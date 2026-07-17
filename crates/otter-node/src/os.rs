@@ -2,7 +2,7 @@
 //!
 //! Operating-system information, implemented natively over `libc` and `std`.
 //! Pure queries — no permission-gated resources — so the static namespace is
-//! built with [`ModuleScope`] and the dynamic shapes (`cpus`, `loadavg`,
+//! built with [`otter_vm::NativeScope`] and the dynamic shapes (`cpus`, `loadavg`,
 //! `userInfo`, …) are built inside each method body.
 //!
 //! # Contents
@@ -18,9 +18,8 @@
 //!   `process.env` proxy; they never read the host environment directly.
 //! - No VM values are retained across the FFI calls; results are copied out.
 
-use otter_runtime::CapabilitySet;
-use otter_runtime::module_scope::{ModuleScope, Rooted};
-use otter_vm::{ErrorKind, NativeCtx, NativeError, Value, object};
+use otter_runtime::{CapabilitySet, RuntimeLocal as Local, RuntimeNativeScope as NativeScope};
+use otter_vm::{ErrorKind, NativeCtx, NativeError, Value, object, object::PropertyFlags};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::string_value;
@@ -95,31 +94,64 @@ pub fn install_os_module(ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Result
 
 /// CommonJS export: the `os` namespace with methods + `EOL`/`devNull` +
 /// `constants.priority`.
-pub fn os_cjs_value(ctx: &mut NativeCtx<'_>, _caps: &CapabilitySet) -> Result<Value, String> {
-    let mut scope = ModuleScope::new(ctx);
-    let os = scope.object()?;
-    let coerce = scope.function("toString", 0, os_method_to_primitive)?;
+pub fn os_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    _caps: &CapabilitySet,
+) -> Result<Local<'scope>, String> {
+    let os = scope.object().map_err(|error| error.to_string())?;
+    let coerce = scope
+        .native_method("toString", 0, os_method_to_primitive)
+        .map_err(|error| error.to_string())?;
     for (name, len, f) in OS_METHODS {
-        let method = scope.function(name, *len, *f)?;
-        if os_method_is_primitive_coercible(name) {
-            scope.set_native_function_property(method, "toString", coerce)?;
-            scope.set_native_function_property(method, "valueOf", coerce)?;
-        }
-        scope.set(os, name, method);
+        scope.scope(|mut method_scope| {
+            let method = method_scope
+                .native_method(name, *len, *f)
+                .map_err(|error| error.to_string())?;
+            if os_method_is_primitive_coercible(name) {
+                let flags = PropertyFlags::new(true, false, true);
+                method_scope
+                    .define(method, "toString", coerce, flags)
+                    .map_err(|error| error.to_string())?;
+                method_scope
+                    .define(method, "valueOf", coerce, flags)
+                    .map_err(|error| error.to_string())?;
+            }
+            method_scope
+                .set(os, name, method)
+                .map_err(|error| error.to_string())
+        })?;
     }
+
     // EOL must throw on assignment (strict mode) yet stay redefinable.
-    scope.set_string_readonly(os, "EOL", ctx_eol())?;
-    scope.set_string(os, "devNull", dev_null())?;
+    let eol = scope.string(ctx_eol()).map_err(|error| error.to_string())?;
+    scope
+        .define(os, "EOL", eol, PropertyFlags::new(false, true, true))
+        .map_err(|error| error.to_string())?;
+    let dev_null = scope
+        .string(dev_null())
+        .map_err(|error| error.to_string())?;
+    scope
+        .set(os, "devNull", dev_null)
+        .map_err(|error| error.to_string())?;
 
-    let constants = scope.object()?;
-    let priority = scope.object()?;
+    let constants = scope.object().map_err(|error| error.to_string())?;
+    let priority = scope.object().map_err(|error| error.to_string())?;
     for (name, value) in PRIORITY {
-        scope.set_number(priority, name, *value);
+        scope.scope(|mut field_scope| {
+            let value = field_scope.number(*value);
+            field_scope
+                .set(priority, name, value)
+                .map_err(|error| error.to_string())
+        })?;
     }
-    scope.set(constants, "priority", priority);
-    scope.set(os, "constants", constants);
+    scope
+        .set(constants, "priority", priority)
+        .map_err(|error| error.to_string())?;
+    scope
+        .set(os, "constants", constants)
+        .map_err(|error| error.to_string())?;
 
-    Ok(scope.finish(os))
+    Ok(os)
 }
 
 fn os_method_is_primitive_coercible(name: &str) -> bool {
@@ -274,55 +306,67 @@ fn os_available_parallelism(
 
 fn os_loadavg(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let avg = load_avg();
-    let mut scope = ModuleScope::new(ctx);
-    let nums: Vec<Rooted> = avg.iter().map(|n| scope.number(*n)).collect();
-    let arr = scope.array(&nums).map_err(oom)?;
-    Ok(scope.finish(arr))
+    ctx.scope(|mut scope| {
+        let array = scope.array(avg.len())?;
+        for (index, value) in avg.into_iter().enumerate() {
+            let value = scope.number(value);
+            scope.set_index(array, index, value)?;
+        }
+        Ok(scope.finish(array))
+    })
 }
 
 fn os_cpus(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let count = num_cpus().max(1);
     let model = cpu_model();
     let speed = cpu_speed_mhz();
-    let mut scope = ModuleScope::new(ctx);
-    let mut entries: Vec<Rooted> = Vec::with_capacity(count);
-    for _ in 0..count {
-        let cpu = scope.object().map_err(oom)?;
-        scope.set_string(cpu, "model", &model).map_err(oom)?;
-        scope.set_number(cpu, "speed", speed);
-        let times = scope.object().map_err(oom)?;
-        for field in ["user", "nice", "sys", "idle", "irq"] {
-            scope.set_number(times, field, 0.0);
+    ctx.scope(|mut scope| {
+        let array = scope.array(count)?;
+        for index in 0..count {
+            scope.scope(|mut cpu_scope| {
+                let cpu = cpu_scope.object()?;
+                let model = cpu_scope.string(&model)?;
+                cpu_scope.set(cpu, "model", model)?;
+                let speed = cpu_scope.number(speed);
+                cpu_scope.set(cpu, "speed", speed)?;
+                let times = cpu_scope.object()?;
+                for field in ["user", "nice", "sys", "idle", "irq"] {
+                    let zero = cpu_scope.number(0.0);
+                    cpu_scope.set(times, field, zero)?;
+                }
+                cpu_scope.set(cpu, "times", times)?;
+                cpu_scope.set_index(array, index, cpu)
+            })?;
         }
-        scope.set(cpu, "times", times);
-        entries.push(cpu);
-    }
-    let arr = scope.array(&entries).map_err(oom)?;
-    Ok(scope.finish(arr))
+        Ok(scope.finish(array))
+    })
 }
 
 fn os_network_interfaces(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     // Minimal: an empty interface map. Sufficient for callers that enumerate
     // entries; per-interface detail lands when a test requires it.
-    let mut scope = ModuleScope::new(ctx);
-    let obj = scope.object().map_err(oom)?;
-    Ok(scope.finish(obj))
+    ctx.scope(|mut scope| {
+        let object = scope.object()?;
+        Ok(scope.finish(object))
+    })
 }
 
 fn os_user_info(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let info = user_info(ctx);
-    let mut scope = ModuleScope::new(ctx);
-    let obj = scope.object().map_err(oom)?;
-    scope.set_number(obj, "uid", info.uid as f64);
-    scope.set_number(obj, "gid", info.gid as f64);
-    scope
-        .set_string(obj, "username", &info.username)
-        .map_err(oom)?;
-    scope
-        .set_string(obj, "homedir", &info.homedir)
-        .map_err(oom)?;
-    scope.set_string(obj, "shell", &info.shell).map_err(oom)?;
-    Ok(scope.finish(obj))
+    ctx.scope(|mut scope| {
+        let object = scope.object()?;
+        let uid = scope.number(info.uid as f64);
+        scope.set(object, "uid", uid)?;
+        let gid = scope.number(info.gid as f64);
+        scope.set(object, "gid", gid)?;
+        let username = scope.string(&info.username)?;
+        scope.set(object, "username", username)?;
+        let homedir = scope.string(&info.homedir)?;
+        scope.set(object, "homedir", homedir)?;
+        let shell = scope.string(&info.shell)?;
+        scope.set(object, "shell", shell)?;
+        Ok(scope.finish(object))
+    })
 }
 
 // ---- priority ----
@@ -395,10 +439,6 @@ fn system_error(syscall: &str, code: &str, message: &str) -> NativeError {
         code: "ERR_SYSTEM_ERROR",
         message: format!("A system error occurred: {syscall} returned {code} ({message})"),
     }
-}
-
-fn oom(err: String) -> NativeError {
-    crate::type_error("os", err)
 }
 
 fn number_value(ctx: &mut NativeCtx<'_>, n: f64) -> Result<Value, NativeError> {

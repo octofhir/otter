@@ -677,6 +677,24 @@ impl<'rt> NativeCtx<'rt> {
             + Sync
             + 'static,
     {
+        self.native_value_with_length(name, 0, captures, call)
+    }
+
+    /// Allocate a captured native function with explicit `.length` through the
+    /// native root contract.
+    pub fn native_value_with_length<F>(
+        &mut self,
+        name: &'static str,
+        length: u8,
+        captures: smallvec::SmallVec<[Value; 4]>,
+        call: F,
+    ) -> Result<Value, otter_gc::OutOfMemory>
+    where
+        F: for<'call> Fn(&mut NativeCtx<'call>, &[Value], &[Value]) -> Result<Value, NativeError>
+            + Send
+            + Sync
+            + 'static,
+    {
         let roots = self.collect_native_roots();
         let this_value = self.call_info.this_value;
         let new_target = self.call_info.new_target;
@@ -686,6 +704,7 @@ impl<'rt> NativeCtx<'rt> {
         native_function::native_value_with_captures_and_roots(
             self.heap_mut(),
             name,
+            length,
             captures,
             &mut external_visit,
             call,
@@ -1938,11 +1957,40 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         self.ctx.cx.interp.scoped_null(self.token)
     }
 
-    /// Read an ordinary string-keyed property. Missing properties become
-    /// `undefined`; the result is rooted before returning.
-    pub fn get(&mut self, object: Local<'_>, key: &str) -> Result<Local<'scope>, NativeError> {
-        let result = self.ctx.cx.interp.scoped_get(self.token, object, key);
-        result.map_err(|error| self.vm_error(error, "NativeScope::get"))
+    /// Perform JavaScript `Get(receiver, key)` and root the result.
+    ///
+    /// Callable objects, proxies, accessors, and inherited properties follow
+    /// the same dispatch path as bytecode property reads. The receiver remains
+    /// in this scope's collector-rewritten arena throughout any nested getter
+    /// call.
+    pub fn get(&mut self, receiver: Local<'_>, key: &str) -> Result<Local<'scope>, NativeError> {
+        if self.ctx.context.is_none() {
+            let raw = self.raw(receiver);
+            if raw.as_object().is_some() {
+                let result = self.ctx.cx.interp.scoped_get(self.token, receiver, key);
+                return result.map_err(|error| self.vm_error(error, "NativeScope::get"));
+            }
+            if let Some(native) = raw.as_native_function() {
+                let descriptor = native
+                    .own_property_descriptor(self.ctx.heap_mut(), key)
+                    .map_err(|error| self.vm_error(VmError::from(error), "NativeScope::get"))?;
+                let value = match descriptor.map(|descriptor| descriptor.kind) {
+                    Some(object::DescriptorKind::Data { value }) => value,
+                    Some(object::DescriptorKind::Accessor { .. }) => {
+                        return Err(NativeError::TypeError {
+                            name: "NativeScope::get",
+                            reason: "cannot invoke an accessor without an execution context"
+                                .to_string(),
+                        });
+                    }
+                    None => Value::undefined(),
+                };
+                return Ok(self.value(value));
+            }
+        }
+        let receiver = self.raw(receiver);
+        let result = self.ctx.get_value_property(receiver, key)?;
+        Ok(self.value(result))
     }
 
     /// Store a string-keyed property through the rooted object path.
@@ -2109,6 +2157,71 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
             .native_function_from_call_host_rooted(name, length, call, &[], &[])
             .map(|value| self.value(value));
         result.map_err(|error| self.vm_error(VmError::from(error), "NativeScope::native_call"))
+    }
+
+    /// Allocate a dynamic native callable with rooted JavaScript captures.
+    ///
+    /// Capture values are read from their arena slots immediately before the
+    /// allocation, traced by the function body while it is being published,
+    /// and retained by the resulting native function thereafter.
+    pub fn native_closure<F>(
+        &mut self,
+        name: &'static str,
+        length: u8,
+        captures: &[Local<'_>],
+        call: F,
+    ) -> Result<Local<'scope>, NativeError>
+    where
+        F: for<'call> Fn(&mut NativeCtx<'call>, &[Value], &[Value]) -> Result<Value, NativeError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let captures = captures.iter().map(|capture| self.raw(*capture)).collect();
+        let result = self
+            .ctx
+            .native_value_with_length(name, length, captures, call)
+            .map_err(|error| self.vm_error(VmError::from(error), "NativeScope::native_closure"))?;
+        Ok(self.value(result))
+    }
+
+    /// Compile a CommonJS wrapper on the current runtime turn and root it in
+    /// this scope before any subsequent module allocation can relocate it.
+    pub fn commonjs_wrapper(
+        &mut self,
+        module_url: &str,
+        body: &str,
+    ) -> Result<Local<'scope>, NativeError> {
+        let wrapper = self.ctx.create_commonjs_wrapper(module_url, body)?;
+        Ok(self.value(wrapper))
+    }
+
+    /// Return a previously cached hosted-module namespace in this handle
+    /// arena. The returned local remains valid across later allocations in the
+    /// current scope.
+    pub fn cached_host_module_env(&mut self, specifier: &str) -> Option<Local<'scope>> {
+        let env = self.ctx.cx.interp.host_module_env_cached(specifier)?;
+        Some(self.value(Value::object(env)))
+    }
+
+    /// Cache a rooted object as a hosted-module namespace.
+    pub fn cache_host_module_env(
+        &mut self,
+        specifier: &str,
+        env: Local<'_>,
+    ) -> Result<(), NativeError> {
+        let env = self
+            .raw(env)
+            .as_object()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "NativeScope::cache_host_module_env",
+                reason: "expected an object".to_string(),
+            })?;
+        self.ctx
+            .cx
+            .interp
+            .cache_host_module_env(std::sync::Arc::from(specifier), env);
+        Ok(())
     }
 
     /// Strictly read a JavaScript string into owned Rust text.
@@ -2660,6 +2773,63 @@ mod tests {
             })
         });
         assert!(ok);
+    }
+
+    #[test]
+    fn native_scope_defines_and_gets_rooted_native_function_properties() {
+        fn noop(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+            Ok(Value::undefined())
+        }
+
+        let mut interp = Interpreter::new();
+        with_default_ctx(&mut interp, |ctx| {
+            ctx.scope(|mut scope| {
+                let function = scope
+                    .native_method("moduleMethod", 0, noop)
+                    .expect("native method");
+                let payload = scope.object().expect("property payload");
+                scope
+                    .define(
+                        function,
+                        "payload",
+                        payload,
+                        crate::object::PropertyFlags::new(true, false, true),
+                    )
+                    .expect("define native function property");
+
+                scope
+                    .context()
+                    .cx
+                    .interp
+                    .collect_minor_tracing_runtime_roots();
+
+                let read_back = scope
+                    .get(function, "payload")
+                    .expect("read callable property");
+                assert_eq!(scope.raw(read_back), scope.raw(payload));
+
+                let function_value = scope.raw(function);
+                let payload_value = scope.raw(payload);
+                let native = function_value
+                    .as_native_function()
+                    .expect("function survives relocation");
+                let descriptor = native
+                    .own_property_descriptor(scope.context().heap_mut(), "payload")
+                    .expect("descriptor lookup")
+                    .expect("payload descriptor");
+                match &descriptor.kind {
+                    crate::object::DescriptorKind::Data { value } => {
+                        assert_eq!(*value, payload_value);
+                    }
+                    crate::object::DescriptorKind::Accessor { .. } => {
+                        panic!("payload must be a data descriptor");
+                    }
+                }
+                assert!(descriptor.writable());
+                assert!(!descriptor.enumerable());
+                assert!(descriptor.configurable());
+            });
+        });
     }
 
     /// A `%Object.prototype%`-proto'd object built inside `NativeCtx::scope`

@@ -11,14 +11,17 @@
 //!   node globals installer) to populate `globalThis.Buffer`.
 
 use otter_runtime::CapabilitySet;
-use otter_vm::{NativeCtx, Value};
+use otter_vm::{Local, NativeScope};
 
 /// Embedded `Buffer` implementation.
 pub const SHIM: &str = include_str!("buffer.js");
 
 /// CommonJS export: the `buffer` namespace.
-pub fn buffer_cjs_value(ctx: &mut NativeCtx<'_>, _caps: &CapabilitySet) -> Result<Value, String> {
-    otter_runtime::run_builtin_cjs_shim(ctx, "node:buffer", SHIM, &[])
+pub fn buffer_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    _caps: &CapabilitySet,
+) -> Result<Local<'scope>, String> {
+    otter_runtime::run_builtin_cjs_shim(scope, "node:buffer", SHIM, &[])
 }
 
 /// ESM namespace install — CommonJS is the supported surface for now.

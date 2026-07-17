@@ -18,11 +18,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use otter_runtime::module_scope::ModuleScope;
 use otter_runtime::{
-    CapabilitySet, HostedModuleCtx, HostedNativeCall, RuntimeAttr, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeObjectBuilder, RuntimeValue as Value,
-    runtime_arg_to_string, runtime_native_dynamic, runtime_optional_arg_to_string,
+    CapabilitySet, HostedModuleCtx, HostedNativeCall, RuntimeLocal as Local,
+    RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
+    RuntimeNativeScope as NativeScope, RuntimeValue as Value, runtime_arg_to_string,
+    runtime_optional_arg_to_string,
 };
 
 /// Errors produced by the native `node:fs` core.
@@ -115,12 +115,15 @@ const FS_SHIM: &str = include_str!("fs.js");
 const FS_PROMISES_SHIM: &str = "'use strict';\nmodule.exports = require('fs').promises;\n";
 
 /// CommonJS export: the full `fs` namespace, built by `fs.js` on the native core.
-pub fn fs_cjs_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result<Value, String> {
-    let native = fs_native_value(ctx, caps)?;
-    let buffer = crate::buffer::buffer_cjs_value(ctx, caps)?;
-    let stream = crate::stream::stream_cjs_value(ctx, caps)?;
+pub fn fs_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    caps: &CapabilitySet,
+) -> Result<Local<'scope>, String> {
+    let native = fs_native_value(scope, caps)?;
+    let buffer = crate::buffer::buffer_cjs_value(scope, caps)?;
+    let stream = crate::stream::stream_cjs_value(scope, caps)?;
     otter_runtime::run_builtin_cjs_shim(
-        ctx,
+        scope,
         "node:fs",
         FS_SHIM,
         &[
@@ -132,35 +135,37 @@ pub fn fs_cjs_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result<Val
 }
 
 /// CommonJS export: `fs/promises` (= `require('fs').promises`).
-pub fn fs_promises_cjs_value(
-    ctx: &mut NativeCtx<'_>,
+pub fn fs_promises_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Value, String> {
-    let fs = fs_cjs_value(ctx, caps)?;
-    otter_runtime::run_builtin_cjs_shim(ctx, "node:fs/promises", FS_PROMISES_SHIM, &[("fs", fs)])
+) -> Result<Local<'scope>, String> {
+    let fs = fs_cjs_value(scope, caps)?;
+    otter_runtime::run_builtin_cjs_shim(scope, "node:fs/promises", FS_PROMISES_SHIM, &[("fs", fs)])
 }
 
 /// Build the raw synchronous core as a value: `{ readRaw, writeRaw, stat, … }`.
 /// Each method captures a clone of the capability set.
-pub fn fs_native_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result<Value, String> {
-    let object = otter_runtime::runtime_alloc_object(ctx).map_err(|e| e.to_string())?;
-    let mut builder = RuntimeObjectBuilder::from_object(ctx, object);
-
+pub fn fs_native_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    caps: &CapabilitySet,
+) -> Result<Local<'scope>, String> {
+    let object = scope.object().map_err(|error| error.to_string())?;
     macro_rules! m {
         ($name:literal, $len:expr, $f:ident) => {{
             let caps = caps.clone();
-            builder
-                .method(
+            let method = scope
+                .native_closure(
                     $name,
                     $len,
-                    runtime_native_dynamic(Arc::new(
-                        move |ctx: &mut NativeCtx<'_>, args: &[Value], _c: &[Value]| {
-                            $f(ctx, args, &caps)
-                        },
-                    )),
-                    RuntimeAttr::builtin_function(),
+                    &[],
+                    move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+                        $f(ctx, args, &caps)
+                    },
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(|error| error.to_string())?;
+            scope
+                .set(object, $name, method)
+                .map_err(|error| error.to_string())?;
         }};
     }
 
@@ -187,7 +192,7 @@ pub fn fs_native_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result<
     m!("closeFd", 1, fs_close_fd);
     m!("fstatFd", 1, fs_fstat_fd);
 
-    Ok(Value::object(builder.build()))
+    Ok(object)
 }
 
 // ---- file-descriptor table (open/read/write/close/fstat) ----
@@ -418,27 +423,28 @@ fn stat_object(ctx: &mut NativeCtx<'_>, meta: &std::fs::Metadata) -> Result<Valu
     let birthtime = to_ms(meta.created().ok());
     let file_type = meta.file_type();
 
-    let mut scope = ModuleScope::new(ctx);
-    let obj = scope.object().map_err(oom)?;
-    scope.set_number(obj, "size", meta.len() as f64);
-    scope.set_number(obj, "mode", file_mode(meta) as f64);
-    scope.set_number(obj, "mtimeMs", mtime);
-    scope.set_number(obj, "atimeMs", atime);
-    scope.set_number(obj, "ctimeMs", ctime);
-    scope.set_number(obj, "birthtimeMs", birthtime);
-    set_bool(&mut scope, obj, "isFile", file_type.is_file());
-    set_bool(&mut scope, obj, "isDirectory", file_type.is_dir());
-    set_bool(&mut scope, obj, "isSymbolicLink", file_type.is_symlink());
-    let (blksize, blocks, dev, ino, nlink, uid, gid, rdev) = stat_extra(meta);
-    scope.set_number(obj, "blksize", blksize);
-    scope.set_number(obj, "blocks", blocks);
-    scope.set_number(obj, "dev", dev);
-    scope.set_number(obj, "ino", ino);
-    scope.set_number(obj, "nlink", nlink);
-    scope.set_number(obj, "uid", uid);
-    scope.set_number(obj, "gid", gid);
-    scope.set_number(obj, "rdev", rdev);
-    Ok(scope.finish(obj))
+    ctx.scope(|mut scope| {
+        let object = scope.object()?;
+        set_number(&mut scope, object, "size", meta.len() as f64)?;
+        set_number(&mut scope, object, "mode", file_mode(meta) as f64)?;
+        set_number(&mut scope, object, "mtimeMs", mtime)?;
+        set_number(&mut scope, object, "atimeMs", atime)?;
+        set_number(&mut scope, object, "ctimeMs", ctime)?;
+        set_number(&mut scope, object, "birthtimeMs", birthtime)?;
+        set_bool(&mut scope, object, "isFile", file_type.is_file())?;
+        set_bool(&mut scope, object, "isDirectory", file_type.is_dir())?;
+        set_bool(&mut scope, object, "isSymbolicLink", file_type.is_symlink())?;
+        let (blksize, blocks, dev, ino, nlink, uid, gid, rdev) = stat_extra(meta);
+        set_number(&mut scope, object, "blksize", blksize)?;
+        set_number(&mut scope, object, "blocks", blocks)?;
+        set_number(&mut scope, object, "dev", dev)?;
+        set_number(&mut scope, object, "ino", ino)?;
+        set_number(&mut scope, object, "nlink", nlink)?;
+        set_number(&mut scope, object, "uid", uid)?;
+        set_number(&mut scope, object, "gid", gid)?;
+        set_number(&mut scope, object, "rdev", rdev)?;
+        Ok(scope.finish(object))
+    })
 }
 
 fn fs_readdir_raw(
@@ -449,13 +455,16 @@ fn fs_readdir_raw(
     let path = path_arg(ctx, args, 0, "fs.readdir")?;
     require_read(&path, caps).map_err(fs_error)?;
     let entries = read_dir_names(&path).map_err(|e| fs_error(io_error(&path, &e)))?;
-    let mut scope = ModuleScope::new(ctx);
-    let mut items = Vec::with_capacity(entries.len());
-    for name in &entries {
-        items.push(scope.string(name).map_err(oom)?);
-    }
-    let arr = scope.array(&items).map_err(oom)?;
-    Ok(scope.finish(arr))
+    ctx.scope(|mut scope| {
+        let array = scope.array(entries.len())?;
+        for (index, name) in entries.iter().enumerate() {
+            scope.scope(|mut item_scope| {
+                let value = item_scope.string(name)?;
+                item_scope.set_index(array, index, value)
+            })?;
+        }
+        Ok(scope.finish(array))
+    })
 }
 
 fn fs_readdir_types(
@@ -477,18 +486,21 @@ fn fs_readdir_types(
             ft.as_ref().is_some_and(std::fs::FileType::is_symlink),
         ));
     }
-    let mut scope = ModuleScope::new(ctx);
-    let mut items = Vec::with_capacity(rows.len());
-    for (name, is_dir, is_file, is_link) in &rows {
-        let row = scope.object().map_err(oom)?;
-        scope.set_string(row, "name", name).map_err(oom)?;
-        set_bool(&mut scope, row, "isDir", *is_dir);
-        set_bool(&mut scope, row, "isFile", *is_file);
-        set_bool(&mut scope, row, "isSymlink", *is_link);
-        items.push(row);
-    }
-    let arr = scope.array(&items).map_err(oom)?;
-    Ok(scope.finish(arr))
+    ctx.scope(|mut scope| {
+        let array = scope.array(rows.len())?;
+        for (index, (name, is_dir, is_file, is_link)) in rows.iter().enumerate() {
+            scope.scope(|mut row_scope| {
+                let row = row_scope.object()?;
+                let name = row_scope.string(name)?;
+                row_scope.set(row, "name", name)?;
+                set_bool(&mut row_scope, row, "isDir", *is_dir)?;
+                set_bool(&mut row_scope, row, "isFile", *is_file)?;
+                set_bool(&mut row_scope, row, "isSymlink", *is_link)?;
+                row_scope.set_index(array, index, row)
+            })?;
+        }
+        Ok(scope.finish(array))
+    })
 }
 
 fn fs_mkdir(
@@ -675,13 +687,23 @@ fn read_dir_names(path: &Path) -> std::io::Result<Vec<String>> {
 }
 
 fn set_bool(
-    scope: &mut ModuleScope<'_, '_>,
-    obj: otter_runtime::module_scope::Rooted,
+    scope: &mut NativeScope<'_, '_>,
+    object: Local<'_>,
     key: &str,
-    b: bool,
-) {
-    let v = scope.boolean(b);
-    scope.set(obj, key, v);
+    value: bool,
+) -> Result<(), NativeError> {
+    let value = scope.boolean(value);
+    scope.set(object, key, value)
+}
+
+fn set_number(
+    scope: &mut NativeScope<'_, '_>,
+    object: Local<'_>,
+    key: &str,
+    value: f64,
+) -> Result<(), NativeError> {
+    let value = scope.number(value);
+    scope.set(object, key, value)
 }
 
 #[cfg(unix)]
@@ -716,10 +738,6 @@ fn stat_extra(meta: &std::fs::Metadata) -> (f64, f64, f64, f64, f64, f64, f64, f
 #[cfg(not(unix))]
 fn stat_extra(_meta: &std::fs::Metadata) -> (f64, f64, f64, f64, f64, f64, f64, f64) {
     (4096.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
-}
-
-fn oom(err: String) -> NativeError {
-    crate::type_error("fs", err)
 }
 
 fn path_arg(

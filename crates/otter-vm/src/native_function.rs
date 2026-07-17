@@ -1180,6 +1180,7 @@ where
 pub(crate) fn native_value_with_captures_and_roots<F>(
     heap: &mut otter_gc::GcHeap,
     name: &'static str,
+    length: u8,
     captures: SmallVec<[Value; 4]>,
     external_visit: &mut RootSlotVisitor<'_>,
     call: F,
@@ -1193,7 +1194,7 @@ where
     Ok(Value::native_function(NativeFunction::allocate_with_roots(
         heap,
         name,
-        0,
+        length,
         NativeCallStorage::Dynamic(Arc::new(call)),
         captures,
         None,

@@ -3,25 +3,27 @@
 //! Public-key / cipher operations are out of scope for this slice; the focus is
 //! the high-frequency `createHash`/`createHmac`/`randomBytes` surface. Bytes
 //! cross the native/JS boundary as latin1 strings (the same bridge `fs` uses).
-
-use std::sync::Arc;
+//! The CommonJS namespace is assembled inside one rooted native scope.
 
 use otter_runtime::{
-    CapabilitySet, RuntimeAttr, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeObjectBuilder, RuntimeValue as Value, runtime_alloc_object, runtime_arg_to_string,
-    runtime_native_dynamic,
+    CapabilitySet, RuntimeLocal as Local, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeNativeScope as NativeScope, RuntimeValue as Value,
+    runtime_arg_to_string,
 };
 use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 
 const SHIM: &str = include_str!("crypto.js");
 
 /// CommonJS export: the `crypto` namespace built by `crypto.js`.
-pub fn crypto_cjs_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result<Value, String> {
-    let native = native_value(ctx)?;
-    let buffer = crate::buffer::buffer_cjs_value(ctx, caps)?;
-    let events = crate::events::events_cjs_value(ctx, caps)?;
+pub fn crypto_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    caps: &CapabilitySet,
+) -> Result<Local<'scope>, String> {
+    let native = native_value(scope)?;
+    let buffer = crate::buffer::buffer_cjs_value(scope, caps)?;
+    let events = crate::events::events_cjs_value(scope, caps)?;
     otter_runtime::run_builtin_cjs_shim(
-        ctx,
+        scope,
         "node:crypto",
         SHIM,
         &[
@@ -37,22 +39,16 @@ pub fn install_crypto_module(_ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> R
     Ok(())
 }
 
-fn native_value(ctx: &mut NativeCtx<'_>) -> Result<Value, String> {
-    let object = runtime_alloc_object(ctx).map_err(|e| e.to_string())?;
-    let mut builder = RuntimeObjectBuilder::from_object(ctx, object);
-
+fn native_value<'scope>(scope: &mut NativeScope<'scope, '_>) -> Result<Local<'scope>, String> {
+    let object = scope.object().map_err(|error| error.to_string())?;
     macro_rules! m {
         ($name:literal, $len:expr, $f:ident) => {
-            builder
-                .method(
-                    $name,
-                    $len,
-                    runtime_native_dynamic(Arc::new(
-                        |ctx: &mut NativeCtx<'_>, args: &[Value], _c: &[Value]| $f(ctx, args),
-                    )),
-                    RuntimeAttr::builtin_function(),
-                )
-                .map_err(|e| e.to_string())?;
+            let method = scope
+                .native_method($name, $len, $f)
+                .map_err(|error| error.to_string())?;
+            scope
+                .set(object, $name, method)
+                .map_err(|error| error.to_string())?;
         };
     }
 
@@ -60,7 +56,7 @@ fn native_value(ctx: &mut NativeCtx<'_>) -> Result<Value, String> {
     m!("hashDigest", 2, hash_digest);
     m!("hmacDigest", 3, hmac_digest);
 
-    Ok(Value::object(builder.build()))
+    Ok(object)
 }
 
 fn bytes_to_latin1(bytes: &[u8]) -> String {

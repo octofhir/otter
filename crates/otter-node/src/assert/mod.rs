@@ -17,8 +17,7 @@
 //! # See also
 //! - `assert/assert.js`, `assert/calltracker.js`, `assert/myers_diff.js`.
 
-use otter_runtime::CapabilitySet;
-use otter_vm::{NativeCtx, Value};
+use otter_runtime::{CapabilitySet, RuntimeLocal as Local, RuntimeNativeScope as NativeScope};
 
 /// Embedded `assert` surface.
 const ASSERT_JS: &str = include_str!("assert.js");
@@ -28,77 +27,52 @@ const CALLTRACKER_JS: &str = include_str!("calltracker.js");
 const MYERS_DIFF_JS: &str = include_str!("myers_diff.js");
 
 /// CommonJS export: the callable `assert` namespace.
-pub fn assert_cjs_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result<Value, String> {
-    // CommonJS compilation is still an explicit raw runtime boundary in this
-    // checkpoint. Keep intermediate module values in persistent VM roots while
-    // later shims allocate; ordinary native value construction uses
-    // `NativeScope` everywhere else.
-    let mut roots = Vec::with_capacity(3);
-    let result = (|| {
-        let util = crate::util::util_cjs_value(ctx, caps)?;
-        let util_root = ctx.persistent_root_insert(util);
-        roots.push(util_root);
-        let calltracker = otter_runtime::run_builtin_cjs_shim(
-            ctx,
-            "internal/assert/calltracker",
-            CALLTRACKER_JS,
-            &[],
-        )?;
-        let calltracker_root = ctx.persistent_root_insert(calltracker);
-        roots.push(calltracker_root);
-        let myers = otter_runtime::run_builtin_cjs_shim(
-            ctx,
-            "internal/assert/myers_diff",
-            MYERS_DIFF_JS,
-            &[],
-        )?;
-        let myers_root = ctx.persistent_root_insert(myers);
-        roots.push(myers_root);
-        let util = ctx
-            .persistent_root_get(util_root)
-            .ok_or_else(|| "util root disappeared during assert bootstrap".to_string())?;
-        let calltracker = ctx
-            .persistent_root_get(calltracker_root)
-            .ok_or_else(|| "calltracker root disappeared during assert bootstrap".to_string())?;
-        let myers = ctx
-            .persistent_root_get(myers_root)
-            .ok_or_else(|| "myers root disappeared during assert bootstrap".to_string())?;
-        otter_runtime::run_builtin_cjs_shim(
-            ctx,
-            "assert",
-            ASSERT_JS,
-            &[
-                ("util", util),
-                ("internal/assert/calltracker", calltracker),
-                ("internal/assert/myers_diff", myers),
-            ],
-        )
-    })();
-    for root in roots {
-        let _ = ctx.persistent_root_remove(root);
-    }
-    result
+pub fn assert_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    caps: &CapabilitySet,
+) -> Result<Local<'scope>, String> {
+    let util = crate::util::util_cjs_value(scope, caps)?;
+    let calltracker = otter_runtime::run_builtin_cjs_shim(
+        scope,
+        "internal/assert/calltracker",
+        CALLTRACKER_JS,
+        &[],
+    )?;
+    let myers = otter_runtime::run_builtin_cjs_shim(
+        scope,
+        "internal/assert/myers_diff",
+        MYERS_DIFF_JS,
+        &[],
+    )?;
+    otter_runtime::run_builtin_cjs_shim(
+        scope,
+        "assert",
+        ASSERT_JS,
+        &[
+            ("util", util),
+            ("internal/assert/calltracker", calltracker),
+            ("internal/assert/myers_diff", myers),
+        ],
+    )
 }
 
 /// CommonJS export: strict assert namespace (`node:assert/strict`).
-pub fn assert_strict_cjs_value(
-    ctx: &mut NativeCtx<'_>,
+pub fn assert_strict_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Value, String> {
-    let assert = assert_cjs_value(ctx, caps)?;
-    let (interp, exec) = ctx.interp_mut_and_context();
-    let exec = exec.ok_or_else(|| "missing execution context for assert/strict".to_string())?;
-    interp
-        .get_property(&exec, assert, "strict")
-        .map_err(|err| err.to_string())
+) -> Result<Local<'scope>, String> {
+    let assert = assert_cjs_value(scope, caps)?;
+    scope
+        .get(assert, "strict")
+        .map_err(|error| error.to_string())
 }
 
 /// CommonJS export for `internal/assert/myers_diff` (`--expose-internals`).
-pub fn myers_diff_cjs_value(
-    ctx: &mut NativeCtx<'_>,
+pub fn myers_diff_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Value, String> {
-    otter_runtime::run_builtin_cjs_shim(ctx, "internal/assert/myers_diff", MYERS_DIFF_JS, &[])
+) -> Result<Local<'scope>, String> {
+    otter_runtime::run_builtin_cjs_shim(scope, "internal/assert/myers_diff", MYERS_DIFF_JS, &[])
 }
 
 /// ESM namespace install — CommonJS is the supported surface for now.

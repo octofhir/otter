@@ -1,7 +1,7 @@
 //! `node:path` / `path` hosted module.
 //!
-//! Pure string algorithms — no I/O — so the whole module is built with
-//! [`ModuleScope`]. `resolve`/`relative` consult the process cwd via
+//! Pure string algorithms — no I/O — so the whole module is built in one
+//! [`otter_vm::NativeScope`]. `resolve`/`relative` consult the process cwd via
 //! `std::env::current_dir`.
 //!
 //! # Contents
@@ -19,8 +19,7 @@
 //! # See also
 //! - Node v24 `lib/path.js` (the reference implementation this mirrors).
 
-use otter_runtime::CapabilitySet;
-use otter_runtime::module_scope::ModuleScope;
+use otter_runtime::{CapabilitySet, RuntimeLocal as Local, RuntimeNativeScope as NativeScope};
 use otter_vm::{NativeCtx, NativeError, Value};
 
 use crate::{invalid_arg_type, string_value};
@@ -35,31 +34,66 @@ pub fn install_path_module(ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Resu
 
 /// CommonJS export: the default (posix) `path` namespace with `.posix` and
 /// `.win32` sub-namespaces (each cross-linked), matching Node's layout.
-pub fn path_cjs_value(ctx: &mut NativeCtx<'_>, _caps: &CapabilitySet) -> Result<Value, String> {
-    let mut scope = ModuleScope::new(ctx);
-
-    let posix = scope.object()?;
+pub fn path_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    _caps: &CapabilitySet,
+) -> Result<Local<'scope>, String> {
+    let posix = scope.object().map_err(|error| error.to_string())?;
     for (name, len, f) in PATH_METHODS {
-        scope.set_method(posix, name, *len, *f)?;
+        scope.scope(|mut method_scope| {
+            let method = method_scope
+                .native_method(name, *len, *f)
+                .map_err(|error| error.to_string())?;
+            method_scope
+                .set(posix, name, method)
+                .map_err(|error| error.to_string())
+        })?;
     }
-    scope.set_string(posix, "sep", "/")?;
-    scope.set_string(posix, "delimiter", ":")?;
+    let separator = scope.string("/").map_err(|error| error.to_string())?;
+    scope
+        .set(posix, "sep", separator)
+        .map_err(|error| error.to_string())?;
+    let delimiter = scope.string(":").map_err(|error| error.to_string())?;
+    scope
+        .set(posix, "delimiter", delimiter)
+        .map_err(|error| error.to_string())?;
 
-    let win32 = scope.object()?;
+    let win32 = scope.object().map_err(|error| error.to_string())?;
     for (name, len, f) in WIN32_METHODS {
-        scope.set_method(win32, name, *len, *f)?;
+        scope.scope(|mut method_scope| {
+            let method = method_scope
+                .native_method(name, *len, *f)
+                .map_err(|error| error.to_string())?;
+            method_scope
+                .set(win32, name, method)
+                .map_err(|error| error.to_string())
+        })?;
     }
-    scope.set_string(win32, "sep", "\\")?;
-    scope.set_string(win32, "delimiter", ";")?;
+    let separator = scope.string("\\").map_err(|error| error.to_string())?;
+    scope
+        .set(win32, "sep", separator)
+        .map_err(|error| error.to_string())?;
+    let delimiter = scope.string(";").map_err(|error| error.to_string())?;
+    scope
+        .set(win32, "delimiter", delimiter)
+        .map_err(|error| error.to_string())?;
 
     // Cross-links: each flavor exposes both, like Node.
-    scope.set(posix, "posix", posix);
-    scope.set(posix, "win32", win32);
-    scope.set(win32, "posix", posix);
-    scope.set(win32, "win32", win32);
+    scope
+        .set(posix, "posix", posix)
+        .map_err(|error| error.to_string())?;
+    scope
+        .set(posix, "win32", win32)
+        .map_err(|error| error.to_string())?;
+    scope
+        .set(win32, "posix", posix)
+        .map_err(|error| error.to_string())?;
+    scope
+        .set(win32, "win32", win32)
+        .map_err(|error| error.to_string())?;
 
     // Default export is the posix implementation.
-    Ok(scope.finish(posix))
+    Ok(posix)
 }
 
 type Method = (
@@ -1456,14 +1490,20 @@ fn build_parse_object(
     parts: (String, String, String, String, String),
 ) -> Result<Value, NativeError> {
     let (root, dir, base, ext, name) = parts;
-    let mut scope = ModuleScope::new(ctx);
-    let obj = scope.ordinary_object().map_err(string_err)?;
-    scope.set_string(obj, "root", &root).map_err(string_err)?;
-    scope.set_string(obj, "dir", &dir).map_err(string_err)?;
-    scope.set_string(obj, "base", &base).map_err(string_err)?;
-    scope.set_string(obj, "ext", &ext).map_err(string_err)?;
-    scope.set_string(obj, "name", &name).map_err(string_err)?;
-    Ok(scope.finish(obj))
+    ctx.scope(|mut scope| {
+        let object = scope.object()?;
+        let root = scope.string(&root)?;
+        scope.set(object, "root", root)?;
+        let dir = scope.string(&dir)?;
+        scope.set(object, "dir", dir)?;
+        let base = scope.string(&base)?;
+        scope.set(object, "base", base)?;
+        let ext = scope.string(&ext)?;
+        scope.set(object, "ext", ext)?;
+        let name = scope.string(&name)?;
+        scope.set(object, "name", name)?;
+        Ok(scope.finish(object))
+    })
 }
 
 fn path_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -1518,10 +1558,6 @@ fn format_path(ctx: &mut NativeCtx<'_>, args: &[Value], sep: char) -> Result<Val
 
 fn path_format(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     format_path(ctx, args, '/')
-}
-
-fn string_err(message: String) -> NativeError {
-    crate::type_error("path", message)
 }
 
 /// Node's `invalidArgTypeHelper` suffix for a rejected value (` Received ...`).

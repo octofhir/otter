@@ -15,13 +15,16 @@
 //! - The module grants no filesystem or subprocess capability.
 
 use otter_runtime::CapabilitySet;
-use otter_vm::{NativeCtx, Value};
+use otter_vm::{Local, NativeScope};
 
 const SHIM: &str = include_str!("tty.js");
 
 /// CommonJS TTY compatibility namespace.
-pub fn tty_cjs_value(ctx: &mut NativeCtx<'_>, _caps: &CapabilitySet) -> Result<Value, String> {
-    otter_runtime::run_builtin_cjs_shim(ctx, "node:tty", SHIM, &[])
+pub fn tty_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    _caps: &CapabilitySet,
+) -> Result<Local<'scope>, String> {
+    otter_runtime::run_builtin_cjs_shim(scope, "node:tty", SHIM, &[])
 }
 
 /// ESM namespace install. CommonJS is the supported constructor surface.

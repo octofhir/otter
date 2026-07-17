@@ -115,13 +115,12 @@ fn date_construct_time_value(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<
                 name: "Date",
                 reason: "missing execution context".to_string(),
             })?;
-        match ctx
-            .cx
-            .interp
-            .coerce_to_primitive(&context, &value, ToPrimitiveHint::Default)
-        {
+        let primitive = ctx.with_turn_parts(|interp, stack| {
+            interp.coerce_to_primitive(stack, &context, &value, ToPrimitiveHint::Default)
+        });
+        match primitive {
             Ok(v) => v,
-            Err(err) => return Err(date_vm_error(ctx.cx.interp, err)),
+            Err(err) => return Err(date_vm_error(ctx.interp_mut(), err)),
         }
     };
 
@@ -139,9 +138,11 @@ fn date_construct_time_value(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<
             name: "Date",
             reason: "missing execution context".to_string(),
         })?;
-    match ctx.cx.interp.coerce_to_number(&context, &primitive) {
+    let number =
+        ctx.with_turn_parts(|interp, stack| interp.coerce_to_number(stack, &context, &primitive));
+    match number {
         Ok(n) => Ok(n.as_f64()),
-        Err(err) => Err(date_vm_error(ctx.cx.interp, err)),
+        Err(err) => Err(date_vm_error(ctx.interp_mut(), err)),
     }
 }
 
@@ -157,15 +158,25 @@ fn coerce_number_args(
             name,
             reason: "missing execution context".to_string(),
         })?;
-    let mut coerced = SmallVec::with_capacity(args.len());
-    for value in args {
-        let number = match ctx.cx.interp.coerce_to_number(&context, value) {
-            Ok(n) => n,
-            Err(err) => return Err(date_vm_error(ctx.cx.interp, err)),
-        };
-        coerced.push(Value::number(number));
-    }
-    Ok(coerced)
+    ctx.scope(|mut scope| {
+        let rooted_args: Vec<_> = args
+            .iter()
+            .copied()
+            .map(|value| scope.value(value))
+            .collect();
+        let mut coerced = SmallVec::with_capacity(rooted_args.len());
+        for value in rooted_args {
+            let value = scope.raw(value);
+            let number = scope
+                .with_turn_parts(|interp, stack| interp.coerce_to_number(stack, &context, &value));
+            let number = match number {
+                Ok(number) => number,
+                Err(error) => return Err(date_vm_error(scope.context().interp_mut(), error)),
+            };
+            coerced.push(Value::number(number));
+        }
+        Ok(coerced)
+    })
 }
 
 fn date_vm_error(interp: &crate::Interpreter, err: VmError) -> NativeError {

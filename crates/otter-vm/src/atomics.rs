@@ -206,16 +206,17 @@ fn to_primitive_number(
     if abstract_ops::is_primitive(value) {
         return Ok(*value);
     }
-    let (interp, exec) = ctx.interp_mut_and_context();
-    let exec = exec.ok_or_else(|| {
+    let exec = ctx.execution_context().cloned().ok_or_else(|| {
         type_err(
             method_name,
             "missing execution context for ToPrimitive".to_string(),
         )
     })?;
-    interp
-        .evaluate_to_primitive(&exec, value, ToPrimitiveHint::Number)
-        .map_err(|e| vm_error_to_native(interp, method_name, e))
+    ctx.with_turn_parts(|interp, stack| {
+        interp
+            .evaluate_to_primitive(stack, &exec, value, ToPrimitiveHint::Number)
+            .map_err(|e| vm_error_to_native(interp, method_name, e))
+    })
 }
 
 /// Convert a [`VmError`] surfaced from re-entering the interpreter

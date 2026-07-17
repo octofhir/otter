@@ -17,46 +17,34 @@ use otter_bytecode::method_id::{ArrayBufferMethod, SharedArrayBufferMethod};
 
 use crate::abstract_ops::{self, ToPrimitiveHint};
 use crate::binary::dispatch;
-use crate::{NativeCtx, NativeError, Value, VmError, VmGetOutcome, VmPropertyKey};
+use crate::{
+    ExecutionContext, Local, NativeCtx, NativeError, NativeScope, Value, VmError, VmGetOutcome,
+    VmPropertyKey,
+};
 
 /// §7.1.5 `ToIntegerOrInfinity(value)` with an observable
 /// `ToPrimitive` (number hint): object arguments route through
 /// `valueOf` / `toString` / `@@toPrimitive` so user callbacks fire,
 /// and `Symbol` / `BigInt` surface a `TypeError` per §7.1.4 ToNumber.
 /// `resize` / `grow` apply their own `RangeError` bounds afterwards.
-fn coerce_length_integer(
-    ctx: &mut NativeCtx<'_>,
-    value: &Value,
+fn coerce_length_integer<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    context: &ExecutionContext,
+    value: Local<'scope>,
     name: &'static str,
 ) -> Result<f64, NativeError> {
-    let primitive = if abstract_ops::is_primitive(value) {
-        *value
+    let value_raw = scope.raw(value);
+    let primitive = if abstract_ops::is_primitive(&value_raw) {
+        value
     } else {
-        let (interp, exec) = ctx.interp_mut_and_context();
-        let exec = exec.ok_or_else(|| NativeError::TypeError {
-            name,
-            reason: "missing execution context for ToPrimitive".to_string(),
+        let primitive = scope.with_turn_parts(|interp, stack| {
+            interp
+                .evaluate_to_primitive(stack, context, &value_raw, ToPrimitiveHint::Number)
+                .map_err(|error| vm_to_native(interp, error, name))
         })?;
-        match interp.evaluate_to_primitive(&exec, value, ToPrimitiveHint::Number) {
-            Ok(v) => v,
-            Err(VmError::Uncaught) => {
-                let value = match interp.take_error_detail() {
-                    Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                    _ => Default::default(),
-                };
-                return Err(NativeError::Thrown {
-                    name,
-                    message: value.into(),
-                });
-            }
-            Err(other) => {
-                return Err(NativeError::TypeError {
-                    name,
-                    reason: other.to_string(),
-                });
-            }
-        }
+        scope.value(primitive)
     };
+    let primitive = scope.raw(primitive);
     if primitive.is_symbol() {
         return Err(NativeError::TypeError {
             name,
@@ -71,19 +59,20 @@ fn coerce_length_integer(
     }
     Ok(crate::number::parse::to_integer_or_infinity(
         &primitive,
-        ctx.heap(),
+        scope.context().heap(),
     ))
 }
 
 /// §7.1.22 `ToIndex(value)` with an observable `ToPrimitive`. Out-of-range
 /// (negative or `> 2^53 - 1`, including `±∞`) surfaces a `RangeError`,
 /// matching `transfer` / `transferToFixedLength`'s clamping semantics.
-fn coerce_index(
-    ctx: &mut NativeCtx<'_>,
-    value: &Value,
+fn coerce_index<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    context: &ExecutionContext,
+    value: Local<'scope>,
     name: &'static str,
 ) -> Result<usize, NativeError> {
-    let n = coerce_length_integer(ctx, value, name)?;
+    let n = coerce_length_integer(scope, context, value, name)?;
     if !(0.0..=9_007_199_254_740_991.0).contains(&n) {
         return Err(NativeError::RangeError {
             name,
@@ -151,75 +140,115 @@ fn sab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
             reason: "constructor requires 'new'".to_string(),
         });
     }
-    // §25.2.3.1 step 2 — ToIndex(length) observable coercion.
-    let length = observable_to_index_arg(ctx, args.first(), "SharedArrayBuffer")?;
-    let max_byte_length = observable_max_byte_length_option(ctx, args.get(1), "SharedArrayBuffer")?;
-    let proto = array_buffer_new_target_prototype_before_allocation(
-        ctx,
-        "SharedArrayBuffer",
-        &length,
-        &max_byte_length,
-    )?;
-    let mut coerced_args: smallvec::SmallVec<[Value; 4]> = smallvec::SmallVec::new();
-    coerced_args.push(length);
-    coerced_args.push(max_byte_length);
-    let args = coerced_args.as_slice();
-    let roots = ctx.collect_native_roots();
-    let this_value = *ctx.this_value();
-    let new_target = ctx.new_target().cloned();
-    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        crate::runtime_cx::visit_native_roots(
-            visitor,
-            &roots,
-            &this_value,
-            new_target.as_ref(),
-            &[],
-            &[args],
-        );
-    };
-    let value = dispatch::shared_array_buffer_call_with_roots(
-        SharedArrayBufferMethod::Construct,
-        args,
-        ctx.interp_mut(),
-        &mut external_visit,
-    )
-    .map_err(|e| vm_to_native(ctx.cx.interp, e, "SharedArrayBuffer"))?;
-    if let Some(proto) = proto {
-        ctx.interp_mut()
-            .set_non_gc_exotic_prototype_override(&value, Some(proto));
-    }
-    Ok(value)
+    let context = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "SharedArrayBuffer",
+            reason: "missing execution context".to_string(),
+        })?;
+    ctx.scope(|mut scope| {
+        // Root both incoming operands before the first observable coercion.
+        let length_input = scope.argument(args, 0);
+        let options_input = args.get(1).copied().map(|value| scope.value(value));
+        // §25.2.3.1 step 2 — ToIndex(length) observable coercion.
+        let length =
+            observable_to_index_arg(&mut scope, &context, length_input, "SharedArrayBuffer")?;
+        let max_byte_length = observable_max_byte_length_option(
+            &mut scope,
+            &context,
+            options_input,
+            "SharedArrayBuffer",
+        )?;
+        let proto = array_buffer_new_target_prototype_before_allocation(
+            &mut scope,
+            "SharedArrayBuffer",
+            length,
+            max_byte_length,
+        )?;
+        let coerced_args = [scope.raw(length), scope.raw(max_byte_length)];
+        let value = scope.with_turn_parts(|interp, _stack| {
+            // The RuntimeTurn and handle scope already publish the activation
+            // stack plus handle arena. The allocation callback therefore needs
+            // no materialised root snapshot.
+            let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
+            dispatch::shared_array_buffer_call_with_roots(
+                SharedArrayBufferMethod::Construct,
+                &coerced_args,
+                interp,
+                &mut external_visit,
+            )
+            .map_err(|error| vm_to_native(interp, error, "SharedArrayBuffer"))
+        })?;
+        let value = scope.value(value);
+        if let Some(proto) = proto {
+            let value_raw = scope.raw(value);
+            let proto_raw = scope.raw(proto);
+            scope.with_turn_parts(|interp, _stack| {
+                interp.set_non_gc_exotic_prototype_override(&value_raw, Some(proto_raw));
+            });
+        }
+        Ok(scope.finish(value))
+    })
 }
 
 /// §25.2.5.4 — `SharedArrayBuffer.prototype.grow(newByteLength)`.
 fn sab_grow(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     const NAME: &str = "SharedArrayBuffer.prototype.grow";
-    // §25.2.5.4 steps 2-3 — RequireInternalSlot + IsSharedArrayBuffer.
-    let buf = receiver_sab(ctx, NAME)?;
-    // Step 2 — RequireInternalSlot([[ArrayBufferMaxByteLength]]): a
-    // non-growable shared buffer lacks the slot.
-    if !buf.is_growable(ctx.heap()) {
-        return Err(NativeError::TypeError {
+    let context = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
             name: NAME,
-            reason: "receiver is not a growable SharedArrayBuffer".to_string(),
-        });
-    }
-    // Step 4 — ToIntegerOrInfinity (observable valueOf / toString).
-    let new_len_f = coerce_length_integer(ctx, args.first().unwrap_or(&Value::undefined()), NAME)?;
-    // Step 5 — RangeError when out of [0, maxByteLength].
-    if new_len_f < 0.0 || new_len_f > buf.max_byte_length(ctx.heap()) as f64 {
-        return Err(NativeError::RangeError {
-            name: NAME,
-            reason: "newLength is out of bounds [0, maxByteLength]".to_string(),
-        });
-    }
-    if !buf.grow(ctx.heap_mut(), new_len_f as usize) {
-        return Err(NativeError::RangeError {
-            name: NAME,
-            reason: "newLength is smaller than the current byteLength".to_string(),
-        });
-    }
-    Ok(Value::undefined())
+            reason: "missing execution context".to_string(),
+        })?;
+    ctx.scope(|mut scope| {
+        let receiver = scope.this();
+        let new_length = scope.argument(args, 0);
+        // §25.2.5.4 steps 2-3 — RequireInternalSlot + IsSharedArrayBuffer.
+        let buf = scope
+            .raw(receiver)
+            .as_array_buffer()
+            .filter(|buffer| buffer.is_shared())
+            .ok_or_else(|| NativeError::TypeError {
+                name: NAME,
+                reason: "this is not a SharedArrayBuffer".to_string(),
+            })?;
+        // Step 2 — RequireInternalSlot([[ArrayBufferMaxByteLength]]): a
+        // non-growable shared buffer lacks the slot.
+        if !buf.is_growable(scope.context().heap()) {
+            return Err(NativeError::TypeError {
+                name: NAME,
+                reason: "receiver is not a growable SharedArrayBuffer".to_string(),
+            });
+        }
+        // Step 4 — ToIntegerOrInfinity (observable valueOf / toString).
+        let new_len_f = coerce_length_integer(&mut scope, &context, new_length, NAME)?;
+        // Re-read the rooted receiver after the coercion callback.
+        let buf = scope
+            .raw(receiver)
+            .as_array_buffer()
+            .filter(|buffer| buffer.is_shared())
+            .ok_or_else(|| NativeError::TypeError {
+                name: NAME,
+                reason: "SharedArrayBuffer root changed kind".to_string(),
+            })?;
+        // Step 5 — RangeError when out of [0, maxByteLength].
+        if new_len_f < 0.0 || new_len_f > buf.max_byte_length(scope.context().heap()) as f64 {
+            return Err(NativeError::RangeError {
+                name: NAME,
+                reason: "newLength is out of bounds [0, maxByteLength]".to_string(),
+            });
+        }
+        if !buf.grow(scope.context().heap(), new_len_f as usize) {
+            return Err(NativeError::RangeError {
+                name: NAME,
+                reason: "newLength is smaller than the current byteLength".to_string(),
+            });
+        }
+        let undefined = scope.undefined();
+        Ok(scope.finish(undefined))
+    })
 }
 
 fn sab_growable(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -241,30 +270,22 @@ fn sab_max_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value
 /// §7.1.22 ToIndex with the OBSERVABLE ToNumber ladder — fires user
 /// `valueOf` / `@@toPrimitive` and propagates their abrupt
 /// completions before the truncation / range checks.
-fn observable_to_index_arg(
-    ctx: &mut NativeCtx<'_>,
-    arg: Option<&Value>,
+fn observable_to_index_arg<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    context: &ExecutionContext,
+    value: Local<'scope>,
     name: &'static str,
-) -> Result<Value, NativeError> {
-    let Some(v) = arg else {
-        return Ok(Value::undefined());
-    };
-    if v.is_undefined() || v.as_number().is_some() {
-        return Ok(*v);
+) -> Result<Local<'scope>, NativeError> {
+    let value_raw = scope.raw(value);
+    if value_raw.is_undefined() || value_raw.as_number().is_some() {
+        return Ok(value);
     }
-    let exec_ctx = ctx
-        .execution_context()
-        .cloned()
-        .ok_or_else(|| NativeError::TypeError {
-            name,
-            reason: "missing execution context".to_string(),
-        })?;
-    let n = ctx
-        .cx
-        .interp
-        .coerce_to_number(&exec_ctx, v)
-        .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, name))?;
-    Ok(Value::number(n))
+    let n = scope.with_turn_parts(|interp, stack| {
+        interp
+            .coerce_to_number(stack, context, &value_raw)
+            .map_err(|error| vm_to_native(interp, error, name))
+    })?;
+    Ok(scope.value(Value::number(n)))
 }
 
 /// §25.1.4.1 GetArrayBufferMaxByteLengthOption(options).
@@ -273,45 +294,44 @@ fn observable_to_index_arg(
 /// The `maxByteLength` property read must go through ordinary
 /// `[[Get]]`, so accessors and proxies can throw user values before
 /// allocation or newTarget prototype lookup.
-fn observable_max_byte_length_option(
-    ctx: &mut NativeCtx<'_>,
-    arg: Option<&Value>,
+fn observable_max_byte_length_option<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    context: &ExecutionContext,
+    options: Option<Local<'scope>>,
     name: &'static str,
-) -> Result<Value, NativeError> {
-    let Some(options) = arg.copied() else {
-        return Ok(Value::undefined());
+) -> Result<Local<'scope>, NativeError> {
+    let Some(options) = options else {
+        return Ok(scope.undefined());
     };
-    if !options.is_object_type() && !options.is_proxy() {
-        return Ok(Value::undefined());
+    let options_raw = scope.raw(options);
+    if !options_raw.is_object_type() && !options_raw.is_proxy() {
+        return Ok(scope.undefined());
     }
 
-    let value = {
-        let (interp, exec_ctx) = ctx.interp_mut_and_context();
-        let exec_ctx = exec_ctx.ok_or_else(|| NativeError::TypeError {
-            name,
-            reason: "missing execution context".to_string(),
-        })?;
-        match interp
+    let outcome = scope.with_turn_parts(|interp, stack| {
+        interp
             .ordinary_get_value(
-                &exec_ctx,
-                options,
-                options,
+                stack,
+                context,
+                options_raw,
+                options_raw,
                 &VmPropertyKey::String("maxByteLength"),
                 0,
             )
-            .map_err(|err| vm_to_native(interp, err, name))?
-        {
-            VmGetOutcome::Value(value) => value,
-            VmGetOutcome::InvokeGetter { getter } => interp
-                .run_callable_sync(&exec_ctx, &getter, options, smallvec::SmallVec::new())
-                .map_err(|err| vm_to_native(interp, err, name))?,
+            .map_err(|err| vm_to_native(interp, err, name))
+    })?;
+    let value = match outcome {
+        VmGetOutcome::Value(value) => scope.value(value),
+        VmGetOutcome::InvokeGetter { getter } => {
+            let getter = scope.value(getter);
+            scope.call(getter, options, &[])?
         }
     };
 
-    if value.is_undefined() {
-        Ok(Value::undefined())
+    if scope.is_undefined(value) {
+        Ok(value)
     } else {
-        observable_to_index_arg(ctx, Some(&value), name)
+        observable_to_index_arg(scope, context, value, name)
     }
 }
 
@@ -332,31 +352,34 @@ fn array_buffer_allocation_reaches_object_creation(
     length <= max_byte_length
 }
 
-fn array_buffer_new_target_prototype_before_allocation(
-    ctx: &mut NativeCtx<'_>,
+fn array_buffer_new_target_prototype_before_allocation<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
     intrinsic_name: &'static str,
-    length: &Value,
-    max_byte_length: &Value,
-) -> Result<Option<Value>, NativeError> {
-    if !array_buffer_allocation_reaches_object_creation(ctx.heap(), length, max_byte_length) {
+    length: Local<'scope>,
+    max_byte_length: Local<'scope>,
+) -> Result<Option<Local<'scope>>, NativeError> {
+    let length_raw = scope.raw(length);
+    let max_byte_length_raw = scope.raw(max_byte_length);
+    if !array_buffer_allocation_reaches_object_creation(
+        scope.context().heap(),
+        &length_raw,
+        &max_byte_length_raw,
+    ) {
         return Ok(None);
     }
-    let Some(new_target) = ctx.new_target().cloned() else {
+    let Some(new_target) = scope.new_target() else {
         return Ok(None);
     };
-    let is_self_target = crate::object::get(
-        ctx.cx.interp.global_this,
-        &ctx.cx.interp.gc_heap,
-        intrinsic_name,
-    )
-    .is_some_and(|intrinsic| new_target == intrinsic);
+    let is_self_target = scope
+        .global(intrinsic_name)
+        .is_some_and(|intrinsic| scope.strict_equals(new_target, intrinsic));
     if is_self_target {
         return Ok(None);
     }
-    Ok(
-        crate::bootstrap::native_new_target_prototype(ctx, intrinsic_name)?
-            .filter(|proto| proto.is_object_type()),
-    )
+    let prototype = crate::bootstrap::native_new_target_prototype(scope.context(), intrinsic_name)?;
+    Ok(prototype
+        .filter(|proto| proto.is_object_type())
+        .map(|prototype| scope.value(prototype)))
 }
 
 fn ab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -366,45 +389,48 @@ fn ab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
             reason: "constructor requires 'new'".to_string(),
         });
     }
-    // §25.1.4.1 step 2 — ToIndex(length) runs the observable
-    // ToNumber ladder before allocation.
-    let length = observable_to_index_arg(ctx, args.first(), "ArrayBuffer")?;
-    let max_byte_length = observable_max_byte_length_option(ctx, args.get(1), "ArrayBuffer")?;
-    let proto = array_buffer_new_target_prototype_before_allocation(
-        ctx,
-        "ArrayBuffer",
-        &length,
-        &max_byte_length,
-    )?;
-    let mut coerced_args: smallvec::SmallVec<[Value; 4]> = smallvec::SmallVec::new();
-    coerced_args.push(length);
-    coerced_args.push(max_byte_length);
-    let args = coerced_args.as_slice();
-    let roots = ctx.collect_native_roots();
-    let this_value = *ctx.this_value();
-    let new_target = ctx.new_target().cloned();
-    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        crate::runtime_cx::visit_native_roots(
-            visitor,
-            &roots,
-            &this_value,
-            new_target.as_ref(),
-            &[],
-            &[args],
-        );
-    };
-    let value = dispatch::array_buffer_call_with_roots(
-        ArrayBufferMethod::Construct,
-        args,
-        ctx.interp_mut(),
-        &mut external_visit,
-    )
-    .map_err(|e| vm_to_native(ctx.cx.interp, e, "ArrayBuffer"))?;
-    if let Some(proto) = proto {
-        ctx.interp_mut()
-            .set_non_gc_exotic_prototype_override(&value, Some(proto));
-    }
-    Ok(value)
+    let context = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "ArrayBuffer",
+            reason: "missing execution context".to_string(),
+        })?;
+    ctx.scope(|mut scope| {
+        let length_input = scope.argument(args, 0);
+        let options_input = args.get(1).copied().map(|value| scope.value(value));
+        // §25.1.4.1 step 2 — ToIndex(length) runs the observable
+        // ToNumber ladder before allocation.
+        let length = observable_to_index_arg(&mut scope, &context, length_input, "ArrayBuffer")?;
+        let max_byte_length =
+            observable_max_byte_length_option(&mut scope, &context, options_input, "ArrayBuffer")?;
+        let proto = array_buffer_new_target_prototype_before_allocation(
+            &mut scope,
+            "ArrayBuffer",
+            length,
+            max_byte_length,
+        )?;
+        let coerced_args = [scope.raw(length), scope.raw(max_byte_length)];
+        let value = scope.with_turn_parts(|interp, _stack| {
+            let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
+            dispatch::array_buffer_call_with_roots(
+                ArrayBufferMethod::Construct,
+                &coerced_args,
+                interp,
+                &mut external_visit,
+            )
+            .map_err(|error| vm_to_native(interp, error, "ArrayBuffer"))
+        })?;
+        let value = scope.value(value);
+        if let Some(proto) = proto {
+            let value_raw = scope.raw(value);
+            let proto_raw = scope.raw(proto);
+            scope.with_turn_parts(|interp, _stack| {
+                interp.set_non_gc_exotic_prototype_override(&value_raw, Some(proto_raw));
+            });
+        }
+        Ok(scope.finish(value))
+    })
 }
 
 fn ab_is_view(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -420,107 +446,132 @@ fn ab_is_view(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 /// `[0, byteLength]`, returns a fresh fixed-length buffer.
 fn ab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     const NAME: &str = "ArrayBuffer.prototype.slice";
-    let this_value = *ctx.this_value();
-    let buf = receiver_ab(ctx, NAME)?;
-    if buf.is_detached(ctx.heap()) {
-        return Err(NativeError::TypeError {
-            name: NAME,
-            reason: "buffer is detached".to_string(),
-        });
-    }
-    let exec_ctx = ctx
+    let context = ctx
         .execution_context()
         .cloned()
         .ok_or_else(|| NativeError::TypeError {
             name: NAME,
             reason: "missing execution context".to_string(),
         })?;
-    // §25.1.6.16 steps 6-13 — ToIntegerOrInfinity coercion fires
-    // user valueOf for both operands.
-    let len = buf.byte_length(ctx.heap()) as i64;
-    let start_f = ctx
-        .cx
-        .interp
-        .integer_or_infinity_for_arg(&exec_ctx, args.first())
-        .map_err(|e| vm_to_native(ctx.cx.interp, e, NAME))?;
-    let first = relative_clamp_f(start_f, len);
-    let end_f = match args.get(1) {
-        None => len as f64,
-        Some(v) if v.is_undefined() => len as f64,
-        Some(_) => ctx
-            .cx
-            .interp
-            .integer_or_infinity_for_arg(&exec_ctx, args.get(1))
-            .map_err(|e| vm_to_native(ctx.cx.interp, e, NAME))?,
-    };
-    let final_end = relative_clamp_f(end_f, len);
-    let new_len = (final_end - first).max(0) as usize;
-    // §25.1.6.16 step 14 — SpeciesConstructor(O, %ArrayBuffer%).
-    let default_ctor = crate::object::get(ctx.cx.interp.global_this, ctx.heap(), "ArrayBuffer")
-        .ok_or_else(|| NativeError::TypeError {
-            name: NAME,
-            reason: "%ArrayBuffer% intrinsic is missing".to_string(),
+    ctx.scope(|mut scope| {
+        let source = scope.this();
+        let start_arg = scope.argument(args, 0);
+        let end_arg = args.get(1).copied().map(|value| scope.value(value));
+        let source_raw = scope.raw(source);
+        let buf = source_raw
+            .as_array_buffer()
+            .filter(|buffer| !buffer.is_shared())
+            .ok_or_else(|| NativeError::TypeError {
+                name: NAME,
+                reason: "this is not an ArrayBuffer".to_string(),
+            })?;
+        if buf.is_detached(scope.context().heap()) {
+            return Err(NativeError::TypeError {
+                name: NAME,
+                reason: "buffer is detached".to_string(),
+            });
+        }
+        // §25.1.6.16 steps 6-13 — ToIntegerOrInfinity coercion fires
+        // user valueOf for both operands. Both arguments remain rooted while
+        // the first coercion re-enters JavaScript.
+        let len = buf.byte_length(scope.context().heap()) as i64;
+        let start_raw = scope.raw(start_arg);
+        let start_f = scope.with_turn_parts(|interp, stack| {
+            interp
+                .integer_or_infinity_for_arg(stack, &context, Some(&start_raw))
+                .map_err(|error| vm_to_native(interp, error, NAME))
         })?;
-    let ctor = ctx
-        .cx
-        .interp
-        .species_constructor_value(&exec_ctx, &this_value, &default_ctor)
-        .map_err(|e| vm_to_native(ctx.cx.interp, e, NAME))?;
-    let mut argv: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-    argv.push(Value::number(crate::number::NumberValue::from_f64(
-        new_len as f64,
-    )));
-    let new_value = ctx
-        .cx
-        .interp
-        .run_construct_sync(&exec_ctx, &ctor, ctor, argv)
-        .map_err(|e| vm_to_native(ctx.cx.interp, e, NAME))?;
-    // Steps 16-21 — result-shape checks.
-    let Some(new_buf) = new_value.as_array_buffer() else {
-        return Err(NativeError::TypeError {
-            name: NAME,
-            reason: "species constructor did not return an ArrayBuffer".to_string(),
-        });
-    };
-    if new_buf.is_shared() {
-        return Err(NativeError::TypeError {
-            name: NAME,
-            reason: "species constructor returned a SharedArrayBuffer".to_string(),
-        });
-    }
-    if new_buf.is_detached(ctx.heap()) {
-        return Err(NativeError::TypeError {
-            name: NAME,
-            reason: "species constructor returned a detached ArrayBuffer".to_string(),
-        });
-    }
-    if new_buf.ptr_eq(buf) {
-        return Err(NativeError::TypeError {
-            name: NAME,
-            reason: "species constructor returned the source ArrayBuffer".to_string(),
-        });
-    }
-    if new_buf.byte_length(ctx.heap()) < new_len {
-        return Err(NativeError::TypeError {
-            name: NAME,
-            reason: "species constructor returned a too-small ArrayBuffer".to_string(),
-        });
-    }
-    // Step 22 — the constructor may have detached the source.
-    if buf.is_detached(ctx.heap()) {
-        return Err(NativeError::TypeError {
-            name: NAME,
-            reason: "buffer was detached by the species constructor".to_string(),
-        });
-    }
-    if new_len > 0 {
-        let first = first as usize;
-        let copy: Vec<u8> = buf.with_bytes(ctx.heap(), |b| b[first..first + new_len].to_vec());
-        new_buf.with_bytes_mut(ctx.heap_mut(), |dst| {
-            dst[..copy.len()].copy_from_slice(&copy)
-        });
-    }
-    Ok(new_value)
+        let first = relative_clamp_f(start_f, len);
+        let end_f = match end_arg {
+            None => len as f64,
+            Some(end) if scope.is_undefined(end) => len as f64,
+            Some(end) => {
+                let end_raw = scope.raw(end);
+                scope.with_turn_parts(|interp, stack| {
+                    interp
+                        .integer_or_infinity_for_arg(stack, &context, Some(&end_raw))
+                        .map_err(|error| vm_to_native(interp, error, NAME))
+                })?
+            }
+        };
+        let final_end = relative_clamp_f(end_f, len);
+        let new_len = (final_end - first).max(0) as usize;
+        // §25.1.6.16 step 14 — SpeciesConstructor(O, %ArrayBuffer%).
+        let default_ctor = scope
+            .global("ArrayBuffer")
+            .ok_or_else(|| NativeError::TypeError {
+                name: NAME,
+                reason: "%ArrayBuffer% intrinsic is missing".to_string(),
+            })?;
+        let source_raw = scope.raw(source);
+        let default_ctor_raw = scope.raw(default_ctor);
+        let ctor = scope.with_turn_parts(|interp, stack| {
+            interp
+                .species_constructor_value(stack, &context, &source_raw, &default_ctor_raw)
+                .map_err(|error| vm_to_native(interp, error, NAME))
+        })?;
+        let ctor = scope.value(ctor);
+        let length_arg = scope.number(new_len as f64);
+        let new_value = scope.construct(ctor, &[length_arg])?;
+        // Steps 16-21 — result-shape checks. Re-read both rooted buffers after
+        // the species constructor, which may have allocated or detached source.
+        let new_value_raw = scope.raw(new_value);
+        let Some(new_buf) = new_value_raw.as_array_buffer() else {
+            return Err(NativeError::TypeError {
+                name: NAME,
+                reason: "species constructor did not return an ArrayBuffer".to_string(),
+            });
+        };
+        if new_buf.is_shared() {
+            return Err(NativeError::TypeError {
+                name: NAME,
+                reason: "species constructor returned a SharedArrayBuffer".to_string(),
+            });
+        }
+        if new_buf.is_detached(scope.context().heap()) {
+            return Err(NativeError::TypeError {
+                name: NAME,
+                reason: "species constructor returned a detached ArrayBuffer".to_string(),
+            });
+        }
+        let source_raw = scope.raw(source);
+        let buf = source_raw
+            .as_array_buffer()
+            .filter(|buffer| !buffer.is_shared())
+            .ok_or_else(|| NativeError::TypeError {
+                name: NAME,
+                reason: "source ArrayBuffer root changed kind".to_string(),
+            })?;
+        if new_buf.ptr_eq(buf) {
+            return Err(NativeError::TypeError {
+                name: NAME,
+                reason: "species constructor returned the source ArrayBuffer".to_string(),
+            });
+        }
+        if new_buf.byte_length(scope.context().heap()) < new_len {
+            return Err(NativeError::TypeError {
+                name: NAME,
+                reason: "species constructor returned a too-small ArrayBuffer".to_string(),
+            });
+        }
+        // Step 22 — the constructor may have detached the source.
+        if buf.is_detached(scope.context().heap()) {
+            return Err(NativeError::TypeError {
+                name: NAME,
+                reason: "buffer was detached by the species constructor".to_string(),
+            });
+        }
+        if new_len > 0 {
+            let first = first as usize;
+            let copy: Vec<u8> = buf.with_bytes(scope.context().heap(), |bytes| {
+                bytes[first..first + new_len].to_vec()
+            });
+            new_buf.with_bytes_mut(scope.context().heap_mut(), |dst| {
+                dst[..copy.len()].copy_from_slice(&copy)
+            });
+        }
+        Ok(scope.finish(new_value))
+    })
 }
 
 /// Resolve a ToIntegerOrInfinity result against `len` with relative
@@ -543,85 +594,107 @@ fn relative_clamp_f(n: f64, len: i64) -> i64 {
 /// receiver, plain copy (species kept default).
 fn sab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     const NAME: &str = "SharedArrayBuffer.prototype.slice";
-    let this_value = *ctx.this_value();
-    let buf = receiver_sab(ctx, NAME)?;
-    let exec_ctx = ctx
+    let context = ctx
         .execution_context()
         .cloned()
         .ok_or_else(|| NativeError::TypeError {
             name: NAME,
             reason: "missing execution context".to_string(),
         })?;
-    // §25.2.5.6 steps 4-9 — ToIntegerOrInfinity coercion fires user
-    // valueOf for both operands, in source order.
-    let len = buf.byte_length(ctx.heap()) as i64;
-    let start_f = ctx
-        .cx
-        .interp
-        .integer_or_infinity_for_arg(&exec_ctx, args.first())
-        .map_err(|e| vm_to_native(ctx.cx.interp, e, NAME))?;
-    let first = relative_clamp_f(start_f, len);
-    let end_f = match args.get(1) {
-        None => len as f64,
-        Some(v) if v.is_undefined() => len as f64,
-        Some(_) => ctx
-            .cx
-            .interp
-            .integer_or_infinity_for_arg(&exec_ctx, args.get(1))
-            .map_err(|e| vm_to_native(ctx.cx.interp, e, NAME))?,
-    };
-    let final_end = relative_clamp_f(end_f, len);
-    let new_len = (final_end - first).max(0) as usize;
-    // Step 11 — SpeciesConstructor(O, %SharedArrayBuffer%).
-    let default_ctor =
-        crate::object::get(ctx.cx.interp.global_this, ctx.heap(), "SharedArrayBuffer").ok_or(
-            NativeError::TypeError {
+    ctx.scope(|mut scope| {
+        let source = scope.this();
+        let start_arg = scope.argument(args, 0);
+        let end_arg = args.get(1).copied().map(|value| scope.value(value));
+        let source_raw = scope.raw(source);
+        let buf = source_raw
+            .as_array_buffer()
+            .filter(|buffer| buffer.is_shared())
+            .ok_or_else(|| NativeError::TypeError {
                 name: NAME,
-                reason: "%SharedArrayBuffer% intrinsic is missing".to_string(),
-            },
-        )?;
-    let ctor = ctx
-        .cx
-        .interp
-        .species_constructor_value(&exec_ctx, &this_value, &default_ctor)
-        .map_err(|e| vm_to_native(ctx.cx.interp, e, NAME))?;
-    let mut argv: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-    argv.push(Value::number(crate::number::NumberValue::from_f64(
-        new_len as f64,
-    )));
-    let new_value = ctx
-        .cx
-        .interp
-        .run_construct_sync(&exec_ctx, &ctor, ctor, argv)
-        .map_err(|e| vm_to_native(ctx.cx.interp, e, NAME))?;
-    // Steps 13-16 — result must be a SharedArrayBuffer, distinct from
-    // the source, and at least `new_len` bytes long.
-    let Some(new_buf) = new_value.as_array_buffer().filter(|b| b.is_shared()) else {
-        return Err(NativeError::TypeError {
-            name: NAME,
-            reason: "species constructor did not return a SharedArrayBuffer".to_string(),
-        });
-    };
-    if new_buf.ptr_eq(buf) {
-        return Err(NativeError::TypeError {
-            name: NAME,
-            reason: "species constructor returned the source SharedArrayBuffer".to_string(),
-        });
-    }
-    if new_buf.byte_length(ctx.heap()) < new_len {
-        return Err(NativeError::TypeError {
-            name: NAME,
-            reason: "species constructor returned a too-small SharedArrayBuffer".to_string(),
-        });
-    }
-    if new_len > 0 {
-        let first = first as usize;
-        let copy: Vec<u8> = buf.with_bytes(ctx.heap(), |b| b[first..first + new_len].to_vec());
-        new_buf.with_bytes_mut(ctx.heap_mut(), |dst| {
-            dst[..copy.len()].copy_from_slice(&copy)
-        });
-    }
-    Ok(new_value)
+                reason: "this is not a SharedArrayBuffer".to_string(),
+            })?;
+        // §25.2.5.6 steps 4-9 — ToIntegerOrInfinity coercion fires user
+        // valueOf for both operands, in source order.
+        let len = buf.byte_length(scope.context().heap()) as i64;
+        let start_raw = scope.raw(start_arg);
+        let start_f = scope.with_turn_parts(|interp, stack| {
+            interp
+                .integer_or_infinity_for_arg(stack, &context, Some(&start_raw))
+                .map_err(|error| vm_to_native(interp, error, NAME))
+        })?;
+        let first = relative_clamp_f(start_f, len);
+        let end_f = match end_arg {
+            None => len as f64,
+            Some(end) if scope.is_undefined(end) => len as f64,
+            Some(end) => {
+                let end_raw = scope.raw(end);
+                scope.with_turn_parts(|interp, stack| {
+                    interp
+                        .integer_or_infinity_for_arg(stack, &context, Some(&end_raw))
+                        .map_err(|error| vm_to_native(interp, error, NAME))
+                })?
+            }
+        };
+        let final_end = relative_clamp_f(end_f, len);
+        let new_len = (final_end - first).max(0) as usize;
+        // Step 11 — SpeciesConstructor(O, %SharedArrayBuffer%).
+        let default_ctor =
+            scope
+                .global("SharedArrayBuffer")
+                .ok_or_else(|| NativeError::TypeError {
+                    name: NAME,
+                    reason: "%SharedArrayBuffer% intrinsic is missing".to_string(),
+                })?;
+        let source_raw = scope.raw(source);
+        let default_ctor_raw = scope.raw(default_ctor);
+        let ctor = scope.with_turn_parts(|interp, stack| {
+            interp
+                .species_constructor_value(stack, &context, &source_raw, &default_ctor_raw)
+                .map_err(|error| vm_to_native(interp, error, NAME))
+        })?;
+        let ctor = scope.value(ctor);
+        let length_arg = scope.number(new_len as f64);
+        let new_value = scope.construct(ctor, &[length_arg])?;
+        // Steps 13-16 — result must be a SharedArrayBuffer, distinct from
+        // the source, and at least `new_len` bytes long.
+        let new_value_raw = scope.raw(new_value);
+        let Some(new_buf) = new_value_raw.as_array_buffer().filter(|b| b.is_shared()) else {
+            return Err(NativeError::TypeError {
+                name: NAME,
+                reason: "species constructor did not return a SharedArrayBuffer".to_string(),
+            });
+        };
+        let source_raw = scope.raw(source);
+        let buf = source_raw
+            .as_array_buffer()
+            .filter(|buffer| buffer.is_shared())
+            .ok_or_else(|| NativeError::TypeError {
+                name: NAME,
+                reason: "source SharedArrayBuffer root changed kind".to_string(),
+            })?;
+        if new_buf.ptr_eq(buf) {
+            return Err(NativeError::TypeError {
+                name: NAME,
+                reason: "species constructor returned the source SharedArrayBuffer".to_string(),
+            });
+        }
+        if new_buf.byte_length(scope.context().heap()) < new_len {
+            return Err(NativeError::TypeError {
+                name: NAME,
+                reason: "species constructor returned a too-small SharedArrayBuffer".to_string(),
+            });
+        }
+        if new_len > 0 {
+            let first = first as usize;
+            let copy: Vec<u8> = buf.with_bytes(scope.context().heap(), |bytes| {
+                bytes[first..first + new_len].to_vec()
+            });
+            new_buf.with_bytes_mut(scope.context().heap_mut(), |dst| {
+                dst[..copy.len()].copy_from_slice(&copy)
+            });
+        }
+        Ok(scope.finish(new_value))
+    })
 }
 
 /// §25.2.4.2 — shared-brand byteLength getter.
@@ -634,39 +707,66 @@ fn sab_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
 /// non-detached buffers.
 fn ab_resize(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     const NAME: &str = "ArrayBuffer.prototype.resize";
-    let buf = receiver_ab(ctx, NAME)?;
-    // §25.1.5.6 step 2 — RequireInternalSlot([[ArrayBufferMaxByteLength]]):
-    // fixed-length buffers lack the slot. Shared buffers use `grow`.
-    if !buf.is_resizable(ctx.heap()) || buf.is_shared() {
-        return Err(NativeError::TypeError {
+    let context = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
             name: NAME,
-            reason: "receiver is not a resizable ArrayBuffer".to_string(),
-        });
-    }
-    // Step 4 — ToIntegerOrInfinity runs *before* the detach check, so a
-    // poisoned `valueOf` that detaches the buffer still throws here.
-    let new_len_f = coerce_length_integer(ctx, args.first().unwrap_or(&Value::undefined()), NAME)?;
-    // Step 5 — bounds check is a RangeError (±∞ and overflow included).
-    if new_len_f < 0.0 || new_len_f > buf.max_byte_length(ctx.heap()) as f64 {
-        return Err(NativeError::RangeError {
-            name: NAME,
-            reason: "newLength is out of bounds [0, maxByteLength]".to_string(),
-        });
-    }
-    // Step 6 — detach check after coercion.
-    if buf.is_detached(ctx.heap()) {
-        return Err(NativeError::TypeError {
-            name: NAME,
-            reason: "buffer is detached".to_string(),
-        });
-    }
-    if !buf.resize(ctx.heap_mut(), new_len_f as usize) {
-        return Err(NativeError::RangeError {
-            name: NAME,
-            reason: "newLength exceeds maxByteLength".to_string(),
-        });
-    }
-    Ok(Value::undefined())
+            reason: "missing execution context".to_string(),
+        })?;
+    ctx.scope(|mut scope| {
+        let receiver = scope.this();
+        let new_length = scope.argument(args, 0);
+        let buf = scope
+            .raw(receiver)
+            .as_array_buffer()
+            .filter(|buffer| !buffer.is_shared())
+            .ok_or_else(|| NativeError::TypeError {
+                name: NAME,
+                reason: "this is not an ArrayBuffer".to_string(),
+            })?;
+        // §25.1.5.6 step 2 — RequireInternalSlot([[ArrayBufferMaxByteLength]]):
+        // fixed-length buffers lack the slot. Shared buffers use `grow`.
+        if !buf.is_resizable(scope.context().heap()) {
+            return Err(NativeError::TypeError {
+                name: NAME,
+                reason: "receiver is not a resizable ArrayBuffer".to_string(),
+            });
+        }
+        // Step 4 — ToIntegerOrInfinity runs *before* the detach check, so a
+        // poisoned `valueOf` that detaches the buffer still throws here.
+        let new_len_f = coerce_length_integer(&mut scope, &context, new_length, NAME)?;
+        let buf = scope
+            .raw(receiver)
+            .as_array_buffer()
+            .filter(|buffer| !buffer.is_shared())
+            .ok_or_else(|| NativeError::TypeError {
+                name: NAME,
+                reason: "ArrayBuffer root changed kind".to_string(),
+            })?;
+        // Step 5 — bounds check is a RangeError (±∞ and overflow included).
+        if new_len_f < 0.0 || new_len_f > buf.max_byte_length(scope.context().heap()) as f64 {
+            return Err(NativeError::RangeError {
+                name: NAME,
+                reason: "newLength is out of bounds [0, maxByteLength]".to_string(),
+            });
+        }
+        // Step 6 — detach check after coercion.
+        if buf.is_detached(scope.context().heap()) {
+            return Err(NativeError::TypeError {
+                name: NAME,
+                reason: "buffer is detached".to_string(),
+            });
+        }
+        if !buf.resize(scope.context().heap_mut(), new_len_f as usize) {
+            return Err(NativeError::RangeError {
+                name: NAME,
+                reason: "newLength exceeds maxByteLength".to_string(),
+            });
+        }
+        let undefined = scope.undefined();
+        Ok(scope.finish(undefined))
+    })
 }
 
 /// §25.1.5.8 `transfer(newLength?)` — copy + detach; the new buffer is
@@ -695,49 +795,84 @@ fn ab_transfer_inner(
     fixed: bool,
     name: &'static str,
 ) -> Result<Value, NativeError> {
-    let buf = receiver_ab(ctx, name)?;
-    // §25.1.5.8 step 4 — ToIndex(newLength) runs before the detach
-    // check, so a poisoned `valueOf` is observable even on a detached
-    // buffer.
-    let new_len = match args.first() {
-        None => buf.byte_length(ctx.heap()),
-        Some(v) if v.is_undefined() => buf.byte_length(ctx.heap()),
-        Some(v) => coerce_index(ctx, v, name)?,
-    };
-    if buf.is_detached(ctx.heap()) {
-        return Err(NativeError::TypeError {
-            name,
-            reason: "buffer is detached".to_string(),
-        });
-    }
-    let cur_len = buf.byte_length(ctx.heap());
-    let mut new_bytes = vec![0u8; new_len];
-    let copy_len = new_len.min(cur_len);
-    buf.with_bytes(ctx.heap(), |src| {
-        new_bytes[..copy_len].copy_from_slice(&src[..copy_len]);
-    });
-    let resizable = buf.is_resizable(ctx.heap());
-    let max = if resizable {
-        buf.max_byte_length(ctx.heap()).max(new_len)
-    } else {
-        0
-    };
-    let new_buffer = if fixed {
-        ctx.array_buffer_from_bytes_rooted(new_bytes, &[], &[args])?
-    } else if resizable {
-        let result = ctx
-            .array_buffer_resizable_rooted(new_len, max, &[], &[args])?
+    let context = ctx.execution_context().cloned();
+    ctx.scope(|mut scope| {
+        let receiver = scope.this();
+        let new_length = args.first().copied().map(|value| scope.value(value));
+        let buf = scope
+            .raw(receiver)
+            .as_array_buffer()
+            .filter(|buffer| !buffer.is_shared())
             .ok_or_else(|| NativeError::TypeError {
                 name,
-                reason: "allocation failed".to_string(),
+                reason: "this is not an ArrayBuffer".to_string(),
             })?;
-        result.with_bytes_mut(ctx.heap_mut(), |dst| dst.copy_from_slice(&new_bytes));
-        result
-    } else {
-        ctx.array_buffer_from_bytes_rooted(new_bytes, &[], &[args])?
-    };
-    buf.detach(ctx.heap_mut());
-    Ok(Value::array_buffer(new_buffer))
+        // §25.1.5.8 step 4 — ToIndex(newLength) runs before the detach
+        // check, so a poisoned `valueOf` is observable even on a detached
+        // buffer.
+        let new_len = match new_length {
+            None => buf.byte_length(scope.context().heap()),
+            Some(value) if scope.is_undefined(value) => buf.byte_length(scope.context().heap()),
+            Some(value) => {
+                let context = context.as_ref().ok_or_else(|| NativeError::TypeError {
+                    name,
+                    reason: "missing execution context".to_string(),
+                })?;
+                coerce_index(&mut scope, context, value, name)?
+            }
+        };
+        let buf = scope
+            .raw(receiver)
+            .as_array_buffer()
+            .filter(|buffer| !buffer.is_shared())
+            .ok_or_else(|| NativeError::TypeError {
+                name,
+                reason: "ArrayBuffer root changed kind".to_string(),
+            })?;
+        if buf.is_detached(scope.context().heap()) {
+            return Err(NativeError::TypeError {
+                name,
+                reason: "buffer is detached".to_string(),
+            });
+        }
+        let cur_len = buf.byte_length(scope.context().heap());
+        let mut new_bytes = vec![0u8; new_len];
+        let copy_len = new_len.min(cur_len);
+        buf.with_bytes(scope.context().heap(), |src| {
+            new_bytes[..copy_len].copy_from_slice(&src[..copy_len]);
+        });
+        let resizable = buf.is_resizable(scope.context().heap());
+        let max = if resizable {
+            buf.max_byte_length(scope.context().heap()).max(new_len)
+        } else {
+            0
+        };
+        let new_buffer = if fixed || !resizable {
+            scope.array_buffer_from_bytes(new_bytes)?
+        } else {
+            let result = scope
+                .context()
+                .array_buffer_resizable_rooted(new_len, max, &[], &[])?
+                .ok_or_else(|| NativeError::TypeError {
+                    name,
+                    reason: "allocation failed".to_string(),
+                })?;
+            result.with_bytes_mut(scope.context().heap_mut(), |dst| {
+                dst.copy_from_slice(&new_bytes)
+            });
+            scope.value(Value::array_buffer(result))
+        };
+        let buf = scope
+            .raw(receiver)
+            .as_array_buffer()
+            .filter(|buffer| !buffer.is_shared())
+            .ok_or_else(|| NativeError::TypeError {
+                name,
+                reason: "ArrayBuffer root changed kind during allocation".to_string(),
+            })?;
+        buf.detach(scope.context().heap_mut());
+        Ok(scope.finish(new_buffer))
+    })
 }
 
 // ---------------------------------------------------------------

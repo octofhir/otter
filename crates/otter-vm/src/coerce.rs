@@ -42,47 +42,51 @@ use crate::abstract_ops::{self, ToPrimitiveHint};
 use crate::bigint::BigIntValue;
 use crate::number::NumberValue;
 use crate::string::JsString;
-use crate::{ExecutionContext, Interpreter, Value, VmError};
+use crate::{ActivationStack, ExecutionContext, Interpreter, Value, VmError};
 
 impl Interpreter {
     /// §7.1.17 ToString shortcut — see [`to_string_or_throw`].
     pub(crate) fn coerce_to_string(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         input: &Value,
     ) -> Result<String, VmError> {
-        to_string_or_throw(self, context, input)
+        to_string_or_throw(self, stack, context, input)
     }
 
     /// §7.1.4 ToNumber shortcut — see [`to_number_or_throw`].
     #[allow(dead_code)]
     pub(crate) fn coerce_to_number(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         input: &Value,
     ) -> Result<NumberValue, VmError> {
-        to_number_or_throw(self, context, input)
+        to_number_or_throw(self, stack, context, input)
     }
 
     /// §21.1.1.1 `Number(value)` coercion (BigInt → f64, Symbol →
     /// TypeError, Object → ToPrimitive(number) ladder).
     pub(crate) fn number_for_number_ctor(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         input: &Value,
     ) -> Result<NumberValue, VmError> {
-        to_number_for_number_ctor(self, context, input)
+        to_number_for_number_ctor(self, stack, context, input)
     }
 
     /// §7.1.1 ToPrimitive shortcut — see [`to_primitive_or_throw`].
     #[allow(dead_code)]
     pub(crate) fn coerce_to_primitive(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         input: &Value,
         hint: ToPrimitiveHint,
     ) -> Result<Value, VmError> {
-        to_primitive_or_throw(self, context, input, hint)
+        to_primitive_or_throw(self, stack, context, input, hint)
     }
 }
 
@@ -91,6 +95,7 @@ impl Interpreter {
 /// `@@toPrimitive` / `OrdinaryToPrimitive` ladder.
 pub(crate) fn to_primitive_or_throw(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     input: &Value,
     hint: ToPrimitiveHint,
@@ -98,7 +103,7 @@ pub(crate) fn to_primitive_or_throw(
     if abstract_ops::is_primitive(input) {
         return Ok(*input);
     }
-    interp.evaluate_to_primitive(context, input, hint)
+    interp.evaluate_to_primitive(stack, context, input, hint)
 }
 
 /// §7.1.17 `ToString(argument)`. Symbol operands surface as
@@ -111,13 +116,14 @@ pub(crate) fn to_primitive_or_throw(
 /// `StringHeap` in scope.
 pub(crate) fn to_string_or_throw(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     input: &Value,
 ) -> Result<String, VmError> {
     let primitive = if abstract_ops::is_primitive(input) {
         *input
     } else {
-        interp.evaluate_to_primitive(context, input, ToPrimitiveHint::String)?
+        interp.evaluate_to_primitive(stack, context, input, ToPrimitiveHint::String)?
     };
     primitive_to_string_lossy(interp, &primitive)
 }
@@ -162,13 +168,14 @@ pub(crate) fn primitive_to_string_lossy(
 /// a TypeError instead of guessing.
 pub(crate) fn to_js_string_units(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: Option<&ExecutionContext>,
     input: &Value,
 ) -> Result<Vec<u16>, VmError> {
     let primitive = if abstract_ops::is_primitive(input) {
         *input
     } else if let Some(context) = context {
-        interp.evaluate_to_primitive(context, input, ToPrimitiveHint::String)?
+        interp.evaluate_to_primitive(stack, context, input, ToPrimitiveHint::String)?
     } else {
         return Err(interp.err_type(
             ("cannot coerce an object to a string without an execution context".to_string()).into(),
@@ -192,13 +199,14 @@ pub(crate) fn to_js_string_units(
 /// surrogates.
 pub(crate) fn to_js_string_or_throw(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     input: &Value,
 ) -> Result<JsString, VmError> {
     let primitive = if abstract_ops::is_primitive(input) {
         *input
     } else {
-        interp.evaluate_to_primitive(context, input, ToPrimitiveHint::String)?
+        interp.evaluate_to_primitive(stack, context, input, ToPrimitiveHint::String)?
     };
     if primitive.is_symbol() {
         return Err(
@@ -229,13 +237,14 @@ pub(crate) fn to_js_string_or_throw(
 /// `ToPrimitive(argument, "number")` first.
 pub(crate) fn to_number_or_throw(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     input: &Value,
 ) -> Result<NumberValue, VmError> {
     let primitive = if abstract_ops::is_primitive(input) {
         *input
     } else {
-        interp.evaluate_to_primitive(context, input, ToPrimitiveHint::Number)?
+        interp.evaluate_to_primitive(stack, context, input, ToPrimitiveHint::Number)?
     };
     primitive_to_number(interp, &primitive)
 }
@@ -268,6 +277,7 @@ pub(crate) fn primitive_to_number(
 /// throwing). Symbol arguments still raise TypeError.
 pub(crate) fn to_number_for_number_ctor(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     input: &Value,
 ) -> Result<NumberValue, VmError> {
@@ -286,7 +296,7 @@ pub(crate) fn to_number_for_number_ctor(
     let primitive = if abstract_ops::is_primitive(input) {
         *input
     } else {
-        interp.evaluate_to_primitive(context, input, ToPrimitiveHint::Number)?
+        interp.evaluate_to_primitive(stack, context, input, ToPrimitiveHint::Number)?
     };
     if primitive.is_symbol() {
         return Err(
@@ -320,10 +330,11 @@ pub(crate) fn to_number_for_number_ctor(
 /// and abrupt completions propagated.
 pub(crate) fn to_length_or_throw(
     interp: &mut crate::Interpreter,
+    stack: &mut ActivationStack,
     context: &crate::ExecutionContext,
     value: &crate::Value,
 ) -> Result<usize, crate::VmError> {
-    let number = to_number_or_throw(interp, context, value)?;
+    let number = to_number_or_throw(interp, stack, context, value)?;
     let n = number.as_f64();
     if n.is_nan() || n <= 0.0 {
         return Ok(0);
@@ -333,13 +344,14 @@ pub(crate) fn to_length_or_throw(
 
 pub(crate) fn to_big_int_or_throw(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     input: &Value,
 ) -> Result<BigIntValue, VmError> {
     let primitive = if abstract_ops::is_primitive(input) {
         *input
     } else {
-        interp.evaluate_to_primitive(context, input, ToPrimitiveHint::Number)?
+        interp.evaluate_to_primitive(stack, context, input, ToPrimitiveHint::Number)?
     };
     if let Some(b) = primitive.as_big_int() {
         return Ok(b);

@@ -7,12 +7,14 @@
 //!
 //! # Contents
 //! - `CallMethodValue` executable operand decoding.
-//! - Callback-driven Array prototype methods.
+//! - Callback-driven Array and TypedArray prototype methods.
 //!
 //! # Invariants
 //! - Stack-modifying callback paths run before the dense in-frame match.
 //! - Caller PC is advanced before synchronous callback dispatch where nested
 //!   execution can re-enter the VM.
+//! - Callback receivers, elements, accumulators, and results stay in traced
+//!   anchors across moving GC; nested calls share the current activation stack.
 //! - Ordinary method lookup still funnels into `Interpreter::invoke`.
 //!
 //! # See also
@@ -253,14 +255,18 @@ impl Interpreter {
         } else {
             let receiver = Value::object(self.global_this);
             let key = VmPropertyKey::String("Math");
-            if !self.ordinary_has_property_value(context, receiver, &key, 0)? {
+            if !self.ordinary_has_property_value(stack, context, receiver, &key, 0)? {
                 return Err(self.err_undefined_ident(("Math".to_string()).into()));
             }
-            match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
+            match self.ordinary_get_value(stack, context, receiver, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => value,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
-                }
+                VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+                    stack,
+                    context,
+                    &getter,
+                    receiver,
+                    SmallVec::new(),
+                )?,
             }
         };
         if math_value.is_nullish() {
@@ -290,6 +296,7 @@ impl Interpreter {
     /// the stable published window only after any getter re-entry completes.
     pub(crate) fn do_math_call_active(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         frame: &mut ActiveFrameMut<'_>,
         dst: u16,
@@ -325,14 +332,18 @@ impl Interpreter {
             } else {
                 let receiver = Value::object(interp.global_this);
                 let key = VmPropertyKey::String("Math");
-                if !interp.ordinary_has_property_value(context, receiver, &key, 0)? {
+                if !interp.ordinary_has_property_value(stack, context, receiver, &key, 0)? {
                     return Err(interp.err_undefined_ident(("Math".to_string()).into()));
                 }
-                match interp.ordinary_get_value(context, receiver, receiver, &key, 0)? {
+                match interp.ordinary_get_value(stack, context, receiver, receiver, &key, 0)? {
                     VmGetOutcome::Value(value) => value,
-                    VmGetOutcome::InvokeGetter { getter } => {
-                        interp.run_callable_sync(context, &getter, receiver, SmallVec::new())?
-                    }
+                    VmGetOutcome::InvokeGetter { getter } => interp.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &getter,
+                        receiver,
+                        SmallVec::new(),
+                    )?,
                 }
             };
             let math_value = interp.scoped_value(scope, math_value);
@@ -346,12 +357,17 @@ impl Interpreter {
                 return Err(interp.err_type((format!("Cannot read properties of {label}")).into()));
             }
             let key = VmPropertyKey::String(method.name());
-            let callee = match interp.ordinary_get_value(context, receiver, receiver, &key, 0)? {
-                VmGetOutcome::Value(value) => value,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    interp.run_callable_sync(context, &getter, receiver, SmallVec::new())?
-                }
-            };
+            let callee =
+                match interp.ordinary_get_value(stack, context, receiver, receiver, &key, 0)? {
+                    VmGetOutcome::Value(value) => value,
+                    VmGetOutcome::InvokeGetter { getter } => interp.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &getter,
+                        receiver,
+                        SmallVec::new(),
+                    )?,
+                };
             let callee = interp.scoped_value(scope, callee);
             let callee_value = interp.escape_scoped(callee);
             if !interp.is_callable_runtime(&callee_value) {
@@ -361,7 +377,8 @@ impl Interpreter {
             for &register in arg_regs {
                 args.push(frame.read(register)?);
             }
-            interp.run_callable_sync(
+            interp.run_callable_sync_rooted(
+                stack,
                 context,
                 &callee_value,
                 interp.escape_scoped(math_value),
@@ -383,6 +400,7 @@ impl Interpreter {
     /// `@@`-method.
     pub(crate) fn coerce_string_method_args(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         name: &str,
         args: &mut [Value],
@@ -431,32 +449,51 @@ impl Interpreter {
                 || v.is_proxy()
                 || (!regexp_pass_through && v.is_regexp())
         };
-        for &(idx, is_int) in order {
-            let Some(&v) = args.get(idx) else {
-                continue;
-            };
-            if is_int {
-                // Skip primitives the native method body already
-                // recognises (`undefined` is the "absent" sentinel some
-                // §B.2.3.1 substr-style methods key on).
-                if v.is_number() || v.is_boolean() || v.is_null() || v.is_undefined() {
-                    continue;
+        self.with_handle_scope(|interp, scope| {
+            let handles: SmallVec<[crate::Local<'_>; 8]> = args
+                .iter()
+                .copied()
+                .map(|value| interp.scoped_value(scope, value))
+                .collect();
+            let result = (|| -> Result<(), VmError> {
+                for &(idx, is_int) in order {
+                    let Some(&handle) = handles.get(idx) else {
+                        continue;
+                    };
+                    let value = interp.escape_scoped(handle);
+                    if is_int {
+                        // Skip primitives the native method body already
+                        // recognises (`undefined` is the "absent" sentinel some
+                        // §B.2.3.1 substr-style methods key on).
+                        if value.is_number()
+                            || value.is_boolean()
+                            || value.is_null()
+                            || value.is_undefined()
+                        {
+                            continue;
+                        }
+                        let coerced = interp.coerce_to_number(stack, context, &value)?;
+                        interp.set_scoped(handle, Value::number(coerced));
+                    } else {
+                        if !is_non_primitive(&value) {
+                            continue;
+                        }
+                        let primitive = interp.evaluate_to_primitive(
+                            stack,
+                            context,
+                            &value,
+                            crate::abstract_ops::ToPrimitiveHint::String,
+                        )?;
+                        interp.set_scoped(handle, primitive);
+                    }
                 }
-                let coerced = self.coerce_to_number(context, &v)?;
-                args[idx] = Value::number(coerced);
-            } else {
-                if !is_non_primitive(&v) {
-                    continue;
-                }
-                let primitive = self.evaluate_to_primitive(
-                    context,
-                    &v,
-                    crate::abstract_ops::ToPrimitiveHint::String,
-                )?;
-                args[idx] = primitive;
+                Ok(())
+            })();
+            for (slot, handle) in args.iter_mut().zip(handles) {
+                *slot = interp.escape_scoped(handle);
             }
-        }
-        Ok(())
+            result
+        })
     }
 
     /// Handle `Op::CallMethodValue`: the universal method-call op.
@@ -509,9 +546,13 @@ impl Interpreter {
         let method_site = context
             .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
             .unwrap_or(usize::MAX);
-        if let Some(result) =
-            self.try_array_method_call_ic(context, method_site, recv_value, arg_values.as_slice())
-        {
+        if let Some(result) = self.try_array_method_call_ic(
+            stack,
+            context,
+            method_site,
+            recv_value,
+            arg_values.as_slice(),
+        ) {
             let value = result?;
             stack[top_idx].advance_pc()?;
             write_register(&mut stack[top_idx], dst, value)?;
@@ -551,6 +592,7 @@ impl Interpreter {
             .string_constant_str_for_function(stack[top_idx].function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         if let Some(result) = self.try_fast_array_proto_method(
+            stack,
             context,
             method_site,
             recv_value,
@@ -719,7 +761,7 @@ impl Interpreter {
                                 let resume = g
                                     .front_async_resume(&self.gc_heap)
                                     .ok_or(VmError::InvalidOperand)?;
-                                self.resume_generator(context, &g, resume)?;
+                                self.resume_generator(stack, context, &g, resume)?;
                             }
                         }
                     }
@@ -728,7 +770,7 @@ impl Interpreter {
                     frame.advance_pc()?;
                     return Ok(());
                 }
-                match self.resume_generator(context, &g, kind) {
+                match self.resume_generator(stack, context, &g, kind) {
                     Ok(result) => {
                         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                         write_register(frame, dst, result)?;
@@ -855,6 +897,7 @@ impl Interpreter {
                 // (hot in string method loops: `s.indexOf`, `s.slice`, …).
                 let key = VmPropertyKey::String(name);
                 let method = match self.ordinary_get_value(
+                    stack,
                     context,
                     Value::object(proto),
                     recv_value,
@@ -862,9 +905,13 @@ impl Interpreter {
                     0,
                 )? {
                     VmGetOutcome::Value(v) => v,
-                    VmGetOutcome::InvokeGetter { getter } => {
-                        self.run_callable_sync(context, &getter, recv_value, SmallVec::new())?
-                    }
+                    VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &getter,
+                        recv_value,
+                        SmallVec::new(),
+                    )?,
                 };
                 if self.is_callable_runtime(&method) {
                     stack[top_idx].advance_pc()?;
@@ -883,7 +930,7 @@ impl Interpreter {
         // §9.4.5 integer-indexed exotic: an own expando property shadows
         // any inherited prototype method.
         if let Some(method) =
-            self.typed_array_own_method_value_for_call(context, recv_value, name)?
+            self.typed_array_own_method_value_for_call(stack, context, recv_value, name)?
         {
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
@@ -970,6 +1017,7 @@ impl Interpreter {
                     || original.is_proxy()
                 {
                     let primitive = self.evaluate_to_primitive(
+                        stack,
                         context,
                         &original,
                         crate::abstract_ops::ToPrimitiveHint::String,
@@ -1002,6 +1050,7 @@ impl Interpreter {
             }
             stack[top_idx].advance_pc()?;
             let result = self.dispatch_string_callable_replace(
+                stack,
                 context,
                 &recv_value,
                 &coerced_args,
@@ -1060,7 +1109,7 @@ impl Interpreter {
         }
         if recv_value.as_native_function().is_some() && object_prototype_dispatch_method_name(name)
         {
-            let method = self.ordinary_method_value_for_call(context, recv_value, name)?;
+            let method = self.ordinary_method_value_for_call(stack, context, recv_value, name)?;
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
             }
@@ -1068,7 +1117,7 @@ impl Interpreter {
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
         if recv_value.as_bound_function().is_some() && object_prototype_dispatch_method_name(name) {
-            let method = self.ordinary_method_value_for_call(context, recv_value, name)?;
+            let method = self.ordinary_method_value_for_call(stack, context, recv_value, name)?;
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
             }
@@ -1250,6 +1299,7 @@ impl Interpreter {
     /// array method can scavenge and they live only on this native stack frame.
     fn try_fast_array_proto_method(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         site: usize,
         recv: Value,
@@ -1283,7 +1333,7 @@ impl Interpreter {
                 }),
             );
         }
-        Some(self.dispatch_array_builtin_rooted(context, tag, recv, args))
+        Some(self.dispatch_array_builtin_rooted(stack, context, tag, recv, args))
     }
 
     /// Fast `arr.method(args)` dispatch through the call-site method IC.
@@ -1297,6 +1347,7 @@ impl Interpreter {
     /// without the per-call name lookup.
     fn try_array_method_call_ic(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         site: usize,
         recv: Value,
@@ -1324,7 +1375,7 @@ impl Interpreter {
         if !ic.tag.matches_builtin(method, &self.gc_heap) {
             return None;
         }
-        Some(self.dispatch_array_builtin_rooted(context, ic.tag, recv, args))
+        Some(self.dispatch_array_builtin_rooted(stack, context, ic.tag, recv, args))
     }
 
     /// Fast Map/Set builtin dispatch through the call-site method IC.
@@ -1622,6 +1673,7 @@ impl Interpreter {
         let recv = *read_register(&stack[frame_index], recv_reg)?;
         let value = Value::from_bits(value_bits);
         let result = self.dispatch_array_builtin_rooted(
+            stack,
             context,
             crate::array_prototype::ArrayMethodTag::Push,
             recv,
@@ -1633,6 +1685,7 @@ impl Interpreter {
 
     fn dispatch_array_builtin_rooted(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         tag: crate::array_prototype::ArrayMethodTag,
         recv: Value,
@@ -1646,7 +1699,7 @@ impl Interpreter {
         let _roots_guard = self
             .gc_heap
             .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-        self.array_live_method_dispatch(context, tag, roots.recv, roots.args, &[roots.args])
+        self.array_live_method_dispatch(stack, context, tag, roots.recv, roots.args, &[roots.args])
     }
 
     fn try_fast_primitive_string_char_code_at(
@@ -1824,22 +1877,24 @@ impl Interpreter {
 
     fn ordinary_method_value_for_call(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         recv_value: Value,
         name: &str,
     ) -> Result<Value, VmError> {
         let key = VmPropertyKey::String(name);
-        match self.ordinary_get_value(context, recv_value, recv_value, &key, 0)? {
+        match self.ordinary_get_value(stack, context, recv_value, recv_value, &key, 0)? {
             VmGetOutcome::Value(value) => Ok(value),
             VmGetOutcome::InvokeGetter { getter } => {
                 let args: SmallVec<[Value; 8]> = SmallVec::new();
-                self.run_callable_sync(context, &getter, recv_value, args)
+                self.run_callable_sync_rooted(stack, context, &getter, recv_value, args)
             }
         }
     }
 
     fn typed_array_own_method_value_for_call(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         recv_value: Value,
         name: &str,
@@ -1853,9 +1908,15 @@ impl Interpreter {
         match crate::object::lookup_own(bag, &self.gc_heap, name) {
             crate::object::PropertyLookup::Data { value, .. } => Ok(Some(value)),
             crate::object::PropertyLookup::Accessor { getter, .. } => match getter {
-                Some(getter) if self.is_callable_runtime(&getter) => Ok(Some(
-                    self.run_callable_sync(context, &getter, recv_value, SmallVec::new())?,
-                )),
+                Some(getter) if self.is_callable_runtime(&getter) => {
+                    Ok(Some(self.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &getter,
+                        recv_value,
+                        SmallVec::new(),
+                    )?))
+                }
                 _ => Ok(Some(Value::undefined())),
             },
             crate::object::PropertyLookup::Absent => Ok(None),
@@ -1896,13 +1957,13 @@ impl Interpreter {
             // `ordinary_get_value` so user-installed own properties
             // shadow the builtin fallback path.
             let key = VmPropertyKey::String(name);
-            return match self.ordinary_get_value(context, recv_value, recv_value, &key, 0)? {
+            return match self.ordinary_get_value(stack, context, recv_value, recv_value, &key, 0)? {
                 VmGetOutcome::Value(value) => Ok(Some(value)),
                 VmGetOutcome::InvokeGetter { getter } => {
                     let args: SmallVec<[Value; 8]> = SmallVec::new();
-                    Ok(Some(
-                        self.run_callable_sync(context, &getter, recv_value, args)?,
-                    ))
+                    Ok(Some(self.run_callable_sync_rooted(
+                        stack, context, &getter, recv_value, args,
+                    )?))
                 }
             };
         }
@@ -1914,11 +1975,11 @@ impl Interpreter {
                 // descriptors on static members invoke their getter.
                 let statics = Value::object(c.statics(&self.gc_heap));
                 let key = VmPropertyKey::String(name);
-                match self.ordinary_get_value(context, statics, statics, &key, 0)? {
+                match self.ordinary_get_value(stack, context, statics, statics, &key, 0)? {
                     VmGetOutcome::Value(v) => v,
                     VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync(context, &getter, statics, args)?
+                        self.run_callable_sync_rooted(stack, context, &getter, statics, args)?
                     }
                 }
             };
@@ -1932,16 +1993,14 @@ impl Interpreter {
             // §10.1.8 OrdinaryGet on a callable receiver — user
             // properties resolve via the function-properties side table.
             let owner = recv_value.as_closure(&self.gc_heap);
-            return Ok(Some(
-                self.function_property_get_stack_rooted_with_receiver(
-                    context,
-                    stack,
-                    owner,
-                    fid,
-                    Some(recv_value),
-                    name,
-                )?,
-            ));
+            return Ok(Some(self.function_property_get_with_receiver(
+                stack,
+                context,
+                owner,
+                fid,
+                Some(recv_value),
+                name,
+            )?));
         }
         if let Some(native) = recv_value.as_native_function() {
             // Native callable receiver — own properties first, then the
@@ -1960,14 +2019,18 @@ impl Interpreter {
                 None => match native.prototype_override(&self.gc_heap) {
                     Some(parent) => {
                         let key = VmPropertyKey::String(name);
-                        match self.ordinary_get_value(context, parent, recv_value, &key, 0)? {
+                        match self
+                            .ordinary_get_value(stack, context, parent, recv_value, &key, 0)?
+                        {
                             VmGetOutcome::Value(value) => value,
-                            VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
-                                context,
-                                &getter,
-                                recv_value,
-                                SmallVec::new(),
-                            )?,
+                            VmGetOutcome::InvokeGetter { getter } => self
+                                .run_callable_sync_rooted(
+                                    stack,
+                                    context,
+                                    &getter,
+                                    recv_value,
+                                    SmallVec::new(),
+                                )?,
                         }
                     }
                     None => self
@@ -1989,13 +2052,13 @@ impl Interpreter {
             // constructor's prototype to surface inherited
             // `Object.prototype.*` methods.
             let key = VmPropertyKey::String(name);
-            return match self.ordinary_get_value(context, recv_value, recv_value, &key, 0)? {
+            return match self.ordinary_get_value(stack, context, recv_value, recv_value, &key, 0)? {
                 VmGetOutcome::Value(value) => Ok(Some(value)),
                 VmGetOutcome::InvokeGetter { getter } => {
                     let args: SmallVec<[Value; 8]> = SmallVec::new();
-                    Ok(Some(
-                        self.run_callable_sync(context, &getter, recv_value, args)?,
-                    ))
+                    Ok(Some(self.run_callable_sync_rooted(
+                        stack, context, &getter, recv_value, args,
+                    )?))
                 }
             };
         }
@@ -2009,91 +2072,116 @@ impl Interpreter {
     /// per spec step 6.h. Returns the spliced result string.
     pub(crate) fn dispatch_string_callable_replace(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: &Value,
         args: &SmallVec<[Value; 8]>,
         replace_all: bool,
     ) -> Result<Value, VmError> {
         use crate::string::JsString;
-        let recv = receiver
-            .as_string(&self.gc_heap)
-            .ok_or(VmError::TypeMismatch)?;
-        let needle = args
-            .first()
-            .and_then(|v| v.as_string(&self.gc_heap))
-            .ok_or(VmError::TypeMismatch)?;
-        let callback = args.get(1).cloned().unwrap_or(Value::undefined());
-        let recv_units = recv.to_utf16_vec(&self.gc_heap);
-        let needle_units = needle.to_utf16_vec(&self.gc_heap);
-        let needle_len = needle_units.len();
-        let recv_value = Value::string(recv);
-        let mut out: Vec<u16> = Vec::with_capacity(recv_units.len());
-        if needle_len == 0 {
-            let positions: Vec<usize> = if replace_all {
-                (0..=recv_units.len()).collect()
-            } else {
-                vec![0]
-            };
-            for pos in positions {
-                let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                    Value::string(needle),
-                    Value::number_f64(pos as f64),
-                    recv_value,
-                ];
-                let raw =
-                    self.run_callable_sync(context, &callback, Value::undefined(), cb_args)?;
-                let raw_string = if let Some(s) = raw.as_string(&self.gc_heap) {
-                    s
+        self.with_handle_scope(|interp, scope| {
+            let recv = receiver
+                .as_string(&interp.gc_heap)
+                .ok_or(VmError::TypeMismatch)?;
+            let needle = args
+                .first()
+                .and_then(|v| v.as_string(&interp.gc_heap))
+                .ok_or(VmError::TypeMismatch)?;
+            let callback = args.get(1).copied().unwrap_or_else(Value::undefined);
+            let recv_units = recv.to_utf16_vec(&interp.gc_heap);
+            let needle_units = needle.to_utf16_vec(&interp.gc_heap);
+            let needle_len = needle_units.len();
+
+            // The callback can allocate and relocate every heap value used by
+            // later iterations. Keep the callback inputs and its most recent
+            // result in the handle arena for the whole replacement operation.
+            let recv_handle = interp.scoped_value(scope, Value::string(recv));
+            let needle_handle = interp.scoped_value(scope, Value::string(needle));
+            let callback_handle = interp.scoped_value(scope, callback);
+            let result_handle = interp.scoped_value(scope, Value::undefined());
+            let mut out: Vec<u16> = Vec::with_capacity(recv_units.len());
+
+            if needle_len == 0 {
+                let last_position = if replace_all { recv_units.len() } else { 0 };
+                for pos in 0..=last_position {
+                    let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                        interp.escape_scoped(needle_handle),
+                        Value::number_f64(pos as f64),
+                        interp.escape_scoped(recv_handle),
+                    ];
+                    let raw = interp.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &interp.escape_scoped(callback_handle),
+                        Value::undefined(),
+                        cb_args,
+                    )?;
+                    interp.set_scoped(result_handle, raw);
+                    let raw = interp.escape_scoped(result_handle);
+                    let replacement = if let Some(string) = raw.as_string(&interp.gc_heap) {
+                        string.to_utf16_vec(&interp.gc_heap)
+                    } else {
+                        let display = raw.display_string(&interp.gc_heap);
+                        JsString::from_str(&display, &mut interp.gc_heap)
+                            .map_err(|_| VmError::TypeMismatch)?
+                            .to_utf16_vec(&interp.gc_heap)
+                    };
+                    out.extend_from_slice(&replacement);
+                    if pos < recv_units.len() {
+                        out.push(recv_units[pos]);
+                    }
+                }
+                return Ok(Value::string(
+                    JsString::from_utf16_units(&out, &mut interp.gc_heap)
+                        .map_err(|_| VmError::TypeMismatch)?,
+                ));
+            }
+            if recv_units.len() < needle_len {
+                // Needle longer than receiver — no match possible.
+                return Ok(interp.escape_scoped(recv_handle));
+            }
+            let last_start = recv_units.len() - needle_len;
+            let mut cursor: usize = 0;
+            while cursor <= last_start {
+                if recv_units[cursor..cursor + needle_len] == needle_units[..] {
+                    let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                        interp.escape_scoped(needle_handle),
+                        Value::number_f64(cursor as f64),
+                        interp.escape_scoped(recv_handle),
+                    ];
+                    let raw = interp.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &interp.escape_scoped(callback_handle),
+                        Value::undefined(),
+                        cb_args,
+                    )?;
+                    interp.set_scoped(result_handle, raw);
+                    let raw = interp.escape_scoped(result_handle);
+                    let replacement = if let Some(string) = raw.as_string(&interp.gc_heap) {
+                        string.to_utf16_vec(&interp.gc_heap)
+                    } else {
+                        let display = raw.display_string(&interp.gc_heap);
+                        JsString::from_str(&display, &mut interp.gc_heap)
+                            .map_err(|_| VmError::TypeMismatch)?
+                            .to_utf16_vec(&interp.gc_heap)
+                    };
+                    out.extend_from_slice(&replacement);
+                    cursor += needle_len;
+                    if !replace_all {
+                        break;
+                    }
                 } else {
-                    JsString::from_str(&raw.display_string(&self.gc_heap), &mut self.gc_heap)
-                        .map_err(|_| VmError::TypeMismatch)?
-                };
-                out.extend_from_slice(&raw_string.to_utf16_vec(&self.gc_heap));
-                if pos < recv_units.len() {
-                    out.push(recv_units[pos]);
+                    out.push(recv_units[cursor]);
+                    cursor += 1;
                 }
             }
-            return Ok(Value::string(
-                JsString::from_utf16_units(&out, &mut self.gc_heap)
+            out.extend_from_slice(&recv_units[cursor..]);
+            Ok(Value::string(
+                JsString::from_utf16_units(&out, &mut interp.gc_heap)
                     .map_err(|_| VmError::TypeMismatch)?,
-            ));
-        }
-        if recv_units.len() < needle_len {
-            // Needle longer than receiver — no match possible.
-            return Ok(Value::string(recv));
-        }
-        let last_start = recv_units.len() - needle_len;
-        let mut cursor: usize = 0;
-        while cursor <= last_start {
-            if recv_units[cursor..cursor + needle_len] == needle_units[..] {
-                let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                    Value::string(needle),
-                    Value::number_f64(cursor as f64),
-                    recv_value,
-                ];
-                let raw =
-                    self.run_callable_sync(context, &callback, Value::undefined(), cb_args)?;
-                let raw_string = if let Some(s) = raw.as_string(&self.gc_heap) {
-                    s
-                } else {
-                    JsString::from_str(&raw.display_string(&self.gc_heap), &mut self.gc_heap)
-                        .map_err(|_| VmError::TypeMismatch)?
-                };
-                out.extend_from_slice(&raw_string.to_utf16_vec(&self.gc_heap));
-                cursor += needle_len;
-                if !replace_all {
-                    break;
-                }
-            } else {
-                out.push(recv_units[cursor]);
-                cursor += 1;
-            }
-        }
-        out.extend_from_slice(&recv_units[cursor..]);
-        Ok(Value::string(
-            JsString::from_utf16_units(&out, &mut self.gc_heap)
-                .map_err(|_| VmError::TypeMismatch)?,
-        ))
+            ))
+        })
     }
 
     /// §23.2.3 TypedArray prototype callback methods —
@@ -2131,6 +2219,7 @@ impl Interpreter {
 
     fn run_typed_array_callback(
         &mut self,
+        stack: &mut ActivationStack,
         lean: &mut Option<LeanCallbackState>,
         context: &ExecutionContext,
         callee: Value,
@@ -2138,19 +2227,19 @@ impl Interpreter {
         args: &[Value],
     ) -> Result<Value, VmError> {
         match lean {
-            Some(inner) => {
-                self.run_bytecode_callable_committed_lean_args(inner, context, this_arg, args)
-            }
+            Some(inner) => self
+                .run_bytecode_callable_committed_lean_args(stack, inner, context, this_arg, args),
             None => {
                 let mut owned: SmallVec<[Value; 8]> = SmallVec::with_capacity(args.len());
                 owned.extend(args.iter().copied());
-                self.run_callable_sync(context, &callee, this_arg, owned)
+                self.run_callable_sync_rooted(stack, context, &callee, this_arg, owned)
             }
         }
     }
 
     pub(crate) fn typed_array_callback_value_dispatch(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         t: &crate::binary::typed_array::JsTypedArray,
         name: &str,
@@ -2172,21 +2261,46 @@ impl Interpreter {
         let len = t.length(&self.gc_heap);
         let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
         let callee = require_callable(args.first())?;
-        let mut lean = self.acquire_lean_callback_stack(context, callee);
+
+        // Every value reused after a callback lives in the collector-traced
+        // iteration-anchor range. Callback execution may move the receiver,
+        // callee, `thisArg`, the current element, or an arbitrary reduce
+        // accumulator; raw `Value` / `JsTypedArray` copies must therefore be
+        // re-read after every re-entry.
+        const RECEIVER: usize = 0;
+        const CALLEE: usize = 1;
+        const THIS_ARG: usize = 2;
+        const ELEMENT: usize = 3;
+        const CARRIED: usize = 4;
+        let anchor_base = self.iteration_anchors_for_trace().len();
+        self.push_iteration_anchor(ta_value);
+        self.push_iteration_anchor(callee);
+        self.push_iteration_anchor(this_arg);
+        self.push_iteration_anchor(Value::undefined());
+        self.push_iteration_anchor(args.get(1).copied().unwrap_or(Value::undefined()));
+
+        let rooted_callee = self.iteration_anchor(anchor_base + CALLEE);
+        let mut lean = self.acquire_lean_callback_stack(context, rooted_callee);
 
         let result =
             (|interp: &mut Self, lean: &mut Option<LeanCallbackState>| -> Result<Value, VmError> {
                 match name {
                     "forEach" => {
                         for i in 0..len {
-                            let value = interp.ta_live_element(t, i)?;
+                            let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
+                            let t = ta_value
+                                .as_typed_array(&interp.gc_heap)
+                                .ok_or(VmError::InvalidOperand)?;
+                            let value = interp.ta_live_element(&t, i)?;
+                            interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                             interp.run_typed_array_callback(
+                                stack,
                                 lean,
                                 context,
-                                callee,
-                                this_arg,
+                                interp.iteration_anchor(anchor_base + CALLEE),
+                                interp.iteration_anchor(anchor_base + THIS_ARG),
                                 &[
-                                    value,
+                                    interp.iteration_anchor(anchor_base + ELEMENT),
                                     Value::number(NumberValue::from_i32(i as i32)),
                                     ta_value,
                                 ],
@@ -2199,89 +2313,131 @@ impl Interpreter {
                         // (step 5) runs before any callback. `A` is pinned on the
                         // iteration-anchor stack so it stays GC-rooted across each
                         // callback re-entry.
-                        let a = interp.typed_array_species_create(context, t, len)?;
+                        let t = interp
+                            .iteration_anchor(anchor_base + RECEIVER)
+                            .as_typed_array(&interp.gc_heap)
+                            .ok_or(VmError::InvalidOperand)?;
+                        let a = interp.typed_array_species_create(stack, context, &t, len)?;
                         let a_value = Value::typed_array(a);
                         let target_kind = a.kind();
-                        let anchor = interp.push_iteration_anchor(a_value);
-                        let result = (|interp: &mut Self| -> Result<(), VmError> {
-                            for i in 0..len {
-                                let value = interp.ta_live_element(t, i)?;
-                                let mapped = interp.run_typed_array_callback(
-                                    lean,
-                                    context,
-                                    callee,
-                                    this_arg,
-                                    &[
-                                        value,
-                                        Value::number(NumberValue::from_i32(i as i32)),
-                                        ta_value,
-                                    ],
-                                )?;
-                                let coerced = crate::binary::dispatch::coerce_element_for_store(
-                                    &mut interp.gc_heap,
-                                    target_kind,
-                                    &mapped,
-                                )?;
-                                a.set(&mut interp.gc_heap, i, &coerced);
-                            }
-                            Ok(())
-                        })(interp);
-                        interp.pop_iteration_anchors_to(anchor - 1);
-                        result?;
-                        Ok(a_value)
+                        let output_anchor = interp.push_iteration_anchor(a_value) - 1;
+                        for i in 0..len {
+                            let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
+                            let t = ta_value
+                                .as_typed_array(&interp.gc_heap)
+                                .ok_or(VmError::InvalidOperand)?;
+                            let value = interp.ta_live_element(&t, i)?;
+                            interp.set_iteration_anchor(anchor_base + ELEMENT, value);
+                            let mapped = interp.run_typed_array_callback(
+                                stack,
+                                lean,
+                                context,
+                                interp.iteration_anchor(anchor_base + CALLEE),
+                                interp.iteration_anchor(anchor_base + THIS_ARG),
+                                &[
+                                    interp.iteration_anchor(anchor_base + ELEMENT),
+                                    Value::number(NumberValue::from_i32(i as i32)),
+                                    ta_value,
+                                ],
+                            )?;
+                            interp.set_iteration_anchor(anchor_base + CARRIED, mapped);
+                            let mapped = interp.iteration_anchor(anchor_base + CARRIED);
+                            let coerced = crate::binary::dispatch::coerce_element_for_store(
+                                &mut interp.gc_heap,
+                                target_kind,
+                                &mapped,
+                            )?;
+                            interp.set_iteration_anchor(anchor_base + CARRIED, coerced);
+                            let output = interp
+                                .iteration_anchor(output_anchor)
+                                .as_typed_array(&interp.gc_heap)
+                                .ok_or(VmError::InvalidOperand)?;
+                            let coerced = interp.iteration_anchor(anchor_base + CARRIED);
+                            output.set(&mut interp.gc_heap, i, &coerced);
+                        }
+                        Ok(interp.iteration_anchor(output_anchor))
                     }
                     "filter" => {
                         // §23.2.3.10 — run the predicate over every element,
                         // collecting kept values, then call
                         // `TypedArraySpeciesCreate(O, « captured »)` (step 9) with
-                        // the kept count and copy the survivors in.
-                        let mut kept: Vec<Value> = Vec::new();
+                        // the kept count and copy the survivors in. The kept
+                        // range itself is collector-traced so BigInt values are
+                        // rewritten by a moving collection.
+                        let kept_base = interp.iteration_anchors_for_trace().len();
                         for i in 0..len {
-                            let value = interp.ta_live_element(t, i)?;
+                            let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
+                            let t = ta_value
+                                .as_typed_array(&interp.gc_heap)
+                                .ok_or(VmError::InvalidOperand)?;
+                            let value = interp.ta_live_element(&t, i)?;
+                            interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                             let selected = interp.run_typed_array_callback(
+                                stack,
                                 lean,
                                 context,
-                                callee,
-                                this_arg,
+                                interp.iteration_anchor(anchor_base + CALLEE),
+                                interp.iteration_anchor(anchor_base + THIS_ARG),
                                 &[
-                                    value,
+                                    interp.iteration_anchor(anchor_base + ELEMENT),
                                     Value::number(NumberValue::from_i32(i as i32)),
                                     ta_value,
                                 ],
                             )?;
                             if selected.to_boolean(&interp.gc_heap) {
-                                kept.push(value);
+                                interp.push_iteration_anchor(
+                                    interp.iteration_anchor(anchor_base + ELEMENT),
+                                );
                             }
                         }
-                        let a = interp.typed_array_species_create(context, t, kept.len())?;
+                        let kept_len = interp.iteration_anchors_for_trace().len() - kept_base;
+                        let t = interp
+                            .iteration_anchor(anchor_base + RECEIVER)
+                            .as_typed_array(&interp.gc_heap)
+                            .ok_or(VmError::InvalidOperand)?;
+                        let a = interp.typed_array_species_create(stack, context, &t, kept_len)?;
                         let target_kind = a.kind();
-                        for (i, value) in kept.iter().enumerate() {
+                        let output_anchor = interp.push_iteration_anchor(Value::typed_array(a)) - 1;
+                        for i in 0..kept_len {
+                            let kept = interp.iteration_anchor(kept_base + i);
                             let coerced = crate::binary::dispatch::coerce_element_for_store(
                                 &mut interp.gc_heap,
                                 target_kind,
-                                value,
+                                &kept,
                             )?;
-                            a.set(&mut interp.gc_heap, i, &coerced);
+                            interp.set_iteration_anchor(anchor_base + CARRIED, coerced);
+                            let output = interp
+                                .iteration_anchor(output_anchor)
+                                .as_typed_array(&interp.gc_heap)
+                                .ok_or(VmError::InvalidOperand)?;
+                            let coerced = interp.iteration_anchor(anchor_base + CARRIED);
+                            output.set(&mut interp.gc_heap, i, &coerced);
                         }
-                        Ok(Value::typed_array(a))
+                        Ok(interp.iteration_anchor(output_anchor))
                     }
                     "find" => {
                         let mut found = Value::undefined();
                         for i in 0..len {
-                            let value = interp.ta_live_element(t, i)?;
+                            let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
+                            let t = ta_value
+                                .as_typed_array(&interp.gc_heap)
+                                .ok_or(VmError::InvalidOperand)?;
+                            let value = interp.ta_live_element(&t, i)?;
+                            interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                             let hit = interp.run_typed_array_callback(
+                                stack,
                                 lean,
                                 context,
-                                callee,
-                                this_arg,
+                                interp.iteration_anchor(anchor_base + CALLEE),
+                                interp.iteration_anchor(anchor_base + THIS_ARG),
                                 &[
-                                    value,
+                                    interp.iteration_anchor(anchor_base + ELEMENT),
                                     Value::number(NumberValue::from_i32(i as i32)),
                                     ta_value,
                                 ],
                             )?;
                             if hit.to_boolean(&interp.gc_heap) {
-                                found = value;
+                                found = interp.iteration_anchor(anchor_base + ELEMENT);
                                 break;
                             }
                         }
@@ -2290,14 +2446,20 @@ impl Interpreter {
                     "findIndex" => {
                         let mut idx: i32 = -1;
                         for i in 0..len {
-                            let value = interp.ta_live_element(t, i)?;
+                            let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
+                            let t = ta_value
+                                .as_typed_array(&interp.gc_heap)
+                                .ok_or(VmError::InvalidOperand)?;
+                            let value = interp.ta_live_element(&t, i)?;
+                            interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                             let hit = interp.run_typed_array_callback(
+                                stack,
                                 lean,
                                 context,
-                                callee,
-                                this_arg,
+                                interp.iteration_anchor(anchor_base + CALLEE),
+                                interp.iteration_anchor(anchor_base + THIS_ARG),
                                 &[
-                                    value,
+                                    interp.iteration_anchor(anchor_base + ELEMENT),
                                     Value::number(NumberValue::from_i32(i as i32)),
                                     ta_value,
                                 ],
@@ -2312,20 +2474,26 @@ impl Interpreter {
                     "findLast" => {
                         let mut found = Value::undefined();
                         for i in (0..len).rev() {
-                            let value = interp.ta_live_element(t, i)?;
+                            let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
+                            let t = ta_value
+                                .as_typed_array(&interp.gc_heap)
+                                .ok_or(VmError::InvalidOperand)?;
+                            let value = interp.ta_live_element(&t, i)?;
+                            interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                             let hit = interp.run_typed_array_callback(
+                                stack,
                                 lean,
                                 context,
-                                callee,
-                                this_arg,
+                                interp.iteration_anchor(anchor_base + CALLEE),
+                                interp.iteration_anchor(anchor_base + THIS_ARG),
                                 &[
-                                    value,
+                                    interp.iteration_anchor(anchor_base + ELEMENT),
                                     Value::number(NumberValue::from_i32(i as i32)),
                                     ta_value,
                                 ],
                             )?;
                             if hit.to_boolean(&interp.gc_heap) {
-                                found = value;
+                                found = interp.iteration_anchor(anchor_base + ELEMENT);
                                 break;
                             }
                         }
@@ -2334,14 +2502,20 @@ impl Interpreter {
                     "findLastIndex" => {
                         let mut idx: i32 = -1;
                         for i in (0..len).rev() {
-                            let value = interp.ta_live_element(t, i)?;
+                            let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
+                            let t = ta_value
+                                .as_typed_array(&interp.gc_heap)
+                                .ok_or(VmError::InvalidOperand)?;
+                            let value = interp.ta_live_element(&t, i)?;
+                            interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                             let hit = interp.run_typed_array_callback(
+                                stack,
                                 lean,
                                 context,
-                                callee,
-                                this_arg,
+                                interp.iteration_anchor(anchor_base + CALLEE),
+                                interp.iteration_anchor(anchor_base + THIS_ARG),
                                 &[
-                                    value,
+                                    interp.iteration_anchor(anchor_base + ELEMENT),
                                     Value::number(NumberValue::from_i32(i as i32)),
                                     ta_value,
                                 ],
@@ -2356,14 +2530,20 @@ impl Interpreter {
                     "every" => {
                         let mut all = true;
                         for i in 0..len {
-                            let value = interp.ta_live_element(t, i)?;
+                            let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
+                            let t = ta_value
+                                .as_typed_array(&interp.gc_heap)
+                                .ok_or(VmError::InvalidOperand)?;
+                            let value = interp.ta_live_element(&t, i)?;
+                            interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                             let hit = interp.run_typed_array_callback(
+                                stack,
                                 lean,
                                 context,
-                                callee,
-                                this_arg,
+                                interp.iteration_anchor(anchor_base + CALLEE),
+                                interp.iteration_anchor(anchor_base + THIS_ARG),
                                 &[
-                                    value,
+                                    interp.iteration_anchor(anchor_base + ELEMENT),
                                     Value::number(NumberValue::from_i32(i as i32)),
                                     ta_value,
                                 ],
@@ -2378,14 +2558,20 @@ impl Interpreter {
                     "some" => {
                         let mut any = false;
                         for i in 0..len {
-                            let value = interp.ta_live_element(t, i)?;
+                            let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
+                            let t = ta_value
+                                .as_typed_array(&interp.gc_heap)
+                                .ok_or(VmError::InvalidOperand)?;
+                            let value = interp.ta_live_element(&t, i)?;
+                            interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                             let hit = interp.run_typed_array_callback(
+                                stack,
                                 lean,
                                 context,
-                                callee,
-                                this_arg,
+                                interp.iteration_anchor(anchor_base + CALLEE),
+                                interp.iteration_anchor(anchor_base + THIS_ARG),
                                 &[
-                                    value,
+                                    interp.iteration_anchor(anchor_base + ELEMENT),
                                     Value::number(NumberValue::from_i32(i as i32)),
                                     ta_value,
                                 ],
@@ -2404,35 +2590,49 @@ impl Interpreter {
                             return Err(VmError::TypeMismatch);
                         }
                         let step: i64 = if reverse { -1 } else { 1 };
-                        let (mut acc, start_idx) = if has_init {
-                            (args[1], if reverse { len as i64 - 1 } else { 0 })
+                        let start_idx = if has_init {
+                            if reverse { len as i64 - 1 } else { 0 }
                         } else {
                             let seed = if reverse { len - 1 } else { 0 };
-                            (interp.ta_live_element(t, seed)?, seed as i64 + step)
+                            let t = interp
+                                .iteration_anchor(anchor_base + RECEIVER)
+                                .as_typed_array(&interp.gc_heap)
+                                .ok_or(VmError::InvalidOperand)?;
+                            let seed_value = interp.ta_live_element(&t, seed)?;
+                            interp.set_iteration_anchor(anchor_base + CARRIED, seed_value);
+                            seed as i64 + step
                         };
                         let mut i = start_idx;
                         while i >= 0 && (i as usize) < len {
-                            let value = interp.ta_live_element(t, i as usize)?;
-                            acc = interp.run_typed_array_callback(
+                            let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
+                            let t = ta_value
+                                .as_typed_array(&interp.gc_heap)
+                                .ok_or(VmError::InvalidOperand)?;
+                            let value = interp.ta_live_element(&t, i as usize)?;
+                            interp.set_iteration_anchor(anchor_base + ELEMENT, value);
+                            let next_acc = interp.run_typed_array_callback(
+                                stack,
                                 lean,
                                 context,
-                                callee,
+                                interp.iteration_anchor(anchor_base + CALLEE),
                                 Value::undefined(),
                                 &[
-                                    acc,
-                                    value,
+                                    interp.iteration_anchor(anchor_base + CARRIED),
+                                    interp.iteration_anchor(anchor_base + ELEMENT),
                                     Value::number(NumberValue::from_i32(i as i32)),
                                     ta_value,
                                 ],
                             )?;
+                            interp.set_iteration_anchor(anchor_base + CARRIED, next_acc);
                             i += step;
                         }
-                        Ok(acc)
+                        Ok(interp.iteration_anchor(anchor_base + CARRIED))
                     }
                     _ => Err(VmError::TypeMismatch),
                 }
             })(self, &mut lean);
         self.release_lean_callback_stack(lean);
+        self.pop_iteration_anchors_to(anchor_base);
         result
     }
 
@@ -2444,13 +2644,14 @@ impl Interpreter {
     /// non-detached TypedArray of at least `length` elements.
     fn typed_array_species_create(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         exemplar: &crate::binary::typed_array::JsTypedArray,
         length: usize,
     ) -> Result<crate::binary::typed_array::JsTypedArray, VmError> {
         let mut argv: SmallVec<[Value; 8]> = SmallVec::new();
         argv.push(Value::number(NumberValue::from_f64(length as f64)));
-        self.typed_array_create_via_species(context, exemplar, argv, Some(length))
+        self.typed_array_create_via_species(stack, context, exemplar, argv, Some(length))
     }
 
     /// §23.2.4.2 `TypedArrayCreate(SpeciesConstructor(exemplar), argv)`.
@@ -2463,39 +2664,75 @@ impl Interpreter {
     /// Number).
     fn typed_array_create_via_species(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         exemplar: &crate::binary::typed_array::JsTypedArray,
         argv: SmallVec<[Value; 8]>,
         min_length: Option<usize>,
     ) -> Result<crate::binary::typed_array::JsTypedArray, VmError> {
-        let exemplar_value = Value::typed_array(*exemplar);
-        let default_name = exemplar.kind().name();
-        let default_ctor = crate::object::get(self.global_this, &self.gc_heap, default_name)
-            .ok_or_else(|| {
-                self.err_type((format!("%{default_name}% intrinsic is missing")).into())
-            })?;
-        let constructor =
-            self.species_constructor_value(context, &exemplar_value, &default_ctor)?;
-        let result = self.run_construct_sync(context, &constructor, constructor, argv)?;
-        let Some(new_ta) = result.as_typed_array(&self.gc_heap) else {
-            return Err(self
-                .err_type(("Species constructor did not return a TypedArray".to_string()).into()));
-        };
-        if new_ta.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
-            return Err(self.err_type(
-                ("Species constructor returned a TypedArray with a detached buffer".to_string())
+        self.with_handle_scope(|interp, scope| {
+            let exemplar_handle = interp.scoped_value(scope, Value::typed_array(*exemplar));
+            let argv_handles: SmallVec<[crate::Local<'_>; 8]> = argv
+                .into_iter()
+                .map(|value| interp.scoped_value(scope, value))
+                .collect();
+
+            let exemplar_value = interp.escape_scoped(exemplar_handle);
+            let exemplar = exemplar_value
+                .as_typed_array(&interp.gc_heap)
+                .ok_or(VmError::InvalidOperand)?;
+            let default_name = exemplar.kind().name();
+            let Some(default_ctor) =
+                crate::object::get(interp.global_this, &interp.gc_heap, default_name)
+            else {
+                return Err(
+                    interp.err_type((format!("%{default_name}% intrinsic is missing")).into())
+                );
+            };
+            let default_ctor_handle = interp.scoped_value(scope, default_ctor);
+            let constructor = interp.species_constructor_value(
+                stack,
+                context,
+                &interp.escape_scoped(exemplar_handle),
+                &interp.escape_scoped(default_ctor_handle),
+            )?;
+            let constructor_handle = interp.scoped_value(scope, constructor);
+            let rooted_argv = argv_handles
+                .iter()
+                .map(|handle| interp.escape_scoped(*handle))
+                .collect();
+            let constructor = interp.escape_scoped(constructor_handle);
+            let result = interp.run_construct_sync_rooted(
+                stack,
+                context,
+                &constructor,
+                constructor,
+                rooted_argv,
+            )?;
+            let result_handle = interp.scoped_value(scope, result);
+            let result = interp.escape_scoped(result_handle);
+            let Some(new_ta) = result.as_typed_array(&interp.gc_heap) else {
+                return Err(interp.err_type(
+                    ("Species constructor did not return a TypedArray".to_string()).into(),
+                ));
+            };
+            if new_ta.buffer(&interp.gc_heap).is_detached(&interp.gc_heap) {
+                return Err(interp.err_type(
+                    ("Species constructor returned a TypedArray with a detached buffer"
+                        .to_string())
                     .into(),
-            ));
-        }
-        if let Some(min) = min_length
-            && new_ta.length(&self.gc_heap) < min
-        {
-            return Err(self.err_type(
-                ("Species constructor returned a TypedArray smaller than required".to_string())
-                    .into(),
-            ));
-        }
-        Ok(new_ta)
+                ));
+            }
+            if let Some(min) = min_length
+                && new_ta.length(&interp.gc_heap) < min
+            {
+                return Err(interp.err_type(
+                    ("Species constructor returned a TypedArray smaller than required".to_string())
+                        .into(),
+                ));
+            }
+            Ok(new_ta)
+        })
     }
 
     /// §23.2.3.27 `%TypedArray%.prototype.subarray(begin, end)`. Builds
@@ -2510,43 +2747,71 @@ impl Interpreter {
     /// `ToIntegerOrInfinity`, observing user `@@toPrimitive` / `valueOf`.
     pub(crate) fn typed_array_subarray_value_dispatch(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         t: &crate::binary::typed_array::JsTypedArray,
         args: &[Value],
     ) -> Result<Value, VmError> {
-        let buffer = t.buffer(&self.gc_heap);
-        // §23.2.3.27 step 4 — `[[ArrayLength]]` is `0` for a detached
-        // buffer; `subarray` does not itself throw on detachment.
-        let src_len = t.length(&self.gc_heap) as i64;
-        let begin = self.integer_or_infinity_for_arg(context, args.first())?;
-        let begin_index = relative_index_clamp(begin, src_len);
-        let relative_end = match args.get(1) {
-            None => src_len as f64,
-            Some(v) if v.is_undefined() => src_len as f64,
-            Some(_) => self.integer_or_infinity_for_arg(context, args.get(1))?,
-        };
-        let end_index = relative_index_clamp(relative_end, src_len);
-        let new_length = (end_index - begin_index).max(0) as usize;
-        let bpe = t.kind().bytes_per_element();
-        // §23.2.3.30 step 13 — [[ByteOffset]] is the construction-time
-        // slot; the `end` coercion may have detached the buffer, which
-        // zeroes the public accessor but not the slot.
-        let begin_byte_offset = t.raw_byte_offset(&self.gc_heap) + begin_index as usize * bpe;
+        self.with_handle_scope(|interp, scope| {
+            let source_handle = interp.scoped_value(scope, Value::typed_array(*t));
+            let arg_handles: SmallVec<[crate::Local<'_>; 2]> = args
+                .iter()
+                .take(2)
+                .copied()
+                .map(|value| interp.scoped_value(scope, value))
+                .collect();
+            let source = interp
+                .escape_scoped(source_handle)
+                .as_typed_array(&interp.gc_heap)
+                .ok_or(VmError::InvalidOperand)?;
+            // §23.2.3.27 step 4 — `[[ArrayLength]]` is `0` for a detached
+            // buffer; `subarray` does not itself throw on detachment.
+            let src_len = source.length(&interp.gc_heap) as i64;
+            let begin_arg = arg_handles
+                .first()
+                .map(|handle| interp.escape_scoped(*handle));
+            let begin = interp.integer_or_infinity_for_arg(stack, context, begin_arg.as_ref())?;
+            let begin_index = relative_index_clamp(begin, src_len);
+            let end_arg = arg_handles
+                .get(1)
+                .map(|handle| interp.escape_scoped(*handle));
+            let end_absent = end_arg.as_ref().is_none_or(|value| value.is_undefined());
+            let relative_end = match end_arg.as_ref() {
+                None => src_len as f64,
+                Some(value) if value.is_undefined() => src_len as f64,
+                Some(value) => interp.integer_or_infinity_for_arg(stack, context, Some(value))?,
+            };
+            let end_index = relative_index_clamp(relative_end, src_len);
+            let new_length = (end_index - begin_index).max(0) as usize;
 
-        let mut argv: SmallVec<[Value; 8]> = SmallVec::new();
-        argv.push(Value::array_buffer(buffer));
-        argv.push(Value::number(NumberValue::from_f64(
-            begin_byte_offset as f64,
-        )));
-        // §23.2.3.30 — a length-tracking source with no end argument
-        // produces a length-tracking view: the species constructor is
-        // called WITHOUT the length argument.
-        let end_absent = args.get(1).is_none() || args.get(1).is_some_and(|v| v.is_undefined());
-        if !(end_absent && t.is_length_tracking(&self.gc_heap)) {
-            argv.push(Value::number(NumberValue::from_f64(new_length as f64)));
-        }
-        let a = self.typed_array_create_via_species(context, t, argv, None)?;
-        Ok(Value::typed_array(a))
+            // Both coercions above are observable. Refresh the source before
+            // reading its buffer and construction-time internal slots.
+            let source = interp
+                .escape_scoped(source_handle)
+                .as_typed_array(&interp.gc_heap)
+                .ok_or(VmError::InvalidOperand)?;
+            let buffer = source.buffer(&interp.gc_heap);
+            let bpe = source.kind().bytes_per_element();
+            // §23.2.3.30 step 13 — [[ByteOffset]] is the construction-time
+            // slot; the `end` coercion may have detached the buffer, which
+            // zeroes the public accessor but not the slot.
+            let begin_byte_offset =
+                source.raw_byte_offset(&interp.gc_heap) + begin_index as usize * bpe;
+
+            let mut argv: SmallVec<[Value; 8]> = SmallVec::new();
+            argv.push(Value::array_buffer(buffer));
+            argv.push(Value::number(NumberValue::from_f64(
+                begin_byte_offset as f64,
+            )));
+            // §23.2.3.30 — a length-tracking source with no end argument
+            // produces a length-tracking view: the species constructor is
+            // called WITHOUT the length argument.
+            if !(end_absent && source.is_length_tracking(&interp.gc_heap)) {
+                argv.push(Value::number(NumberValue::from_f64(new_length as f64)));
+            }
+            let a = interp.typed_array_create_via_species(stack, context, &source, argv, None)?;
+            Ok(Value::typed_array(a))
+        })
     }
 
     /// §23.2.3.26 `%TypedArray%.prototype.slice(start, end)`,
@@ -2559,57 +2824,106 @@ impl Interpreter {
     /// copy itself does not re-enter, so the result stays live as a local.
     pub(crate) fn typed_array_slice_value_dispatch(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         t: &crate::binary::typed_array::JsTypedArray,
         args: &[Value],
     ) -> Result<Value, VmError> {
-        if t.is_out_of_bounds(&self.gc_heap) {
-            return Err(self.err_type(
-                ("Cannot slice a detached or out-of-bounds TypedArray".to_string()).into(),
-            ));
-        }
-        let len = t.length(&self.gc_heap) as i64;
-        let start = self.integer_or_infinity_for_arg(context, args.first())?;
-        let k = relative_index_clamp(start, len);
-        let relative_end = match args.get(1) {
-            None => len as f64,
-            Some(v) if v.is_undefined() => len as f64,
-            Some(_) => self.integer_or_infinity_for_arg(context, args.get(1))?,
-        };
-        let final_index = relative_index_clamp(relative_end, len);
-        let count = (final_index - k).max(0) as usize;
-
-        let a = self.typed_array_species_create(context, t, count)?;
-        if count > 0 {
-            // §23.2.3.27 step 11 — the argument coercion and the species
-            // constructor can both resize the source. Re-validate: an
-            // out-of-bounds (or detached) source throws; otherwise clamp
-            // the copy to the source's current length, leaving the tail
-            // of the freshly-created (zeroed) result untouched.
-            if t.is_out_of_bounds(&self.gc_heap) {
-                return Err(self.err_type(
-                    ("TypedArray buffer was detached or resized out of bounds during slice"
-                        .to_string())
-                    .into(),
+        self.with_handle_scope(|interp, scope| {
+            let source_handle = interp.scoped_value(scope, Value::typed_array(*t));
+            let arg_handles: SmallVec<[crate::Local<'_>; 2]> = args
+                .iter()
+                .take(2)
+                .copied()
+                .map(|value| interp.scoped_value(scope, value))
+                .collect();
+            let source = interp
+                .escape_scoped(source_handle)
+                .as_typed_array(&interp.gc_heap)
+                .ok_or(VmError::InvalidOperand)?;
+            if source.is_out_of_bounds(&interp.gc_heap) {
+                return Err(interp.err_type(
+                    ("Cannot slice a detached or out-of-bounds TypedArray".to_string()).into(),
                 ));
             }
-            let base = k as usize;
-            let cur_len = t.length(&self.gc_heap);
-            let copy_count = count.min(cur_len.saturating_sub(base));
-            let target_kind = a.kind();
-            for n in 0..copy_count {
-                let value = t
-                    .get(&mut self.gc_heap, base + n)
-                    .map_err(crate::oom_to_vm)?;
-                let coerced = crate::binary::dispatch::coerce_element_for_store(
-                    &mut self.gc_heap,
-                    target_kind,
-                    &value,
-                )?;
-                a.set(&mut self.gc_heap, n, &coerced);
+            let len = source.length(&interp.gc_heap) as i64;
+            let start_arg = arg_handles
+                .first()
+                .map(|handle| interp.escape_scoped(*handle));
+            let start = interp.integer_or_infinity_for_arg(stack, context, start_arg.as_ref())?;
+            let k = relative_index_clamp(start, len);
+            let end_arg = arg_handles
+                .get(1)
+                .map(|handle| interp.escape_scoped(*handle));
+            let relative_end = match end_arg.as_ref() {
+                None => len as f64,
+                Some(value) if value.is_undefined() => len as f64,
+                Some(value) => interp.integer_or_infinity_for_arg(stack, context, Some(value))?,
+            };
+            let final_index = relative_index_clamp(relative_end, len);
+            let count = (final_index - k).max(0) as usize;
+
+            // Argument coercion is observable, so refresh before resolving the
+            // species constructor. The species helper roots both this source
+            // and its argv across constructor lookup and construction.
+            let source = interp
+                .escape_scoped(source_handle)
+                .as_typed_array(&interp.gc_heap)
+                .ok_or(VmError::InvalidOperand)?;
+            let a = interp.typed_array_species_create(stack, context, &source, count)?;
+            let result_handle = interp.scoped_value(scope, Value::typed_array(a));
+            if count > 0 {
+                // §23.2.3.27 step 11 — the argument coercion and the species
+                // constructor can both resize the source. Re-validate: an
+                // out-of-bounds (or detached) source throws; otherwise clamp
+                // the copy to the source's current length, leaving the tail
+                // of the freshly-created (zeroed) result untouched.
+                let source = interp
+                    .escape_scoped(source_handle)
+                    .as_typed_array(&interp.gc_heap)
+                    .ok_or(VmError::InvalidOperand)?;
+                if source.is_out_of_bounds(&interp.gc_heap) {
+                    return Err(interp.err_type(
+                        ("TypedArray buffer was detached or resized out of bounds during slice"
+                            .to_string())
+                        .into(),
+                    ));
+                }
+                let base = k as usize;
+                let cur_len = source.length(&interp.gc_heap);
+                let copy_count = count.min(cur_len.saturating_sub(base));
+                let target_kind = interp
+                    .escape_scoped(result_handle)
+                    .as_typed_array(&interp.gc_heap)
+                    .ok_or(VmError::InvalidOperand)?
+                    .kind();
+                let element_handle = interp.scoped_value(scope, Value::undefined());
+                for n in 0..copy_count {
+                    let source = interp
+                        .escape_scoped(source_handle)
+                        .as_typed_array(&interp.gc_heap)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let value = source
+                        .get(&mut interp.gc_heap, base + n)
+                        .map_err(crate::oom_to_vm)?;
+                    interp.set_scoped(element_handle, value);
+                    let value = interp.escape_scoped(element_handle);
+                    let coerced = crate::binary::dispatch::coerce_element_for_store(
+                        &mut interp.gc_heap,
+                        target_kind,
+                        &value,
+                    )?;
+                    interp.set_scoped(element_handle, coerced);
+                    let target = interp
+                        .escape_scoped(result_handle)
+                        .as_typed_array(&interp.gc_heap)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let coerced = interp.escape_scoped(element_handle);
+                    target.set(&mut interp.gc_heap, n, &coerced);
+                }
             }
-        }
-        Ok(Value::typed_array(a))
+            Ok(interp.escape_scoped(result_handle))
+        })
     }
 
     /// §7.1.5 `ToIntegerOrInfinity` applied to an optional argument
@@ -2618,13 +2932,14 @@ impl Interpreter {
     /// Symbol / BigInt operands.
     pub(crate) fn integer_or_infinity_for_arg(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         arg: Option<&Value>,
     ) -> Result<f64, VmError> {
         let n = match arg {
             None => return Ok(0.0),
             Some(v) if v.is_undefined() => return Ok(0.0),
-            Some(v) => self.coerce_to_number(context, v)?.as_f64(),
+            Some(v) => self.coerce_to_number(stack, context, v)?.as_f64(),
         };
         if n.is_nan() {
             Ok(0.0)
@@ -2659,7 +2974,9 @@ impl Interpreter {
                 let forwarded: SmallVec<[Value; 8]> = match iter.next() {
                     None => SmallVec::new(),
                     Some(v) if v.is_nullish() => SmallVec::new(),
-                    Some(arg_array) => self.create_list_from_array_like(context, arg_array)?,
+                    Some(arg_array) => {
+                        self.create_list_from_array_like(stack, context, arg_array)?
+                    }
                 };
                 stack[top_idx].advance_pc()?;
                 self.invoke(stack, context, callee, this_value, forwarded, dst)

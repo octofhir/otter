@@ -15,6 +15,9 @@
 //! - Helpers advance the current frame PC exactly once on success.
 //! - Object-with-prototype allocation parks both object and prototype in a
 //!   handle scope before either raw handle is used after a possible scavenge.
+//! - Runtime-rooted helpers install a direct temporary root provider only when
+//!   the caller has not already published one; external visitors trace only
+//!   caller-local values and never allocate a runtime-root snapshot.
 //!
 //! # See also
 //! - [`crate::array`]
@@ -93,12 +96,9 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, VmError> {
-        let roots = self.collect_runtime_roots();
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let shape_root = self.shape_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
             for value in value_roots {
                 value.trace_value_slots(visitor);
             }
@@ -126,12 +126,9 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, otter_gc::OutOfMemory> {
-        let roots = self.collect_runtime_roots();
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let shape_root = self.shape_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
             for value in value_roots {
                 value.trace_value_slots(visitor);
             }
@@ -157,38 +154,40 @@ impl Interpreter {
         &mut self,
         target_url: std::sync::Arc<str>,
     ) -> Result<crate::object::JsObject, otter_gc::OutOfMemory> {
-        let roots = self.collect_runtime_roots();
-        let shape_root = self.shape_root();
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-        };
-        let obj = crate::object::alloc_host_object_with_shape_roots(
-            &mut self.gc_heap,
-            shape_root,
-            crate::object::DeferredNamespaceData {
-                target_url,
-                populated: std::cell::Cell::new(false),
-            },
-            &mut external_visit,
-        )?;
-        let tag_sym = self
-            .well_known_symbols
-            .get(crate::symbol::WellKnown::ToStringTag);
-        let module_str = crate::JsString::from_str("Deferred Module", &mut self.gc_heap)?;
-        crate::object::define_own_symbol_property(
-            obj,
-            &mut self.gc_heap,
-            tag_sym,
-            crate::object::PropertyDescriptor::data(
-                crate::Value::string(module_str),
-                false,
-                false,
-                false,
-            ),
-        );
-        Ok(obj)
+        self.with_handle_scope(|interp, scope| {
+            let shape_root = interp.shape_root();
+            let mut external_visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+            let obj = crate::object::alloc_host_object_with_shape_roots(
+                &mut interp.gc_heap,
+                shape_root,
+                crate::object::DeferredNamespaceData {
+                    target_url,
+                    populated: std::cell::Cell::new(false),
+                },
+                &mut external_visit,
+            )?;
+            let obj = interp.scoped_value(scope, Value::object(obj));
+            let module_str = crate::JsString::from_str("Deferred Module", &mut interp.gc_heap)?;
+            let module_str = interp.scoped_value(scope, Value::string(module_str));
+            let tag_sym = interp
+                .well_known_symbols
+                .get(crate::symbol::WellKnown::ToStringTag);
+            let obj_raw = interp
+                .escape_scoped(obj)
+                .as_object()
+                .expect("rooted deferred namespace remains an object");
+            let module_str = interp.escape_scoped(module_str);
+            crate::object::define_own_symbol_property(
+                obj_raw,
+                &mut interp.gc_heap,
+                tag_sym,
+                crate::object::PropertyDescriptor::data(module_str, false, false, false),
+            );
+            Ok(interp
+                .escape_scoped(obj)
+                .as_object()
+                .expect("rooted deferred namespace remains an object"))
+        })
     }
 
     /// Allocate a Module Namespace Exotic Object (ECMA-262 §10.4.6): a
@@ -202,39 +201,53 @@ impl Interpreter {
         env: crate::object::JsObject,
         module_url: std::sync::Arc<str>,
     ) -> Result<crate::object::JsObject, otter_gc::OutOfMemory> {
-        let roots = self.collect_runtime_roots();
-        let shape_root = self.shape_root();
-        let env_value = Value::object(env);
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-            env_value.trace_value_slots(visitor);
-        };
-        let obj = crate::object::alloc_host_object_with_shape_roots(
-            &mut self.gc_heap,
-            shape_root,
-            crate::object::ModuleNamespaceData { env, module_url },
-            &mut external_visit,
-        )?;
-        let tag_sym = self
-            .well_known_symbols
-            .get(crate::symbol::WellKnown::ToStringTag);
-        let module_str = crate::JsString::from_str("Module", &mut self.gc_heap)?;
-        crate::object::define_own_symbol_property(
-            obj,
-            &mut self.gc_heap,
-            tag_sym,
-            crate::object::PropertyDescriptor::data(
-                crate::Value::string(module_str),
-                false,
-                false,
-                false,
-            ),
-        );
-        // §10.4.6 namespaces are non-extensible from creation.
-        crate::object::prevent_extensions(obj, &mut self.gc_heap);
-        Ok(obj)
+        self.with_handle_scope(|interp, scope| {
+            let env = interp.scoped_value(scope, Value::object(env));
+            let shape_root = interp.shape_root();
+            let env_value = interp.escape_scoped(env);
+            let env_object = env_value
+                .as_object()
+                .expect("rooted module environment remains an object");
+            let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                env_value.trace_value_slots(visitor);
+            };
+            let obj = crate::object::alloc_host_object_with_shape_roots(
+                &mut interp.gc_heap,
+                shape_root,
+                crate::object::ModuleNamespaceData {
+                    env: env_object,
+                    module_url,
+                },
+                &mut external_visit,
+            )?;
+            let obj = interp.scoped_value(scope, Value::object(obj));
+            let module_str = crate::JsString::from_str("Module", &mut interp.gc_heap)?;
+            let module_str = interp.scoped_value(scope, Value::string(module_str));
+            let tag_sym = interp
+                .well_known_symbols
+                .get(crate::symbol::WellKnown::ToStringTag);
+            let obj_raw = interp
+                .escape_scoped(obj)
+                .as_object()
+                .expect("rooted module namespace remains an object");
+            let module_str = interp.escape_scoped(module_str);
+            crate::object::define_own_symbol_property(
+                obj_raw,
+                &mut interp.gc_heap,
+                tag_sym,
+                crate::object::PropertyDescriptor::data(module_str, false, false, false),
+            );
+            // §10.4.6 namespaces are non-extensible from creation.
+            let obj_raw = interp
+                .escape_scoped(obj)
+                .as_object()
+                .expect("rooted module namespace remains an object");
+            crate::object::prevent_extensions(obj_raw, &mut interp.gc_heap);
+            Ok(interp
+                .escape_scoped(obj)
+                .as_object()
+                .expect("rooted module namespace remains an object"))
+        })
     }
 
     pub(crate) fn alloc_runtime_rooted_object_with_proto(
@@ -245,12 +258,8 @@ impl Interpreter {
     ) -> Result<crate::object::JsObject, VmError> {
         self.with_handle_scope(|interp, scope| {
             let proto_handle = interp.scoped_value(scope, Value::object(proto));
-            let roots = interp.collect_runtime_roots();
             let shape_root = interp.shape_root();
             let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                for &slot in &roots {
-                    visitor(slot);
-                }
                 for value in value_roots {
                     value.trace_value_slots(visitor);
                 }
@@ -290,12 +299,9 @@ impl Interpreter {
         I: IntoIterator<Item = Value>,
     {
         let elements: Vec<Value> = elements.into_iter().collect();
-        let roots = self.collect_runtime_roots();
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let prototype = self.current_array_prototype_override();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
             if let Some(prototype) = &prototype {
                 prototype.trace_value_slots(visitor);
             }
@@ -331,12 +337,9 @@ impl Interpreter {
         I: IntoIterator<Item = Value>,
     {
         let elements: Vec<Value> = elements.into_iter().collect();
-        let roots = self.collect_runtime_roots();
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let prototype = self.current_array_prototype_override();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
             if let Some(prototype) = &prototype {
                 prototype.trace_value_slots(visitor);
             }
@@ -365,11 +368,8 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<Value, otter_gc::OutOfMemory> {
-        let roots = self.collect_runtime_roots();
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
             for value in value_roots {
                 value.trace_value_slots(visitor);
             }
@@ -400,11 +400,8 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<Value, otter_gc::OutOfMemory> {
-        let roots = self.collect_runtime_roots();
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
             for value in value_roots {
                 value.trace_value_slots(visitor);
             }
@@ -435,11 +432,8 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<Value, otter_gc::OutOfMemory> {
-        let roots = self.collect_runtime_roots();
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
             for value in value_roots {
                 value.trace_value_slots(visitor);
             }
@@ -466,12 +460,9 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<IteratorHandle, VmError> {
-        let roots = self.collect_runtime_roots();
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let prototype = self.iterator_prototype_override_for_state(&state);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
             if let Some(prototype) = &prototype {
                 prototype.trace_value_slots(visitor);
             }

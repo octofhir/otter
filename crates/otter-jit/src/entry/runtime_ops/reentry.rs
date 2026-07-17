@@ -877,10 +877,11 @@ pub(crate) extern "C" fn jit_construct_stub(
         return 2;
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
+    let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
     let mut inline_args = [0u16; crate::entry::MAX_METHOD_ARGS];
     let args = crate::entry::decode_packed_arg_regs(argc as usize, packed_args, &mut inline_args);
-    match vm.jit_runtime_construct_in_place(context, dst as u16, callee as u16, args, regs) {
+    match vm.jit_runtime_construct_in_place(context, stack, dst as u16, callee as u16, args, regs) {
         Ok(true) => 0,
         Ok(false) => 2,
         Err(err) => match try_resume_caller_throw(ctx, matches!(err, VmError::Uncaught)) {
@@ -920,8 +921,10 @@ pub(crate) extern "C" fn jit_loose_eq_stub(
         return 2;
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
+    let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
     match vm.jit_runtime_loose_equal_in_place(
+        stack,
         context,
         dst as u16,
         lhs as u16,

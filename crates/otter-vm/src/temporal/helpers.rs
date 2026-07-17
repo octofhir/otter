@@ -88,7 +88,8 @@ pub fn to_number_field(
                 name: class,
                 reason: "missing execution context".to_string(),
             })?;
-        let computed = ctx.cx.interp.number_for_number_ctor(&exec, value);
+        let computed =
+            ctx.with_turn_parts(|interp, stack| interp.number_for_number_ctor(stack, &exec, value));
         let n = computed
             .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))?;
         return Ok(n.as_f64());
@@ -221,7 +222,8 @@ pub fn read_option_string(
             name: class,
             reason: "missing execution context".to_string(),
         })?;
-    let coerced = ctx.cx.interp.coerce_to_string(&exec, &field);
+    let coerced =
+        ctx.with_turn_parts(|interp, stack| interp.coerce_to_string(stack, &exec, &field));
     coerced
         .map(Some)
         .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))
@@ -249,7 +251,9 @@ pub fn read_required_string(
                 name: class,
                 reason: "missing execution context".to_string(),
             })?;
-        let prim = ctx.cx.interp.to_primitive_string_hint_sync(&exec, field);
+        let prim = ctx.with_turn_parts(|interp, stack| {
+            interp.to_primitive_string_hint_sync(stack, &exec, field)
+        });
         prim.map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))?
     } else {
         field
@@ -313,7 +317,8 @@ pub fn parse_overflow(
             name: "Temporal",
             reason: "missing execution context".to_string(),
         })?;
-    let coerced = ctx.cx.interp.coerce_to_string(&exec, &field);
+    let coerced =
+        ctx.with_turn_parts(|interp, stack| interp.coerce_to_string(stack, &exec, &field));
     let s = coerced
         .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, "Temporal"))?;
     temporal_rs::options::Overflow::from_str(&s)
@@ -350,30 +355,14 @@ pub fn get_option_value(
     name: &str,
     class: &'static str,
 ) -> Result<Value, NativeError> {
-    use crate::native_function::vm_to_native_error;
-    let exec = ctx
-        .execution_context()
-        .cloned()
-        .ok_or_else(|| NativeError::TypeError {
-            name: class,
-            reason: "missing execution context".to_string(),
-        })?;
-    let key = crate::VmPropertyKey::String(name);
-    let got = ctx
-        .cx
-        .interp
-        .ordinary_get_value(&exec, options, options, &key, 0);
-    let outcome = got.map_err(|e| vm_to_native_error(ctx.cx.interp, e, class))?;
-    match outcome {
-        crate::VmGetOutcome::Value(v) => Ok(v),
-        crate::VmGetOutcome::InvokeGetter { getter } => {
-            let called =
-                ctx.cx
-                    .interp
-                    .run_callable_sync(&exec, &getter, options, smallvec::SmallVec::new());
-            called.map_err(|e| vm_to_native_error(ctx.cx.interp, e, class))
-        }
-    }
+    ctx.get_value_property(options, name)
+        .map_err(|error| match error {
+            NativeError::TypeError { reason, .. } => NativeError::TypeError {
+                name: class,
+                reason,
+            },
+            other => other,
+        })
 }
 
 pub fn opt_integer_if_integral(
@@ -651,7 +640,8 @@ pub fn parse_to_string_rounding_options(
                     name: class,
                     reason: "missing execution context".to_string(),
                 })?;
-            let coerced = ctx.cx.interp.coerce_to_string(&exec, &frac);
+            let coerced =
+                ctx.with_turn_parts(|interp, stack| interp.coerce_to_string(stack, &exec, &frac));
             let s = coerced
                 .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))?;
             if s == "auto" {

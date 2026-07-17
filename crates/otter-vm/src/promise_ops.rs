@@ -119,6 +119,7 @@ impl Interpreter {
         stack[top_idx].advance_pc()?;
         let result = promise_dispatch::statics_call(
             self,
+            stack,
             Some(context.clone()),
             None,
             method,

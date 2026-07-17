@@ -46,12 +46,12 @@ fn coerce_to_string(ctx: &mut NativeCtx<'_>, value: Value) -> Result<String, Nat
             .execution_context()
             .cloned()
             .ok_or_else(|| type_err("missing execution context"))?;
-        let prim = ctx.cx.interp.to_primitive_string_hint_sync(&exec, value);
-        let prim =
-            prim.map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, CLASS))?;
-        if let Some(s) = prim.as_string(ctx.heap()) {
-            return Ok(s.to_lossy_string(ctx.heap()));
-        }
+        let string = ctx.with_turn_parts(|interp, stack| {
+            crate::coerce::to_string_or_throw(interp, stack, &exec, &value)
+        });
+        return string.map_err(|error| {
+            crate::native_function::vm_to_native_error(ctx.interp_mut(), error, CLASS)
+        });
     }
     Err(type_err("locale value cannot be converted to a string"))
 }
@@ -61,10 +61,17 @@ fn has_property(ctx: &mut NativeCtx<'_>, object: Value, key: &str) -> Result<boo
         .execution_context()
         .cloned()
         .ok_or_else(|| type_err("missing execution context"))?;
-    ctx.cx
-        .interp
-        .ordinary_has_property_value(&exec, object, &crate::VmPropertyKey::String(key), 0)
-        .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, CLASS))
+    let result = ctx.with_turn_parts(|interp, stack| {
+        interp.ordinary_has_property_value(
+            stack,
+            &exec,
+            object,
+            &crate::VmPropertyKey::String(key),
+            0,
+        )
+    });
+    result
+        .map_err(|error| crate::native_function::vm_to_native_error(ctx.interp_mut(), error, CLASS))
 }
 
 fn validate_and_canon(tag: &str) -> Result<String, NativeError> {
@@ -157,41 +164,60 @@ pub fn canonicalize_locale_list(
     if locales.is_null() {
         return Err(type_err("locales argument cannot be null"));
     }
-    let object = if locales.is_object_type() || locales.as_array().is_some() {
-        locales
-    } else {
-        ctx.cx
-            .interp
-            .box_sloppy_this_primitive_runtime_rooted(locales, &[])
-            .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, CLASS))?
-    };
-    let len_v = get_option_value(ctx, object, "length", CLASS)?;
-    let len = to_length(ctx, &len_v)?;
-    for k in 0..len {
-        let key = k.to_string();
-        if !has_property(ctx, object, &key)? {
-            continue;
-        }
-        let kv = get_option_value(ctx, object, &key, CLASS)?;
-        // §step 7.c.ii — `If Type(kValue) is not String or Object,
-        // throw a TypeError` (covers undefined / null / boolean /
-        // number / symbol).
-        let tag = if let Some(intl) = kv.as_intl(ctx.heap()) {
-            match intl.payload_clone(ctx.heap()) {
-                IntlPayload::Locale(p) => p.locale,
-                _ => return Err(type_err("locale list element is not a string or object")),
-            }
-        } else if kv.as_string(ctx.heap()).is_some() || kv.is_object_type() {
-            coerce_to_string(ctx, kv)?
+    ctx.scope(|mut scope| {
+        let object_value = if locales.is_object_type() || locales.as_array().is_some() {
+            locales
         } else {
-            return Err(type_err("locale list element is not a string or object"));
+            scope
+                .context()
+                .interp_mut()
+                .box_sloppy_this_primitive_runtime_rooted(locales, &[])
+                .map_err(|error| {
+                    crate::native_function::vm_to_native_error(
+                        scope.context().interp_mut(),
+                        error,
+                        CLASS,
+                    )
+                })?
         };
-        let canon = validate_and_canon(&tag)?;
-        if !seen.contains(&canon) {
-            seen.push(canon);
+        let object = scope.value(object_value);
+        let object_value = scope.raw(object);
+        let length_value = get_option_value(scope.context(), object_value, "length", CLASS)?;
+        let length = scope.value(length_value);
+        let length_value = scope.raw(length);
+        let len = to_length(scope.context(), &length_value)?;
+        for k in 0..len {
+            let key = k.to_string();
+            let object_value = scope.raw(object);
+            if !has_property(scope.context(), object_value, &key)? {
+                continue;
+            }
+            let object_value = scope.raw(object);
+            let element_value = get_option_value(scope.context(), object_value, &key, CLASS)?;
+            let element = scope.value(element_value);
+            let element_value = scope.raw(element);
+            // §step 7.c.ii — `If Type(kValue) is not String or Object,
+            // throw a TypeError` (covers undefined / null / boolean /
+            // number / symbol).
+            let tag = if let Some(intl) = element_value.as_intl(scope.context().heap()) {
+                match intl.payload_clone(scope.context().heap()) {
+                    IntlPayload::Locale(p) => p.locale,
+                    _ => return Err(type_err("locale list element is not a string or object")),
+                }
+            } else if element_value.as_string(scope.context().heap()).is_some()
+                || element_value.is_object_type()
+            {
+                coerce_to_string(scope.context(), element_value)?
+            } else {
+                return Err(type_err("locale list element is not a string or object"));
+            };
+            let canon = validate_and_canon(&tag)?;
+            if !seen.contains(&canon) {
+                seen.push(canon);
+            }
         }
-    }
-    Ok(seen)
+        Ok(seen)
+    })
 }
 
 /// §7.1.20 ToLength on `Get(O, "length")` — applies a proper `ToNumber`
@@ -202,8 +228,10 @@ fn to_length(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<usize, NativeErro
         .execution_context()
         .cloned()
         .ok_or_else(|| type_err("missing execution context"))?;
-    let len = crate::coerce::to_length_or_throw(ctx.cx.interp, &exec, value);
-    len.map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, CLASS))
+    let len = ctx.with_turn_parts(|interp, stack| {
+        crate::coerce::to_length_or_throw(interp, stack, &exec, value)
+    });
+    len.map_err(|error| crate::native_function::vm_to_native_error(ctx.interp_mut(), error, CLASS))
 }
 
 /// A locale is "supported" iff ICU has likely-subtags data for its
@@ -285,8 +313,12 @@ pub(crate) fn supported_locales_of(
                 .execution_context()
                 .cloned()
                 .ok_or_else(|| type_err("missing execution context"))?;
-            let s = crate::coerce::to_string_or_throw(ctx.cx.interp, &exec, &lm)
-                .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, CLASS))?;
+            let string = ctx.with_turn_parts(|interp, stack| {
+                crate::coerce::to_string_or_throw(interp, stack, &exec, &lm)
+            });
+            let s = string.map_err(|error| {
+                crate::native_function::vm_to_native_error(ctx.interp_mut(), error, CLASS)
+            })?;
             if s != "lookup" && s != "best fit" {
                 return Err(range_err("invalid localeMatcher option"));
             }
@@ -535,8 +567,12 @@ pub(crate) fn supported_values_of(
         .execution_context()
         .cloned()
         .ok_or_else(|| type_err("missing execution context"))?;
-    let key = crate::coerce::to_string_or_throw(ctx.cx.interp, &exec, &key_v)
-        .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, CLASS))?;
+    let string = ctx.with_turn_parts(|interp, stack| {
+        crate::coerce::to_string_or_throw(interp, stack, &exec, &key_v)
+    });
+    let key = string.map_err(|error| {
+        crate::native_function::vm_to_native_error(ctx.interp_mut(), error, CLASS)
+    })?;
     let list: &[&str] = match key.as_str() {
         "calendar" => CALENDARS,
         "collation" => COLLATIONS,

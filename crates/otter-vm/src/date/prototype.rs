@@ -269,17 +269,38 @@ fn coerce_set_args(
     name: &'static str,
     args: &[Value],
 ) -> Result<SmallVec<[Value; 4]>, NativeError> {
-    let mut coerced: SmallVec<[Value; 4]> = args.iter().cloned().collect();
-    if let Some(exec) = ctx.execution_context().cloned() {
-        let interp = ctx.interp_mut();
-        for slot in coerced.iter_mut() {
-            let n = interp
-                .coerce_to_number(&exec, slot)
-                .map_err(|err| crate::native_function::vm_to_native_error(interp, err, name))?;
-            *slot = Value::number(n);
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name,
+            reason: "missing execution context".to_string(),
+        })?;
+    ctx.scope(|mut scope| {
+        let rooted_args: Vec<_> = args
+            .iter()
+            .copied()
+            .map(|value| scope.value(value))
+            .collect();
+        let mut coerced = SmallVec::with_capacity(rooted_args.len());
+        for value in rooted_args {
+            let value = scope.raw(value);
+            let number = scope
+                .with_turn_parts(|interp, stack| interp.coerce_to_number(stack, &exec, &value));
+            let number = match number {
+                Ok(number) => number,
+                Err(error) => {
+                    return Err(crate::native_function::vm_to_native_error(
+                        scope.context().interp_mut(),
+                        error,
+                        name,
+                    ));
+                }
+            };
+            coerced.push(Value::number(number));
         }
-    }
-    Ok(coerced)
+        Ok(coerced)
+    })
 }
 
 /// Read `coerced[idx]` as `f64`; a missing slot falls back to the
@@ -404,8 +425,8 @@ fn set_full_year_base_components(time: f64, use_utc: bool) -> Components {
 }
 
 fn finish_set(
-    obj: JsObject,
     ctx: &mut NativeCtx<'_>,
+    name: &'static str,
     c: Components,
     use_utc: bool,
 ) -> Result<Value, NativeError> {
@@ -415,6 +436,10 @@ fn finish_set(
     } else {
         super::make_local_date(year, month, day, hour, minute, second, ms)
     };
+    // Argument coercion can synchronously re-enter JavaScript and move the
+    // receiver. Re-read the exact native-call root instead of retaining the
+    // pre-coercion `JsObject` cage offset.
+    let (obj, _) = this_handle(ctx, name)?;
     object::set_date_data(obj, ctx.heap_mut(), new_ms);
     let written = object::date_data(obj, ctx.heap()).unwrap_or(f64::NAN);
     Ok(Value::number_f64(written))
@@ -426,9 +451,10 @@ fn set_time_impl(
     args: &[Value],
     name: &'static str,
 ) -> Result<Value, NativeError> {
-    let (obj, _) = this_handle(ctx, name)?;
+    let _ = this_handle(ctx, name)?;
     let coerced = coerce_set_args(ctx, name, args)?;
     let ms = read_primary_arg_number(&coerced);
+    let (obj, _) = this_handle(ctx, name)?;
     object::set_date_data(obj, ctx.heap_mut(), ms);
     let written = object::date_data(obj, ctx.heap()).unwrap_or(f64::NAN);
     Ok(Value::number_f64(written))
@@ -441,7 +467,7 @@ fn set_full_year_impl(
     args: &[Value],
     name: &'static str,
 ) -> Result<Value, NativeError> {
-    let (obj, time) = this_handle(ctx, name)?;
+    let (_, time) = this_handle(ctx, name)?;
     let coerced = coerce_set_args(ctx, name, args)?;
     let use_utc = name.contains("UTC");
     let mut c = set_full_year_base_components(time, use_utc);
@@ -452,7 +478,7 @@ fn set_full_year_impl(
     if coerced.len() >= 3 {
         c.2 = read_arg_number(&coerced, 2, c.2);
     }
-    finish_set(obj, ctx, c, use_utc)
+    finish_set(ctx, name, c, use_utc)
 }
 
 /// §21.4.4.x component setters (`setMonth` … `setMilliseconds`) — step
@@ -462,7 +488,7 @@ fn set_month_impl(
     args: &[Value],
     name: &'static str,
 ) -> Result<Value, NativeError> {
-    let (obj, time) = this_handle(ctx, name)?;
+    let (_, time) = this_handle(ctx, name)?;
     let coerced = coerce_set_args(ctx, name, args)?;
     if time.is_nan() {
         return Ok(nan());
@@ -473,7 +499,7 @@ fn set_month_impl(
     if coerced.len() >= 2 {
         c.2 = read_arg_number(&coerced, 1, c.2);
     }
-    finish_set(obj, ctx, c, use_utc)
+    finish_set(ctx, name, c, use_utc)
 }
 
 fn set_date_impl(
@@ -481,7 +507,7 @@ fn set_date_impl(
     args: &[Value],
     name: &'static str,
 ) -> Result<Value, NativeError> {
-    let (obj, time) = this_handle(ctx, name)?;
+    let (_, time) = this_handle(ctx, name)?;
     let coerced = coerce_set_args(ctx, name, args)?;
     if time.is_nan() {
         return Ok(nan());
@@ -489,7 +515,7 @@ fn set_date_impl(
     let use_utc = name.contains("UTC");
     let mut c = current_components(time, use_utc);
     c.2 = read_primary_arg_number(&coerced);
-    finish_set(obj, ctx, c, use_utc)
+    finish_set(ctx, name, c, use_utc)
 }
 
 fn set_hours_impl(
@@ -497,7 +523,7 @@ fn set_hours_impl(
     args: &[Value],
     name: &'static str,
 ) -> Result<Value, NativeError> {
-    let (obj, time) = this_handle(ctx, name)?;
+    let (_, time) = this_handle(ctx, name)?;
     let coerced = coerce_set_args(ctx, name, args)?;
     if time.is_nan() {
         return Ok(nan());
@@ -514,7 +540,7 @@ fn set_hours_impl(
     if coerced.len() >= 4 {
         c.6 = read_arg_number(&coerced, 3, c.6);
     }
-    finish_set(obj, ctx, c, use_utc)
+    finish_set(ctx, name, c, use_utc)
 }
 
 fn set_minutes_impl(
@@ -522,7 +548,7 @@ fn set_minutes_impl(
     args: &[Value],
     name: &'static str,
 ) -> Result<Value, NativeError> {
-    let (obj, time) = this_handle(ctx, name)?;
+    let (_, time) = this_handle(ctx, name)?;
     let coerced = coerce_set_args(ctx, name, args)?;
     if time.is_nan() {
         return Ok(nan());
@@ -536,7 +562,7 @@ fn set_minutes_impl(
     if coerced.len() >= 3 {
         c.6 = read_arg_number(&coerced, 2, c.6);
     }
-    finish_set(obj, ctx, c, use_utc)
+    finish_set(ctx, name, c, use_utc)
 }
 
 fn set_seconds_impl(
@@ -544,7 +570,7 @@ fn set_seconds_impl(
     args: &[Value],
     name: &'static str,
 ) -> Result<Value, NativeError> {
-    let (obj, time) = this_handle(ctx, name)?;
+    let (_, time) = this_handle(ctx, name)?;
     let coerced = coerce_set_args(ctx, name, args)?;
     if time.is_nan() {
         return Ok(nan());
@@ -555,7 +581,7 @@ fn set_seconds_impl(
     if coerced.len() >= 2 {
         c.6 = read_arg_number(&coerced, 1, c.6);
     }
-    finish_set(obj, ctx, c, use_utc)
+    finish_set(ctx, name, c, use_utc)
 }
 
 fn set_milliseconds_impl(
@@ -563,7 +589,7 @@ fn set_milliseconds_impl(
     args: &[Value],
     name: &'static str,
 ) -> Result<Value, NativeError> {
-    let (obj, time) = this_handle(ctx, name)?;
+    let (_, time) = this_handle(ctx, name)?;
     let coerced = coerce_set_args(ctx, name, args)?;
     if time.is_nan() {
         return Ok(nan());
@@ -571,7 +597,7 @@ fn set_milliseconds_impl(
     let use_utc = name.contains("UTC");
     let mut c = current_components(time, use_utc);
     c.6 = read_primary_arg_number(&coerced);
-    finish_set(obj, ctx, c, use_utc)
+    finish_set(ctx, name, c, use_utc)
 }
 
 /// §B.2.4.1 — `Date.prototype.getYear()` returns `year - 1900`.
@@ -592,10 +618,11 @@ fn set_year_impl(
     args: &[Value],
     name: &'static str,
 ) -> Result<Value, NativeError> {
-    let (obj, time) = this_handle(ctx, name)?;
+    let (_, time) = this_handle(ctx, name)?;
     let coerced = coerce_set_args(ctx, name, args)?;
     let y = read_primary_arg_number(&coerced);
     if y.is_nan() {
+        let (obj, _) = this_handle(ctx, name)?;
         object::set_date_data(obj, ctx.heap_mut(), f64::NAN);
         return Ok(Value::number_f64(f64::NAN));
     }
@@ -607,7 +634,7 @@ fn set_year_impl(
     };
     let mut c = set_full_year_base_components(time, false);
     c.0 = yyyy;
-    finish_set(obj, ctx, c, false)
+    finish_set(ctx, name, c, false)
 }
 
 /// Generates a thin `bridge_*` native per JS method name (binding the
@@ -699,84 +726,118 @@ date_prototype_methods!(
 /// - <https://tc39.es/ecma262/#sec-invoke>
 fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     const NAME: &str = "Date.prototype.toJSON";
-    let receiver = *ctx.this_value();
-    // §7.1.18 ToObject(undefined / null) → TypeError.
-    if receiver.is_undefined() || receiver.is_null() {
-        return Err(NativeError::TypeError {
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
             name: NAME,
-            reason: "Cannot convert undefined or null to object".to_string(),
-        });
-    }
-
-    let (interp, exec) = ctx.interp_mut_and_context();
-    let exec = exec.ok_or_else(|| NativeError::TypeError {
-        name: NAME,
-        reason: "missing execution context".to_string(),
-    })?;
-
-    // Step 2 — ToPrimitive(O, number).
-    let tv = match interp.evaluate_to_primitive(&exec, &receiver, ToPrimitiveHint::Number) {
-        Ok(v) => v,
-        Err(err) => return Err(vm_to_native(interp, NAME, err)),
-    };
-    // Step 3 — non-finite Number → null.
-    if let Some(n) = tv.as_number()
-        && !n.as_f64().is_finite()
-    {
-        return Ok(Value::null());
-    }
-
-    // Step 4 — Invoke(O, "toISOString").
-    let receiver_is_primitive = receiver.is_number()
-        || receiver.is_boolean()
-        || receiver.is_string()
-        || receiver.is_symbol();
-    let method_outcome = if receiver_is_primitive {
-        let proto = interp
-            .intrinsic_prototype_object_for(&receiver)
-            .ok_or_else(|| NativeError::TypeError {
+            reason: "missing execution context".to_string(),
+        })?;
+    ctx.scope(|mut scope| {
+        let receiver = scope.this();
+        let receiver_value = scope.raw(receiver);
+        // §7.1.18 ToObject(undefined / null) → TypeError.
+        if receiver_value.is_nullish() {
+            return Err(NativeError::TypeError {
                 name: NAME,
-                reason: "no intrinsic prototype for receiver".to_string(),
-            })?;
-        interp.ordinary_get_value(
-            &exec,
-            Value::object(proto),
-            receiver,
-            &VmPropertyKey::String("toISOString"),
-            0,
-        )
-    } else {
-        interp.ordinary_get_value(
-            &exec,
-            receiver,
-            receiver,
-            &VmPropertyKey::String("toISOString"),
-            0,
-        )
-    };
-    let method = match method_outcome {
-        Ok(v) => v,
-        Err(err) => return Err(vm_to_native(interp, NAME, err)),
-    };
-    let method = match method {
-        VmGetOutcome::Value(v) => v,
-        VmGetOutcome::InvokeGetter { getter } => {
-            match interp.run_callable_sync(&exec, &getter, receiver, SmallVec::new()) {
-                Ok(v) => v,
-                Err(err) => return Err(vm_to_native(interp, NAME, err)),
-            }
+                reason: "Cannot convert undefined or null to object".to_string(),
+            });
         }
-    };
-    if !abstract_ops::is_callable(&method) {
-        return Err(NativeError::TypeError {
-            name: NAME,
-            reason: "toISOString is not callable".to_string(),
+
+        // Step 2 — ToPrimitive(O, number).
+        let primitive = scope.with_turn_parts(|interp, stack| {
+            interp.evaluate_to_primitive(stack, &exec, &receiver_value, ToPrimitiveHint::Number)
         });
-    }
-    match interp.run_callable_sync(&exec, &method, receiver, SmallVec::new()) {
-        Ok(v) => Ok(v),
-        Err(err) => Err(vm_to_native(interp, NAME, err)),
-    }
+        let primitive = match primitive {
+            Ok(value) => value,
+            Err(error) => return Err(vm_to_native(scope.context().interp_mut(), NAME, error)),
+        };
+        // Step 3 — non-finite Number → null.
+        if let Some(number) = primitive.as_number()
+            && !number.as_f64().is_finite()
+        {
+            return Ok(Value::null());
+        }
+
+        // Step 4 — Invoke(O, "toISOString"). Re-read the receiver after the
+        // observable ToPrimitive step because a moving collection may have
+        // rewritten its handle slot.
+        let receiver_value = scope.raw(receiver);
+        let base = if abstract_ops::is_primitive(&receiver_value) {
+            let prototype = scope
+                .context()
+                .interp_mut()
+                .intrinsic_prototype_object_for(&receiver_value)
+                .ok_or_else(|| NativeError::TypeError {
+                    name: NAME,
+                    reason: "no intrinsic prototype for receiver".to_string(),
+                })?;
+            Value::object(prototype)
+        } else {
+            receiver_value
+        };
+        let method_outcome = scope.with_turn_parts(|interp, stack| {
+            interp.ordinary_get_value(
+                stack,
+                &exec,
+                base,
+                receiver_value,
+                &VmPropertyKey::String("toISOString"),
+                0,
+            )
+        });
+        let method_outcome = match method_outcome {
+            Ok(outcome) => outcome,
+            Err(error) => return Err(vm_to_native(scope.context().interp_mut(), NAME, error)),
+        };
+        let method_value = match method_outcome {
+            VmGetOutcome::Value(value) => value,
+            VmGetOutcome::InvokeGetter { getter } => {
+                let getter = scope.value(getter);
+                let getter_value = scope.raw(getter);
+                let receiver_value = scope.raw(receiver);
+                let result = scope.with_turn_parts(|interp, stack| {
+                    interp.run_callable_sync_rooted(
+                        stack,
+                        &exec,
+                        &getter_value,
+                        receiver_value,
+                        SmallVec::new(),
+                    )
+                });
+                match result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Err(vm_to_native(scope.context().interp_mut(), NAME, error));
+                    }
+                }
+            }
+        };
+        let method = scope.value(method_value);
+        if !abstract_ops::is_callable(&scope.raw(method)) {
+            return Err(NativeError::TypeError {
+                name: NAME,
+                reason: "toISOString is not callable".to_string(),
+            });
+        }
+        let method_value = scope.raw(method);
+        let receiver_value = scope.raw(receiver);
+        let result = scope.with_turn_parts(|interp, stack| {
+            interp.run_callable_sync_rooted(
+                stack,
+                &exec,
+                &method_value,
+                receiver_value,
+                SmallVec::new(),
+            )
+        });
+        let result = match result {
+            Ok(value) => value,
+            Err(error) => return Err(vm_to_native(scope.context().interp_mut(), NAME, error)),
+        };
+        let result = scope.value(result);
+        Ok(scope.finish(result))
+    })
 }
 
 /// `VmError → NativeError` mapper for the generic `toJSON` bridge.

@@ -8,8 +8,8 @@
 //! - Packed-operand dispatch for the template-tier reentrant stub.
 //!
 //! # Invariants
-//! - Calls and constructions run through `run_callable_sync_already_rooted` or
-//!   `run_construct_sync_already_rooted`; JIT code owns no JS call semantics.
+//! - Calls and constructions append to the current rooted activation stack;
+//!   JIT code owns no parallel JS call semantics.
 //! - No frame borrow survives reentrant completion; the destination is
 //!   re-borrowed from the published stack afterwards.
 //! - Spread validation order matches interpreter dispatch.
@@ -184,6 +184,7 @@ impl Interpreter {
 
     fn run_rooted_call_values(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         callee: Value,
         this_value: Value,
@@ -197,22 +198,23 @@ impl Interpreter {
             self.push_iteration_anchor(value);
         }
         let args_len = self.module_root_depth() - args_start;
-        let run = |interp: &mut Self| {
+        let run = |interp: &mut Self, stack: &mut ActivationStack| {
             let callee = interp.iteration_anchor(callee_anchor);
             let this_value = interp.iteration_anchor(this_anchor);
             let mut rooted_args = SmallVec::with_capacity(args_len);
             for index in args_start..args_start + args_len {
                 rooted_args.push(interp.iteration_anchor(index));
             }
-            interp.run_callable_sync_already_rooted(context, &callee, this_value, rooted_args)
+            interp.run_callable_sync_rooted(stack, context, &callee, this_value, rooted_args)
         };
-        let result = run(self);
+        let result = run(self, stack);
         self.pop_iteration_anchors_to(anchor_base);
         result
     }
 
     fn run_rooted_construct_values(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         callee: Value,
         new_target: Value,
@@ -226,16 +228,16 @@ impl Interpreter {
             self.push_iteration_anchor(value);
         }
         let args_len = self.module_root_depth() - args_start;
-        let run = |interp: &mut Self| {
+        let run = |interp: &mut Self, stack: &mut ActivationStack| {
             let callee = interp.iteration_anchor(callee_anchor);
             let new_target = interp.iteration_anchor(new_target_anchor);
             let mut rooted_args = SmallVec::with_capacity(args_len);
             for index in args_start..args_start + args_len {
                 rooted_args.push(interp.iteration_anchor(index));
             }
-            interp.run_construct_sync_already_rooted(context, &callee, new_target, rooted_args)
+            interp.run_construct_sync_rooted(stack, context, &callee, new_target, rooted_args)
         };
-        let result = run(self);
+        let result = run(self, stack);
         self.pop_iteration_anchors_to(anchor_base);
         result
     }
@@ -254,7 +256,7 @@ impl Interpreter {
         let callee = *read_register(&stack[frame_index], callee_reg)?;
         let this_value = *read_register(&stack[frame_index], this_reg)?;
         let args = self.spread_arguments(stack, frame_index, args_reg)?;
-        let result = self.run_rooted_call_values(context, callee, this_value, args)?;
+        let result = self.run_rooted_call_values(stack, context, callee, this_value, args)?;
         let frame = &mut stack[frame_index];
         write_register(frame, dst, result)?;
         frame.advance_pc()?;
@@ -281,7 +283,7 @@ impl Interpreter {
         for &reg in arg_regs {
             args.push(*read_register(&stack[frame_index], reg)?);
         }
-        let result = self.run_rooted_call_values(context, callee, this_value, args)?;
+        let result = self.run_rooted_call_values(stack, context, callee, this_value, args)?;
         let frame = &mut stack[frame_index];
         write_register(frame, dst, result)?;
         frame.advance_pc()?;
@@ -311,7 +313,7 @@ impl Interpreter {
             callee
         };
         let args = self.spread_arguments(stack, frame_index, args_reg)?;
-        let result = self.run_rooted_construct_values(context, callee, new_target, args)?;
+        let result = self.run_rooted_construct_values(stack, context, callee, new_target, args)?;
         let frame = &mut stack[frame_index];
         write_register(frame, dst, result)?;
         frame.advance_pc()?;

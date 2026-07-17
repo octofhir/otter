@@ -351,32 +351,48 @@ pub(crate) fn string_proto_iterator(
             reason: "called on null or undefined".to_string(),
         });
     }
-    let string = if let Some(s) = this.as_string(ctx.heap()) {
-        s
-    } else if let Some(obj) = this.as_object()
-        && let Some(s) = crate::object::string_data(obj, ctx.heap())
-    {
-        s
-    } else {
-        let (interp, exec) = ctx.interp_mut_and_context();
-        let exec = exec.ok_or_else(|| NativeError::TypeError {
-            name: NAME,
-            reason: "missing execution context".to_string(),
-        })?;
-        let text = interp
-            .coerce_to_string(&exec, &this)
-            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))?;
-        JsString::from_str(&text, ctx.heap_mut()).map_err(|_| NativeError::TypeError {
-            name: NAME,
-            reason: "out of memory".to_string(),
-        })?
-    };
-    let state = IteratorState::String { string, index: 0 };
-    Ok(Value::iterator(ctx.alloc_iterator_state(
-        state,
-        &[],
-        &[],
-    )?))
+    let exec = ctx.execution_context().cloned();
+    ctx.scope(|mut scope| {
+        let this = scope.value(this);
+        let this_raw = scope.raw(this);
+        let string = if let Some(string) = this_raw.as_string(scope.context().heap()) {
+            scope.value(Value::string(string))
+        } else if let Some(obj) = this_raw.as_object()
+            && let Some(string) = crate::object::string_data(obj, scope.context().heap())
+        {
+            scope.value(Value::string(string))
+        } else {
+            let exec = exec.ok_or_else(|| NativeError::TypeError {
+                name: NAME,
+                reason: "missing execution context".to_string(),
+            })?;
+            let text = scope.with_turn_parts(|interp, stack| {
+                interp
+                    .coerce_to_string(stack, &exec, &this_raw)
+                    .map_err(|error| {
+                        crate::native_function::vm_to_native_error(interp, error, NAME)
+                    })
+            })?;
+            scope.string(&text)?
+        };
+        let string_raw = scope
+            .raw(string)
+            .as_string(scope.context().heap())
+            .expect("rooted string coercion result stays a string");
+        let state = IteratorState::String {
+            string: string_raw,
+            index: 0,
+        };
+        let iterator = scope
+            .context()
+            .alloc_iterator_state(state, &[], &[])
+            .map_err(|_| NativeError::TypeError {
+                name: NAME,
+                reason: "out of memory".to_string(),
+            })?;
+        let iterator = scope.value(Value::iterator(iterator));
+        Ok(scope.finish(iterator))
+    })
 }
 
 /// Install `String.prototype[Symbol.iterator]` per §22.1.3.34.

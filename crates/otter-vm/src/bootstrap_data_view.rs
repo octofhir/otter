@@ -82,8 +82,10 @@ fn ctor_to_index(ctx: &mut NativeCtx<'_>, value: Option<&Value>) -> Result<usize
             name: "DataView",
             reason: "missing execution context".to_string(),
         })?;
-    let number = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, value)
-        .map_err(|e| crate::native_function::vm_to_native_error(ctx.interp_mut(), e, "DataView"))?;
+    let number = ctx.with_turn_parts(|interp, stack| {
+        crate::coerce::to_number_or_throw(interp, stack, &exec, value)
+            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "DataView"))
+    })?;
     let n = number.as_f64();
     let integer = if n.is_nan() { 0.0 } else { n.trunc() };
     if !(0.0..=9_007_199_254_740_991.0).contains(&integer) {
@@ -102,37 +104,51 @@ fn data_view_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
             reason: "constructor requires 'new'".to_string(),
         });
     }
-    // §25.3.2.1 in spec order: require an ArrayBuffer argument, ToIndex
-    // the byteOffset (whose coercion may detach the buffer), only then
-    // check the detached state, the offset bound, and finally ToIndex
-    // the byteLength against the offset.
-    let buffer = args
-        .first()
-        .and_then(|v| v.as_array_buffer())
-        .ok_or_else(|| NativeError::TypeError {
-            name: "DataView",
-            reason: "First argument to DataView constructor must be an ArrayBuffer".to_string(),
-        })?;
-    let byte_offset = ctor_to_index(ctx, args.get(1))?;
-    if buffer.is_detached(ctx.heap()) {
-        return Err(NativeError::TypeError {
-            name: "DataView",
-            reason: "Cannot construct a DataView with a detached ArrayBuffer".to_string(),
-        });
-    }
-    let buffer_byte_length = buffer.byte_length(ctx.heap());
-    if byte_offset > buffer_byte_length {
-        return Err(NativeError::RangeError {
-            name: "DataView",
-            reason: "Start offset is outside the bounds of the buffer".to_string(),
-        });
-    }
-    let length_absent = args.get(2).is_none() || args.get(2).is_some_and(|v| v.is_undefined());
-    let byte_length = match args.get(2) {
-        None => buffer_byte_length - byte_offset,
-        Some(v) if v.is_undefined() => buffer_byte_length - byte_offset,
-        Some(_) => {
-            let requested = ctor_to_index(ctx, args.get(2))?;
+    ctx.scope(|mut scope| {
+        // §25.3.2.1 in spec order: require an ArrayBuffer argument, ToIndex
+        // the byteOffset (whose coercion may detach the buffer), only then
+        // check the detached state, the offset bound, and finally ToIndex
+        // the byteLength against the offset.
+        let buffer_value = scope.argument(args, 0);
+        if scope.raw(buffer_value).as_array_buffer().is_none() {
+            return Err(NativeError::TypeError {
+                name: "DataView",
+                reason: "First argument to DataView constructor must be an ArrayBuffer".to_string(),
+            });
+        }
+        let offset_value = scope.argument(args, 1);
+        let byte_offset = {
+            let offset = scope.raw(offset_value);
+            ctor_to_index(scope.context(), Some(&offset))?
+        };
+        let buffer =
+            scope
+                .raw(buffer_value)
+                .as_array_buffer()
+                .ok_or_else(|| NativeError::TypeError {
+                    name: "DataView",
+                    reason: "ArrayBuffer root changed kind during construction".to_string(),
+                })?;
+        if buffer.is_detached(scope.context().heap()) {
+            return Err(NativeError::TypeError {
+                name: "DataView",
+                reason: "Cannot construct a DataView with a detached ArrayBuffer".to_string(),
+            });
+        }
+        let buffer_byte_length = buffer.byte_length(scope.context().heap());
+        if byte_offset > buffer_byte_length {
+            return Err(NativeError::RangeError {
+                name: "DataView",
+                reason: "Start offset is outside the bounds of the buffer".to_string(),
+            });
+        }
+        let length_value = scope.argument(args, 2);
+        let length_absent = scope.raw(length_value).is_undefined();
+        let byte_length = if length_absent {
+            buffer_byte_length - byte_offset
+        } else {
+            let length = scope.raw(length_value);
+            let requested = ctor_to_index(scope.context(), Some(&length))?;
             if byte_offset + requested > buffer_byte_length {
                 return Err(NativeError::RangeError {
                     name: "DataView",
@@ -140,50 +156,90 @@ fn data_view_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
                 });
             }
             requested
-        }
-    };
-    // §25.3.2.1 step 10 — GetPrototypeFromConstructor may run user code. The
-    // initial offset/length bounds above must happen first, but the buffer must
-    // be revalidated after this observable lookup before a view is installed.
-    let needs_proto_override = ctx.new_target().is_none_or(|v| !v.is_native_function());
-    let proto_override = if needs_proto_override {
-        crate::bootstrap::native_new_target_prototype(ctx, "DataView")?
-    } else {
-        None
-    };
-    if buffer.is_detached(ctx.heap()) {
-        return Err(NativeError::TypeError {
-            name: "DataView",
-            reason: "Cannot construct a DataView with a detached ArrayBuffer".to_string(),
-        });
-    }
-    let current_buffer_byte_length = buffer.byte_length(ctx.heap());
-    if byte_offset > current_buffer_byte_length
-        || (!length_absent && byte_offset + byte_length > current_buffer_byte_length)
-    {
-        return Err(NativeError::RangeError {
-            name: "DataView",
-            reason: "Invalid DataView length".to_string(),
-        });
-    }
-    let view =
-        crate::binary::data_view::JsDataView::new(ctx.heap_mut(), buffer, byte_offset, byte_length)
-            .map_err(|_| NativeError::TypeError {
+        };
+
+        // §25.3.2.1 step 10 — GetPrototypeFromConstructor may run user code.
+        // Re-read every rooted value after it before installing the view.
+        let needs_proto_override = scope
+            .context()
+            .new_target()
+            .is_none_or(|value| !value.is_native_function());
+        let proto_override = if needs_proto_override {
+            crate::bootstrap::native_new_target_prototype(scope.context(), "DataView")?
+                .map(|value| scope.value(value))
+        } else {
+            None
+        };
+        let buffer =
+            scope
+                .raw(buffer_value)
+                .as_array_buffer()
+                .ok_or_else(|| NativeError::TypeError {
+                    name: "DataView",
+                    reason: "ArrayBuffer root changed kind during construction".to_string(),
+                })?;
+        if buffer.is_detached(scope.context().heap()) {
+            return Err(NativeError::TypeError {
                 name: "DataView",
-                reason: "out of memory".to_string(),
-            })?;
-    // §25.3.2.1 — an absent byteLength over a length-resizable buffer
-    // (resizable ArrayBuffer or growable SharedArrayBuffer) makes the
-    // view length-tracking (AUTO byte length).
-    if length_absent && (buffer.is_resizable(ctx.heap()) || buffer.is_growable(ctx.heap())) {
-        view.set_length_tracking(ctx.heap_mut());
-    }
-    let value = Value::data_view(view);
-    if let Some(proto) = proto_override {
-        ctx.interp_mut()
-            .set_non_gc_exotic_prototype_override(&value, Some(proto));
-    }
-    Ok(value)
+                reason: "Cannot construct a DataView with a detached ArrayBuffer".to_string(),
+            });
+        }
+        let current_buffer_byte_length = buffer.byte_length(scope.context().heap());
+        if byte_offset > current_buffer_byte_length
+            || (!length_absent && byte_offset + byte_length > current_buffer_byte_length)
+        {
+            return Err(NativeError::RangeError {
+                name: "DataView",
+                reason: "Invalid DataView length".to_string(),
+            });
+        }
+        let view = crate::binary::data_view::JsDataView::new(
+            scope.context().heap_mut(),
+            buffer,
+            byte_offset,
+            byte_length,
+        )
+        .map_err(|_| NativeError::TypeError {
+            name: "DataView",
+            reason: "out of memory".to_string(),
+        })?;
+        let view_value = scope.value(Value::data_view(view));
+
+        // §25.3.2.1 — an absent byteLength over a length-resizable buffer
+        // (resizable ArrayBuffer or growable SharedArrayBuffer) makes the
+        // view length-tracking (AUTO byte length).
+        let buffer =
+            scope
+                .raw(buffer_value)
+                .as_array_buffer()
+                .ok_or_else(|| NativeError::TypeError {
+                    name: "DataView",
+                    reason: "ArrayBuffer root changed kind during construction".to_string(),
+                })?;
+        if length_absent
+            && (buffer.is_resizable(scope.context().heap())
+                || buffer.is_growable(scope.context().heap()))
+        {
+            let view =
+                scope
+                    .raw(view_value)
+                    .as_data_view()
+                    .ok_or_else(|| NativeError::TypeError {
+                        name: "DataView",
+                        reason: "DataView root changed kind during construction".to_string(),
+                    })?;
+            view.set_length_tracking(scope.context().heap_mut());
+        }
+        if let Some(proto) = proto_override {
+            let value = scope.raw(view_value);
+            let proto = scope.raw(proto);
+            scope
+                .context()
+                .interp_mut()
+                .set_non_gc_exotic_prototype_override(&value, Some(proto));
+        }
+        Ok(scope.finish(view_value))
+    })
 }
 
 // ---------------------------------------------------------------

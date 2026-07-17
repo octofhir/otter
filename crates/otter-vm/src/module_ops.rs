@@ -26,6 +26,8 @@
 //!   namespace table.
 //! - Dynamic import always writes a Promise to the destination register.
 //! - `import.meta.resolve` accepts only string specifiers.
+//! - Module init, deferred-namespace accessors, and async continuation jobs
+//!   re-enter above an activation floor on the current rooted runtime turn.
 //!
 //! # See also
 //! - [`crate::module_records`]
@@ -194,7 +196,7 @@ impl Interpreter {
             .string_constant_str_for_function(function_id, url_idx)
             .ok_or(VmError::InvalidOperand)?
             .to_string();
-        let gate = self.evaluate_module(context, &url)?;
+        let gate = self.evaluate_module(stack, context, &url)?;
         let value = gate.map_or_else(Value::undefined, Value::promise);
         let frame = &mut stack[frame_index];
         write_register(frame, dst, value)?;
@@ -226,6 +228,7 @@ impl Interpreter {
     /// `TypeError` (§28.3 ReadyForSyncExecution), not a parked promise.
     pub(crate) fn evaluate_module_rec(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         url: &str,
     ) -> Result<(), VmError> {
@@ -241,7 +244,7 @@ impl Interpreter {
                 .into(),
             ));
         }
-        self.evaluate_module(context, url).map(|_| ())
+        self.evaluate_module(stack, context, url).map(|_| ())
     }
 
     /// §16.2.1.4 Evaluate over interpreter-owned records.
@@ -263,6 +266,7 @@ impl Interpreter {
     /// propagates infrastructure failures from the init body.
     pub fn evaluate_module(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         url: &str,
     ) -> Result<Option<crate::promise::JsPromiseHandle>, VmError> {
@@ -302,13 +306,13 @@ impl Interpreter {
         // function declarations for every module in the subtree
         // before ANY body evaluates, so cyclic importers observe the
         // exporting module's functions during their own evaluation.
-        self.hoist_module_subtree(context, &url_arc)?;
+        self.hoist_module_subtree(stack, context, &url_arc)?;
         let mut state = ModuleEvalState {
             stack: Vec::new(),
             next_index: 0,
         };
         self.module_evaluation_depth += 1;
-        let evaluation = self.inner_module_evaluation(context, &mut state, &url_arc);
+        let evaluation = self.inner_module_evaluation(stack, context, &mut state, &url_arc);
         self.module_evaluation_depth -= 1;
         match evaluation {
             Ok(()) => {
@@ -332,6 +336,7 @@ impl Interpreter {
     /// while a top-level-await module is suspended.
     fn inner_module_evaluation(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         state: &mut ModuleEvalState,
         url_arc: &std::sync::Arc<str>,
@@ -387,7 +392,7 @@ impl Interpreter {
         }
         for dep in deps {
             let dep_arc: std::sync::Arc<str> = std::sync::Arc::from(dep.as_str());
-            self.inner_module_evaluation(context, state, &dep_arc)?;
+            self.inner_module_evaluation(stack, context, state, &dep_arc)?;
             // Step 11.c — post-recursion bookkeeping against the dep's
             // (possibly cycle-root) record.
             let dep_status = self.module_record_status(&dep);
@@ -443,8 +448,7 @@ impl Interpreter {
             // order. The per-module gate promise generalises the
             // spec's capability-on-cycle-root.
             let gate = promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .pending_runtime_rooted(self, &[], &[])
-                .map_err(VmError::from)?;
+                .pending_stack_rooted(self, stack, &[], &[])?;
             let order = self.next_module_async_order;
             self.next_module_async_order += 1;
             {
@@ -457,11 +461,11 @@ impl Interpreter {
                 // Step 12.c — ExecuteAsyncModule now; with pending
                 // deps the init runs later, triggered by the last
                 // dep's fulfilled-walk.
-                self.execute_async_module(context, url_arc)?;
+                self.execute_async_module(stack, context, url_arc)?;
             }
         } else {
             // Step 13 — synchronous body; status flips at SCC pop.
-            self.run_module_body_sync(context, url, url_arc)?;
+            self.run_module_body_sync(stack, context, url, url_arc)?;
         }
 
         // Steps 14–16 — pop the strongly connected component once its
@@ -567,6 +571,7 @@ impl Interpreter {
     /// non-async arm of §16.2.1.5 step 16 / ExecuteModule).
     fn run_module_body_sync(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         url: &str,
         url_arc: &std::sync::Arc<str>,
@@ -581,7 +586,7 @@ impl Interpreter {
         // pairing as a fallback for inits reached outside
         // `evaluate_module` (defensive — cells must exist before the
         // body binds against them).
-        self.run_module_hoist_phase(context, url_arc)?;
+        self.run_module_hoist_phase(stack, context, url_arc)?;
         let meta = self.build_import_meta(url)?;
         // Read the environment AFTER every allocation above: the registry
         // entry is a traced root the collector forwards, while a bare copy
@@ -590,7 +595,7 @@ impl Interpreter {
         let Some(env) = self.module_environments.get(url_arc).copied() else {
             return Ok(());
         };
-        self.run_module_init(context, function_id, Value::object(env), meta)?;
+        self.run_module_init(stack, context, function_id, Value::object(env), meta)?;
         Ok(())
     }
 
@@ -599,6 +604,7 @@ impl Interpreter {
     /// not yet hoisted. Idempotent per module per graph generation.
     fn hoist_module_subtree(
         &mut self,
+        activation_stack: &mut ActivationStack,
         context: &ExecutionContext,
         root: &std::sync::Arc<str>,
     ) -> Result<(), VmError> {
@@ -609,7 +615,7 @@ impl Interpreter {
             if !seen.insert(url.clone()) {
                 continue;
             }
-            self.run_module_hoist_phase(context, &url)?;
+            self.run_module_hoist_phase(activation_stack, context, &url)?;
             for (target, _) in context.module_requests(&url) {
                 stack.push(std::sync::Arc::from(target));
             }
@@ -622,6 +628,7 @@ impl Interpreter {
     /// instantiation into the persistent module environment cells.
     fn run_module_hoist_phase(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         url_arc: &std::sync::Arc<str>,
     ) -> Result<(), VmError> {
@@ -643,7 +650,7 @@ impl Interpreter {
         let Some(env) = self.module_environments.get(url_arc).copied() else {
             return Ok(());
         };
-        self.run_module_init_hoist(context, function_id, Value::object(env), meta)
+        self.run_module_init_hoist(stack, context, function_id, Value::object(env), meta)
     }
 
     /// §16.2.1.9 ExecuteAsyncModule: run a top-level-await module's
@@ -651,35 +658,36 @@ impl Interpreter {
     /// fulfilled/rejected walks via the init promise's reactions.
     fn execute_async_module(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         url_arc: &std::sync::Arc<str>,
     ) -> Result<(), VmError> {
         let url = url_arc.as_ref();
         let Some(function_id) = context.module_init_function_id(url) else {
-            self.async_module_execution_fulfilled(context, url_arc);
+            self.async_module_execution_fulfilled(stack, context, url_arc);
             return Ok(());
         };
         if !self.module_environments.contains_key(url_arc) {
-            self.async_module_execution_fulfilled(context, url_arc);
+            self.async_module_execution_fulfilled(stack, context, url_arc);
             return Ok(());
         }
-        self.run_module_hoist_phase(context, url_arc)?;
+        self.run_module_hoist_phase(stack, context, url_arc)?;
         let meta = self.build_import_meta(url)?;
         // Environment read AFTER the hoist + import.meta allocations — a
         // pre-allocation copy is a use-after-move under a moving young gen.
         let Some(env) = self.module_environments.get(url_arc).copied() else {
-            self.async_module_execution_fulfilled(context, url_arc);
+            self.async_module_execution_fulfilled(stack, context, url_arc);
             return Ok(());
         };
-        match self.run_module_init(context, function_id, Value::object(env), meta) {
+        match self.run_module_init(stack, context, function_id, Value::object(env), meta) {
             Ok(Some(init_promise)) => {
-                self.attach_async_module_reactions(context, url_arc.clone(), init_promise)
+                self.attach_async_module_reactions(stack, context, url_arc.clone(), init_promise)
             }
             // ExecuteAsyncModule targets are `[[HasTLA]]` modules, so
             // the init is async; stay safe if the body completed
             // without parking.
             Ok(None) => {
-                self.async_module_execution_fulfilled(context, url_arc);
+                self.async_module_execution_fulfilled(stack, context, url_arc);
                 Ok(())
             }
             Err(err) => {
@@ -707,6 +715,7 @@ impl Interpreter {
     /// closures capture only the module URL.
     fn attach_async_module_reactions(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         url_arc: std::sync::Arc<str>,
         init: crate::promise::JsPromiseHandle,
@@ -723,9 +732,14 @@ impl Interpreter {
             SmallVec::new(),
             &mut |visitor| init_value.trace_value_slots(visitor),
             move |ncx, _args, _captures| {
-                let (interp, reaction_context) = ncx.interp_mut_and_context();
-                if let Some(reaction_context) = reaction_context {
-                    interp.async_module_execution_fulfilled(&reaction_context, &fulfilled_url);
+                if let Some(reaction_context) = ncx.execution_context().cloned() {
+                    ncx.with_turn_parts(|interp, stack| {
+                        interp.async_module_execution_fulfilled(
+                            stack,
+                            &reaction_context,
+                            &fulfilled_url,
+                        );
+                    });
                 }
                 Ok(Value::undefined())
             },
@@ -749,7 +763,12 @@ impl Interpreter {
         )
         .map_err(VmError::from)?;
         let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
-            .capability_runtime_rooted(self, &[&on_fulfilled, &on_rejected, &init_value], &[])?;
+            .capability_stack_rooted(
+                self,
+                stack,
+                &[&on_fulfilled, &on_rejected, &init_value],
+                &[],
+            )?;
         let init = init_value
             .as_promise()
             .expect("rooted async-module gate survives reaction allocation");
@@ -776,6 +795,7 @@ impl Interpreter {
     /// child.
     pub(crate) fn async_module_execution_fulfilled(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         url_arc: &std::sync::Arc<str>,
     ) {
@@ -803,10 +823,10 @@ impl Interpreter {
             if has_tla {
                 // §16.2.1.9.4 step 9.b — its own init reactions
                 // continue the walk when it settles.
-                if let Err(err) = self.execute_async_module(context, &module) {
+                if let Err(err) = self.execute_async_module(stack, context, &module) {
                     let message = format!("module evaluation failed: {err}");
                     let reason = self
-                        .make_type_error_with_stack_roots(&ActivationStack::new(), &message)
+                        .make_type_error_with_stack_roots(stack, &message)
                         .unwrap_or_else(|_| Value::undefined());
                     self.async_module_execution_rejected(&module, reason);
                 }
@@ -815,7 +835,7 @@ impl Interpreter {
             // §16.2.1.9.4 step 9.c — ExecuteModule; ancestors were
             // already gathered into this exec list, so success only
             // marks the record evaluated and settles its gate.
-            match self.run_module_body_sync(context, module.as_ref(), &module) {
+            match self.run_module_body_sync(stack, context, module.as_ref(), &module) {
                 Ok(()) => {
                     {
                         let record = self.module_record_mut(&module);
@@ -829,7 +849,7 @@ impl Interpreter {
                     Err(err) => {
                         let message = format!("module evaluation failed: {err}");
                         let reason = self
-                            .make_type_error_with_stack_roots(&ActivationStack::new(), &message)
+                            .make_type_error_with_stack_roots(stack, &message)
                             .unwrap_or_else(|_| Value::undefined());
                         self.async_module_execution_rejected(&module, reason);
                     }
@@ -957,55 +977,91 @@ impl Interpreter {
             smallvec::smallvec![pending_value],
             &mut |visitor| pending_value.trace_value_slots(visitor),
             move |ncx, _args, captures| {
-                let (interp, job_context) = ncx.interp_mut_and_context();
-                let Some(job_context) = job_context else {
+                let Some(job_context) = ncx.execution_context().cloned() else {
                     return Ok(Value::undefined());
                 };
-                let Some(pending) = captures.first().and_then(|v| v.as_promise()) else {
+                let Some(pending_value) = captures.first().copied() else {
                     return Ok(Value::undefined());
                 };
-                match interp.evaluate_module(&job_context, &target) {
-                    Ok(Some(gate)) => {
-                        interp
-                            .settle_promise_on_module_evaluation(
-                                &job_context,
-                                pending,
-                                gate,
-                                std::sync::Arc::from(target.as_str()),
-                            )
-                            .map_err(|e| {
-                                crate::native_function::vm_to_native_error(interp, e, "import()")
+                ncx.scope(|mut scope| {
+                    let pending = scope.value(pending_value);
+                    let evaluation = scope.with_turn_parts(|interp, stack| {
+                        interp.evaluate_module(stack, &job_context, &target)
+                    });
+                    match evaluation {
+                        Ok(Some(gate)) => {
+                            let pending = scope
+                                .raw(pending)
+                                .as_promise()
+                                .expect("rooted dynamic-import promise remains a promise");
+                            scope.with_turn_parts(|interp, stack| {
+                                interp
+                                    .settle_promise_on_module_evaluation(
+                                        stack,
+                                        &job_context,
+                                        pending,
+                                        gate,
+                                        std::sync::Arc::from(target.as_str()),
+                                    )
+                                    .map_err(|e| {
+                                        crate::native_function::vm_to_native_error(
+                                            interp, e, "import()",
+                                        )
+                                    })
                             })?;
-                    }
-                    Ok(None) => {
-                        let namespace = interp
-                            .resolve_module_namespace(&job_context, referrer.as_str(), &specifier)
-                            .map(Value::object)
-                            .unwrap_or_else(Value::undefined);
-                        let jobs =
-                            crate::JsPromise::fulfill(&pending, &mut interp.gc_heap, namespace);
-                        for j in jobs.jobs {
-                            interp.microtasks.enqueue(j);
+                        }
+                        Ok(None) => {
+                            let pending = scope
+                                .raw(pending)
+                                .as_promise()
+                                .expect("rooted dynamic-import promise remains a promise");
+                            scope.with_turn_parts(|interp, _stack| {
+                                let namespace = interp
+                                    .resolve_module_namespace(
+                                        &job_context,
+                                        referrer.as_str(),
+                                        &specifier,
+                                    )
+                                    .map(Value::object)
+                                    .unwrap_or_else(Value::undefined);
+                                let jobs = crate::JsPromise::fulfill(
+                                    &pending,
+                                    &mut interp.gc_heap,
+                                    namespace,
+                                );
+                                for job in jobs.jobs {
+                                    interp.microtasks.enqueue(job);
+                                }
+                            });
+                        }
+                        Err(err) => {
+                            let pending = scope
+                                .raw(pending)
+                                .as_promise()
+                                .expect("rooted dynamic-import promise remains a promise");
+                            scope.with_turn_parts(|interp, _stack| {
+                                let reason = match err {
+                                    VmError::Uncaught => interp
+                                        .take_pending_uncaught_throw()
+                                        .unwrap_or_else(Value::undefined),
+                                    other => {
+                                        return Err(crate::native_function::vm_to_native_error(
+                                            interp, other, "import()",
+                                        ));
+                                    }
+                                };
+                                let jobs =
+                                    crate::JsPromise::reject(&pending, &mut interp.gc_heap, reason);
+                                for job in jobs.jobs {
+                                    interp.microtasks.enqueue(job);
+                                }
+                                Ok(())
+                            })?;
                         }
                     }
-                    Err(err) => {
-                        let reason = match err {
-                            VmError::Uncaught => interp
-                                .take_pending_uncaught_throw()
-                                .unwrap_or_else(Value::undefined),
-                            other => {
-                                return Err(crate::native_function::vm_to_native_error(
-                                    interp, other, "import()",
-                                ));
-                            }
-                        };
-                        let jobs = crate::JsPromise::reject(&pending, &mut interp.gc_heap, reason);
-                        for j in jobs.jobs {
-                            interp.microtasks.enqueue(j);
-                        }
-                    }
-                }
-                Ok(Value::undefined())
+                    let undefined = scope.undefined();
+                    Ok(scope.finish(undefined))
+                })
             },
         )
         .map_err(VmError::from)?;
@@ -1022,6 +1078,7 @@ impl Interpreter {
 
     pub(crate) fn settle_promise_on_module_evaluation(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         downstream: crate::promise::JsPromiseHandle,
         init: crate::promise::JsPromiseHandle,
@@ -1072,7 +1129,7 @@ impl Interpreter {
         )
         .map_err(VmError::from)?;
         let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
-            .capability_runtime_rooted(self, &[&on_fulfilled, &on_rejected], &[])?;
+            .capability_stack_rooted(self, stack, &[&on_fulfilled, &on_rejected], &[])?;
         let outcome = crate::JsPromise::perform_then_with_context(
             &init,
             &mut self.gc_heap,
@@ -1121,6 +1178,7 @@ impl Interpreter {
     /// to normal handling on the same object afterward.
     pub(crate) fn ensure_deferred_namespace_ready(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         value: &Value,
         trigger: bool,
@@ -1141,32 +1199,55 @@ impl Interpreter {
                 .into(),
             ));
         }
-        self.evaluate_module_rec(context, &target_url)?;
-        if let Some(env) = self.module_environments.get(&target_url).copied() {
-            let env_value = Value::object(env);
-            let mut names = self.enumerable_own_string_keys_for_value(context, env_value, 0)?;
-            names.sort();
-            for name in &names {
-                let key = crate::VmPropertyKey::String(name);
-                let val = match self.ordinary_get_value(context, env_value, env_value, &key, 0)? {
-                    crate::VmGetOutcome::Value(v) => v,
-                    crate::VmGetOutcome::InvokeGetter { getter } => {
-                        self.run_callable_sync(context, &getter, env_value, SmallVec::new())?
-                    }
-                };
-                // §28.3 namespace export properties: writable, enumerable,
-                // non-configurable.
-                crate::object::define_own_property(
-                    obj,
-                    &mut self.gc_heap,
-                    name,
-                    crate::object::PropertyDescriptor::data(val, true, true, false),
-                );
+        self.with_handle_scope(|interp, scope| {
+            let namespace = interp.scoped_value(scope, *value);
+            interp.evaluate_module_rec(stack, context, &target_url)?;
+            if let Some(env) = interp.module_environments.get(&target_url).copied() {
+                let env = interp.scoped_value(scope, Value::object(env));
+                let env_value = interp.escape_scoped(env);
+                let mut names =
+                    interp.enumerable_own_string_keys_for_value(stack, context, env_value, 0)?;
+                names.sort();
+                for name in &names {
+                    let key = crate::VmPropertyKey::String(name);
+                    let env_value = interp.escape_scoped(env);
+                    let val = match interp
+                        .ordinary_get_value(stack, context, env_value, env_value, &key, 0)?
+                    {
+                        crate::VmGetOutcome::Value(value) => value,
+                        crate::VmGetOutcome::InvokeGetter { getter } => interp
+                            .run_callable_sync_rooted(
+                                stack,
+                                context,
+                                &getter,
+                                env_value,
+                                SmallVec::new(),
+                            )?,
+                    };
+                    let val = interp.scoped_value(scope, val);
+                    // §28.3 namespace export properties: writable, enumerable,
+                    // non-configurable.
+                    interp.scoped_define_data(
+                        scope,
+                        namespace,
+                        name,
+                        val,
+                        crate::object::PropertyFlags::new(true, true, false),
+                    )?;
+                }
+                let namespace_obj = interp
+                    .escape_scoped(namespace)
+                    .as_object()
+                    .ok_or(VmError::TypeMismatch)?;
+                crate::object::prevent_extensions(namespace_obj, &mut interp.gc_heap);
             }
-            crate::object::prevent_extensions(obj, &mut self.gc_heap);
-        }
-        crate::object::set_deferred_namespace_populated(obj, &self.gc_heap);
-        Ok(())
+            let namespace_obj = interp
+                .escape_scoped(namespace)
+                .as_object()
+                .ok_or(VmError::TypeMismatch)?;
+            crate::object::set_deferred_namespace_populated(namespace_obj, &interp.gc_heap);
+            Ok(())
+        })
     }
 
     /// Conservative §28.3 ReadyForSyncExecution over the active
@@ -1251,7 +1332,7 @@ impl Interpreter {
             .map(|f| f.module_url.as_ref().to_string())
             .unwrap_or_default();
         let import_context = context.clone();
-        let promise = match self.coerce_to_string(context, &spec_value) {
+        let promise = match self.coerce_to_string(stack, context, &spec_value) {
             Ok(specifier) => {
                 if let Some(target) =
                     context.module_resolution_target(referrer.as_str(), &specifier)
@@ -1279,7 +1360,7 @@ impl Interpreter {
                         frame.advance_pc()?;
                         return Ok(());
                     }
-                    match self.evaluate_module(context, &target) {
+                    match self.evaluate_module(stack, context, &target) {
                         Ok(Some(gate)) => {
                             // §13.3.10 — an async-evaluating target
                             // settles the import promise only when its
@@ -1295,6 +1376,7 @@ impl Interpreter {
                                 &[],
                             )?;
                             self.settle_promise_on_module_evaluation(
+                                stack,
                                 context,
                                 pending,
                                 gate,

@@ -43,18 +43,24 @@ impl Interpreter {
             return Err(VmError::InvalidOperand);
         }
         let saved_pc = stack[frame_index].pc;
-        let frame = &mut stack[frame_index];
         match opcode {
             value if value == Op::LoadGlobalThis as u8 => {
-                self.run_load_global_this_reg(frame, arg0 as u16)?;
+                self.run_load_global_this_reg(&mut stack[frame_index], arg0 as u16)?;
             }
             value if value == Op::LoadGlobalOrUndefined as u8 => {
-                self.run_load_global_or_undefined_reg(context, frame, arg0 as u16, arg1 as u32)?;
+                self.run_load_global_or_undefined_reg(
+                    context,
+                    stack,
+                    frame_index,
+                    arg0 as u16,
+                    arg1 as u32,
+                )?;
             }
             value if value == Op::StoreGlobalBinding as u8 => {
                 self.run_store_global_binding_reg(
                     context,
-                    frame,
+                    stack,
+                    frame_index,
                     arg0 as u16,
                     arg1 as u32,
                     arg2 != 0,
@@ -63,47 +69,78 @@ impl Interpreter {
             value if value == Op::StoreGlobalChecked as u8 => {
                 self.run_store_global_checked_reg(
                     context,
-                    frame,
+                    stack,
+                    frame_index,
                     arg0 as u16,
                     arg1 as u32,
                     arg2 as u16,
                 )?;
             }
             value if value == Op::LoadDynamic as u8 => {
-                self.run_load_dynamic_reg(context, frame, arg0 as u16, arg1 as u32)?;
+                self.run_load_dynamic_reg(context, stack, frame_index, arg0 as u16, arg1 as u32)?;
             }
             value if value == Op::StoreDynamic as u8 => {
-                self.run_store_dynamic_reg(context, frame, arg0 as u16, arg1 as u32)?;
+                self.run_store_dynamic_reg(context, stack, frame_index, arg0 as u16, arg1 as u32)?;
             }
             value if value == Op::TypeofDynamic as u8 => {
-                self.run_typeof_dynamic_reg(context, frame, arg0 as u16, arg1 as u32)?;
+                self.run_typeof_dynamic_reg(context, stack, frame_index, arg0 as u16, arg1 as u32)?;
             }
             value if value == Op::DeclareGlobalVar as u8 => {
-                self.run_declare_global_var_reg(context, frame, arg1 as u32, arg2 != 0)?;
+                self.run_declare_global_var_reg(
+                    context,
+                    &mut stack[frame_index],
+                    arg1 as u32,
+                    arg2 != 0,
+                )?;
             }
             value if value == Op::DeclareGlobalLex as u8 => {
-                self.run_declare_global_lex_reg(context, frame, arg1 as u32, arg2 != 0)?;
+                self.run_declare_global_lex_reg(
+                    context,
+                    &mut stack[frame_index],
+                    arg1 as u32,
+                    arg2 != 0,
+                )?;
             }
             value if value == Op::ValidateGlobalDecl as u8 => {
-                self.run_validate_global_decl_reg(context, frame, arg1 as u32, arg2 as u32 as i32)?;
+                self.run_validate_global_decl_reg(
+                    context,
+                    &mut stack[frame_index],
+                    arg1 as u32,
+                    arg2 as u32 as i32,
+                )?;
             }
             value if value == Op::DefineGlobalVar as u8 => {
-                self.run_define_global_var_reg(context, frame, arg1 as u32, arg0 as u16)?;
+                self.run_define_global_var_reg(
+                    context,
+                    &mut stack[frame_index],
+                    arg1 as u32,
+                    arg0 as u16,
+                )?;
             }
             value if value == Op::DefineGlobalFunction as u8 => {
                 self.run_define_global_function_reg(
                     context,
-                    frame,
+                    &mut stack[frame_index],
                     arg1 as u32,
                     arg0 as u16,
                     arg2 != 0,
                 )?;
             }
             value if value == Op::InitGlobalLex as u8 => {
-                self.run_init_global_lex_reg(context, frame, arg0 as u16, arg1 as u32)?;
+                self.run_init_global_lex_reg(
+                    context,
+                    &mut stack[frame_index],
+                    arg0 as u16,
+                    arg1 as u32,
+                )?;
             }
             value if value == Op::GlobalBindingExists as u8 => {
-                self.run_global_binding_exists_reg(context, frame, arg0 as u16, arg1 as u32)?;
+                self.run_global_binding_exists_reg(
+                    context,
+                    &mut stack[frame_index],
+                    arg0 as u16,
+                    arg1 as u32,
+                )?;
             }
             _ => return Err(VmError::InvalidOperand),
         }

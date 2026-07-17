@@ -357,7 +357,9 @@ impl Interpreter {
                     // frames. If a catch absorbs the throw the
                     // unwind path clears `pending_uncaught_frames`
                     // through [`Self::clear_pending_uncaught_frames`].
-                    self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+                    if self.pending_uncaught_frames.is_none() {
+                        self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+                    }
                     let unwind = self.unwind_throw_above(context, stack, floor, value);
                     if unwind.is_ok() {
                         self.pending_uncaught_frames = None;
@@ -377,7 +379,10 @@ impl Interpreter {
                         .and_then(|c| c.parked_finally.pop());
                     match parked {
                         Some((crate::cold_frame::ParkedFinally::Throw(value), _)) => {
-                            self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+                            if self.pending_uncaught_frames.is_none() {
+                                self.pending_uncaught_frames =
+                                    Some(snapshot_frames(context, stack));
+                            }
                             let unwind = self.unwind_throw_above(context, stack, floor, value);
                             if unwind.is_ok() {
                                 self.pending_uncaught_frames = None;
@@ -606,7 +611,7 @@ impl Interpreter {
                     // `[[return]]`: if `return` throws, the unwind must
                     // not close it again (it is already closing).
                     self.deregister_frame_iterator_closer(&mut stack[top_idx], iterator);
-                    self.iterator_close_value_sync(context, iterator)?;
+                    self.iterator_close_value_sync(stack, context, iterator)?;
                     stack[top_idx].advance_pc()?;
                     continue;
                 }
@@ -696,8 +701,7 @@ impl Interpreter {
                     let (dst, recv_reg, idx_reg) = context
                         .exec_register3(instr)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_load_element_regs(context, frame, dst, recv_reg, idx_reg)?;
+                    self.run_load_element_regs(context, stack, top_idx, dst, recv_reg, idx_reg)?;
                     continue;
                 }
                 Op::LoadSuperProperty => {
@@ -838,7 +842,7 @@ impl Interpreter {
                             frame.read(src_reg)?,
                         )
                     };
-                    self.store_element_values(context, function_id, receiver, key, value)?;
+                    self.store_element_values(stack, context, function_id, receiver, key, value)?;
                     // The synchronous helper completed the full effect (or
                     // threw), so publish exactly one resume increment.
                     stack[top_idx].advance_pc()?;
@@ -867,8 +871,7 @@ impl Interpreter {
                     let (dst, lhs, rhs) = context
                         .exec_register3(instr)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_has_property_regs(frame, context, dst, lhs, rhs)?;
+                    self.run_has_property_regs(stack, top_idx, context, dst, lhs, rhs)?;
                     continue;
                 }
                 Op::DeleteProperty => {
@@ -898,6 +901,7 @@ impl Interpreter {
                         crate::object::deferred_namespace_target(o, &self.gc_heap).is_some()
                     }) {
                         self.ensure_deferred_namespace_ready(
+                            stack,
                             context,
                             &receiver,
                             key.name() != "then",
@@ -925,7 +929,12 @@ impl Interpreter {
                             || key_val
                                 .as_string(&self.gc_heap)
                                 .is_some_and(|s| s.to_lossy_string(&self.gc_heap) == "then");
-                        self.ensure_deferred_namespace_ready(context, &receiver, !symbol_like)?;
+                        self.ensure_deferred_namespace_ready(
+                            stack,
+                            context,
+                            &receiver,
+                            !symbol_like,
+                        )?;
                     }
                     let frame = &mut stack[top_idx];
                     self.run_delete_element_regs(frame, dst, obj_reg, idx_reg, strict)?;
@@ -961,8 +970,7 @@ impl Interpreter {
                     let proto_reg = context
                         .exec_register(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_set_prototype_regs(context, frame, obj_reg, proto_reg)?;
+                    self.run_set_prototype_regs(context, stack, top_idx, obj_reg, proto_reg)?;
                     continue;
                 }
                 // §19.4.1 indirect eval — recursively dispatches a
@@ -1344,8 +1352,7 @@ impl Interpreter {
                     let name_idx = context
                         .exec_const_index(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_load_global_or_throw_reg(context, frame, dst, name_idx)?;
+                    self.run_load_global_or_throw_reg(context, stack, top_idx, dst, name_idx)?;
                     continue;
                 }
                 Op::LoadGlobalOrUndefined => {
@@ -1355,8 +1362,7 @@ impl Interpreter {
                     let name_idx = context
                         .exec_const_index(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_load_global_or_undefined_reg(context, frame, dst, name_idx)?;
+                    self.run_load_global_or_undefined_reg(context, stack, top_idx, dst, name_idx)?;
                     continue;
                 }
                 Op::DeclareGlobalVar => {
@@ -1403,8 +1409,7 @@ impl Interpreter {
                     let name_idx = context
                         .exec_const_index(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_load_dynamic_reg(context, frame, dst, name_idx)?;
+                    self.run_load_dynamic_reg(context, stack, top_idx, dst, name_idx)?;
                     continue;
                 }
                 Op::StoreDynamic => {
@@ -1414,8 +1419,7 @@ impl Interpreter {
                     let name_idx = context
                         .exec_const_index(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_store_dynamic_reg(context, frame, value_reg, name_idx)?;
+                    self.run_store_dynamic_reg(context, stack, top_idx, value_reg, name_idx)?;
                     continue;
                 }
                 Op::TypeofDynamic => {
@@ -1425,8 +1429,7 @@ impl Interpreter {
                     let name_idx = context
                         .exec_const_index(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_typeof_dynamic_reg(context, frame, dst, name_idx)?;
+                    self.run_typeof_dynamic_reg(context, stack, top_idx, dst, name_idx)?;
                     continue;
                 }
                 Op::DeleteDynamic => {
@@ -1484,8 +1487,9 @@ impl Interpreter {
                         .exec_const_index(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let strict = context.exec_imm32(instr, 2).unwrap_or(0) != 0;
-                    let frame = &mut stack[top_idx];
-                    self.run_store_global_binding_reg(context, frame, value_reg, name_idx, strict)?;
+                    self.run_store_global_binding_reg(
+                        context, stack, top_idx, value_reg, name_idx, strict,
+                    )?;
                     continue;
                 }
                 Op::InitGlobalLex => {
@@ -1640,8 +1644,7 @@ impl Interpreter {
                         .exec_register(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let delta = context.exec_imm32(instr, 2).unwrap_or(1);
-                    let frame = &mut stack[top_idx];
-                    self.run_increment_regs(context, frame, dst, src, delta, feedback)?;
+                    self.run_increment_regs(stack, context, top_idx, dst, src, delta, feedback)?;
                     continue;
                 }
                 Op::ValidateGlobalDecl => {
@@ -1866,9 +1869,8 @@ impl Interpreter {
                     let value_reg = register_operand(context.exec_operand(instr, 0))?;
                     let name_idx = const_operand(context.exec_operand(instr, 1))?;
                     let exists_reg = register_operand(context.exec_operand(instr, 2))?;
-                    let frame = &mut stack[top_idx];
                     self.run_store_global_checked_reg(
-                        context, frame, value_reg, name_idx, exists_reg,
+                        context, stack, top_idx, value_reg, name_idx, exists_reg,
                     )?;
                     continue;
                 }
@@ -2229,23 +2231,31 @@ impl Interpreter {
                     let (dst, lhs, rhs) = context
                         .exec_register3(instr)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
                     match op {
-                        Op::Equal => self.run_equal_regs(frame, dst, lhs, rhs, false, feedback)?,
+                        Op::Equal => self.run_equal_regs(
+                            &mut stack[top_idx],
+                            dst,
+                            lhs,
+                            rhs,
+                            false,
+                            feedback,
+                        )?,
                         Op::NotEqual => {
-                            self.run_equal_regs(frame, dst, lhs, rhs, true, feedback)?
+                            self.run_equal_regs(&mut stack[top_idx], dst, lhs, rhs, true, feedback)?
                         }
                         Op::LooseEqual => {
                             self.run_loose_equal_regs(
-                                context, frame, dst, lhs, rhs, false, feedback,
+                                stack, context, top_idx, dst, lhs, rhs, false, feedback,
                             )?;
                         }
                         Op::LooseNotEqual => {
                             self.run_loose_equal_regs(
-                                context, frame, dst, lhs, rhs, true, feedback,
+                                stack, context, top_idx, dst, lhs, rhs, true, feedback,
                             )?;
                         }
-                        Op::SameValue => self.run_same_value_regs(frame, dst, lhs, rhs)?,
+                        Op::SameValue => {
+                            self.run_same_value_regs(&mut stack[top_idx], dst, lhs, rhs)?
+                        }
                         _ => unreachable!("equality opcode group"),
                     }
                     continue;

@@ -307,23 +307,34 @@ pub struct ErrorClassRegistry {
 /// - <https://tc39.es/ecma262/#sec-error.prototype.tostring>
 pub(crate) fn render_error_to_string_spec(
     interp: &mut crate::Interpreter,
+    stack: &mut crate::ActivationStack,
     context: &crate::ExecutionContext,
     receiver: &Value,
 ) -> Result<String, crate::VmError> {
     fn coerce(
         interp: &mut crate::Interpreter,
+        stack: &mut crate::ActivationStack,
         context: &crate::ExecutionContext,
-        receiver: &Value,
+        receiver: crate::Local<'_>,
         key: &'static str,
         default: &str,
     ) -> Result<String, crate::VmError> {
+        let receiver_value = interp.escape_scoped(receiver);
         let vm_key = crate::VmPropertyKey::String(key);
-        let outcome = interp.ordinary_get_value(context, *receiver, *receiver, &vm_key, 0)?;
+        let outcome = interp.ordinary_get_value(
+            stack,
+            context,
+            receiver_value,
+            receiver_value,
+            &vm_key,
+            0,
+        )?;
         let value = match outcome {
             crate::VmGetOutcome::Value(v) => v,
             crate::VmGetOutcome::InvokeGetter { getter } => {
                 let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                interp.run_callable_sync(context, &getter, *receiver, args)?
+                let receiver_value = interp.escape_scoped(receiver);
+                interp.run_callable_sync_rooted(stack, context, &getter, receiver_value, args)?
             }
         };
         if value.is_undefined() {
@@ -341,6 +352,7 @@ pub(crate) fn render_error_to_string_spec(
             return Ok(value.display_string(interp.gc_heap()));
         }
         let primitive = interp.evaluate_to_primitive(
+            stack,
             context,
             &value,
             crate::abstract_ops::ToPrimitiveHint::String,
@@ -357,13 +369,16 @@ pub(crate) fn render_error_to_string_spec(
         }
     }
 
-    let name = coerce(interp, context, receiver, "name", "Error")?;
-    let message = coerce(interp, context, receiver, "message", "")?;
-    Ok(match (name.is_empty(), message.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => name,
-        (true, false) => message,
-        (false, false) => format!("{name}: {message}"),
+    interp.with_handle_scope(|interp, scope| {
+        let receiver = interp.scoped_value(scope, *receiver);
+        let name = coerce(interp, stack, context, receiver, "name", "Error")?;
+        let message = coerce(interp, stack, context, receiver, "message", "")?;
+        Ok(match (name.is_empty(), message.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => name,
+            (true, false) => message,
+            (false, false) => format!("{name}: {message}"),
+        })
     })
 }
 
@@ -603,25 +618,26 @@ impl ErrorClassRegistry {
                         name: "Error.prototype.toString",
                         reason: "missing execution context".to_string(),
                     })?;
-            let (interp, _) = ctx.interp_mut_and_context();
-            let display = render_error_to_string_spec(interp, &context, &receiver).map_err(
-                |err| match err {
-                    crate::VmError::Uncaught => {
-                        let value = match interp.take_error_detail() {
-                            Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                            _ => Default::default(),
-                        };
-                        NativeError::Thrown {
-                            name: "Error.prototype.toString",
-                            message: value.into(),
+            let display = ctx.with_turn_parts(|interp, stack| {
+                render_error_to_string_spec(interp, stack, &context, &receiver).map_err(|err| {
+                    match err {
+                        crate::VmError::Uncaught => {
+                            let value = match interp.take_error_detail() {
+                                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                                _ => Default::default(),
+                            };
+                            NativeError::Thrown {
+                                name: "Error.prototype.toString",
+                                message: value.into(),
+                            }
                         }
+                        other => NativeError::TypeError {
+                            name: "Error.prototype.toString",
+                            reason: other.to_string(),
+                        },
                     }
-                    other => NativeError::TypeError {
-                        name: "Error.prototype.toString",
-                        reason: other.to_string(),
-                    },
-                },
-            )?;
+                })
+            })?;
             let s = JsString::from_str(&display, ctx.heap_mut()).map_err(|err| {
                 NativeError::TypeError {
                     name: "Error.prototype.toString",
@@ -717,18 +733,6 @@ impl ErrorClassRegistry {
                         name: "set Error.prototype.stack",
                         reason: "missing execution context".to_string(),
                     })?;
-            let interp = ctx.interp_mut();
-            // SetterThatIgnoresPrototypeProperties step 2 — setting on
-            // %Error.prototype% itself throws.
-            let home = interp.constructor_prototype_value("Error").ok();
-            if let Some(home) = home
-                && crate::abstract_ops::same_value(&home, &receiver, interp.gc_heap())
-            {
-                return Err(NativeError::TypeError {
-                    name: "set Error.prototype.stack",
-                    reason: "cannot set stack on Error.prototype".to_string(),
-                });
-            }
             fn map_err(interp: &mut crate::Interpreter, err: crate::VmError) -> NativeError {
                 match err {
                     crate::VmError::Uncaught => {
@@ -747,37 +751,73 @@ impl ErrorClassRegistry {
                     },
                 }
             }
-            // SetterThatIgnoresPrototypeProperties steps 3-5.
-            let existing = match interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
-                &context,
-                receiver,
-                &crate::VmPropertyKey::String("stack"),
-                0,
-                &[&receiver, &value],
-                &[],
-            ) {
-                Ok(v) => v,
-                Err(e) => return Err(map_err(interp, e)),
-            };
-            match existing {
-                // step 4 — no own "stack": CreateDataPropertyOrThrow.
-                None => {
-                    if let Err(e) =
-                        interp.create_data_property_or_throw(&context, receiver, "stack", value)
-                    {
-                        return Err(map_err(interp, e));
+            ctx.scope(|mut scope| {
+                let receiver = scope.value(receiver);
+                let value = scope.value(value);
+                // SetterThatIgnoresPrototypeProperties step 2 — setting on
+                // %Error.prototype% itself throws.
+                let home = scope.with_turn_parts(|interp, _stack| {
+                    interp.constructor_prototype_value("Error").ok()
+                });
+                if let Some(home) = home {
+                    let receiver_value = scope.raw(receiver);
+                    let is_home = scope.with_turn_parts(|interp, _stack| {
+                        crate::abstract_ops::same_value(&home, &receiver_value, interp.gc_heap())
+                    });
+                    if is_home {
+                        return Err(NativeError::TypeError {
+                            name: "set Error.prototype.stack",
+                            reason: "cannot set stack on Error.prototype".to_string(),
+                        });
                     }
                 }
-                // step 5 — own "stack" exists: Set(this, p, v, true).
-                Some(_) => {
-                    if let Err(e) =
-                        interp.array_set_property_throwing(&context, receiver, "stack", value)
-                    {
-                        return Err(map_err(interp, e));
+                // SetterThatIgnoresPrototypeProperties steps 3-5.
+                let receiver_value = scope.raw(receiver);
+                let existing = scope.with_turn_parts(|interp, stack| {
+                    interp
+                        .ordinary_get_own_property_descriptor_value(
+                            stack,
+                            &context,
+                            receiver_value,
+                            &crate::VmPropertyKey::String("stack"),
+                            0,
+                        )
+                        .map_err(|error| map_err(interp, error))
+                })?;
+                let receiver_value = scope.raw(receiver);
+                let value = scope.raw(value);
+                match existing {
+                    // step 4 — no own "stack": CreateDataPropertyOrThrow.
+                    None => {
+                        scope.with_turn_parts(|interp, stack| {
+                            interp
+                                .create_data_property_or_throw(
+                                    stack,
+                                    &context,
+                                    receiver_value,
+                                    "stack",
+                                    value,
+                                )
+                                .map_err(|error| map_err(interp, error))
+                        })?;
+                    }
+                    // step 5 — own "stack" exists: Set(this, p, v, true).
+                    Some(_) => {
+                        scope.with_turn_parts(|interp, stack| {
+                            interp
+                                .array_set_property_throwing(
+                                    stack,
+                                    &context,
+                                    receiver_value,
+                                    "stack",
+                                    value,
+                                )
+                                .map_err(|error| map_err(interp, error))
+                        })?;
                     }
                 }
-            }
-            Ok(Value::undefined())
+                Ok(Value::undefined())
+            })
         }
         stack_get_root = Value::native_function(native_static_with_roots(
             gc_heap,
@@ -908,7 +948,10 @@ impl ErrorClassRegistry {
                 if v.is_undefined() {
                     None
                 } else {
-                    Some(match ctx.interp_mut().coerce_to_string(&context, v) {
+                    let coerced = ctx.with_turn_parts(|interp, stack| {
+                        interp.coerce_to_string(stack, &context, v)
+                    });
+                    Some(match coerced {
                         Ok(v) => v,
                         Err(e) => return Err(map_vm_err(ctx, kind, e)),
                     })
@@ -978,22 +1021,39 @@ impl ErrorClassRegistry {
                 return Ok(None);
             }
             let key = crate::VmPropertyKey::String("cause");
-            let interp = ctx.interp_mut();
-            if !interp.ordinary_has_property_value(context, *options, &key, 0)? {
-                return Ok(None);
-            }
-            match interp.ordinary_get_value(context, *options, *options, &key, 0)? {
-                crate::VmGetOutcome::Value(value) => Ok(Some(value)),
-                crate::VmGetOutcome::InvokeGetter { getter } => {
-                    let value = interp.run_callable_sync(
-                        context,
-                        &getter,
-                        *options,
-                        smallvec::SmallVec::<[Value; 8]>::new(),
-                    )?;
-                    Ok(Some(value))
+            ctx.scope(|mut scope| {
+                let options = scope.value(*options);
+                let options_value = scope.raw(options);
+                let present = scope.with_turn_parts(|interp, stack| {
+                    interp.ordinary_has_property_value(stack, context, options_value, &key, 0)
+                })?;
+                if !present {
+                    return Ok(None);
                 }
-            }
+                let options_value = scope.raw(options);
+                let outcome = scope.with_turn_parts(|interp, stack| {
+                    interp.ordinary_get_value(stack, context, options_value, options_value, &key, 0)
+                })?;
+                let value = match outcome {
+                    crate::VmGetOutcome::Value(value) => value,
+                    crate::VmGetOutcome::InvokeGetter { getter } => {
+                        let getter = scope.value(getter);
+                        let receiver = scope.raw(options);
+                        let getter = scope.raw(getter);
+                        scope.with_turn_parts(|interp, stack| {
+                            interp.run_callable_sync_rooted(
+                                stack,
+                                context,
+                                &getter,
+                                receiver,
+                                smallvec::SmallVec::<[Value; 8]>::new(),
+                            )
+                        })?
+                    }
+                };
+                let value = scope.value(value);
+                Ok(Some(scope.finish(value)))
+            })
         }
 
         /// §20.5.6.1.1 InstallErrorCause step 1.b —
@@ -1066,7 +1126,10 @@ impl ErrorClassRegistry {
                 if v.is_undefined() {
                     None
                 } else {
-                    Some(match c.interp_mut().coerce_to_string(&context, v) {
+                    let coerced = c.with_turn_parts(|interp, stack| {
+                        interp.coerce_to_string(stack, &context, v)
+                    });
+                    Some(match coerced {
                         Ok(v) => v,
                         Err(e) => return Err(map_vm_err(c, e)),
                     })
@@ -1150,34 +1213,32 @@ impl ErrorClassRegistry {
                 let heap = ctx.heap();
                 return Ok(crate::array::with_elements(arr, heap, <[Value]>::to_vec));
             }
-            let interp = ctx.interp_mut();
-            let anchor_base = interp.push_iteration_anchor(*value) - 1;
-            let result = (|interp: &mut crate::Interpreter| -> Result<Vec<Value>, crate::VmError> {
-                let value = interp.iteration_anchor(anchor_base);
-                let (iterator, next_method) = interp.get_iterator_sync(context, &value)?;
-                let iterator_anchor = interp.push_iteration_anchor(iterator) - 1;
-                let next_method_anchor = interp.push_iteration_anchor(next_method) - 1;
-                let values_start = next_method_anchor + 1;
-                let mut out_count = 0usize;
+            ctx.scope(|mut scope| {
+                let value = scope.value(*value);
+                let value_raw = scope.raw(value);
+                let (iterator, next_method) = scope.with_turn_parts(|interp, stack| {
+                    interp
+                        .get_iterator_sync(stack, context, &value_raw)
+                        .map_err(|error| map_err(interp, error))
+                })?;
+                let iterator = scope.value(iterator);
+                let next_method = scope.value(next_method);
+                let mut values = Vec::new();
                 loop {
-                    let iterator = interp.iteration_anchor(iterator_anchor);
-                    let next_method = interp.iteration_anchor(next_method_anchor);
-                    match interp.iterator_step_sync(context, &iterator, &next_method)? {
-                        Some(value) => {
-                            interp.push_iteration_anchor(value);
-                            out_count += 1;
-                        }
+                    let iterator_raw = scope.raw(iterator);
+                    let next_method_raw = scope.raw(next_method);
+                    let next = scope.with_turn_parts(|interp, stack| {
+                        interp
+                            .iterator_step_sync(stack, context, &iterator_raw, &next_method_raw)
+                            .map_err(|error| map_err(interp, error))
+                    })?;
+                    match next {
+                        Some(value) => values.push(scope.value(value)),
                         None => break,
                     }
                 }
-                let mut out = Vec::with_capacity(out_count);
-                for index in values_start..values_start + out_count {
-                    out.push(interp.iteration_anchor(index));
-                }
-                Ok(out)
-            })(interp);
-            interp.pop_iteration_anchors_to(anchor_base);
-            result.map_err(|e| map_err(interp, e))
+                Ok(values.into_iter().map(|value| scope.raw(value)).collect())
+            })
         }
 
         // Error itself. §20.5.3 — `Error.prototype.constructor`

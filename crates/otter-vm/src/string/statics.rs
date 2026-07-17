@@ -95,7 +95,6 @@ pub static STRING_STATIC_METHODS: &[MethodSpec] = &[
 /// re-enters `@@toPrimitive` / `toString` / `valueOf` on object
 /// operands.
 fn string_raw(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let template = args.first().copied().unwrap_or_else(Value::undefined);
     let context = ctx
         .execution_context()
         .cloned()
@@ -103,45 +102,115 @@ fn string_raw(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
             name: "String.raw",
             reason: "no execution context available".to_string(),
         })?;
-    let interp = &mut ctx.cx.interp;
+    ctx.scope(|mut scope| {
+        let template = scope.argument(args, 0);
+        let template_value = scope.raw(template);
+        let raw_result = scope.with_turn_parts(|interp, stack| {
+            interp.get_property_value_for_call(stack, &context, template_value, "raw")
+        });
+        let raw_value = match raw_result {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(crate::native_function::vm_to_native_error(
+                    scope.context().interp_mut(),
+                    error,
+                    "String.raw",
+                ));
+            }
+        };
+        let raw = scope.value(raw_value);
 
-    let raw = interp
-        .get_property_value_for_call(&context, template, "raw")
-        .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "String.raw"))?;
-    let len_val = interp
-        .get_property_value_for_call(&context, raw, "length")
-        .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "String.raw"))?;
-    let literal_segments = crate::to_length(&len_val, interp.gc_heap())
-        .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "String.raw"))?;
-    if literal_segments == 0 {
-        return Ok(Value::string(JsString::from_str("", interp.gc_heap_mut())?));
-    }
+        let raw_value = scope.raw(raw);
+        let length_result = scope.with_turn_parts(|interp, stack| {
+            interp.get_property_value_for_call(stack, &context, raw_value, "length")
+        });
+        let length_value = match length_result {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(crate::native_function::vm_to_native_error(
+                    scope.context().interp_mut(),
+                    error,
+                    "String.raw",
+                ));
+            }
+        };
+        let length = scope.value(length_value);
+        let length_value = scope.raw(length);
+        let literal_segments_result = scope.with_turn_parts(|interp, stack| {
+            crate::coerce::to_length_or_throw(interp, stack, &context, &length_value)
+        });
+        let literal_segments = match literal_segments_result {
+            Ok(length) => length,
+            Err(error) => {
+                return Err(crate::native_function::vm_to_native_error(
+                    scope.context().interp_mut(),
+                    error,
+                    "String.raw",
+                ));
+            }
+        };
+        if literal_segments == 0 {
+            let empty = scope.string("")?;
+            return Ok(scope.finish(empty));
+        }
 
-    let mut out = String::new();
-    let substitutions = args.get(1..).unwrap_or(&[]);
-    for next_index in 0..literal_segments {
-        let key = next_index.to_string();
-        let seg_val = interp
-            .get_property_value_for_call(&context, raw, &key)
-            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "String.raw"))?;
-        let seg = interp
-            .coerce_to_string(&context, &seg_val)
-            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "String.raw"))?;
-        out.push_str(&seg);
-        if next_index + 1 == literal_segments {
-            break;
+        let mut out = String::new();
+        let substitutions = args.get(1..).unwrap_or(&[]);
+        for next_index in 0..literal_segments {
+            let key = next_index.to_string();
+            let raw_value = scope.raw(raw);
+            let segment_result = scope.with_turn_parts(|interp, stack| {
+                interp.get_property_value_for_call(stack, &context, raw_value, &key)
+            });
+            let segment_value = match segment_result {
+                Ok(value) => value,
+                Err(error) => {
+                    return Err(crate::native_function::vm_to_native_error(
+                        scope.context().interp_mut(),
+                        error,
+                        "String.raw",
+                    ));
+                }
+            };
+            let segment = scope.value(segment_value);
+            let segment_value = scope.raw(segment);
+            let text_result = scope.with_turn_parts(|interp, stack| {
+                interp.coerce_to_string(stack, &context, &segment_value)
+            });
+            let text = match text_result {
+                Ok(text) => text,
+                Err(error) => {
+                    return Err(crate::native_function::vm_to_native_error(
+                        scope.context().interp_mut(),
+                        error,
+                        "String.raw",
+                    ));
+                }
+            };
+            out.push_str(&text);
+            if next_index + 1 == literal_segments {
+                break;
+            }
+            if let Some(substitution) = substitutions.get(next_index) {
+                let text_result = scope.with_turn_parts(|interp, stack| {
+                    interp.coerce_to_string(stack, &context, substitution)
+                });
+                let text = match text_result {
+                    Ok(text) => text,
+                    Err(error) => {
+                        return Err(crate::native_function::vm_to_native_error(
+                            scope.context().interp_mut(),
+                            error,
+                            "String.raw",
+                        ));
+                    }
+                };
+                out.push_str(&text);
+            }
         }
-        if let Some(sub) = substitutions.get(next_index) {
-            let sub_str = interp
-                .coerce_to_string(&context, sub)
-                .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "String.raw"))?;
-            out.push_str(&sub_str);
-        }
-    }
-    Ok(Value::string(JsString::from_str(
-        &out,
-        interp.gc_heap_mut(),
-    )?))
+        let result = scope.string(&out)?;
+        Ok(scope.finish(result))
+    })
 }
 
 /// `String.fromCharCode(...codeUnits)` — ECMA-262 §22.1.2.1.
@@ -173,9 +242,16 @@ fn string_from_char_code(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
         })?;
     let mut units: Vec<u16> = Vec::with_capacity(args.len());
     for arg in args {
-        let n = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, arg)
-            .map_err(|e| {
-                crate::native_function::vm_to_native_error(ctx.cx.interp, e, "String.fromCharCode")
+        let number = ctx.with_turn_parts(|interp, stack| {
+            crate::coerce::to_number_or_throw(interp, stack, &exec, arg)
+        });
+        let n = number
+            .map_err(|error| {
+                crate::native_function::vm_to_native_error(
+                    ctx.interp_mut(),
+                    error,
+                    "String.fromCharCode",
+                )
             })?
             .as_f64();
         units.push(to_uint16(n));
@@ -220,9 +296,16 @@ fn string_from_code_point(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
         })?;
     let mut units: Vec<u16> = Vec::with_capacity(args.len() * 2);
     for arg in args {
-        let n = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, arg)
-            .map_err(|e| {
-                crate::native_function::vm_to_native_error(ctx.cx.interp, e, "String.fromCodePoint")
+        let number = ctx.with_turn_parts(|interp, stack| {
+            crate::coerce::to_number_or_throw(interp, stack, &exec, arg)
+        });
+        let n = number
+            .map_err(|error| {
+                crate::native_function::vm_to_native_error(
+                    ctx.interp_mut(),
+                    error,
+                    "String.fromCodePoint",
+                )
             })?
             .as_f64();
         if !n.is_finite() || n < 0.0 || n > 0x10FFFF as f64 || n.fract() != 0.0 {

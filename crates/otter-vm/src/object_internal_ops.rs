@@ -169,29 +169,6 @@ fn descriptor_to_lookup(desc: object::PropertyDescriptor) -> object::PropertyLoo
     }
 }
 
-#[derive(Clone, Copy)]
-enum DescriptorAllocationRoots<'a> {
-    Runtime {
-        value_roots: &'a [&'a Value],
-        slice_roots: &'a [&'a [Value]],
-    },
-    Stack(&'a ActivationStack),
-}
-
-fn partial_descriptor_value_roots(descriptor: &object::PartialPropertyDescriptor) -> Vec<Value> {
-    let mut roots = Vec::with_capacity(3);
-    if let Some(value) = &descriptor.value {
-        roots.push(*value);
-    }
-    if let Some(get) = &descriptor.get {
-        roots.push(*get);
-    }
-    if let Some(set) = &descriptor.set {
-        roots.push(*set);
-    }
-    roots
-}
-
 impl Interpreter {
     /// §28.2 — call a Proxy handler trap. When the trap is missing,
     /// returns `Ok(None)` so the caller can fall through to the
@@ -201,31 +178,61 @@ impl Interpreter {
     /// from `args`) and returns the result.
     pub fn invoke_proxy_trap(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         proxy: &crate::proxy::JsProxy,
         trap: &str,
         args: SmallVec<[Value; 8]>,
     ) -> Result<Option<Value>, VmError> {
-        if proxy.is_revoked(&self.gc_heap) {
-            return Err(VmError::TypeMismatch);
-        }
-        let handler = proxy.handler(&self.gc_heap);
-        let trap_key = VmPropertyKey::String(trap);
-        let trap_value = match self.ordinary_get_value(context, handler, handler, &trap_key, 0)? {
-            VmGetOutcome::Value(value) => value,
-            VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, handler, SmallVec::new())?
+        self.with_handle_scope(|interp, scope| {
+            let proxy_handle = interp.scoped_value(scope, Value::proxy(*proxy));
+            let arg_handles: SmallVec<[Local<'_>; 8]> = args
+                .into_iter()
+                .map(|value| interp.scoped_value(scope, value))
+                .collect();
+
+            let proxy = interp
+                .escape_scoped(proxy_handle)
+                .as_proxy()
+                .ok_or(VmError::TypeMismatch)?;
+            if proxy.is_revoked(&interp.gc_heap) {
+                return Err(VmError::TypeMismatch);
             }
-        };
-        let trap_fn = if self.is_callable_runtime(&trap_value) {
-            trap_value
-        } else if trap_value.is_nullish() {
-            return Ok(None);
-        } else {
-            return Err(VmError::TypeMismatch);
-        };
-        let result = self.run_callable_sync(context, &trap_fn, handler, args)?;
-        Ok(Some(result))
+            let handler_handle = interp.scoped_value(scope, proxy.handler(&interp.gc_heap));
+            let trap_key = VmPropertyKey::String(trap);
+            let handler = interp.escape_scoped(handler_handle);
+            let trap_value =
+                match interp.ordinary_get_value(stack, context, handler, handler, &trap_key, 0)? {
+                    VmGetOutcome::Value(value) => value,
+                    VmGetOutcome::InvokeGetter { getter } => interp.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &getter,
+                        interp.escape_scoped(handler_handle),
+                        SmallVec::new(),
+                    )?,
+                };
+            let trap_handle = interp.scoped_value(scope, trap_value);
+            let trap_value = interp.escape_scoped(trap_handle);
+            if trap_value.is_nullish() {
+                return Ok(None);
+            }
+            if !interp.is_callable_runtime(&trap_value) {
+                return Err(VmError::TypeMismatch);
+            }
+            let current_args = arg_handles
+                .into_iter()
+                .map(|handle| interp.escape_scoped(handle))
+                .collect();
+            let result = interp.run_callable_sync_rooted(
+                stack,
+                context,
+                &interp.escape_scoped(trap_handle),
+                interp.escape_scoped(handler_handle),
+                current_args,
+            )?;
+            Ok(Some(result))
+        })
     }
 
     pub(crate) fn vm_property_key_to_value(
@@ -465,60 +472,28 @@ impl Interpreter {
         Err(VmError::InvalidOperand)
     }
 
-    pub(crate) fn ordinary_get_own_property_descriptor_value_stack_rooted(
+    pub(crate) fn ordinary_get_own_property_descriptor_value(
         &mut self,
-        context: &ExecutionContext,
-        stack: &ActivationStack,
-        target: Value,
-        key: &VmPropertyKey,
-        hops: usize,
-    ) -> Result<Option<object::PropertyDescriptor>, VmError> {
-        self.ordinary_get_own_property_descriptor_value_with_roots(
-            context,
-            target,
-            key,
-            hops,
-            DescriptorAllocationRoots::Stack(stack),
-        )
-    }
-
-    pub(crate) fn ordinary_get_own_property_descriptor_value_runtime_rooted(
-        &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         target: Value,
         key: &VmPropertyKey,
         hops: usize,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
-    ) -> Result<Option<object::PropertyDescriptor>, VmError> {
-        self.ordinary_get_own_property_descriptor_value_with_roots(
-            context,
-            target,
-            key,
-            hops,
-            DescriptorAllocationRoots::Runtime {
-                value_roots,
-                slice_roots,
-            },
-        )
-    }
-
-    fn ordinary_get_own_property_descriptor_value_with_roots(
-        &mut self,
-        context: &ExecutionContext,
-        target: Value,
-        key: &VmPropertyKey,
-        hops: usize,
-        allocation_roots: DescriptorAllocationRoots<'_>,
     ) -> Result<Option<object::PropertyDescriptor>, VmError> {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(None);
         }
-        self.ensure_deferred_namespace_ready(
-            context,
-            &target,
-            !Self::deferred_key_is_symbol_like(key),
-        )?;
+        let target = self.with_handle_scope(|interp, scope| -> Result<Value, VmError> {
+            let target = interp.scoped_value(scope, target);
+            let current = interp.escape_scoped(target);
+            interp.ensure_deferred_namespace_ready(
+                stack,
+                context,
+                &current,
+                !Self::deferred_key_is_symbol_like(key),
+            )?;
+            Ok(interp.escape_scoped(target))
+        })?;
         // §10.4.6.5 [[GetOwnProperty]] — namespace string keys report
         // `{writable:true, enumerable:true, configurable:false}` data
         // descriptors resolved through the environment; symbol keys
@@ -542,18 +517,19 @@ impl Interpreter {
             let trap_args: SmallVec<[Value; 8]> =
                 smallvec::smallvec![proxy.target(&self.gc_heap), key_value];
             return match self.invoke_proxy_trap(
+                stack,
                 context,
                 &proxy,
                 "getOwnPropertyDescriptor",
                 trap_args,
             )? {
                 Some(v) if v.is_nullish() => {
-                    let target_desc = self.ordinary_get_own_property_descriptor_value_with_roots(
+                    let target_desc = self.ordinary_get_own_property_descriptor_value(
+                        stack,
                         context,
                         proxy.target(&self.gc_heap),
                         key,
                         hops + 1,
-                        allocation_roots,
                     )?;
                     self.validate_proxy_get_own_property_descriptor(
                         &proxy.target(&self.gc_heap),
@@ -566,14 +542,14 @@ impl Interpreter {
                     // §10.5.5 step 9-ish ToPropertyDescriptor through
                     // ordinary [[Get]]s so a Proxy descriptor object
                     // dispatches its own traps.
-                    let partial = self.evaluate_to_property_descriptor(context, &v)?;
+                    let partial = self.evaluate_to_property_descriptor(stack, context, &v)?;
                     let desc = partial.complete_for_new_property();
-                    let target_desc = self.ordinary_get_own_property_descriptor_value_with_roots(
+                    let target_desc = self.ordinary_get_own_property_descriptor_value(
+                        stack,
                         context,
                         proxy.target(&self.gc_heap),
                         key,
                         hops + 1,
-                        allocation_roots,
                     )?;
                     self.validate_proxy_get_own_property_descriptor(
                         &proxy.target(&self.gc_heap),
@@ -587,12 +563,12 @@ impl Interpreter {
                         .to_string())
                     .into(),
                 )),
-                None => self.ordinary_get_own_property_descriptor_value_with_roots(
+                None => self.ordinary_get_own_property_descriptor_value(
+                    stack,
                     context,
                     proxy.target(&self.gc_heap),
                     key,
                     hops + 1,
-                    allocation_roots,
                 ),
             };
         }
@@ -821,29 +797,14 @@ impl Interpreter {
                 .string_name()
                 .expect("non-symbol key has string spelling");
             if key == "prototype" {
-                let _ = match allocation_roots {
-                    DescriptorAllocationRoots::Runtime {
-                        value_roots,
-                        slice_roots,
-                    } => self.function_property_get_runtime_rooted_with_receiver(
-                        context,
-                        owner,
-                        function_id,
-                        Some(target),
-                        "prototype",
-                        value_roots,
-                        slice_roots,
-                    )?,
-                    DescriptorAllocationRoots::Stack(stack) => self
-                        .function_property_get_stack_rooted_with_receiver(
-                            context,
-                            stack,
-                            owner,
-                            function_id,
-                            Some(target),
-                            "prototype",
-                        )?,
-                };
+                let _ = self.function_property_get_with_receiver(
+                    stack,
+                    context,
+                    owner,
+                    function_id,
+                    Some(target),
+                    "prototype",
+                )?;
                 let Some(bag) = self.callable_bag_read(owner, function_id) else {
                     return Ok(None);
                 };
@@ -929,6 +890,7 @@ impl Interpreter {
 
     fn proxy_get_prototype_invariant_target_proto(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         target: &Value,
     ) -> Result<Option<Value>, VmError> {
@@ -938,13 +900,14 @@ impl Interpreter {
         if object::is_extensible(obj, &self.gc_heap) {
             return Ok(None);
         }
-        Ok(Some(
-            self.ordinary_get_prototype_value(context, *target, 0)?,
-        ))
+        Ok(Some(self.ordinary_get_prototype_value(
+            stack, context, *target, 0,
+        )?))
     }
 
     pub(crate) fn ordinary_get_prototype_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         value: Value,
         hops: usize,
@@ -954,7 +917,13 @@ impl Interpreter {
         }
         if let Some(proxy) = value.as_proxy() {
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
-            return match self.invoke_proxy_trap(context, &proxy, "getPrototypeOf", trap_args)? {
+            return match self.invoke_proxy_trap(
+                stack,
+                context,
+                &proxy,
+                "getPrototypeOf",
+                trap_args,
+            )? {
                 Some(result) => {
                     if !Self::proxy_get_prototype_result_is_object_or_null(&result) {
                         return Err(self.err_type(
@@ -962,6 +931,7 @@ impl Interpreter {
                         ));
                     }
                     if let Some(target_proto) = self.proxy_get_prototype_invariant_target_proto(
+                        stack,
                         context,
                         &proxy.target(&self.gc_heap),
                     )? && !abstract_ops::same_value(&result, &target_proto, &self.gc_heap)
@@ -975,6 +945,7 @@ impl Interpreter {
                     Ok(result)
                 }
                 None => self.ordinary_get_prototype_value(
+                    stack,
                     context,
                     proxy.target(&self.gc_heap),
                     hops + 1,
@@ -1008,6 +979,7 @@ impl Interpreter {
     /// target's actual extensibility.
     pub(crate) fn is_extensible_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         value: &Value,
     ) -> Result<bool, VmError> {
@@ -1027,11 +999,17 @@ impl Interpreter {
                 ));
             }
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
-            return match self.invoke_proxy_trap(context, &proxy, "isExtensible", trap_args)? {
+            return match self.invoke_proxy_trap(
+                stack,
+                context,
+                &proxy,
+                "isExtensible",
+                trap_args,
+            )? {
                 Some(result) => {
                     let trap = result.to_boolean(&self.gc_heap);
                     let target_ext =
-                        self.is_extensible_value(context, &proxy.target(&self.gc_heap))?;
+                        self.is_extensible_value(stack, context, &proxy.target(&self.gc_heap))?;
                     if trap != target_ext {
                         return Err(self.err_type(
                             ("Proxy isExtensible trap returned value inconsistent with target"
@@ -1041,7 +1019,7 @@ impl Interpreter {
                     }
                     Ok(trap)
                 }
-                None => self.is_extensible_value(context, &proxy.target(&self.gc_heap)),
+                None => self.is_extensible_value(stack, context, &proxy.target(&self.gc_heap)),
             };
         }
         if let Some(obj) = value.as_object() {
@@ -1124,6 +1102,7 @@ impl Interpreter {
     /// non-extensible objects) apply their own define semantics.
     pub(crate) fn ordinary_set_on_receiver(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         key: &VmPropertyKey,
         value: Value,
@@ -1132,14 +1111,8 @@ impl Interpreter {
         if !crate::reflect::is_type_object_value(receiver) {
             return Ok(false);
         }
-        let existing = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
-            context,
-            *receiver,
-            key,
-            0,
-            &[receiver, &value],
-            &[],
-        )?;
+        let existing =
+            self.ordinary_get_own_property_descriptor_value(stack, context, *receiver, key, 0)?;
         match existing {
             Some(desc) => match desc.kind {
                 object::DescriptorKind::Accessor { .. } => Ok(false),
@@ -1151,7 +1124,7 @@ impl Interpreter {
                         value: Some(value),
                         ..Default::default()
                     };
-                    self.define_own_property_value(context, receiver, key, partial)
+                    self.define_own_property_value(stack, context, receiver, key, partial)
                 }
             },
             None => {
@@ -1162,7 +1135,7 @@ impl Interpreter {
                     configurable: Some(true),
                     ..Default::default()
                 };
-                self.define_own_property_value(context, receiver, key, descriptor)
+                self.define_own_property_value(stack, context, receiver, key, descriptor)
             }
         }
     }
@@ -1207,125 +1180,130 @@ impl Interpreter {
 
     pub(crate) fn private_element_lookup(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: &Value,
         sym: crate::symbol::JsSymbol,
     ) -> Result<Option<(Value, object::PropertyDescriptor)>, VmError> {
-        // §6.2.12 — a Proxy carries its own [[PrivateElements]];
-        // private names never consult traps or the target/prototype
-        // chain.
-        if sym.is_private_name()
-            && let Some(p) = receiver.as_proxy()
-        {
-            if let Some(value) = self.proxy_private_find(&p, sym) {
-                return Ok(Some((
-                    *receiver,
-                    object::PropertyDescriptor {
-                        kind: object::DescriptorKind::Data { value },
-                        flags: object::PropertyFlags::new(true, false, false),
-                    },
-                )));
-            }
-            // Miss in the bag: brand entries carry the class
-            // prototype object as their value, so private METHODS /
-            // accessors of a branded receiver resolve through it
-            // even though the proxy's chain never reaches the
-            // holder. The holder reported is the prototype, which
-            // keeps the PrivateSet not-writable check intact.
-            let brand_protos: Vec<Value> = self.gc_heap.read_payload(p.handle(), |body| {
-                body.private_elements
-                    .as_ref()
-                    .map(|entries| {
-                        entries
-                            .iter()
-                            .filter(|(_, v)| v.is_object())
-                            .map(|(_, v)| *v)
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            });
-            let key = VmPropertyKey::Symbol(sym);
-            for proto in brand_protos {
-                if let Some(desc) = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
-                    context,
-                    proto,
-                    &key,
-                    0,
-                    &[&proto, receiver],
-                    &[],
-                )? {
-                    return Ok(Some((proto, desc)));
+        self.with_handle_scope(|interp, scope| {
+            let receiver_handle = interp.scoped_value(scope, *receiver);
+            let receiver = interp.escape_scoped(receiver_handle);
+            // §6.2.12 — a Proxy carries its own [[PrivateElements]];
+            // private names never consult traps or the target/prototype
+            // chain.
+            if sym.is_private_name()
+                && let Some(p) = receiver.as_proxy()
+            {
+                if let Some(value) = interp.proxy_private_find(&p, sym) {
+                    return Ok(Some((
+                        interp.escape_scoped(receiver_handle),
+                        object::PropertyDescriptor {
+                            kind: object::DescriptorKind::Data { value },
+                            flags: object::PropertyFlags::new(true, false, false),
+                        },
+                    )));
                 }
-            }
-            return Ok(None);
-        }
-        let key = VmPropertyKey::Symbol(sym);
-        let mut current = *receiver;
-        let mut hops = 0;
-        loop {
-            if let Some(desc) = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
-                context,
-                current,
-                &key,
-                0,
-                &[&current, receiver],
-                &[],
-            )? {
-                return Ok(Some((current, desc)));
-            }
-            if hops >= object::PROTO_CHAIN_HARD_CAP {
-                break;
-            }
-            // §7.3.30 — private elements never inherit across a class
-            // boundary: a subclass constructor does not see the parent
-            // constructor's static privates (the ctor_proto identity
-            // chain would otherwise leak them).
-            if current.is_class_constructor() {
-                break;
-            }
-            // Proxies participate via their getPrototypeOf trap —
-            // the context-aware walker handles them (the plain
-            // get_prototype_for_op rejects proxy values).
-            let proto = self.ordinary_get_prototype_value(context, current, hops)?;
-            if !proto.is_object() && !proto.is_object_type() {
-                break;
-            }
-            current = proto;
-            hops += 1;
-        }
-        // Constructor-return override: a branded plain object whose
-        // [[Prototype]] chain misses the method holder still resolves
-        // private methods through its brand entries, whose stored
-        // value is the class prototype object (see `__privproto_*`).
-        if sym.is_private_name()
-            && let Some(obj) = receiver.as_object()
-        {
-            let brand_protos: Vec<Value> =
-                crate::object::with_properties(obj, &self.gc_heap, |props| {
-                    props
-                        .symbol_keys()
-                        .filter(|k| k.is_private_name())
-                        .filter_map(|k| crate::object::get_symbol(obj, &self.gc_heap, k))
-                        .filter(|v| v.is_object())
-                        .collect()
+                // Brand entries are copied out under a non-allocating heap
+                // borrow, then immediately parked as handles before any
+                // descriptor lookup can allocate or invoke user code.
+                let brand_protos: Vec<Value> = interp.gc_heap.read_payload(p.handle(), |body| {
+                    body.private_elements
+                        .as_ref()
+                        .map(|entries| {
+                            entries
+                                .iter()
+                                .filter(|(_, v)| v.is_object())
+                                .map(|(_, v)| *v)
+                                .collect()
+                        })
+                        .unwrap_or_default()
                 });
-            for proto in brand_protos {
-                if proto == *receiver {
-                    continue;
+                let brand_protos: Vec<_> = brand_protos
+                    .into_iter()
+                    .map(|proto| interp.scoped_value(scope, proto))
+                    .collect();
+                let key = VmPropertyKey::Symbol(sym);
+                for proto in brand_protos {
+                    let proto_value = interp.escape_scoped(proto);
+                    if let Some(desc) = interp.ordinary_get_own_property_descriptor_value(
+                        stack,
+                        context,
+                        proto_value,
+                        &key,
+                        0,
+                    )? {
+                        return Ok(Some((interp.escape_scoped(proto), desc)));
+                    }
                 }
-                if let Some(desc) = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
-                    context,
-                    proto,
-                    &key,
-                    0,
-                    &[&proto, receiver],
-                    &[],
-                )? {
-                    return Ok(Some((proto, desc)));
+                return Ok(None);
+            }
+
+            let key = VmPropertyKey::Symbol(sym);
+            let current_handle = interp.scoped_value(scope, receiver);
+            let mut hops = 0;
+            loop {
+                let current = interp.escape_scoped(current_handle);
+                if let Some(desc) = interp
+                    .ordinary_get_own_property_descriptor_value(stack, context, current, &key, 0)?
+                {
+                    return Ok(Some((interp.escape_scoped(current_handle), desc)));
+                }
+                if hops >= object::PROTO_CHAIN_HARD_CAP {
+                    break;
+                }
+                let current = interp.escape_scoped(current_handle);
+                // §7.3.30 — private elements never inherit across a class
+                // boundary: a subclass constructor does not see the parent
+                // constructor's static privates.
+                if current.is_class_constructor() {
+                    break;
+                }
+                let proto = interp.ordinary_get_prototype_value(stack, context, current, hops)?;
+                if !proto.is_object() && !proto.is_object_type() {
+                    break;
+                }
+                interp.set_scoped(current_handle, proto);
+                hops += 1;
+            }
+
+            // Constructor-return override: a branded plain object whose
+            // [[Prototype]] chain misses the method holder still resolves
+            // private methods through its brand entries.
+            let receiver = interp.escape_scoped(receiver_handle);
+            if sym.is_private_name()
+                && let Some(obj) = receiver.as_object()
+            {
+                let brand_protos: Vec<Value> =
+                    crate::object::with_properties(obj, &interp.gc_heap, |props| {
+                        props
+                            .symbol_keys()
+                            .filter(|k| k.is_private_name())
+                            .filter_map(|k| crate::object::get_symbol(obj, &interp.gc_heap, k))
+                            .filter(|v| v.is_object())
+                            .collect()
+                    });
+                let brand_protos: Vec<_> = brand_protos
+                    .into_iter()
+                    .map(|proto| interp.scoped_value(scope, proto))
+                    .collect();
+                for proto in brand_protos {
+                    let proto_value = interp.escape_scoped(proto);
+                    if proto_value == interp.escape_scoped(receiver_handle) {
+                        continue;
+                    }
+                    if let Some(desc) = interp.ordinary_get_own_property_descriptor_value(
+                        stack,
+                        context,
+                        proto_value,
+                        &key,
+                        0,
+                    )? {
+                        return Ok(Some((interp.escape_scoped(proto), desc)));
+                    }
                 }
             }
-        }
-        Ok(None)
+            Ok(None)
+        })
     }
 
     /// Flip the existing array-index accessor protector latch and publish its
@@ -1361,6 +1339,7 @@ impl Interpreter {
 
     pub(crate) fn define_own_property_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         target: &Value,
         key: &VmPropertyKey,
@@ -1403,11 +1382,33 @@ impl Interpreter {
         {
             self.activate_array_index_accessor_protector();
         }
-        self.ensure_deferred_namespace_ready(
-            context,
-            target,
-            !Self::deferred_key_is_symbol_like(key),
+        let (target, descriptor) = self.with_handle_scope(
+            |interp, scope| -> Result<(Value, object::PartialPropertyDescriptor), VmError> {
+                let target_handle = interp.scoped_value(scope, *target);
+                let value_handle = descriptor
+                    .value
+                    .map(|value| interp.scoped_value(scope, value));
+                let get_handle = descriptor
+                    .get
+                    .map(|value| interp.scoped_value(scope, value));
+                let set_handle = descriptor
+                    .set
+                    .map(|value| interp.scoped_value(scope, value));
+                let current = interp.escape_scoped(target_handle);
+                interp.ensure_deferred_namespace_ready(
+                    stack,
+                    context,
+                    &current,
+                    !Self::deferred_key_is_symbol_like(key),
+                )?;
+                let mut descriptor = descriptor;
+                descriptor.value = value_handle.map(|value| interp.escape_scoped(value));
+                descriptor.get = get_handle.map(|value| interp.escape_scoped(value));
+                descriptor.set = set_handle.map(|value| interp.escape_scoped(value));
+                Ok((interp.escape_scoped(target_handle), descriptor))
+            },
         )?;
+        let target = &target;
         // §10.4.6.6 [[DefineOwnProperty]] — a namespace export is a fixed
         // `{writable:true, enumerable:true, configurable:false}` data
         // property; a define on a string export succeeds only if it
@@ -1447,26 +1448,26 @@ impl Interpreter {
                 self.partial_descriptor_to_object(&descriptor, &[&key_value, &target_value])?;
             let trap_args: SmallVec<[Value; 8]> =
                 smallvec::smallvec![target_value, key_value, Value::object(descriptor_object),];
-            return match self.invoke_proxy_trap(context, &proxy, "defineProperty", trap_args)? {
+            return match self.invoke_proxy_trap(
+                stack,
+                context,
+                &proxy,
+                "defineProperty",
+                trap_args,
+            )? {
                 Some(result) => {
                     let ok = result.to_boolean(&self.gc_heap);
                     if !ok {
                         return Ok(false);
                     }
-                    let descriptor_roots = partial_descriptor_value_roots(&descriptor);
-                    let mut value_roots = Vec::with_capacity(descriptor_roots.len() + 1);
-                    value_roots.push(&target_value);
-                    value_roots.extend(descriptor_roots.iter());
-                    let target_desc = self
-                        .ordinary_get_own_property_descriptor_value_runtime_rooted(
-                            context,
-                            target_value,
-                            key,
-                            0,
-                            value_roots.as_slice(),
-                            &[],
-                        )?;
-                    let extensible = self.is_extensible_value(context, &target_value)?;
+                    let target_desc = self.ordinary_get_own_property_descriptor_value(
+                        stack,
+                        context,
+                        target_value,
+                        key,
+                        0,
+                    )?;
+                    let extensible = self.is_extensible_value(stack, context, &target_value)?;
                     let setting_config_false = matches!(descriptor.configurable, Some(false))
                         || (descriptor.configurable.is_none() && !descriptor.is_generic() && {
                             // Defaults when adding (current undefined):
@@ -1528,6 +1529,7 @@ impl Interpreter {
                 None => {
                     // Trap missing — fall through to target.
                     self.define_own_property_value(
+                        stack,
                         context,
                         &proxy.target(&self.gc_heap),
                         key,
@@ -1601,7 +1603,7 @@ impl Interpreter {
         if let Some(function_id) = fid {
             let owner = target.as_closure(&self.gc_heap);
             if let VmPropertyKey::Symbol(sym) = key {
-                let bag = self.function_user_bag_runtime_rooted(owner, function_id, &[], &[])?;
+                let bag = self.function_user_bag(stack, owner, function_id, &[])?;
                 return Ok(object::define_own_symbol_property_partial(
                     bag,
                     &mut self.gc_heap,
@@ -1620,14 +1622,13 @@ impl Interpreter {
             // wrongly letting `defineProperty(fn, "prototype", {set})` (a
             // data→accessor change) or a `configurable:true` flip succeed.
             if k == "prototype" {
-                let _ = self.function_property_get_runtime_rooted_with_receiver(
+                let _ = self.function_property_get_with_receiver(
+                    stack,
                     context,
                     owner,
                     function_id,
                     None,
                     "prototype",
-                    &[],
-                    &[],
                 )?;
             }
             let completed = match self.ordinary_function_own_property_descriptor(
@@ -1640,6 +1641,7 @@ impl Interpreter {
                 None => descriptor.complete_for_new_property(),
             };
             return self.ordinary_function_define_own_property(
+                stack,
                 Some(context),
                 owner,
                 function_id,
@@ -1779,9 +1781,10 @@ impl Interpreter {
                 // length raises `RangeError` ahead of the configurable /
                 // enumerable / writable checks.
                 let new_len = if let Some(v) = descriptor.value {
-                    let number_for_uint = crate::coerce::to_number_or_throw(self, context, &v)?;
+                    let number_for_uint =
+                        crate::coerce::to_number_or_throw(self, stack, context, &v)?;
                     let new_len = crate::number::bitwise::to_uint32(number_for_uint);
-                    let number_len = crate::coerce::to_number_or_throw(self, context, &v)?;
+                    let number_len = crate::coerce::to_number_or_throw(self, stack, context, &v)?;
                     if (new_len as f64) != number_len.as_f64() {
                         return Err(self.err_range(("Invalid array length".to_string()).into()));
                     }
@@ -1879,7 +1882,8 @@ impl Interpreter {
                     // descriptor value with ToNumber / ToBigInt (firing
                     // its coercion and throwing for a Symbol / cross-type)
                     // before storing it.
-                    let coerced = self.typed_array_coerce_element(context, t.kind(), value)?;
+                    let coerced =
+                        self.typed_array_coerce_element(stack, context, t.kind(), value)?;
                     t.set(&mut self.gc_heap, idx, &coerced);
                 }
                 return Ok(true);
@@ -1933,16 +1937,17 @@ impl Interpreter {
     /// `defineProperty` in the spec order.
     pub(crate) fn set_integrity_level_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         target: &Value,
         level: ObjectIntegrityLevel,
     ) -> Result<bool, VmError> {
         // §7.3.15 steps 3-4 — `[[PreventExtensions]]` runs *before*
         // `[[OwnPropertyKeys]]` (observable through Proxy trap order).
-        if !self.prevent_extensions_value(context, target)? {
+        if !self.prevent_extensions_value(stack, context, target)? {
             return Ok(false);
         }
-        let keys = self.own_property_keys_value(context, target)?;
+        let keys = self.own_property_keys_value(stack, context, target)?;
         for key_value in &keys {
             let key = property_key_value_to_vm_key(self, key_value, &self.gc_heap)?;
             let descriptor = match level {
@@ -1951,13 +1956,8 @@ impl Interpreter {
                     ..Default::default()
                 },
                 ObjectIntegrityLevel::Frozen => {
-                    let current = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
-                        context,
-                        *target,
-                        &key,
-                        0,
-                        &[target],
-                        &[],
+                    let current = self.ordinary_get_own_property_descriptor_value(
+                        stack, context, *target, &key, 0,
                     )?;
                     let Some(current) = current else {
                         continue;
@@ -1978,7 +1978,7 @@ impl Interpreter {
             // `Object.freeze`/`seal` throw on a non-empty TypedArray: its
             // integer-indexed elements cannot be made non-configurable /
             // non-writable, so `[[DefineOwnProperty]]` returns false.
-            if !self.define_own_property_value(context, target, &key, descriptor)? {
+            if !self.define_own_property_value(stack, context, target, &key, descriptor)? {
                 return Err(self.err_type(
                     ("Cannot redefine property during SetIntegrityLevel".to_string()).into(),
                 ));
@@ -1993,24 +1993,19 @@ impl Interpreter {
     /// trap order and symbol keys from `[[OwnPropertyKeys]]`.
     pub(crate) fn test_integrity_level_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         target: &Value,
         level: ObjectIntegrityLevel,
     ) -> Result<bool, VmError> {
-        if self.is_extensible_value(context, target)? {
+        if self.is_extensible_value(stack, context, target)? {
             return Ok(false);
         }
-        let keys = self.own_property_keys_value(context, target)?;
+        let keys = self.own_property_keys_value(stack, context, target)?;
         for key_value in &keys {
             let key = property_key_value_to_vm_key(self, key_value, &self.gc_heap)?;
-            let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
-                context,
-                *target,
-                &key,
-                0,
-                &[target],
-                &[],
-            )?;
+            let desc =
+                self.ordinary_get_own_property_descriptor_value(stack, context, *target, &key, 0)?;
             let Some(desc) = desc else {
                 continue;
             };
@@ -2431,6 +2426,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-ordinarytoprimitive>
     pub(crate) fn evaluate_to_primitive(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         input: &Value,
         hint: abstract_ops::ToPrimitiveHint,
@@ -2438,41 +2434,58 @@ impl Interpreter {
         if abstract_ops::is_primitive(input) {
             return Ok(*input);
         }
-        // Step 1.a — try `@@toPrimitive` via OrdinaryGet on the
-        // object's prototype chain. Falls back to ordinary toString /
-        // valueOf when the exotic hook is absent.
-        let to_prim_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
-        let exotic = match self.ordinary_get_value(
-            context,
-            *input,
-            *input,
-            &VmPropertyKey::Symbol(to_prim_sym),
-            0,
-        )? {
-            VmGetOutcome::Value(v) => v,
-            VmGetOutcome::InvokeGetter { getter } => {
-                let args: SmallVec<[Value; 8]> = SmallVec::new();
-                self.run_callable_sync(context, &getter, *input, args)?
+        self.with_handle_scope(|interp, scope| {
+            let input_handle = interp.scoped_value(scope, *input);
+            // Step 1.a — try `@@toPrimitive` via OrdinaryGet on the
+            // object's prototype chain. Falls back to ordinary toString /
+            // valueOf when the exotic hook is absent.
+            let to_prim_sym = interp
+                .well_known_symbols
+                .get(symbol::WellKnown::ToPrimitive);
+            let current_input = interp.escape_scoped(input_handle);
+            let exotic = match interp.ordinary_get_value(
+                stack,
+                context,
+                current_input,
+                current_input,
+                &VmPropertyKey::Symbol(to_prim_sym),
+                0,
+            )? {
+                VmGetOutcome::Value(value) => value,
+                VmGetOutcome::InvokeGetter { getter } => interp.run_callable_sync_rooted(
+                    stack,
+                    context,
+                    &getter,
+                    interp.escape_scoped(input_handle),
+                    SmallVec::new(),
+                )?,
+            };
+            let exotic_handle = interp.scoped_value(scope, exotic);
+            if !interp.escape_scoped(exotic_handle).is_nullish() {
+                if !interp.is_callable_runtime(&interp.escape_scoped(exotic_handle)) {
+                    return Err(interp.err_type(
+                        ("Symbol.toPrimitive method is not callable".to_string()).into(),
+                    ));
+                }
+                let hint_handle = interp.scoped_string(scope, hint.as_token())?;
+                let args: SmallVec<[Value; 8]> =
+                    smallvec::smallvec![interp.escape_scoped(hint_handle)];
+                let result = interp.run_callable_sync_rooted(
+                    stack,
+                    context,
+                    &interp.escape_scoped(exotic_handle),
+                    interp.escape_scoped(input_handle),
+                    args,
+                )?;
+                if abstract_ops::is_primitive(&result) {
+                    return Ok(result);
+                }
+                return Err(interp
+                    .err_type(("Symbol.toPrimitive returned a non-primitive".to_string()).into()));
             }
-        };
-        if !exotic.is_nullish() {
-            if !self.is_callable_runtime(&exotic) {
-                return Err(
-                    self.err_type(("Symbol.toPrimitive method is not callable".to_string()).into())
-                );
-            }
-            let hint_str = JsString::from_str(hint.as_token(), &mut self.gc_heap)?;
-            let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-            args.push(Value::string(hint_str));
-            let result = self.run_callable_sync(context, &exotic, *input, args)?;
-            if abstract_ops::is_primitive(&result) {
-                return Ok(result);
-            }
-            return Err(
-                self.err_type(("Symbol.toPrimitive returned a non-primitive".to_string()).into())
-            );
-        }
-        self.evaluate_ordinary_to_primitive(context, input, hint)
+            let current_input = interp.escape_scoped(input_handle);
+            interp.evaluate_ordinary_to_primitive(stack, context, &current_input, hint)
+        })
     }
 
     /// §7.1.1.1 `OrdinaryToPrimitive` synchronous helper. Walks the
@@ -2486,40 +2499,55 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-ordinarytoprimitive>
     pub(crate) fn evaluate_ordinary_to_primitive(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         input: &Value,
         hint: abstract_ops::ToPrimitiveHint,
     ) -> Result<Value, VmError> {
-        let names: [&str; 2] = match hint {
-            abstract_ops::ToPrimitiveHint::String => ["toString", "valueOf"],
-            _ => ["valueOf", "toString"],
-        };
-        for name in names {
-            let method = match self.ordinary_get_value(
-                context,
-                *input,
-                *input,
-                &VmPropertyKey::String(name),
-                0,
-            )? {
-                VmGetOutcome::Value(v) => v,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    let args: SmallVec<[Value; 8]> = SmallVec::new();
-                    self.run_callable_sync(context, &getter, *input, args)?
-                }
+        self.with_handle_scope(|interp, scope| {
+            let input_handle = interp.scoped_value(scope, *input);
+            let names: [&str; 2] = match hint {
+                abstract_ops::ToPrimitiveHint::String => ["toString", "valueOf"],
+                _ => ["valueOf", "toString"],
             };
-            if !self.is_callable_runtime(&method) {
-                continue;
+            for name in names {
+                let current_input = interp.escape_scoped(input_handle);
+                let method = match interp.ordinary_get_value(
+                    stack,
+                    context,
+                    current_input,
+                    current_input,
+                    &VmPropertyKey::String(name),
+                    0,
+                )? {
+                    VmGetOutcome::Value(value) => value,
+                    VmGetOutcome::InvokeGetter { getter } => interp.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &getter,
+                        interp.escape_scoped(input_handle),
+                        SmallVec::new(),
+                    )?,
+                };
+                let method_handle = interp.scoped_value(scope, method);
+                if !interp.is_callable_runtime(&interp.escape_scoped(method_handle)) {
+                    continue;
+                }
+                let result = interp.run_callable_sync_rooted(
+                    stack,
+                    context,
+                    &interp.escape_scoped(method_handle),
+                    interp.escape_scoped(input_handle),
+                    SmallVec::new(),
+                )?;
+                if abstract_ops::is_primitive(&result) {
+                    return Ok(result);
+                }
             }
-            let args: SmallVec<[Value; 8]> = SmallVec::new();
-            let result = self.run_callable_sync(context, &method, *input, args)?;
-            if abstract_ops::is_primitive(&result) {
-                return Ok(result);
-            }
-        }
-        Err(self.err_type(
-            ("OrdinaryToPrimitive could not convert object to primitive".to_string()).into(),
-        ))
+            Err(interp.err_type(
+                ("OrdinaryToPrimitive could not convert object to primitive".to_string()).into(),
+            ))
+        })
     }
 
     /// §6.2.5.5 ToPropertyDescriptor synchronous helper.
@@ -2533,6 +2561,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-topropertydescriptor>
     pub(crate) fn evaluate_to_property_descriptor(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         attributes: &Value,
     ) -> Result<object::PartialPropertyDescriptor, VmError> {
@@ -2544,63 +2573,73 @@ impl Interpreter {
                 .err_type(("ToPropertyDescriptor argument must be an Object".to_string()).into()));
         }
 
-        let read_field = |this: &mut Self, name: &str| -> Result<Option<Value>, VmError> {
-            let key = VmPropertyKey::String(name);
-            if !this.ordinary_has_property_value(context, *attributes, &key, 0)? {
-                return Ok(None);
-            }
-            let value = match this.ordinary_get_value(context, *attributes, *attributes, &key, 0)? {
-                VmGetOutcome::Value(v) => v,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    let args: SmallVec<[Value; 8]> = SmallVec::new();
-                    this.run_callable_sync(context, &getter, *attributes, args)?
+        self.with_handle_scope(|interp, scope| {
+            let attributes = interp.scoped_value(scope, *attributes);
+            let read_field = |interp: &mut Self,
+                              stack: &mut ActivationStack,
+                              name: &str|
+             -> Result<Option<Value>, VmError> {
+                let key = VmPropertyKey::String(name);
+                let current = interp.escape_scoped(attributes);
+                if !interp.ordinary_has_property_value(stack, context, current, &key, 0)? {
+                    return Ok(None);
                 }
+                let current = interp.escape_scoped(attributes);
+                let value =
+                    match interp.ordinary_get_value(stack, context, current, current, &key, 0)? {
+                        VmGetOutcome::Value(v) => v,
+                        VmGetOutcome::InvokeGetter { getter } => interp.run_callable_sync_rooted(
+                            stack,
+                            context,
+                            &getter,
+                            interp.escape_scoped(attributes),
+                            SmallVec::new(),
+                        )?,
+                    };
+                Ok(Some(value))
             };
-            Ok(Some(value))
-        };
 
-        let mut descriptor = object::PartialPropertyDescriptor::default();
-        // §6.2.5.5 step 3 — enumerable.
-        if let Some(v) = read_field(self, "enumerable")? {
-            descriptor.enumerable = Some(v.to_boolean(&self.gc_heap));
-        }
-        // step 4 — configurable.
-        if let Some(v) = read_field(self, "configurable")? {
-            descriptor.configurable = Some(v.to_boolean(&self.gc_heap));
-        }
-        // step 5 — value.
-        if let Some(v) = read_field(self, "value")? {
-            descriptor.value = Some(v);
-        }
-        // step 6 — writable.
-        if let Some(v) = read_field(self, "writable")? {
-            descriptor.writable = Some(v.to_boolean(&self.gc_heap));
-        }
-        // step 7 — get.
-        if let Some(v) = read_field(self, "get")? {
-            if !v.is_undefined() && !self.is_callable_runtime(&v) {
-                return Err(
-                    self.err_type(("Property descriptor `get` is not callable".to_string()).into())
-                );
+            let enumerable =
+                read_field(interp, stack, "enumerable")?.map(|v| v.to_boolean(&interp.gc_heap));
+            let configurable =
+                read_field(interp, stack, "configurable")?.map(|v| v.to_boolean(&interp.gc_heap));
+            let value = read_field(interp, stack, "value")?.map(|v| interp.scoped_value(scope, v));
+            let writable =
+                read_field(interp, stack, "writable")?.map(|v| v.to_boolean(&interp.gc_heap));
+            let get = read_field(interp, stack, "get")?.map(|v| interp.scoped_value(scope, v));
+            if let Some(get) = get {
+                let current = interp.escape_scoped(get);
+                if !current.is_undefined() && !interp.is_callable_runtime(&current) {
+                    return Err(interp.err_type(
+                        ("Property descriptor `get` is not callable".to_string()).into(),
+                    ));
+                }
             }
-            descriptor.get = Some(v);
-        }
-        // step 8 — set.
-        if let Some(v) = read_field(self, "set")? {
-            if !v.is_undefined() && !self.is_callable_runtime(&v) {
-                return Err(
-                    self.err_type(("Property descriptor `set` is not callable".to_string()).into())
-                );
+            let set = read_field(interp, stack, "set")?.map(|v| interp.scoped_value(scope, v));
+            if let Some(set) = set {
+                let current = interp.escape_scoped(set);
+                if !current.is_undefined() && !interp.is_callable_runtime(&current) {
+                    return Err(interp.err_type(
+                        ("Property descriptor `set` is not callable".to_string()).into(),
+                    ));
+                }
             }
-            descriptor.set = Some(v);
-        }
-        // step 9 — cannot mix accessor + data fields.
-        if descriptor.is_accessor() && descriptor.is_data() {
-            return Err(self.err_type(
-                ("Property descriptor mixes accessor + data fields".to_string()).into(),
-            ));
-        }
-        Ok(descriptor)
+
+            let descriptor = object::PartialPropertyDescriptor {
+                value: value.map(|value| interp.escape_scoped(value)),
+                writable,
+                get: get.map(|get| interp.escape_scoped(get)),
+                set: set.map(|set| interp.escape_scoped(set)),
+                enumerable,
+                configurable,
+            };
+            if descriptor.is_accessor() && descriptor.is_data() {
+                return Err(interp.err_type(
+                    ("Property descriptor mixes accessor + data fields".to_string()).into(),
+                ));
+            }
+            Ok(descriptor)
+        })
     }
 
     /// §7.1.19 ToPropertyKey synchronous helper. Used by Reflect /
@@ -2611,11 +2650,16 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-topropertykey>
     pub(crate) fn evaluate_to_property_key(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         input: &Value,
     ) -> Result<VmPropertyKey<'static>, VmError> {
-        let primitive =
-            self.evaluate_to_primitive(context, input, abstract_ops::ToPrimitiveHint::String)?;
+        let primitive = self.evaluate_to_primitive(
+            stack,
+            context,
+            input,
+            abstract_ops::ToPrimitiveHint::String,
+        )?;
         if let Some(sym) = primitive.as_symbol(&self.gc_heap) {
             return Ok(VmPropertyKey::Symbol(sym));
         }
@@ -2678,15 +2722,21 @@ impl Interpreter {
 
     pub(crate) fn own_property_keys_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         target: &Value,
     ) -> Result<Vec<Value>, VmError> {
-        self.ensure_deferred_namespace_ready(context, target, true)?;
+        let target = self.with_handle_scope(|interp, scope| -> Result<Value, VmError> {
+            let target = interp.scoped_value(scope, *target);
+            let current = interp.escape_scoped(target);
+            interp.ensure_deferred_namespace_ready(stack, context, &current, true)?;
+            Ok(interp.escape_scoped(target))
+        })?;
         // Own a mutable copy of the receiver so `push_own_key_string` can refresh
         // it after each key allocation: a moving collection during key building
         // relocates the receiver, and the branches below re-read it to gather
         // symbol keys after the string keys are built.
-        let mut target = *target;
+        let mut target = target;
         // WeakRef / FinalizationRegistry are ordinary objects whose
         // observable own keys (no expando installed) are empty.
         if target.as_weak_ref().is_some() || target.as_finalization_registry().is_some() {
@@ -2719,13 +2769,16 @@ impl Interpreter {
                 ));
             }
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
-            return match self.invoke_proxy_trap(context, &proxy, "ownKeys", trap_args)? {
+            return match self.invoke_proxy_trap(stack, context, &proxy, "ownKeys", trap_args)? {
                 Some(trap_result) => {
-                    let trap_keys =
-                        self.create_list_from_array_like_property_keys(context, trap_result)?;
-                    self.validate_proxy_own_keys(context, &proxy, trap_keys)
+                    let trap_keys = self.create_list_from_array_like_property_keys(
+                        stack,
+                        context,
+                        trap_result,
+                    )?;
+                    self.validate_proxy_own_keys(stack, context, &proxy, trap_keys)
                 }
-                None => self.own_property_keys_value(context, &proxy.target(&self.gc_heap)),
+                None => self.own_property_keys_value(stack, context, &proxy.target(&self.gc_heap)),
             };
         }
         // §10.4.5.11 TypedArray [[OwnPropertyKeys]] — integer indices
@@ -2988,6 +3041,7 @@ impl Interpreter {
     /// validation per §10.5.11 step 8.
     fn create_list_from_array_like_property_keys(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         list_value: Value,
     ) -> Result<Vec<Value>, VmError> {
@@ -2997,6 +3051,7 @@ impl Interpreter {
             );
         }
         let len_value = match self.ordinary_get_value(
+            stack,
             context,
             list_value,
             list_value,
@@ -3006,20 +3061,21 @@ impl Interpreter {
             VmGetOutcome::Value(v) => v,
             VmGetOutcome::InvokeGetter { getter } => {
                 let args: SmallVec<[Value; 8]> = SmallVec::new();
-                self.run_callable_sync(context, &getter, list_value, args)?
+                self.run_callable_sync_rooted(stack, context, &getter, list_value, args)?
             }
         };
         let len = to_length(&len_value, &self.gc_heap)?;
         let mut out: Vec<Value> = Vec::with_capacity(len);
         for i in 0..len {
             let key = VmPropertyKey::OwnedString(i.to_string());
-            let element = match self.ordinary_get_value(context, list_value, list_value, &key, 0)? {
-                VmGetOutcome::Value(v) => v,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    let args: SmallVec<[Value; 8]> = SmallVec::new();
-                    self.run_callable_sync(context, &getter, list_value, args)?
-                }
-            };
+            let element =
+                match self.ordinary_get_value(stack, context, list_value, list_value, &key, 0)? {
+                    VmGetOutcome::Value(v) => v,
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.run_callable_sync_rooted(stack, context, &getter, list_value, args)?
+                    }
+                };
             if !(element.is_string() || element.is_symbol()) {
                 return Err(self.err_type(
                     ("Proxy ownKeys trap result contains a non-property-key entry".to_string())
@@ -3035,6 +3091,7 @@ impl Interpreter {
     /// against the target's own keys.
     fn validate_proxy_own_keys(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         proxy: &proxy::JsProxy,
         trap_result: Vec<Value>,
@@ -3085,25 +3142,18 @@ impl Interpreter {
             }
         }
         let target_value = proxy.target(&self.gc_heap);
-        let extensible_target = self.is_extensible_value(context, &target_value)?;
-        let target_keys = self.own_property_keys_value(context, &target_value)?;
+        let extensible_target = self.is_extensible_value(stack, context, &target_value)?;
+        let target_keys = self.own_property_keys_value(stack, context, &target_value)?;
         let mut target_configurable: Vec<Value> = Vec::new();
         let mut target_nonconfigurable: Vec<Value> = Vec::new();
         for key in &target_keys {
             let vm_key = property_key_from_value(key, &self.gc_heap)?;
-            let slice_roots: [&[Value]; 4] = [
-                target_keys.as_slice(),
-                trap_result.as_slice(),
-                target_configurable.as_slice(),
-                target_nonconfigurable.as_slice(),
-            ];
-            let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+            let desc = self.ordinary_get_own_property_descriptor_value(
+                stack,
                 context,
                 target_value,
                 &vm_key,
                 0,
-                &[&target_value],
-                &slice_roots,
             )?;
             match desc {
                 Some(d) if !d.configurable() => target_nonconfigurable.push(*key),
@@ -3183,6 +3233,7 @@ impl Interpreter {
     /// §10.5.7 invariant for non-extensible targets.
     pub(crate) fn set_prototype_value_proxy_aware(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         target: &Value,
         proto: &Value,
@@ -3206,17 +3257,24 @@ impl Interpreter {
             }
             let trap_args: SmallVec<[Value; 8]> =
                 smallvec::smallvec![proxy.target(&self.gc_heap), *proto];
-            return match self.invoke_proxy_trap(context, &proxy, "setPrototypeOf", trap_args)? {
+            return match self.invoke_proxy_trap(
+                stack,
+                context,
+                &proxy,
+                "setPrototypeOf",
+                trap_args,
+            )? {
                 Some(result) => {
                     let ok = result.to_boolean(&self.gc_heap);
                     if !ok {
                         return Ok(false);
                     }
                     let target_value = proxy.target(&self.gc_heap);
-                    let target_extensible = self.is_extensible_value(context, &target_value)?;
+                    let target_extensible =
+                        self.is_extensible_value(stack, context, &target_value)?;
                     if !target_extensible {
                         let target_proto =
-                            self.ordinary_get_prototype_value(context, target_value, 0)?;
+                            self.ordinary_get_prototype_value(stack, context, target_value, 0)?;
                         if !abstract_ops::same_value(proto, &target_proto, &self.gc_heap) {
                             return Err(self.err_type((
                                     "Proxy setPrototypeOf invariant violated: target is non-extensible and prototypes differ"
@@ -3226,6 +3284,7 @@ impl Interpreter {
                     Ok(true)
                 }
                 None => self.set_prototype_value_proxy_aware(
+                    stack,
                     context,
                     &proxy.target(&self.gc_heap),
                     proto,
@@ -3244,7 +3303,7 @@ impl Interpreter {
                 *proto
             };
             let statics = Value::object(c.statics(&self.gc_heap));
-            return self.set_prototype_value_proxy_aware(context, &statics, &statics_chain);
+            return self.set_prototype_value_proxy_aware(stack, context, &statics, &statics_chain);
         }
         if let Some(obj) = target.as_object() {
             // §10.1.2 OrdinarySetPrototypeOf full algorithm.
@@ -3360,6 +3419,7 @@ impl Interpreter {
     /// §10.5.4 / §10.1.4 — value-level `[[PreventExtensions]]`.
     pub(crate) fn prevent_extensions_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         value: &Value,
     ) -> Result<bool, VmError> {
@@ -3381,17 +3441,25 @@ impl Interpreter {
                 ));
             }
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
-            return match self.invoke_proxy_trap(context, &proxy, "preventExtensions", trap_args)? {
+            return match self.invoke_proxy_trap(
+                stack,
+                context,
+                &proxy,
+                "preventExtensions",
+                trap_args,
+            )? {
                 Some(result) => {
                     let ok = result.to_boolean(&self.gc_heap);
-                    if ok && self.is_extensible_value(context, &proxy.target(&self.gc_heap))? {
+                    if ok
+                        && self.is_extensible_value(stack, context, &proxy.target(&self.gc_heap))?
+                    {
                         return Err(self.err_type((
                                 "Proxy preventExtensions trap succeeded but target is still extensible"
                                     .to_string()).into()));
                     }
                     Ok(ok)
                 }
-                None => self.prevent_extensions_value(context, &proxy.target(&self.gc_heap)),
+                None => self.prevent_extensions_value(stack, context, &proxy.target(&self.gc_heap)),
             };
         }
         if let Some(obj) = value.as_object() {
@@ -3454,86 +3522,29 @@ impl Interpreter {
 
     pub(crate) fn instanceof_target_prototype(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         rhs: &Value,
     ) -> Result<Option<Value>, VmError> {
-        if rhs.is_object() || rhs.is_proxy() {
-            let key = VmPropertyKey::String("prototype");
-            return match self.ordinary_get_value(context, *rhs, *rhs, &key, 0)? {
-                VmGetOutcome::Value(v) if v.is_undefined() => Ok(Some(*rhs)),
-                VmGetOutcome::Value(value) if value.is_object_type() || value.is_proxy() => {
-                    Ok(Some(value))
-                }
-                VmGetOutcome::Value(_) => {
-                    Err(self.err_type(("instanceof prototype is not an object".to_string()).into()))
-                }
-                VmGetOutcome::InvokeGetter { getter } => {
-                    let args: SmallVec<[Value; 8]> = SmallVec::new();
-                    let value = self.run_callable_sync(context, &getter, *rhs, args)?;
-                    if value.is_object_type() || value.is_proxy() {
-                        Ok(Some(value))
-                    } else {
-                        Err(self
-                            .err_type(("instanceof prototype is not an object".to_string()).into()))
-                    }
-                }
-            };
-        }
-        let fid = rhs
-            .as_function()
-            .or_else(|| rhs.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
-        if let Some(function_id) = fid {
-            let owner = rhs.as_closure(&self.gc_heap);
-            let value = self.function_property_get(context, owner, function_id, "prototype")?;
-            return if value.is_object_type() || value.is_proxy() {
-                Ok(Some(value))
-            } else {
-                Err(self.err_type(("instanceof prototype is not an object".to_string()).into()))
-            };
-        }
-        if let Some(class) = rhs.as_class_constructor() {
-            return Ok(Some(Value::object(class.prototype(&self.gc_heap))));
-        }
-        if let Some(native) = rhs.as_native_function() {
-            let desc = native
-                .own_property_descriptor(&mut self.gc_heap, "prototype")
-                .map_err(VmError::from)?;
-            let value = match desc {
-                Some(object::PropertyDescriptor {
-                    kind: object::DescriptorKind::Data { value },
-                    ..
-                }) => value,
-                Some(object::PropertyDescriptor {
-                    kind: object::DescriptorKind::Accessor { getter, .. },
-                    ..
-                }) => match getter {
-                    Some(getter) if abstract_ops::is_callable(&getter) => {
-                        let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync(context, &getter, *rhs, args)?
-                    }
-                    _ => Value::undefined(),
-                },
-                None => Value::undefined(),
-            };
-            return if value.is_object_type() || value.is_proxy() {
-                Ok(Some(value))
-            } else {
-                Err(self.err_type(("instanceof prototype is not an object".to_string()).into()))
-            };
-        }
-        Ok(None)
+        self.with_handle_scope(|interp, scope| {
+            let rhs_handle = interp.scoped_value(scope, *rhs);
+            interp.instanceof_target_prototype_scoped(stack, context, rhs_handle)
+        })
     }
 
-    pub(crate) fn instanceof_target_prototype_stack_rooted(
+    fn instanceof_target_prototype_scoped(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
-        stack: &ActivationStack,
-        rhs: &Value,
+        rhs_handle: Local<'_>,
     ) -> Result<Option<Value>, VmError> {
+        let rhs = self.escape_scoped(rhs_handle);
         if rhs.is_object() || rhs.is_proxy() {
             let key = VmPropertyKey::String("prototype");
-            return match self.ordinary_get_value(context, *rhs, *rhs, &key, 0)? {
-                VmGetOutcome::Value(v) if v.is_undefined() => Ok(Some(*rhs)),
+            return match self.ordinary_get_value(stack, context, rhs, rhs, &key, 0)? {
+                VmGetOutcome::Value(v) if v.is_undefined() => {
+                    Ok(Some(self.escape_scoped(rhs_handle)))
+                }
                 VmGetOutcome::Value(value) if value.is_object_type() || value.is_proxy() => {
                     Ok(Some(value))
                 }
@@ -3542,7 +3553,9 @@ impl Interpreter {
                 }
                 VmGetOutcome::InvokeGetter { getter } => {
                     let args: SmallVec<[Value; 8]> = SmallVec::new();
-                    let value = self.run_callable_sync(context, &getter, *rhs, args)?;
+                    let receiver = self.escape_scoped(rhs_handle);
+                    let value =
+                        self.run_callable_sync_rooted(stack, context, &getter, receiver, args)?;
                     if value.is_object_type() || value.is_proxy() {
                         Ok(Some(value))
                     } else {
@@ -3552,16 +3565,18 @@ impl Interpreter {
                 }
             };
         }
+        let rhs = self.escape_scoped(rhs_handle);
         let fid = rhs
             .as_function()
             .or_else(|| rhs.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         if let Some(function_id) = fid {
             let owner = rhs.as_closure(&self.gc_heap);
-            let value = self.function_property_get_stack_rooted(
-                context,
+            let value = self.function_property_get_with_receiver(
                 stack,
+                context,
                 owner,
                 function_id,
+                Some(rhs),
                 "prototype",
             )?;
             return if value.is_object_type() || value.is_proxy() {
@@ -3588,7 +3603,8 @@ impl Interpreter {
                 }) => match getter {
                     Some(getter) if abstract_ops::is_callable(&getter) => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync(context, &getter, *rhs, args)?
+                        let receiver = self.escape_scoped(rhs_handle);
+                        self.run_callable_sync_rooted(stack, context, &getter, receiver, args)?
                     }
                     _ => Value::undefined(),
                 },
@@ -3605,21 +3621,29 @@ impl Interpreter {
 
     pub(crate) fn value_has_proxy_aware_prototype(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         lhs: Value,
         target_proto: &Value,
     ) -> Result<bool, VmError> {
-        let mut current = lhs;
-        for hops in 0..object::PROTO_CHAIN_HARD_CAP {
-            current = self.ordinary_get_prototype_value(context, current, hops)?;
-            if current.is_null() {
-                return Ok(false);
+        self.with_handle_scope(|interp, scope| {
+            let current_handle = interp.scoped_value(scope, lhs);
+            let target_handle = interp.scoped_value(scope, *target_proto);
+            for hops in 0..object::PROTO_CHAIN_HARD_CAP {
+                let current = interp.escape_scoped(current_handle);
+                let next = interp.ordinary_get_prototype_value(stack, context, current, hops)?;
+                interp.set_scoped(current_handle, next);
+                let current = interp.escape_scoped(current_handle);
+                if current.is_null() {
+                    return Ok(false);
+                }
+                let target_proto = interp.escape_scoped(target_handle);
+                if abstract_ops::same_value(&current, &target_proto, &interp.gc_heap) {
+                    return Ok(true);
+                }
             }
-            if abstract_ops::same_value(&current, target_proto, &self.gc_heap) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+            Ok(false)
+        })
     }
 
     /// The `[[Prototype]]` an Array exotic object inherits from: a
@@ -3635,22 +3659,57 @@ impl Interpreter {
 
     pub(crate) fn ordinary_get_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         base: Value,
         receiver: Value,
         key: &VmPropertyKey,
         hops: usize,
     ) -> Result<VmGetOutcome, VmError> {
+        // `VmPropertyKey::Symbol` carries the symbol identity body, which
+        // `alloc_symbol` (including private names) allocates directly in old
+        // space. That identity handle is immovable across a young collection;
+        // only a symbol's cached description may move, and property lookup
+        // never uses that cache for identity. String/Atom keys contain no
+        // moving GC handle.
+        self.with_handle_scope(|interp, scope| {
+            let base_handle = interp.scoped_value(scope, base);
+            let receiver_handle = interp.scoped_value(scope, receiver);
+            interp.ordinary_get_value_scoped(
+                stack,
+                context,
+                scope,
+                base_handle,
+                receiver_handle,
+                key,
+                hops,
+            )
+        })
+    }
+
+    fn ordinary_get_value_scoped(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        scope: &crate::handles::HandleScope,
+        base_handle: Local<'_>,
+        receiver_handle: Local<'_>,
+        key: &VmPropertyKey,
+        hops: usize,
+    ) -> Result<VmGetOutcome, VmError> {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(VmGetOutcome::Value(Value::undefined()));
         }
+        let base = self.escape_scoped(base_handle);
         // TC39 import defer — accessing a deferred namespace evaluates
         // its module, then reads delegate to the module environment.
         self.ensure_deferred_namespace_ready(
+            stack,
             context,
             &base,
             !Self::deferred_key_is_symbol_like(key),
         )?;
+        let base = self.escape_scoped(base_handle);
         if let Some(obj) = base.as_object() {
             // §10.4.6.8 [[Get]] — a Module Namespace Exotic Object
             // resolves string keys through the wrapped environment;
@@ -3686,27 +3745,57 @@ impl Interpreter {
                 },
                 object::PropertyLookup::Absent => match object::prototype_value(obj, &self.gc_heap)
                 {
-                    Some(proto) => self.ordinary_get_value(context, proto, receiver, key, hops + 1),
+                    Some(proto) => self.continue_ordinary_get_value_scoped(
+                        stack,
+                        context,
+                        scope,
+                        base_handle,
+                        receiver_handle,
+                        proto,
+                        key,
+                        hops + 1,
+                    ),
                     None => Ok(VmGetOutcome::Value(Value::undefined())),
                 },
             };
         }
-        if let Some(proxy) = base.as_proxy() {
+        if base.as_proxy().is_some() {
             let key_value = self.vm_property_key_to_value(key)?;
-            let trap_args: SmallVec<[Value; 8]> =
-                smallvec::smallvec![proxy.target(&self.gc_heap), key_value, receiver];
-            return match self.invoke_proxy_trap(context, &proxy, "get", trap_args)? {
+            let key_handle = self.scoped_value(scope, key_value);
+            let proxy = self
+                .escape_scoped(base_handle)
+                .as_proxy()
+                .ok_or(VmError::TypeMismatch)?;
+            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                proxy.target(&self.gc_heap),
+                self.escape_scoped(key_handle),
+                self.escape_scoped(receiver_handle)
+            ];
+            return match self.invoke_proxy_trap(stack, context, &proxy, "get", trap_args)? {
                 Some(value) => {
+                    let proxy = self
+                        .escape_scoped(base_handle)
+                        .as_proxy()
+                        .ok_or(VmError::TypeMismatch)?;
                     self.validate_proxy_get_invariants(&proxy.target(&self.gc_heap), key, &value)?;
                     Ok(VmGetOutcome::Value(value))
                 }
-                None => self.ordinary_get_value(
-                    context,
-                    proxy.target(&self.gc_heap),
-                    receiver,
-                    key,
-                    hops + 1,
-                ),
+                None => {
+                    let proxy = self
+                        .escape_scoped(base_handle)
+                        .as_proxy()
+                        .ok_or(VmError::TypeMismatch)?;
+                    self.continue_ordinary_get_value_scoped(
+                        stack,
+                        context,
+                        scope,
+                        base_handle,
+                        receiver_handle,
+                        proxy.target(&self.gc_heap),
+                        key,
+                        hops + 1,
+                    )
+                }
             };
         }
         if let Some(arr) = base.as_array() {
@@ -3727,10 +3816,13 @@ impl Interpreter {
                     } else {
                         let proto = self.array_get_prototype_value(arr)?;
                         if proto.is_object_type() {
-                            return self.ordinary_get_value(
+                            return self.continue_ordinary_get_value_scoped(
+                                stack,
                                 context,
+                                scope,
+                                base_handle,
+                                receiver_handle,
                                 proto,
-                                receiver,
                                 key,
                                 hops + 1,
                             );
@@ -3769,10 +3861,13 @@ impl Interpreter {
                             // just %Array.prototype%.
                             let proto = self.array_get_prototype_value(arr)?;
                             if proto.is_object_type() {
-                                return self.ordinary_get_value(
+                                return self.continue_ordinary_get_value_scoped(
+                                    stack,
                                     context,
+                                    scope,
+                                    base_handle,
+                                    receiver_handle,
                                     proto,
-                                    receiver,
                                     key,
                                     hops + 1,
                                 );
@@ -3803,6 +3898,36 @@ impl Interpreter {
                     let key_name = key
                         .string_name()
                         .expect("non-symbol key has string spelling");
+                    // Ordinary constructable functions own a virtual
+                    // `prototype` data property until its object is first
+                    // observed. Materialize it through the shared activation
+                    // stack before the descriptor lookup; otherwise the
+                    // metadata-only descriptor path sees only `name`/`length`
+                    // and incorrectly falls through to %Function.prototype%.
+                    //
+                    // Do not take this shortcut for arrows/methods/async
+                    // functions: they have no own `prototype`, so an inherited
+                    // user-installed property must still be found by the
+                    // ordinary prototype walk below.
+                    if key_name == "prototype"
+                        && context.function_has_prototype_property(function_id)
+                        && self
+                            .callable_bag_read(owner, function_id)
+                            .is_none_or(|bag| {
+                                object::get_own_descriptor(bag, &self.gc_heap, key_name).is_none()
+                            })
+                    {
+                        let callable = self.escape_scoped(base_handle);
+                        let value = self.function_property_get_with_receiver(
+                            stack,
+                            context,
+                            owner,
+                            function_id,
+                            Some(callable),
+                            key_name,
+                        )?;
+                        return Ok(VmGetOutcome::Value(value));
+                    }
                     self.ordinary_function_own_property_descriptor(
                         Some(context),
                         owner,
@@ -3818,7 +3943,16 @@ impl Interpreter {
                 if over.is_null() {
                     return Ok(VmGetOutcome::Value(Value::undefined()));
                 }
-                return self.ordinary_get_value(context, over, receiver, key, hops + 1);
+                return self.continue_ordinary_get_value_scoped(
+                    stack,
+                    context,
+                    scope,
+                    base_handle,
+                    receiver_handle,
+                    over,
+                    key,
+                    hops + 1,
+                );
             }
             let lookup = match own_lookup {
                 Some(lookup) => lookup,
@@ -3903,10 +4037,13 @@ impl Interpreter {
                                 self.function_prototype_object().ok().map(Value::object)
                             });
                             if let Some(proto) = proto {
-                                return self.ordinary_get_value(
+                                return self.continue_ordinary_get_value_scoped(
+                                    stack,
                                     context,
+                                    scope,
+                                    base_handle,
+                                    receiver_handle,
                                     proto,
-                                    receiver,
                                     key,
                                     hops + 1,
                                 );
@@ -3937,19 +4074,25 @@ impl Interpreter {
                         }
                         None => {
                             if let Some(proto) = native.prototype_override(&self.gc_heap) {
-                                return self.ordinary_get_value(
+                                return self.continue_ordinary_get_value_scoped(
+                                    stack,
                                     context,
+                                    scope,
+                                    base_handle,
+                                    receiver_handle,
                                     proto,
-                                    receiver,
                                     key,
                                     hops + 1,
                                 );
                             }
                             if let Ok(proto) = self.function_prototype_object() {
-                                return self.ordinary_get_value(
+                                return self.continue_ordinary_get_value_scoped(
+                                    stack,
                                     context,
+                                    scope,
+                                    base_handle,
+                                    receiver_handle,
                                     Value::object(proto),
-                                    receiver,
                                     key,
                                     hops + 1,
                                 );
@@ -4018,10 +4161,27 @@ impl Interpreter {
                 && object::get_own_descriptor(statics, &self.gc_heap, k).is_none()
             {
                 let ctor = class.ctor(&self.gc_heap);
-                return self.ordinary_get_value(context, ctor, receiver, key, hops + 1);
+                return self.continue_ordinary_get_value_scoped(
+                    stack,
+                    context,
+                    scope,
+                    base_handle,
+                    receiver_handle,
+                    ctor,
+                    key,
+                    hops + 1,
+                );
             }
-            let outcome =
-                self.ordinary_get_value(context, Value::object(statics), receiver, key, hops + 1)?;
+            let outcome = self.continue_ordinary_get_value_scoped(
+                stack,
+                context,
+                scope,
+                base_handle,
+                receiver_handle,
+                Value::object(statics),
+                key,
+                hops + 1,
+            )?;
             let value = match &outcome {
                 VmGetOutcome::Value(v) => *v,
                 VmGetOutcome::InvokeGetter { .. } => return Ok(outcome),
@@ -4089,7 +4249,16 @@ impl Interpreter {
                 if proto.is_nullish() {
                     return Ok(VmGetOutcome::Value(Value::undefined()));
                 }
-                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
+                self.continue_ordinary_get_value_scoped(
+                    stack,
+                    context,
+                    scope,
+                    base_handle,
+                    receiver_handle,
+                    proto,
+                    key,
+                    hops + 1,
+                )
             } else {
                 Ok(VmGetOutcome::Value(direct))
             };
@@ -4174,7 +4343,16 @@ impl Interpreter {
                 if proto.is_nullish() {
                     return Ok(VmGetOutcome::Value(Value::undefined()));
                 }
-                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
+                self.continue_ordinary_get_value_scoped(
+                    stack,
+                    context,
+                    scope,
+                    base_handle,
+                    receiver_handle,
+                    proto,
+                    key,
+                    hops + 1,
+                )
             } else {
                 Ok(VmGetOutcome::Value(direct))
             };
@@ -4223,7 +4401,16 @@ impl Interpreter {
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
-            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+            return self.continue_ordinary_get_value_scoped(
+                stack,
+                context,
+                scope,
+                base_handle,
+                receiver_handle,
+                proto,
+                key,
+                hops + 1,
+            );
         }
         if let Some(promise) = base.as_promise() {
             if let Some(bag) = promise.expando(&self.gc_heap) {
@@ -4260,14 +4447,32 @@ impl Interpreter {
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
-            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+            return self.continue_ordinary_get_value_scoped(
+                stack,
+                context,
+                scope,
+                base_handle,
+                receiver_handle,
+                proto,
+                key,
+                hops + 1,
+            );
         }
         if base.is_big_int() {
             let proto = self.constructor_prototype_value("BigInt")?;
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
-            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+            return self.continue_ordinary_get_value_scoped(
+                stack,
+                context,
+                scope,
+                base_handle,
+                receiver_handle,
+                proto,
+                key,
+                hops + 1,
+            );
         }
         if base.is_boolean() || base.is_number() || base.is_symbol() {
             let proto_name = if base.is_boolean() {
@@ -4281,7 +4486,16 @@ impl Interpreter {
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
-            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+            return self.continue_ordinary_get_value_scoped(
+                stack,
+                context,
+                scope,
+                base_handle,
+                receiver_handle,
+                proto,
+                key,
+                hops + 1,
+            );
         }
         if let Some(s) = base.as_string(&self.gc_heap) {
             if let Some(name) = key.string_name() {
@@ -4303,7 +4517,16 @@ impl Interpreter {
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
-            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+            return self.continue_ordinary_get_value_scoped(
+                stack,
+                context,
+                scope,
+                base_handle,
+                receiver_handle,
+                proto,
+                key,
+                hops + 1,
+            );
         }
         if base.is_weak_ref() || base.is_finalization_registry() {
             let proto_name = if base.is_weak_ref() {
@@ -4315,7 +4538,16 @@ impl Interpreter {
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
-            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+            return self.continue_ordinary_get_value_scoped(
+                stack,
+                context,
+                scope,
+                base_handle,
+                receiver_handle,
+                proto,
+                key,
+                hops + 1,
+            );
         }
         if let Some(dv) = base.as_data_view() {
             // §25.3 — ordinary own properties in the lazy expando win
@@ -4351,7 +4583,16 @@ impl Interpreter {
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
-            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+            return self.continue_ordinary_get_value_scoped(
+                stack,
+                context,
+                scope,
+                base_handle,
+                receiver_handle,
+                proto,
+                key,
+                hops + 1,
+            );
         }
         if let Some(b) = base.as_array_buffer() {
             // Own expando bag (a `constructor` override for the
@@ -4389,7 +4630,16 @@ impl Interpreter {
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
-            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+            return self.continue_ordinary_get_value_scoped(
+                stack,
+                context,
+                scope,
+                base_handle,
+                receiver_handle,
+                proto,
+                key,
+                hops + 1,
+            );
         }
         if base.is_generator() || base.is_iterator() {
             // A user-defined own property on a generator/iterator lives
@@ -4436,7 +4686,16 @@ impl Interpreter {
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
-            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+            return self.continue_ordinary_get_value_scoped(
+                stack,
+                context,
+                scope,
+                base_handle,
+                receiver_handle,
+                proto,
+                key,
+                hops + 1,
+            );
         }
         if let Some(t) = base.as_typed_array(&self.gc_heap) {
             if let Some(name) = key.string_name() {
@@ -4467,7 +4726,16 @@ impl Interpreter {
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
-            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+            return self.continue_ordinary_get_value_scoped(
+                stack,
+                context,
+                scope,
+                base_handle,
+                receiver_handle,
+                proto,
+                key,
+                hops + 1,
+            );
         }
         if let Some(t) = base.as_temporal(&self.gc_heap) {
             // An ordinary own property installed via defineProperty /
@@ -4506,7 +4774,16 @@ impl Interpreter {
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
-            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+            return self.continue_ordinary_get_value_scoped(
+                stack,
+                context,
+                scope,
+                base_handle,
+                receiver_handle,
+                proto,
+                key,
+                hops + 1,
+            );
         }
         if base.as_intl(&self.gc_heap).is_some() {
             if let Some(bag) = self.non_gc_exotic_user_props(&base) {
@@ -4543,7 +4820,16 @@ impl Interpreter {
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
-            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+            return self.continue_ordinary_get_value_scoped(
+                stack,
+                context,
+                scope,
+                base_handle,
+                receiver_handle,
+                proto,
+                key,
+                hops + 1,
+            );
         }
         // V8-compatible diagnostic: name the base kind and the key being
         // read ("Cannot read properties of undefined (reading 'foo')").
@@ -4555,6 +4841,29 @@ impl Interpreter {
             ))
             .into(),
         ))
+    }
+
+    fn continue_ordinary_get_value_scoped<'scope>(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        scope: &'scope crate::handles::HandleScope,
+        base_handle: Local<'scope>,
+        receiver_handle: Local<'scope>,
+        next_base: Value,
+        key: &VmPropertyKey,
+        hops: usize,
+    ) -> Result<VmGetOutcome, VmError> {
+        self.set_scoped(base_handle, next_base);
+        self.ordinary_get_value_scoped(
+            stack,
+            context,
+            scope,
+            base_handle,
+            receiver_handle,
+            key,
+            hops,
+        )
     }
 
     /// Resolve `Intl.<class_name>.prototype` by walking
@@ -4583,19 +4892,38 @@ impl Interpreter {
 
     pub(crate) fn ordinary_has_property_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         base: Value,
+        key: &VmPropertyKey,
+        hops: usize,
+    ) -> Result<bool, VmError> {
+        self.with_handle_scope(|interp, scope| {
+            let base = interp.scoped_value(scope, base);
+            interp.ordinary_has_property_value_scoped(stack, context, scope, base, key, hops)
+        })
+    }
+
+    fn ordinary_has_property_value_scoped(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        scope: &crate::handles::HandleScope,
+        base_handle: Local<'_>,
         key: &VmPropertyKey,
         hops: usize,
     ) -> Result<bool, VmError> {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(false);
         }
+        let base = self.escape_scoped(base_handle);
         self.ensure_deferred_namespace_ready(
+            stack,
             context,
             &base,
             !Self::deferred_key_is_symbol_like(key),
         )?;
+        let base = self.escape_scoped(base_handle);
         if let Some(obj) = base.as_object() {
             // §10.4.6.7 [[HasProperty]] — namespace string keys exist iff
             // the environment exports them; symbol keys check own props.
@@ -4623,36 +4951,52 @@ impl Interpreter {
                 return Ok(true);
             }
             return match object::prototype_value(obj, &self.gc_heap) {
-                Some(proto) => self.ordinary_has_property_value(context, proto, key, hops + 1),
+                Some(proto) => self.continue_ordinary_has_property_value_scoped(
+                    stack,
+                    context,
+                    scope,
+                    base_handle,
+                    proto,
+                    key,
+                    hops + 1,
+                ),
                 None => Ok(false),
             };
         }
-        if let Some(proxy) = base.as_proxy() {
+        if base.as_proxy().is_some() {
             let key_value = self.vm_property_key_to_value(key)?;
+            let proxy = self
+                .escape_scoped(base_handle)
+                .as_proxy()
+                .ok_or(VmError::TypeMismatch)?;
             let trap_args: SmallVec<[Value; 8]> =
                 smallvec::smallvec![proxy.target(&self.gc_heap), key_value];
-            return match self.invoke_proxy_trap(context, &proxy, "has", trap_args)? {
+            return match self.invoke_proxy_trap(stack, context, &proxy, "has", trap_args)? {
                 Some(value) => {
                     let result = value.to_boolean(&self.gc_heap);
                     if !result {
-                        let target_value = proxy.target(&self.gc_heap);
-                        let target_desc = self
-                            .ordinary_get_own_property_descriptor_value_runtime_rooted(
-                                context,
-                                target_value,
-                                key,
-                                hops + 1,
-                                &[&target_value],
-                                &[],
-                            )?;
+                        let proxy = self
+                            .escape_scoped(base_handle)
+                            .as_proxy()
+                            .ok_or(VmError::TypeMismatch)?;
+                        self.set_scoped(base_handle, proxy.target(&self.gc_heap));
+                        let target_value = self.escape_scoped(base_handle);
+                        let target_desc = self.ordinary_get_own_property_descriptor_value(
+                            stack,
+                            context,
+                            target_value,
+                            key,
+                            hops + 1,
+                        )?;
                         if let Some(desc) = target_desc {
                             if !desc.configurable() {
                                 return Err(self.err_type((
                                         "Proxy has trap returned false but target has the property as non-configurable"
                                             .to_string()).into()));
                             }
+                            let target_value = self.escape_scoped(base_handle);
                             let target_extensible =
-                                self.is_extensible_value(context, &target_value)?;
+                                self.is_extensible_value(stack, context, &target_value)?;
                             if !target_extensible {
                                 return Err(self.err_type((
                                         "Proxy has trap returned false but target has the property and is non-extensible"
@@ -4662,12 +5006,21 @@ impl Interpreter {
                     }
                     Ok(result)
                 }
-                None => self.ordinary_has_property_value(
-                    context,
-                    proxy.target(&self.gc_heap),
-                    key,
-                    hops + 1,
-                ),
+                None => {
+                    let proxy = self
+                        .escape_scoped(base_handle)
+                        .as_proxy()
+                        .ok_or(VmError::TypeMismatch)?;
+                    self.continue_ordinary_has_property_value_scoped(
+                        stack,
+                        context,
+                        scope,
+                        base_handle,
+                        proxy.target(&self.gc_heap),
+                        key,
+                        hops + 1,
+                    )
+                }
             };
         }
         if let Some(arr) = base.as_array() {
@@ -4688,7 +5041,15 @@ impl Interpreter {
                     if proto.is_null() || proto.is_undefined() {
                         return Ok(false);
                     }
-                    self.ordinary_has_property_value(context, proto, key, hops + 1)
+                    self.continue_ordinary_has_property_value_scoped(
+                        stack,
+                        context,
+                        scope,
+                        base_handle,
+                        proto,
+                        key,
+                        hops + 1,
+                    )
                 }
                 _ if key.string_name().is_some_and(|k| k == "length") => Ok(true),
                 _ => {
@@ -4715,7 +5076,15 @@ impl Interpreter {
                     if proto.is_null() || proto.is_undefined() {
                         return Ok(false);
                     }
-                    self.ordinary_has_property_value(context, proto, key, hops + 1)
+                    self.continue_ordinary_has_property_value_scoped(
+                        stack,
+                        context,
+                        scope,
+                        base_handle,
+                        proto,
+                        key,
+                        hops + 1,
+                    )
                 }
             };
         }
@@ -4740,7 +5109,15 @@ impl Interpreter {
             return if proto.is_null() || proto.is_undefined() {
                 Ok(false)
             } else {
-                self.ordinary_has_property_value(context, proto, key, hops + 1)
+                self.continue_ordinary_has_property_value_scoped(
+                    stack,
+                    context,
+                    scope,
+                    base_handle,
+                    proto,
+                    key,
+                    hops + 1,
+                )
             };
         }
         if let Some(native) = base.as_native_function() {
@@ -4766,7 +5143,15 @@ impl Interpreter {
             return if proto.is_null() || proto.is_undefined() {
                 Ok(false)
             } else {
-                self.ordinary_has_property_value(context, proto, key, hops + 1)
+                self.continue_ordinary_has_property_value_scoped(
+                    stack,
+                    context,
+                    scope,
+                    base_handle,
+                    proto,
+                    key,
+                    hops + 1,
+                )
             };
         }
         if let Some(bound) = base.as_bound_function() {
@@ -4784,7 +5169,15 @@ impl Interpreter {
             return if proto.is_null() || proto.is_undefined() {
                 Ok(false)
             } else {
-                self.ordinary_has_property_value(context, proto, key, hops + 1)
+                self.continue_ordinary_has_property_value_scoped(
+                    stack,
+                    context,
+                    scope,
+                    base_handle,
+                    proto,
+                    key,
+                    hops + 1,
+                )
             };
         }
         if base.is_class_constructor()
@@ -4802,13 +5195,12 @@ impl Interpreter {
             || base.is_temporal()
             || base.is_intl()
         {
-            let own = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+            let own = self.ordinary_get_own_property_descriptor_value(
+                stack,
                 context,
                 base,
                 key,
                 hops + 1,
-                &[&base],
-                &[],
             )?;
             if own.is_some() {
                 return Ok(true);
@@ -4817,7 +5209,15 @@ impl Interpreter {
             return if proto.is_null() || proto.is_undefined() {
                 Ok(false)
             } else {
-                self.ordinary_has_property_value(context, proto, key, hops + 1)
+                self.continue_ordinary_has_property_value_scoped(
+                    stack,
+                    context,
+                    scope,
+                    base_handle,
+                    proto,
+                    key,
+                    hops + 1,
+                )
             };
         }
         // §10.4.5.2 TypedArray [[HasProperty]] — a canonical numeric
@@ -4854,16 +5254,39 @@ impl Interpreter {
             }
             let proto = self.get_prototype_for_op(&base)?;
             if crate::reflect::is_type_object_value(&proto) {
-                return self.ordinary_has_property_value(context, proto, key, hops + 1);
+                return self.continue_ordinary_has_property_value_scoped(
+                    stack,
+                    context,
+                    scope,
+                    base_handle,
+                    proto,
+                    key,
+                    hops + 1,
+                );
             }
             return Ok(false);
         }
         Err(VmError::TypeMismatch)
     }
+
+    fn continue_ordinary_has_property_value_scoped(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        scope: &crate::handles::HandleScope,
+        base_handle: Local<'_>,
+        next_base: Value,
+        key: &VmPropertyKey,
+        hops: usize,
+    ) -> Result<bool, VmError> {
+        self.set_scoped(base_handle, next_base);
+        self.ordinary_has_property_value_scoped(stack, context, scope, base_handle, key, hops)
+    }
+
     pub(crate) fn try_proxy_object_static_call(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
-        stack_roots: Option<&ActivationStack>,
         method: otter_bytecode::method_id::ObjectMethod,
         args: &[Value],
     ) -> Result<Option<Value>, VmError> {
@@ -4875,11 +5298,14 @@ impl Interpreter {
         // every Object target, not only Proxy targets. The rest of the
         // proxy preflight is Proxy-specific.
         if matches!(method, M::DefineProperty) && target.is_object_type() {
-            let key =
-                self.evaluate_to_property_key(context, args.get(1).unwrap_or(&Value::undefined()))?;
+            let key = self.evaluate_to_property_key(
+                stack,
+                context,
+                args.get(1).unwrap_or(&Value::undefined()),
+            )?;
             let attributes = args.get(2).cloned().unwrap_or(Value::undefined());
-            let descriptor = self.evaluate_to_property_descriptor(context, &attributes)?;
-            let ok = self.define_own_property_value(context, target, &key, descriptor)?;
+            let descriptor = self.evaluate_to_property_descriptor(stack, context, &attributes)?;
+            let ok = self.define_own_property_value(stack, context, target, &key, descriptor)?;
             if !ok {
                 return Err(self.err_type(("Cannot define property".to_string()).into()));
             }
@@ -4936,33 +5362,51 @@ impl Interpreter {
         }
         match method {
             M::Freeze => {
-                if !self.set_integrity_level_value(context, target, ObjectIntegrityLevel::Frozen)? {
+                if !self.set_integrity_level_value(
+                    stack,
+                    context,
+                    target,
+                    ObjectIntegrityLevel::Frozen,
+                )? {
                     return Err(self.err_type(("Object.freeze failed".to_string()).into()));
                 }
                 Ok(Some(*target))
             }
             M::Seal => {
-                if !self.set_integrity_level_value(context, target, ObjectIntegrityLevel::Sealed)? {
+                if !self.set_integrity_level_value(
+                    stack,
+                    context,
+                    target,
+                    ObjectIntegrityLevel::Sealed,
+                )? {
                     return Err(self.err_type(("Object.seal failed".to_string()).into()));
                 }
                 Ok(Some(*target))
             }
             M::IsFrozen => {
-                let frozen =
-                    self.test_integrity_level_value(context, target, ObjectIntegrityLevel::Frozen)?;
+                let frozen = self.test_integrity_level_value(
+                    stack,
+                    context,
+                    target,
+                    ObjectIntegrityLevel::Frozen,
+                )?;
                 Ok(Some(Value::boolean(frozen)))
             }
             M::IsSealed => {
-                let sealed =
-                    self.test_integrity_level_value(context, target, ObjectIntegrityLevel::Sealed)?;
+                let sealed = self.test_integrity_level_value(
+                    stack,
+                    context,
+                    target,
+                    ObjectIntegrityLevel::Sealed,
+                )?;
                 Ok(Some(Value::boolean(sealed)))
             }
             M::IsExtensible => {
-                let ext = self.is_extensible_value(context, target)?;
+                let ext = self.is_extensible_value(stack, context, target)?;
                 Ok(Some(Value::boolean(ext)))
             }
             M::PreventExtensions => {
-                let ok = self.prevent_extensions_value(context, target)?;
+                let ok = self.prevent_extensions_value(stack, context, target)?;
                 // §20.1.2.10 — Object.preventExtensions throws when the
                 // underlying `[[PreventExtensions]]` returns false.
                 if !ok {
@@ -4976,12 +5420,15 @@ impl Interpreter {
             // handled in the pre-Proxy block above.
             M::DefineProperty => {
                 let key = self.evaluate_to_property_key(
+                    stack,
                     context,
                     args.get(1).unwrap_or(&Value::undefined()),
                 )?;
                 let attributes = args.get(2).cloned().unwrap_or(Value::undefined());
-                let descriptor = self.evaluate_to_property_descriptor(context, &attributes)?;
-                let ok = self.define_own_property_value(context, target, &key, descriptor)?;
+                let descriptor =
+                    self.evaluate_to_property_descriptor(stack, context, &attributes)?;
+                let ok =
+                    self.define_own_property_value(stack, context, target, &key, descriptor)?;
                 if !ok {
                     return Err(self.err_type(("Object.defineProperty failed".to_string()).into()));
                 }
@@ -4992,40 +5439,26 @@ impl Interpreter {
             // validated against §10.5.11 invariants.
             M::GetOwnPropertyNames => {
                 let target_clone = *target;
-                let trap_keys = self.own_property_keys_value(context, &target_clone)?;
+                let trap_keys = self.own_property_keys_value(stack, context, &target_clone)?;
                 let values: Vec<Value> = trap_keys.into_iter().filter(|v| v.is_string()).collect();
-                let array = match stack_roots {
-                    Some(stack) => self.alloc_stack_rooted_array_from_values_with_root_slices(
-                        stack,
-                        values,
-                        &[&target_clone],
-                        &[args],
-                    )?,
-                    None => self.alloc_runtime_rooted_array_from_values(
-                        values,
-                        &[&target_clone],
-                        &[args],
-                    )?,
-                };
+                let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
+                    stack,
+                    values,
+                    &[&target_clone],
+                    &[args],
+                )?;
                 Ok(Some(Value::array(array)))
             }
             M::GetOwnPropertySymbols => {
                 let target_clone = *target;
-                let trap_keys = self.own_property_keys_value(context, &target_clone)?;
+                let trap_keys = self.own_property_keys_value(stack, context, &target_clone)?;
                 let values: Vec<Value> = trap_keys.into_iter().filter(|v| v.is_symbol()).collect();
-                let array = match stack_roots {
-                    Some(stack) => self.alloc_stack_rooted_array_from_values_with_root_slices(
-                        stack,
-                        values,
-                        &[&target_clone],
-                        &[args],
-                    )?,
-                    None => self.alloc_runtime_rooted_array_from_values(
-                        values,
-                        &[&target_clone],
-                        &[args],
-                    )?,
-                };
+                let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
+                    stack,
+                    values,
+                    &[&target_clone],
+                    &[args],
+                )?;
                 Ok(Some(Value::array(array)))
             }
             _ => Ok(None),
@@ -5034,19 +5467,14 @@ impl Interpreter {
 
     pub(crate) fn get_own_property_descriptor_for_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         target: Value,
         key: Option<&Value>,
     ) -> Result<Option<object::PropertyDescriptor>, VmError> {
-        let key = self.to_property_key_sync(context, key.cloned().unwrap_or(Value::undefined()))?;
-        self.ordinary_get_own_property_descriptor_value_runtime_rooted(
-            context,
-            target,
-            &key,
-            0,
-            &[&target],
-            &[],
-        )
+        let key =
+            self.to_property_key_sync(stack, context, key.cloned().unwrap_or(Value::undefined()))?;
+        self.ordinary_get_own_property_descriptor_value(stack, context, target, &key, 0)
     }
 
     /// §7.1.19 `ToPropertyKey(value)` — synchronous variant for native
@@ -5069,6 +5497,7 @@ impl Interpreter {
     #[allow(clippy::wrong_self_convention)]
     pub(crate) fn to_property_key_sync(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         value: Value,
     ) -> Result<VmPropertyKey<'static>, VmError> {
@@ -5076,7 +5505,7 @@ impl Interpreter {
             return primitive_to_property_key(value, &self.gc_heap);
         }
         let primitive =
-            self.to_primitive_sync(context, value, abstract_ops::ToPrimitiveHint::String)?;
+            self.to_primitive_sync(stack, context, value, abstract_ops::ToPrimitiveHint::String)?;
         primitive_to_property_key(primitive, &self.gc_heap)
     }
 
@@ -5085,52 +5514,17 @@ impl Interpreter {
     #[allow(clippy::wrong_self_convention)]
     pub(crate) fn to_primitive_sync(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         value: Value,
         hint: abstract_ops::ToPrimitiveHint,
     ) -> Result<Value, VmError> {
-        if abstract_ops::is_primitive(&value) {
-            return Ok(value);
-        }
-        let to_prim_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
-        let to_prim = value
-            .as_object()
-            .and_then(|o| crate::object::get_symbol(o, &self.gc_heap, to_prim_sym));
-        if let Some(callee) = to_prim
-            && self.is_callable_runtime(&callee)
-        {
-            let hint_str = JsString::from_str(hint.as_token(), &mut self.gc_heap)?;
-            let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-            args.push(Value::string(hint_str));
-            let result = self.run_callable_sync(context, &callee, value, args)?;
-            if abstract_ops::is_primitive(&result) {
-                return Ok(result);
-            }
-            return Err(
-                self.err_type(("Cannot convert object to primitive value".to_string()).into())
-            );
-        }
-        let order: [&str; 2] = match hint {
-            abstract_ops::ToPrimitiveHint::String => ["toString", "valueOf"],
-            abstract_ops::ToPrimitiveHint::Number | abstract_ops::ToPrimitiveHint::Default => {
-                ["valueOf", "toString"]
-            }
-        };
-        for method in order {
-            let callee = self.get_property_value_for_call(context, value, method)?;
-            if !self.is_callable_runtime(&callee) {
-                continue;
-            }
-            let result = self.run_callable_sync(context, &callee, value, SmallVec::new())?;
-            if abstract_ops::is_primitive(&result) {
-                return Ok(result);
-            }
-        }
-        Err(self.err_type(("Cannot convert object to primitive value".to_string()).into()))
+        self.evaluate_to_primitive(stack, context, &value, hint)
     }
 
     pub(crate) fn enumerable_own_string_keys_for_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         target: Value,
         hops: usize,
@@ -5138,15 +5532,22 @@ impl Interpreter {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(Vec::new());
         }
-        self.ensure_deferred_namespace_ready(context, &target, true)?;
+        let target = self.with_handle_scope(|interp, scope| -> Result<Value, VmError> {
+            let target = interp.scoped_value(scope, target);
+            let current = interp.escape_scoped(target);
+            interp.ensure_deferred_namespace_ready(stack, context, &current, true)?;
+            Ok(interp.escape_scoped(target))
+        })?;
         if let Some(proxy) = target.as_proxy() {
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
-            let trap_result = self.invoke_proxy_trap(context, &proxy, "ownKeys", trap_args)?;
+            let trap_result =
+                self.invoke_proxy_trap(stack, context, &proxy, "ownKeys", trap_args)?;
             let keys = if let Some(arr) = trap_result.and_then(|v| v.as_array()) {
                 crate::array::with_elements(arr, &self.gc_heap, |elements| elements.to_vec())
             } else if let Some(v) = trap_result {
                 if v.is_nullish() {
                     return self.enumerable_own_string_keys_for_value(
+                        stack,
                         context,
                         proxy.target(&self.gc_heap),
                         hops + 1,
@@ -5157,6 +5558,7 @@ impl Interpreter {
                 );
             } else {
                 return self.enumerable_own_string_keys_for_value(
+                    stack,
                     context,
                     proxy.target(&self.gc_heap),
                     hops + 1,
@@ -5169,14 +5571,12 @@ impl Interpreter {
                 };
                 let name = name.to_lossy_string(&self.gc_heap);
                 let proxy_root = Value::proxy(proxy);
-                let slice_roots: [&[Value]; 1] = [keys.as_slice()];
-                let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                let desc = self.ordinary_get_own_property_descriptor_value(
+                    stack,
                     context,
                     proxy_root,
                     &VmPropertyKey::OwnedString(name.clone()),
                     hops + 1,
-                    &[&proxy_root],
-                    &slice_roots,
                 )?;
                 if desc
                     .as_ref()
@@ -5197,13 +5597,12 @@ impl Interpreter {
                 let names = self.module_namespace_export_names(obj);
                 let mut out = Vec::with_capacity(names.len());
                 for name in names {
-                    let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                    let desc = self.ordinary_get_own_property_descriptor_value(
+                        stack,
                         context,
                         target,
                         &VmPropertyKey::OwnedString(name.clone()),
                         hops + 1,
-                        &[&target],
-                        &[],
                     )?;
                     if desc.is_some_and(|d| d.enumerable()) {
                         out.push(name);
@@ -5222,20 +5621,19 @@ impl Interpreter {
         }
         if let Some(arr) = target.as_array() {
             let target = Value::array(arr);
-            let own_keys = self.own_property_keys_value(context, &target)?;
+            let own_keys = self.own_property_keys_value(stack, context, &target)?;
             let mut out = Vec::new();
             for key_value in own_keys {
                 let Some(name) = key_value.as_string(&self.gc_heap) else {
                     continue;
                 };
                 let key = name.to_lossy_string(&self.gc_heap);
-                if let Some(desc) = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                if let Some(desc) = self.ordinary_get_own_property_descriptor_value(
+                    stack,
                     context,
                     target,
                     &VmPropertyKey::OwnedString(key.clone()),
                     hops + 1,
-                    &[&target],
-                    &[],
                 )? && desc.enumerable()
                 {
                     out.push(key);
@@ -5322,20 +5720,19 @@ impl Interpreter {
         if target.is_temporal() {
             // Enumerable own string keys are exactly the enumerable
             // entries of the lazy expando bag.
-            let own_keys = self.own_property_keys_value(context, &target)?;
+            let own_keys = self.own_property_keys_value(stack, context, &target)?;
             let mut out = Vec::new();
             for key_value in own_keys {
                 let Some(name) = key_value.as_string(&self.gc_heap) else {
                     continue;
                 };
                 let key = name.to_lossy_string(&self.gc_heap);
-                if let Some(desc) = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                if let Some(desc) = self.ordinary_get_own_property_descriptor_value(
+                    stack,
                     context,
                     target,
                     &VmPropertyKey::OwnedString(key.clone()),
                     hops + 1,
-                    &[&target],
-                    &[],
                 )? && desc.enumerable()
                 {
                     out.push(key);
@@ -5348,13 +5745,19 @@ impl Interpreter {
 
     pub(crate) fn enumerable_for_in_string_keys_for_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         target: Value,
     ) -> Result<Vec<String>, VmError> {
         if target.is_nullish() {
             return Ok(Vec::new());
         }
-        self.ensure_deferred_namespace_ready(context, &target, true)?;
+        let target = self.with_handle_scope(|interp, scope| -> Result<Value, VmError> {
+            let target = interp.scoped_value(scope, target);
+            let current = interp.escape_scoped(target);
+            interp.ensure_deferred_namespace_ready(stack, context, &current, true)?;
+            Ok(interp.escape_scoped(target))
+        })?;
 
         let mut current = target;
         let mut visited = BTreeSet::new();
@@ -5385,7 +5788,7 @@ impl Interpreter {
                 break;
             }
 
-            let keys = self.own_property_keys_value(context, &current)?;
+            let keys = self.own_property_keys_value(stack, context, &current)?;
             for key in &keys {
                 let Some(name) = key.as_string(&self.gc_heap) else {
                     continue;
@@ -5396,13 +5799,12 @@ impl Interpreter {
                 }
 
                 let key = VmPropertyKey::OwnedString(name.clone());
-                let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                let desc = self.ordinary_get_own_property_descriptor_value(
+                    stack,
                     context,
                     current,
                     &key,
                     hops + 1,
-                    &[&current],
-                    &[keys.as_slice()],
                 )?;
                 if desc
                     .as_ref()
@@ -5412,7 +5814,7 @@ impl Interpreter {
                 }
             }
 
-            current = self.ordinary_get_prototype_value(context, current, hops + 1)?;
+            current = self.ordinary_get_prototype_value(stack, context, current, hops + 1)?;
         }
 
         Ok(out)
@@ -5420,6 +5822,7 @@ impl Interpreter {
 
     pub(crate) fn ordinary_delete_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         target: Value,
         key: &VmPropertyKey,
@@ -5428,11 +5831,17 @@ impl Interpreter {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(true);
         }
-        self.ensure_deferred_namespace_ready(
-            context,
-            &target,
-            !Self::deferred_key_is_symbol_like(key),
-        )?;
+        let target = self.with_handle_scope(|interp, scope| -> Result<Value, VmError> {
+            let target = interp.scoped_value(scope, target);
+            let current = interp.escape_scoped(target);
+            interp.ensure_deferred_namespace_ready(
+                stack,
+                context,
+                &current,
+                !Self::deferred_key_is_symbol_like(key),
+            )?;
+            Ok(interp.escape_scoped(target))
+        })?;
         // §10.4.6.11 [[Delete]] — an exported string name cannot be
         // deleted (returns false); a non-export string succeeds. Symbol
         // keys fall through to the ordinary delete on own properties.
@@ -5446,29 +5855,34 @@ impl Interpreter {
             let key_value = self.vm_property_key_to_value(key)?;
             let trap_args: SmallVec<[Value; 8]> =
                 smallvec::smallvec![proxy.target(&self.gc_heap), key_value];
-            return match self.invoke_proxy_trap(context, &proxy, "deleteProperty", trap_args)? {
+            return match self.invoke_proxy_trap(
+                stack,
+                context,
+                &proxy,
+                "deleteProperty",
+                trap_args,
+            )? {
                 Some(value) => {
                     let result = value.to_boolean(&self.gc_heap);
                     if !result {
                         return Ok(false);
                     }
                     let target_value = proxy.target(&self.gc_heap);
-                    let target_desc = self
-                        .ordinary_get_own_property_descriptor_value_runtime_rooted(
-                            context,
-                            target_value,
-                            key,
-                            hops + 1,
-                            &[&target_value],
-                            &[],
-                        )?;
+                    let target_desc = self.ordinary_get_own_property_descriptor_value(
+                        stack,
+                        context,
+                        target_value,
+                        key,
+                        hops + 1,
+                    )?;
                     if let Some(desc) = target_desc {
                         if !desc.configurable() {
                             return Err(self.err_type((
                                     "Proxy deleteProperty trap returned true but target has the property as non-configurable"
                                         .to_string()).into()));
                         }
-                        let target_extensible = self.is_extensible_value(context, &target_value)?;
+                        let target_extensible =
+                            self.is_extensible_value(stack, context, &target_value)?;
                         if !target_extensible {
                             return Err(self.err_type((
                                     "Proxy deleteProperty trap returned true but target is non-extensible"
@@ -5477,9 +5891,13 @@ impl Interpreter {
                     }
                     Ok(true)
                 }
-                None => {
-                    self.ordinary_delete_value(context, proxy.target(&self.gc_heap), key, hops + 1)
-                }
+                None => self.ordinary_delete_value(
+                    stack,
+                    context,
+                    proxy.target(&self.gc_heap),
+                    key,
+                    hops + 1,
+                ),
             };
         }
         if let Some(obj) = target.as_object() {
@@ -5593,6 +6011,7 @@ impl Interpreter {
     /// carry parallel property semantics.
     pub(crate) fn ordinary_set_data_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         target: Value,
         key: &VmPropertyKey,
@@ -5603,11 +6022,24 @@ impl Interpreter {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(false);
         }
-        self.ensure_deferred_namespace_ready(
-            context,
-            &target,
-            !Self::deferred_key_is_symbol_like(key),
-        )?;
+        let (target, value, receiver) =
+            self.with_handle_scope(|interp, scope| -> Result<(Value, Value, Value), VmError> {
+                let target = interp.scoped_value(scope, target);
+                let value = interp.scoped_value(scope, value);
+                let receiver = interp.scoped_value(scope, receiver);
+                let current = interp.escape_scoped(target);
+                interp.ensure_deferred_namespace_ready(
+                    stack,
+                    context,
+                    &current,
+                    !Self::deferred_key_is_symbol_like(key),
+                )?;
+                Ok((
+                    interp.escape_scoped(target),
+                    interp.escape_scoped(value),
+                    interp.escape_scoped(receiver),
+                ))
+            })?;
         // §10.4.6.9 [[Set]] — a Module Namespace Exotic Object never
         // accepts assignment.
         if let Some(obj) = target.as_object()
@@ -5640,7 +6072,7 @@ impl Interpreter {
                             .is_some_and(|r| r == t);
                         if same_receiver {
                             let coerced =
-                                self.typed_array_coerce_element(context, t.kind(), value)?;
+                                self.typed_array_coerce_element(stack, context, t.kind(), value)?;
                             if let Some(idx) = crate::property_dispatch::typed_array_valid_index(
                                 &t,
                                 &self.gc_heap,
@@ -5659,7 +6091,8 @@ impl Interpreter {
                         // §10.1.9.2 receiver phase (GetOwnProperty +
                         // DefineOwnProperty on the receiver, never its
                         // [[Set]]).
-                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                        return self
+                            .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                     }
                     let mut bag = crate::property_dispatch::typed_array_ensure_expando(self, &t)?;
                     // OrdinarySet on the expando: an own non-writable
@@ -5678,8 +6111,9 @@ impl Interpreter {
                                 // §10.1.9.2 — own writable data on the
                                 // chain: the write lands on the
                                 // RECEIVER, never the holder.
-                                return self
-                                    .ordinary_set_on_receiver(context, key, value, &receiver);
+                                return self.ordinary_set_on_receiver(
+                                    stack, context, key, value, &receiver,
+                                );
                             }
                             object::set(&mut bag, &mut self.gc_heap, &name, value);
                             return Ok(true);
@@ -5689,7 +6123,7 @@ impl Interpreter {
                                 return Ok(false);
                             };
                             let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                            self.run_callable_sync(context, &setter, receiver, argv)?;
+                            self.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
                             return Ok(true);
                         }
                         object::PropertyLookup::Absent => {
@@ -5701,10 +6135,12 @@ impl Interpreter {
                             // receiver.
                             let parent = self.get_prototype_for_op(&target)?;
                             if parent.is_null() || parent.is_undefined() {
-                                return self
-                                    .ordinary_set_on_receiver(context, key, value, &receiver);
+                                return self.ordinary_set_on_receiver(
+                                    stack, context, key, value, &receiver,
+                                );
                             }
                             return self.ordinary_set_data_value(
+                                stack,
                                 context,
                                 parent,
                                 key,
@@ -5726,22 +6162,20 @@ impl Interpreter {
             let key_value = self.vm_property_key_to_value(key)?;
             let trap_args: SmallVec<[Value; 8]> =
                 smallvec::smallvec![proxy.target(&self.gc_heap), key_value, value, receiver,];
-            return match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
+            return match self.invoke_proxy_trap(stack, context, &proxy, "set", trap_args)? {
                 Some(result) => {
                     let ok = result.to_boolean(&self.gc_heap);
                     if !ok {
                         return Ok(false);
                     }
                     let target_value = proxy.target(&self.gc_heap);
-                    let target_desc = self
-                        .ordinary_get_own_property_descriptor_value_runtime_rooted(
-                            context,
-                            target_value,
-                            key,
-                            hops + 1,
-                            &[&target_value, &value, &receiver],
-                            &[],
-                        )?;
+                    let target_desc = self.ordinary_get_own_property_descriptor_value(
+                        stack,
+                        context,
+                        target_value,
+                        key,
+                        hops + 1,
+                    )?;
                     if let Some(desc) = target_desc.as_ref()
                         && !desc.configurable()
                     {
@@ -5769,6 +6203,7 @@ impl Interpreter {
                     Ok(true)
                 }
                 None => self.ordinary_set_data_value(
+                    stack,
                     context,
                     proxy.target(&self.gc_heap),
                     key,
@@ -5784,13 +6219,12 @@ impl Interpreter {
             // A raw element/named store would skip extensibility,
             // length, accessor, prototype, and Proxy receiver rules.
             let target_value = Value::array(arr);
-            let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+            let desc = self.ordinary_get_own_property_descriptor_value(
+                stack,
                 context,
                 target_value,
                 key,
                 hops + 1,
-                &[&target_value, &value, &receiver],
-                &[],
             )?;
             if let Some(desc) = desc {
                 return match desc.kind {
@@ -5799,22 +6233,30 @@ impl Interpreter {
                             return Ok(false);
                         };
                         let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                        self.run_callable_sync(context, &setter, receiver, argv)?;
+                        self.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
                         Ok(true)
                     }
                     object::DescriptorKind::Data { .. } => {
                         if !desc.writable() {
                             return Ok(false);
                         }
-                        self.ordinary_set_on_receiver(context, key, value, &receiver)
+                        self.ordinary_set_on_receiver(stack, context, key, value, &receiver)
                     }
                 };
             }
             let parent = self.get_prototype_for_op(&target_value)?;
             if parent.is_null() || parent.is_undefined() {
-                return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                return self.ordinary_set_on_receiver(stack, context, key, value, &receiver);
             }
-            return self.ordinary_set_data_value(context, parent, key, value, receiver, hops + 1);
+            return self.ordinary_set_data_value(
+                stack,
+                context,
+                parent,
+                key,
+                value,
+                receiver,
+                hops + 1,
+            );
         }
         if let Some(obj) = target.as_object() {
             // §7.3.28 PrivateSet — installing a new private element is a hard
@@ -5854,17 +6296,24 @@ impl Interpreter {
             return match outcome {
                 object::SetOutcome::InvokeSetter { setter } => {
                     let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                    self.run_callable_sync(context, &setter, receiver, argv)?;
+                    self.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
                     Ok(true)
                 }
                 object::SetOutcome::Reject { .. } => Ok(false),
-                object::SetOutcome::ExoticParent { parent } => {
-                    self.ordinary_set_data_value(context, parent, key, value, receiver, hops + 1)
-                }
+                object::SetOutcome::ExoticParent { parent } => self.ordinary_set_data_value(
+                    stack,
+                    context,
+                    parent,
+                    key,
+                    value,
+                    receiver,
+                    hops + 1,
+                ),
                 object::SetOutcome::AssignData => {
                     let same_receiver = receiver.as_object().is_some_and(|r| r == obj);
                     if !same_receiver {
-                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                        return self
+                            .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                     }
                     Ok(if let VmPropertyKey::Symbol(sym) = key {
                         object::set_symbol(obj, &mut self.gc_heap, *sym, value)
@@ -5915,7 +6364,8 @@ impl Interpreter {
                             return Ok(false);
                         }
                         if !same_receiver {
-                            return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                            return self
+                                .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                         }
                         return Ok(if let VmPropertyKey::Symbol(sym) = key {
                             object::set_symbol(bag, &mut self.gc_heap, *sym, value)
@@ -5932,18 +6382,38 @@ impl Interpreter {
                         let Some(setter) = setter else {
                             return Ok(false);
                         };
-                        let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                        self.run_callable_sync(context, &setter, receiver, argv)?;
-                        return Ok(true);
+                        return self.with_handle_scope(|interp, scope| {
+                            let setter = interp.scoped_value(scope, setter);
+                            let receiver = interp.scoped_value(scope, receiver);
+                            let value = interp.scoped_value(scope, value);
+                            let argv: SmallVec<[Value; 8]> =
+                                smallvec::smallvec![interp.escape_scoped(value)];
+                            interp.run_callable_sync_rooted(
+                                stack,
+                                context,
+                                &interp.escape_scoped(setter),
+                                interp.escape_scoped(receiver),
+                                argv,
+                            )?;
+                            Ok(true)
+                        });
                     }
                     object::PropertyLookup::Absent => {}
                 }
             }
             let parent = self.get_prototype_for_op(&target)?;
             if parent.is_null() || parent.is_undefined() {
-                return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                return self.ordinary_set_on_receiver(stack, context, key, value, &receiver);
             }
-            return self.ordinary_set_data_value(context, parent, key, value, receiver, hops + 1);
+            return self.ordinary_set_data_value(
+                stack,
+                context,
+                parent,
+                key,
+                value,
+                receiver,
+                hops + 1,
+            );
         }
         if target.is_map() || target.is_set() || target.is_generator() {
             // OrdinarySet over the lazy expando: an own writable data
@@ -5983,7 +6453,8 @@ impl Interpreter {
                         return Ok(false);
                     }
                     if !same_receiver {
-                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                        return self
+                            .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                     }
                     return Ok(if let VmPropertyKey::Symbol(sym) = key {
                         object::set_symbol(bag, &mut self.gc_heap, *sym, value)
@@ -6000,16 +6471,30 @@ impl Interpreter {
                     let Some(setter) = setter else {
                         return Ok(false);
                     };
-                    let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                    self.run_callable_sync(context, &setter, receiver, argv)?;
-                    return Ok(true);
+                    return self.with_handle_scope(|interp, scope| {
+                        let setter = interp.scoped_value(scope, setter);
+                        let receiver = interp.scoped_value(scope, receiver);
+                        let value = interp.scoped_value(scope, value);
+                        let argv: SmallVec<[Value; 8]> =
+                            smallvec::smallvec![interp.escape_scoped(value)];
+                        interp.run_callable_sync_rooted(
+                            stack,
+                            context,
+                            &interp.escape_scoped(setter),
+                            interp.escape_scoped(receiver),
+                            argv,
+                        )?;
+                        Ok(true)
+                    });
                 }
                 object::PropertyLookup::Absent => {
                     let parent = self.get_prototype_for_op(&target)?;
                     if parent.is_null() || parent.is_undefined() {
-                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                        return self
+                            .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                     }
                     return self.ordinary_set_data_value(
+                        stack,
                         context,
                         parent,
                         key,
@@ -6046,7 +6531,8 @@ impl Interpreter {
                         return Ok(false);
                     }
                     if !same_receiver {
-                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                        return self
+                            .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                     }
                     if let VmPropertyKey::Symbol(sym) = key {
                         object::set_symbol(bag, &mut self.gc_heap, *sym, value);
@@ -6066,15 +6552,17 @@ impl Interpreter {
                         return Ok(false);
                     };
                     let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                    self.run_callable_sync(context, &setter, receiver, argv)?;
+                    self.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
                     return Ok(true);
                 }
                 object::PropertyLookup::Absent => {
                     let parent = self.get_prototype_for_op(&target)?;
                     if parent.is_null() || parent.is_undefined() {
-                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                        return self
+                            .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                     }
                     return self.ordinary_set_data_value(
+                        stack,
                         context,
                         parent,
                         key,
@@ -6111,7 +6599,8 @@ impl Interpreter {
                         return Ok(false);
                     }
                     if !same_receiver {
-                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                        return self
+                            .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                     }
                     if let VmPropertyKey::Symbol(sym) = key {
                         object::set_symbol(bag, &mut self.gc_heap, *sym, value);
@@ -6131,15 +6620,17 @@ impl Interpreter {
                         return Ok(false);
                     };
                     let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                    self.run_callable_sync(context, &setter, receiver, argv)?;
+                    self.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
                     return Ok(true);
                 }
                 object::PropertyLookup::Absent => {
                     let parent = self.get_prototype_for_op(&target)?;
                     if parent.is_null() || parent.is_undefined() {
-                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                        return self
+                            .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                     }
                     return self.ordinary_set_data_value(
+                        stack,
                         context,
                         parent,
                         key,
@@ -6178,7 +6669,8 @@ impl Interpreter {
                         return Ok(false);
                     }
                     if !same_receiver {
-                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                        return self
+                            .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                     }
                     if let VmPropertyKey::Symbol(sym) = key {
                         object::set_symbol(bag, &mut self.gc_heap, *sym, value);
@@ -6198,15 +6690,17 @@ impl Interpreter {
                         return Ok(false);
                     };
                     let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                    self.run_callable_sync(context, &setter, receiver, argv)?;
+                    self.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
                     return Ok(true);
                 }
                 object::PropertyLookup::Absent => {
                     let parent = self.get_prototype_for_op(&target)?;
                     if parent.is_null() || parent.is_undefined() {
-                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                        return self
+                            .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                     }
                     return self.ordinary_set_data_value(
+                        stack,
                         context,
                         parent,
                         key,
@@ -6242,22 +6736,31 @@ impl Interpreter {
                             return Ok(false);
                         };
                         let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                        self.run_callable_sync(context, &setter, receiver, argv)?;
+                        self.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
                         Ok(true)
                     }
                     object::DescriptorKind::Data { .. } => {
                         if !desc.flags.writable() {
                             return Ok(false);
                         }
-                        self.ordinary_set_on_receiver(context, key, value, &receiver)
+                        self.ordinary_set_on_receiver(stack, context, key, value, &receiver)
                     }
                 },
                 None => {
                     let parent = self.get_prototype_for_op(&target)?;
                     if parent.is_null() || parent.is_undefined() {
-                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                        return self
+                            .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                     }
-                    self.ordinary_set_data_value(context, parent, key, value, receiver, hops + 1)
+                    self.ordinary_set_data_value(
+                        stack,
+                        context,
+                        parent,
+                        key,
+                        value,
+                        receiver,
+                        hops + 1,
+                    )
                 }
             };
         }
@@ -6300,22 +6803,31 @@ impl Interpreter {
                             return Ok(false);
                         };
                         let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                        self.run_callable_sync(context, &setter, receiver, argv)?;
+                        self.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
                         Ok(true)
                     }
                     object::DescriptorKind::Data { .. } => {
                         if !desc.flags.writable() {
                             return Ok(false);
                         }
-                        self.ordinary_set_on_receiver(context, key, value, &receiver)
+                        self.ordinary_set_on_receiver(stack, context, key, value, &receiver)
                     }
                 },
                 None => {
                     let parent = self.get_prototype_for_op(&target)?;
                     if parent.is_null() || parent.is_undefined() {
-                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                        return self
+                            .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                     }
-                    self.ordinary_set_data_value(context, parent, key, value, receiver, hops + 1)
+                    self.ordinary_set_data_value(
+                        stack,
+                        context,
+                        parent,
+                        key,
+                        value,
+                        receiver,
+                        hops + 1,
+                    )
                 }
             };
         }
@@ -6329,15 +6841,14 @@ impl Interpreter {
                 let target = interp.scoped_value(scope, target);
                 let value = interp.scoped_value(scope, value);
                 let receiver = interp.scoped_value(scope, receiver);
-                // The handle arena owns every moving value here. The legacy
-                // descriptor helper receives no manually threaded roots.
-                let own = interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                // The handle arena owns every moving value here while the
+                // shared activation stack remains the sole frame-root owner.
+                let own = interp.ordinary_get_own_property_descriptor_value(
+                    stack,
                     context,
                     interp.escape_scoped(target),
                     key,
                     hops + 1,
-                    &[],
-                    &[],
                 )?;
                 if let Some(desc) = own {
                     return match desc.kind {
@@ -6345,7 +6856,8 @@ impl Interpreter {
                             let Some(setter) = setter else {
                                 return Ok(false);
                             };
-                            interp.run_callable_sync(
+                            interp.run_callable_sync_rooted(
+                                stack,
                                 context,
                                 &setter,
                                 interp.escape_scoped(receiver),
@@ -6358,6 +6870,7 @@ impl Interpreter {
                                 return Ok(false);
                             }
                             interp.ordinary_set_on_receiver(
+                                stack,
                                 context,
                                 key,
                                 interp.escape_scoped(value),
@@ -6369,6 +6882,7 @@ impl Interpreter {
                 let parent = interp.get_prototype_for_op(&interp.escape_scoped(target))?;
                 if parent.is_null() || parent.is_undefined() {
                     return interp.ordinary_set_on_receiver(
+                        stack,
                         context,
                         key,
                         interp.escape_scoped(value),
@@ -6376,6 +6890,7 @@ impl Interpreter {
                     );
                 }
                 interp.ordinary_set_data_value(
+                    stack,
                     context,
                     parent,
                     key,

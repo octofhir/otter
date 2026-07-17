@@ -24,6 +24,9 @@
 //!   the active [`ExecutionContext`].
 //! - Species-created arrays and their receivers stay in the interpreter handle
 //!   arena across every allocating property operation.
+//! - Callback and comparator paths append above the current activation floor;
+//!   sort operands live in traced anchors while merge buffers store only stable
+//!   anchor indices.
 //! - Pathological array-like lengths are guarded before any dense
 //!   materialisation.
 
@@ -37,7 +40,9 @@ use crate::number::NumberValue;
 use crate::object::{self, PartialPropertyDescriptor};
 use crate::string::JsString;
 use crate::symbol::{WellKnown, WellKnownSymbols};
-use crate::{ExecutionContext, Interpreter, NativeCall, NativeCtx, NativeError, VmError};
+use crate::{
+    ActivationStack, ExecutionContext, Interpreter, NativeCall, NativeCtx, NativeError, VmError,
+};
 
 /// Defensive upper bound on the materialised length of an
 /// array-like Object receiver before we'd refuse to expand a
@@ -767,10 +772,11 @@ fn native_array_method(
             reason: "unknown Array.prototype method".to_string(),
         });
     };
-    let interp = ctx.interp_mut();
-    interp
-        .array_live_method_dispatch(&exec, tag, receiver, args, &[args])
-        .map_err(|err| crate::native_function::vm_to_native_error(interp, err, name))
+    ctx.with_turn_parts(|interp, stack| {
+        interp
+            .array_live_method_dispatch(stack, &exec, tag, receiver, args, &[args])
+            .map_err(|err| crate::native_function::vm_to_native_error(interp, err, name))
+    })
 }
 macro_rules! native_array {
     ($fn_name:ident, $js_name:literal) => {
@@ -999,6 +1005,7 @@ pub(crate) fn is_array_prototype_builtin(
 /// §7.3.18 `LengthOfArrayLike(O)` with live `Get(O, "length")` semantics.
 pub(crate) fn length_of_array_like(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     o: &Value,
 ) -> Result<usize, VmError> {
@@ -1010,16 +1017,21 @@ pub(crate) fn length_of_array_like(
     if let Some(arr) = o.as_array() {
         return Ok(crate::array::len(arr, interp.gc_heap()));
     }
-    let len_val = interp.get_property_value_for_call(context, *o, "length")?;
+    let len_val = interp.get_property_value_for_call(stack, context, *o, "length")?;
     // §7.1.20 ToLength(? ToNumber(len)). A wrapper-object length
     // (`obj.length = new Number(4.5)`) or one with a `valueOf` must run
     // the numeric coercion ladder, not just match an existing Number.
     let len_val = if len_val.is_object_type() {
-        interp.evaluate_to_primitive(
+        let anchor = interp.push_iteration_anchor(len_val) - 1;
+        let rooted = interp.iteration_anchor(anchor);
+        let result = interp.evaluate_to_primitive(
+            stack,
             context,
-            &len_val,
+            &rooted,
             crate::abstract_ops::ToPrimitiveHint::Number,
-        )?
+        );
+        interp.pop_iteration_anchors_to(anchor);
+        result?
     } else {
         len_val
     };
@@ -1029,133 +1041,165 @@ pub(crate) fn length_of_array_like(
 /// §23.1.3.17 / §23.1.3.22 live search for `indexOf` and `lastIndexOf`.
 pub(crate) fn array_linear_search(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     o: Value,
     name: &str,
     search: Value,
     from_arg: Option<Value>,
 ) -> Result<i64, VmError> {
-    // §23.1.3.* step 2 — len = ? LengthOfArrayLike(O).
-    let len = length_of_array_like(interp, context, &o)?;
-    if len == 0 {
-        return Ok(-1);
-    }
-    // §7.1.5 ToIntegerOrInfinity(fromIndex) begins with ToNumber →
-    // ToPrimitive(Number); run user `valueOf` / `@@toPrimitive` on an
-    // object `fromIndex` before the numeric clamp below.
-    let from_arg = match from_arg {
-        Some(v) if v.is_object_type() => Some(interp.evaluate_to_primitive(
-            context,
-            &v,
-            crate::abstract_ops::ToPrimitiveHint::Number,
-        )?),
-        other => other,
-    };
-    let to_int = |v: &Value, heap: &otter_gc::GcHeap| -> f64 {
-        let n = crate::number::parse::to_number_value(v, heap);
-        if n.is_nan() { 0.0 } else { n.trunc() }
-    };
-    let len_i = len as i64;
-    // String primitives / `String` wrappers expose code-unit indices
-    // through `[[StringData]]`, which the ordinary `[[Get]]` /
-    // `[[HasProperty]]` ladder may not surface. Resolve those indices
-    // directly; `len` is already the string length, so inherited
-    // beyond-length indices (`String.prototype[3]`) are never probed.
-    let string_data = if let Some(obj) = o.as_object() {
-        crate::object::string_data(obj, interp.gc_heap())
-    } else {
-        o.as_string(interp.gc_heap())
-    };
-    let probe = |interp: &mut Interpreter, k: i64| -> Result<Option<i64>, VmError> {
-        if let Some(s) = string_data {
-            let Some(unit) = s.char_code_at(k as u32, interp.gc_heap()) else {
-                return Ok(None);
+    let anchor_base = interp.push_iteration_anchor(o) - 1;
+    let search_anchor = interp.push_iteration_anchor(search) - 1;
+    let has_from_arg = from_arg.is_some();
+    let from_anchor = interp.push_iteration_anchor(from_arg.unwrap_or_else(Value::undefined)) - 1;
+    let result = (|| {
+        // §23.1.3.* step 2 — len = ? LengthOfArrayLike(O).
+        let o = interp.iteration_anchor(anchor_base);
+        let len = length_of_array_like(interp, stack, context, &o)?;
+        if len == 0 {
+            return Ok(-1);
+        }
+        // §7.1.5 ToIntegerOrInfinity(fromIndex) begins with ToNumber →
+        // ToPrimitive(Number); run user `valueOf` / `@@toPrimitive` on an
+        // object `fromIndex` before the numeric clamp below.
+        if has_from_arg {
+            let from = interp.iteration_anchor(from_anchor);
+            if from.is_object_type() {
+                let coerced = interp.evaluate_to_primitive(
+                    stack,
+                    context,
+                    &from,
+                    crate::abstract_ops::ToPrimitiveHint::Number,
+                )?;
+                interp.set_iteration_anchor(from_anchor, coerced);
+            }
+        }
+        let to_int = |v: &Value, heap: &otter_gc::GcHeap| -> f64 {
+            let n = crate::number::parse::to_number_value(v, heap);
+            if n.is_nan() { 0.0 } else { n.trunc() }
+        };
+        let len_i = len as i64;
+        let probe = |interp: &mut Interpreter,
+                     stack: &mut ActivationStack,
+                     k: i64|
+         -> Result<Option<i64>, VmError> {
+            // String primitives / `String` wrappers expose code-unit indices
+            // through `[[StringData]]`, which the ordinary `[[Get]]` /
+            // `[[HasProperty]]` ladder may not surface.
+            let o = interp.iteration_anchor(anchor_base);
+            let string_data = if let Some(obj) = o.as_object() {
+                crate::object::string_data(obj, interp.gc_heap())
+            } else {
+                o.as_string(interp.gc_heap())
             };
-            let ch = crate::string::JsString::from_utf16_units(&[unit], interp.gc_heap_mut())
-                .map(Value::string)?;
-            return Ok(
-                if crate::abstract_ops::is_strictly_equal(&ch, &search, interp.gc_heap()) {
-                    Some(k)
-                } else {
-                    None
-                },
-            );
-        }
-        let key = k.to_string();
-        let has = interp.ordinary_has_property_value(
-            context,
-            o,
-            &crate::VmPropertyKey::String(&key),
-            0,
-        )?;
-        if !has {
-            return Ok(None);
-        }
-        let v = interp.get_property_value_for_call(context, o, &key)?;
-        if crate::abstract_ops::is_strictly_equal(&v, &search, interp.gc_heap()) {
-            Ok(Some(k))
-        } else {
-            Ok(None)
-        }
-    };
-    if name == "indexOf" {
-        let n = from_arg.map_or(0.0, |v| to_int(&v, interp.gc_heap()));
-        let mut k = if n >= len as f64 {
-            len_i
-        } else if n >= 0.0 {
-            n as i64
-        } else {
-            (len_i + n as i64).max(0)
-        };
-        while k < len_i {
-            if let Some(idx) = probe(interp, k)? {
-                return Ok(idx);
+            if let Some(s) = string_data {
+                let Some(unit) = s.char_code_at(k as u32, interp.gc_heap()) else {
+                    return Ok(None);
+                };
+                let ch = crate::string::JsString::from_utf16_units(&[unit], interp.gc_heap_mut())
+                    .map(Value::string)?;
+                let search = interp.iteration_anchor(search_anchor);
+                return Ok(
+                    if crate::abstract_ops::is_strictly_equal(&ch, &search, interp.gc_heap()) {
+                        Some(k)
+                    } else {
+                        None
+                    },
+                );
             }
-            k += 1;
-        }
-        Ok(-1)
-    } else {
-        // lastIndexOf — default fromIndex is len-1.
-        let n = from_arg.map_or((len - 1) as f64, |v| to_int(&v, interp.gc_heap()));
-        let mut k = if n >= 0.0 {
-            (n as i64).min(len_i - 1)
-        } else {
-            len_i + n as i64
-        };
-        while k >= 0 {
-            if let Some(idx) = probe(interp, k)? {
-                return Ok(idx);
+            let key = k.to_string();
+            let has = interp.ordinary_has_property_value(
+                stack,
+                context,
+                o,
+                &crate::VmPropertyKey::String(&key),
+                0,
+            )?;
+            if !has {
+                return Ok(None);
             }
-            k -= 1;
+            let o = interp.iteration_anchor(anchor_base);
+            let v = interp.get_property_value_for_call(stack, context, o, &key)?;
+            let search = interp.iteration_anchor(search_anchor);
+            if crate::abstract_ops::is_strictly_equal(&v, &search, interp.gc_heap()) {
+                Ok(Some(k))
+            } else {
+                Ok(None)
+            }
+        };
+        let from = has_from_arg.then(|| interp.iteration_anchor(from_anchor));
+        if name == "indexOf" {
+            let n = from.map_or(0.0, |v| to_int(&v, interp.gc_heap()));
+            let mut k = if n >= len as f64 {
+                len_i
+            } else if n >= 0.0 {
+                n as i64
+            } else {
+                (len_i + n as i64).max(0)
+            };
+            while k < len_i {
+                if let Some(idx) = probe(interp, stack, k)? {
+                    return Ok(idx);
+                }
+                k += 1;
+            }
+            Ok(-1)
+        } else {
+            // lastIndexOf — default fromIndex is len-1.
+            let n = from.map_or((len - 1) as f64, |v| to_int(&v, interp.gc_heap()));
+            let mut k = if n >= 0.0 {
+                (n as i64).min(len_i - 1)
+            } else {
+                len_i + n as i64
+            };
+            while k >= 0 {
+                if let Some(idx) = probe(interp, stack, k)? {
+                    return Ok(idx);
+                }
+                k -= 1;
+            }
+            Ok(-1)
         }
-        Ok(-1)
-    }
+    })();
+    interp.pop_iteration_anchors_to(anchor_base);
+    result
 }
 
 /// §23.1.3.16 live `Array.prototype.includes` with `SameValueZero`.
 pub(crate) fn array_includes(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     o: Value,
     search: Value,
     from_arg: Option<Value>,
 ) -> Result<bool, VmError> {
-    let len = length_of_array_like(interp, context, &o)?;
-    if len == 0 {
-        return Ok(false);
-    }
-    // §7.1.5 ToIntegerOrInfinity(fromIndex): ToNumber → ToPrimitive(Number).
-    let from_arg = match from_arg {
-        Some(v) if v.is_object_type() => Some(interp.evaluate_to_primitive(
-            context,
-            &v,
-            crate::abstract_ops::ToPrimitiveHint::Number,
-        )?),
-        other => other,
-    };
-    let len_i = len as i64;
-    let n = match from_arg {
-        Some(v) => {
+    let anchor_base = interp.push_iteration_anchor(o) - 1;
+    let search_anchor = interp.push_iteration_anchor(search) - 1;
+    let has_from_arg = from_arg.is_some();
+    let from_anchor = interp.push_iteration_anchor(from_arg.unwrap_or_else(Value::undefined)) - 1;
+    let result = (|| {
+        let o = interp.iteration_anchor(anchor_base);
+        let len = length_of_array_like(interp, stack, context, &o)?;
+        if len == 0 {
+            return Ok(false);
+        }
+        // §7.1.5 ToIntegerOrInfinity(fromIndex): ToNumber → ToPrimitive(Number).
+        if has_from_arg {
+            let from = interp.iteration_anchor(from_anchor);
+            if from.is_object_type() {
+                let coerced = interp.evaluate_to_primitive(
+                    stack,
+                    context,
+                    &from,
+                    crate::abstract_ops::ToPrimitiveHint::Number,
+                )?;
+                interp.set_iteration_anchor(from_anchor, coerced);
+            }
+        }
+        let len_i = len as i64;
+        let n = if has_from_arg {
+            let v = interp.iteration_anchor(from_anchor);
             // §7.1.4 ToNumber — Symbol / BigInt fromIndex throws TypeError.
             if v.is_symbol() {
                 return Err(interp
@@ -1167,46 +1211,52 @@ pub(crate) fn array_includes(
             }
             let f = crate::number::parse::to_number_value(&v, interp.gc_heap());
             if f.is_nan() { 0.0 } else { f.trunc() }
-        }
-        None => 0.0,
-    };
-    let mut k = if n >= len as f64 {
-        return Ok(false);
-    } else if n >= 0.0 {
-        n as i64
-    } else {
-        (len_i + n as i64).max(0)
-    };
-    let string_data = if let Some(obj) = o.as_object() {
-        crate::object::string_data(obj, interp.gc_heap())
-    } else {
-        o.as_string(interp.gc_heap())
-    };
-    while k < len_i {
-        let v = if let Some(s) = string_data {
-            match s.char_code_at(k as u32, interp.gc_heap()) {
-                Some(unit) => {
-                    crate::string::JsString::from_utf16_units(&[unit], interp.gc_heap_mut())
-                        .map(Value::string)?
-                }
-                None => Value::undefined(),
-            }
         } else {
-            let key = k.to_string();
-            interp.get_property_value_for_call(context, o, &key)?
+            0.0
         };
-        if crate::abstract_ops::same_value_zero(&v, &search, interp.gc_heap()) {
-            return Ok(true);
+        let mut k = if n >= len as f64 {
+            return Ok(false);
+        } else if n >= 0.0 {
+            n as i64
+        } else {
+            (len_i + n as i64).max(0)
+        };
+        while k < len_i {
+            let o = interp.iteration_anchor(anchor_base);
+            let string_data = if let Some(obj) = o.as_object() {
+                crate::object::string_data(obj, interp.gc_heap())
+            } else {
+                o.as_string(interp.gc_heap())
+            };
+            let v = if let Some(s) = string_data {
+                match s.char_code_at(k as u32, interp.gc_heap()) {
+                    Some(unit) => {
+                        crate::string::JsString::from_utf16_units(&[unit], interp.gc_heap_mut())
+                            .map(Value::string)?
+                    }
+                    None => Value::undefined(),
+                }
+            } else {
+                let key = k.to_string();
+                interp.get_property_value_for_call(stack, context, o, &key)?
+            };
+            let search = interp.iteration_anchor(search_anchor);
+            if crate::abstract_ops::same_value_zero(&v, &search, interp.gc_heap()) {
+                return Ok(true);
+            }
+            k += 1;
         }
-        k += 1;
-    }
-    Ok(false)
+        Ok(false)
+    })();
+    interp.pop_iteration_anchors_to(anchor_base);
+    result
 }
 
 impl Interpreter {
     /// §23.1.3 indexed search entry for `includes`, `indexOf`, and `lastIndexOf`.
     pub(crate) fn array_indexed_search(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         name: &str,
@@ -1220,10 +1270,10 @@ impl Interpreter {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
         if name == "includes" {
-            let found = array_includes(self, context, o, search, from_arg)?;
+            let found = array_includes(self, stack, context, o, search, from_arg)?;
             Ok(Value::boolean(found))
         } else {
-            let idx = array_linear_search(self, context, o, name, search, from_arg)?;
+            let idx = array_linear_search(self, stack, context, o, name, search, from_arg)?;
             Ok(Value::number(NumberValue::from_f64(idx as f64)))
         }
     }
@@ -1231,6 +1281,7 @@ impl Interpreter {
     /// Routes NativeCtx Array prototype calls to their live interpreter drivers.
     pub(crate) fn array_live_method_dispatch(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         tag: ArrayMethodTag,
         receiver: Value,
@@ -1242,49 +1293,57 @@ impl Interpreter {
             T::IndexOf | T::LastIndexOf | T::Includes => {
                 let search = args.first().copied().unwrap_or_else(Value::undefined);
                 let from_arg = args.get(1).copied();
-                self.array_indexed_search(context, receiver, tag.name(), search, from_arg, roots)
+                self.array_indexed_search(
+                    stack,
+                    context,
+                    receiver,
+                    tag.name(),
+                    search,
+                    from_arg,
+                    roots,
+                )
             }
             T::Join => {
                 let separator_arg = args.first().copied();
-                self.array_join(context, receiver, separator_arg, roots)
+                self.array_join(stack, context, receiver, separator_arg, roots)
             }
-            T::ToString => self.array_to_string(context, receiver, roots),
-            T::ToLocaleString => self.array_to_locale_string(context, receiver, roots),
-            T::Concat => self.array_concat(context, receiver, args, roots),
+            T::ToString => self.array_to_string(stack, context, receiver, roots),
+            T::ToLocaleString => self.array_to_locale_string(stack, context, receiver, roots),
+            T::Concat => self.array_concat(stack, context, receiver, args, roots),
             T::Sort => {
                 let comparefn = args.first().copied().unwrap_or_else(Value::undefined);
-                self.array_sort(context, receiver, comparefn, roots)
+                self.array_sort(stack, context, receiver, comparefn, roots)
             }
-            T::Push => self.array_push(context, receiver, args, roots),
-            T::Pop => self.array_pop(context, receiver, roots),
-            T::Shift => self.array_shift(context, receiver, roots),
-            T::Unshift => self.array_unshift(context, receiver, args, roots),
+            T::Push => self.array_push(stack, context, receiver, args, roots),
+            T::Pop => self.array_pop(stack, context, receiver, roots),
+            T::Shift => self.array_shift(stack, context, receiver, roots),
+            T::Unshift => self.array_unshift(stack, context, receiver, args, roots),
             T::At => {
                 let index = args.first().copied().unwrap_or_else(Value::undefined);
-                self.array_at(context, receiver, index, roots)
+                self.array_at(stack, context, receiver, index, roots)
             }
-            T::Reverse => self.array_reverse(context, receiver, roots),
+            T::Reverse => self.array_reverse(stack, context, receiver, roots),
             T::Fill => {
                 let value = args.first().copied().unwrap_or_else(Value::undefined);
-                self.array_fill(context, receiver, value, args, roots)
+                self.array_fill(stack, context, receiver, value, args, roots)
             }
             T::Flat => {
                 let depth = args.first().copied().unwrap_or_else(Value::undefined);
-                self.array_flat(context, receiver, depth, roots)
+                self.array_flat(stack, context, receiver, depth, roots)
             }
-            T::CopyWithin => self.array_copy_within(context, receiver, args, roots),
-            T::Slice => self.array_slice(context, receiver, args, roots),
-            T::Splice => self.array_splice(context, receiver, args, roots),
-            T::ToReversed => self.array_to_reversed(context, receiver, roots),
-            T::ToSpliced => self.array_to_spliced(context, receiver, args, roots),
+            T::CopyWithin => self.array_copy_within(stack, context, receiver, args, roots),
+            T::Slice => self.array_slice(stack, context, receiver, args, roots),
+            T::Splice => self.array_splice(stack, context, receiver, args, roots),
+            T::ToReversed => self.array_to_reversed(stack, context, receiver, roots),
+            T::ToSpliced => self.array_to_spliced(stack, context, receiver, args, roots),
             T::ToSorted => {
                 let comparefn = args.first().copied().unwrap_or_else(Value::undefined);
-                self.array_to_sorted(context, receiver, comparefn, roots)
+                self.array_to_sorted(stack, context, receiver, comparefn, roots)
             }
             T::With => {
                 let index = args.first().copied().unwrap_or_else(Value::undefined);
                 let value = args.get(1).copied().unwrap_or_else(Value::undefined);
-                self.array_with(context, receiver, index, value, roots)
+                self.array_with(stack, context, receiver, index, value, roots)
             }
             T::Keys => self.array_iterator_method(context, receiver, "keys", roots),
             T::Values => self.array_iterator_method(context, receiver, "values", roots),
@@ -1295,6 +1354,7 @@ impl Interpreter {
     /// §23.1.3.1 live `Array.prototype.at`.
     pub(crate) fn array_at(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         index: Value,
@@ -1305,8 +1365,8 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
-        let len = length_of_array_like(self, context, &o)?;
-        let n = self.coerce_to_number(context, &index)?.as_f64();
+        let len = length_of_array_like(self, stack, context, &o)?;
+        let n = self.coerce_to_number(stack, context, &index)?.as_f64();
         let relative = if n.is_nan() {
             0.0
         } else if n.is_infinite() {
@@ -1322,12 +1382,13 @@ impl Interpreter {
         if !actual.is_finite() || actual < 0.0 || actual >= len as f64 {
             return Ok(Value::undefined());
         }
-        self.array_method_get_property(context, o, &format_index_key(actual))
+        self.array_method_get_property(stack, context, o, &format_index_key(actual))
     }
 
     /// §23.1.3.27 live `Array.prototype.reverse`.
     pub(crate) fn array_reverse(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         roots: &[&[Value]],
@@ -1337,7 +1398,7 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
-        let len = length_of_array_like(self, context, &o)?;
+        let len = length_of_array_like(self, stack, context, &o)?;
         if len < 2 {
             return Ok(o);
         }
@@ -1346,30 +1407,30 @@ impl Interpreter {
             let upper = len - lower - 1;
             let lower_key = lower.to_string();
             let upper_key = format_index_key(upper as f64);
-            let lower_exists = self.array_method_has_property(context, o, &lower_key)?;
+            let lower_exists = self.array_method_has_property(stack, context, o, &lower_key)?;
             let lower_value = if lower_exists {
-                Some(self.array_method_get_property(context, o, &lower_key)?)
+                Some(self.array_method_get_property(stack, context, o, &lower_key)?)
             } else {
                 None
             };
-            let upper_exists = self.array_method_has_property(context, o, &upper_key)?;
+            let upper_exists = self.array_method_has_property(stack, context, o, &upper_key)?;
             let upper_value = if upper_exists {
-                Some(self.array_method_get_property(context, o, &upper_key)?)
+                Some(self.array_method_get_property(stack, context, o, &upper_key)?)
             } else {
                 None
             };
             match (lower_value, upper_value) {
                 (Some(l), Some(u)) => {
-                    self.array_set_property_throwing(context, o, &lower_key, u)?;
-                    self.array_set_property_throwing(context, o, &upper_key, l)?;
+                    self.array_set_property_throwing(stack, context, o, &lower_key, u)?;
+                    self.array_set_property_throwing(stack, context, o, &upper_key, l)?;
                 }
                 (Some(l), None) => {
-                    self.array_delete_property_throwing(context, o, &lower_key)?;
-                    self.array_set_property_throwing(context, o, &upper_key, l)?;
+                    self.array_delete_property_throwing(stack, context, o, &lower_key)?;
+                    self.array_set_property_throwing(stack, context, o, &upper_key, l)?;
                 }
                 (None, Some(u)) => {
-                    self.array_set_property_throwing(context, o, &lower_key, u)?;
-                    self.array_delete_property_throwing(context, o, &upper_key)?;
+                    self.array_set_property_throwing(stack, context, o, &lower_key, u)?;
+                    self.array_delete_property_throwing(stack, context, o, &upper_key)?;
                 }
                 (None, None) => {}
             }
@@ -1380,6 +1441,7 @@ impl Interpreter {
     /// §23.1.3.7 live `Array.prototype.fill`.
     pub(crate) fn array_fill(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         value: Value,
@@ -1391,9 +1453,9 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
-        let len = length_of_array_like(self, context, &o)?;
-        let start = self.array_relative_index(context, args.get(1), 0.0, len)?;
-        let end = self.array_relative_index(context, args.get(2), len as f64, len)?;
+        let len = length_of_array_like(self, stack, context, &o)?;
+        let start = self.array_relative_index(stack, context, args.get(1), 0.0, len)?;
+        let end = self.array_relative_index(stack, context, args.get(2), len as f64, len)?;
         let bounded_end = end.min(start.saturating_add(MAX_ARRAY_LIKE_PROBE_LEN));
         if let Some(arr) = o.as_array()
             && crate::array::can_fast_fill_dense_range(arr, self.gc_heap(), start, bounded_end)
@@ -1422,7 +1484,13 @@ impl Interpreter {
             return Ok(o);
         }
         for k in start..bounded_end {
-            self.array_set_property_throwing(context, o, &format_index_key(k as f64), value)?;
+            self.array_set_property_throwing(
+                stack,
+                context,
+                o,
+                &format_index_key(k as f64),
+                value,
+            )?;
         }
         Ok(o)
     }
@@ -1470,6 +1538,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-array.prototype.flat>
     pub(crate) fn array_flat(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         depth_arg: Value,
@@ -1480,11 +1549,12 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
-        let source_len = length_of_array_like(self, context, &o)?.min(MAX_ARRAY_LIKE_PROBE_LEN);
+        let source_len =
+            length_of_array_like(self, stack, context, &o)?.min(MAX_ARRAY_LIKE_PROBE_LEN);
         let depth = if depth_arg.is_undefined() {
             1
         } else {
-            let n = self.coerce_to_number(context, &depth_arg)?.as_f64();
+            let n = self.coerce_to_number(stack, context, &depth_arg)?.as_f64();
             if n.is_nan() || n <= 0.0 {
                 0
             } else if n.is_infinite() {
@@ -1493,10 +1563,10 @@ impl Interpreter {
                 n.trunc() as i64
             }
         };
-        let a = self.array_species_create(context, o, 0, roots)?;
+        let a = self.array_species_create(stack, context, o, 0, roots)?;
         let anchor_base = self.push_iteration_anchor(a) - 1;
         self.push_iteration_anchor(o);
-        let result = self.flatten_into_array(context, a, o, source_len, 0, depth, None);
+        let result = self.flatten_into_array(stack, context, a, o, source_len, 0, depth, None);
         self.pop_iteration_anchors_to(anchor_base);
         result?;
         Ok(a)
@@ -1536,6 +1606,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-flattenintoarray>
     pub(crate) fn flatten_into_array(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         target: Value,
         source: Value,
@@ -1550,21 +1621,23 @@ impl Interpreter {
         let mut target_index = start;
         for source_index in 0..source_len {
             let key = format_index_key(source_index as f64);
-            if !self.array_method_has_property(context, source, &key)? {
+            if !self.array_method_has_property(stack, context, source, &key)? {
                 continue;
             }
-            let mut element = self.array_method_get_property(context, source, &key)?;
+            let mut element = self.array_method_get_property(stack, context, source, &key)?;
             let anchor_base = self.push_iteration_anchor(element) - 1;
             if let Some((mapper_fn, map_this)) = mapper {
                 let cb_args: SmallVec<[Value; 8]> =
                     smallvec::smallvec![element, Value::number_f64(source_index as f64), source,];
-                element = self.run_callable_sync(context, &mapper_fn, map_this, cb_args)?;
+                element =
+                    self.run_callable_sync_rooted(stack, context, &mapper_fn, map_this, cb_args)?;
                 self.push_iteration_anchor(element);
             }
             if depth > 0 && self.is_array_spec(&element)? {
-                let element_len =
-                    length_of_array_like(self, context, &element)?.min(MAX_ARRAY_LIKE_PROBE_LEN);
+                let element_len = length_of_array_like(self, stack, context, &element)?
+                    .min(MAX_ARRAY_LIKE_PROBE_LEN);
                 target_index = self.flatten_into_array(
+                    stack,
                     context,
                     target,
                     element,
@@ -1581,6 +1654,7 @@ impl Interpreter {
                     ));
                 }
                 self.create_data_property_or_throw(
+                    stack,
                     context,
                     target,
                     &format_index_key(target_index as f64),
@@ -1672,6 +1746,7 @@ impl Interpreter {
     /// §23.1.3.18 live `Array.prototype.join` over a generic array-like receiver.
     pub(crate) fn array_join(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         separator_arg: Option<Value>,
@@ -1686,13 +1761,13 @@ impl Interpreter {
         // §23.1.3.16 step 2 — len = ? LengthOfArrayLike(O). Reads
         // `O.length` through `[[Get]]`, so a `get length()` accessor
         // fires here exactly once.
-        let len = length_of_array_like(self, context, &o)?;
+        let len = length_of_array_like(self, stack, context, &o)?;
         // §23.1.3.16 step 3 — sep = (separator is undefined) ? ","
         // : ? ToString(separator). Ordered AFTER the length read.
         let separator = match separator_arg {
             None => ",".to_string(),
             Some(v) if v.is_undefined() => ",".to_string(),
-            Some(v) => self.coerce_to_string(context, &v)?,
+            Some(v) => self.coerce_to_string(stack, context, &v)?,
         };
         // Allocation is bounded by `MAX_ARRAY_LIKE_PROBE_LEN`, matching
         // `impl_join`, so a pathological `length` (`2**32`) never sizes a
@@ -1767,7 +1842,7 @@ impl Interpreter {
                 if v.is_hole() || v.is_undefined() || v.is_null() {
                     continue;
                 }
-                parts[k] = self.coerce_to_string(context, &v)?;
+                parts[k] = self.coerce_to_string(stack, context, &v)?;
             }
         } else {
             let o_root = self.json_root_push(o);
@@ -1776,11 +1851,11 @@ impl Interpreter {
                     continue;
                 }
                 let o_cur = self.json_root_get(o_root);
-                let v = self.get_property_value_for_call(context, o_cur, &k.to_string())?;
+                let v = self.get_property_value_for_call(stack, context, o_cur, &k.to_string())?;
                 parts[k] = if v.is_undefined() || v.is_null() {
                     String::new()
                 } else {
-                    self.coerce_to_string(context, &v)?
+                    self.coerce_to_string(stack, context, &v)?
                 };
             }
             self.json_root_pop_to(o_root);
@@ -1799,6 +1874,7 @@ impl Interpreter {
     /// computed directly rather than through a property lookup.
     pub(crate) fn array_to_string(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         roots: &[&[Value]],
@@ -1808,11 +1884,11 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
-        let func = self.get_property_value_for_call(context, o, "join")?;
+        let func = self.get_property_value_for_call(stack, context, o, "join")?;
         if self.is_callable_runtime(&func) {
-            return self.run_callable_sync(context, &func, o, SmallVec::new());
+            return self.run_callable_sync_rooted(stack, context, &func, o, SmallVec::new());
         }
-        self.ordinary_object_to_string(context, o)
+        self.ordinary_object_to_string(stack, context, o)
     }
 
     /// §20.1.3.6 `%Object.prototype.toString%` applied to `o`: a string
@@ -1820,11 +1896,13 @@ impl Interpreter {
     /// `"[object <tag>]"`. Shared fallback for `Array.prototype.toString`.
     fn ordinary_object_to_string(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         o: Value,
     ) -> Result<Value, VmError> {
         let tag_sym = self.well_known_symbols().get(WellKnown::ToStringTag);
         let explicit = match self.ordinary_get_value(
+            stack,
             context,
             o,
             o,
@@ -1833,7 +1911,7 @@ impl Interpreter {
         )? {
             crate::VmGetOutcome::Value(v) => v,
             crate::VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, o, SmallVec::new())?
+                self.run_callable_sync_rooted(stack, context, &getter, o, SmallVec::new())?
             }
         };
         let tag = explicit
@@ -1856,6 +1934,7 @@ impl Interpreter {
     /// separator is still emitted between every position.
     pub(crate) fn array_to_locale_string(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         roots: &[&[Value]],
@@ -1867,7 +1946,7 @@ impl Interpreter {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
         // step 2 — len = ? LengthOfArrayLike(array).
-        let len = length_of_array_like(self, context, &o)?;
+        let len = length_of_array_like(self, stack, context, &o)?;
         // The list separator is implementation-defined; ECMA-402 absent,
         // use "," so `["",""].toLocaleString()` reports it consistently.
         const SEPARATOR: &str = ",";
@@ -1878,7 +1957,7 @@ impl Interpreter {
                 r.push_str(SEPARATOR);
             }
             // step 12.b — element = ? Get(array, ToString(k)).
-            let element = self.get_property_value_for_call(context, o, &k.to_string())?;
+            let element = self.get_property_value_for_call(stack, context, o, &k.to_string())?;
             if element.is_undefined() || element.is_null() {
                 continue;
             }
@@ -1886,6 +1965,7 @@ impl Interpreter {
             // the method (boxing a primitive only for the lookup), then
             // Call passes the original element as `this`.
             let method = match self.ordinary_get_value(
+                stack,
                 context,
                 element,
                 element,
@@ -1893,17 +1973,22 @@ impl Interpreter {
                 0,
             )? {
                 crate::VmGetOutcome::Value(v) => v,
-                crate::VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, element, SmallVec::new())?
-                }
+                crate::VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+                    stack,
+                    context,
+                    &getter,
+                    element,
+                    SmallVec::new(),
+                )?,
             };
             if !crate::abstract_ops::is_callable(&method) {
                 return Err(
                     self.err_type(("element's toLocaleString is not callable".to_string()).into())
                 );
             }
-            let result = self.run_callable_sync(context, &method, element, SmallVec::new())?;
-            let s = self.coerce_to_string(context, &result)?;
+            let result =
+                self.run_callable_sync_rooted(stack, context, &method, element, SmallVec::new())?;
+            let s = self.coerce_to_string(stack, context, &result)?;
             r.push_str(&s);
         }
         Ok(Value::string(JsString::from_str(&r, self.gc_heap_mut())?))
@@ -1914,6 +1999,7 @@ impl Interpreter {
     /// undefined (ToBoolean), else `IsArray(O)`.
     fn is_concat_spreadable(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         e: Value,
     ) -> Result<bool, VmError> {
@@ -1921,13 +2007,23 @@ impl Interpreter {
             return Ok(false);
         }
         let sym = self.well_known_symbols.get(WellKnown::IsConcatSpreadable);
-        let spread =
-            match self.ordinary_get_value(context, e, e, &crate::VmPropertyKey::Symbol(sym), 0)? {
-                crate::VmGetOutcome::Value(v) => v,
-                crate::VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, e, smallvec::SmallVec::new())?
-                }
-            };
+        let spread = match self.ordinary_get_value(
+            stack,
+            context,
+            e,
+            e,
+            &crate::VmPropertyKey::Symbol(sym),
+            0,
+        )? {
+            crate::VmGetOutcome::Value(v) => v,
+            crate::VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+                stack,
+                context,
+                &getter,
+                e,
+                smallvec::SmallVec::new(),
+            )?,
+        };
         if spread.is_undefined() {
             // §22.1.3.1.1 step 3 — fall back to IsArray(O), which per
             // §7.2.2 unwraps a Proxy to its target (throwing for a
@@ -1952,6 +2048,7 @@ impl Interpreter {
     /// collector-rewritten anchor slots after each one.
     fn concat_append_to(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         e_anchor: usize,
         a_anchor: usize,
@@ -1960,9 +2057,9 @@ impl Interpreter {
         const MAX_SAFE: f64 = 9_007_199_254_740_991.0;
         const TOO_LONG: &str = "concatenated array length exceeds the maximum safe integer";
         let e = self.iteration_anchor(e_anchor);
-        if self.is_concat_spreadable(context, e)? {
+        if self.is_concat_spreadable(stack, context, e)? {
             let e = self.iteration_anchor(e_anchor);
-            let len = length_of_array_like(self, context, &e)? as u64;
+            let len = length_of_array_like(self, stack, context, &e)? as u64;
             if (n as f64) + (len as f64) > MAX_SAFE {
                 return Err(self.err_type(TOO_LONG.to_string().into()));
             }
@@ -1970,15 +2067,16 @@ impl Interpreter {
                 let key = k.to_string();
                 let e = self.iteration_anchor(e_anchor);
                 if self.ordinary_has_property_value(
+                    stack,
                     context,
                     e,
                     &crate::VmPropertyKey::String(&key),
                     0,
                 )? {
                     let e = self.iteration_anchor(e_anchor);
-                    let v = self.get_property_value_for_call(context, e, &key)?;
+                    let v = self.get_property_value_for_call(stack, context, e, &key)?;
                     let a = self.iteration_anchor(a_anchor);
-                    self.create_data_property_or_throw(context, a, &n.to_string(), v)?;
+                    self.create_data_property_or_throw(stack, context, a, &n.to_string(), v)?;
                 }
                 n += 1;
             }
@@ -1988,7 +2086,7 @@ impl Interpreter {
             }
             let e = self.iteration_anchor(e_anchor);
             let a = self.iteration_anchor(a_anchor);
-            self.create_data_property_or_throw(context, a, &n.to_string(), e)?;
+            self.create_data_property_or_throw(stack, context, a, &n.to_string(), e)?;
             n += 1;
         }
         Ok(n)
@@ -1997,6 +2095,7 @@ impl Interpreter {
     /// §23.1.3.2 live `Array.prototype.concat` over a generic receiver.
     pub(crate) fn array_concat(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         args: &[Value],
@@ -2020,16 +2119,17 @@ impl Interpreter {
         for &item in args {
             self.push_iteration_anchor(item);
         }
-        let a = self.array_species_create(context, o, 0, roots)?;
+        let a = self.array_species_create(stack, context, o, 0, roots)?;
         let a_anchor = self.push_iteration_anchor(a) - 1;
         let result = (|| {
-            let mut n: u64 = self.concat_append_to(context, o_anchor, a_anchor, 0)?;
+            let mut n: u64 = self.concat_append_to(stack, context, o_anchor, a_anchor, 0)?;
             for index in 0..args.len() {
-                n = self.concat_append_to(context, o_anchor + 1 + index, a_anchor, n)?;
+                n = self.concat_append_to(stack, context, o_anchor + 1 + index, a_anchor, n)?;
             }
             // §23.1.3.1 step 4 — Set(A, "length", n).
             let a = self.iteration_anchor(a_anchor);
             self.array_set_property_throwing(
+                stack,
                 context,
                 a,
                 "length",
@@ -2046,14 +2146,17 @@ impl Interpreter {
     /// (NaN → equal); otherwise the ToString lexicographic order.
     fn sort_compare(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
-        x: Value,
-        y: Value,
-        comparefn: Value,
+        x_anchor: usize,
+        y_anchor: usize,
+        comparefn_anchor: usize,
         fast_path: Option<SortComparatorFastPath>,
         lean_inner: Option<&mut crate::call_ops::LeanCallbackState>,
     ) -> Result<std::cmp::Ordering, VmError> {
         use std::cmp::Ordering;
+        let x = self.iteration_anchor(x_anchor);
+        let y = self.iteration_anchor(y_anchor);
         let x_undef = x.is_undefined();
         let y_undef = y.is_undefined();
         if x_undef && y_undef {
@@ -2065,6 +2168,7 @@ impl Interpreter {
         if y_undef {
             return Ok(Ordering::Less);
         }
+        let comparefn = self.iteration_anchor(comparefn_anchor);
         if !comparefn.is_undefined() {
             if fast_path == Some(SortComparatorFastPath::NumericSub)
                 && let Some(order) = numeric_sub_sort_order(x, y)
@@ -2073,6 +2177,7 @@ impl Interpreter {
             }
             let r = match lean_inner {
                 Some(state) => self.run_bytecode_callable_committed_lean_args(
+                    stack,
                     state,
                     context,
                     Value::undefined(),
@@ -2080,13 +2185,29 @@ impl Interpreter {
                 ),
                 None => {
                     let args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![x, y];
-                    self.run_callable_sync(context, &comparefn, Value::undefined(), args)
+                    self.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &comparefn,
+                        Value::undefined(),
+                        args,
+                    )
                 }
             }?;
             let f = if let Some(f) = r.as_f64() {
                 f
             } else {
-                self.coerce_to_number(context, &r)?.as_f64()
+                // A comparator result can be a young object whose ToNumber
+                // invokes user code. Keep it in the directly traced anchor
+                // arena while coercion allocates/re-enters, then release the
+                // temporary slot on both normal and abrupt completion.
+                let result_anchor = self.push_iteration_anchor(r) - 1;
+                let result = self.iteration_anchor(result_anchor);
+                let coerced = self
+                    .coerce_to_number(stack, context, &result)
+                    .map(|number| number.as_f64());
+                self.pop_iteration_anchors_to(result_anchor);
+                coerced?
             };
             return Ok(if f.is_nan() {
                 Ordering::Equal
@@ -2098,28 +2219,34 @@ impl Interpreter {
                 Ordering::Equal
             });
         }
-        let xs = self.coerce_to_string(context, &x)?;
-        let ys = self.coerce_to_string(context, &y)?;
+        // ToString(x) may scavenge before ToString(y). Re-read each value
+        // from its collector-rewritten anchor immediately before coercion.
+        let x = self.iteration_anchor(x_anchor);
+        let xs = self.coerce_to_string(stack, context, &x)?;
+        let y = self.iteration_anchor(y_anchor);
+        let ys = self.coerce_to_string(stack, context, &y)?;
         Ok(xs.cmp(&ys))
     }
 
-    /// Stable merge sort over `items`, propagating an abrupt completion
-    /// from the comparator (Rust's `sort_by` cannot carry a `Result`).
+    /// Stable merge sort over directly traced item-anchor indices,
+    /// propagating an abrupt completion from the comparator (Rust's
+    /// `sort_by` cannot carry a `Result`).
     fn sort_merge(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
-        items: Vec<Value>,
-        comparefn: Value,
+        items: Vec<usize>,
+        comparefn_anchor: usize,
         fast_path: Option<SortComparatorFastPath>,
         lean_inner: Option<&mut crate::call_ops::LeanCallbackState>,
-    ) -> Result<Vec<Value>, VmError> {
+    ) -> Result<Vec<usize>, VmError> {
         use std::cmp::Ordering;
         let n = items.len();
         if n <= 1 {
             return Ok(items);
         }
         let mut src = items;
-        let mut dst = vec![Value::undefined(); n];
+        let mut dst = vec![0; n];
         let mut width = 1usize;
         let mut lean_inner = lean_inner;
         while width < n {
@@ -2130,18 +2257,20 @@ impl Interpreter {
                 let (mut left, mut right, mut out) = (start, mid, start);
                 while left < mid && right < end {
                     let order = match fast_path {
-                        Some(SortComparatorFastPath::NumericSub) => {
-                            numeric_sub_sort_order(src[left], src[right])
-                        }
+                        Some(SortComparatorFastPath::NumericSub) => numeric_sub_sort_order(
+                            self.iteration_anchor(src[left]),
+                            self.iteration_anchor(src[right]),
+                        ),
                         None => None,
                     };
                     let order = match order {
                         Some(order) => order,
                         None => self.sort_compare(
+                            stack,
                             context,
                             src[left],
                             src[right],
-                            comparefn,
+                            comparefn_anchor,
                             fast_path,
                             lean_inner.as_deref_mut(),
                         )?,
@@ -2195,6 +2324,7 @@ impl Interpreter {
     /// §23.1.3.30 live `Array.prototype.sort` over a generic receiver.
     pub(crate) fn array_sort(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         comparefn: Value,
@@ -2206,72 +2336,115 @@ impl Interpreter {
                 ("Array.prototype.sort comparator is not a function".to_string()).into(),
             ));
         }
+        // Root the comparator before boxing a primitive receiver: wrapper
+        // allocation can scavenge a young closure before `O` exists.
+        let anchor_base = self.push_iteration_anchor(comparefn) - 1;
+        let comparefn_anchor = anchor_base;
         let o = if receiver.is_object_type() {
-            receiver
+            Ok(receiver)
         } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
         };
-        let len = length_of_array_like(self, context, &o)?;
-        let cap = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
-        // SortIndexedProperties: collect the present indexed values.
-        let mut items: Vec<Value> = Vec::new();
-        for k in 0..cap {
-            let key = k.to_string();
-            if self.ordinary_has_property_value(
+        let o = match o {
+            Ok(o) => o,
+            Err(err) => {
+                self.pop_iteration_anchors_to(anchor_base);
+                return Err(err);
+            }
+        };
+        // The receiver, comparator, and every collected item live in the
+        // interpreter's directly traced anchor arena. The sort buffers carry
+        // only stable indices into that arena, so a comparator/getter/setter
+        // scavenge rewrites the values in place without materialising a roots
+        // snapshot at each allocation boundary.
+        let o_anchor = self.push_iteration_anchor(o) - 1;
+        let result = (|| {
+            let o = self.iteration_anchor(o_anchor);
+            let len = length_of_array_like(self, stack, context, &o)?;
+            let cap = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
+            // SortIndexedProperties: collect the present indexed values in
+            // observable index order, re-reading O after every fallible step.
+            let mut items: Vec<usize> = Vec::new();
+            for k in 0..cap {
+                let key = k.to_string();
+                let o = self.iteration_anchor(o_anchor);
+                if self.ordinary_has_property_value(
+                    stack,
+                    context,
+                    o,
+                    &crate::VmPropertyKey::String(&key),
+                    0,
+                )? {
+                    let o = self.iteration_anchor(o_anchor);
+                    let item = self.get_property_value_for_call(stack, context, o, &key)?;
+                    items.push(self.push_iteration_anchor(item) - 1);
+                }
+            }
+            let item_count = items.len();
+            // Lean comparator invocation: when the comparator is a plain
+            // bytecode closure, drive every SortCompare call through the
+            // committed bytecode tail on this same ActivationStack. Always
+            // release the guard/state before propagating an abrupt result.
+            let comparefn = self.iteration_anchor(comparefn_anchor);
+            let fast_path = self.sort_comparator_fast_path(context, comparefn);
+            let mut lean = self.acquire_lean_callback_stack(context, comparefn);
+            let sorted = self.sort_merge(
+                stack,
                 context,
-                o,
-                &crate::VmPropertyKey::String(&key),
-                0,
-            )? {
-                items.push(self.get_property_value_for_call(context, o, &key)?);
+                items,
+                comparefn_anchor,
+                fast_path,
+                lean.as_mut(),
+            );
+            self.release_lean_callback_stack(lean);
+            let sorted = sorted?;
+            // §23.1.3.30 steps 8-9 — write the sorted prefix back with
+            // `Set(O, j, v, true)` (so an own / inherited accessor setter
+            // fires and a failed write throws), then `DeletePropertyOrThrow`
+            // the trailing holes. Re-read both operands from their anchors
+            // before each reentrant property operation.
+            for (j, item_anchor) in sorted.into_iter().enumerate() {
+                let key = j.to_string();
+                let o = self.iteration_anchor(o_anchor);
+                let item = self.iteration_anchor(item_anchor);
+                let ok = if let Some(arr) = o.as_array() {
+                    self.array_ordinary_set_own(stack, context, arr, &key, item)?
+                } else {
+                    self.array_set_property_throwing(stack, context, o, &key, item)?;
+                    true
+                };
+                if !ok {
+                    return Err(self.err_type(
+                        (format!("Cannot assign to read only property '{key}' during sort")).into(),
+                    ));
+                }
             }
-        }
-        let item_count = items.len();
-        // Lean comparator invocation: when the comparator is a plain bytecode
-        // closure, drive every `sort_compare` call through the committed
-        // bytecode tail on ONE reservation-stable stack (see
-        // `acquire_lean_callback_stack`). The `?` below cannot early-return
-        // before release: capture the result and release on both paths.
-        let fast_path = self.sort_comparator_fast_path(context, comparefn);
-        let mut lean = self.acquire_lean_callback_stack(context, comparefn);
-        let sorted = self.sort_merge(context, items, comparefn, fast_path, lean.as_mut());
-        self.release_lean_callback_stack(lean);
-        let sorted = sorted?;
-        // §23.1.3.30 steps 8-9 — write the sorted prefix back with
-        // `Set(O, j, v, true)` (so an own / inherited accessor setter
-        // fires and a failed write throws), then `DeletePropertyOrThrow`
-        // the trailing holes.
-        for (j, item) in sorted.into_iter().enumerate() {
-            let key = j.to_string();
-            let ok = if let Some(arr) = o.as_array() {
-                self.array_ordinary_set_own(context, arr, &key, item)?
-            } else {
-                self.array_set_property_throwing(context, o, &key, item)?;
-                true
-            };
-            if !ok {
-                return Err(self.err_type(
-                    (format!("Cannot assign to read only property '{key}' during sort")).into(),
-                ));
+            for k in item_count..cap {
+                let key = k.to_string();
+                let o = self.iteration_anchor(o_anchor);
+                let deleted = self.ordinary_delete_value(
+                    stack,
+                    context,
+                    o,
+                    &crate::VmPropertyKey::String(&key),
+                    0,
+                )?;
+                if !deleted {
+                    return Err(self
+                        .err_type((format!("Cannot delete property '{key}' during sort")).into()));
+                }
             }
-        }
-        for k in item_count..cap {
-            let key = k.to_string();
-            let deleted =
-                self.ordinary_delete_value(context, o, &crate::VmPropertyKey::String(&key), 0)?;
-            if !deleted {
-                return Err(
-                    self.err_type((format!("Cannot delete property '{key}' during sort")).into())
-                );
-            }
-        }
-        Ok(o)
+            Ok(self.iteration_anchor(o_anchor))
+        })();
+        self.pop_iteration_anchors_to(anchor_base);
+        result
     }
 
     /// `Set(O, "length", v, true)` — a `false` result (non-writable /
     /// frozen length) raises the spec TypeError.
     fn array_set_length_throwing(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         o: Value,
         len: f64,
@@ -2284,6 +2457,7 @@ impl Interpreter {
             }
         } else {
             return self.array_set_property_throwing(
+                stack,
                 context,
                 o,
                 "length",
@@ -2291,6 +2465,7 @@ impl Interpreter {
             );
         }
         let ok = self.ordinary_set_data_value(
+            stack,
             context,
             o,
             &crate::VmPropertyKey::String("length"),
@@ -2309,6 +2484,7 @@ impl Interpreter {
 
     pub(crate) fn array_set_property_throwing(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         o: Value,
         key: &str,
@@ -2323,7 +2499,7 @@ impl Interpreter {
                 match crate::object::resolve_set(proto, self.gc_heap(), key) {
                     crate::object::SetOutcome::InvokeSetter { setter } => {
                         let args: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                        self.run_callable_sync(context, &setter, o, args)?;
+                        self.run_callable_sync_rooted(stack, context, &setter, o, args)?;
                         return Ok(());
                     }
                     crate::object::SetOutcome::Reject { .. } => {
@@ -2342,7 +2518,7 @@ impl Interpreter {
             match crate::object::resolve_set(obj, self.gc_heap(), key) {
                 crate::object::SetOutcome::InvokeSetter { setter } => {
                     let args: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                    self.run_callable_sync(context, &setter, o, args)?;
+                    self.run_callable_sync_rooted(stack, context, &setter, o, args)?;
                     return Ok(());
                 }
                 crate::object::SetOutcome::Reject { .. } => {
@@ -2355,6 +2531,7 @@ impl Interpreter {
             }
         }
         let ok = self.ordinary_set_data_value(
+            stack,
             context,
             o,
             &crate::VmPropertyKey::String(key),
@@ -2373,12 +2550,13 @@ impl Interpreter {
 
     fn array_delete_property_throwing(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         o: Value,
         key: &str,
     ) -> Result<(), VmError> {
         let deleted =
-            self.ordinary_delete_value(context, o, &crate::VmPropertyKey::String(key), 0)?;
+            self.ordinary_delete_value(stack, context, o, &crate::VmPropertyKey::String(key), 0)?;
         if deleted {
             Ok(())
         } else {
@@ -2388,6 +2566,7 @@ impl Interpreter {
 
     fn array_relative_index(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         arg: Option<&Value>,
         default: f64,
@@ -2397,7 +2576,7 @@ impl Interpreter {
             None => default,
             Some(v) if v.is_undefined() => default,
             Some(v) => {
-                let n = self.coerce_to_number(context, v)?.as_f64();
+                let n = self.coerce_to_number(stack, context, v)?.as_f64();
                 if n.is_nan() {
                     0.0
                 } else if n.is_infinite() {
@@ -2419,11 +2598,12 @@ impl Interpreter {
 
     fn array_clamped_count(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         arg: &Value,
         max: usize,
     ) -> Result<usize, VmError> {
-        let n = self.coerce_to_number(context, arg)?.as_f64();
+        let n = self.coerce_to_number(stack, context, arg)?.as_f64();
         if n.is_nan() || n <= 0.0 {
             return Ok(0);
         }
@@ -2442,6 +2622,7 @@ impl Interpreter {
     /// the spec `TypeError`.
     fn array_ordinary_set_own(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         arr: crate::array::JsArray,
         key: &str,
@@ -2452,7 +2633,7 @@ impl Interpreter {
                 Some(s) if crate::abstract_ops::is_callable(&s) => {
                     let mut a: SmallVec<[Value; 8]> = SmallVec::new();
                     a.push(value);
-                    self.run_callable_sync(context, &s, Value::array(arr), a)?;
+                    self.run_callable_sync_rooted(stack, context, &s, Value::array(arr), a)?;
                     Ok(true)
                 }
                 _ => Ok(false),
@@ -2478,7 +2659,13 @@ impl Interpreter {
                     crate::object::SetOutcome::InvokeSetter { setter } => {
                         let mut a: SmallVec<[Value; 8]> = SmallVec::new();
                         a.push(value);
-                        self.run_callable_sync(context, &setter, Value::array(arr), a)?;
+                        self.run_callable_sync_rooted(
+                            stack,
+                            context,
+                            &setter,
+                            Value::array(arr),
+                            a,
+                        )?;
                         return Ok(true);
                     }
                     crate::object::SetOutcome::Reject { .. } => return Ok(false),
@@ -2504,6 +2691,7 @@ impl Interpreter {
 
     pub(crate) fn array_push(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         args: &[Value],
@@ -2553,7 +2741,7 @@ impl Interpreter {
                 return Ok(Value::number(NumberValue::from_f64(end as f64)));
             }
         }
-        let len = length_of_array_like(self, context, &o)? as f64;
+        let len = length_of_array_like(self, stack, context, &o)? as f64;
         let arg_count = args.len() as f64;
         // §23.1.3.23 step 4 — len + argCount must stay a safe integer.
         if len + arg_count > 9_007_199_254_740_991.0 {
@@ -2569,7 +2757,7 @@ impl Interpreter {
             // failure; a generic array-like routes through the throwing
             // property setter.
             if let Some(arr) = o.as_array() {
-                if !self.array_ordinary_set_own(context, arr, &key, arg)? {
+                if !self.array_ordinary_set_own(stack, context, arr, &key, arg)? {
                     // A non-extensible (sealed / frozen) array fails to
                     // create the fresh index — V8 reports this as an
                     // "add property" failure, distinct from assigning a
@@ -2582,17 +2770,18 @@ impl Interpreter {
                     return Err(self.err_type(message.into()));
                 }
             } else {
-                self.array_set_property_throwing(context, o, &key, arg)?;
+                self.array_set_property_throwing(stack, context, o, &key, arg)?;
             }
             n += 1.0;
         }
-        self.array_set_length_throwing(context, o, n)?;
+        self.array_set_length_throwing(stack, context, o, n)?;
         Ok(Value::number(NumberValue::from_f64(n)))
     }
 
     /// §23.1.3.21 live `Array.prototype.pop` over a generic array-like receiver.
     pub(crate) fn array_pop(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         roots: &[&[Value]],
@@ -2623,26 +2812,27 @@ impl Interpreter {
                 return Ok(crate::array::pop(arr, self.gc_heap_mut()));
             }
         }
-        let len = length_of_array_like(self, context, &o)? as f64;
+        let len = length_of_array_like(self, stack, context, &o)? as f64;
         if len == 0.0 {
-            self.array_set_length_throwing(context, o, 0.0)?;
+            self.array_set_length_throwing(stack, context, o, 0.0)?;
             return Ok(Value::undefined());
         }
         let new_len = len - 1.0;
         let key = format_index_key(new_len);
-        let element = self.get_property_value_for_call(context, o, &key)?;
+        let element = self.get_property_value_for_call(stack, context, o, &key)?;
         let deleted =
-            self.ordinary_delete_value(context, o, &crate::VmPropertyKey::String(&key), 0)?;
+            self.ordinary_delete_value(stack, context, o, &crate::VmPropertyKey::String(&key), 0)?;
         if !deleted {
             return Err(self.err_type((format!("Cannot delete property '{key}'")).into()));
         }
-        self.array_set_length_throwing(context, o, new_len)?;
+        self.array_set_length_throwing(stack, context, o, new_len)?;
         Ok(element)
     }
 
     /// §23.1.3.26 live `Array.prototype.shift`.
     pub(crate) fn array_shift(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         roots: &[&[Value]],
@@ -2652,38 +2842,40 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
-        let len = length_of_array_like(self, context, &o)?;
+        let len = length_of_array_like(self, stack, context, &o)?;
         if len == 0 {
-            self.array_set_length_throwing(context, o, 0.0)?;
+            self.array_set_length_throwing(stack, context, o, 0.0)?;
             return Ok(Value::undefined());
         }
-        let first = self.get_property_value_for_call(context, o, "0")?;
+        let first = self.get_property_value_for_call(stack, context, o, "0")?;
         let scan_len = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
         for k in 1..scan_len {
             let from = k.to_string();
             let to = (k - 1).to_string();
             let has = self.ordinary_has_property_value(
+                stack,
                 context,
                 o,
                 &crate::VmPropertyKey::String(&from),
                 0,
             )?;
             if has {
-                let value = self.get_property_value_for_call(context, o, &from)?;
-                self.array_set_property_throwing(context, o, &to, value)?;
+                let value = self.get_property_value_for_call(stack, context, o, &from)?;
+                self.array_set_property_throwing(stack, context, o, &to, value)?;
             } else {
-                self.array_delete_property_throwing(context, o, &to)?;
+                self.array_delete_property_throwing(stack, context, o, &to)?;
             }
         }
         let tail = format_index_key((len - 1) as f64);
-        self.array_delete_property_throwing(context, o, &tail)?;
-        self.array_set_length_throwing(context, o, (len - 1) as f64)?;
+        self.array_delete_property_throwing(stack, context, o, &tail)?;
+        self.array_set_length_throwing(stack, context, o, (len - 1) as f64)?;
         Ok(first)
     }
 
     /// §23.1.3.34 live `Array.prototype.unshift`.
     pub(crate) fn array_unshift(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         args: &[Value],
@@ -2694,10 +2886,10 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
-        let len = length_of_array_like(self, context, &o)?;
+        let len = length_of_array_like(self, stack, context, &o)?;
         let arg_count = args.len();
         if arg_count == 0 {
-            self.array_set_length_throwing(context, o, len as f64)?;
+            self.array_set_length_throwing(stack, context, o, len as f64)?;
             return Ok(Value::number(NumberValue::from_f64(len as f64)));
         }
         let new_len = len as f64 + arg_count as f64;
@@ -2708,24 +2900,25 @@ impl Interpreter {
 
         if len <= MAX_ARRAY_LIKE_PROBE_LEN {
             for k in (0..len).rev() {
-                self.unshift_move_index(context, o, k, arg_count)?;
+                self.unshift_move_index(stack, context, o, k, arg_count)?;
             }
         } else {
             let mut candidates = self.unshift_sparse_candidates(o, len, arg_count)?;
             while let Some(k) = candidates.pop_last() {
-                self.unshift_move_index(context, o, k, arg_count)?;
+                self.unshift_move_index(stack, context, o, k, arg_count)?;
             }
         }
 
         for (j, value) in args.iter().enumerate() {
-            self.array_set_property_throwing(context, o, &j.to_string(), *value)?;
+            self.array_set_property_throwing(stack, context, o, &j.to_string(), *value)?;
         }
-        self.array_set_length_throwing(context, o, new_len)?;
+        self.array_set_length_throwing(stack, context, o, new_len)?;
         Ok(Value::number(NumberValue::from_f64(new_len)))
     }
 
     fn unshift_move_index(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         o: Value,
         from_index: usize,
@@ -2733,13 +2926,18 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let from = format_index_key(from_index as f64);
         let to = format_index_key((from_index + arg_count) as f64);
-        let has =
-            self.ordinary_has_property_value(context, o, &crate::VmPropertyKey::String(&from), 0)?;
+        let has = self.ordinary_has_property_value(
+            stack,
+            context,
+            o,
+            &crate::VmPropertyKey::String(&from),
+            0,
+        )?;
         if has {
-            let value = self.get_property_value_for_call(context, o, &from)?;
-            self.array_set_property_throwing(context, o, &to, value)
+            let value = self.get_property_value_for_call(stack, context, o, &from)?;
+            self.array_set_property_throwing(stack, context, o, &to, value)
         } else {
-            self.array_delete_property_throwing(context, o, &to)
+            self.array_delete_property_throwing(stack, context, o, &to)
         }
     }
 
@@ -2782,6 +2980,7 @@ impl Interpreter {
     /// §23.1.3.4 live `Array.prototype.copyWithin`.
     pub(crate) fn array_copy_within(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         args: &[Value],
@@ -2792,10 +2991,11 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
-        let len = length_of_array_like(self, context, &o)?;
-        let to = self.array_relative_index(context, args.first(), 0.0, len)?;
-        let from = self.array_relative_index(context, args.get(1), 0.0, len)?;
-        let final_index = self.array_relative_index(context, args.get(2), len as f64, len)?;
+        let len = length_of_array_like(self, stack, context, &o)?;
+        let to = self.array_relative_index(stack, context, args.first(), 0.0, len)?;
+        let from = self.array_relative_index(stack, context, args.get(1), 0.0, len)?;
+        let final_index =
+            self.array_relative_index(stack, context, args.get(2), len as f64, len)?;
         let count = final_index.saturating_sub(from).min(len.saturating_sub(to));
         if count == 0 {
             return Ok(o);
@@ -2805,22 +3005,22 @@ impl Interpreter {
         if count <= MAX_ARRAY_LIKE_PROBE_LEN {
             if backwards {
                 for offset in (0..count).rev() {
-                    self.copy_within_move_index(context, o, from + offset, to + offset)?;
+                    self.copy_within_move_index(stack, context, o, from + offset, to + offset)?;
                 }
             } else {
                 for offset in 0..count {
-                    self.copy_within_move_index(context, o, from + offset, to + offset)?;
+                    self.copy_within_move_index(stack, context, o, from + offset, to + offset)?;
                 }
             }
         } else {
             let mut offsets = self.copy_within_sparse_offsets(o, len, from, to, count)?;
             if backwards {
                 while let Some(offset) = offsets.pop_last() {
-                    self.copy_within_move_index(context, o, from + offset, to + offset)?;
+                    self.copy_within_move_index(stack, context, o, from + offset, to + offset)?;
                 }
             } else {
                 for offset in offsets {
-                    self.copy_within_move_index(context, o, from + offset, to + offset)?;
+                    self.copy_within_move_index(stack, context, o, from + offset, to + offset)?;
                 }
             }
         }
@@ -2829,6 +3029,7 @@ impl Interpreter {
 
     fn copy_within_move_index(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         o: Value,
         from_index: usize,
@@ -2836,29 +3037,30 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let from = format_index_key(from_index as f64);
         let to = format_index_key(to_index as f64);
-        let has = self.array_method_has_property(context, o, &from)?;
+        let has = self.array_method_has_property(stack, context, o, &from)?;
         if has {
-            let value = self.array_method_get_property(context, o, &from)?;
-            self.array_set_property_throwing(context, o, &to, value)
+            let value = self.array_method_get_property(stack, context, o, &from)?;
+            self.array_set_property_throwing(stack, context, o, &to, value)
         } else {
-            self.array_delete_property_throwing(context, o, &to)
+            self.array_delete_property_throwing(stack, context, o, &to)
         }
     }
 
     fn array_method_has_property(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         o: Value,
         key: &str,
     ) -> Result<bool, VmError> {
         let property_key = crate::VmPropertyKey::String(key);
-        if self.ordinary_has_property_value(context, o, &property_key, 0)? {
+        if self.ordinary_has_property_value(stack, context, o, &property_key, 0)? {
             return Ok(true);
         }
         if o.is_array() {
             let proto = self.get_prototype_for_op(&o)?;
             if !proto.is_nullish() {
-                return self.ordinary_has_property_value(context, proto, &property_key, 0);
+                return self.ordinary_has_property_value(stack, context, proto, &property_key, 0);
             }
         }
         Ok(false)
@@ -2866,6 +3068,7 @@ impl Interpreter {
 
     fn array_method_get_property(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         o: Value,
         key: &str,
@@ -2875,7 +3078,7 @@ impl Interpreter {
                 return match getter {
                     Some(getter) if crate::abstract_ops::is_callable(&getter) => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync(context, &getter, o, args)
+                        self.run_callable_sync_rooted(stack, context, &getter, o, args)
                     }
                     _ => Ok(Value::undefined()),
                 };
@@ -2891,16 +3094,17 @@ impl Interpreter {
             let proto = self.get_prototype_for_op(&o)?;
             if !proto.is_nullish()
                 && self.ordinary_has_property_value(
+                    stack,
                     context,
                     proto,
                     &crate::VmPropertyKey::String(key),
                     0,
                 )?
             {
-                return self.get_property_value_for_call(context, proto, key);
+                return self.get_property_value_for_call(stack, context, proto, key);
             }
         }
-        self.get_property_value_for_call(context, o, key)
+        self.get_property_value_for_call(stack, context, o, key)
     }
 
     fn copy_within_sparse_offsets(
@@ -2942,6 +3146,7 @@ impl Interpreter {
     /// §23.1.3.28 live `Array.prototype.slice`.
     pub(crate) fn array_slice(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         args: &[Value],
@@ -2952,21 +3157,23 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
-        let len = length_of_array_like(self, context, &o)?;
-        let start = self.array_relative_index(context, args.first(), 0.0, len)?;
-        let final_index = self.array_relative_index(context, args.get(1), len as f64, len)?;
+        let len = length_of_array_like(self, stack, context, &o)?;
+        let start = self.array_relative_index(stack, context, args.first(), 0.0, len)?;
+        let final_index =
+            self.array_relative_index(stack, context, args.get(1), len as f64, len)?;
         let count = final_index.saturating_sub(start);
-        let a = self.array_species_create(context, o, count, roots)?;
+        let a = self.array_species_create(stack, context, o, count, roots)?;
         if count <= MAX_ARRAY_LIKE_PROBE_LEN {
             for n in 0..count {
-                self.slice_copy_index(context, o, a, start + n, n)?;
+                self.slice_copy_index(stack, context, o, a, start + n, n)?;
             }
         } else {
             for n in self.slice_sparse_offsets(o, len, start, count)? {
-                self.slice_copy_index(context, o, a, start + n, n)?;
+                self.slice_copy_index(stack, context, o, a, start + n, n)?;
             }
         }
         self.array_set_property_throwing(
+            stack,
             context,
             a,
             "length",
@@ -2977,6 +3184,7 @@ impl Interpreter {
 
     fn slice_copy_index(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         from_object: Value,
         to_object: Value,
@@ -2984,16 +3192,17 @@ impl Interpreter {
         to_index: usize,
     ) -> Result<(), VmError> {
         let from = format_index_key(from_index as f64);
-        if !self.array_method_has_property(context, from_object, &from)? {
+        if !self.array_method_has_property(stack, context, from_object, &from)? {
             return Ok(());
         }
-        let value = self.array_method_get_property(context, from_object, &from)?;
+        let value = self.array_method_get_property(stack, context, from_object, &from)?;
         let to = format_index_key(to_index as f64);
-        self.create_data_property_or_throw(context, to_object, &to, value)
+        self.create_data_property_or_throw(stack, context, to_object, &to, value)
     }
 
     fn array_species_create(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         original: Value,
         length: usize,
@@ -3004,13 +3213,14 @@ impl Interpreter {
         }
         let default_ctor = crate::object::get(self.global_this, &self.gc_heap, "Array")
             .ok_or_else(|| self.err_type(("%Array% intrinsic is missing".to_string()).into()))?;
-        let constructor = self.species_constructor_value(context, &original, &default_ctor)?;
+        let constructor =
+            self.species_constructor_value(stack, context, &original, &default_ctor)?;
         if crate::abstract_ops::same_value(&constructor, &default_ctor, &self.gc_heap) {
             return self.array_create_with_length(original, length, roots);
         }
         let argv: SmallVec<[Value; 8]> =
             smallvec::smallvec![Value::number(NumberValue::from_f64(length as f64))];
-        self.run_construct_sync(context, &constructor, constructor, argv)
+        self.run_construct_sync_rooted(stack, context, &constructor, constructor, argv)
     }
 
     fn array_create_with_length(
@@ -3076,6 +3286,7 @@ impl Interpreter {
     /// accessor-bearing array) falls back to the spec `[[DefineOwnProperty]]`.
     pub(crate) fn create_data_property_array_index(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         target: Value,
         idx: usize,
@@ -3096,11 +3307,12 @@ impl Interpreter {
             return Ok(());
         }
         let key = format_index_key(idx as f64);
-        self.create_data_property_or_throw(context, target, &key, value)
+        self.create_data_property_or_throw(stack, context, target, &key, value)
     }
 
     pub(crate) fn create_data_property_or_throw(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         target: Value,
         key: &str,
@@ -3114,6 +3326,7 @@ impl Interpreter {
             ..Default::default()
         };
         let ok = self.define_own_property_value(
+            stack,
             context,
             &target,
             &crate::VmPropertyKey::String(key),
@@ -3161,6 +3374,7 @@ impl Interpreter {
     /// §23.1.3.31 live `Array.prototype.splice`.
     pub(crate) fn array_splice(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         args: &[Value],
@@ -3171,17 +3385,22 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
-        let len = length_of_array_like(self, context, &o)?;
+        let len = length_of_array_like(self, stack, context, &o)?;
         let actual_start = if args.is_empty() {
             0
         } else {
-            self.array_relative_index(context, args.first(), 0.0, len)?
+            self.array_relative_index(stack, context, args.first(), 0.0, len)?
         };
         let insert_count = args.len().saturating_sub(2);
         let actual_delete_count = match args.len() {
             0 => 0,
             1 => len.saturating_sub(actual_start),
-            _ => self.array_clamped_count(context, &args[1], len.saturating_sub(actual_start))?,
+            _ => self.array_clamped_count(
+                stack,
+                context,
+                &args[1],
+                len.saturating_sub(actual_start),
+            )?,
         };
         let new_len = len
             .checked_sub(actual_delete_count)
@@ -3198,6 +3417,7 @@ impl Interpreter {
             let receiver = interp.scoped_value(scope, o);
             let current_receiver = interp.escape_scoped(receiver);
             let removed = interp.array_species_create(
+                stack,
                 context,
                 current_receiver,
                 actual_delete_count,
@@ -3212,6 +3432,7 @@ impl Interpreter {
                     let current_receiver = interp.escape_scoped(receiver);
                     let current_removed = interp.escape_scoped(removed);
                     interp.splice_copy_deleted_index(
+                        stack,
                         context,
                         current_receiver,
                         current_removed,
@@ -3231,6 +3452,7 @@ impl Interpreter {
                     let current_receiver = interp.escape_scoped(receiver);
                     let current_removed = interp.escape_scoped(removed);
                     interp.splice_copy_deleted_index(
+                        stack,
                         context,
                         current_receiver,
                         current_removed,
@@ -3241,6 +3463,7 @@ impl Interpreter {
             }
             let current_removed = interp.escape_scoped(removed);
             interp.array_set_property_throwing(
+                stack,
                 context,
                 current_removed,
                 "length",
@@ -3250,6 +3473,7 @@ impl Interpreter {
             if insert_count < actual_delete_count {
                 let current_receiver = interp.escape_scoped(receiver);
                 interp.splice_shift_left(
+                    stack,
                     context,
                     current_receiver,
                     len,
@@ -3260,6 +3484,7 @@ impl Interpreter {
             } else if insert_count > actual_delete_count {
                 let current_receiver = interp.escape_scoped(receiver);
                 interp.splice_shift_right(
+                    stack,
                     context,
                     current_receiver,
                     len,
@@ -3272,16 +3497,23 @@ impl Interpreter {
             for (offset, value) in args.iter().skip(2).copied().enumerate() {
                 let key = format_index_key((actual_start + offset) as f64);
                 let current_receiver = interp.escape_scoped(receiver);
-                interp.array_set_property_throwing(context, current_receiver, &key, value)?;
+                interp.array_set_property_throwing(
+                    stack,
+                    context,
+                    current_receiver,
+                    &key,
+                    value,
+                )?;
             }
             let current_receiver = interp.escape_scoped(receiver);
-            interp.array_set_length_throwing(context, current_receiver, new_len as f64)?;
+            interp.array_set_length_throwing(stack, context, current_receiver, new_len as f64)?;
             Ok(interp.escape_scoped(removed))
         })
     }
 
     fn splice_copy_deleted_index(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         from_object: Value,
         to_object: Value,
@@ -3289,16 +3521,17 @@ impl Interpreter {
         to_index: usize,
     ) -> Result<(), VmError> {
         let from = format_index_key(from_index as f64);
-        if !self.array_method_has_property(context, from_object, &from)? {
+        if !self.array_method_has_property(stack, context, from_object, &from)? {
             return Ok(());
         }
-        let value = self.array_method_get_property(context, from_object, &from)?;
+        let value = self.array_method_get_property(stack, context, from_object, &from)?;
         let to = format_index_key(to_index as f64);
-        self.create_data_property_or_throw(context, to_object, &to, value)
+        self.create_data_property_or_throw(stack, context, to_object, &to, value)
     }
 
     fn splice_shift_left(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         o: Value,
         len: usize,
@@ -3310,11 +3543,17 @@ impl Interpreter {
         let tail_count = len.saturating_sub(actual_start + actual_delete_count);
         if tail_count <= MAX_ARRAY_LIKE_PROBE_LEN {
             for k in actual_start..len.saturating_sub(actual_delete_count) {
-                self.splice_move_or_delete(context, o, k + actual_delete_count, k + insert_count)?;
+                self.splice_move_or_delete(
+                    stack,
+                    context,
+                    o,
+                    k + actual_delete_count,
+                    k + insert_count,
+                )?;
             }
             for k in (len - shift)..len {
                 let key = format_index_key(k as f64);
-                self.array_delete_property_throwing(context, o, &key)?;
+                self.array_delete_property_throwing(stack, context, o, &key)?;
             }
             return Ok(());
         }
@@ -3322,18 +3561,25 @@ impl Interpreter {
         let candidates =
             self.splice_shift_candidates(o, len, actual_start, actual_delete_count, insert_count)?;
         for k in candidates {
-            self.splice_move_or_delete(context, o, k + actual_delete_count, k + insert_count)?;
+            self.splice_move_or_delete(
+                stack,
+                context,
+                o,
+                k + actual_delete_count,
+                k + insert_count,
+            )?;
         }
         let own_indices = self.splice_own_indices(o, len)?;
         for k in own_indices.range((len - shift)..len) {
             let key = format_index_key(*k as f64);
-            self.array_delete_property_throwing(context, o, &key)?;
+            self.array_delete_property_throwing(stack, context, o, &key)?;
         }
         Ok(())
     }
 
     fn splice_shift_right(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         o: Value,
         len: usize,
@@ -3344,7 +3590,13 @@ impl Interpreter {
         let tail_count = len.saturating_sub(actual_start + actual_delete_count);
         if tail_count <= MAX_ARRAY_LIKE_PROBE_LEN {
             for k in (actual_start..len.saturating_sub(actual_delete_count)).rev() {
-                self.splice_move_or_delete(context, o, k + actual_delete_count, k + insert_count)?;
+                self.splice_move_or_delete(
+                    stack,
+                    context,
+                    o,
+                    k + actual_delete_count,
+                    k + insert_count,
+                )?;
             }
             return Ok(());
         }
@@ -3352,13 +3604,20 @@ impl Interpreter {
         let candidates =
             self.splice_shift_candidates(o, len, actual_start, actual_delete_count, insert_count)?;
         for k in candidates.into_iter().rev() {
-            self.splice_move_or_delete(context, o, k + actual_delete_count, k + insert_count)?;
+            self.splice_move_or_delete(
+                stack,
+                context,
+                o,
+                k + actual_delete_count,
+                k + insert_count,
+            )?;
         }
         Ok(())
     }
 
     fn splice_move_or_delete(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         o: Value,
         from_index: usize,
@@ -3366,11 +3625,11 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let from = format_index_key(from_index as f64);
         let to = format_index_key(to_index as f64);
-        if self.array_method_has_property(context, o, &from)? {
-            let value = self.array_method_get_property(context, o, &from)?;
-            self.array_set_property_throwing(context, o, &to, value)
+        if self.array_method_has_property(stack, context, o, &from)? {
+            let value = self.array_method_get_property(stack, context, o, &from)?;
+            self.array_set_property_throwing(stack, context, o, &to, value)
         } else {
-            self.array_delete_property_throwing(context, o, &to)
+            self.array_delete_property_throwing(stack, context, o, &to)
         }
     }
 
@@ -3452,6 +3711,7 @@ impl Interpreter {
     /// §23.1.3.39 live `Array.prototype.toReversed`.
     pub(crate) fn array_to_reversed(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         roots: &[&[Value]],
@@ -3461,12 +3721,12 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
-        let len = length_of_array_like(self, context, &o)?;
+        let len = length_of_array_like(self, stack, context, &o)?;
         self.ensure_change_by_copy_len(len)?;
         let mut out = Vec::with_capacity(len);
         for k in 0..len {
             let from = format_index_key((len - k - 1) as f64);
-            out.push(self.array_method_get_property(context, o, &from)?);
+            out.push(self.array_method_get_property(stack, context, o, &from)?);
         }
         self.array_create_from_dense_values(out)
     }
@@ -3474,6 +3734,7 @@ impl Interpreter {
     /// §23.1.3.40 live `Array.prototype.toSpliced`.
     pub(crate) fn array_to_spliced(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         args: &[Value],
@@ -3484,13 +3745,18 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
-        let len = length_of_array_like(self, context, &o)?;
-        let actual_start = self.array_relative_index(context, args.first(), 0.0, len)?;
+        let len = length_of_array_like(self, stack, context, &o)?;
+        let actual_start = self.array_relative_index(stack, context, args.first(), 0.0, len)?;
         let insert_count = args.len().saturating_sub(2);
         let skip_count = match args.len() {
             0 => 0,
             1 => len.saturating_sub(actual_start),
-            _ => self.array_clamped_count(context, &args[1], len.saturating_sub(actual_start))?,
+            _ => self.array_clamped_count(
+                stack,
+                context,
+                &args[1],
+                len.saturating_sub(actual_start),
+            )?,
         };
         let new_len = len
             .checked_sub(skip_count)
@@ -3503,11 +3769,21 @@ impl Interpreter {
 
         let mut out = Vec::with_capacity(new_len);
         for k in 0..actual_start {
-            out.push(self.array_method_get_property(context, o, &format_index_key(k as f64))?);
+            out.push(self.array_method_get_property(
+                stack,
+                context,
+                o,
+                &format_index_key(k as f64),
+            )?);
         }
         out.extend(args.iter().skip(2).copied());
         for k in (actual_start + skip_count)..len {
-            out.push(self.array_method_get_property(context, o, &format_index_key(k as f64))?);
+            out.push(self.array_method_get_property(
+                stack,
+                context,
+                o,
+                &format_index_key(k as f64),
+            )?);
         }
         self.array_create_from_dense_values(out)
     }
@@ -3515,6 +3791,7 @@ impl Interpreter {
     /// §23.1.3.41 live `Array.prototype.toSorted`.
     pub(crate) fn array_to_sorted(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         comparefn: Value,
@@ -3525,28 +3802,63 @@ impl Interpreter {
                 ("Array.prototype.toSorted comparator is not a function".to_string()).into(),
             ));
         }
+        let anchor_base = self.push_iteration_anchor(comparefn) - 1;
+        let comparefn_anchor = anchor_base;
         let o = if receiver.is_object_type() {
-            receiver
+            Ok(receiver)
         } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
         };
-        let len = length_of_array_like(self, context, &o)?;
-        self.ensure_change_by_copy_len(len)?;
-        let mut items = Vec::with_capacity(len);
-        for k in 0..len {
-            items.push(self.array_method_get_property(context, o, &format_index_key(k as f64))?);
-        }
-        let fast_path = self.sort_comparator_fast_path(context, comparefn);
-        let mut lean = self.acquire_lean_callback_stack(context, comparefn);
-        let sorted = self.sort_merge(context, items, comparefn, fast_path, lean.as_mut());
-        self.release_lean_callback_stack(lean);
-        let sorted = sorted?;
-        self.array_create_from_dense_values(sorted)
+        let o = match o {
+            Ok(o) => o,
+            Err(err) => {
+                self.pop_iteration_anchors_to(anchor_base);
+                return Err(err);
+            }
+        };
+        let o_anchor = self.push_iteration_anchor(o) - 1;
+        let result = (|| {
+            let o = self.iteration_anchor(o_anchor);
+            let len = length_of_array_like(self, stack, context, &o)?;
+            self.ensure_change_by_copy_len(len)?;
+            // `toSorted` reads every index (holes become undefined). Keep
+            // each result directly traced and sort stable anchor indices.
+            let mut items = Vec::with_capacity(len);
+            for k in 0..len {
+                let o = self.iteration_anchor(o_anchor);
+                let item =
+                    self.array_method_get_property(stack, context, o, &format_index_key(k as f64))?;
+                items.push(self.push_iteration_anchor(item) - 1);
+            }
+            let comparefn = self.iteration_anchor(comparefn_anchor);
+            let fast_path = self.sort_comparator_fast_path(context, comparefn);
+            let mut lean = self.acquire_lean_callback_stack(context, comparefn);
+            let sorted = self.sort_merge(
+                stack,
+                context,
+                items,
+                comparefn_anchor,
+                fast_path,
+                lean.as_mut(),
+            );
+            self.release_lean_callback_stack(lean);
+            let sorted = sorted?;
+            // Building this host Vec cannot trigger a VM collection. The
+            // array allocator traces the owned values while it allocates.
+            let values = sorted
+                .into_iter()
+                .map(|anchor| self.iteration_anchor(anchor))
+                .collect();
+            self.array_create_from_dense_values(values)
+        })();
+        self.pop_iteration_anchors_to(anchor_base);
+        result
     }
 
     /// §23.1.3.42 live `Array.prototype.with`.
     pub(crate) fn array_with(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         index: Value,
@@ -3558,15 +3870,16 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
-        let len = length_of_array_like(self, context, &o)?;
+        let len = length_of_array_like(self, stack, context, &o)?;
         self.ensure_change_by_copy_len(len)?;
-        let actual = self.array_relative_index_strict(context, &index, len)?;
+        let actual = self.array_relative_index_strict(stack, context, &index, len)?;
         let mut out = Vec::with_capacity(len);
         for k in 0..len {
             if k == actual {
                 out.push(value);
             } else {
                 out.push(self.array_method_get_property(
+                    stack,
                     context,
                     o,
                     &format_index_key(k as f64),
@@ -3585,11 +3898,12 @@ impl Interpreter {
 
     fn array_relative_index_strict(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         arg: &Value,
         len: usize,
     ) -> Result<usize, VmError> {
-        let n = self.coerce_to_number(context, arg)?.as_f64();
+        let n = self.coerce_to_number(stack, context, arg)?.as_f64();
         let relative = if n.is_nan() {
             0.0
         } else if n.is_infinite() {
@@ -3779,274 +4093,334 @@ pub(crate) fn array_callback_native_dispatch(
     }
     let callback = args.first().cloned().unwrap_or(Value::undefined());
     let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let (interp, ctx_opt) = ctx.interp_mut_and_context();
-    let context = ctx_opt.ok_or_else(|| NativeError::TypeError {
-        name: "Array.prototype callback",
-        reason: "missing execution context".to_string(),
-    })?;
-    // §22.1.3 step 1 — `O = ? ToObject(this value)`. Box primitive
-    // receivers so the callback's `O` argument and the prototype-chain
-    // walk see a real wrapper (e.g. `Boolean.prototype[k]` inherited
-    // indices).
-    let receiver = if raw_receiver.is_object_type() {
-        raw_receiver
-    } else {
-        let boxed = interp.box_sloppy_this_primitive_runtime_rooted(raw_receiver, &[args]);
-        boxed.map_err(|err| {
-            crate::native_function::vm_to_native_error(interp, err, "Array.prototype callback")
-        })?
-    };
-    // §23.1.3.* step 2 — len = ? LengthOfArrayLike(O), read once via
-    // `[[Get]]` (observes a `get length()`). The walk below is LIVE:
-    // each index is re-checked with `HasProperty(O, k)` / `Get(O, k)`
-    // during iteration, so a callback that mutates the receiver is
-    // observed in spec order and a Function / exotic receiver's indexed
-    // properties are seen (the previous one-shot snapshot saw neither).
-    let len_result = length_of_array_like(interp, &context, &receiver);
-    let len = len_result.map_err(|err| {
-        crate::native_function::vm_to_native_error(interp, err, "Array.prototype callback")
-    })?;
-    // §23.1.3.* step 3 — `if IsCallable(callbackfn) is false, throw a
-    // TypeError`, ordered after `ToObject` + `LengthOfArrayLike`.
-    if !interp.is_callable_runtime(&callback) {
-        return Err(NativeError::TypeError {
+    let context = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
             name: "Array.prototype callback",
-            reason: "callback is not a function".to_string(),
-        });
-    }
-    let callback_roots = [receiver, callback, this_arg];
-    let mut output_target = match kind {
-        ArrayCallbackKind::Map => {
-            let created =
-                interp.array_species_create(&context, receiver, len, &[args, &callback_roots]);
-            Some(created.map_err(|err| {
-                crate::native_function::vm_to_native_error(interp, err, "Array.prototype callback")
-            })?)
-        }
-        ArrayCallbackKind::Filter | ArrayCallbackKind::FlatMap => {
-            let created =
-                interp.array_species_create(&context, receiver, 0, &[args, &callback_roots]);
-            Some(created.map_err(|err| {
-                crate::native_function::vm_to_native_error(interp, err, "Array.prototype callback")
-            })?)
-        }
-        _ => None,
-    };
-    // `array_species_create` above allocates the output array and may
-    // scavenge, relocating the receiver / callback / thisArg. The collector
-    // forwarded the `callback_roots` slots in place, but the standalone
-    // locals are copies it never saw — re-read them so every use below
-    // (fast path, iteration anchors, the live walk) sees the moved handles.
-    let [receiver, callback, this_arg] = callback_roots;
-    // §23.1.3.12 `flatMap` is FlattenIntoArray(A, O, len, 0, 1, mapper,
-    // T): each callback result that IsArray is spliced one level deep
-    // through the observable HasProperty / Get / CreateDataProperty
-    // protocol — not the raw element snapshot the generic loop uses.
-    if kind == ArrayCallbackKind::FlatMap {
-        let target = output_target.expect("flatMap output target created above");
-        let anchor_base = interp.push_iteration_anchor(target) - 1;
-        interp.push_iteration_anchor(receiver);
-        let probe_len = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
-        let result = interp.flatten_into_array(
-            &context,
-            target,
-            receiver,
-            probe_len,
-            0,
-            1,
-            Some((callback, this_arg)),
-        );
-        interp.pop_iteration_anchors_to(anchor_base);
-        result.map_err(|err| crate::native_function::vm_to_native_error(interp, err, "flatMap"))?;
-        return Ok(target);
-    }
-    // `find` family visits every index `0..len` (an absent slot yields
-    // `undefined` for the element); the rest skip absent indices.
-    let visit_all = kind.visits_absent();
-    let reverse = kind.reverse();
-    // `reduce` / `reduceRight` do not accept a `thisArg`; the callback
-    // runs with `undefined` this (the second positional is the
-    // initialValue, not a receiver).
-    let reduce_kind = kind.is_reduce();
-    let cb_this = if reduce_kind {
-        Value::undefined()
-    } else {
-        this_arg
-    };
-    let callback_fast_path = array_callback_fast_path(&context, interp.gc_heap(), kind, callback);
-    if let Some(result) = try_dense_array_callback_fast_path(
-        interp,
-        kind,
-        receiver,
-        len,
-        output_target,
-        callback_fast_path,
-        args,
-    ) {
-        return result;
-    }
-    // String-exotic wrappers expose their code-unit indices through
-    // `[[StringData]]`, which the ordinary `[[HasProperty]]` ladder may
-    // not surface — resolve those directly.
-    let string_data = receiver
-        .as_object()
-        .and_then(|o| crate::object::string_data(o, interp.gc_heap()));
-    // Index visit order. A bounded `0..len` ladder is spec-exact for any
-    // receiver (dense array, Function, object with getters, mutation
-    // mid-walk). A pathological `length` (> MAX_ARRAY_LIKE_PROBE_LEN)
-    // falls back to the sparse present-index set across the prototype
-    // chain so the walk never runs billions of `HasProperty` probes.
-    let index_iter: Box<dyn Iterator<Item = usize>> = if len <= MAX_ARRAY_LIKE_PROBE_LEN {
-        if reverse {
-            Box::new((0..len).rev())
+            reason: "missing execution context".to_string(),
+        })?;
+    ctx.with_turn_parts(|interp, stack| {
+        // §22.1.3 step 1 — `O = ? ToObject(this value)`. Box primitive
+        // receivers so the callback's `O` argument and the prototype-chain
+        // walk see a real wrapper (e.g. `Boolean.prototype[k]` inherited
+        // indices).
+        let receiver = if raw_receiver.is_object_type() {
+            raw_receiver
         } else {
-            Box::new(0..len)
-        }
-    } else if visit_all && reverse {
-        // `findLast` / `findLastIndex` must visit absent indices too.
-        // For pathological array-like lengths we cannot probe the whole
-        // range, but the spec-observable first reverse callback is the
-        // clamped final index.
-        Box::new(std::iter::once(len.saturating_sub(1)))
-    } else {
-        let mut indices: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-        let mut current = receiver;
-        let mut hops = 0usize;
-        loop {
-            collect_own_indices_below(interp, &current, len, &mut indices);
-            if hops >= object::PROTO_CHAIN_HARD_CAP {
-                break;
-            }
-            let proto_result = interp.get_prototype_for_op(&current);
-            let proto = proto_result.map_err(|err| {
+            let boxed = interp.box_sloppy_this_primitive_runtime_rooted(raw_receiver, &[args]);
+            boxed.map_err(|err| {
                 crate::native_function::vm_to_native_error(interp, err, "Array.prototype callback")
-            })?;
-            if proto.is_null() || !proto.is_object_type() {
-                break;
+            })?
+        };
+        // §23.1.3.* step 2 — len = ? LengthOfArrayLike(O), read once via
+        // `[[Get]]` (observes a `get length()`). The walk below is LIVE:
+        // each index is re-checked with `HasProperty(O, k)` / `Get(O, k)`
+        // during iteration, so a callback that mutates the receiver is
+        // observed in spec order and a Function / exotic receiver's indexed
+        // properties are seen (the previous one-shot snapshot saw neither).
+        let len_result = length_of_array_like(interp, stack, &context, &receiver);
+        let len = len_result.map_err(|err| {
+            crate::native_function::vm_to_native_error(interp, err, "Array.prototype callback")
+        })?;
+        // §23.1.3.* step 3 — `if IsCallable(callbackfn) is false, throw a
+        // TypeError`, ordered after `ToObject` + `LengthOfArrayLike`.
+        if !interp.is_callable_runtime(&callback) {
+            return Err(NativeError::TypeError {
+                name: "Array.prototype callback",
+                reason: "callback is not a function".to_string(),
+            });
+        }
+        let callback_roots = [receiver, callback, this_arg];
+        let mut output_target = match kind {
+            ArrayCallbackKind::Map => {
+                let created = interp.array_species_create(
+                    stack,
+                    &context,
+                    receiver,
+                    len,
+                    &[args, &callback_roots],
+                );
+                Some(created.map_err(|err| {
+                    crate::native_function::vm_to_native_error(
+                        interp,
+                        err,
+                        "Array.prototype callback",
+                    )
+                })?)
             }
-            current = proto;
-            hops += 1;
+            ArrayCallbackKind::Filter | ArrayCallbackKind::FlatMap => {
+                let created = interp.array_species_create(
+                    stack,
+                    &context,
+                    receiver,
+                    0,
+                    &[args, &callback_roots],
+                );
+                Some(created.map_err(|err| {
+                    crate::native_function::vm_to_native_error(
+                        interp,
+                        err,
+                        "Array.prototype callback",
+                    )
+                })?)
+            }
+            _ => None,
+        };
+        // `array_species_create` above allocates the output array and may
+        // scavenge, relocating the receiver / callback / thisArg. The collector
+        // forwarded the `callback_roots` slots in place, but the standalone
+        // locals are copies it never saw — re-read them so every use below
+        // (fast path, iteration anchors, the live walk) sees the moved handles.
+        let [receiver, callback, this_arg] = callback_roots;
+        // §23.1.3.12 `flatMap` is FlattenIntoArray(A, O, len, 0, 1, mapper,
+        // T): each callback result that IsArray is spliced one level deep
+        // through the observable HasProperty / Get / CreateDataProperty
+        // protocol — not the raw element snapshot the generic loop uses.
+        if kind == ArrayCallbackKind::FlatMap {
+            let target = output_target.expect("flatMap output target created above");
+            let anchor_base = interp.push_iteration_anchor(target) - 1;
+            interp.push_iteration_anchor(receiver);
+            let probe_len = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
+            let result = interp.flatten_into_array(
+                stack,
+                &context,
+                target,
+                receiver,
+                probe_len,
+                0,
+                1,
+                Some((callback, this_arg)),
+            );
+            interp.pop_iteration_anchors_to(anchor_base);
+            result.map_err(|err| {
+                crate::native_function::vm_to_native_error(interp, err, "flatMap")
+            })?;
+            return Ok(target);
         }
-        let mut v: Vec<usize> = indices.into_iter().collect();
-        if reverse {
-            v.reverse();
+        // `find` family visits every index `0..len` (an absent slot yields
+        // `undefined` for the element); the rest skip absent indices.
+        let visit_all = kind.visits_absent();
+        let reverse = kind.reverse();
+        // `reduce` / `reduceRight` do not accept a `thisArg`; the callback
+        // runs with `undefined` this (the second positional is the
+        // initialValue, not a receiver).
+        let reduce_kind = kind.is_reduce();
+        let cb_this = if reduce_kind {
+            Value::undefined()
+        } else {
+            this_arg
+        };
+        let callback_fast_path =
+            array_callback_fast_path(&context, interp.gc_heap(), kind, callback);
+        if let Some(result) = try_dense_array_callback_fast_path(
+            interp,
+            kind,
+            receiver,
+            len,
+            output_target,
+            callback_fast_path,
+            args,
+        ) {
+            return result;
         }
-        Box::new(v.into_iter())
-    };
-
-    let mut acc = Value::undefined();
-    let mut found_idx: Option<usize> = None;
-    let mut found_val = Value::undefined();
-    let mut bool_acc: bool = matches!(name, "every");
-    let mut target_index = 0usize;
-    let mut reduce_has_init = args.len() >= 2;
-    if reduce_kind && reduce_has_init {
-        acc = args[1];
-    }
-    // Root every heap handle the loop carries across a reentrant callback
-    // (or an element getter) on the interpreter's iteration-anchor stack
-    // — the same mechanism `flatMap` (above) and the rest of the VM use.
-    // A moving young-generation scavenge triggered inside
-    // `run_callable_sync` rewrites these slots in place, so the loop
-    // reads each handle back through `iteration_anchor` at the point of
-    // use rather than trusting a stale Rust local. Without this the
-    // receiver array would be left dangling and the walk would mis-read
-    // it as a generic array-like (a spurious `TypeError`).
-    const A_RECEIVER: usize = 0;
-    const A_CALLBACK: usize = 1;
-    const A_CB_THIS: usize = 2;
-    const A_OUTPUT: usize = 3;
-    const A_STRING: usize = 4;
-    const A_ACC: usize = 5;
-    const A_ELEM: usize = 6;
-    let anchor_base = interp.iteration_anchors_for_trace().len();
-    interp.push_iteration_anchor(receiver);
-    interp.push_iteration_anchor(callback);
-    interp.push_iteration_anchor(cb_this);
-    interp.push_iteration_anchor(output_target.unwrap_or_else(Value::undefined));
-    interp.push_iteration_anchor(string_data.map_or_else(Value::undefined, Value::string));
-    interp.push_iteration_anchor(acc);
-    interp.push_iteration_anchor(Value::undefined());
-    // Lean per-element callback invocation. When the callback is a plain
-    // bytecode function/closure (not native/bound/proxy/generator/async/…), we
-    // draw ONE reservation-stable stack + enter the sync-reentry guard once for
-    // the whole loop, then invoke the callback directly through the committed
-    // bytecode tail per element — skipping `run_callable_sync`'s per-call
-    // bound/proxy/native dispatch checks and stack draw/return. Ineligible
-    // callbacks keep the general per-element `run_callable_sync_already_rooted`
-    // path. `function_id` is shape-stable, so resolving eligibility once on the
-    // pre-loop callback handle is valid for the whole walk.
-    let mut lean_inner = interp.acquire_lean_callback_stack(&context, callback);
-    // Run the walk inside a closure so the matching
-    // `pop_iteration_anchors_to` always runs — on normal completion and
-    // on every `?` error — without threading a manual cleanup through
-    // each fallible step (mirrors `flatMap`'s capture-then-pop above).
-    let walk: Result<(), NativeError> = (|| {
-        for idx in index_iter {
-            let receiver = interp.iteration_anchor(anchor_base + A_RECEIVER);
-            let string_data = interp
-                .iteration_anchor(anchor_base + A_STRING)
-                .as_string(interp.gc_heap());
-            // Live `HasProperty(O, k)` + `Get(O, k)`. An absent index
-            // reads as `(false, undefined)`; `find`-family methods visit
-            // it anyway.
-            let (present, v) = if let Some(s) = string_data {
-                match s.char_code_at(idx as u32, interp.gc_heap()) {
-                    Some(unit) => {
-                        let ch = crate::string::JsString::from_utf16_units(
-                            &[unit],
-                            interp.gc_heap_mut(),
-                        )
-                        .map(Value::string)
-                        .map_err(|_| NativeError::TypeError {
-                            name: "Array.prototype callback",
-                            reason: "out of memory".to_string(),
-                        })?;
-                        (true, ch)
-                    }
-                    None => (false, Value::undefined()),
+        // String-exotic wrappers expose their code-unit indices through
+        // `[[StringData]]`, which the ordinary `[[HasProperty]]` ladder may
+        // not surface — resolve those directly.
+        let string_data = receiver
+            .as_object()
+            .and_then(|o| crate::object::string_data(o, interp.gc_heap()));
+        // Index visit order. A bounded `0..len` ladder is spec-exact for any
+        // receiver (dense array, Function, object with getters, mutation
+        // mid-walk). A pathological `length` (> MAX_ARRAY_LIKE_PROBE_LEN)
+        // falls back to the sparse present-index set across the prototype
+        // chain so the walk never runs billions of `HasProperty` probes.
+        let index_iter: Box<dyn Iterator<Item = usize>> = if len <= MAX_ARRAY_LIKE_PROBE_LEN {
+            if reverse {
+                Box::new((0..len).rev())
+            } else {
+                Box::new(0..len)
+            }
+        } else if visit_all && reverse {
+            // `findLast` / `findLastIndex` must visit absent indices too.
+            // For pathological array-like lengths we cannot probe the whole
+            // range, but the spec-observable first reverse callback is the
+            // clamped final index.
+            Box::new(std::iter::once(len.saturating_sub(1)))
+        } else {
+            let mut indices: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+            let mut current = receiver;
+            let mut hops = 0usize;
+            loop {
+                collect_own_indices_below(interp, &current, len, &mut indices);
+                if hops >= object::PROTO_CHAIN_HARD_CAP {
+                    break;
                 }
-            } else if let Some(arr) = receiver.as_array() {
-                // Fast path: a present own data element on an array that has
-                // no accessors reads straight from the dense backing. An own
-                // data property shadows the prototype and exposes no getter,
-                // so this is observably identical to the `[[Get]]` ladder
-                // below — without stringifying the index (a `String` alloc per
-                // element) or running the property protocol. The slow path
-                // still owns holes (inherited `Array.prototype[k]`), accessors,
-                // and sparse/exotic shapes.
-                if let Some(value) =
-                    crate::array::own_data_element_without_accessors(arr, interp.gc_heap(), idx)
-                {
-                    (true, value)
-                } else {
-                    // A present own element (data or accessor) reads through
-                    // the ordinary `[[Get]]`. An absent index (hole / beyond
-                    // the element store but `< len`) is not skipped outright:
-                    // §10.4.2.4 [[Get]] walks the Array.prototype chain, so an
-                    // inherited `Array.prototype[k]` is observed; a hole with
-                    // no inherited value reads as absent.
-                    let key = idx.to_string();
-                    let present = crate::array::has_own_element(arr, interp.gc_heap(), idx)
-                        || crate::array::get_accessor(arr, interp.gc_heap(), &key).is_some()
-                        || {
-                            let has_result = interp.ordinary_has_property_value(
-                                &context,
-                                receiver,
-                                &crate::VmPropertyKey::String(&key),
-                                0,
-                            );
-                            has_result.map_err(|err| {
+                let proto_result = interp.get_prototype_for_op(&current);
+                let proto = proto_result.map_err(|err| {
+                    crate::native_function::vm_to_native_error(
+                        interp,
+                        err,
+                        "Array.prototype callback",
+                    )
+                })?;
+                if proto.is_null() || !proto.is_object_type() {
+                    break;
+                }
+                current = proto;
+                hops += 1;
+            }
+            let mut v: Vec<usize> = indices.into_iter().collect();
+            if reverse {
+                v.reverse();
+            }
+            Box::new(v.into_iter())
+        };
+
+        let mut acc = Value::undefined();
+        let mut found_idx: Option<usize> = None;
+        let mut found_val = Value::undefined();
+        let mut bool_acc: bool = matches!(name, "every");
+        let mut target_index = 0usize;
+        let mut reduce_has_init = args.len() >= 2;
+        if reduce_kind && reduce_has_init {
+            acc = args[1];
+        }
+        // Root every heap handle the loop carries across a reentrant callback
+        // (or an element getter) on the interpreter's iteration-anchor stack
+        // — the same mechanism `flatMap` (above) and the rest of the VM use.
+        // A moving young-generation scavenge triggered inside
+        // `run_callable_sync` rewrites these slots in place, so the loop
+        // reads each handle back through `iteration_anchor` at the point of
+        // use rather than trusting a stale Rust local. Without this the
+        // receiver array would be left dangling and the walk would mis-read
+        // it as a generic array-like (a spurious `TypeError`).
+        const A_RECEIVER: usize = 0;
+        const A_CALLBACK: usize = 1;
+        const A_CB_THIS: usize = 2;
+        const A_OUTPUT: usize = 3;
+        const A_STRING: usize = 4;
+        const A_ACC: usize = 5;
+        const A_ELEM: usize = 6;
+        let anchor_base = interp.iteration_anchors_for_trace().len();
+        interp.push_iteration_anchor(receiver);
+        interp.push_iteration_anchor(callback);
+        interp.push_iteration_anchor(cb_this);
+        interp.push_iteration_anchor(output_target.unwrap_or_else(Value::undefined));
+        interp.push_iteration_anchor(string_data.map_or_else(Value::undefined, Value::string));
+        interp.push_iteration_anchor(acc);
+        interp.push_iteration_anchor(Value::undefined());
+        // Lean per-element callback invocation. When the callback is a plain
+        // bytecode function/closure (not native/bound/proxy/generator/async/…), we
+        // enter the sync-reentry guard once for the whole loop, then append each
+        // callback frame above a floor on the current runtime turn — skipping
+        // `run_callable_sync`'s per-call bound/proxy/native dispatch checks.
+        // Ineligible callbacks keep the general rooted call path on the same
+        // activation stack. `function_id` is shape-stable, so resolving it once on the
+        // pre-loop callback handle is valid for the whole walk.
+        let mut lean_inner = interp.acquire_lean_callback_stack(&context, callback);
+        // Run the walk inside a closure so the matching
+        // `pop_iteration_anchors_to` always runs — on normal completion and
+        // on every `?` error — without threading a manual cleanup through
+        // each fallible step (mirrors `flatMap`'s capture-then-pop above).
+        let walk: Result<(), NativeError> = (|| {
+            for idx in index_iter {
+                let receiver = interp.iteration_anchor(anchor_base + A_RECEIVER);
+                let string_data = interp
+                    .iteration_anchor(anchor_base + A_STRING)
+                    .as_string(interp.gc_heap());
+                // Live `HasProperty(O, k)` + `Get(O, k)`. An absent index
+                // reads as `(false, undefined)`; `find`-family methods visit
+                // it anyway.
+                let (present, v) = if let Some(s) = string_data {
+                    match s.char_code_at(idx as u32, interp.gc_heap()) {
+                        Some(unit) => {
+                            let ch = crate::string::JsString::from_utf16_units(
+                                &[unit],
+                                interp.gc_heap_mut(),
+                            )
+                            .map(Value::string)
+                            .map_err(|_| NativeError::TypeError {
+                                name: "Array.prototype callback",
+                                reason: "out of memory".to_string(),
+                            })?;
+                            (true, ch)
+                        }
+                        None => (false, Value::undefined()),
+                    }
+                } else if let Some(arr) = receiver.as_array() {
+                    // Fast path: a present own data element on an array that has
+                    // no accessors reads straight from the dense backing. An own
+                    // data property shadows the prototype and exposes no getter,
+                    // so this is observably identical to the `[[Get]]` ladder
+                    // below — without stringifying the index (a `String` alloc per
+                    // element) or running the property protocol. The slow path
+                    // still owns holes (inherited `Array.prototype[k]`), accessors,
+                    // and sparse/exotic shapes.
+                    if let Some(value) =
+                        crate::array::own_data_element_without_accessors(arr, interp.gc_heap(), idx)
+                    {
+                        (true, value)
+                    } else {
+                        // A present own element (data or accessor) reads through
+                        // the ordinary `[[Get]]`. An absent index (hole / beyond
+                        // the element store but `< len`) is not skipped outright:
+                        // §10.4.2.4 [[Get]] walks the Array.prototype chain, so an
+                        // inherited `Array.prototype[k]` is observed; a hole with
+                        // no inherited value reads as absent.
+                        let key = idx.to_string();
+                        let present = crate::array::has_own_element(arr, interp.gc_heap(), idx)
+                            || crate::array::get_accessor(arr, interp.gc_heap(), &key).is_some()
+                            || {
+                                let has_result = interp.ordinary_has_property_value(
+                                    stack,
+                                    &context,
+                                    receiver,
+                                    &crate::VmPropertyKey::String(&key),
+                                    0,
+                                );
+                                has_result.map_err(|err| {
+                                    crate::native_function::vm_to_native_error(
+                                        interp,
+                                        err,
+                                        "Array.prototype callback",
+                                    )
+                                })?
+                            };
+                        if present {
+                            let get_result =
+                                interp.get_property_value_for_call(stack, &context, receiver, &key);
+                            let v = get_result.map_err(|err| {
                                 crate::native_function::vm_to_native_error(
                                     interp,
                                     err,
                                     "Array.prototype callback",
                                 )
-                            })?
-                        };
-                    if present {
+                            })?;
+                            (true, v)
+                        } else {
+                            (false, Value::undefined())
+                        }
+                    }
+                } else {
+                    let key = idx.to_string();
+                    let has_result = interp.ordinary_has_property_value(
+                        stack,
+                        &context,
+                        receiver,
+                        &crate::VmPropertyKey::String(&key),
+                        0,
+                    );
+                    let has = has_result.map_err(|err| {
+                        crate::native_function::vm_to_native_error(
+                            interp,
+                            err,
+                            "Array.prototype callback",
+                        )
+                    })?;
+                    if has {
                         let get_result =
-                            interp.get_property_value_for_call(&context, receiver, &key);
+                            interp.get_property_value_for_call(stack, &context, receiver, &key);
                         let v = get_result.map_err(|err| {
                             crate::native_function::vm_to_native_error(
                                 interp,
@@ -4058,207 +4432,201 @@ pub(crate) fn array_callback_native_dispatch(
                     } else {
                         (false, Value::undefined())
                     }
+                };
+                if !present && !visit_all {
+                    continue;
                 }
-            } else {
-                let key = idx.to_string();
-                let has_result = interp.ordinary_has_property_value(
-                    &context,
-                    receiver,
-                    &crate::VmPropertyKey::String(&key),
-                    0,
+                // Re-root the receiver (a getter above may have moved it) and
+                // park the current element before the callback runs.
+                let receiver = interp.iteration_anchor(anchor_base + A_RECEIVER);
+                interp.set_iteration_anchor(anchor_base + A_ELEM, v);
+                if reduce_kind && !reduce_has_init {
+                    acc = v;
+                    reduce_has_init = true;
+                    interp.set_iteration_anchor(anchor_base + A_ACC, acc);
+                    continue;
+                }
+                let callback = interp.iteration_anchor(anchor_base + A_CALLBACK);
+                let cb_this = interp.iteration_anchor(anchor_base + A_CB_THIS);
+                // This loop always runs nested under the forEach/map/... native,
+                // which `run_callable_sync` reached after pushing its own
+                // `ExtraRoots` — so the per-element runtime-global root set is
+                // already live. Use the already-rooted re-entry to drop a redundant
+                // `ExtraRoots` Vec push/truncate per element (the duplicate the
+                // heap's `same_source` walk would skip anyway).
+                let acc_now = if reduce_kind {
+                    interp.iteration_anchor(anchor_base + A_ACC)
+                } else {
+                    Value::undefined()
+                };
+                let mut fast_result = execute_array_callback_fast_path(
+                    callback_fast_path,
+                    kind,
+                    reduce_kind,
+                    acc_now,
+                    v,
                 );
-                let has = has_result.map_err(|err| {
+                if fast_result.is_none()
+                    && let Some(ArrayCallbackFastPath::ForEachAddBitAndUpvalue {
+                        upvalue_index,
+                        mask,
+                    }) = callback_fast_path
+                    && kind == ArrayCallbackKind::ForEach
+                    && let Some(state) = lean_inner.as_ref()
+                    && let Some(cell) = interp.lean_callback_parent_upvalue(state, upvalue_index)
+                {
+                    fast_result = execute_array_for_each_fast_path(interp, cell, mask, v);
+                }
+                let cb_result = if let Some(result) = fast_result {
+                    Ok(result)
+                } else {
+                    match lean_inner {
+                        Some(ref mut state) => {
+                            if reduce_kind {
+                                interp.run_bytecode_callable_committed_lean_args(
+                                    stack,
+                                    state,
+                                    &context,
+                                    cb_this,
+                                    &[acc_now, v, Value::number_f64(idx as f64), receiver],
+                                )
+                            } else {
+                                interp.run_bytecode_callable_committed_lean_args(
+                                    stack,
+                                    state,
+                                    &context,
+                                    cb_this,
+                                    &[v, Value::number_f64(idx as f64), receiver],
+                                )
+                            }
+                        }
+                        None => {
+                            let cb_args: SmallVec<[Value; 8]> = if reduce_kind {
+                                smallvec::smallvec![
+                                    acc_now,
+                                    v,
+                                    Value::number_f64(idx as f64),
+                                    receiver,
+                                ]
+                            } else {
+                                smallvec::smallvec![v, Value::number_f64(idx as f64), receiver,]
+                            };
+                            interp.run_callable_sync_rooted(
+                                stack, &context, &callback, cb_this, cb_args,
+                            )
+                        }
+                    }
+                };
+                let result = cb_result.map_err(|err| {
                     crate::native_function::vm_to_native_error(
                         interp,
                         err,
                         "Array.prototype callback",
                     )
                 })?;
-                if has {
-                    let get_result = interp.get_property_value_for_call(&context, receiver, &key);
-                    let v = get_result.map_err(|err| {
-                        crate::native_function::vm_to_native_error(
-                            interp,
-                            err,
-                            "Array.prototype callback",
-                        )
-                    })?;
-                    (true, v)
-                } else {
-                    (false, Value::undefined())
-                }
-            };
-            if !present && !visit_all {
-                continue;
-            }
-            // Re-root the receiver (a getter above may have moved it) and
-            // park the current element before the callback runs.
-            let receiver = interp.iteration_anchor(anchor_base + A_RECEIVER);
-            interp.set_iteration_anchor(anchor_base + A_ELEM, v);
-            if reduce_kind && !reduce_has_init {
-                acc = v;
-                reduce_has_init = true;
-                interp.set_iteration_anchor(anchor_base + A_ACC, acc);
-                continue;
-            }
-            let callback = interp.iteration_anchor(anchor_base + A_CALLBACK);
-            let cb_this = interp.iteration_anchor(anchor_base + A_CB_THIS);
-            // This loop always runs nested under the forEach/map/... native,
-            // which `run_callable_sync` reached after pushing its own
-            // `ExtraRoots` — so the per-element runtime-global root set is
-            // already live. Use the already-rooted re-entry to drop a redundant
-            // `ExtraRoots` Vec push/truncate per element (the duplicate the
-            // heap's `same_source` walk would skip anyway).
-            let acc_now = if reduce_kind {
-                interp.iteration_anchor(anchor_base + A_ACC)
-            } else {
-                Value::undefined()
-            };
-            let mut fast_result =
-                execute_array_callback_fast_path(callback_fast_path, kind, reduce_kind, acc_now, v);
-            if fast_result.is_none()
-                && let Some(ArrayCallbackFastPath::ForEachAddBitAndUpvalue {
-                    upvalue_index,
-                    mask,
-                }) = callback_fast_path
-                && kind == ArrayCallbackKind::ForEach
-                && let Some(state) = lean_inner.as_ref()
-                && let Some(cell) = interp.lean_callback_parent_upvalue(state, upvalue_index)
-            {
-                fast_result = execute_array_for_each_fast_path(interp, cell, mask, v);
-            }
-            let cb_result = if let Some(result) = fast_result {
-                Ok(result)
-            } else {
-                match lean_inner {
-                    Some(ref mut state) => {
-                        if reduce_kind {
-                            interp.run_bytecode_callable_committed_lean_args(
-                                state,
-                                &context,
-                                cb_this,
-                                &[acc_now, v, Value::number_f64(idx as f64), receiver],
-                            )
-                        } else {
-                            interp.run_bytecode_callable_committed_lean_args(
-                                state,
-                                &context,
-                                cb_this,
-                                &[v, Value::number_f64(idx as f64), receiver],
-                            )
+                // The callback may have moved the element / output target.
+                let v = interp.iteration_anchor(anchor_base + A_ELEM);
+                match kind {
+                    ArrayCallbackKind::ForEach => {}
+                    ArrayCallbackKind::Map => {
+                        let target = interp.iteration_anchor(anchor_base + A_OUTPUT);
+                        if target.is_undefined() {
+                            return Err(NativeError::TypeError {
+                                name: "map",
+                                reason: "missing output target".to_string(),
+                            });
                         }
+                        let create_result = interp
+                            .create_data_property_array_index(stack, &context, target, idx, result);
+                        create_result.map_err(|err| {
+                            crate::native_function::vm_to_native_error(interp, err, "map")
+                        })?;
                     }
-                    None => {
-                        let cb_args: SmallVec<[Value; 8]> = if reduce_kind {
-                            smallvec::smallvec![acc_now, v, Value::number_f64(idx as f64), receiver,]
-                        } else {
-                            smallvec::smallvec![v, Value::number_f64(idx as f64), receiver,]
-                        };
-                        interp
-                            .run_callable_sync_already_rooted(&context, &callback, cb_this, cb_args)
+                    ArrayCallbackKind::Filter if result.to_boolean(interp.gc_heap()) => {
+                        let target = interp.iteration_anchor(anchor_base + A_OUTPUT);
+                        if target.is_undefined() {
+                            return Err(NativeError::TypeError {
+                                name: "filter",
+                                reason: "missing output target".to_string(),
+                            });
+                        }
+                        let create_result = interp.create_data_property_array_index(
+                            stack,
+                            &context,
+                            target,
+                            target_index,
+                            v,
+                        );
+                        create_result.map_err(|err| {
+                            crate::native_function::vm_to_native_error(interp, err, "filter")
+                        })?;
+                        target_index += 1;
                     }
-                }
-            };
-            let result = cb_result.map_err(|err| {
-                crate::native_function::vm_to_native_error(interp, err, "Array.prototype callback")
-            })?;
-            // The callback may have moved the element / output target.
-            let v = interp.iteration_anchor(anchor_base + A_ELEM);
-            match kind {
-                ArrayCallbackKind::ForEach => {}
-                ArrayCallbackKind::Map => {
-                    let target = interp.iteration_anchor(anchor_base + A_OUTPUT);
-                    if target.is_undefined() {
-                        return Err(NativeError::TypeError {
-                            name: "map",
-                            reason: "missing output target".to_string(),
-                        });
+                    ArrayCallbackKind::Find | ArrayCallbackKind::FindLast
+                        if result.to_boolean(interp.gc_heap()) =>
+                    {
+                        found_val = v;
+                        found_idx = Some(idx);
+                        break;
                     }
-                    let create_result =
-                        interp.create_data_property_array_index(&context, target, idx, result);
-                    create_result.map_err(|err| {
-                        crate::native_function::vm_to_native_error(interp, err, "map")
-                    })?;
-                }
-                ArrayCallbackKind::Filter if result.to_boolean(interp.gc_heap()) => {
-                    let target = interp.iteration_anchor(anchor_base + A_OUTPUT);
-                    if target.is_undefined() {
-                        return Err(NativeError::TypeError {
-                            name: "filter",
-                            reason: "missing output target".to_string(),
-                        });
+                    ArrayCallbackKind::FindIndex | ArrayCallbackKind::FindLastIndex
+                        if result.to_boolean(interp.gc_heap()) =>
+                    {
+                        found_idx = Some(idx);
+                        break;
                     }
-                    let create_result =
-                        interp.create_data_property_array_index(&context, target, target_index, v);
-                    create_result.map_err(|err| {
-                        crate::native_function::vm_to_native_error(interp, err, "filter")
-                    })?;
-                    target_index += 1;
+                    ArrayCallbackKind::Every if !result.to_boolean(interp.gc_heap()) => {
+                        bool_acc = false;
+                        break;
+                    }
+                    ArrayCallbackKind::Some if result.to_boolean(interp.gc_heap()) => {
+                        bool_acc = true;
+                        break;
+                    }
+                    ArrayCallbackKind::Reduce | ArrayCallbackKind::ReduceRight => {
+                        acc = result;
+                        interp.set_iteration_anchor(anchor_base + A_ACC, acc);
+                    }
+                    _ => {}
                 }
-                ArrayCallbackKind::Find | ArrayCallbackKind::FindLast
-                    if result.to_boolean(interp.gc_heap()) =>
-                {
-                    found_val = v;
-                    found_idx = Some(idx);
-                    break;
+            }
+            Ok(())
+        })();
+        // Release the lean-path stack + reentry guard on every completion path
+        // (mirrors the anchor pop below), regardless of `walk` success/error.
+        interp.release_lean_callback_stack(lean_inner.take());
+        // Read the (possibly relocated) output target and accumulator back
+        // before releasing the anchors so the final result returns a live
+        // handle. `map`/`filter`/`flatMap` keep their target identity; other
+        // methods stay `None`.
+        output_target = output_target.map(|_| interp.iteration_anchor(anchor_base + A_OUTPUT));
+        acc = interp.iteration_anchor(anchor_base + A_ACC);
+        interp.pop_iteration_anchors_to(anchor_base);
+        walk?;
+        match kind {
+            ArrayCallbackKind::ForEach => Ok(Value::undefined()),
+            ArrayCallbackKind::Find | ArrayCallbackKind::FindLast => Ok(found_val),
+            ArrayCallbackKind::FindIndex | ArrayCallbackKind::FindLastIndex => Ok(Value::number(
+                NumberValue::from_f64(found_idx.map_or(-1.0, |i| i as f64)),
+            )),
+            ArrayCallbackKind::Every | ArrayCallbackKind::Some => Ok(Value::boolean(bool_acc)),
+            ArrayCallbackKind::Reduce | ArrayCallbackKind::ReduceRight => {
+                if !reduce_has_init {
+                    return Err(NativeError::TypeError {
+                        name: "reduce",
+                        reason: "empty array with no initial value".to_string(),
+                    });
                 }
-                ArrayCallbackKind::FindIndex | ArrayCallbackKind::FindLastIndex
-                    if result.to_boolean(interp.gc_heap()) =>
-                {
-                    found_idx = Some(idx);
-                    break;
-                }
-                ArrayCallbackKind::Every if !result.to_boolean(interp.gc_heap()) => {
-                    bool_acc = false;
-                    break;
-                }
-                ArrayCallbackKind::Some if result.to_boolean(interp.gc_heap()) => {
-                    bool_acc = true;
-                    break;
-                }
-                ArrayCallbackKind::Reduce | ArrayCallbackKind::ReduceRight => {
-                    acc = result;
-                    interp.set_iteration_anchor(anchor_base + A_ACC, acc);
-                }
-                _ => {}
+                Ok(acc)
+            }
+            ArrayCallbackKind::Map | ArrayCallbackKind::Filter | ArrayCallbackKind::FlatMap => {
+                output_target.ok_or_else(|| NativeError::TypeError {
+                    name: kind.name(),
+                    reason: "missing output target".to_string(),
+                })
             }
         }
-        Ok(())
-    })();
-    // Release the lean-path stack + reentry guard on every completion path
-    // (mirrors the anchor pop below), regardless of `walk` success/error.
-    interp.release_lean_callback_stack(lean_inner.take());
-    // Read the (possibly relocated) output target and accumulator back
-    // before releasing the anchors so the final result returns a live
-    // handle. `map`/`filter`/`flatMap` keep their target identity; other
-    // methods stay `None`.
-    output_target = output_target.map(|_| interp.iteration_anchor(anchor_base + A_OUTPUT));
-    acc = interp.iteration_anchor(anchor_base + A_ACC);
-    interp.pop_iteration_anchors_to(anchor_base);
-    walk?;
-    match kind {
-        ArrayCallbackKind::ForEach => Ok(Value::undefined()),
-        ArrayCallbackKind::Find | ArrayCallbackKind::FindLast => Ok(found_val),
-        ArrayCallbackKind::FindIndex | ArrayCallbackKind::FindLastIndex => Ok(Value::number(
-            NumberValue::from_f64(found_idx.map_or(-1.0, |i| i as f64)),
-        )),
-        ArrayCallbackKind::Every | ArrayCallbackKind::Some => Ok(Value::boolean(bool_acc)),
-        ArrayCallbackKind::Reduce | ArrayCallbackKind::ReduceRight => {
-            if !reduce_has_init {
-                return Err(NativeError::TypeError {
-                    name: "reduce",
-                    reason: "empty array with no initial value".to_string(),
-                });
-            }
-            Ok(acc)
-        }
-        ArrayCallbackKind::Map | ArrayCallbackKind::Filter | ArrayCallbackKind::FlatMap => {
-            output_target.ok_or_else(|| NativeError::TypeError {
-                name: kind.name(),
-                reason: "missing output target".to_string(),
-            })
-        }
-    }
+    })
 }
 
 fn native_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

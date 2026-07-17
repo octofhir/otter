@@ -48,6 +48,16 @@ pub enum JsError {
 }
 
 impl JsError {
+    /// Lift a dispatcher-facing native error into the owned marshalling model.
+    #[must_use]
+    pub(crate) fn from_native(error: NativeError) -> Self {
+        match error {
+            NativeError::Thrown { message, .. } => Self::Thrown(message),
+            NativeError::RangeError { reason, .. } => Self::Range(reason),
+            other => Self::Type(other.to_string()),
+        }
+    }
+
     /// Shorthand for a `TypeError` with a formatted message.
     #[must_use]
     pub fn type_error(message: impl Into<String>) -> Self {
@@ -92,11 +102,9 @@ impl JsError {
     /// user-thrown values as [`JsError::Thrown`].
     #[must_use]
     pub fn from_vm(interp: &crate::Interpreter, err: crate::VmError) -> Self {
-        match crate::native_function::vm_to_native_error(interp, err, "marshal") {
-            NativeError::Thrown { message, .. } => Self::Thrown(message),
-            NativeError::RangeError { reason, .. } => Self::Range(reason),
-            other => Self::Type(other.to_string()),
-        }
+        Self::from_native(crate::native_function::vm_to_native_error(
+            interp, err, "marshal",
+        ))
     }
 }
 

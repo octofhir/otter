@@ -263,30 +263,6 @@ impl Interpreter {
         self.free_reg_window(frame.registers.stack_base());
     }
 
-    /// Draw a materialized frame stack for synchronous re-entry, reusing its
-    /// observed capacity when a pooled stack is available.
-    #[inline]
-    pub(crate) fn take_reentry_stack(&mut self) -> ActivationStack {
-        self.reentry_stack_cache.pop().unwrap_or_default()
-    }
-
-    /// Return a drained re-entry stack to the pool for reuse. The stack is
-    /// cleared (it holds no live frames, so the pool is never GC-traced); a full
-    /// pool drops the stack instead.
-    #[inline]
-    pub(crate) fn recycle_reentry_stack(&mut self, mut stack: ActivationStack) {
-        while let Some(mut frame) = stack.pop() {
-            self.frame_release_cold(&mut frame);
-            self.reclaim_registers(&mut frame);
-        }
-        if self.reentry_stack_cache.len() < Self::REENTRY_STACK_CACHE_CAP {
-            self.reentry_stack_cache.push(stack);
-        }
-    }
-
-    /// Maximum pooled re-entry stacks retained at once.
-    const REENTRY_STACK_CACHE_CAP: usize = 64;
-
     /// Acquire (or lazily create) this frame's cold side record and
     /// then return a mutable borrow.
     #[inline]
@@ -566,17 +542,8 @@ impl Interpreter {
         }
     }
 
-    /// Return `value` from the top frame, first running any enclosing
-    /// `finally` blocks (§14.15.3).
-    pub(crate) fn return_running_finally(
-        &mut self,
-        stack: &mut ActivationStack,
-        value: Value,
-    ) -> Result<Option<Value>, VmError> {
-        self.return_running_finally_above(stack, ActivationFloor::ROOT, value)
-    }
-
-    /// Floor-aware counterpart to [`Self::return_running_finally`].
+    /// Return `value` from the top frame above `floor`, first running any
+    /// enclosing `finally` blocks (§14.15.3).
     pub(crate) fn return_running_finally_above(
         &mut self,
         stack: &mut ActivationStack,

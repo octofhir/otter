@@ -164,16 +164,14 @@ mod tests {
     }
 
     #[test]
-    fn hot_return_releases_owner_without_materializing_an_activation() {
+    fn hot_return_releases_owner_and_register_window() {
         let mut vm = Interpreter::new();
-        let pooled_before = vm.reentry_stack_cache.len();
         let (owner_id, _) = publish_test_owner(&mut vm, 17);
 
         vm.jit_finish_direct_call_returned(owner_id).unwrap();
 
         assert_eq!(vm.native_call_owners.len(), 0);
         assert_eq!(vm.register_stack.checkpoint(), 0);
-        assert_eq!(vm.reentry_stack_cache.len(), pooled_before);
     }
 
     #[test]

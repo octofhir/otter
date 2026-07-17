@@ -180,6 +180,7 @@ impl Interpreter {
             || value.is_proxy();
         if can_have_method {
             let method = match self.ordinary_get_value(
+                stack,
                 context,
                 value,
                 value,
@@ -188,14 +189,15 @@ impl Interpreter {
             )? {
                 VmGetOutcome::Value(v) => v,
                 VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, value, SmallVec::new())?
+                    self.run_callable_sync_rooted(stack, context, &getter, value, SmallVec::new())?
                 }
             };
             if !method.is_nullish() {
                 if !is_callable(&method) {
                     return Err(VmError::TypeMismatch);
                 }
-                let produced = self.run_callable_sync(context, &method, value, SmallVec::new())?;
+                let produced =
+                    self.run_callable_sync_rooted(stack, context, &method, value, SmallVec::new())?;
                 if produced.as_object().is_none()
                     && produced.as_generator().is_none()
                     && produced.as_iterator().is_none()
@@ -240,6 +242,7 @@ impl Interpreter {
             // `next` is read ONCE here; later `IteratorNext` ticks must not
             // re-read it (observable via an accessor-defined `next`).
             let next_method = match self.ordinary_get_value(
+                stack,
                 context,
                 produced,
                 produced,
@@ -247,9 +250,13 @@ impl Interpreter {
                 0,
             )? {
                 VmGetOutcome::Value(v) => v,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, produced, SmallVec::new())?
-                }
+                VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+                    stack,
+                    context,
+                    &getter,
+                    produced,
+                    SmallVec::new(),
+                )?,
             };
             IteratorState::User {
                 iterator: produced,
@@ -290,6 +297,7 @@ impl Interpreter {
             let proto = self.constructor_prototype_value("Array")?;
             let proto_has = if own_method.is_none() {
                 self.ordinary_has_property_value(
+                    stack,
                     context,
                     proto,
                     &VmPropertyKey::Symbol(iter_sym),
@@ -303,6 +311,7 @@ impl Interpreter {
                     method
                 } else {
                     match self.ordinary_get_value(
+                        stack,
                         context,
                         proto,
                         value,
@@ -310,17 +319,26 @@ impl Interpreter {
                         0,
                     )? {
                         VmGetOutcome::Value(v) => v,
-                        VmGetOutcome::InvokeGetter { getter } => {
-                            self.run_callable_sync(context, &getter, value, SmallVec::new())?
-                        }
+                        VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+                            stack,
+                            context,
+                            &getter,
+                            value,
+                            SmallVec::new(),
+                        )?,
                     }
                 };
                 if callee.is_undefined() || callee.is_null() || !is_callable(&callee) {
                     return Err(VmError::TypeMismatch);
                 }
                 let receiver = *read_register(&stack[top_idx], src)?;
-                let produced =
-                    self.run_callable_sync(context, &callee, receiver, SmallVec::new())?;
+                let produced = self.run_callable_sync_rooted(
+                    stack,
+                    context,
+                    &callee,
+                    receiver,
+                    SmallVec::new(),
+                )?;
                 let wrapped = self.wrap_iterator_method_result(context, stack, produced)?;
                 write_register(&mut stack[top_idx], dst, wrapped)?;
                 return Ok(());
@@ -333,6 +351,7 @@ impl Interpreter {
         // through its prototype's `@@iterator`.
         if value.as_typed_array(&self.gc_heap).is_some() {
             let callee = match self.ordinary_get_value(
+                stack,
                 context,
                 value,
                 value,
@@ -341,14 +360,15 @@ impl Interpreter {
             )? {
                 VmGetOutcome::Value(v) => v,
                 VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, value, SmallVec::new())?
+                    self.run_callable_sync_rooted(stack, context, &getter, value, SmallVec::new())?
                 }
             };
             if !is_callable(&callee) {
                 return Err(VmError::TypeMismatch);
             }
             let receiver = *read_register(&stack[top_idx], src)?;
-            let produced = self.run_callable_sync(context, &callee, receiver, SmallVec::new())?;
+            let produced =
+                self.run_callable_sync_rooted(stack, context, &callee, receiver, SmallVec::new())?;
             let wrapped = self.wrap_iterator_method_result(context, stack, produced)?;
             write_register(&mut stack[top_idx], dst, wrapped)?;
             return Ok(());
@@ -362,6 +382,7 @@ impl Interpreter {
         }
 
         let callee = match self.ordinary_get_value(
+            stack,
             context,
             value,
             value,
@@ -370,7 +391,7 @@ impl Interpreter {
         )? {
             VmGetOutcome::Value(v) => v,
             VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, value, SmallVec::new())?
+                self.run_callable_sync_rooted(stack, context, &getter, value, SmallVec::new())?
             }
         };
         if callee.is_undefined() || callee.is_null() || !is_callable(&callee) {
@@ -378,7 +399,8 @@ impl Interpreter {
             return Err(VmError::TypeMismatch);
         }
         let receiver = *read_register(&stack[top_idx], src)?;
-        let produced = self.run_callable_sync(context, &callee, receiver, SmallVec::new())?;
+        let produced =
+            self.run_callable_sync_rooted(stack, context, &callee, receiver, SmallVec::new())?;
         let wrapped = self.wrap_iterator_method_result(context, stack, produced)?;
         write_register(&mut stack[top_idx], dst, wrapped)?;
         Ok(())
@@ -414,15 +436,16 @@ impl Interpreter {
     /// its abrupt completion. Spec: IteratorComplete / IteratorValue.
     fn iter_result_get(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         record: Value,
         name: &'static str,
     ) -> Result<Value, VmError> {
         let key = crate::VmPropertyKey::String(name);
-        match self.ordinary_get_value(context, record, record, &key, 0)? {
+        match self.ordinary_get_value(stack, context, record, record, &key, 0)? {
             crate::VmGetOutcome::Value(v) => Ok(v),
             crate::VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, record, SmallVec::new())
+                self.run_callable_sync_rooted(stack, context, &getter, record, SmallVec::new())
             }
         }
     }
@@ -537,6 +560,7 @@ impl Interpreter {
         match snapshot {
             IteratorStateSnapshot::Generator(handle) => {
                 let result = self.resume_generator(
+                    stack,
                     context,
                     &handle,
                     GeneratorResumeKind::Next(Value::undefined()),
@@ -563,18 +587,31 @@ impl Interpreter {
                     Some(next_fn) => next_fn,
                     None => {
                         let key = crate::VmPropertyKey::String("next");
-                        match self.ordinary_get_value(context, iter_value, iter_value, &key, 0)? {
+                        match self
+                            .ordinary_get_value(stack, context, iter_value, iter_value, &key, 0)?
+                        {
                             crate::VmGetOutcome::Value(v) => v,
                             crate::VmGetOutcome::InvokeGetter { getter } => self
-                                .run_callable_sync(context, &getter, iter_value, SmallVec::new())?,
+                                .run_callable_sync_rooted(
+                                    stack,
+                                    context,
+                                    &getter,
+                                    iter_value,
+                                    SmallVec::new(),
+                                )?,
                         }
                     }
                 };
                 if !self.is_callable_runtime(&next_fn) {
                     return Err(VmError::TypeMismatch);
                 }
-                let result =
-                    self.run_callable_sync(context, &next_fn, iter_value, SmallVec::new())?;
+                let result = self.run_callable_sync_rooted(
+                    stack,
+                    context,
+                    &next_fn,
+                    iter_value,
+                    SmallVec::new(),
+                )?;
                 if !crate::reflect::is_type_object_value(&result) {
                     return Err(
                         self.err_type(("iterator result is not an object".to_string()).into())
@@ -587,13 +624,13 @@ impl Interpreter {
                 // than silently reading `undefined` (which would never
                 // terminate a `done`-less iterator).
                 let done = self
-                    .iter_result_get(context, result, "done")?
+                    .iter_result_get(stack, context, result, "done")?
                     .to_boolean(&self.gc_heap);
                 if done {
                     self.gc_heap.with_payload(*iter, |state| state.exhaust());
                     return Ok((Value::undefined(), true));
                 }
-                let value = self.iter_result_get(context, result, "value")?;
+                let value = self.iter_result_get(stack, context, result, "value")?;
                 Ok((value, false))
             }
             IteratorStateSnapshot::RegExpString {
@@ -658,7 +695,8 @@ impl Interpreter {
                         *running = true;
                     }
                 });
-                let mapped = match self.run_callable_sync(
+                let mapped = match self.run_callable_sync_rooted(
+                    stack,
                     context,
                     &mapper,
                     Value::undefined(),
@@ -674,7 +712,7 @@ impl Interpreter {
                     }
                     Err(err) => {
                         self.gc_heap.with_payload(*iter, |state| state.exhaust());
-                        self.close_iterator_preserving_throw(context, &source);
+                        self.close_iterator_preserving_throw(stack, context, &source);
                         return Err(err);
                     }
                 };
@@ -712,7 +750,8 @@ impl Interpreter {
                             *running = true;
                         }
                     });
-                    let kept = match self.run_callable_sync(
+                    let kept = match self.run_callable_sync_rooted(
+                        stack,
                         context,
                         &predicate,
                         Value::undefined(),
@@ -728,7 +767,7 @@ impl Interpreter {
                         }
                         Err(err) => {
                             self.gc_heap.with_payload(*iter, |state| state.exhaust());
-                            self.close_iterator_preserving_throw(context, &source);
+                            self.close_iterator_preserving_throw(stack, context, &source);
                             return Err(err);
                         }
                     };
@@ -761,7 +800,7 @@ impl Interpreter {
                     // §27.1.4.9 step 5.b.ii — the limit being reached
                     // closes the underlying iterator with a normal
                     // completion.
-                    self.iterator_close_value_sync(context, Value::iterator(source))?;
+                    self.iterator_close_value_sync(stack, context, Value::iterator(source))?;
                     return Ok((Value::undefined(), true));
                 }
                 self.gc_heap.with_payload(*iter, |state| {
@@ -862,7 +901,7 @@ impl Interpreter {
                         Ok(next) => next,
                         Err(err) => {
                             self.gc_heap.with_payload(*iter, |state| state.exhaust());
-                            self.close_iterator_preserving_throw(context, &source);
+                            self.close_iterator_preserving_throw(stack, context, &source);
                             return Err(err);
                         }
                     };
@@ -889,7 +928,8 @@ impl Interpreter {
                         *running = true;
                     }
                 });
-                let mapped = match self.run_callable_sync(
+                let mapped = match self.run_callable_sync_rooted(
+                    stack,
                     context,
                     &mapper,
                     Value::undefined(),
@@ -905,7 +945,7 @@ impl Interpreter {
                     }
                     Err(err) => {
                         self.gc_heap.with_payload(*iter, |state| state.exhaust());
-                        self.close_iterator_preserving_throw(context, &source);
+                        self.close_iterator_preserving_throw(stack, context, &source);
                         return Err(err);
                     }
                 };
@@ -949,23 +989,29 @@ impl Interpreter {
                         .well_known_symbols
                         .get(crate::symbol::WellKnown::Iterator);
                     let key = crate::VmPropertyKey::Symbol(iterator_sym);
-                    let outcome = match self.ordinary_get_value(context, mapped, mapped, &key, 0) {
-                        Ok(outcome) => outcome,
-                        Err(err) => {
-                            self.gc_heap.with_payload(*iter, |state| state.exhaust());
-                            self.close_iterator_preserving_throw(context, &source);
-                            return Err(err);
-                        }
-                    };
+                    let outcome =
+                        match self.ordinary_get_value(stack, context, mapped, mapped, &key, 0) {
+                            Ok(outcome) => outcome,
+                            Err(err) => {
+                                self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                                self.close_iterator_preserving_throw(stack, context, &source);
+                                return Err(err);
+                            }
+                        };
                     let iter_method = match outcome {
                         crate::VmGetOutcome::Value(v) => v,
                         crate::VmGetOutcome::InvokeGetter { getter } => match self
-                            .run_callable_sync(context, &getter, mapped, SmallVec::new())
-                        {
+                            .run_callable_sync_rooted(
+                                stack,
+                                context,
+                                &getter,
+                                mapped,
+                                SmallVec::new(),
+                            ) {
                             Ok(value) => value,
                             Err(err) => {
                                 self.gc_heap.with_payload(*iter, |state| state.exhaust());
-                                self.close_iterator_preserving_throw(context, &source);
+                                self.close_iterator_preserving_throw(stack, context, &source);
                                 return Err(err);
                             }
                         },
@@ -977,18 +1023,23 @@ impl Interpreter {
                         // its own `.next`.
                         mapped
                     } else if self.is_callable_runtime(&iter_method) {
-                        match self.run_callable_sync(context, &iter_method, mapped, SmallVec::new())
-                        {
+                        match self.run_callable_sync_rooted(
+                            stack,
+                            context,
+                            &iter_method,
+                            mapped,
+                            SmallVec::new(),
+                        ) {
                             Ok(value) => value,
                             Err(err) => {
                                 self.gc_heap.with_payload(*iter, |state| state.exhaust());
-                                self.close_iterator_preserving_throw(context, &source);
+                                self.close_iterator_preserving_throw(stack, context, &source);
                                 return Err(err);
                             }
                         }
                     } else {
                         self.gc_heap.with_payload(*iter, |state| state.exhaust());
-                        self.close_iterator_preserving_throw(context, &source);
+                        self.close_iterator_preserving_throw(stack, context, &source);
                         return Err(self.err_type(
                             ("Iterator.prototype.flatMap mapper return must be iterable"
                                 .to_string())
@@ -1012,30 +1063,35 @@ impl Interpreter {
                         // GetIteratorDirect caches `next` once.
                         let key = crate::VmPropertyKey::String("next");
                         let next_method = match match self
-                            .ordinary_get_value(context, iter_value, iter_value, &key, 0)
+                            .ordinary_get_value(stack, context, iter_value, iter_value, &key, 0)
                         {
                             Ok(outcome) => outcome,
                             Err(err) => {
                                 self.gc_heap.with_payload(*iter, |state| state.exhaust());
-                                self.close_iterator_preserving_throw(context, &source);
+                                self.close_iterator_preserving_throw(stack, context, &source);
                                 return Err(err);
                             }
                         } {
                             crate::VmGetOutcome::Value(v) => v,
                             crate::VmGetOutcome::InvokeGetter { getter } => match self
-                                .run_callable_sync(context, &getter, iter_value, SmallVec::new())
-                            {
+                                .run_callable_sync_rooted(
+                                    stack,
+                                    context,
+                                    &getter,
+                                    iter_value,
+                                    SmallVec::new(),
+                                ) {
                                 Ok(value) => value,
                                 Err(err) => {
                                     self.gc_heap.with_payload(*iter, |state| state.exhaust());
-                                    self.close_iterator_preserving_throw(context, &source);
+                                    self.close_iterator_preserving_throw(stack, context, &source);
                                     return Err(err);
                                 }
                             },
                         };
                         if !self.is_callable_runtime(&next_method) {
                             self.gc_heap.with_payload(*iter, |state| state.exhaust());
-                            self.close_iterator_preserving_throw(context, &source);
+                            self.close_iterator_preserving_throw(stack, context, &source);
                             return Err(self.err_type(
                                 ("Iterator.prototype.flatMap mapper return must be iterable"
                                     .to_string())
@@ -1049,7 +1105,7 @@ impl Interpreter {
                     }
                 } else {
                     self.gc_heap.with_payload(*iter, |state| state.exhaust());
-                    self.close_iterator_preserving_throw(context, &source);
+                    self.close_iterator_preserving_throw(stack, context, &source);
                     return Err(self.err_type(
                         ("Iterator.prototype.flatMap mapper return must be iterable".to_string())
                             .into(),
@@ -1075,6 +1131,7 @@ impl Interpreter {
 
     pub(crate) fn get_iterator_sync(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         iterable: &Value,
     ) -> Result<(Value, Value), VmError> {
@@ -1084,6 +1141,7 @@ impl Interpreter {
             let iterator_sym = interp.well_known_symbols.get(symbol::WellKnown::Iterator);
             let iterable = interp.iteration_anchor(iterable_anchor);
             let method = match interp.ordinary_get_value(
+                stack,
                 context,
                 iterable,
                 iterable,
@@ -1095,7 +1153,13 @@ impl Interpreter {
                     let getter_anchor = interp.push_iteration_anchor(getter) - 1;
                     let getter = interp.iteration_anchor(getter_anchor);
                     let iterable = interp.iteration_anchor(iterable_anchor);
-                    interp.run_callable_sync(context, &getter, iterable, SmallVec::new())?
+                    interp.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &getter,
+                        iterable,
+                        SmallVec::new(),
+                    )?
                 }
             };
             if method.is_undefined() || method.is_null() || !interp.is_callable_runtime(&method) {
@@ -1104,7 +1168,13 @@ impl Interpreter {
             let method_anchor = interp.push_iteration_anchor(method) - 1;
             let method = interp.iteration_anchor(method_anchor);
             let iterable = interp.iteration_anchor(iterable_anchor);
-            let iterator = interp.run_callable_sync(context, &method, iterable, SmallVec::new())?;
+            let iterator = interp.run_callable_sync_rooted(
+                stack,
+                context,
+                &method,
+                iterable,
+                SmallVec::new(),
+            )?;
             if !(iterator.is_object()
                 || iterator.is_proxy()
                 || iterator.is_array()
@@ -1119,6 +1189,7 @@ impl Interpreter {
             let iterator_anchor = interp.push_iteration_anchor(iterator) - 1;
             let iterator = interp.iteration_anchor(iterator_anchor);
             let next_method = match interp.ordinary_get_value(
+                stack,
                 context,
                 iterator,
                 iterator,
@@ -1130,7 +1201,13 @@ impl Interpreter {
                     let getter_anchor = interp.push_iteration_anchor(getter) - 1;
                     let getter = interp.iteration_anchor(getter_anchor);
                     let iterator = interp.iteration_anchor(iterator_anchor);
-                    interp.run_callable_sync(context, &getter, iterator, SmallVec::new())?
+                    interp.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &getter,
+                        iterator,
+                        SmallVec::new(),
+                    )?
                 }
             };
             Ok((interp.iteration_anchor(iterator_anchor), next_method))
@@ -1152,11 +1229,13 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-iteratorvalue>
     pub(crate) fn iterator_step_sync(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         iterator: &Value,
         next_method: &Value,
     ) -> Result<Option<Value>, VmError> {
-        let result = self.run_callable_sync(context, next_method, *iterator, SmallVec::new())?;
+        let result =
+            self.run_callable_sync_rooted(stack, context, next_method, *iterator, SmallVec::new())?;
         if !result.is_object() && !result.is_proxy() {
             return Err(self.err_type(("iterator result is not an object".to_string()).into()));
         }
@@ -1167,7 +1246,7 @@ impl Interpreter {
         // could reclaim the IterResult — its shape/keys would then
         // dangle when the second read walks the same shape chain.
         let anchor_depth = self.push_iteration_anchor(result);
-        let outcome = iterator_step_read(self, context, &result);
+        let outcome = iterator_step_read(self, stack, context, &result);
         self.pop_iteration_anchors_to(anchor_depth - 1);
         outcome
     }
@@ -1184,10 +1263,12 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-iteratorclose>
     pub(crate) fn iterator_close_sync(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         iterator: &Value,
     ) -> Result<(), VmError> {
         let return_method = match self.ordinary_get_value(
+            stack,
             context,
             *iterator,
             *iterator,
@@ -1196,7 +1277,7 @@ impl Interpreter {
         )? {
             VmGetOutcome::Value(v) => v,
             VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, *iterator, SmallVec::new())?
+                self.run_callable_sync_rooted(stack, context, &getter, *iterator, SmallVec::new())?
             }
         };
         if return_method.is_undefined() || return_method.is_null() {
@@ -1205,7 +1286,13 @@ impl Interpreter {
         if !self.is_callable_runtime(&return_method) {
             return Err(self.err_type(("iterator `return` is not callable".to_string()).into()));
         }
-        let result = self.run_callable_sync(context, &return_method, *iterator, SmallVec::new())?;
+        let result = self.run_callable_sync_rooted(
+            stack,
+            context,
+            &return_method,
+            *iterator,
+            SmallVec::new(),
+        )?;
         if !result.is_object() && !result.is_proxy() {
             return Err(
                 self.err_type(("iterator `return` did not yield an object".to_string()).into())
@@ -1216,6 +1303,7 @@ impl Interpreter {
 
     pub(crate) fn iterator_close_value_sync(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         iterator: Value,
     ) -> Result<(), VmError> {
@@ -1262,10 +1350,11 @@ impl Interpreter {
         };
         match action {
             CloseAction::User(close_target) => {
-                self.iterator_close_sync(context, &close_target)?;
+                self.iterator_close_sync(stack, context, &close_target)?;
             }
             CloseAction::Generator(handle) => {
                 self.resume_generator(
+                    stack,
                     context,
                     &handle,
                     GeneratorResumeKind::Return(Value::undefined()),
@@ -1278,10 +1367,12 @@ impl Interpreter {
                     self.gc_heap.with_payload(handle, |state| state.exhaust());
                 }
                 let inner_result = match inner {
-                    Some(inner) => self.iterator_close_value_sync(context, Value::iterator(inner)),
+                    Some(inner) => {
+                        self.iterator_close_value_sync(stack, context, Value::iterator(inner))
+                    }
                     None => Ok(()),
                 };
-                self.iterator_close_value_sync(context, Value::iterator(source))?;
+                self.iterator_close_value_sync(stack, context, Value::iterator(source))?;
                 inner_result?;
             }
             CloseAction::Builtin | CloseAction::None => {}
@@ -1294,11 +1385,12 @@ impl Interpreter {
     /// abrupt) is swallowed in favour of the original completion.
     pub(crate) fn close_iterator_preserving_throw(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         handle: &IteratorHandle,
     ) {
         let original_throw = self.take_pending_uncaught_throw();
-        let _ = self.iterator_close_value_sync(context, Value::iterator(*handle));
+        let _ = self.iterator_close_value_sync(stack, context, Value::iterator(*handle));
         if let Some(value) = original_throw {
             self.set_pending_uncaught_throw(value);
         }
@@ -1351,6 +1443,7 @@ impl Interpreter {
             let mut out: Vec<Value> = Vec::new();
             loop {
                 let result = self.resume_generator(
+                    stack,
                     context,
                     &handle,
                     GeneratorResumeKind::Next(Value::undefined()),
@@ -1386,7 +1479,7 @@ impl Interpreter {
             }
         }
 
-        let (iterator, next_method) = self.get_iterator_sync(context, iterable)?;
+        let (iterator, next_method) = self.get_iterator_sync(stack, context, iterable)?;
         // §7.4.13 — drive `IteratorStep` through the user iterator.
         // Each step calls into JS (the user's `next`), which can
         // trigger GC. Park the iterator + next-method handles on
@@ -1398,12 +1491,12 @@ impl Interpreter {
         self.push_iteration_anchor(next_method);
         let mut values: Vec<Value> = Vec::new();
         let result = loop {
-            match self.iterator_step_sync(context, &iterator, &next_method) {
+            match self.iterator_step_sync(stack, context, &iterator, &next_method) {
                 Ok(Some(value)) => values.push(value),
                 Ok(None) => break Ok(values),
                 Err(err) => {
                     // Best-effort close; original error wins.
-                    let _ = self.iterator_close_sync(context, &iterator);
+                    let _ = self.iterator_close_sync(stack, context, &iterator);
                     break Err(err);
                 }
             }
@@ -1481,7 +1574,7 @@ impl Interpreter {
         Ok(())
     }
 
-    /// Resume a generator object — drives the saved frame on a fresh sub-stack
+    /// Resume a generator object above a floor on the current activation stack
     /// until either an [`otter_bytecode::Op::Yield`] pauses it (returning
     /// `{value, done: false}`) or the body runs to completion (returning
     /// `{value: returnValue, done: true}`).
@@ -1502,6 +1595,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-generator.prototype.throw>
     pub fn resume_generator(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         handle: &crate::generator::JsGenerator,
         kind: GeneratorResumeKind,
@@ -1569,9 +1663,9 @@ impl Interpreter {
             if is_async {
                 handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::Executing);
             }
-            let mut sub_stack: ActivationStack = ActivationStack::new();
-            sub_stack.push(*frame);
-            return self.finish_generator_dispatch(context, handle, sub_stack, is_async);
+            let floor = stack.floor();
+            stack.push(*frame);
+            return self.finish_generator_dispatch(stack, floor, context, handle, is_async);
         }
         // Apply the resume operation to the frame before re-entering
         // dispatch.
@@ -1594,7 +1688,7 @@ impl Interpreter {
                     .map(|cold| cold.active_iterator_closers.clone())
                     .unwrap_or_default();
                 for (iterator, _) in closers.iter().rev() {
-                    self.iterator_close_value_sync(context, *iterator)?;
+                    self.iterator_close_value_sync(stack, context, *iterator)?;
                 }
                 // §27.5.3.4 GeneratorResumeAbrupt(return) — if the body
                 // is suspended inside a `try` with a `finally`, resume
@@ -1614,19 +1708,21 @@ impl Interpreter {
                 throw_value = Some(*reason);
             }
         }
-        let mut sub_stack: ActivationStack = ActivationStack::new();
-        sub_stack.push(*frame);
+        let floor = stack.floor();
+        stack.push(*frame);
         if let Some(arg) = return_value {
             // Drive the parked frame's `finally` blocks via the abrupt
             // `return` path; `EndFinally` resumes the completion.
-            match self.return_running_finally(&mut sub_stack, arg) {
+            match self.return_running_finally_above(stack, floor, arg) {
                 Ok(Some(v)) => {
                     handle.mark_done(&mut self.gc_heap);
+                    self.release_frames_above(stack, floor);
                     return self.make_runtime_rooted_iter_result(v, true, &[], &[]);
                 }
                 Ok(None) => { /* finally parked; dispatch below runs it */ }
                 Err(err) => {
                     handle.mark_done(&mut self.gc_heap);
+                    self.release_frames_above(stack, floor);
                     return Err(err);
                 }
             }
@@ -1638,14 +1734,15 @@ impl Interpreter {
             // converts the value to a string when it surfaces as
             // VmError::Uncaught, losing the payload).
             self.pending_generator_throw = Some(reason);
-            match self.unwind_throw(context, &mut sub_stack, reason) {
+            match self.unwind_throw_above(context, stack, floor, reason) {
                 Ok(_) => {}
                 Err(err) => {
                     handle.mark_done(&mut self.gc_heap);
+                    self.release_frames_above(stack, floor);
                     return Err(err);
                 }
             }
-            if sub_stack.is_empty() {
+            if stack.is_at_floor(floor) {
                 handle.mark_done(&mut self.gc_heap);
                 return Err(self.err_uncaught(("generator-throw".to_string()).into()));
             }
@@ -1656,7 +1753,7 @@ impl Interpreter {
         if is_async {
             handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::Executing);
         }
-        self.finish_generator_dispatch(context, handle, sub_stack, is_async)
+        self.finish_generator_dispatch(stack, floor, context, handle, is_async)
     }
 
     /// Run the resumed generator frame to its next suspension or
@@ -1664,13 +1761,14 @@ impl Interpreter {
     /// ordinary resume path and the §27.5.3.7 delegating resume.
     fn finish_generator_dispatch(
         &mut self,
+        stack: &mut ActivationStack,
+        floor: crate::ActivationFloor,
         context: &ExecutionContext,
         handle: &crate::generator::JsGenerator,
-        mut sub_stack: ActivationStack,
         is_async: bool,
     ) -> Result<Value, VmError> {
-        let outcome = self.dispatch_loop(context, &mut sub_stack);
-        match outcome {
+        let outcome = self.dispatch_loop_above_rooted(context, stack, floor);
+        let result = (|| match outcome {
             Ok(value) => {
                 // If a Yield fired, the gen body has the paused
                 // frame back; surface yielded_value as the result.
@@ -1695,8 +1793,6 @@ impl Interpreter {
                 // the frame: a parked await leaves the slot empty
                 // (the await microtask owns it) AND `sub_stack` is
                 // empty.
-                let frame_taken_by_await =
-                    handle.has_frame(&self.gc_heap) || sub_stack.is_empty() && is_async;
                 let parked = is_async && !handle.has_frame(&self.gc_heap) && {
                     // The await machinery stored the parked frame
                     // in its closure, not on the gen handle. Detect
@@ -1704,7 +1800,6 @@ impl Interpreter {
                     // exist — if so, it is awaiting.
                     handle.has_async_requests(&self.gc_heap)
                 };
-                let _ = frame_taken_by_await;
                 if parked {
                     // Body suspended on `Op::Await`; the resume
                     // microtask will eventually settle
@@ -1733,7 +1828,7 @@ impl Interpreter {
                     } else if let Some(thrown) = self.pending_uncaught_throw.take() {
                         Some(thrown)
                     } else {
-                        self.vm_error_to_throwable_with_stack_roots(Some(context), &sub_stack, &err)
+                        self.vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)
                     };
                     if let Some(reason) = rejection {
                         self.async_generator_complete_step(context, handle, Err(reason), true)?;
@@ -1743,7 +1838,9 @@ impl Interpreter {
                 }
                 Err(err)
             }
-        }
+        })();
+        self.release_frames_above(stack, floor);
+        result
     }
     /// Drive one tick of [`Op::GetIterator`] for user objects.
     ///
@@ -1818,6 +1915,7 @@ impl Interpreter {
             let proto = self.constructor_prototype_value("Array")?;
             let proto_has = if own_method.is_none() {
                 self.ordinary_has_property_value(
+                    stack,
                     context,
                     proto,
                     &VmPropertyKey::Symbol(iter_sym),
@@ -1831,6 +1929,7 @@ impl Interpreter {
                     method
                 } else {
                     match self.ordinary_get_value(
+                        stack,
                         context,
                         proto,
                         value,
@@ -1838,9 +1937,13 @@ impl Interpreter {
                         0,
                     )? {
                         VmGetOutcome::Value(v) => v,
-                        VmGetOutcome::InvokeGetter { getter } => {
-                            self.run_callable_sync(context, &getter, value, SmallVec::new())?
-                        }
+                        VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+                            stack,
+                            context,
+                            &getter,
+                            value,
+                            SmallVec::new(),
+                        )?,
                     }
                 };
                 if callee.is_undefined() || callee.is_null() || !is_callable(&callee) {
@@ -1859,6 +1962,7 @@ impl Interpreter {
         // iterator that observes element mutations during `for…of`).
         if value.as_typed_array(&self.gc_heap).is_some() {
             let callee = match self.ordinary_get_value(
+                stack,
                 context,
                 value,
                 value,
@@ -1867,7 +1971,7 @@ impl Interpreter {
             )? {
                 VmGetOutcome::Value(v) => v,
                 VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, value, SmallVec::new())?
+                    self.run_callable_sync_rooted(stack, context, &getter, value, SmallVec::new())?
                 }
             };
             if !is_callable(&callee) {
@@ -1886,6 +1990,7 @@ impl Interpreter {
         // @@iterator fires its getter (and the getter's abrupt
         // completion propagates) instead of reading a data slot.
         let callee = match self.ordinary_get_value(
+            stack,
             context,
             value,
             value,
@@ -1894,7 +1999,7 @@ impl Interpreter {
         )? {
             VmGetOutcome::Value(v) => v,
             VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, value, SmallVec::new())?
+                self.run_callable_sync_rooted(stack, context, &getter, value, SmallVec::new())?
             }
         };
         if callee.is_undefined() || callee.is_null() || !is_callable(&callee) {
@@ -1963,7 +2068,7 @@ impl Interpreter {
             // A throw out of the `done` / `value` getters also sets
             // [[Done]] (IteratorStepValue); drop the parked state so a
             // later IteratorNext at this pc starts fresh.
-            let step = match iterator_step_read(self, context, &result) {
+            let step = match iterator_step_read(self, stack, context, &result) {
                 Ok(step) => step,
                 Err(e) => {
                     if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
@@ -2010,6 +2115,7 @@ impl Interpreter {
         });
         if let Some(handle) = gen_handle {
             let result = self.resume_generator(
+                stack,
                 context,
                 &handle,
                 GeneratorResumeKind::Next(Value::undefined()),
@@ -2074,9 +2180,13 @@ impl Interpreter {
                 }
             });
             let value = match getter {
-                Some(g) => {
-                    self.run_callable_sync(context, &g, Value::array(array), SmallVec::new())?
-                }
+                Some(g) => self.run_callable_sync_rooted(
+                    stack,
+                    context,
+                    &g,
+                    Value::array(array),
+                    SmallVec::new(),
+                )?,
                 None => Value::undefined(),
             };
             write_register(&mut stack[top_idx], value_dst, value)?;
@@ -2107,6 +2217,7 @@ impl Interpreter {
         let next_fn = match cached_next {
             Some(cached) => cached,
             None => match self.ordinary_get_value(
+                stack,
                 context,
                 user_iter_value,
                 user_iter_value,
@@ -2114,9 +2225,13 @@ impl Interpreter {
                 0,
             )? {
                 VmGetOutcome::Value(v) => v,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, user_iter_value, SmallVec::new())?
-                }
+                VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+                    stack,
+                    context,
+                    &getter,
+                    user_iter_value,
+                    SmallVec::new(),
+                )?,
             },
         };
         if !is_callable(&next_fn) {
@@ -2148,10 +2263,12 @@ impl Interpreter {
 
 fn iterator_step_read(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     result: &Value,
 ) -> Result<Option<Value>, VmError> {
     let done_value = match interp.ordinary_get_value(
+        stack,
         context,
         *result,
         *result,
@@ -2160,13 +2277,14 @@ fn iterator_step_read(
     )? {
         VmGetOutcome::Value(v) => v,
         VmGetOutcome::InvokeGetter { getter } => {
-            interp.run_callable_sync(context, &getter, *result, SmallVec::new())?
+            interp.run_callable_sync_rooted(stack, context, &getter, *result, SmallVec::new())?
         }
     };
     if done_value.to_boolean(interp.gc_heap()) {
         return Ok(None);
     }
     let value = match interp.ordinary_get_value(
+        stack,
         context,
         *result,
         *result,
@@ -2175,7 +2293,7 @@ fn iterator_step_read(
     )? {
         VmGetOutcome::Value(v) => v,
         VmGetOutcome::InvokeGetter { getter } => {
-            interp.run_callable_sync(context, &getter, *result, SmallVec::new())?
+            interp.run_callable_sync_rooted(stack, context, &getter, *result, SmallVec::new())?
         }
     };
     Ok(Some(value))

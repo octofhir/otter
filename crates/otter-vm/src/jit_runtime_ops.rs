@@ -83,6 +83,7 @@ impl Interpreter {
     /// operation, owns the compiled instruction PC.
     pub fn jit_runtime_numeric_op(
         &mut self,
+        stack: &mut crate::ActivationStack,
         context: &ExecutionContext,
         frame: &mut ActiveFrameMut<'_>,
         dst: u16,
@@ -95,7 +96,7 @@ impl Interpreter {
             .rhs_register()
             .map(|register| frame.read(register))
             .transpose()?;
-        let result = self.numeric_runtime_value(context, operation, lhs, rhs)?;
+        let result = self.numeric_runtime_value(stack, context, operation, lhs, rhs)?;
         frame.write(dst, result)
     }
 
@@ -123,6 +124,7 @@ impl Interpreter {
     /// hint; constant-pool lookup is confined to the native ABI adapter.
     pub fn jit_runtime_coerce_unary(
         &mut self,
+        stack: &mut crate::ActivationStack,
         context: &ExecutionContext,
         frame: &mut ActiveFrameMut<'_>,
         dst: u16,
@@ -131,7 +133,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         let input = frame.read(src)?;
-        let result = self.coerce_unary_value(context, input, operation)?;
+        let result = self.coerce_unary_value(stack, context, input, operation)?;
         frame.write(dst, result)
     }
 
@@ -140,6 +142,7 @@ impl Interpreter {
     /// commit and no source/destination register aliasing assumptions leak in.
     pub(crate) fn coerce_unary_value(
         &mut self,
+        stack: &mut crate::ActivationStack,
         context: &ExecutionContext,
         input: Value,
         operation: UnaryCoercionOp,
@@ -154,7 +157,7 @@ impl Interpreter {
             let primitive = if abstract_ops::is_primitive(&current) {
                 current
             } else {
-                interp.evaluate_to_primitive(context, &current, hint)?
+                interp.evaluate_to_primitive(stack, context, &current, hint)?
             };
             let primitive = interp.scoped_value(scope, primitive);
             let primitive_value = interp.escape_scoped(primitive);
@@ -203,13 +206,14 @@ impl Interpreter {
     /// Define one object-literal data property from decoded registers.
     pub fn jit_runtime_define_data_property(
         &mut self,
+        stack: &mut crate::ActivationStack,
         context: &ExecutionContext,
         frame: &mut ActiveFrameMut<'_>,
         object: u16,
         key: u16,
         value: u16,
     ) -> Result<(), VmError> {
-        self.run_define_data_property_active(context, frame, object, key, value)
+        self.run_define_data_property_active(stack, context, frame, object, key, value)
     }
 
     /// Replace one loop-captured upvalue cell with a fresh TDZ cell.
@@ -258,13 +262,14 @@ impl Interpreter {
     /// Apply a descriptor object through `OrdinaryDefineOwnProperty`.
     pub fn jit_runtime_define_own_property(
         &mut self,
+        stack: &mut crate::ActivationStack,
         context: &ExecutionContext,
         frame: &mut ActiveFrameMut<'_>,
         target: u16,
         key: u16,
         descriptor: u16,
     ) -> Result<(), VmError> {
-        self.run_define_own_property_active(context, frame, target, key, descriptor)
+        self.run_define_own_property_active(stack, context, frame, target, key, descriptor)
     }
 
     /// Allocate a closure from decoded function and parent-upvalue indices.
@@ -358,13 +363,14 @@ impl Interpreter {
     #[allow(clippy::too_many_arguments)]
     pub fn jit_runtime_math_call(
         &mut self,
+        stack: &mut crate::ActivationStack,
         context: &ExecutionContext,
         frame: &mut ActiveFrameMut<'_>,
         dst: u16,
         method_id: u32,
         argument_regs: &[u16],
     ) -> Result<(), VmError> {
-        self.do_math_call_active(context, frame, dst, method_id, argument_regs)
+        self.do_math_call_active(stack, context, frame, dst, method_id, argument_regs)
     }
 }
 
@@ -402,8 +408,10 @@ mod tests {
         assert_eq!(UnaryPrimitiveHint::from_token("invalid"), None);
 
         let mut interp = Interpreter::new();
+        let mut stack = crate::ActivationStack::new();
         let primitive = interp
             .coerce_unary_value(
+                &mut stack,
                 &empty_context(),
                 crate::Value::boolean(true),
                 UnaryCoercionOp::ToPrimitive {
@@ -445,10 +453,12 @@ mod tests {
             let mut frame = unsafe { ActiveFrameMut::from_native_ptr(&mut native) }
                 .expect("valid native activation");
             let mut interp = Interpreter::new();
+            let mut stack = crate::ActivationStack::new();
             let context = empty_context();
 
             interp
                 .jit_runtime_numeric_op(
+                    &mut stack,
                     &context,
                     &mut frame,
                     2,
@@ -463,7 +473,14 @@ mod tests {
                 .jit_runtime_neg(&mut frame, 4, 1)
                 .expect("native negate runtime op");
             interp
-                .jit_runtime_coerce_unary(&context, &mut frame, 6, 5, UnaryCoercionOp::ToNumeric)
+                .jit_runtime_coerce_unary(
+                    &mut stack,
+                    &context,
+                    &mut frame,
+                    6,
+                    5,
+                    UnaryCoercionOp::ToNumeric,
+                )
                 .expect("native ToNumeric runtime op");
         }
 

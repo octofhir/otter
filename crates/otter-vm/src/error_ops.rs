@@ -42,7 +42,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let frame = &stack[top_idx];
         let value = *read_register(frame, msg_reg)?;
-        let owned_message = self.coerce_error_message(context, &value)?;
+        let owned_message = self.coerce_error_message(stack, context, &value)?;
         let obj = self.make_error_instance_with_stack_roots(
             stack,
             ErrorKind::Error,
@@ -74,7 +74,7 @@ impl Interpreter {
         let kind = ErrorKind::from_class_name(kind_name).ok_or(VmError::InvalidOperand)?;
         let frame = &stack[top_idx];
         let value = *read_register(frame, msg_reg)?;
-        let owned_message = self.coerce_error_message(context, &value)?;
+        let owned_message = self.coerce_error_message(stack, context, &value)?;
         let obj = self.make_error_instance_with_stack_roots(stack, kind, owned_message, &value)?;
         self.capture_error_stack_frames(context, stack, obj);
         let frame = &mut stack[top_idx];
@@ -113,13 +113,14 @@ impl Interpreter {
     /// ladder to [`Interpreter::coerce_to_string`].
     fn coerce_error_message(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         value: &Value,
     ) -> Result<Option<String>, VmError> {
         if value.is_undefined() {
             return Ok(None);
         }
-        Ok(Some(self.coerce_to_string(context, value)?))
+        Ok(Some(self.coerce_to_string(stack, context, value)?))
     }
 
     fn make_error_instance_with_stack_roots(

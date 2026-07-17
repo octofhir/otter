@@ -23,8 +23,8 @@
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Frame, Interpreter, Value, VmError, VmGetOutcome, VmPropertyKey, object,
-    write_register,
+    ExecutionContext, Frame, Interpreter, Value, VmError, VmGetOutcome, VmPropertyKey,
+    activation_stack::ActivationStack, object, write_register,
 };
 
 impl Interpreter {
@@ -41,14 +41,17 @@ impl Interpreter {
     pub(crate) fn run_load_global_or_throw_reg(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut ActivationStack,
+        top_idx: usize,
         dst: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
+        let function_id = stack[top_idx].function_id;
         self.run_load_global_or_throw_reg_for_function(
             context,
-            frame,
-            frame.function_id,
+            stack,
+            top_idx,
+            function_id,
             dst,
             name_idx,
         )
@@ -57,12 +60,14 @@ impl Interpreter {
     pub(crate) fn run_load_global_or_throw_reg_for_function(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut ActivationStack,
+        top_idx: usize,
         function_id: u32,
         dst: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
-        let value = self.load_global_or_throw_value(context, function_id, name_idx)?;
+        let value = self.load_global_or_throw_value(stack, context, function_id, name_idx)?;
+        let frame = &mut stack[top_idx];
         write_register(frame, dst, value)?;
         frame.advance_pc()?;
         Ok(())
@@ -77,6 +82,7 @@ impl Interpreter {
     /// the dispatch tier.
     pub(crate) fn load_global_or_throw_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         function_id: u32,
         name_idx: u32,
@@ -114,13 +120,15 @@ impl Interpreter {
         }
         let receiver = Value::object(self.global_this);
         let key = VmPropertyKey::String(name);
-        if !self.ordinary_has_property_value(context, receiver, &key, 0)? {
+        if !self.ordinary_has_property_value(stack, context, receiver, &key, 0)? {
             return Err(self.err_undefined_ident((name.to_string()).into()));
         }
-        let value = match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
+        let receiver = Value::object(self.global_this);
+        let value = match self.ordinary_get_value(stack, context, receiver, receiver, &key, 0)? {
             VmGetOutcome::Value(value) => value,
             VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
+                let receiver = Value::object(self.global_this);
+                self.run_callable_sync_rooted(stack, context, &getter, receiver, SmallVec::new())?
             }
         };
         Ok(value)
@@ -129,10 +137,12 @@ impl Interpreter {
     pub(crate) fn run_load_global_or_undefined_reg(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut ActivationStack,
+        top_idx: usize,
         dst: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
+        let frame = &stack[top_idx];
         let name = context
             .string_constant_str_for_function(frame.function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
@@ -148,13 +158,21 @@ impl Interpreter {
             // abrupt completion propagates).
             let receiver = Value::object(self.global_this);
             let key = crate::VmPropertyKey::String(name);
-            match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
+            match self.ordinary_get_value(stack, context, receiver, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => value,
                 VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
+                    let receiver = Value::object(self.global_this);
+                    self.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &getter,
+                        receiver,
+                        SmallVec::new(),
+                    )?
                 }
             }
         };
+        let frame = &mut stack[top_idx];
         write_register(frame, dst, value)?;
         frame.advance_pc()?;
         Ok(())
@@ -332,20 +350,21 @@ impl Interpreter {
     pub(crate) fn run_load_dynamic_reg(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut ActivationStack,
+        top_idx: usize,
         dst: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
         let name = context
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        if let Some(cell) = self.frame_eval_var(frame, name) {
+        if let Some(cell) = self.frame_eval_var(&stack[top_idx], name) {
             let value = crate::read_upvalue(&self.gc_heap, cell);
-            write_register(frame, dst, value)?;
-            frame.advance_pc()?;
+            write_register(&mut stack[top_idx], dst, value)?;
+            stack[top_idx].advance_pc()?;
             return Ok(());
         }
-        self.run_load_global_or_throw_reg(context, frame, dst, name_idx)
+        self.run_load_global_or_throw_reg(context, stack, top_idx, dst, name_idx)
     }
 
     /// `Op::StoreDynamic` — §10.2.4.2 PutValue counterpart of
@@ -355,22 +374,23 @@ impl Interpreter {
     pub(crate) fn run_store_dynamic_reg(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut ActivationStack,
+        top_idx: usize,
         value_reg: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
         let name = context
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        let value = *crate::read_register(frame, value_reg)?;
-        if let Some(cell) = self.frame_eval_var(frame, name) {
+        let value = *crate::read_register(&stack[top_idx], value_reg)?;
+        if let Some(cell) = self.frame_eval_var(&stack[top_idx], name) {
             crate::store_upvalue(&mut self.gc_heap, cell, value);
-            frame.advance_pc()?;
+            stack[top_idx].advance_pc()?;
             return Ok(());
         }
         // Fall through to the full global SetMutableBinding so
         // realm-wide lexical bindings stay visible (sloppy mode).
-        self.run_store_global_binding_reg(context, frame, value_reg, name_idx, false)
+        self.run_store_global_binding_reg(context, stack, top_idx, value_reg, name_idx, false)
     }
 
     /// `Op::TypeofDynamic` — `typeof` flavour of
@@ -379,20 +399,21 @@ impl Interpreter {
     pub(crate) fn run_typeof_dynamic_reg(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut ActivationStack,
+        top_idx: usize,
         dst: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
         let name = context
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        if let Some(cell) = self.frame_eval_var(frame, name) {
+        if let Some(cell) = self.frame_eval_var(&stack[top_idx], name) {
             let value = crate::read_upvalue(&self.gc_heap, cell);
-            write_register(frame, dst, value)?;
-            frame.advance_pc()?;
+            write_register(&mut stack[top_idx], dst, value)?;
+            stack[top_idx].advance_pc()?;
             return Ok(());
         }
-        self.run_load_global_or_undefined_reg(context, frame, dst, name_idx)
+        self.run_load_global_or_undefined_reg(context, stack, top_idx, dst, name_idx)
     }
 
     /// `Op::DeleteDynamic` — §13.5.1.2 delete of a name that may
@@ -601,11 +622,13 @@ impl Interpreter {
     pub(crate) fn run_store_global_checked_reg(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut ActivationStack,
+        top_idx: usize,
         value_reg: u16,
         name_idx: u32,
         exists_reg: u16,
     ) -> Result<(), VmError> {
+        let frame = &stack[top_idx];
         let existed = crate::read_register(frame, exists_reg)?
             .as_boolean()
             .unwrap_or(false);
@@ -615,17 +638,19 @@ impl Interpreter {
                 .ok_or(VmError::InvalidOperand)?;
             return Err(self.err_undefined_ident((name.to_string()).into()));
         }
-        self.run_store_global_binding_reg(context, frame, value_reg, name_idx, true)
+        self.run_store_global_binding_reg(context, stack, top_idx, value_reg, name_idx, true)
     }
 
     pub(crate) fn run_store_global_binding_reg(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut ActivationStack,
+        top_idx: usize,
         value_reg: u16,
         name_idx: u32,
         strict: bool,
     ) -> Result<(), VmError> {
+        let frame = &stack[top_idx];
         let name = context
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
@@ -642,7 +667,7 @@ impl Interpreter {
                 ));
             }
             crate::store_upvalue(&mut self.gc_heap, cell, value);
-            frame.advance_pc()?;
+            stack[top_idx].advance_pc()?;
             return Ok(());
         }
         // §9.1.1.4.18 object-record SetMutableBinding — strict mode
@@ -655,10 +680,12 @@ impl Interpreter {
         }
         let receiver = Value::object(self.global_this);
         let key = VmPropertyKey::String(name);
-        if !self.ordinary_set_data_value(context, receiver, &key, value, receiver, 0)? && strict {
+        if !self.ordinary_set_data_value(stack, context, receiver, &key, value, receiver, 0)?
+            && strict
+        {
             return Err(self.err_type((format!("Cannot assign to property '{name}'")).into()));
         }
-        frame.advance_pc()?;
+        stack[top_idx].advance_pc()?;
         Ok(())
     }
 }

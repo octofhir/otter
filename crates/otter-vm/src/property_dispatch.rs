@@ -55,6 +55,7 @@ enum MetadataProtoSet {
 impl Interpreter {
     fn store_array_accessor_property(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         arr: JsArray,
         key: &str,
@@ -68,7 +69,7 @@ impl Interpreter {
             Some(setter) if abstract_ops::is_callable(&setter) => {
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                 args.push(*value);
-                self.run_callable_sync(context, &setter, Value::array(arr), args)?;
+                self.run_callable_sync_rooted(stack, context, &setter, Value::array(arr), args)?;
             }
             _ => {
                 self.failed_set_result(
@@ -138,6 +139,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-toprimitive>
     pub(crate) fn coerce_property_key_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         value: Value,
     ) -> Result<Value, VmError> {
@@ -166,7 +168,7 @@ impl Interpreter {
             let js = JsString::from_str(&b.to_decimal_string(&self.gc_heap), self.gc_heap_mut())?;
             return Ok(Value::string(js));
         }
-        let key = self.to_property_key_sync(context, value)?;
+        let key = self.to_property_key_sync(stack, context, value)?;
         match key {
             VmPropertyKey::Symbol(sym) => Ok(Value::symbol(sym)),
             VmPropertyKey::Atom(atom) => {
@@ -186,6 +188,7 @@ impl Interpreter {
 
     fn load_string_primitive_property(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: &Value,
         string: JsString,
@@ -200,7 +203,7 @@ impl Interpreter {
                 None => Ok(Value::undefined()),
             },
             None if name == "length" => Ok(Value::number_i32(string.len() as i32)),
-            None => self.load_from_constructor_prototype(context, "String", receiver, name),
+            None => self.load_from_constructor_prototype(stack, context, "String", receiver, name),
         }
     }
 
@@ -256,14 +259,15 @@ impl Interpreter {
 
     pub(crate) fn run_has_property_regs(
         &mut self,
-        frame: &mut Frame,
+        stack: &mut ActivationStack,
+        top_idx: usize,
         context: &crate::execution_context::ExecutionContext,
         dst: u16,
         lhs: u16,
         rhs: u16,
     ) -> Result<(), VmError> {
-        let lhs = *read_register(frame, lhs)?;
-        let rhs = *read_register(frame, rhs)?;
+        let lhs = *read_register(&stack[top_idx], lhs)?;
+        let rhs = *read_register(&stack[top_idx], rhs)?;
         let key_name = if let Some(s) = lhs.as_string(&self.gc_heap) {
             Some(s.to_lossy_string(&self.gc_heap))
         } else if let Some(n) = lhs.as_number() {
@@ -289,16 +293,28 @@ impl Interpreter {
             } else {
                 return Err(VmError::TypeMismatch);
             };
-            self.ordinary_has_property_value(context, rhs, &vm_key, 0)?
+            self.ordinary_has_property_value(stack, context, rhs, &vm_key, 0)?
         } else if let Some(arr) = rhs.as_array() {
             // §13.10.1 `in` → HasProperty → OrdinaryHasProperty: own
             // elements / named props, then the Array.prototype chain
             // (inherited indices, `@@iterator`, …). The own-only
             // `has_array_property` is kept as the symbol-less fallback.
             if let Some(sym) = lhs.as_symbol(&self.gc_heap) {
-                self.ordinary_has_property_value(context, rhs, &VmPropertyKey::Symbol(sym), 0)?
+                self.ordinary_has_property_value(
+                    stack,
+                    context,
+                    rhs,
+                    &VmPropertyKey::Symbol(sym),
+                    0,
+                )?
             } else if let Some(name) = key_name.as_deref() {
-                self.ordinary_has_property_value(context, rhs, &VmPropertyKey::String(name), 0)?
+                self.ordinary_has_property_value(
+                    stack,
+                    context,
+                    rhs,
+                    &VmPropertyKey::String(name),
+                    0,
+                )?
             } else {
                 has_array_property(self, arr, &lhs)
             }
@@ -310,12 +326,12 @@ impl Interpreter {
             } else {
                 return Err(VmError::TypeMismatch);
             };
-            self.ordinary_has_property_value(context, rhs, &key, 0)?
+            self.ordinary_has_property_value(stack, context, rhs, &key, 0)?
         } else {
             return Err(VmError::TypeMismatch);
         };
-        write_register(frame, dst, Value::boolean(present))?;
-        frame.advance_pc()?;
+        write_register(&mut stack[top_idx], dst, Value::boolean(present))?;
+        stack[top_idx].advance_pc()?;
         Ok(())
     }
 
@@ -706,7 +722,7 @@ impl Interpreter {
         let key = match key {
             SuperReadKey::Resolved(k) => k,
             SuperReadKey::Computed(raw) => {
-                let coerced = self.coerce_property_key_value(context, raw)?;
+                let coerced = self.coerce_property_key_value(stack, context, raw)?;
                 if let Some(sym) = coerced.as_symbol(&self.gc_heap) {
                     VmPropertyKey::Symbol(sym)
                 } else if let Some(s) = coerced.as_string(&self.gc_heap) {
@@ -718,11 +734,15 @@ impl Interpreter {
                 }
             }
         };
-        let value = match self.ordinary_get_value(context, base, actual_this, &key, 0)? {
+        let value = match self.ordinary_get_value(stack, context, base, actual_this, &key, 0)? {
             VmGetOutcome::Value(v) => v,
-            VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, actual_this, SmallVec::new())?
-            }
+            VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+                stack,
+                context,
+                &getter,
+                actual_this,
+                SmallVec::new(),
+            )?,
         };
         write_register(&mut stack[top_idx], dst, value)?;
         stack[top_idx].advance_pc()?;
@@ -762,7 +782,7 @@ impl Interpreter {
                 None => return Err(VmError::TypeMismatch),
             },
             SuperReadKey::Computed(raw) => {
-                let coerced = self.coerce_property_key_value(context, raw)?;
+                let coerced = self.coerce_property_key_value(stack, context, raw)?;
                 if coerced.as_symbol(&self.gc_heap).is_some() {
                     // Symbol-keyed super writes are not yet exercised
                     // by the conformance subset; reject explicitly.
@@ -778,6 +798,7 @@ impl Interpreter {
         };
         let base_obj = base.as_object();
         self.ensure_deferred_namespace_ready(
+            stack,
             context,
             &base,
             !Self::deferred_key_is_symbol_like(&VmPropertyKey::String(&key)),
@@ -790,7 +811,7 @@ impl Interpreter {
             object::SetOutcome::InvokeSetter { setter } => {
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                 args.push(value);
-                self.run_callable_sync(context, &setter, actual_this, args)?;
+                self.run_callable_sync_rooted(stack, context, &setter, actual_this, args)?;
             }
             object::SetOutcome::Reject { .. } => {
                 self.failed_set_result(
@@ -800,6 +821,7 @@ impl Interpreter {
             }
             object::SetOutcome::ExoticParent { parent } => {
                 if !self.ordinary_set_data_value(
+                    stack,
                     context,
                     parent,
                     &VmPropertyKey::String(&key),
@@ -814,6 +836,7 @@ impl Interpreter {
                 // No setter on the super base — write an own data
                 // property on the receiver (`this`).
                 self.ensure_deferred_namespace_ready(
+                    stack,
                     context,
                     &actual_this,
                     !Self::deferred_key_is_symbol_like(&VmPropertyKey::String(&key)),
@@ -826,13 +849,12 @@ impl Interpreter {
                     // uninitialized (§10.4.6.5 step 7), which must surface
                     // before the namespace's non-writable rejection.
                     if object::module_namespace_env(this_obj, &self.gc_heap).is_some() {
-                        self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                        self.ordinary_get_own_property_descriptor_value(
+                            stack,
                             context,
                             actual_this,
                             &VmPropertyKey::String(&key),
                             0,
-                            &[&actual_this],
-                            &[],
                         )?;
                     }
                     if !self.ordinary_set_data_property(this_obj, &key, value)? {
@@ -864,11 +886,12 @@ impl Interpreter {
     pub(crate) fn run_set_prototype_regs(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut ActivationStack,
+        top_idx: usize,
         obj_reg: u16,
         proto_reg: u16,
     ) -> Result<(), VmError> {
-        let raw_proto = *read_register(frame, proto_reg)?;
+        let raw_proto = *read_register(&stack[top_idx], proto_reg)?;
         let proto = if raw_proto.is_object()
             || raw_proto.is_proxy()
             || raw_proto.is_iterator()
@@ -896,9 +919,9 @@ impl Interpreter {
         } else {
             return Err(VmError::TypeMismatch);
         };
-        let receiver = *read_register(frame, obj_reg)?;
+        let receiver = *read_register(&stack[top_idx], obj_reg)?;
         if receiver.is_object() {
-            let ok = self.set_prototype_value_proxy_aware(context, &receiver, &proto)?;
+            let ok = self.set_prototype_value_proxy_aware(stack, context, &receiver, &proto)?;
             if !ok {
                 return Err(self.err_type(("Object.setPrototypeOf failed".to_string()).into()));
             }
@@ -924,7 +947,7 @@ impl Interpreter {
         } else {
             return Err(VmError::TypeMismatch);
         }
-        frame.advance_pc()?;
+        stack[top_idx].advance_pc()?;
         Ok(())
     }
 
@@ -966,11 +989,15 @@ impl Interpreter {
         }
         let value = if receiver.as_object().is_some() {
             let key = VmPropertyKey::String(name);
-            match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
+            match self.ordinary_get_value(stack, context, receiver, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => value,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
-                }
+                VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+                    stack,
+                    context,
+                    &getter,
+                    receiver,
+                    SmallVec::new(),
+                )?,
             }
         } else if let Some(c) = receiver.as_class_constructor() {
             if name == "prototype" {
@@ -1008,11 +1035,16 @@ impl Interpreter {
                         Value::undefined()
                     } else {
                         let key = VmPropertyKey::String(name);
-                        match self.ordinary_get_value(context, parent, receiver, &key, 1)? {
+                        match self.ordinary_get_value(stack, context, parent, receiver, &key, 1)? {
                             VmGetOutcome::Value(v) => v,
-                            VmGetOutcome::InvokeGetter { getter } => {
-                                self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
-                            }
+                            VmGetOutcome::InvokeGetter { getter } => self
+                                .run_callable_sync_rooted(
+                                    stack,
+                                    context,
+                                    &getter,
+                                    receiver,
+                                    SmallVec::new(),
+                                )?,
                         }
                     }
                 } else if (name == "name" || name == "length")
@@ -1052,6 +1084,7 @@ impl Interpreter {
                     let walked = match parent {
                         Some(p) if !(p.is_object() || p.is_null() || p.is_undefined()) => {
                             match self.ordinary_get_value(
+                                stack,
                                 context,
                                 p,
                                 receiver,
@@ -1060,7 +1093,8 @@ impl Interpreter {
                             )? {
                                 VmGetOutcome::Value(v) => Some(v),
                                 VmGetOutcome::InvokeGetter { getter } => {
-                                    Some(self.run_callable_sync(
+                                    Some(self.run_callable_sync_rooted(
+                                        stack,
                                         context,
                                         &getter,
                                         receiver,
@@ -1077,7 +1111,7 @@ impl Interpreter {
                 }
             }
         } else if let Some(s) = receiver.as_string(&self.gc_heap) {
-            self.load_string_primitive_property(context, &receiver, s, name)?
+            self.load_string_primitive_property(stack, context, &receiver, s, name)?
         } else if receiver.is_array() {
             let v = &receiver;
             let a = v.as_array().unwrap();
@@ -1087,7 +1121,7 @@ impl Interpreter {
                 match getter {
                     Some(getter) if abstract_ops::is_callable(&getter) => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        Some(self.run_callable_sync(context, &getter, *v, args)?)
+                        Some(self.run_callable_sync_rooted(stack, context, &getter, *v, args)?)
                     }
                     _ => Some(Value::undefined()),
                 }
@@ -1104,6 +1138,7 @@ impl Interpreter {
                 None => match crate::array::prototype_override(a, &self.gc_heap) {
                     Some(proto) if proto.is_object_type() => {
                         match self.ordinary_get_value(
+                            stack,
                             context,
                             proto,
                             *v,
@@ -1111,13 +1146,20 @@ impl Interpreter {
                             0,
                         )? {
                             VmGetOutcome::Value(val) => val,
-                            VmGetOutcome::InvokeGetter { getter } => {
-                                self.run_callable_sync(context, &getter, *v, SmallVec::new())?
-                            }
+                            VmGetOutcome::InvokeGetter { getter } => self
+                                .run_callable_sync_rooted(
+                                    stack,
+                                    context,
+                                    &getter,
+                                    *v,
+                                    SmallVec::new(),
+                                )?,
                         }
                     }
                     Some(_) => Value::undefined(),
-                    None => self.load_from_constructor_prototype(context, "Array", v, name)?,
+                    None => {
+                        self.load_from_constructor_prototype(stack, context, "Array", v, name)?
+                    }
                 },
             }
         } else if let Some(fid) = receiver.as_function().or_else(|| {
@@ -1126,9 +1168,9 @@ impl Interpreter {
                 .map(|c| c.cached_function_id)
         }) {
             let owner = receiver.as_closure(&self.gc_heap);
-            self.function_property_get_stack_rooted_with_receiver(
-                context,
+            self.function_property_get_with_receiver(
                 stack,
+                context,
                 owner,
                 fid,
                 Some(receiver),
@@ -1141,7 +1183,7 @@ impl Interpreter {
                     object::DescriptorKind::Accessor { getter, .. } => match getter {
                         Some(g) => {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
-                            self.run_callable_sync(context, g, receiver, args)?
+                            self.run_callable_sync_rooted(stack, context, g, receiver, args)?
                         }
                         None => Value::undefined(),
                     },
@@ -1153,17 +1195,23 @@ impl Interpreter {
                 None => match native.prototype_override(&self.gc_heap) {
                     Some(parent) => {
                         let key = VmPropertyKey::String(name);
-                        match self.ordinary_get_value(context, parent, receiver, &key, 0)? {
+                        match self.ordinary_get_value(stack, context, parent, receiver, &key, 0)? {
                             VmGetOutcome::Value(value) => value,
-                            VmGetOutcome::InvokeGetter { getter } => {
-                                self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
-                            }
+                            VmGetOutcome::InvokeGetter { getter } => self
+                                .run_callable_sync_rooted(
+                                    stack,
+                                    context,
+                                    &getter,
+                                    receiver,
+                                    SmallVec::new(),
+                                )?,
                         }
                     }
                     None => {
                         if let Ok(proto) = self.function_prototype_object() {
                             let key = VmPropertyKey::String(name);
                             match self.ordinary_get_value(
+                                stack,
                                 context,
                                 Value::object(proto),
                                 receiver,
@@ -1171,12 +1219,14 @@ impl Interpreter {
                                 0,
                             )? {
                                 VmGetOutcome::Value(value) => value,
-                                VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
-                                    context,
-                                    &getter,
-                                    receiver,
-                                    SmallVec::new(),
-                                )?,
+                                VmGetOutcome::InvokeGetter { getter } => self
+                                    .run_callable_sync_rooted(
+                                        stack,
+                                        context,
+                                        &getter,
+                                        receiver,
+                                        SmallVec::new(),
+                                    )?,
                             }
                         } else {
                             Value::undefined()
@@ -1191,9 +1241,13 @@ impl Interpreter {
                 Some(desc) => match &desc.kind {
                     object::DescriptorKind::Data { value } => *value,
                     object::DescriptorKind::Accessor { getter, .. } => match getter {
-                        Some(g) if abstract_ops::is_callable(g) => {
-                            self.run_callable_sync(context, g, receiver, SmallVec::new())?
-                        }
+                        Some(g) if abstract_ops::is_callable(g) => self.run_callable_sync_rooted(
+                            stack,
+                            context,
+                            g,
+                            receiver,
+                            SmallVec::new(),
+                        )?,
                         _ => Value::undefined(),
                     },
                 },
@@ -1210,11 +1264,15 @@ impl Interpreter {
             // ladder checks the expando, the struct flag fast path, and
             // the prototype chain in spec order.
             let key = VmPropertyKey::String(name);
-            match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
+            match self.ordinary_get_value(stack, context, receiver, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => value,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
-                }
+                VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+                    stack,
+                    context,
+                    &getter,
+                    receiver,
+                    SmallVec::new(),
+                )?,
             }
         } else if let Some(s) = receiver.as_symbol(&self.gc_heap) {
             symbol_prototype::load_property(s, name)
@@ -1224,14 +1282,14 @@ impl Interpreter {
             // `next` / `return` / `throw` natives (and the helper
             // terminals like `map` / `forEach` / `toArray`) all
             // resolve uniformly via the realm prototype.
-            self.load_from_constructor_prototype(context, "Iterator", &receiver, name)?
+            self.load_from_constructor_prototype(stack, context, "Iterator", &receiver, name)?
         } else if receiver.is_weak_ref() || receiver.is_finalization_registry() {
             let proto_name = if receiver.is_weak_ref() {
                 "WeakRef"
             } else {
                 "FinalizationRegistry"
             };
-            self.load_from_constructor_prototype(context, proto_name, &receiver, name)?
+            self.load_from_constructor_prototype(stack, context, proto_name, &receiver, name)?
         } else if let Some(p) = receiver.as_promise() {
             // §27.2.5 — user-installed own properties
             // (`promise.then = fn`) live in a lazy expando bag;
@@ -1253,9 +1311,10 @@ impl Interpreter {
                     Value::undefined()
                 } else {
                     let key = VmPropertyKey::String(name);
-                    match self.ordinary_get_value(context, proto, receiver, &key, 0)? {
+                    match self.ordinary_get_value(stack, context, proto, receiver, &key, 0)? {
                         VmGetOutcome::Value(value) => value,
-                        VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
+                        VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+                            stack,
                             context,
                             &getter,
                             receiver,
@@ -1279,7 +1338,7 @@ impl Interpreter {
                     VmGetOutcome::Value(v) => v,
                     VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync(context, &getter, receiver, args)?
+                        self.run_callable_sync_rooted(stack, context, &getter, receiver, args)?
                     }
                 }
             } else {
@@ -1295,7 +1354,9 @@ impl Interpreter {
                     } else {
                         "WeakSet"
                     };
-                    self.load_from_constructor_prototype(context, proto_name, &receiver, name)?
+                    self.load_from_constructor_prototype(
+                        stack, context, proto_name, &receiver, name,
+                    )?
                 } else {
                     direct
                 }
@@ -1311,7 +1372,7 @@ impl Interpreter {
                     VmGetOutcome::Value(v) => v,
                     VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync(context, &getter, receiver, args)?
+                        self.run_callable_sync_rooted(stack, context, &getter, receiver, args)?
                     }
                 }
             } else {
@@ -1329,7 +1390,7 @@ impl Interpreter {
                     VmGetOutcome::Value(v) => v,
                     VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync(context, &getter, receiver, args)?
+                        self.run_callable_sync_rooted(stack, context, &getter, receiver, args)?
                     }
                 }
             } else {
@@ -1340,7 +1401,9 @@ impl Interpreter {
                     } else {
                         "ArrayBuffer"
                     };
-                    self.load_from_constructor_prototype(context, proto_name, &receiver, name)?
+                    self.load_from_constructor_prototype(
+                        stack, context, proto_name, &receiver, name,
+                    )?
                 } else {
                     direct
                 }
@@ -1356,13 +1419,15 @@ impl Interpreter {
                     VmGetOutcome::Value(v) => v,
                     VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync(context, &getter, receiver, args)?
+                        self.run_callable_sync_rooted(stack, context, &getter, receiver, args)?
                     }
                 }
             } else {
                 let direct = binary::data_view_prototype::load_property(&dv, &self.gc_heap, name);
                 if direct.is_undefined() {
-                    self.load_from_constructor_prototype(context, "DataView", &receiver, name)?
+                    self.load_from_constructor_prototype(
+                        stack, context, "DataView", &receiver, name,
+                    )?
                 } else {
                     direct
                 }
@@ -1384,7 +1449,7 @@ impl Interpreter {
                     VmGetOutcome::Value(v) => v,
                     VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync(context, &getter, receiver, args)?
+                        self.run_callable_sync_rooted(stack, context, &getter, receiver, args)?
                     }
                 }
             } else {
@@ -1399,6 +1464,7 @@ impl Interpreter {
                         Some(proto_obj) => {
                             let key = VmPropertyKey::String(name);
                             match self.ordinary_get_value(
+                                stack,
                                 context,
                                 Value::object(proto_obj),
                                 receiver,
@@ -1406,12 +1472,14 @@ impl Interpreter {
                                 0,
                             )? {
                                 VmGetOutcome::Value(v) => v,
-                                VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
-                                    context,
-                                    &getter,
-                                    receiver,
-                                    smallvec::SmallVec::new(),
-                                )?,
+                                VmGetOutcome::InvokeGetter { getter } => self
+                                    .run_callable_sync_rooted(
+                                        stack,
+                                        context,
+                                        &getter,
+                                        receiver,
+                                        smallvec::SmallVec::new(),
+                                    )?,
                             }
                         }
                         None => Value::undefined(),
@@ -1421,16 +1489,20 @@ impl Interpreter {
                 }
             }
         } else if receiver.is_big_int() {
-            self.load_from_constructor_prototype(context, "BigInt", &receiver, name)?
+            self.load_from_constructor_prototype(stack, context, "BigInt", &receiver, name)?
         } else if receiver.is_intl() {
             // ECMA-402: methods resolve through `Intl.<Kind>.prototype`;
             // `ordinary_get_value` walks the kind prototype.
             let key = VmPropertyKey::String(name);
-            match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
+            match self.ordinary_get_value(stack, context, receiver, receiver, &key, 0)? {
                 VmGetOutcome::Value(v) => v,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, receiver, smallvec::SmallVec::new())?
-                }
+                VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+                    stack,
+                    context,
+                    &getter,
+                    receiver,
+                    smallvec::SmallVec::new(),
+                )?,
             }
         } else {
             // Proxy and any other receiver not special-cased above resolve
@@ -1439,11 +1511,15 @@ impl Interpreter {
             // proxy pre-handling; the JIT bridge calls here directly, so this
             // fallback must cover proxies too.
             let key = VmPropertyKey::String(name);
-            match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
+            match self.ordinary_get_value(stack, context, receiver, receiver, &key, 0)? {
                 VmGetOutcome::Value(v) => v,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
-                }
+                VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+                    stack,
+                    context,
+                    &getter,
+                    receiver,
+                    SmallVec::new(),
+                )?,
             }
         };
         Ok(value)
@@ -1461,7 +1537,7 @@ impl Interpreter {
     pub(crate) fn store_property_value(
         &mut self,
         context: &ExecutionContext,
-        _stack: &mut ActivationStack,
+        stack: &mut ActivationStack,
         receiver: Value,
         name: &str,
         value: Value,
@@ -1492,9 +1568,17 @@ impl Interpreter {
         };
         let accepted = if let Some(wrapper_name) = wrapper_name {
             let parent = self.primitive_wrapper_prototype(wrapper_name)?;
-            self.ordinary_set_data_value(context, Value::object(parent), &key, value, receiver, 0)?
+            self.ordinary_set_data_value(
+                stack,
+                context,
+                Value::object(parent),
+                &key,
+                value,
+                receiver,
+                0,
+            )?
         } else {
-            self.ordinary_set_data_value(context, receiver, &key, value, receiver, 0)?
+            self.ordinary_set_data_value(stack, context, receiver, &key, value, receiver, 0)?
         };
         if !accepted {
             self.failed_set_result(strict, format!("Cannot assign to property '{name}'"))?;
@@ -1513,6 +1597,7 @@ impl Interpreter {
     /// inherited non-writable slot.
     fn callable_metadata_proto_set(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         name: &str,
@@ -1524,14 +1609,8 @@ impl Interpreter {
             if current.is_null() || current.is_undefined() {
                 return Ok(MetadataProtoSet::Create);
             }
-            let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
-                context,
-                current,
-                &key,
-                0,
-                &[&receiver, &current],
-                &[],
-            )?;
+            let desc =
+                self.ordinary_get_own_property_descriptor_value(stack, context, current, &key, 0)?;
             match desc {
                 Some(d) => {
                     return Ok(match &d.kind {
@@ -1574,7 +1653,7 @@ impl Interpreter {
         if let Some(o) = receiver.as_object()
             && object::deferred_namespace_target(o, &self.gc_heap).is_some()
         {
-            self.ensure_deferred_namespace_ready(context, &receiver, true)?;
+            self.ensure_deferred_namespace_ready(stack, context, &receiver, true)?;
             if !self.ordinary_set_data_property(o, name, value)? {
                 self.failed_set_result(
                     strict,
@@ -1623,7 +1702,9 @@ impl Interpreter {
                             object::SetOutcome::InvokeSetter { setter } => {
                                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                                 args.push(value);
-                                self.run_callable_sync(context, &setter, receiver, args)?;
+                                self.run_callable_sync_rooted(
+                                    stack, context, &setter, receiver, args,
+                                )?;
                                 stack[top_idx].advance_pc()?;
                                 return Ok(());
                             }
@@ -1676,6 +1757,7 @@ impl Interpreter {
                     ..Default::default()
                 };
                 let ok = self.define_own_property_value(
+                    stack,
                     context,
                     &receiver,
                     &crate::VmPropertyKey::String("length"),
@@ -1690,7 +1772,7 @@ impl Interpreter {
                 stack[top_idx].advance_pc()?;
                 return Ok(());
             }
-            if !self.store_array_accessor_property(context, a, name, &value, strict)? {
+            if !self.store_array_accessor_property(stack, context, a, name, &value, strict)? {
                 let has_own_named =
                     crate::array::get_named_property(a, &self.gc_heap, name).is_some();
                 if !has_own_named {
@@ -1700,7 +1782,13 @@ impl Interpreter {
                             object::SetOutcome::InvokeSetter { setter } => {
                                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                                 args.push(value);
-                                self.run_callable_sync(context, &setter, Value::array(a), args)?;
+                                self.run_callable_sync_rooted(
+                                    stack,
+                                    context,
+                                    &setter,
+                                    Value::array(a),
+                                    args,
+                                )?;
                                 stack[top_idx].advance_pc()?;
                                 return Ok(());
                             }
@@ -1727,7 +1815,7 @@ impl Interpreter {
                 // coercion, throwing for a Symbol / cross-type) before
                 // the index check, so side effects run even for an
                 // out-of-bounds write, which then discards the result.
-                let converted = self.typed_array_coerce_element(context, t.kind(), value)?;
+                let converted = self.typed_array_coerce_element(stack, context, t.kind(), value)?;
                 if !t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
                     && n.is_finite()
                     && n.fract() == 0.0
@@ -1742,7 +1830,9 @@ impl Interpreter {
                 // (accessors on %TypedArray.prototype% must fire),
                 // receiver-phase define on a fully-absent chain.
                 let vm_key = VmPropertyKey::OwnedString(name.to_string());
-                self.ordinary_set_data_value(context, receiver, &vm_key, value, receiver, 0)?;
+                self.ordinary_set_data_value(
+                    stack, context, receiver, &vm_key, value, receiver, 0,
+                )?;
             }
             None
         } else if let Some(fid) = receiver.as_function().or_else(|| {
@@ -1781,7 +1871,9 @@ impl Interpreter {
                         )?;
                         Some(bag)
                     }
-                    None => match self.callable_metadata_proto_set(context, receiver, name)? {
+                    None => match self
+                        .callable_metadata_proto_set(stack, context, receiver, name)?
+                    {
                         MetadataProtoSet::Reject => {
                             self.failed_set_result(
                                 strict,
@@ -1790,7 +1882,8 @@ impl Interpreter {
                             None
                         }
                         MetadataProtoSet::InvokeSetter(setter) => {
-                            self.run_callable_sync(
+                            self.run_callable_sync_rooted(
+                                stack,
                                 context,
                                 &setter,
                                 receiver,
@@ -1825,7 +1918,7 @@ impl Interpreter {
                 // §B.2.2.1 `__proto__` setter on %Object.prototype%) or
                 // read-only data slot on the prototype chain intercepts
                 // the write before an own property is created.
-                match self.callable_metadata_proto_set(context, receiver, name)? {
+                match self.callable_metadata_proto_set(stack, context, receiver, name)? {
                     MetadataProtoSet::Reject => {
                         self.failed_set_result(
                             strict,
@@ -1834,7 +1927,8 @@ impl Interpreter {
                         None
                     }
                     MetadataProtoSet::InvokeSetter(setter) => {
-                        self.run_callable_sync(
+                        self.run_callable_sync_rooted(
+                            stack,
                             context,
                             &setter,
                             receiver,
@@ -1878,7 +1972,7 @@ impl Interpreter {
                 // resolve the write along the [[Prototype]] rather than
                 // silently re-creating an own data property.
                 None if matches!(name, "name" | "length") => {
-                    match self.callable_metadata_proto_set(context, receiver, name)? {
+                    match self.callable_metadata_proto_set(stack, context, receiver, name)? {
                         MetadataProtoSet::Reject => {
                             self.failed_set_result(
                                 strict,
@@ -1889,7 +1983,8 @@ impl Interpreter {
                             )?;
                         }
                         MetadataProtoSet::InvokeSetter(setter) => {
-                            self.run_callable_sync(
+                            self.run_callable_sync_rooted(
+                                stack,
                                 context,
                                 &setter,
                                 receiver,
@@ -1942,7 +2037,7 @@ impl Interpreter {
                 // (%Function.prototype% rejects the non-writable slot)
                 // instead of re-creating an own data property.
                 None if matches!(name, "name" | "length") => {
-                    match self.callable_metadata_proto_set(context, receiver, name)? {
+                    match self.callable_metadata_proto_set(stack, context, receiver, name)? {
                         MetadataProtoSet::Reject => {
                             self.failed_set_result(
                                 strict,
@@ -1952,7 +2047,8 @@ impl Interpreter {
                             )?;
                         }
                         MetadataProtoSet::InvokeSetter(setter) => {
-                            self.run_callable_sync(
+                            self.run_callable_sync_rooted(
+                                stack,
                                 context,
                                 &setter,
                                 receiver,
@@ -2019,7 +2115,9 @@ impl Interpreter {
             // prototype chain (a getter-only accessor like `year`
             // rejects the write), receiver-phase define otherwise.
             let vm_key = VmPropertyKey::OwnedString(name.to_string());
-            if !self.ordinary_set_data_value(context, receiver, &vm_key, value, receiver, 0)? {
+            if !self
+                .ordinary_set_data_value(stack, context, receiver, &vm_key, value, receiver, 0)?
+            {
                 self.failed_set_result(
                     strict,
                     format!("Cannot assign to read-only property '{name}'"),
@@ -2032,7 +2130,9 @@ impl Interpreter {
             // walk first lets a getter-only accessor (`size`) reject
             // the write.
             let vm_key = VmPropertyKey::OwnedString(name.to_string());
-            if !self.ordinary_set_data_value(context, receiver, &vm_key, value, receiver, 0)? {
+            if !self
+                .ordinary_set_data_value(stack, context, receiver, &vm_key, value, receiver, 0)?
+            {
                 self.failed_set_result(
                     strict,
                     format!("Cannot assign to read-only property '{name}'"),
@@ -2046,7 +2146,9 @@ impl Interpreter {
             // had a chance to reject through accessors or read-only
             // descriptors.
             let vm_key = VmPropertyKey::OwnedString(name.to_string());
-            if !self.ordinary_set_data_value(context, receiver, &vm_key, value, receiver, 0)? {
+            if !self
+                .ordinary_set_data_value(stack, context, receiver, &vm_key, value, receiver, 0)?
+            {
                 self.failed_set_result(
                     strict,
                     format!("Cannot assign to read-only property '{name}'"),
@@ -2101,14 +2203,17 @@ impl Interpreter {
     pub(crate) fn run_load_element_regs(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut ActivationStack,
+        top_idx: usize,
         dst: u16,
         recv_reg: u16,
         idx_reg: u16,
     ) -> Result<(), VmError> {
-        let mut active = crate::ActiveFrameMut::materialized(frame);
-        self.frame_load_element(context, &mut active, dst, recv_reg, idx_reg)?;
-        active.advance_pc()
+        let receiver = *read_register(&stack[top_idx], recv_reg)?;
+        let key = *read_register(&stack[top_idx], idx_reg)?;
+        let value = self.load_element_values(stack, context, receiver, key)?;
+        write_register(&mut stack[top_idx], dst, value)?;
+        stack[top_idx].advance_pc()
     }
 
     /// Complete computed element lookup against either physical activation.
@@ -2117,24 +2222,30 @@ impl Interpreter {
     /// committed and the receiver is then re-read from the traced frame. This
     /// prevents a moving collection from leaving a stale receiver in a Rust
     /// local. Dispatch owns PC advancement.
-    pub(crate) fn frame_load_element(
+    pub(crate) fn load_element_values(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
-        frame: &mut crate::ActiveFrameMut<'_>,
-        dst: u16,
-        recv_reg: u16,
-        idx_reg: u16,
-    ) -> Result<(), VmError> {
-        let idx_value_raw = frame.read(idx_reg)?;
-        let recv = frame.read(recv_reg)?;
+        mut recv: Value,
+        mut idx_value_raw: Value,
+    ) -> Result<Value, VmError> {
+        let mut idx_value = Value::undefined();
+        let mut result = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: all rooted locals precede `roots` and remain stationary until
+        // the scope is explicitly dropped after the complete observable get.
+        unsafe {
+            roots.add_value(&mut recv);
+            roots.add_value(&mut idx_value_raw);
+            roots.add_value(&mut idx_value);
+            roots.add_value(&mut result);
+        }
         if recv.is_nullish() {
             return Err(
                 self.err_type(("Cannot read property of null or undefined".to_string()).into())
             );
         }
-        let idx_value = self.coerce_property_key_value(context, idx_value_raw)?;
-        frame.write(idx_reg, idx_value)?;
-        let recv = frame.read(recv_reg)?;
+        idx_value = self.coerce_property_key_value(stack, context, idx_value_raw)?;
         let value = if let Some(obj) = recv.as_object() {
             let key = if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 VmPropertyKey::Symbol(sym)
@@ -2145,10 +2256,10 @@ impl Interpreter {
             } else {
                 return Err(VmError::TypeMismatch);
             };
-            match self.ordinary_get_value(context, Value::object(obj), recv, &key, 0)? {
+            match self.ordinary_get_value(stack, context, Value::object(obj), recv, &key, 0)? {
                 VmGetOutcome::Value(value) => value,
                 VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, recv, SmallVec::new())?
+                    self.run_callable_sync_rooted(stack, context, &getter, recv, SmallVec::new())?
                 }
             }
         } else if let Some(arr) = recv.as_array() {
@@ -2161,12 +2272,12 @@ impl Interpreter {
                         v
                     } else {
                         let key = VmPropertyKey::Symbol(sym);
-                        match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                        match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
                             crate::VmGetOutcome::Value(v) => v,
                             crate::VmGetOutcome::InvokeGetter { getter } => {
                                 let args: smallvec::SmallVec<[Value; 8]> =
                                     smallvec::SmallVec::new();
-                                self.run_callable_sync(context, &getter, recv, args)?
+                                self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
                             }
                         }
                     }
@@ -2200,7 +2311,7 @@ impl Interpreter {
                     match getter {
                         Some(getter) if abstract_ops::is_callable(&getter) => {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
-                            self.run_callable_sync(context, &getter, recv, args)?
+                            self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
                         }
                         _ => Value::undefined(),
                     }
@@ -2211,14 +2322,14 @@ impl Interpreter {
                     if crate::array::has_own_element(arr, &self.gc_heap, idx as usize) {
                         crate::array::get(arr, &self.gc_heap, idx as usize)
                     } else {
-                        self.load_from_constructor_prototype(context, "Array", &recv, &name)?
+                        self.load_from_constructor_prototype(stack, context, "Array", &recv, &name)?
                     }
                 } else {
                     match crate::array::get_named_property(arr, &self.gc_heap, &name) {
                         Some(v) => v,
-                        None => {
-                            self.load_from_constructor_prototype(context, "Array", &recv, &name)?
-                        }
+                        None => self.load_from_constructor_prototype(
+                            stack, context, "Array", &recv, &name,
+                        )?,
                     }
                 }
             } else if let Some(n) = idx_value.as_number() {
@@ -2241,7 +2352,8 @@ impl Interpreter {
                                 Some(getter) if abstract_ops::is_callable(&getter) => {
                                     let args: smallvec::SmallVec<[Value; 8]> =
                                         smallvec::SmallVec::new();
-                                    self.run_callable_sync(
+                                    self.run_callable_sync_rooted(
+                                        stack,
                                         context,
                                         &getter,
                                         Value::array(arr),
@@ -2255,6 +2367,7 @@ impl Interpreter {
                         } else {
                             // §10.4.2.4 — an absent index falls to Array.prototype.
                             self.load_from_constructor_prototype(
+                                stack,
                                 context,
                                 "Array",
                                 &recv,
@@ -2287,11 +2400,11 @@ impl Interpreter {
                 }
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let key = VmPropertyKey::Symbol(sym);
-                match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync(context, &getter, recv, args)?
+                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
                     }
                 }
             } else {
@@ -2306,20 +2419,20 @@ impl Interpreter {
             if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let key = key.to_lossy_string(&self.gc_heap);
                 let key = VmPropertyKey::OwnedString(key);
-                match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync(context, &getter, recv, args)?
+                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
                     }
                 }
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let key = VmPropertyKey::Symbol(sym);
-                match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync(context, &getter, recv, args)?
+                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
                     }
                 }
             } else {
@@ -2331,20 +2444,20 @@ impl Interpreter {
             if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let key = key.to_lossy_string(&self.gc_heap);
                 let key = VmPropertyKey::OwnedString(key);
-                match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync(context, &getter, recv, args)?
+                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
                     }
                 }
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let key = VmPropertyKey::Symbol(sym);
-                match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync(context, &getter, recv, args)?
+                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
                     }
                 }
             } else {
@@ -2369,7 +2482,7 @@ impl Interpreter {
                             VmGetOutcome::Value(v) => v,
                             VmGetOutcome::InvokeGetter { getter } => {
                                 let args: SmallVec<[Value; 8]> = SmallVec::new();
-                                self.run_callable_sync(context, &getter, recv, args)?
+                                self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
                             }
                         };
                         found = true;
@@ -2379,7 +2492,9 @@ impl Interpreter {
                             binary::typed_array_prototype::load_property(&t, &self.gc_heap, &name);
                         value = if direct.is_undefined() {
                             let kind_name = t.kind().name();
-                            self.load_from_constructor_prototype(context, kind_name, &recv, &name)?
+                            self.load_from_constructor_prototype(
+                                stack, context, kind_name, &recv, &name,
+                            )?
                         } else {
                             direct
                         };
@@ -2396,11 +2511,11 @@ impl Interpreter {
                 }
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let key = VmPropertyKey::Symbol(sym);
-                match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync(context, &getter, recv, args)?
+                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
                     }
                 }
             } else {
@@ -2411,25 +2526,25 @@ impl Interpreter {
             // unit indexed access then String.prototype fallback.
             if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let name = key.to_lossy_string(&self.gc_heap);
-                self.load_string_primitive_property(context, &recv, s, &name)?
+                self.load_string_primitive_property(stack, context, &recv, s, &name)?
             } else if let Some(n) = idx_value.as_number() {
                 // §10.4.3.5 — every numeric index, in- or out-of-bounds,
                 // goes through the one String [[Get]] funnel so OOB
                 // reads return `undefined` (not the empty string) and
                 // the prototype fallback stays consistent.
                 let name = n.to_display_string();
-                self.load_string_primitive_property(context, &recv, s, &name)?
+                self.load_string_primitive_property(stack, context, &recv, s, &name)?
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let key = VmPropertyKey::Symbol(sym);
                 let proto = self.constructor_prototype_value("String")?;
                 if proto.is_nullish() {
                     Value::undefined()
                 } else {
-                    match self.ordinary_get_value(context, proto, recv, &key, 0)? {
+                    match self.ordinary_get_value(stack, context, proto, recv, &key, 0)? {
                         crate::VmGetOutcome::Value(v) => v,
                         crate::VmGetOutcome::InvokeGetter { getter } => {
                             let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                            self.run_callable_sync(context, &getter, recv, args)?
+                            self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
                         }
                     }
                 }
@@ -2447,18 +2562,20 @@ impl Interpreter {
                 } else {
                     let direct = regexp_prototype::load_property(&r, &mut self.gc_heap, &name);
                     if direct.is_undefined() {
-                        self.load_from_constructor_prototype(context, "RegExp", &recv, &name)?
+                        self.load_from_constructor_prototype(
+                            stack, context, "RegExp", &recv, &name,
+                        )?
                     } else {
                         direct
                     }
                 }
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let key = VmPropertyKey::Symbol(sym);
-                match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync(context, &getter, recv, args)?
+                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
                     }
                 }
             } else {
@@ -2473,11 +2590,11 @@ impl Interpreter {
                     collections_prototype::make_map_iterator_factory(m, &mut self.gc_heap)?
                 } else {
                     let key = VmPropertyKey::Symbol(sym);
-                    match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                    match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
                         crate::VmGetOutcome::Value(v) => v,
                         crate::VmGetOutcome::InvokeGetter { getter } => {
                             let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                            self.run_callable_sync(context, &getter, recv, args)?
+                            self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
                         }
                     }
                 }
@@ -2493,11 +2610,11 @@ impl Interpreter {
                     collections_prototype::make_set_iterator_factory(set, &mut self.gc_heap)?
                 } else {
                     let key = VmPropertyKey::Symbol(sym);
-                    match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                    match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
                         crate::VmGetOutcome::Value(v) => v,
                         crate::VmGetOutcome::InvokeGetter { getter } => {
                             let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                            self.run_callable_sync(context, &getter, recv, args)?
+                            self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
                         }
                     }
                 }
@@ -2517,11 +2634,11 @@ impl Interpreter {
             // collection exotics walks via ordinary [[Get]].
             if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let key = VmPropertyKey::Symbol(sym);
-                match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync(context, &getter, recv, args)?
+                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
                     }
                 }
             } else {
@@ -2552,11 +2669,11 @@ impl Interpreter {
             if proto.is_nullish() {
                 Value::undefined()
             } else {
-                match self.ordinary_get_value(context, proto, recv, &key, 0)? {
+                match self.ordinary_get_value(stack, context, proto, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync(context, &getter, recv, args)?
+                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
                     }
                 }
             }
@@ -2573,15 +2690,17 @@ impl Interpreter {
             } else {
                 return Err(VmError::TypeMismatch);
             };
-            match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+            match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
                 crate::VmGetOutcome::Value(v) => v,
                 crate::VmGetOutcome::InvokeGetter { getter } => {
                     let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                    self.run_callable_sync(context, &getter, recv, args)?
+                    self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
                 }
             }
         };
-        frame.write(dst, value)
+        result = value;
+        drop(roots);
+        Ok(result)
     }
 
     /// §10.4.5.16 step 2 — convert a value being stored into a typed
@@ -2591,14 +2710,19 @@ impl Interpreter {
     /// representation. The conversion runs before the index check.
     pub(crate) fn typed_array_coerce_element(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         kind: crate::binary::TypedArrayKind,
         value: Value,
     ) -> Result<Value, VmError> {
         let converted = if kind.is_bigint() {
-            Value::big_int(crate::coerce::to_big_int_or_throw(self, context, &value)?)
+            Value::big_int(crate::coerce::to_big_int_or_throw(
+                self, stack, context, &value,
+            )?)
         } else {
-            Value::number(crate::coerce::to_number_or_throw(self, context, &value)?)
+            Value::number(crate::coerce::to_number_or_throw(
+                self, stack, context, &value,
+            )?)
         };
         binary::dispatch::coerce_element_for_store(&mut self.gc_heap, kind, &converted)
     }
@@ -2632,6 +2756,7 @@ impl Interpreter {
 
     pub(crate) fn ordinary_set_with_callable_setter(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         obj: JsObject,
         key: &str,
@@ -2654,7 +2779,7 @@ impl Interpreter {
             object::SetOutcome::InvokeSetter { setter } => {
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                 args.push(value);
-                self.run_callable_sync(context, &setter, Value::object(obj), args)?;
+                self.run_callable_sync_rooted(stack, context, &setter, Value::object(obj), args)?;
                 Ok(())
             }
             object::SetOutcome::Reject { .. } => {
@@ -2667,6 +2792,7 @@ impl Interpreter {
             }
             object::SetOutcome::ExoticParent { parent } => {
                 if !self.ordinary_set_data_value(
+                    stack,
                     context,
                     parent,
                     &VmPropertyKey::String(key),
@@ -2686,6 +2812,7 @@ impl Interpreter {
     /// `Object.assign` symbol-key copy loop.
     pub(crate) fn ordinary_set_symbol_with_callable_setter(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         obj: JsObject,
         sym: crate::symbol::JsSymbol,
@@ -2702,7 +2829,7 @@ impl Interpreter {
             object::SetOutcome::InvokeSetter { setter } => {
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                 args.push(value);
-                self.run_callable_sync(context, &setter, Value::object(obj), args)?;
+                self.run_callable_sync_rooted(stack, context, &setter, Value::object(obj), args)?;
                 Ok(())
             }
             object::SetOutcome::Reject { .. } => {
@@ -2710,6 +2837,7 @@ impl Interpreter {
             }
             object::SetOutcome::ExoticParent { parent } => {
                 if !self.ordinary_set_data_value(
+                    stack,
                     context,
                     parent,
                     &VmPropertyKey::Symbol(sym),
@@ -2726,6 +2854,7 @@ impl Interpreter {
 
     fn load_from_constructor_prototype(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         proto_name: &str,
         receiver: &Value,
@@ -2736,11 +2865,22 @@ impl Interpreter {
             return Ok(Value::undefined());
         };
         let key = VmPropertyKey::String(name);
-        match self.ordinary_get_value(context, Value::object(proto_obj), *receiver, &key, 0)? {
+        match self.ordinary_get_value(
+            stack,
+            context,
+            Value::object(proto_obj),
+            *receiver,
+            &key,
+            0,
+        )? {
             VmGetOutcome::Value(value) => Ok(value),
-            VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, *receiver, smallvec::SmallVec::new())
-            }
+            VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+                stack,
+                context,
+                &getter,
+                *receiver,
+                smallvec::SmallVec::new(),
+            ),
         }
     }
     /// Resolve a compiled `LoadProperty` against the canonical activation.
@@ -2984,12 +3124,16 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         frame: &mut crate::ActiveFrameMut<'_>,
+        stack: &mut ActivationStack,
         dst: u16,
         recv_reg: u16,
         idx_reg: u16,
     ) -> Result<(), VmError> {
         self.record_jit_runtime_property_stub();
-        self.frame_load_element(context, frame, dst, recv_reg, idx_reg)
+        let receiver = frame.read(recv_reg)?;
+        let key = frame.read(idx_reg)?;
+        let value = self.load_element_values(stack, context, receiver, key)?;
+        frame.write(dst, value)
     }
 
     /// JIT bridge for `LoadGlobalOrThrow` from compiled code, delegating to the
@@ -3003,6 +3147,7 @@ impl Interpreter {
     /// throwing global accessor) plus `InvalidOperand`.
     pub fn jit_runtime_load_global(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         frame: &mut crate::ActiveFrameMut<'_>,
         function_id: u32,
@@ -3010,7 +3155,7 @@ impl Interpreter {
         name_idx: u32,
     ) -> Result<(), VmError> {
         self.record_jit_runtime_property_stub();
-        let value = self.load_global_or_throw_value(context, function_id, name_idx)?;
+        let value = self.load_global_or_throw_value(stack, context, function_id, name_idx)?;
         frame.write(dst, value)
     }
 
@@ -3030,13 +3175,11 @@ impl Interpreter {
         key_reg: u16,
         value_reg: u16,
     ) -> Result<(), VmError> {
-        let frame = stack.get_mut(top_idx).ok_or(VmError::InvalidOperand)?;
-        let new_target = self
-            .frame_cold(frame)
-            .and_then(|cold| cold.new_target)
-            .unwrap_or_else(Value::undefined);
-        let mut frame = ActiveFrameMut::materialized_with_new_target(frame, new_target);
-        self.run_define_data_property_active(context, &mut frame, obj_reg, key_reg, value_reg)
+        let frame = stack.get(top_idx).ok_or(VmError::InvalidOperand)?;
+        let target = *read_register(frame, obj_reg)?;
+        let key_value = *read_register(frame, key_reg)?;
+        let value = *read_register(frame, value_reg)?;
+        self.define_data_property_values(stack, context, target, key_value, value)
     }
 
     /// Representation-neutral object-literal property definition.
@@ -3047,6 +3190,7 @@ impl Interpreter {
     /// temporary interpreter frame or copied window.
     pub(crate) fn run_define_data_property_active(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         frame: &mut ActiveFrameMut<'_>,
         obj_reg: u16,
@@ -3056,11 +3200,23 @@ impl Interpreter {
         let target = frame.read(obj_reg)?;
         let key_value = frame.read(key_reg)?;
         let value = frame.read(value_reg)?;
+        self.define_data_property_values(stack, context, target, key_value, value)
+    }
+
+    fn define_data_property_values(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        target: Value,
+        key_value: Value,
+        value: Value,
+    ) -> Result<(), VmError> {
         self.with_handle_scope(|interp, scope| {
             let target = interp.scoped_value(scope, target);
             let key_value = interp.scoped_value(scope, key_value);
             let value = interp.scoped_value(scope, value);
-            let key = interp.to_property_key_sync(context, interp.escape_scoped(key_value))?;
+            let key =
+                interp.to_property_key_sync(stack, context, interp.escape_scoped(key_value))?;
             let target = interp.escape_scoped(target);
             let value = interp.escape_scoped(value);
             // Fast path: a plain object receiver takes the shape-friendly
@@ -3086,7 +3242,7 @@ impl Interpreter {
                     configurable: Some(true),
                     ..Default::default()
                 };
-                if !interp.define_own_property_value(context, &target, &key, descriptor)? {
+                if !interp.define_own_property_value(stack, context, &target, &key, descriptor)? {
                     return Err(interp.err_type(
                         ("Cannot define property on object literal".to_string()).into(),
                     ));
@@ -3142,6 +3298,7 @@ impl Interpreter {
     /// for interpreted and compiled `StoreElement` execution.
     pub fn jit_runtime_store_element(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         frame: &ActiveFrameRef<'_>,
         recv_reg: u16,
@@ -3153,7 +3310,7 @@ impl Interpreter {
         let receiver = frame.read(recv_reg)?;
         let key_value = frame.read(idx_reg)?;
         let value = frame.read(src_reg)?;
-        self.store_element_values(context, function_id, receiver, key_value, value)
+        self.store_element_values(stack, context, function_id, receiver, key_value, value)
     }
 
     /// Complete computed `[[Set]]` from copied, representation-independent
@@ -3162,6 +3319,7 @@ impl Interpreter {
     /// without aliasing a retained Rust borrow.
     pub(crate) fn store_element_values(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         function_id: u32,
         mut receiver: Value,
@@ -3180,7 +3338,7 @@ impl Interpreter {
             roots.add_value(&mut value);
             roots.add_value(&mut property_key);
         }
-        property_key = self.coerce_property_key_value(context, key_value)?;
+        property_key = self.coerce_property_key_value(stack, context, key_value)?;
 
         let key = if let Some(symbol) = property_key.as_symbol(&self.gc_heap) {
             VmPropertyKey::Symbol(symbol)
@@ -3212,9 +3370,17 @@ impl Interpreter {
         };
         let accepted = if let Some(wrapper_name) = wrapper_name {
             let parent = self.primitive_wrapper_prototype(wrapper_name)?;
-            self.ordinary_set_data_value(context, Value::object(parent), &key, value, receiver, 0)?
+            self.ordinary_set_data_value(
+                stack,
+                context,
+                Value::object(parent),
+                &key,
+                value,
+                receiver,
+                0,
+            )?
         } else {
-            self.ordinary_set_data_value(context, receiver, &key, value, receiver, 0)?
+            self.ordinary_set_data_value(stack, context, receiver, &key, value, receiver, 0)?
         };
         if !accepted {
             let name = key.string_name().unwrap_or("symbol");
@@ -3345,6 +3511,7 @@ impl Interpreter {
             let key = VmPropertyKey::atom(atomized_key);
             stack[top_idx].advance_pc()?;
             match self.ordinary_get_value(
+                stack,
                 context,
                 Value::object(obj),
                 Value::object(obj),
@@ -3388,7 +3555,7 @@ impl Interpreter {
         {
             let key = VmPropertyKey::atom(atomized_key);
             stack[top_idx].advance_pc()?;
-            match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
+            match self.ordinary_get_value(stack, context, receiver, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)?,
                 VmGetOutcome::InvokeGetter { getter } => {
                     if abstract_ops::is_callable(&getter) {
@@ -3410,7 +3577,7 @@ impl Interpreter {
             let boxed = self.box_sloppy_this_primitive_stack_rooted(stack, receiver, &[])?;
             let key = VmPropertyKey::atom(atomized_key);
             stack[top_idx].advance_pc()?;
-            match self.ordinary_get_value(context, boxed, receiver, &key, 0)? {
+            match self.ordinary_get_value(stack, context, boxed, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)?,
                 VmGetOutcome::InvokeGetter { getter } => {
                     if abstract_ops::is_callable(&getter) {
@@ -3598,7 +3765,7 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let lhs = *read_register(&stack[top_idx], lhs_reg)?;
         let rhs = *read_register(&stack[top_idx], rhs_reg)?;
-        let result = self.instanceof_operator_stack_rooted(context, stack, &lhs, &rhs)?;
+        let result = self.instanceof_operator(stack, context, &lhs, &rhs)?;
         stack[top_idx].advance_pc()?;
         write_register(&mut stack[top_idx], dst, Value::boolean(result))?;
         Ok(true)
@@ -3623,7 +3790,7 @@ impl Interpreter {
                 self.err_type(("Cannot read property of null or undefined".to_string()).into())
             );
         }
-        let key_value = self.coerce_property_key_value(context, key_value_raw)?;
+        let key_value = self.coerce_property_key_value(stack, context, key_value_raw)?;
         write_register(&mut stack[top_idx], key_reg, key_value)?;
         let key = if let Some(s) = key_value.as_string(&self.gc_heap) {
             VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
@@ -3654,7 +3821,7 @@ impl Interpreter {
             || receiver.is_data_view();
         if prototype_routed {
             stack[top_idx].advance_pc()?;
-            match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
+            match self.ordinary_get_value(stack, context, receiver, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)?,
                 VmGetOutcome::InvokeGetter { getter } => {
                     if abstract_ops::is_callable(&getter) {
@@ -3947,7 +4114,7 @@ impl Interpreter {
                     ];
                     let top_idx = stack.len() - 1;
                     stack[top_idx].advance_pc()?;
-                    match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
+                    match self.invoke_proxy_trap(stack, context, &proxy, "set", trap_args)? {
                         Some(_) => {}
                         None => {
                             let Some(target) = proxy.target(&self.gc_heap).as_object() else {
@@ -3977,6 +4144,7 @@ impl Interpreter {
                                         }
                                         object::SetOutcome::ExoticParent { parent } => {
                                             if !self.ordinary_set_data_value(
+                                                stack,
                                                 context,
                                                 parent,
                                                 &VmPropertyKey::Symbol(*sym),
@@ -4018,6 +4186,7 @@ impl Interpreter {
                                         }
                                         object::SetOutcome::ExoticParent { parent } => {
                                             if !self.ordinary_set_data_value(
+                                                stack,
                                                 context,
                                                 parent,
                                                 &VmPropertyKey::String(key),
@@ -4136,7 +4305,7 @@ impl Interpreter {
                 Value::proxy(proxy),
             ];
             stack[top_idx].advance_pc()?;
-            match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
+            match self.invoke_proxy_trap(stack, context, &proxy, "set", trap_args)? {
                 Some(result) => {
                     let ok = result.to_boolean(&self.gc_heap);
                     if !ok {
@@ -4150,14 +4319,13 @@ impl Interpreter {
                     // success, ensure target descriptor admits the
                     // value.
                     let target_value = proxy.target(&self.gc_heap);
-                    let target_desc = self
-                        .ordinary_get_own_property_descriptor_value_stack_rooted(
-                            context,
-                            stack,
-                            target_value,
-                            &key_vm,
-                            0,
-                        )?;
+                    let target_desc = self.ordinary_get_own_property_descriptor_value(
+                        stack,
+                        context,
+                        target_value,
+                        &key_vm,
+                        0,
+                    )?;
                     if let Some(desc) = target_desc.as_ref()
                         && !desc.configurable()
                     {
@@ -4195,6 +4363,7 @@ impl Interpreter {
                     // receiver-blind fast path.
                     let target_value = proxy.target(&self.gc_heap);
                     if !self.ordinary_set_data_value(
+                        stack,
                         context,
                         target_value,
                         &key_vm,
@@ -4402,6 +4571,7 @@ impl Interpreter {
             // §10.4.5.5 etc. are observable from plain receivers).
             object::SetOutcome::ExoticParent { parent } => {
                 if !self.ordinary_set_data_value(
+                    stack,
                     context,
                     parent,
                     &VmPropertyKey::String(name),
@@ -4609,7 +4779,7 @@ impl Interpreter {
             VmPropertyKey::OwnedString(lhs.display_string(&self.gc_heap))
         };
         stack[top_idx].advance_pc()?;
-        let present = self.ordinary_has_property_value(context, rhs, &key, 0)?;
+        let present = self.ordinary_has_property_value(stack, context, rhs, &key, 0)?;
         write_register(&mut stack[top_idx], dst, Value::boolean(present))?;
         Ok(true)
     }
@@ -4635,6 +4805,7 @@ impl Interpreter {
         };
         stack[top_idx].advance_pc()?;
         let removed = self.ordinary_delete_value(
+            stack,
             context,
             Value::proxy(proxy),
             &VmPropertyKey::atom(atomized_key),
@@ -4669,7 +4840,7 @@ impl Interpreter {
         let idx = *read_register(&stack[top_idx], idx_reg)?;
         let key = Self::coerce_vm_property_key(Some(&idx), &self.gc_heap)?;
         stack[top_idx].advance_pc()?;
-        let removed = self.ordinary_delete_value(context, receiver, &key, 0)?;
+        let removed = self.ordinary_delete_value(stack, context, receiver, &key, 0)?;
         let strict = context.function_is_strict(stack[top_idx].function_id);
         if !removed && strict {
             return Err(self.err_type(("Cannot delete property".to_string()).into()));
@@ -4694,7 +4865,7 @@ impl Interpreter {
             return Ok(false);
         };
         stack[top_idx].advance_pc()?;
-        let result = self.ordinary_get_prototype_value(context, value, 0)?;
+        let result = self.ordinary_get_prototype_value(stack, context, value, 0)?;
         write_register(&mut stack[top_idx], dst, result)?;
         Ok(true)
     }
@@ -4726,7 +4897,7 @@ impl Interpreter {
         // §10.5.7 — dispatch through the value-level helper so
         // nested proxies fall through correctly and §10.5.7 invariants
         // apply on the trap result.
-        let ok = self.set_prototype_value_proxy_aware(context, &recv, &proto_obj)?;
+        let ok = self.set_prototype_value_proxy_aware(stack, context, &recv, &proto_obj)?;
         if !ok {
             // Object.setPrototypeOf throws when [[SetPrototypeOf]]
             // returns false (§20.1.2.21 step 4 DefinePropertyOrThrow).

@@ -701,10 +701,16 @@ mod tests {
         });
         let target_value = crate::Value::object(target);
         let prototype_value = crate::Value::object(prototype);
+        let mut stack = crate::activation_stack::ActivationStack::new();
 
         assert!(
             interp
-                .set_prototype_value_proxy_aware(&context, &target_value, &prototype_value)
+                .set_prototype_value_proxy_aware(
+                    &mut stack,
+                    &context,
+                    &target_value,
+                    &prototype_value,
+                )
                 .expect("ordinary prototype mutation")
         );
         assert_eq!(interp.shape_epoch(), 1);
@@ -715,7 +721,12 @@ mod tests {
 
         assert!(
             interp
-                .set_prototype_value_proxy_aware(&context, &target_value, &prototype_value)
+                .set_prototype_value_proxy_aware(
+                    &mut stack,
+                    &context,
+                    &target_value,
+                    &prototype_value,
+                )
                 .expect("same prototype is accepted")
         );
         assert_eq!(interp.shape_epoch(), 1);

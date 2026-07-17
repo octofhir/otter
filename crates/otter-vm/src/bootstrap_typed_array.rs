@@ -30,6 +30,10 @@
 //! - Per-kind prototypes link
 //!   `<T>.prototype.__proto__ = %TypedArray%.prototype`; the
 //!   abstract prototype itself chains to `%Object.prototype%`.
+//! - Constructor re-entry stays on the current runtime turn. Transient element
+//!   buffers are traced in place without a runtime-root snapshot, and each
+//!   freshly allocated view is handle-rooted across observable `new.target`
+//!   prototype lookup.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-typedarray-constructors>
@@ -42,7 +46,7 @@ use crate::binary::typed_array::TypedArrayKind;
 use crate::binary::{dispatch, typed_array_prototype};
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject, PartialPropertyDescriptor, PropertyDescriptor};
-use crate::{NativeCtx, NativeError, Value, VmError};
+use crate::{Local, NativeCtx, NativeError, NativeScope, Value, VmError};
 
 /// Install `@@toStringTag` on each per-kind prototype after the
 /// well-known symbol table exists. Also installs `@@iterator =
@@ -238,80 +242,86 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
 /// constructor path.
 /// §7.4.2 GetIterator + drain — call the already-fetched `@@iterator`
 /// method (one `GetMethod`, per spec) and collect every yielded value.
-fn drain_iterable_into_values(
-    ctx: &mut NativeCtx<'_>,
+fn drain_iterable_into_values<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
     exec_ctx: &crate::ExecutionContext,
-    src: &Value,
-    iter_method: Value,
-) -> Result<Vec<Value>, NativeError> {
-    let src_value = *src;
-    if !ctx.cx.interp.is_callable_runtime(&iter_method) {
+    src: Local<'scope>,
+    iter_method: Local<'scope>,
+) -> Result<Vec<Local<'scope>>, NativeError> {
+    if !scope.is_callable(iter_method) {
         return Err(NativeError::TypeError {
             name: "TypedArray",
             reason: "source object is not iterable".to_string(),
         });
     }
-    let no_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-    let iter_obj = ctx
-        .cx
-        .interp
-        .run_callable_sync(exec_ctx, &iter_method, src_value, no_args)
-        .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
+    let iter_obj = scope.call(iter_method, src, &[])?;
     // §7.4.2 GetIteratorFromMethod step 4 — `next` is read off the
     // iterator object as a property, so a user-overridden
     // `%ArrayIteratorPrototype%.next` (or any custom `next`) drives
     // the drain rather than the engine's internal iterator step.
     let next_method = ta_get_via(
-        ctx,
+        scope,
         exec_ctx,
         iter_obj,
         &crate::VmPropertyKey::String("next"),
     )?;
-    if !ctx.cx.interp.is_callable_runtime(&next_method) {
+    if !scope.is_callable(next_method) {
         return Err(NativeError::TypeError {
             name: "TypedArray",
             reason: "iterator.next is not callable".to_string(),
         });
     }
-    if let Some(handle) = iter_obj.as_iterator()
-        && next_method.as_native_function().is_some_and(|native| {
-            native.is_static_fn(ctx.heap(), crate::intrinsics::iterator::iterator_proto_next)
-        })
+    if scope.raw(iter_obj).as_iterator().is_some()
+        && scope
+            .raw(next_method)
+            .as_native_function()
+            .is_some_and(|native| {
+                native.is_static_fn(
+                    scope.context().heap(),
+                    crate::intrinsics::iterator::iterator_proto_next,
+                )
+            })
     {
-        let mut collected: Vec<Value> = Vec::new();
+        let mut collected = Vec::new();
         loop {
-            let next = ctx
-                .cx
-                .with_parts(|interp, stack| interp.iterator_next_full(exec_ctx, stack, &handle));
-            let (value, done) = next.map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
+            let handle = scope
+                .raw(iter_obj)
+                .as_iterator()
+                .expect("iterator local changed kind");
+            let next = scope.with_turn_parts(|interp, stack| {
+                interp.iterator_next_full(exec_ctx, stack, &handle)
+            });
+            let (value, done) =
+                next.map_err(|e| vm_to_native(scope.context().interp_mut(), e, "TypedArray"))?;
             if done {
                 break;
             }
-            collected.push(value);
+            collected.push(scope.value(value));
         }
         return Ok(collected);
     }
-    let mut collected: Vec<Value> = Vec::new();
+    let mut collected = Vec::new();
     loop {
         // §7.4.3 IteratorNext — Call(next, iterator); the result must
         // be an Object, then read `done` / `value` observably.
-        let result = ctx
-            .cx
-            .interp
-            .run_callable_sync(exec_ctx, &next_method, iter_obj, smallvec::SmallVec::new())
-            .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
-        if !crate::reflect::is_type_object_value(&result) {
+        let result = scope.call(next_method, iter_obj, &[])?;
+        if !crate::reflect::is_type_object_value(&scope.raw(result)) {
             return Err(NativeError::TypeError {
                 name: "TypedArray",
                 reason: "iterator result is not an object".to_string(),
             });
         }
-        let done = ta_get_via(ctx, exec_ctx, result, &crate::VmPropertyKey::String("done"))?;
-        if done.to_boolean(&ctx.cx.interp.gc_heap) {
+        let done = ta_get_via(
+            scope,
+            exec_ctx,
+            result,
+            &crate::VmPropertyKey::String("done"),
+        )?;
+        if scope.raw(done).to_boolean(scope.context().heap()) {
             break;
         }
         let value = ta_get_via(
-            ctx,
+            scope,
             exec_ctx,
             result,
             &crate::VmPropertyKey::String("value"),
@@ -325,24 +335,29 @@ fn drain_iterable_into_values(
 /// `ToBigInt` for BigInt element types and `ToNumber` otherwise, so a
 /// Symbol / cross-numeric value throws and a `valueOf` / `toString`
 /// runs. The per-kind dispatcher narrows the result on store.
-fn coerce_values_for_kind(
-    ctx: &mut NativeCtx<'_>,
+fn coerce_values_for_kind<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
     exec: &crate::ExecutionContext,
-    values: Vec<Value>,
+    values: Vec<Local<'scope>>,
     kind: TypedArrayKind,
-) -> Result<Vec<Value>, NativeError> {
+) -> Result<Vec<Local<'scope>>, NativeError> {
     let mut out = Vec::with_capacity(values.len());
     for value in values {
+        let value = scope.raw(value);
         let converted = if kind.is_bigint() {
-            let big = crate::coerce::to_big_int_or_throw(ctx.cx.interp, exec, &value)
-                .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
+            let big = scope.with_turn_parts(|interp, stack| {
+                crate::coerce::to_big_int_or_throw(interp, stack, exec, &value)
+                    .map_err(|e| vm_to_native(interp, e, "TypedArray"))
+            })?;
             Value::big_int(big)
         } else {
-            let number = crate::coerce::to_number_or_throw(ctx.cx.interp, exec, &value)
-                .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
+            let number = scope.with_turn_parts(|interp, stack| {
+                crate::coerce::to_number_or_throw(interp, stack, exec, &value)
+                    .map_err(|e| vm_to_native(interp, e, "TypedArray"))
+            })?;
             Value::number(number)
         };
-        out.push(converted);
+        out.push(scope.value(converted));
     }
     Ok(out)
 }
@@ -352,24 +367,24 @@ fn coerce_values_for_kind(
 /// **not** numeric-coercing (the caller maps, then converts). Reserves
 /// fallibly so a pathological `length` throws `RangeError`.
 /// §7.3.3 Get + run an accessor, propagating an abrupt completion.
-fn ta_get_via(
-    ctx: &mut NativeCtx<'_>,
+fn ta_get_via<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
     exec: &crate::ExecutionContext,
-    source: Value,
+    source: Local<'scope>,
     key: &crate::VmPropertyKey<'_>,
-) -> Result<Value, NativeError> {
-    let outcome = ctx
-        .cx
-        .interp
-        .ordinary_get_value(exec, source, source, key, 0)
-        .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
+) -> Result<Local<'scope>, NativeError> {
+    let source_raw = scope.raw(source);
+    let outcome = scope.with_turn_parts(|interp, stack| {
+        interp
+            .ordinary_get_value(stack, exec, source_raw, source_raw, key, 0)
+            .map_err(|e| vm_to_native(interp, e, "TypedArray"))
+    })?;
     match outcome {
-        crate::VmGetOutcome::Value(v) => Ok(v),
-        crate::VmGetOutcome::InvokeGetter { getter } => ctx
-            .cx
-            .interp
-            .run_callable_sync(exec, &getter, source, smallvec::SmallVec::new())
-            .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray")),
+        crate::VmGetOutcome::Value(value) => Ok(scope.value(value)),
+        crate::VmGetOutcome::InvokeGetter { getter } => {
+            let getter = scope.value(getter);
+            scope.call(getter, source, &[])
+        }
     }
 }
 
@@ -379,15 +394,18 @@ fn ta_get_via(
 /// effects run and a Symbol / cross-numeric element throws. Returns
 /// the converted elements; the per-kind dispatcher narrows them to the
 /// destination representation on store.
-fn read_array_like_coerced(
-    ctx: &mut NativeCtx<'_>,
+fn read_array_like_coerced<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
     exec: &crate::ExecutionContext,
-    source: Value,
+    source: Local<'scope>,
     kind: TypedArrayKind,
-) -> Result<Vec<Value>, NativeError> {
-    let len_value = ta_get_via(ctx, exec, source, &crate::VmPropertyKey::String("length"))?;
-    let len_number = crate::coerce::to_number_or_throw(ctx.cx.interp, exec, &len_value)
-        .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
+) -> Result<Vec<Local<'scope>>, NativeError> {
+    let len_value = ta_get_via(scope, exec, source, &crate::VmPropertyKey::String("length"))?;
+    let len_value_raw = scope.raw(len_value);
+    let len_number = scope.with_turn_parts(|interp, stack| {
+        crate::coerce::to_number_or_throw(interp, stack, exec, &len_value_raw)
+            .map_err(|e| vm_to_native(interp, e, "TypedArray"))
+    })?;
     let n = len_number.as_f64();
     let len = if n.is_nan() || n <= 0.0 {
         0
@@ -398,7 +416,7 @@ fn read_array_like_coerced(
     // cannot back with a RangeError; reserve up-front (fallibly) so a
     // pathological `length` (e.g. 2**53) fails cleanly instead of
     // aborting the process on the capacity request.
-    let mut out: Vec<Value> = Vec::new();
+    let mut out: Vec<Local<'scope>> = Vec::new();
     if out.try_reserve_exact(len).is_err() {
         return Err(NativeError::RangeError {
             name: "TypedArray",
@@ -407,21 +425,26 @@ fn read_array_like_coerced(
     }
     for i in 0..len {
         let value = ta_get_via(
-            ctx,
+            scope,
             exec,
             source,
             &crate::VmPropertyKey::OwnedString(i.to_string()),
         )?;
+        let value = scope.raw(value);
         let converted = if kind.is_bigint() {
-            let big = crate::coerce::to_big_int_or_throw(ctx.cx.interp, exec, &value)
-                .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
+            let big = scope.with_turn_parts(|interp, stack| {
+                crate::coerce::to_big_int_or_throw(interp, stack, exec, &value)
+                    .map_err(|e| vm_to_native(interp, e, "TypedArray"))
+            })?;
             Value::big_int(big)
         } else {
-            let number = crate::coerce::to_number_or_throw(ctx.cx.interp, exec, &value)
-                .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
+            let number = scope.with_turn_parts(|interp, stack| {
+                crate::coerce::to_number_or_throw(interp, stack, exec, &value)
+                    .map_err(|e| vm_to_native(interp, e, "TypedArray"))
+            })?;
             Value::number(number)
         };
-        out.push(converted);
+        out.push(scope.value(converted));
     }
     Ok(out)
 }
@@ -596,76 +619,92 @@ fn ta_from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError
             name,
             reason: "missing execution context".to_string(),
         })?;
-    let receiver = *ctx.this_value();
-    if !crate::abstract_ops::is_constructor(&receiver, &exec, ctx.heap()) {
-        return Err(NativeError::TypeError {
-            name,
-            reason: "this is not a constructor".to_string(),
-        });
-    }
-    let source = args.first().cloned().unwrap_or(Value::undefined());
-    let mapfn = args.get(1).cloned().unwrap_or(Value::undefined());
-    let mapping = !mapfn.is_undefined();
-    if mapping && !ctx.cx.interp.is_callable_runtime(&mapfn) {
-        return Err(NativeError::TypeError {
-            name,
-            reason: "mapfn is not a function".to_string(),
-        });
-    }
-    let this_arg = args.get(2).cloned().unwrap_or(Value::undefined());
-    if source.is_null() || source.is_undefined() {
-        return Err(NativeError::TypeError {
-            name,
-            reason: "cannot create a TypedArray from null or undefined".to_string(),
-        });
-    }
-    // §7.3.10 GetMethod(source, @@iterator) — non-callable,
-    // non-nullish answers throw before anything else runs.
-    let iter_sym = ctx
-        .cx
-        .interp
-        .well_known_symbols()
-        .get(crate::symbol::WellKnown::Iterator);
-    let iter_method = ta_get_via(ctx, &exec, source, &crate::VmPropertyKey::Symbol(iter_sym))?;
-    let use_iterator = if iter_method.is_undefined() || iter_method.is_null() {
-        false
-    } else if ctx.cx.interp.is_callable_runtime(&iter_method) {
-        true
-    } else {
-        return Err(NativeError::TypeError {
-            name,
-            reason: "@@iterator is not callable".to_string(),
-        });
-    };
-    if use_iterator {
-        // §23.2.2.1 step 6 — IteratorToList first, THEN create.
-        let values = drain_iterable_into_values(ctx, &exec, &source, iter_method)?;
-        let target = ta_create_from_constructor(ctx, &exec, &receiver, values.len(), name)?;
-        for (k, value) in values.into_iter().enumerate() {
-            ta_from_store(
-                ctx, &exec, target, k, value, mapping, &mapfn, &this_arg, name,
-            )?;
+    ctx.scope(|mut scope| {
+        let receiver = scope.this();
+        let receiver_value = scope.raw(receiver);
+        if !crate::abstract_ops::is_constructor(&receiver_value, &exec, scope.context().heap()) {
+            return Err(NativeError::TypeError {
+                name,
+                reason: "this is not a constructor".to_string(),
+            });
         }
-        return Ok(target_value_of(target));
-    }
-    // §23.2.2.1 step 7 — array-like: LengthOfArrayLike, create,
-    // then per-index Get / map / Set in order.
-    let len_value = ta_get_via(ctx, &exec, source, &crate::VmPropertyKey::String("length"))?;
-    let len = crate::coerce::to_length_or_throw(ctx.cx.interp, &exec, &len_value)
-        .map_err(|e| vm_to_native(ctx.cx.interp, e, name))?;
-    let target = ta_create_from_constructor(ctx, &exec, &receiver, len, name)?;
-    for k in 0..len {
-        let value = ta_get_via(
-            ctx,
+        let source = scope.argument(args, 0);
+        let mapfn = scope.argument(args, 1);
+        let mapping = !scope.is_undefined(mapfn);
+        if mapping && !scope.is_callable(mapfn) {
+            return Err(NativeError::TypeError {
+                name,
+                reason: "mapfn is not a function".to_string(),
+            });
+        }
+        let this_arg = scope.argument(args, 2);
+        if scope.is_null(source) || scope.is_undefined(source) {
+            return Err(NativeError::TypeError {
+                name,
+                reason: "cannot create a TypedArray from null or undefined".to_string(),
+            });
+        }
+        // §7.3.10 GetMethod(source, @@iterator) — non-callable,
+        // non-nullish answers throw before anything else runs.
+        let iter_sym = scope
+            .context()
+            .interp_mut()
+            .well_known_symbols()
+            .get(crate::symbol::WellKnown::Iterator);
+        let iter_method = ta_get_via(
+            &mut scope,
             &exec,
             source,
-            &crate::VmPropertyKey::OwnedString(k.to_string()),
+            &crate::VmPropertyKey::Symbol(iter_sym),
         )?;
-        ta_from_store(
-            ctx, &exec, target, k, value, mapping, &mapfn, &this_arg, name,
+        let use_iterator = if scope.is_undefined(iter_method) || scope.is_null(iter_method) {
+            false
+        } else if scope.is_callable(iter_method) {
+            true
+        } else {
+            return Err(NativeError::TypeError {
+                name,
+                reason: "@@iterator is not callable".to_string(),
+            });
+        };
+        if use_iterator {
+            // §23.2.2.1 step 6 — IteratorToList first, THEN create.
+            let values = drain_iterable_into_values(&mut scope, &exec, source, iter_method)?;
+            let target = ta_create_from_constructor(&mut scope, receiver, values.len(), name)?;
+            for (k, value) in values.into_iter().enumerate() {
+                ta_from_store(
+                    &mut scope, &exec, target, k, value, mapping, mapfn, this_arg, name,
+                )?;
+            }
+            return Ok(scope.finish(target));
+        }
+        // §23.2.2.1 step 7 — array-like: LengthOfArrayLike, create,
+        // then per-index Get / map / Set in order.
+        let len_value = ta_get_via(
+            &mut scope,
+            &exec,
+            source,
+            &crate::VmPropertyKey::String("length"),
         )?;
-    }
-    Ok(target_value_of(target))
+        let len_value = scope.raw(len_value);
+        let len = scope.with_turn_parts(|interp, stack| {
+            crate::coerce::to_length_or_throw(interp, stack, &exec, &len_value)
+                .map_err(|e| vm_to_native(interp, e, name))
+        })?;
+        let target = ta_create_from_constructor(&mut scope, receiver, len, name)?;
+        for k in 0..len {
+            let value = ta_get_via(
+                &mut scope,
+                &exec,
+                source,
+                &crate::VmPropertyKey::OwnedString(k.to_string()),
+            )?;
+            ta_from_store(
+                &mut scope, &exec, target, k, value, mapping, mapfn, this_arg, name,
+            )?;
+        }
+        Ok(scope.finish(target))
+    })
 }
 
 /// §23.2.2.2 `%TypedArray%.of(...items)` — generic over `this`.
@@ -678,104 +717,125 @@ fn ta_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> 
             name,
             reason: "missing execution context".to_string(),
         })?;
-    let receiver = *ctx.this_value();
-    if !crate::abstract_ops::is_constructor(&receiver, &exec, ctx.heap()) {
-        return Err(NativeError::TypeError {
-            name,
-            reason: "this is not a constructor".to_string(),
-        });
-    }
-    let target = ta_create_from_constructor(ctx, &exec, &receiver, args.len(), name)?;
-    for (k, value) in args.iter().enumerate() {
-        ta_from_store(
-            ctx,
-            &exec,
-            target,
-            k,
-            *value,
-            false,
-            &Value::undefined(),
-            &Value::undefined(),
-            name,
-        )?;
-    }
-    Ok(target_value_of(target))
+    ctx.scope(|mut scope| {
+        let receiver = scope.this();
+        let receiver_value = scope.raw(receiver);
+        if !crate::abstract_ops::is_constructor(&receiver_value, &exec, scope.context().heap()) {
+            return Err(NativeError::TypeError {
+                name,
+                reason: "this is not a constructor".to_string(),
+            });
+        }
+        let values: SmallVec<[Local<'_>; 4]> =
+            args.iter().map(|value| scope.value(*value)).collect();
+        let target = ta_create_from_constructor(&mut scope, receiver, values.len(), name)?;
+        let undefined = scope.undefined();
+        for (k, value) in values.into_iter().enumerate() {
+            ta_from_store(
+                &mut scope, &exec, target, k, value, false, undefined, undefined, name,
+            )?;
+        }
+        Ok(scope.finish(target))
+    })
 }
 
 /// §23.2.4.2 TypedArrayCreate — `Construct(C, [len])`, then
 /// ValidateTypedArray on the result plus the length floor.
-fn ta_create_from_constructor(
-    ctx: &mut NativeCtx<'_>,
-    exec: &crate::ExecutionContext,
-    ctor: &Value,
+fn ta_create_from_constructor<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    ctor: Local<'scope>,
     len: usize,
     name: &'static str,
-) -> Result<crate::binary::typed_array::JsTypedArray, NativeError> {
-    let len_arg = Value::number(crate::number::NumberValue::from_f64(len as f64));
-    let result = ctx
-        .cx
-        .interp
-        .run_construct_sync(exec, ctor, *ctor, smallvec::smallvec![len_arg])
-        .map_err(|e| vm_to_native(ctx.cx.interp, e, name))?;
-    let Some(target) = result.as_typed_array(ctx.heap()) else {
+) -> Result<Local<'scope>, NativeError> {
+    let len_arg = scope.value(Value::number(crate::number::NumberValue::from_f64(
+        len as f64,
+    )));
+    let result = scope
+        .construct(ctor, &[len_arg])
+        .map_err(|error| match error {
+            NativeError::TypeError { reason, .. } => NativeError::TypeError { name, reason },
+            NativeError::RangeError { reason, .. } => NativeError::RangeError { name, reason },
+            other => other,
+        })?;
+    let Some(target) = scope.raw(result).as_typed_array(scope.context().heap()) else {
         return Err(NativeError::TypeError {
             name,
             reason: "constructor did not return a TypedArray".to_string(),
         });
     };
-    if target.buffer(ctx.heap()).is_detached(ctx.heap()) {
+    if target
+        .buffer(scope.context().heap())
+        .is_detached(scope.context().heap())
+    {
         return Err(NativeError::TypeError {
             name,
             reason: "constructor returned a detached TypedArray".to_string(),
         });
     }
-    if target.length(ctx.heap()) < len {
+    if target.length(scope.context().heap()) < len {
         return Err(NativeError::TypeError {
             name,
             reason: "constructor returned a TypedArray that is too small".to_string(),
         });
     }
-    Ok(target)
-}
-
-fn target_value_of(target: crate::binary::typed_array::JsTypedArray) -> Value {
-    Value::typed_array(target)
+    Ok(result)
 }
 
 /// One `from` / `of` element step: optional mapfn call, the
 /// target-kind numeric coercion (full user ToNumber / ToBigInt),
 /// then the detach-safe §10.4.5.16 IntegerIndexedElementSet write.
 #[allow(clippy::too_many_arguments)]
-fn ta_from_store(
-    ctx: &mut NativeCtx<'_>,
+fn ta_from_store<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
     exec: &crate::ExecutionContext,
-    target: crate::binary::typed_array::JsTypedArray,
+    target: Local<'scope>,
     k: usize,
-    value: Value,
+    value: Local<'scope>,
     mapping: bool,
-    mapfn: &Value,
-    this_arg: &Value,
+    mapfn: Local<'scope>,
+    this_arg: Local<'scope>,
     name: &'static str,
 ) -> Result<(), NativeError> {
     let mapped = if mapping {
-        let index = Value::number(crate::number::NumberValue::from_f64(k as f64));
-        ctx.cx
-            .interp
-            .run_callable_sync(exec, mapfn, *this_arg, smallvec::smallvec![value, index])
-            .map_err(|e| vm_to_native(ctx.cx.interp, e, name))?
+        let index = scope.value(Value::number(crate::number::NumberValue::from_f64(
+            k as f64,
+        )));
+        scope.call(mapfn, this_arg, &[value, index])?
     } else {
         value
     };
-    let converted = if target.kind().is_bigint() {
-        let big = crate::coerce::to_big_int_or_throw(ctx.cx.interp, exec, &mapped)
-            .map_err(|e| vm_to_native(ctx.cx.interp, e, name))?;
+    let target_kind = scope
+        .raw(target)
+        .as_typed_array(scope.context().heap())
+        .ok_or_else(|| NativeError::TypeError {
+            name,
+            reason: "constructor result is no longer a TypedArray".to_string(),
+        })?
+        .kind();
+    let mapped = scope.raw(mapped);
+    let converted = if target_kind.is_bigint() {
+        let big = scope.with_turn_parts(|interp, stack| {
+            crate::coerce::to_big_int_or_throw(interp, stack, exec, &mapped)
+                .map_err(|e| vm_to_native(interp, e, name))
+        })?;
         Value::big_int(big)
     } else {
-        let number = crate::coerce::to_number_or_throw(ctx.cx.interp, exec, &mapped)
-            .map_err(|e| vm_to_native(ctx.cx.interp, e, name))?;
+        let number = scope.with_turn_parts(|interp, stack| {
+            crate::coerce::to_number_or_throw(interp, stack, exec, &mapped)
+                .map_err(|e| vm_to_native(interp, e, name))
+        })?;
         Value::number(number)
     };
-    target.set(ctx.heap_mut(), k, &converted);
+    let converted = scope.value(converted);
+    let target = scope
+        .raw(target)
+        .as_typed_array(scope.context().heap())
+        .ok_or_else(|| NativeError::TypeError {
+            name,
+            reason: "constructor result is no longer a TypedArray".to_string(),
+        })?;
+    let converted = scope.raw(converted);
+    target.set(scope.context().heap_mut(), k, &converted);
     Ok(())
 }
 fn ta_ctor_dispatch(
@@ -789,207 +849,162 @@ fn ta_ctor_dispatch(
             reason: "constructor requires 'new'".to_string(),
         });
     }
-    // §22.2.4.5 `TypedArray(buffer [, byteOffset [, length]])` —
-    // ToIndex(byteOffset) / ToIndex(length) per spec invoke
-    // ToPrimitive(Number) → ToIntegerOrInfinity. The dispatch
-    // helper only handles primitive operands; pre-coerce non-
-    // primitive Object args here so user `@@toPrimitive` /
-    // `valueOf` / `toString` hooks fire.
-    // <https://tc39.es/ecma262/#sec-typedarray-buffer-byteoffset-length>
     let exec = ctx.execution_context().cloned();
-    // §22.2.4.4 — when the source argument is an Object with
-    // `@@iterator`, drain that iterator into an Array up-front so
-    // the per-kind dispatcher's array-like path collects the
-    // yielded values rather than reading the (probably-undefined)
-    // `length` own slot.
-    // §23.2.5.1 — any Object source other than an ArrayBuffer or a
-    // TypedArray (which have dedicated initializers) initializes from
-    // `@@iterator` / array-like reads. Arrays, functions, generators and
-    // proxies are each their own Value kind, so the check is "Type is
-    // Object" minus the two specialized sources — otherwise e.g.
-    // `new TA(functionWithIteratorGetter)` or `new TA(generator)` would
-    // skip the observable `@@iterator` read entirely.
-    let src_value_opt = args
-        .first()
-        .copied()
-        .filter(|v| v.is_object_type() && !v.is_array_buffer() && !v.is_typed_array());
-    let iter_pre: Option<SmallVec<[Value; 4]>> =
-        if let (Some(src_value), Some(exec)) = (src_value_opt, exec.as_ref()) {
-            let iter_sym = ctx
-                .cx
-                .interp
-                .well_known_symbols()
-                .get(crate::symbol::WellKnown::Iterator);
-            // §23.2.5.1 — GetMethod(source, @@iterator): an Object source
-            // with a callable `@@iterator` initializes from the drained
-            // iterator; otherwise it is an array-like read with observable
-            // `[[Get]]` + `ToNumber` / `ToBigInt`. Either way the values are
-            // coerced up-front so the per-kind dispatcher only narrows.
-            let iter_method = ta_get_via(
-                ctx,
-                exec,
-                src_value,
-                &crate::VmPropertyKey::Symbol(iter_sym),
-            )?;
-            // §7.3.10 GetMethod — a non-nullish, non-callable
-            // @@iterator throws TypeError before any reads.
-            if !(iter_method.is_undefined()
-                || iter_method.is_null()
-                || ctx.cx.interp.is_callable_runtime(&iter_method))
+    ctx.scope(|mut scope| {
+        let mut rooted_args: SmallVec<[Local<'_>; 4]> =
+            args.iter().map(|value| scope.value(*value)).collect();
+
+        // §23.2.5.1 — any Object source other than an ArrayBuffer or a
+        // TypedArray initializes from @@iterator / array-like reads. Keep the
+        // source, iterator methods, yielded values, and conversions in this
+        // one handle range while every observable hook re-enters the VM.
+        if let (Some(source), Some(exec)) = (rooted_args.first().copied(), exec.as_ref()) {
+            let source_value = scope.raw(source);
+            if source_value.is_object_type()
+                && !source_value.is_array_buffer()
+                && !source_value.is_typed_array()
             {
-                return Err(NativeError::TypeError {
-                    name: typed_array_name(kind),
-                    reason: "@@iterator is not callable".to_string(),
-                });
-            }
-            let drained = if ctx.cx.interp.is_callable_runtime(&iter_method) {
-                // §22.2.4.4 — IterableToList collects raw values, then each
-                // is converted (ToNumber / ToBigInt) when stored.
-                let raw = drain_iterable_into_values(ctx, exec, &src_value, iter_method)?;
-                coerce_values_for_kind(ctx, exec, raw, kind)?
-            } else {
-                read_array_like_coerced(ctx, exec, src_value, kind)?
-            };
-            if args.len() == 1 {
-                let roots = ctx.collect_native_roots();
-                let this_value = *ctx.this_value();
-                let new_target = ctx.new_target().cloned();
-                let drained_slice = drained.as_slice();
+                let iter_sym = scope
+                    .context()
+                    .interp_mut()
+                    .well_known_symbols()
+                    .get(crate::symbol::WellKnown::Iterator);
+                let iter_method = ta_get_via(
+                    &mut scope,
+                    exec,
+                    source,
+                    &crate::VmPropertyKey::Symbol(iter_sym),
+                )?;
+                if !(scope.is_undefined(iter_method)
+                    || scope.is_null(iter_method)
+                    || scope.is_callable(iter_method))
+                {
+                    return Err(NativeError::TypeError {
+                        name: typed_array_name(kind),
+                        reason: "@@iterator is not callable".to_string(),
+                    });
+                }
+                let values = if scope.is_callable(iter_method) {
+                    let values = drain_iterable_into_values(&mut scope, exec, source, iter_method)?;
+                    coerce_values_for_kind(&mut scope, exec, values, kind)?
+                } else {
+                    read_array_like_coerced(&mut scope, exec, source, kind)?
+                };
+                let values: SmallVec<[Value; 4]> =
+                    values.iter().map(|value| scope.raw(*value)).collect();
+                let values_slice = values.as_slice();
                 let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                    crate::runtime_cx::visit_native_roots(
-                        visitor,
-                        &roots,
-                        &this_value,
-                        new_target.as_ref(),
-                        &[&src_value],
-                        &[drained_slice],
-                    );
+                    for value in values_slice {
+                        value.trace_value_slots(visitor);
+                    }
                 };
                 let value = dispatch::typed_array_from_values_with_roots(
                     kind,
-                    drained_slice,
-                    ctx.interp_mut(),
+                    values_slice,
+                    scope.context().interp_mut(),
                     &mut external_visit,
                 )
-                .map_err(|e| vm_to_native(ctx.cx.interp, e, typed_array_name(kind)))?;
-                apply_typed_array_new_target_proto(ctx, kind, &value)?;
-                return Ok(value);
-            }
-            let arr = ctx
-                .array_from_elements(drained)
-                .map_err(|_| NativeError::TypeError {
-                    name: typed_array_name(kind),
-                    reason: "out of memory while allocating array".to_string(),
+                .map_err(|error| {
+                    vm_to_native(scope.context().interp_mut(), error, typed_array_name(kind))
                 })?;
-            let mut out: SmallVec<[Value; 4]> = SmallVec::new();
-            out.push(Value::array(arr));
-            for v in args.iter().skip(1) {
-                out.push(*v);
+                let value = scope.value(value);
+                let value = apply_typed_array_new_target_proto(&mut scope, kind, value)?;
+                return Ok(scope.finish(value));
             }
-            Some(out)
-        } else {
-            None
-        };
-    let coerced: SmallVec<[Value; 4]> = if let Some(pre) = iter_pre {
-        pre
-    } else if args.first().is_some_and(|v| v.is_array_buffer()) {
-        if let Some(exec) = &exec {
-            let mut out: SmallVec<[Value; 4]> = args.iter().cloned().collect();
+        }
+
+        // §22.2.4.5 `TypedArray(buffer [, byteOffset [, length]])` —
+        // pre-coerce object offsets through ToPrimitive(Number). Replacing a
+        // vector lane swaps Local identities; the old arena slot remains
+        // harmless and the new one is collector-rewritten in place.
+        if rooted_args
+            .first()
+            .is_some_and(|value| scope.raw(*value).is_array_buffer())
+            && let Some(exec) = exec.as_ref()
+        {
             for idx in 1..=2 {
-                let Some(slot) = out.get_mut(idx) else {
+                let Some(value) = rooted_args.get(idx).copied() else {
                     continue;
                 };
-                let object_like = slot.is_object()
-                    || slot.is_array()
-                    || slot.is_function()
-                    || slot.is_closure()
-                    || slot.is_native_function()
-                    || slot.is_bound_function()
-                    || slot.is_class_constructor()
-                    || slot.is_proxy()
-                    || slot.is_regexp();
-                if !object_like {
+                let value = scope.raw(value);
+                if !value.is_object_type() {
                     continue;
                 }
-                let interp = ctx.interp_mut();
-                let primitive = interp.evaluate_to_primitive(
-                    exec,
-                    slot,
-                    crate::abstract_ops::ToPrimitiveHint::Number,
-                );
-                let primitive = primitive.map_err(|e| {
-                    crate::native_function::vm_to_native_error(interp, e, typed_array_name(kind))
+                let primitive = scope.with_turn_parts(|interp, stack| {
+                    interp
+                        .evaluate_to_primitive(
+                            stack,
+                            exec,
+                            &value,
+                            crate::abstract_ops::ToPrimitiveHint::Number,
+                        )
+                        .map_err(|error| vm_to_native(interp, error, typed_array_name(kind)))
                 })?;
-                *slot = primitive;
+                rooted_args[idx] = scope.value(primitive);
             }
-            out
-        } else {
-            args.iter().cloned().collect()
         }
-    } else {
-        args.iter().cloned().collect()
-    };
-    let coerced_slice: &[Value] = coerced.as_slice();
-    // §23.2.5.1 step 6.b ToIndex(length) — a negative or infinite
-    // numeric length throws RangeError before allocation (the
-    // dispatcher's generic path reported TypeError).
-    if let Some(first) = coerced_slice.first()
-        && !first.is_object_type()
-        && let Some(n) = first.as_number()
-    {
-        let f = n.as_f64();
-        let int = if f.is_nan() { 0.0 } else { f.trunc() };
-        if int < 0.0 || int.is_infinite() {
-            return Err(NativeError::RangeError {
-                name: typed_array_name(kind),
-                reason: "Invalid typed array length".to_string(),
-            });
+
+        let coerced: SmallVec<[Value; 4]> =
+            rooted_args.iter().map(|value| scope.raw(*value)).collect();
+        let coerced_slice = coerced.as_slice();
+        // §23.2.5.1 step 6.b ToIndex(length) — a negative or infinite
+        // numeric length throws RangeError before allocation.
+        if let Some(first) = coerced_slice.first()
+            && !first.is_object_type()
+            && let Some(number) = first.as_number()
+        {
+            let value = number.as_f64();
+            let integer = if value.is_nan() { 0.0 } else { value.trunc() };
+            if integer < 0.0 || integer.is_infinite() {
+                return Err(NativeError::RangeError {
+                    name: typed_array_name(kind),
+                    reason: "Invalid typed array length".to_string(),
+                });
+            }
         }
-    }
-    let roots = ctx.collect_native_roots();
-    let this_value = *ctx.this_value();
-    let new_target = ctx.new_target().cloned();
-    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        crate::runtime_cx::visit_native_roots(
-            visitor,
-            &roots,
-            &this_value,
-            new_target.as_ref(),
-            &[],
-            &[coerced_slice],
-        );
-    };
-    let value = dispatch::typed_array_call_with_roots(
-        kind,
-        TypedArrayMethod::Construct,
-        coerced_slice,
-        ctx.interp_mut(),
-        &mut external_visit,
-    )
-    .map_err(|e| vm_to_native(ctx.cx.interp, e, typed_array_name(kind)))?;
-    // §10.1.13 GetPrototypeFromConstructor — derived `super()`
-    // construction forwards `new.target`, so the allocated typed
-    // array receives `Subclass.prototype` as its observable
-    // [[Prototype]].
-    // <https://tc39.es/ecma262/#sec-getprototypefromconstructor>
-    apply_typed_array_new_target_proto(ctx, kind, &value)?;
-    Ok(value)
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            for value in coerced_slice {
+                value.trace_value_slots(visitor);
+            }
+        };
+        let value = dispatch::typed_array_call_with_roots(
+            kind,
+            TypedArrayMethod::Construct,
+            coerced_slice,
+            scope.context().interp_mut(),
+            &mut external_visit,
+        )
+        .map_err(|error| {
+            vm_to_native(scope.context().interp_mut(), error, typed_array_name(kind))
+        })?;
+        let value = scope.value(value);
+        // §10.1.13 GetPrototypeFromConstructor — derived `super()`
+        // construction forwards `new.target`.
+        let value = apply_typed_array_new_target_proto(&mut scope, kind, value)?;
+        Ok(scope.finish(value))
+    })
 }
 
-fn apply_typed_array_new_target_proto(
-    ctx: &mut NativeCtx<'_>,
+fn apply_typed_array_new_target_proto<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
     kind: TypedArrayKind,
-    value: &Value,
-) -> Result<(), NativeError> {
-    let needs_proto_override = !ctx.new_target().is_some_and(|v| v.is_native_function());
+    value: Local<'scope>,
+) -> Result<Local<'scope>, NativeError> {
+    let needs_proto_override = !scope
+        .context()
+        .new_target()
+        .is_some_and(|target| target.is_native_function());
     if needs_proto_override
         && let Some(proto) =
-            crate::bootstrap::native_new_target_prototype(ctx, typed_array_name(kind))?
+            crate::bootstrap::native_new_target_prototype(scope.context(), typed_array_name(kind))?
     {
-        ctx.interp_mut()
-            .set_non_gc_exotic_prototype_override(value, Some(proto));
+        let current = scope.raw(value);
+        scope
+            .context()
+            .interp_mut()
+            .set_non_gc_exotic_prototype_override(&current, Some(proto));
     }
-    Ok(())
+    Ok(value)
 }
 
 const fn typed_array_name(kind: TypedArrayKind) -> &'static str {
@@ -1052,66 +1067,79 @@ fn ta_proto_dispatch(
             name: NAME,
             reason: format!("method {method_name} missing"),
         })?;
-    let receiver = *ctx.this_value();
-    let mut small_args: SmallVec<[Value; 4]> = args.iter().cloned().collect();
+    ctx.scope(|mut scope| {
+        let receiver = scope.this();
+        let mut arg_handles: SmallVec<[crate::Local<'_>; 4]> =
+            args.iter().map(|value| scope.value(*value)).collect();
 
-    // Some relative-index operands are coerced in the wrapper before
-    // calling shared implementations. Methods whose spec first reads
-    // TypedArray length, such as `fill`, `copyWithin`, `includes`,
-    // `indexOf`, and `lastIndexOf`, do their coercions inside the impl
-    // so user side effects cannot pre-empt the length snapshot.
-    let int_coerce: &[usize] = match method_name {
-        // §23.2.3.1 / §23.2.3.36 / §23.2.3.27/.28 — relative-index
-        // operands run ToIntegerOrInfinity (firing valueOf /
-        // toString) before the impl reads them as numbers.
-        // `at` coerces its index inside impl_at AFTER ValidateTypedArray
-        // so a resize during ToIntegerOrInfinity is observed in the
-        // correct order (it must not throw, only read out of range).
-        "with" => &[0],
-        "slice" | "subarray" => &[0, 1],
-        _ => &[],
-    };
-    if !int_coerce.is_empty() {
-        // §23.2.4.4 ValidateTypedArray runs BEFORE the argument
-        // coercions for these methods — a non-TypedArray or detached
-        // receiver throws before any user valueOf fires. `subarray`
-        // (§23.2.3.30) only requires the internal slot and operates
-        // on detached views.
-        match receiver.as_typed_array(ctx.heap()) {
-            None => {
-                return Err(NativeError::TypeError {
-                    name: NAME,
-                    reason: "method called on a non-TypedArray receiver".to_string(),
-                });
-            }
-            Some(t)
-                if method_name != "subarray" && t.buffer(ctx.heap()).is_detached(ctx.heap()) =>
-            {
-                return Err(NativeError::TypeError {
-                    name: NAME,
-                    reason: "expected non-detached typedarray".to_string(),
-                });
-            }
-            Some(_) => {}
-        }
-        let (interp, ctx_opt) = ctx.interp_mut_and_context();
-        if let Some(context) = ctx_opt {
-            for &idx in int_coerce {
-                let Some(value) = small_args.get(idx).copied() else {
-                    continue;
-                };
-                if value.is_number() || value.is_undefined() {
-                    continue;
+        // Some relative-index operands are coerced in the wrapper before
+        // calling shared implementations. Methods whose spec first reads
+        // TypedArray length, such as `fill`, `copyWithin`, `includes`,
+        // `indexOf`, and `lastIndexOf`, do their coercions inside the impl
+        // so user side effects cannot pre-empt the length snapshot.
+        let int_coerce: &[usize] = match method_name {
+            // §23.2.3.1 / §23.2.3.36 / §23.2.3.27/.28 — relative-index
+            // operands run ToIntegerOrInfinity (firing valueOf /
+            // toString) before the impl reads them as numbers.
+            // `at` coerces its index inside impl_at AFTER ValidateTypedArray
+            // so a resize during ToIntegerOrInfinity is observed in the
+            // correct order (it must not throw, only read out of range).
+            "with" => &[0],
+            "slice" | "subarray" => &[0, 1],
+            _ => &[],
+        };
+        if !int_coerce.is_empty() {
+            // §23.2.4.4 ValidateTypedArray runs BEFORE the argument
+            // coercions for these methods — a non-TypedArray or detached
+            // receiver throws before any user valueOf fires. `subarray`
+            // (§23.2.3.30) only requires the internal slot and operates
+            // on detached views.
+            match scope.raw(receiver).as_typed_array(scope.context().heap()) {
+                None => {
+                    return Err(NativeError::TypeError {
+                        name: NAME,
+                        reason: "method called on a non-TypedArray receiver".to_string(),
+                    });
                 }
-                let n = interp.coerce_to_number(&context, &value);
-                let n =
-                    n.map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))?;
-                small_args[idx] = Value::number(n);
+                Some(t)
+                    if method_name != "subarray"
+                        && t.buffer(scope.context().heap())
+                            .is_detached(scope.context().heap()) =>
+                {
+                    return Err(NativeError::TypeError {
+                        name: NAME,
+                        reason: "expected non-detached typedarray".to_string(),
+                    });
+                }
+                Some(_) => {}
+            }
+            if let Some(context) = scope.context().execution_context().cloned() {
+                for &idx in int_coerce {
+                    let Some(value_handle) = arg_handles.get(idx).copied() else {
+                        continue;
+                    };
+                    let value = scope.raw(value_handle);
+                    if value.is_number() || value.is_undefined() {
+                        continue;
+                    }
+                    let number = scope.with_turn_parts(|interp, stack| {
+                        interp
+                            .coerce_to_number(stack, &context, &value)
+                            .map_err(|error| {
+                                crate::native_function::vm_to_native_error(interp, error, NAME)
+                            })
+                    })?;
+                    arg_handles[idx] = scope.value(Value::number(number));
+                }
             }
         }
-    }
 
-    impl_fn(ctx, &small_args)
+        let current_args: SmallVec<[Value; 4]> =
+            arg_handles.iter().map(|value| scope.raw(*value)).collect();
+        let result = impl_fn(scope.context(), &current_args)?;
+        let result = scope.value(result);
+        Ok(scope.finish(result))
+    })
 }
 
 // §23.2.3 callback-driven prototype methods re-enter the interpreter to
@@ -1159,17 +1187,23 @@ fn ta_species_dispatch(
             reason: "method called on a non-TypedArray receiver".to_string(),
         });
     };
-    let (interp, ctx_opt) = ctx.interp_mut_and_context();
-    let context = ctx_opt.ok_or_else(|| NativeError::TypeError {
-        name: method_name,
-        reason: "missing execution context".to_string(),
-    })?;
-    let result = if method_name == "slice" {
-        interp.typed_array_slice_value_dispatch(&context, &t, args)
-    } else {
-        interp.typed_array_subarray_value_dispatch(&context, &t, args)
-    };
-    result.map_err(|err| crate::native_function::vm_to_native_error(interp, err, method_name))
+    let context = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: method_name,
+            reason: "missing execution context".to_string(),
+        })?;
+    let result = ctx.with_turn_parts(|interp, stack| {
+        if method_name == "slice" {
+            interp.typed_array_slice_value_dispatch(stack, &context, &t, args)
+        } else {
+            interp.typed_array_subarray_value_dispatch(stack, &context, &t, args)
+        }
+    });
+    result.map_err(|err| {
+        crate::native_function::vm_to_native_error(ctx.interp_mut(), err, method_name)
+    })
 }
 
 fn ta_callback_dispatch(
@@ -1184,13 +1218,18 @@ fn ta_callback_dispatch(
             reason: "method called on a non-TypedArray receiver".to_string(),
         });
     };
-    let (interp, ctx_opt) = ctx.interp_mut_and_context();
-    let context = ctx_opt.ok_or_else(|| NativeError::TypeError {
-        name: method_name,
-        reason: "missing execution context".to_string(),
-    })?;
-    let result = interp.typed_array_callback_value_dispatch(&context, &t, method_name, args);
-    result.map_err(|err| crate::native_function::vm_to_native_error(interp, err, method_name))
+    let context = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: method_name,
+            reason: "missing execution context".to_string(),
+        })?;
+    ctx.with_turn_parts(|interp, stack| {
+        interp
+            .typed_array_callback_value_dispatch(stack, &context, &t, method_name, args)
+            .map_err(|err| crate::native_function::vm_to_native_error(interp, err, method_name))
+    })
 }
 
 // ---------------------------------------------------------------

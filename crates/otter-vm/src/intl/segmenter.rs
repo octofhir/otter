@@ -7,13 +7,12 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#segmenter-objects>
 
-use otter_gc::raw::RawGc;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::intl::helpers::{DEFAULT_LOCALE, get_string_option, require_options_object};
 use crate::intl::payload::{IntlPayload, SegmenterPayload};
 use crate::string::JsString;
-use crate::{NativeCtx, NativeError, NativeFunction, Value};
+use crate::{NativeCtx, NativeError, Value};
 
 const CLASS: &str = "Segmenter";
 
@@ -190,7 +189,6 @@ pub(crate) fn segmenter_segment(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "segment")?;
-    let text_arg = args.first().copied().unwrap_or_else(Value::undefined);
     let exec = ctx
         .execution_context()
         .cloned()
@@ -198,97 +196,53 @@ pub(crate) fn segmenter_segment(
             name: "segment",
             reason: "missing execution context for string coercion".to_string(),
         })?;
-    let input_string = crate::coerce::to_js_string_or_throw(ctx.cx.interp, &exec, &text_arg)
-        .map_err(|err| crate::native_function::vm_to_native_error(ctx.cx.interp, err, "segment"))?;
-    let input_units = input_string.to_utf16_vec(ctx.heap());
-    let segments = segment(&input_units, &payload.granularity);
-    let input_value = Value::string(input_string);
-    let granularity_word = payload.granularity == "word";
-    let mut prepared: Vec<(Value, i32, bool)> = Vec::with_capacity(segments.len());
-    let roots = ctx.collect_native_roots();
-    let this_value = *ctx.this_value();
-    for segment in segments {
-        let mut segment_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
+    ctx.scope(|mut scope| {
+        let text = scope.argument(args, 0);
+        let text_value = scope.raw(text);
+        let input_string = scope.with_turn_parts(|interp, stack| {
+            crate::coerce::to_js_string_or_throw(interp, stack, &exec, &text_value)
+        });
+        let input_string = input_string.map_err(|error| {
+            crate::native_function::vm_to_native_error(
+                scope.context().interp_mut(),
+                error,
+                "segment",
+            )
+        })?;
+        let input = scope.value(Value::string(input_string));
+        let input_units = input_string.to_utf16_vec(scope.context().heap());
+        let segments = segment(&input_units, &payload.granularity);
+        let result = scope.array(segments.len())?;
+        let granularity_word = payload.granularity == "word";
+
+        for (index, segment) in segments.into_iter().enumerate() {
+            let record = scope.object()?;
+            let segment_string =
+                JsString::from_utf16_units(&segment.units, scope.context().heap_mut())?;
+            let segment_value = scope.value(Value::string(segment_string));
+            scope.set(record, "segment", segment_value)?;
+            let start = scope.number(segment.index as f64);
+            scope.set(record, "index", start)?;
+            scope.set(record, "input", input)?;
+            if granularity_word {
+                let wordlike = scope.boolean(segment.is_word_like);
+                scope.set(record, "isWordLike", wordlike)?;
             }
-            this_value.trace_value_slots(visitor);
-            input_value.trace_value_slots(visitor);
-            for (value, _, _) in &prepared {
-                value.trace_value_slots(visitor);
-            }
-        };
-        let seg_str = Value::string(JsString::from_utf16_units_with_roots(
-            &segment.units,
-            ctx.heap_mut(),
-            &mut segment_visit,
-        )?);
-        prepared.push((seg_str, segment.index as i32, segment.is_word_like));
-    }
-    let prepared_values: Vec<Value> = prepared.iter().map(|(value, _, _)| *value).collect();
-    let mut elements: Vec<Value> = Vec::with_capacity(prepared.len());
-    for (seg_str, idx, wordlike) in &prepared {
-        let mut obj =
-            ctx.alloc_object_with_roots(&[seg_str, &input_value], &[&prepared_values, &elements])?;
-        if let Some(proto) = ctx.cx.interp.object_prototype_object_opt() {
-            crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto));
+            scope.set_index(result, index, record)?;
         }
-        let heap = ctx.heap_mut();
-        crate::object::set(&mut obj, heap, "segment", *seg_str);
-        crate::object::set(&mut obj, heap, "index", Value::number_i32(*idx));
-        crate::object::set(&mut obj, heap, "input", input_value);
-        if granularity_word {
-            crate::object::set(&mut obj, heap, "isWordLike", Value::boolean(*wordlike));
-        }
-        elements.push(Value::object(obj));
-    }
-    let element_roots = elements.clone();
-    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        for &slot in &roots {
-            visitor(slot);
-        }
-        this_value.trace_value_slots(visitor);
-        input_value.trace_value_slots(visitor);
-        for v in &prepared_values {
-            v.trace_value_slots(visitor);
-        }
-        for v in &element_roots {
-            v.trace_value_slots(visitor);
-        }
-    };
-    let arr =
-        crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut external_visit)?;
-    let arr_value = Value::array(arr);
-    let mut method_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        for &slot in &roots {
-            visitor(slot);
-        }
-        this_value.trace_value_slots(visitor);
-        input_value.trace_value_slots(visitor);
-        arr_value.trace_value_slots(visitor);
-    };
-    let containing = Value::native_function(NativeFunction::new_static_with_roots(
-        ctx.heap_mut(),
-        "containing",
-        1,
-        segments_containing,
-        &mut method_visit,
-    )?);
-    crate::array::set_named_property(arr, ctx.heap_mut(), "containing", containing)?;
-    let iterator_fn = Value::native_function(NativeFunction::new_static_with_roots(
-        ctx.heap_mut(),
-        "[Symbol.iterator]",
-        0,
-        segments_symbol_iterator,
-        &mut method_visit,
-    )?);
-    let iterator_sym = ctx
-        .cx
-        .interp
-        .well_known_symbols()
-        .get(crate::WellKnown::Iterator);
-    crate::array::set_symbol_property(arr, ctx.heap_mut(), iterator_sym, iterator_fn);
-    Ok(Value::array(arr))
+
+        let containing = scope.native_method("containing", 1, segments_containing)?;
+        scope.set(result, "containing", containing)?;
+        let iterator = scope.native_method("[Symbol.iterator]", 0, segments_symbol_iterator)?;
+        let iterator_symbol = scope
+            .context()
+            .interp_mut()
+            .well_known_symbols()
+            .get(crate::WellKnown::Iterator);
+        let iterator_symbol = scope.value(Value::symbol(iterator_symbol));
+        scope.set_symbol(result, iterator_symbol, iterator)?;
+        Ok(scope.finish(result))
+    })
 }
 
 fn segments_symbol_iterator(
@@ -309,28 +263,29 @@ fn segments_symbol_iterator(
 }
 
 fn segments_containing(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let Some(arr) = ctx.this_value().as_array() else {
+    if ctx.this_value().as_array().is_none() {
         return Err(NativeError::TypeError {
             name: "containing",
             reason: "intrinsic called on a non-Segments receiver".to_string(),
         });
-    };
+    }
     let index_arg = args.first().copied().unwrap_or_else(Value::undefined);
-    let number = {
-        let (interp, context) = ctx.interp_mut_and_context();
-        let Some(context) = context.as_ref() else {
-            return Err(NativeError::TypeError {
-                name: "containing",
-                reason: "missing execution context for index coercion".to_string(),
-            });
-        };
-        crate::coerce::to_number_or_throw(interp, context, &index_arg)
-            .map_err(|err| NativeError::TypeError {
-                name: "containing",
-                reason: err.to_string(),
-            })?
-            .as_f64()
-    };
+    let context = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "containing",
+            reason: "missing execution context for index coercion".to_string(),
+        })?;
+    let number = ctx.with_turn_parts(|interp, stack| {
+        crate::coerce::to_number_or_throw(interp, stack, &context, &index_arg)
+    });
+    let number = number
+        .map_err(|err| NativeError::TypeError {
+            name: "containing",
+            reason: err.to_string(),
+        })?
+        .as_f64();
     let n = if number.is_nan() || number == 0.0 {
         0.0
     } else {
@@ -341,6 +296,14 @@ fn segments_containing(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
             number.signum() * magnitude
         }
     };
+    // Index coercion may re-enter JavaScript and relocate the Segments array.
+    let arr = ctx
+        .this_value()
+        .as_array()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "containing",
+            reason: "intrinsic called on a non-Segments receiver".to_string(),
+        })?;
     let len = crate::array::len(arr, ctx.heap());
     if len == 0 || n.is_sign_negative() {
         return Ok(Value::undefined());

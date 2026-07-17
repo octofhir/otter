@@ -242,9 +242,15 @@ fn invoke_static(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let context = ctx.execution_context().cloned();
-    let constructor = Some(*ctx.this_value());
-    let (interp, _ignored_ctx) = ctx.interp_mut_and_context();
-    promise_dispatch::statics_call(interp, context, constructor, method, args)
+    ctx.scope(|mut scope| {
+        let constructor = scope.this();
+        let constructor = Some(scope.raw(constructor));
+        let result = scope.with_turn_parts(|interp, stack| {
+            promise_dispatch::statics_call(interp, stack, context, constructor, method, args)
+        })?;
+        let result = scope.value(result);
+        Ok(scope.finish(result))
+    })
 }
 
 // ---------------------------------------------------------------
@@ -252,18 +258,22 @@ fn invoke_static(
 // ---------------------------------------------------------------
 
 fn promise_proto_then(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let promise = match ctx.this_value().as_promise() {
-        Some(p) => p,
-        None => {
-            return Err(NativeError::TypeError {
+    let context = ctx.execution_context().cloned();
+    ctx.scope(|mut scope| {
+        let receiver = scope.this();
+        let promise = scope
+            .raw(receiver)
+            .as_promise()
+            .ok_or_else(|| NativeError::TypeError {
                 name: "Promise.prototype.then",
                 reason: "`this` is not a Promise".to_string(),
-            });
-        }
-    };
-    let context = ctx.execution_context().cloned();
-    let (interp, _ignored) = ctx.interp_mut_and_context();
-    promise_dispatch::prototype_call(interp, context, &promise, "then", args)
+            })?;
+        let result = scope.with_turn_parts(|interp, stack| {
+            promise_dispatch::prototype_call(interp, stack, context, &promise, "then", args)
+        })?;
+        let result = scope.value(result);
+        Ok(scope.finish(result))
+    })
 }
 
 /// §27.2.5.1 `Promise.prototype.catch(onRejected)`.

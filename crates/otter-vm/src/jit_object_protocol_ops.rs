@@ -56,7 +56,7 @@ impl Interpreter {
             }
             value if value == Op::HasProperty as u8 => {
                 if !self.drive_has_property_proxy(stack, context, &ops)? {
-                    self.run_has_property_regs(&mut stack[frame_index], context, a, b, c)?;
+                    self.run_has_property_regs(stack, frame_index, context, a, b, c)?;
                 }
             }
             value if value == Op::GetPrototype as u8 => {
@@ -66,7 +66,7 @@ impl Interpreter {
             }
             value if value == Op::SetPrototype as u8 => {
                 if !self.drive_set_prototype_proxy(stack, context, &ops)? {
-                    self.run_set_prototype_regs(context, &mut stack[frame_index], a, b)?;
+                    self.run_set_prototype_regs(context, stack, frame_index, a, b)?;
                 }
             }
             _ => return Err(VmError::InvalidOperand),

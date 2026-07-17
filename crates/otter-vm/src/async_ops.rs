@@ -41,7 +41,7 @@ impl Interpreter {
     fn await_promise_resolve(
         &mut self,
         context: &ExecutionContext,
-        stack: &ActivationStack,
+        stack: &mut ActivationStack,
         value: Value,
     ) -> Result<crate::promise::JsPromiseHandle, VmError> {
         if let Some(p) = value.as_promise() {
@@ -50,7 +50,8 @@ impl Interpreter {
         let cap = promise_dispatch::PromiseBuilder::with_context(context.clone())
             .capability_stack_rooted(self, stack, &[&value], &[])?;
         let resolve = cap.resolve;
-        self.run_callable_sync(
+        self.run_callable_sync_rooted(
+            stack,
             context,
             &resolve,
             Value::undefined(),
@@ -529,7 +530,7 @@ impl Interpreter {
                 // iterator it left open (floor `-1` takes all depths)
                 // before the frame is discarded.
                 let closers = self.take_frame_closers_above(stack.last_mut().expect("frame"), -1);
-                self.close_unwind_iterators(context, closers);
+                self.close_unwind_iterators(stack, context, closers);
                 // Async frames absorb their own unhandled throws into the
                 // result promise as a rejection — spec §27.7.5.3
                 // step 1.h.iii.
@@ -571,7 +572,7 @@ impl Interpreter {
             }
             let closers =
                 self.take_frame_closers_above(stack.last_mut().expect("frame"), handler_floor);
-            self.close_unwind_iterators(context, closers);
+            self.close_unwind_iterators(stack, context, closers);
             let frame = stack.last_mut().expect("frame still present");
             if let Some(catch_pc) = handler.catch_pc {
                 frame.pc = catch_pc;
@@ -618,11 +619,12 @@ impl Interpreter {
     /// original (throw) completion.
     fn close_unwind_iterators(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         closers: SmallVec<[Value; 2]>,
     ) {
         for iterator in closers {
-            let _ = self.iterator_close_value_sync(context, iterator);
+            let _ = self.iterator_close_value_sync(stack, context, iterator);
         }
     }
 

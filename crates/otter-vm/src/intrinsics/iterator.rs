@@ -10,7 +10,6 @@
 //! - <https://tc39.es/ecma262/#sec-iterator-constructor>
 
 use crate::Value;
-use crate::activation_stack::ActivationStack;
 use crate::bootstrap::native_static_with_value_roots;
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject};
@@ -219,22 +218,26 @@ fn setter_ignoring_prototype_properties(
         }
         return Ok(Value::undefined());
     }
-    let (interp, exec_ctx) = ctx.interp_mut_and_context();
-    let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
-        name,
-        reason: "missing execution context".to_string(),
-    })?;
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name,
+                reason: "missing execution context".to_string(),
+            })?;
     match &key {
-        crate::VmPropertyKey::String(k) => {
-            let result =
-                interp.ordinary_set_with_callable_setter(&exec_ctx, this_obj, k, value, true);
-            result.map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))?
-        }
-        crate::VmPropertyKey::Symbol(sym) => {
-            let result = interp
-                .ordinary_set_symbol_with_callable_setter(&exec_ctx, this_obj, *sym, value, true);
-            result.map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))?
-        }
+        crate::VmPropertyKey::String(k) => ctx.with_turn_parts(|interp, stack| {
+            interp
+                .ordinary_set_with_callable_setter(stack, &exec_ctx, this_obj, k, value, true)
+                .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))
+        })?,
+        crate::VmPropertyKey::Symbol(sym) => ctx.with_turn_parts(|interp, stack| {
+            interp
+                .ordinary_set_symbol_with_callable_setter(
+                    stack, &exec_ctx, this_obj, *sym, value, true,
+                )
+                .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))
+        })?,
         _ => {}
     }
     Ok(Value::undefined())
@@ -706,22 +709,22 @@ fn iterator_receiver(
     // checked for callability (a non-callable `next` throws when the
     // first step is driven, per IteratorNext).
     if !crate::abstract_ops::is_primitive(&this_value) {
-        let (interp, exec_ctx) = ctx.interp_mut_and_context();
-        let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
-            name,
-            reason: "missing execution context".to_string(),
-        })?;
+        let exec_ctx =
+            ctx.execution_context()
+                .cloned()
+                .ok_or_else(|| crate::NativeError::TypeError {
+                    name,
+                    reason: "missing execution context".to_string(),
+                })?;
         let next_key = crate::VmPropertyKey::String("next");
-        let outcome = interp.ordinary_get_value(&exec_ctx, this_value, this_value, &next_key, 0);
-        let outcome =
-            outcome.map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))?;
+        let outcome = ctx.with_turn_parts(|interp, stack| {
+            interp
+                .ordinary_get_value(stack, &exec_ctx, this_value, this_value, &next_key, 0)
+                .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))
+        })?;
         let next_method = match outcome {
             crate::VmGetOutcome::Value(v) => v,
-            crate::VmGetOutcome::InvokeGetter { getter } => {
-                let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                let result = interp.run_callable_sync(&exec_ctx, &getter, this_value, args);
-                result.map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))?
-            }
+            crate::VmGetOutcome::InvokeGetter { getter } => ctx.call(getter, this_value, &[])?,
         };
         let this_root = this_value;
         let state = crate::IteratorState::User {
@@ -766,16 +769,17 @@ fn close_receiver_on_validation_failure(
     this_value: Value,
     err: crate::NativeError,
 ) -> crate::NativeError {
-    let (interp, exec_ctx) = ctx.interp_mut_and_context();
-    let Some(exec_ctx) = exec_ctx else {
+    let Some(exec_ctx) = ctx.execution_context().cloned() else {
         return err;
     };
-    let original_throw = interp.take_pending_uncaught_throw();
-    let _ = interp.iterator_close_value_sync(&exec_ctx, this_value);
-    let _ = interp.take_pending_uncaught_throw();
-    if let Some(value) = original_throw {
-        interp.set_pending_uncaught_throw(value);
-    }
+    ctx.with_turn_parts(|interp, stack| {
+        let original_throw = interp.take_pending_uncaught_throw();
+        let _ = interp.iterator_close_value_sync(stack, &exec_ctx, this_value);
+        let _ = interp.take_pending_uncaught_throw();
+        if let Some(value) = original_throw {
+            interp.set_pending_uncaught_throw(value);
+        }
+    });
     err
 }
 
@@ -974,14 +978,23 @@ fn iterator_arg_count_native(
     let primitive = if crate::abstract_ops::is_primitive(&arg) {
         arg
     } else {
-        let (interp, exec) = ctx.interp_mut_and_context();
-        let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
-            name,
-            reason: "missing execution context".to_string(),
-        })?;
-        let result =
-            interp.evaluate_to_primitive(&exec, &arg, crate::abstract_ops::ToPrimitiveHint::Number);
-        result.map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))?
+        let exec =
+            ctx.execution_context()
+                .cloned()
+                .ok_or_else(|| crate::NativeError::TypeError {
+                    name,
+                    reason: "missing execution context".to_string(),
+                })?;
+        ctx.with_turn_parts(|interp, stack| {
+            interp
+                .evaluate_to_primitive(
+                    stack,
+                    &exec,
+                    &arg,
+                    crate::abstract_ops::ToPrimitiveHint::Number,
+                )
+                .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))
+        })?
     };
     // §7.1.4 ToNumber — a Symbol or BigInt operand is a TypeError, not a
     // coercion to NaN (which would surface as the §27.5.1.2 step 4
@@ -1098,14 +1111,18 @@ fn iterator_proto_for_each(
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         cb_args.push(v);
         cb_args.push(Value::number(crate::number::NumberValue::from_f64(idx)));
-        if let Err(err) =
-            ctx.cx
-                .interp
-                .run_callable_sync(&exec_ctx, &callback, Value::undefined(), cb_args)
-        {
-            ctx.cx
-                .interp
-                .close_iterator_preserving_throw(&exec_ctx, &handle);
+        if let Err(err) = ctx.with_turn_parts(|interp, stack| {
+            interp.run_callable_sync_rooted(
+                stack,
+                &exec_ctx,
+                &callback,
+                Value::undefined(),
+                cb_args,
+            )
+        }) {
+            ctx.with_turn_parts(|interp, stack| {
+                interp.close_iterator_preserving_throw(stack, &exec_ctx, &handle);
+            });
             return Err(crate::native_function::vm_to_native_error(
                 ctx.cx.interp,
                 err,
@@ -1170,24 +1187,21 @@ fn iterator_proto_reduce(
         cb_args.push(acc);
         cb_args.push(v);
         cb_args.push(Value::number(crate::number::NumberValue::from_f64(idx)));
-        acc =
-            match ctx
-                .cx
-                .interp
-                .run_callable_sync(&exec_ctx, &reducer, Value::undefined(), cb_args)
-            {
-                Ok(acc) => acc,
-                Err(err) => {
-                    ctx.cx
-                        .interp
-                        .close_iterator_preserving_throw(&exec_ctx, &handle);
-                    return Err(crate::native_function::vm_to_native_error(
-                        ctx.cx.interp,
-                        err,
-                        "Iterator.prototype.reduce",
-                    ));
-                }
-            };
+        acc = match ctx.with_turn_parts(|interp, stack| {
+            interp.run_callable_sync_rooted(stack, &exec_ctx, &reducer, Value::undefined(), cb_args)
+        }) {
+            Ok(acc) => acc,
+            Err(err) => {
+                ctx.with_turn_parts(|interp, stack| {
+                    interp.close_iterator_preserving_throw(stack, &exec_ctx, &handle);
+                });
+                return Err(crate::native_function::vm_to_native_error(
+                    ctx.cx.interp,
+                    err,
+                    "Iterator.prototype.reduce",
+                ));
+            }
+        };
         idx += 1.0;
     }
     if !has_acc {
@@ -1245,17 +1259,20 @@ fn iterator_proto_find(
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         cb_args.push(v);
         cb_args.push(Value::number(crate::number::NumberValue::from_f64(idx)));
-        let kept = match ctx.cx.interp.run_callable_sync(
-            &exec_ctx,
-            &predicate,
-            Value::undefined(),
-            cb_args,
-        ) {
+        let kept = match ctx.with_turn_parts(|interp, stack| {
+            interp.run_callable_sync_rooted(
+                stack,
+                &exec_ctx,
+                &predicate,
+                Value::undefined(),
+                cb_args,
+            )
+        }) {
             Ok(kept) => kept,
             Err(err) => {
-                ctx.cx
-                    .interp
-                    .close_iterator_preserving_throw(&exec_ctx, &handle);
+                ctx.with_turn_parts(|interp, stack| {
+                    interp.close_iterator_preserving_throw(stack, &exec_ctx, &handle);
+                });
                 return Err(crate::native_function::vm_to_native_error(
                     ctx.cx.interp,
                     err,
@@ -1264,10 +1281,9 @@ fn iterator_proto_find(
             }
         };
         if kept.to_boolean(ctx.heap()) {
-            let close = ctx
-                .cx
-                .interp
-                .iterator_close_value_sync(&exec_ctx, Value::iterator(handle));
+            let close = ctx.with_turn_parts(|interp, stack| {
+                interp.iterator_close_value_sync(stack, &exec_ctx, Value::iterator(handle))
+            });
             close.map_err(|e| {
                 crate::native_function::vm_to_native_error(
                     ctx.cx.interp,
@@ -1408,37 +1424,36 @@ fn wrap_for_valid_iterator_next(
         // generic reconstructing step is equivalent.
         return iterator_proto_next(ctx, args);
     };
-    let (interp, exec_ctx) = ctx.interp_mut_and_context();
-    let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
-        name: NAME,
-        reason: "missing execution context".to_string(),
-    })?;
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name: NAME,
+                reason: "missing execution context".to_string(),
+            })?;
     // §7.4.4 GetIteratorDirect caches the `next` method at record
     // creation; fall back to a fresh `[[Get]]` for records that defer it.
     let next_fn = match next_method {
         Some(v) => v,
         None => {
             let key = crate::VmPropertyKey::String("next");
-            match interp
-                .ordinary_get_value(&exec_ctx, iterator, iterator, &key, 0)
-                .map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))?
-            {
+            match ctx.with_turn_parts(|interp, stack| {
+                interp
+                    .ordinary_get_value(stack, &exec_ctx, iterator, iterator, &key, 0)
+                    .map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))
+            })? {
                 crate::VmGetOutcome::Value(v) => v,
-                crate::VmGetOutcome::InvokeGetter { getter } => interp
-                    .run_callable_sync(&exec_ctx, &getter, iterator, smallvec::SmallVec::new())
-                    .map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))?,
+                crate::VmGetOutcome::InvokeGetter { getter } => ctx.call(getter, iterator, &[])?,
             }
         }
     };
-    if !interp.is_callable_runtime(&next_fn) {
+    if !ctx.interp_mut().is_callable_runtime(&next_fn) {
         return Err(crate::NativeError::TypeError {
             name: NAME,
             reason: "iterator `next` is not callable".to_string(),
         });
     }
-    interp
-        .run_callable_sync(&exec_ctx, &next_fn, iterator, smallvec::SmallVec::new())
-        .map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))
+    ctx.call(next_fn, iterator, &[])
 }
 
 /// §22.2.7.2 `%RegExpStringIteratorPrototype%.next`.
@@ -1538,47 +1553,37 @@ fn iterator_proto_return(
             _ => None,
         });
     if let Some(target) = wrapped_user {
-        let (interp, exec_ctx) = ctx.interp_mut_and_context();
-        let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
-            name: "Iterator.prototype.return",
-            reason: "missing execution context".to_string(),
-        })?;
+        let exec_ctx =
+            ctx.execution_context()
+                .cloned()
+                .ok_or_else(|| crate::NativeError::TypeError {
+                    name: "Iterator.prototype.return",
+                    reason: "missing execution context".to_string(),
+                })?;
         let key = crate::VmPropertyKey::String("return");
-        let outcome = interp.ordinary_get_value(&exec_ctx, target, target, &key, 0);
-        let outcome = outcome.map_err(|e| {
-            crate::native_function::vm_to_native_error(interp, e, "Iterator.prototype.return")
-        })?;
-        let return_method = match outcome {
-            crate::VmGetOutcome::Value(v) => v,
-            crate::VmGetOutcome::InvokeGetter { getter } => {
-                let result =
-                    interp.run_callable_sync(&exec_ctx, &getter, target, smallvec::SmallVec::new());
-                result.map_err(|e| {
+        let outcome = ctx.with_turn_parts(|interp, stack| {
+            interp
+                .ordinary_get_value(stack, &exec_ctx, target, target, &key, 0)
+                .map_err(|e| {
                     crate::native_function::vm_to_native_error(
                         interp,
                         e,
                         "Iterator.prototype.return",
                     )
-                })?
-            }
+                })
+        })?;
+        let return_method = match outcome {
+            crate::VmGetOutcome::Value(v) => v,
+            crate::VmGetOutcome::InvokeGetter { getter } => ctx.call(getter, target, &[])?,
         };
         if !return_method.is_nullish() {
-            if !interp.is_callable_runtime(&return_method) {
+            if !ctx.interp_mut().is_callable_runtime(&return_method) {
                 return Err(crate::NativeError::TypeError {
                     name: "Iterator.prototype.return",
                     reason: "iterator `return` is not callable".to_string(),
                 });
             }
-            let result = interp.run_callable_sync(
-                &exec_ctx,
-                &return_method,
-                target,
-                smallvec::SmallVec::new(),
-            );
-            let result = result.map_err(|e| {
-                crate::native_function::vm_to_native_error(interp, e, "Iterator.prototype.return")
-            })?;
-            return Ok(result);
+            return ctx.call(return_method, target, &[]);
         }
         return create_iterator_return_result(ctx, iter_value, arg);
     } else if !receiver_is_async_generator {
@@ -1589,10 +1594,9 @@ fn iterator_proto_return(
                     name: "Iterator.prototype.return",
                     reason: "missing execution context".to_string(),
                 })?;
-        let close = ctx
-            .cx
-            .interp
-            .iterator_close_value_sync(&exec_ctx, iter_value);
+        let close = ctx.with_turn_parts(|interp, stack| {
+            interp.iterator_close_value_sync(stack, &exec_ctx, iter_value)
+        });
         close.map_err(|e| {
             crate::native_function::vm_to_native_error(
                 ctx.cx.interp,
@@ -1692,17 +1696,20 @@ fn iterator_predicate_drain(
         cb_args.push(Value::number(crate::number::NumberValue::from_f64(idx)));
         // §27.1.4.x — IfAbruptCloseIterator: a throwing predicate
         // closes the underlying iterator before propagating.
-        let kept = match ctx.cx.interp.run_callable_sync(
-            &exec_ctx,
-            &predicate,
-            Value::undefined(),
-            cb_args,
-        ) {
+        let kept = match ctx.with_turn_parts(|interp, stack| {
+            interp.run_callable_sync_rooted(
+                stack,
+                &exec_ctx,
+                &predicate,
+                Value::undefined(),
+                cb_args,
+            )
+        }) {
             Ok(kept) => kept,
             Err(err) => {
-                ctx.cx
-                    .interp
-                    .close_iterator_preserving_throw(&exec_ctx, &handle);
+                ctx.with_turn_parts(|interp, stack| {
+                    interp.close_iterator_preserving_throw(stack, &exec_ctx, &handle);
+                });
                 return Err(crate::native_function::vm_to_native_error(
                     ctx.cx.interp,
                     err,
@@ -1713,10 +1720,9 @@ fn iterator_predicate_drain(
         if kept.to_boolean(ctx.heap()) == short_on_truthy {
             // Early exit closes the underlying iterator with a normal
             // completion; a throwing `return` propagates.
-            let close = ctx
-                .cx
-                .interp
-                .iterator_close_value_sync(&exec_ctx, Value::iterator(handle));
+            let close = ctx.with_turn_parts(|interp, stack| {
+                interp.iterator_close_value_sync(stack, &exec_ctx, Value::iterator(handle))
+            });
             close
                 .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, name))?;
             return Ok(Value::boolean(short_on_truthy));
@@ -1751,32 +1757,27 @@ fn iterator_from_native(
         .interp
         .well_known_symbols()
         .get(crate::symbol::WellKnown::Iterator);
-    let (interp, exec_ctx) = ctx.interp_mut_and_context();
-    let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
-        name: "Iterator.from",
-        reason: "missing execution context".to_string(),
-    })?;
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name: "Iterator.from",
+                reason: "missing execution context".to_string(),
+            })?;
     let key = crate::VmPropertyKey::Symbol(iterator_sym);
-    let outcome = interp.ordinary_get_value(&exec_ctx, input, input, &key, 0);
-    let outcome = outcome
-        .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "Iterator.from"))?;
+    let outcome = ctx.with_turn_parts(|interp, stack| {
+        interp
+            .ordinary_get_value(stack, &exec_ctx, input, input, &key, 0)
+            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "Iterator.from"))
+    })?;
     let iter_method = match outcome {
         crate::VmGetOutcome::Value(v) => v,
-        crate::VmGetOutcome::InvokeGetter { getter } => {
-            let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-            let result = interp.run_callable_sync(&exec_ctx, &getter, input, args);
-            result.map_err(|e| {
-                crate::native_function::vm_to_native_error(interp, e, "Iterator.from")
-            })?
-        }
+        crate::VmGetOutcome::InvokeGetter { getter } => ctx.call(getter, input, &[])?,
     };
     let iter_value = if iter_method.is_nullish() {
         input
-    } else if interp.is_callable_runtime(&iter_method) {
-        let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-        let result = interp.run_callable_sync(&exec_ctx, &iter_method, input, args);
-        result
-            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "Iterator.from"))?
+    } else if ctx.interp_mut().is_callable_runtime(&iter_method) {
+        ctx.call(iter_method, input, &[])?
     } else {
         return Err(crate::NativeError::TypeError {
             name: "Iterator.from",
@@ -1793,36 +1794,37 @@ fn iterator_from_native(
     // the `%Iterator%` instance check below. Even values that pass
     // through unwrapped must observe this `[[Get]]`.
     let next_key = crate::VmPropertyKey::String("next");
-    let next_outcome = interp.ordinary_get_value(&exec_ctx, iter_value, iter_value, &next_key, 0);
-    let next_outcome = next_outcome
-        .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "Iterator.from"))?;
+    let next_outcome = ctx.with_turn_parts(|interp, stack| {
+        interp
+            .ordinary_get_value(stack, &exec_ctx, iter_value, iter_value, &next_key, 0)
+            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "Iterator.from"))
+    })?;
     let next_method = match next_outcome {
         crate::VmGetOutcome::Value(v) => v,
-        crate::VmGetOutcome::InvokeGetter { getter } => {
-            let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-            let result = interp.run_callable_sync(&exec_ctx, &getter, iter_value, args);
-            result.map_err(|e| {
-                crate::native_function::vm_to_native_error(interp, e, "Iterator.from")
-            })?
-        }
+        crate::VmGetOutcome::InvokeGetter { getter } => ctx.call(getter, iter_value, &[])?,
     };
     // §27.1.4.1 step 2-3 — values already inheriting
     // `%Iterator.prototype%` (generators, custom Iterator
     // subclasses, built-in iterator objects) pass through unwrapped.
-    let iterator_ctor = if interp.is_callable_runtime(&receiver_ctor) {
-        receiver_ctor
-    } else if let Some(receiver_obj) = receiver_ctor.as_object()
-        && let Some(candidate) = crate::object::get(receiver_obj, interp.gc_heap(), "Iterator")
-        && interp.is_callable_runtime(&candidate)
-    {
-        candidate
-    } else {
-        let global = *interp.global_this();
-        crate::object::get(global, interp.gc_heap(), "Iterator").unwrap_or(Value::undefined())
+    let iterator_ctor = {
+        let interp = ctx.interp_mut();
+        if interp.is_callable_runtime(&receiver_ctor) {
+            receiver_ctor
+        } else if let Some(receiver_obj) = receiver_ctor.as_object()
+            && let Some(candidate) = crate::object::get(receiver_obj, interp.gc_heap(), "Iterator")
+            && interp.is_callable_runtime(&candidate)
+        {
+            candidate
+        } else {
+            let global = *interp.global_this();
+            crate::object::get(global, interp.gc_heap(), "Iterator").unwrap_or(Value::undefined())
+        }
     };
-    let is_iterator_instance = interp.ordinary_has_instance(&exec_ctx, &iterator_ctor, &iter_value);
-    let is_iterator_instance = is_iterator_instance
-        .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "Iterator.from"))?;
+    let is_iterator_instance = ctx.with_turn_parts(|interp, stack| {
+        interp
+            .ordinary_has_instance(stack, &exec_ctx, &iterator_ctor, &iter_value)
+            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "Iterator.from"))
+    })?;
     if is_iterator_instance {
         return Ok(iter_value);
     }
@@ -1881,8 +1883,11 @@ fn generator_proto_resume(
                 name,
                 reason: "missing execution context".to_string(),
             })?;
-    let resumed = ctx.cx.interp.resume_generator(&exec_ctx, &g, kind);
-    resumed.map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, name))
+    ctx.with_turn_parts(|interp, stack| {
+        interp
+            .resume_generator(stack, &exec_ctx, &g, kind)
+            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))
+    })
 }
 
 /// §27.5.1.2 `%GeneratorPrototype%.next(value)`.
@@ -1942,29 +1947,27 @@ fn async_generator_validate(
     if ok {
         return Ok(None);
     }
-    let (interp, exec_ctx) = ctx.interp_mut_and_context();
-    let Some(exec_ctx) = exec_ctx else {
+    let Some(exec_ctx) = ctx.execution_context().cloned() else {
         return Err(crate::NativeError::TypeError {
             name,
             reason: "missing execution context".to_string(),
         });
     };
-    let reason = interp
-        .make_type_error_with_stack_roots(
-            &ActivationStack::new(),
-            "receiver is not an async generator object",
-        )
-        .map_err(|_| crate::NativeError::TypeError {
-            name,
-            reason: "rejection allocation failed".to_string(),
-        })?;
-    let promise = crate::promise_dispatch::PromiseBuilder::with_context(exec_ctx)
-        .rejected_runtime_rooted(interp, reason, &[&reason], &[])
-        .map_err(|_| crate::NativeError::TypeError {
-            name,
-            reason: "rejection allocation failed".to_string(),
-        })?;
-    Ok(Some(Value::promise(promise)))
+    ctx.with_turn_parts(|interp, stack| {
+        let reason = interp
+            .make_type_error_with_stack_roots(stack, "receiver is not an async generator object")
+            .map_err(|_| crate::NativeError::TypeError {
+                name,
+                reason: "rejection allocation failed".to_string(),
+            })?;
+        let promise = crate::promise_dispatch::PromiseBuilder::with_context(exec_ctx)
+            .rejected_stack_rooted(interp, stack, reason, &[&reason], &[])
+            .map_err(|_| crate::NativeError::TypeError {
+                name,
+                reason: "rejection allocation failed".to_string(),
+            })?;
+        Ok(Some(Value::promise(promise)))
+    })
 }
 
 /// Run one async-generator resumption method: §27.6.1 always returns
@@ -1984,23 +1987,25 @@ fn async_generator_resumption(
     match method(ctx, args) {
         Ok(value) => Ok(value),
         Err(err) => {
-            let (interp, exec_ctx) = ctx.interp_mut_and_context();
-            let Some(exec_ctx) = exec_ctx else {
+            let Some(exec_ctx) = ctx.execution_context().cloned() else {
                 return Err(err);
             };
-            let reason = match interp.take_pending_uncaught_throw() {
-                Some(thrown) => thrown,
-                None => interp
-                    .make_type_error_with_stack_roots(&ActivationStack::new(), &format!("{err:?}"))
-                    .map_err(|_| err)?,
-            };
-            let promise = crate::promise_dispatch::PromiseBuilder::with_context(exec_ctx)
-                .rejected_runtime_rooted(interp, reason, &[&reason], &[])
-                .map_err(|_| crate::NativeError::TypeError {
-                    name,
-                    reason: "rejection allocation failed".to_string(),
-                })?;
-            Ok(Value::promise(promise))
+            let fallback_reason = format!("{err:?}");
+            ctx.with_turn_parts(|interp, stack| {
+                let reason = match interp.take_pending_uncaught_throw() {
+                    Some(thrown) => thrown,
+                    None => interp
+                        .make_type_error_with_stack_roots(stack, &fallback_reason)
+                        .map_err(|_| err)?,
+                };
+                let promise = crate::promise_dispatch::PromiseBuilder::with_context(exec_ctx)
+                    .rejected_stack_rooted(interp, stack, reason, &[&reason], &[])
+                    .map_err(|_| crate::NativeError::TypeError {
+                        name,
+                        reason: "rejection allocation failed".to_string(),
+                    })?;
+                Ok(Value::promise(promise))
+            })
         }
     }
 }

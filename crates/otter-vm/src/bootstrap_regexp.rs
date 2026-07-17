@@ -576,61 +576,117 @@ fn regexp_escape(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 
 /// §22.2.3.1 RegExp(pattern, flags).
 fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let pattern_arg = args.first().cloned().unwrap_or(Value::undefined());
-    let flags_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let pattern_is_regexp = is_regexp_runtime(ctx, &pattern_arg, "RegExp")?;
+    ctx.scope(|mut scope| {
+        let pattern = scope.argument(args, 0);
+        let flags = scope.argument(args, 1);
+        let pattern_value = scope.raw(pattern);
+        let pattern_is_regexp = is_regexp_runtime(scope.context(), &pattern_value, "RegExp")?;
 
-    // §22.2.3.1 steps 3-4 — bare `RegExp(pattern)` returns a
-    // RegExp-like input unchanged only when its observable
-    // `constructor` is the active `%RegExp%` constructor.
-    if pattern_is_regexp
-        && flags_arg.is_undefined()
-        && !ctx.is_construct_call()
-        && regexp_constructor_matches(ctx, &pattern_arg)?
-    {
-        return Ok(pattern_arg);
-    }
+        // §22.2.3.1 steps 3-4 — every observable IsRegExp/constructor
+        // lookup runs with both arguments parked in the handle arena.
+        if pattern_is_regexp && scope.is_undefined(flags) && !scope.context().is_construct_call() {
+            let pattern_value = scope.raw(pattern);
+            if regexp_constructor_matches(scope.context(), &pattern_value)? {
+                return Ok(scope.finish(pattern));
+            }
+        }
 
-    let (pattern_source, flags_value) = if pattern_is_regexp {
-        let source =
-            crate::regexp_prototype::get_property_runtime(ctx, &pattern_arg, "source", "RegExp")?;
-        let flags = if flags_arg.is_undefined() {
-            crate::regexp_prototype::get_property_runtime(ctx, &pattern_arg, "flags", "RegExp")?
+        let pattern_source = if pattern_is_regexp {
+            let pattern_value = scope.raw(pattern);
+            let source = crate::regexp_prototype::get_property_runtime(
+                scope.context(),
+                &pattern_value,
+                "source",
+                "RegExp",
+            )?;
+            scope.value(source)
         } else {
-            flags_arg
+            pattern
         };
-        (source, flags)
-    } else {
-        (pattern_arg, flags_arg)
-    };
-    let pattern_utf16 = if pattern_source.is_undefined() {
-        Vec::new()
-    } else {
-        crate::regexp_prototype::coerce_to_jsstring_runtime(ctx, &pattern_source, "RegExp")?
-            .to_utf16_vec(ctx.heap())
-    };
-    let flags_str = if flags_value.is_undefined() {
-        String::new()
-    } else {
-        crate::regexp_prototype::coerce_to_jsstring_runtime(ctx, &flags_value, "RegExp")?
-            .to_lossy_string(ctx.heap())
-    };
+        let flags_value = if pattern_is_regexp && scope.is_undefined(flags) {
+            let pattern_value = scope.raw(pattern);
+            let flags = crate::regexp_prototype::get_property_runtime(
+                scope.context(),
+                &pattern_value,
+                "flags",
+                "RegExp",
+            )?;
+            scope.value(flags)
+        } else {
+            flags
+        };
 
-    let interp = ctx.interp_mut();
-    let re = JsRegExp::compile_cached(
-        &mut interp.gc_heap,
-        &mut interp.regex_compile_cache,
-        &pattern_utf16,
-        &flags_str,
-    )
-    .map_err(|err| NativeError::SyntaxError {
-        name: "RegExp",
-        reason: format!("{err}"),
-    })?;
-    if let Some(proto) = crate::bootstrap::native_new_target_prototype(ctx, "RegExp")? {
-        re.set_prototype_override(ctx.heap_mut(), Some(proto));
-    }
-    Ok(Value::regexp(re))
+        // Coercing flags can run arbitrary JS after source coercion. Keep the
+        // source string as a Local and copy its units only after both ladders
+        // complete.
+        let pattern_string = if scope.is_undefined(pattern_source) {
+            None
+        } else {
+            let source = scope.raw(pattern_source);
+            let source = crate::regexp_prototype::coerce_to_jsstring_runtime(
+                scope.context(),
+                &source,
+                "RegExp",
+            )?;
+            Some(scope.value(Value::string(source)))
+        };
+        let flags_string = if scope.is_undefined(flags_value) {
+            None
+        } else {
+            let flags = scope.raw(flags_value);
+            let flags = crate::regexp_prototype::coerce_to_jsstring_runtime(
+                scope.context(),
+                &flags,
+                "RegExp",
+            )?;
+            Some(scope.value(Value::string(flags)))
+        };
+        let pattern_utf16 = match pattern_string {
+            Some(pattern) => scope
+                .raw(pattern)
+                .as_string(scope.context().heap())
+                .ok_or_else(|| oom("RegExp"))?
+                .to_utf16_vec(scope.context().heap()),
+            None => Vec::new(),
+        };
+        let flags_text = match flags_string {
+            Some(flags) => scope
+                .raw(flags)
+                .as_string(scope.context().heap())
+                .ok_or_else(|| oom("RegExp"))?
+                .to_lossy_string(scope.context().heap()),
+            None => String::new(),
+        };
+
+        let re = scope
+            .with_turn_parts(|interp, _| {
+                JsRegExp::compile_cached(
+                    &mut interp.gc_heap,
+                    &mut interp.regex_compile_cache,
+                    &pattern_utf16,
+                    &flags_text,
+                )
+            })
+            .map_err(|error| NativeError::SyntaxError {
+                name: "RegExp",
+                reason: format!("{error}"),
+            })?;
+        let re = scope.value(Value::regexp(re));
+
+        // `GetPrototypeFromConstructor(newTarget, ...)` is observable for a
+        // Proxy new.target. Root the freshly compiled RegExp before entering
+        // that lookup and resolve both handles again afterwards.
+        if let Some(prototype) =
+            crate::bootstrap::native_new_target_prototype(scope.context(), "RegExp")?
+        {
+            let prototype = scope.value(prototype);
+            let re_value = scope.raw(re);
+            let re_handle = re_value.as_regexp().ok_or_else(|| oom("RegExp"))?;
+            let prototype = scope.raw(prototype);
+            re_handle.set_prototype_override(scope.context().heap_mut(), Some(prototype));
+        }
+        Ok(scope.finish(re))
+    })
 }
 
 fn is_regexp_runtime(
@@ -670,88 +726,145 @@ fn regexp_constructor_matches(
 // ---------------------------------------------------------------
 
 pub(crate) fn proto_exec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let receiver = *ctx.this_value();
-    let re = receiver_regexp(ctx, "RegExp.prototype.exec")?;
-    let text = args.first().cloned().unwrap_or(Value::undefined());
-    let text_str = coerce_to_string(ctx, &text, "RegExp.prototype.exec")?;
-
-    crate::regexp_prototype::exec_once_native(&re, &receiver, text_str, ctx, &[args])
+    ctx.scope(|mut scope| {
+        let receiver = scope.this();
+        if scope.raw(receiver).as_regexp().is_none() {
+            return Err(NativeError::TypeError {
+                name: "RegExp.prototype.exec",
+                reason: "this is not a RegExp".to_string(),
+            });
+        }
+        let input = scope.argument(args, 0);
+        let input_value = scope.raw(input);
+        let input = coerce_to_string(scope.context(), &input_value, "RegExp.prototype.exec")?;
+        let input = scope.value(Value::string(input));
+        let receiver_value = scope.raw(receiver);
+        let input_value = scope.raw(input);
+        let input = input_value
+            .as_string(scope.context().heap())
+            .ok_or_else(|| oom("RegExp.prototype.exec"))?;
+        let result =
+            crate::regexp_prototype::exec_once_native(&receiver_value, input, scope.context())?;
+        let result = scope.value(result);
+        Ok(scope.finish(result))
+    })
 }
 
 fn proto_test(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     // §22.2.6.16 — `this` need only be an Object; the match runs through
     // the abstract RegExpExec, which dispatches on the `exec` property,
     // so a non-RegExp object carrying its own `exec` is honoured.
-    let receiver = *ctx.this_value();
-    if !receiver.is_object_type() {
-        return Err(NativeError::TypeError {
-            name: "RegExp.prototype.test",
-            reason: "receiver is not an object".to_string(),
-        });
-    }
-    let text = args.first().cloned().unwrap_or(Value::undefined());
-    let text_str = coerce_to_string(ctx, &text, "RegExp.prototype.test")?;
-    let result = crate::regexp_prototype::regexp_exec_runtime(
-        ctx,
-        &receiver,
-        text_str,
-        "RegExp.prototype.test",
-    )?;
-    Ok(Value::boolean(!result.is_null()))
+    ctx.scope(|mut scope| {
+        let receiver = scope.this();
+        if !scope.raw(receiver).is_object_type() {
+            return Err(NativeError::TypeError {
+                name: "RegExp.prototype.test",
+                reason: "receiver is not an object".to_string(),
+            });
+        }
+        let input = scope.argument(args, 0);
+        let input_value = scope.raw(input);
+        let input = coerce_to_string(scope.context(), &input_value, "RegExp.prototype.test")?;
+        let input = scope.value(Value::string(input));
+        let receiver_value = scope.raw(receiver);
+        let input_value = scope.raw(input);
+        let input = input_value
+            .as_string(scope.context().heap())
+            .ok_or_else(|| oom("RegExp.prototype.test"))?;
+        let result = crate::regexp_prototype::regexp_exec_runtime(
+            scope.context(),
+            &receiver_value,
+            input,
+            "RegExp.prototype.test",
+        )?;
+        Ok(Value::boolean(!result.is_null()))
+    })
 }
 
 /// §B.2.4.1 `RegExp.prototype.compile(pattern, flags)` — native
 /// surface shared by direct calls, `Function.prototype.call`, and
 /// property reads.
 fn proto_compile(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let re = receiver_regexp(ctx, "RegExp.prototype.compile")?;
-    // §B.2.4.1 — `compile` only rejects a *subclass* instance, i.e. one
-    // whose prototype differs from `%RegExp.prototype%`. A plain
-    // `new RegExp(...)` stores its (default) prototype as an override, so
-    // the mere presence of an override is not a subclass.
-    let default_proto = ctx.interp_mut().realm_intrinsics().regexp_prototype;
-    if let Some(proto) = re.prototype_override(ctx.heap())
-        && proto.as_object() != default_proto
-    {
-        return Err(NativeError::TypeError {
-            name: "RegExp.prototype.compile",
-            reason: "cannot compile a RegExp subclass instance".to_string(),
-        });
-    }
-    let pattern_raw = args.first().cloned().unwrap_or(Value::undefined());
-    let flags_raw = args.get(1).cloned().unwrap_or(Value::undefined());
-    let (pattern_units, flags_str) = if let Some(other) = pattern_raw.as_regexp() {
-        if !flags_raw.is_undefined() {
+    ctx.scope(|mut scope| {
+        const NAME: &str = "RegExp.prototype.compile";
+        let receiver = scope.this();
+        let re = scope
+            .raw(receiver)
+            .as_regexp()
+            .ok_or_else(|| NativeError::TypeError {
+                name: NAME,
+                reason: "this is not a RegExp".to_string(),
+            })?;
+        // §B.2.4.1 — `compile` only rejects a subclass instance.
+        let default_proto = scope
+            .context()
+            .interp_mut()
+            .realm_intrinsics()
+            .regexp_prototype;
+        if let Some(prototype) = re.prototype_override(scope.context().heap())
+            && prototype.as_object() != default_proto
+        {
             return Err(NativeError::TypeError {
-                name: "RegExp.prototype.compile",
-                reason: "Cannot supply flags when constructing one RegExp from another".to_string(),
+                name: NAME,
+                reason: "cannot compile a RegExp subclass instance".to_string(),
             });
         }
-        let heap = ctx.heap();
-        (other.pattern_utf16(heap), other.flags(heap).to_js_string())
-    } else if pattern_raw.is_undefined() {
-        let flags_text = compile_flags_to_string(ctx, &flags_raw)?;
-        (Vec::<u16>::new(), flags_text)
-    } else {
-        let pattern = crate::regexp_prototype::coerce_to_jsstring_runtime(
-            ctx,
-            &pattern_raw,
-            "RegExp.prototype.compile",
-        )?;
-        let flags_text = compile_flags_to_string(ctx, &flags_raw)?;
-        (pattern.to_utf16_vec(ctx.heap()), flags_text)
-    };
-    let old_last_index = re.last_index_value(ctx.heap());
-    re.reinitialize(ctx.heap_mut(), &pattern_units, &flags_str)
-        .map_err(regexp_error_to_syntax_error)?;
-    if !re.last_index_writable(ctx.heap()) {
-        re.set_last_index_value(ctx.heap_mut(), old_last_index);
-        return Err(NativeError::TypeError {
-            name: "RegExp.prototype.compile",
-            reason: "Cannot assign to read only property 'lastIndex'".to_string(),
-        });
-    }
-    Ok(Value::regexp(re))
+
+        let pattern = scope.argument(args, 0);
+        let flags = scope.argument(args, 1);
+        let (pattern_units, flags_text) = if let Some(other) = scope.raw(pattern).as_regexp() {
+            if !scope.is_undefined(flags) {
+                return Err(NativeError::TypeError {
+                    name: NAME,
+                    reason: "Cannot supply flags when constructing one RegExp from another"
+                        .to_string(),
+                });
+            }
+            let heap = scope.context().heap();
+            (other.pattern_utf16(heap), other.flags(heap).to_js_string())
+        } else if scope.is_undefined(pattern) {
+            let flags_value = scope.raw(flags);
+            (
+                Vec::<u16>::new(),
+                compile_flags_to_string(scope.context(), &flags_value)?,
+            )
+        } else {
+            let pattern_value = scope.raw(pattern);
+            let pattern_string = crate::regexp_prototype::coerce_to_jsstring_runtime(
+                scope.context(),
+                &pattern_value,
+                NAME,
+            )?;
+            let pattern_string = scope.value(Value::string(pattern_string));
+            let flags_value = scope.raw(flags);
+            let flags_text = compile_flags_to_string(scope.context(), &flags_value)?;
+            let pattern_value = scope.raw(pattern_string);
+            let pattern = pattern_value
+                .as_string(scope.context().heap())
+                .ok_or_else(|| oom(NAME))?;
+            (pattern.to_utf16_vec(scope.context().heap()), flags_text)
+        };
+
+        // Re-read the receiver after both user coercions. Preserve an arbitrary
+        // object-valued lastIndex in a Local across the reinitialization
+        // allocation, then restore that relocated value on the non-writable
+        // failure path.
+        let re = scope.raw(receiver).as_regexp().ok_or_else(|| oom(NAME))?;
+        let old_last_index = re.last_index_value(scope.context().heap());
+        let old_last_index = scope.value(old_last_index);
+        re.reinitialize(scope.context().heap_mut(), &pattern_units, &flags_text)
+            .map_err(regexp_error_to_syntax_error)?;
+        let re = scope.raw(receiver).as_regexp().ok_or_else(|| oom(NAME))?;
+        if !re.last_index_writable(scope.context().heap()) {
+            let old_last_index = scope.raw(old_last_index);
+            re.set_last_index_value(scope.context().heap_mut(), old_last_index);
+            return Err(NativeError::TypeError {
+                name: NAME,
+                reason: "Cannot assign to read only property 'lastIndex'".to_string(),
+            });
+        }
+        Ok(scope.finish(receiver))
+    })
 }
 
 fn compile_flags_to_string(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<String, NativeError> {
@@ -793,30 +906,69 @@ fn proto_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
     // RegExp resolves its own `source` / `flags` accessor getters, and
     // `%RegExp.prototype%` yields the `"(?:)"` / `""` sentinels.
     const NAME: &str = "RegExp.prototype.toString";
-    let receiver = *ctx.this_value();
-    if !receiver.is_object_type() {
-        return Err(NativeError::TypeError {
-            name: "RegExp.prototype.toString",
-            reason: "this value must be an Object".to_string(),
-        });
-    }
-    let source_val = crate::regexp_prototype::get_property_runtime(ctx, &receiver, "source", NAME)?;
-    let pattern = crate::regexp_prototype::coerce_to_jsstring_runtime(ctx, &source_val, NAME)?;
-    let flags_val = crate::regexp_prototype::get_property_runtime(ctx, &receiver, "flags", NAME)?;
-    let flags = crate::regexp_prototype::coerce_to_jsstring_runtime(ctx, &flags_val, NAME)?;
-    // `/` + pattern + `/` + flags, concatenated at the code-unit level so
-    // any lone surrogate in the coerced strings survives.
-    let pattern_units = pattern.to_utf16_vec(ctx.heap());
-    let flag_units = flags.to_utf16_vec(ctx.heap());
-    let mut rendered: Vec<u16> = Vec::with_capacity(pattern_units.len() + flag_units.len() + 2);
-    rendered.push(b'/' as u16);
-    rendered.extend_from_slice(&pattern_units);
-    rendered.push(b'/' as u16);
-    rendered.extend_from_slice(&flag_units);
+    ctx.scope(|mut scope| {
+        let receiver = scope.this();
+        if !scope.raw(receiver).is_object_type() {
+            return Err(NativeError::TypeError {
+                name: NAME,
+                reason: "this value must be an Object".to_string(),
+            });
+        }
+        let receiver_value = scope.raw(receiver);
+        let source = crate::regexp_prototype::get_property_runtime(
+            scope.context(),
+            &receiver_value,
+            "source",
+            NAME,
+        )?;
+        let source = scope.value(source);
+        let source_value = scope.raw(source);
+        let pattern = crate::regexp_prototype::coerce_to_jsstring_runtime(
+            scope.context(),
+            &source_value,
+            NAME,
+        )?;
+        let pattern = scope.value(Value::string(pattern));
 
-    let s = JsString::from_utf16_units(&rendered, ctx.heap_mut())
-        .map_err(|_| oom("RegExp.prototype.toString"))?;
-    Ok(Value::string(s))
+        let receiver_value = scope.raw(receiver);
+        let flags = crate::regexp_prototype::get_property_runtime(
+            scope.context(),
+            &receiver_value,
+            "flags",
+            NAME,
+        )?;
+        let flags = scope.value(flags);
+        let flags_value = scope.raw(flags);
+        let flags = crate::regexp_prototype::coerce_to_jsstring_runtime(
+            scope.context(),
+            &flags_value,
+            NAME,
+        )?;
+        let flags = scope.value(Value::string(flags));
+
+        // Copy from the relocated Local slots only after both observable
+        // ladders complete.
+        let pattern_value = scope.raw(pattern);
+        let pattern = pattern_value
+            .as_string(scope.context().heap())
+            .ok_or_else(|| oom(NAME))?;
+        let pattern_units = pattern.to_utf16_vec(scope.context().heap());
+        let flags_value = scope.raw(flags);
+        let flags = flags_value
+            .as_string(scope.context().heap())
+            .ok_or_else(|| oom(NAME))?;
+        let flag_units = flags.to_utf16_vec(scope.context().heap());
+        let mut rendered = Vec::with_capacity(pattern_units.len() + flag_units.len() + 2);
+        rendered.push(b'/' as u16);
+        rendered.extend_from_slice(&pattern_units);
+        rendered.push(b'/' as u16);
+        rendered.extend_from_slice(&flag_units);
+
+        let rendered = JsString::from_utf16_units(&rendered, scope.context().heap_mut())
+            .map_err(|_| oom(NAME))?;
+        let rendered = scope.value(Value::string(rendered));
+        Ok(scope.finish(rendered))
+    })
 }
 
 // ---------------------------------------------------------------
@@ -866,85 +1018,42 @@ fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
 /// `ToBoolean`, and concatenates the flag letter when truthy.
 /// Spec order is `d g i m s u v y`.
 fn accessor_flags(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    let receiver = *ctx.this_value();
-    if !receiver.is_object_type() {
-        return Err(NativeError::TypeError {
-            name: "get RegExp.prototype.flags",
-            reason: "this value must be an Object".to_string(),
-        });
-    }
-    let (interp, exec) = ctx.interp_mut_and_context();
-    let exec = exec.ok_or_else(|| NativeError::TypeError {
-        name: "get RegExp.prototype.flags",
-        reason: "missing execution context".to_string(),
-    })?;
-    let mut out = String::with_capacity(8);
-    fn map_err(interp: &crate::Interpreter, e: crate::VmError) -> NativeError {
-        match e {
-            crate::VmError::Uncaught => {
-                let value = match interp.take_error_detail() {
-                    Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                    _ => Default::default(),
-                };
-                NativeError::Thrown {
-                    name: "get RegExp.prototype.flags",
-                    message: value.into(),
-                }
-            }
-            crate::VmError::TypeError => {
-                let message = match interp.take_error_detail() {
-                    Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                    _ => Default::default(),
-                };
-                NativeError::TypeError {
-                    name: "get RegExp.prototype.flags",
-                    reason: message.into(),
-                }
-            }
-            other => NativeError::TypeError {
-                name: "get RegExp.prototype.flags",
-                reason: other.to_string(),
-            },
+    const NAME: &str = "get RegExp.prototype.flags";
+    ctx.scope(|mut scope| {
+        let receiver = scope.this();
+        if !scope.raw(receiver).is_object_type() {
+            return Err(NativeError::TypeError {
+                name: NAME,
+                reason: "this value must be an Object".to_string(),
+            });
         }
-    }
-    for &(prop, letter) in &[
-        ("hasIndices", 'd'),
-        ("global", 'g'),
-        ("ignoreCase", 'i'),
-        ("multiline", 'm'),
-        ("dotAll", 's'),
-        ("unicode", 'u'),
-        ("unicodeSets", 'v'),
-        ("sticky", 'y'),
-    ] {
-        let outcome = match interp.ordinary_get_value(
-            &exec,
-            receiver,
-            receiver,
-            &crate::VmPropertyKey::String(prop),
-            0,
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(map_err(interp, e)),
-        };
-        let value = match outcome {
-            crate::VmGetOutcome::Value(v) => v,
-            crate::VmGetOutcome::InvokeGetter { getter } => {
-                let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                match interp.run_callable_sync(&exec, &getter, receiver, args) {
-                    Ok(v) => v,
-                    Err(e) => return Err(map_err(interp, e)),
-                }
+        let mut out = String::with_capacity(8);
+        for &(property, letter) in &[
+            ("hasIndices", 'd'),
+            ("global", 'g'),
+            ("ignoreCase", 'i'),
+            ("multiline", 'm'),
+            ("dotAll", 's'),
+            ("unicode", 'u'),
+            ("unicodeSets", 'v'),
+            ("sticky", 'y'),
+        ] {
+            let receiver_value = scope.raw(receiver);
+            let value = crate::regexp_prototype::get_property_runtime(
+                scope.context(),
+                &receiver_value,
+                property,
+                NAME,
+            )?;
+            let value = scope.value(value);
+            if scope.raw(value).to_boolean(scope.context().heap()) {
+                out.push(letter);
             }
-        };
-        if value.to_boolean(interp.gc_heap()) {
-            out.push(letter);
         }
-    }
-
-    Ok(Value::string(
-        JsString::from_str(&out, ctx.heap_mut()).map_err(|_| oom("flags"))?,
-    ))
+        let flags = JsString::from_str(&out, scope.context().heap_mut()).map_err(|_| oom(NAME))?;
+        let flags = scope.value(Value::string(flags));
+        Ok(scope.finish(flags))
+    })
 }
 
 fn accessor_global(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -1016,29 +1125,12 @@ fn this_is_regexp_prototype(ctx: &mut NativeCtx<'_>) -> bool {
 // Helpers
 // ---------------------------------------------------------------
 
-fn receiver_regexp(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsRegExp, NativeError> {
-    ctx.this_value()
-        .as_regexp()
-        .ok_or_else(|| NativeError::TypeError {
-            name,
-            reason: "this is not a RegExp".to_string(),
-        })
-}
-
 fn coerce_to_string(
     ctx: &mut NativeCtx<'_>,
     v: &Value,
     name: &'static str,
 ) -> Result<JsString, NativeError> {
-    if let Some(s) = v.as_string(ctx.heap()) {
-        return Ok(s);
-    }
-    // §7.1.17 ToString — a wrapper object / coercible primitive must run
-    // its `toString` / `valueOf` (a Symbol throws), not a debug render.
-    let exec = ctx.execution_context().cloned().ok_or_else(|| oom(name))?;
-    let s = crate::coerce::to_string_or_throw(ctx.interp_mut(), &exec, v)
-        .map_err(|e| crate::native_function::vm_to_native_error(ctx.interp_mut(), e, name))?;
-    JsString::from_str(&s, ctx.heap_mut()).map_err(|_| oom(name))
+    crate::regexp_prototype::coerce_to_jsstring_runtime(ctx, v, name)
 }
 
 fn oom(name: &'static str) -> NativeError {

@@ -17,12 +17,15 @@
 //! - [`RuntimeTurn`] — explicit interpreter + activation-stack ownership.
 //! - [`NativeCtx`] — high-level native binding API for the current turn.
 //! - [`NativeScope`] — allocation-safe handle scope for native builders.
+//! - `NativeCallRoots` — exact collector-rewritten native-call boundary slots.
 //!
 //! # Invariants
 //!
 //! - A runtime turn refers to exactly one interpreter and one activation stack.
 //! - Native code never discovers live frames through TLS, globals, locks, or a
 //!   diagnostic raw pointer; it receives the current stack through the turn.
+//! - A native-call root record traces only its call-local slots; the enclosing
+//!   runtime turn owns the single interpreter and activation-root traversal.
 //! - Neither context crosses `.await` or escapes the mutator turn.
 //! - Heap allocation and mutation stay rooted through `NativeCtx`/`NativeScope`.
 //!
@@ -150,8 +153,9 @@ impl<'rt> RuntimeTurn<'rt> {
 
 /// Call-site metadata for native bindings.
 ///
-/// The values are snapshots for the active call only. Native code may inspect
-/// them synchronously, but must not store them or move them into async work.
+/// The values are the collector-rewritten root slots for the active call.
+/// Native code may inspect them synchronously, but must not store them or move
+/// them into async work.
 #[derive(Debug, Clone)]
 pub struct NativeCallInfo {
     this_value: Value,
@@ -184,6 +188,56 @@ impl NativeCallInfo {
     }
 }
 
+impl otter_gc::ExtraRootSource for NativeCallInfo {
+    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        self.this_value.trace_value_slots(visitor);
+        if let Some(new_target) = &self.new_target {
+            new_target.trace_value_slots(visitor);
+        }
+    }
+}
+
+/// Exact collector-visible state for one native invocation.
+///
+/// The call metadata, argument window, and additional boundary values stay in
+/// their original storage for the whole invoke. Moving collections rewrite
+/// those slots in place, so [`NativeCtx`] and the native `args` slice observe
+/// forwarded handles without a second snapshot or adapter buffer.
+pub(crate) struct NativeCallRoots<'a> {
+    call_info: &'a NativeCallInfo,
+    value_roots: &'a [&'a Value],
+    slice_roots: &'a [&'a [Value]],
+}
+
+impl<'a> NativeCallRoots<'a> {
+    #[must_use]
+    pub(crate) fn new(
+        call_info: &'a NativeCallInfo,
+        value_roots: &'a [&'a Value],
+        slice_roots: &'a [&'a [Value]],
+    ) -> Self {
+        Self {
+            call_info,
+            value_roots,
+            slice_roots,
+        }
+    }
+}
+
+impl otter_gc::ExtraRootSource for NativeCallRoots<'_> {
+    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        otter_gc::ExtraRootSource::visit_extra_roots(self.call_info, visitor);
+        for value in self.value_roots {
+            value.trace_value_slots(visitor);
+        }
+        for slice in self.slice_roots {
+            for value in *slice {
+                value.trace_value_slots(visitor);
+            }
+        }
+    }
+}
+
 /// Public-to-native binding context. Handed to `holt!` / `couch!` /
 /// `#[dive]` entry points so native code allocates and mutates
 /// against the right isolate without reaching for thread-local
@@ -194,7 +248,7 @@ impl NativeCallInfo {
 /// that applies to [`RuntimeTurn<'rt>`].
 pub struct NativeCtx<'rt> {
     pub(crate) cx: RuntimeTurn<'rt>,
-    call_info: NativeCallInfo,
+    call_info: &'rt NativeCallInfo,
     // Borrowed, not owned: the caller's execution context outlives the native
     // call, so the per-call path takes a reference instead of cloning four
     // `Arc`s + a `FrozenVec` on every native invocation. Owned copies are made
@@ -229,7 +283,7 @@ impl<'rt> NativeCtx<'rt> {
     #[must_use]
     pub(crate) fn from_runtime_turn(
         cx: RuntimeTurn<'rt>,
-        call_info: NativeCallInfo,
+        call_info: &'rt NativeCallInfo,
         context: Option<&'rt ExecutionContext>,
     ) -> Self {
         Self {
@@ -261,7 +315,12 @@ impl<'rt> NativeCtx<'rt> {
     ) -> R {
         let mut activations = ActivationStack::new();
         interp.with_runtime_turn(&mut activations, |turn| {
-            let mut ctx = NativeCtx::from_runtime_turn(turn, call_info, context);
+            let roots = NativeCallRoots::new(&call_info, &[], &[]);
+            let _call_roots = turn
+                .interp
+                .gc_heap
+                .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+            let mut ctx = NativeCtx::from_runtime_turn(turn, &call_info, context);
             body(&mut ctx)
         })
     }
@@ -725,10 +784,10 @@ impl<'rt> NativeCtx<'rt> {
 
     /// `new target(...args)` — construct an instance via the VM construct path.
     ///
-    /// Re-enters the interpreter synchronously (same rooting contract as
-    /// [`Interpreter::run_callable_sync`]); used by native code that needs to
-    /// build platform objects through their real constructors (e.g. the
-    /// structured-clone materializer rebuilding `Date`/`RegExp`/typed arrays).
+    /// Re-enters the interpreter synchronously above this context's current
+    /// activation floor; used by native code that needs to build platform
+    /// objects through their real constructors (e.g. the structured-clone
+    /// materializer rebuilding `Date`/`RegExp`/typed arrays).
     pub fn construct(&mut self, target: Value, args: &[Value]) -> Result<Value, NativeError> {
         self.construct_owned(target, args.iter().copied().collect())
     }
@@ -745,10 +804,11 @@ impl<'rt> NativeCtx<'rt> {
                 name: "construct",
                 reason: "missing execution context".to_string(),
             })?;
-        self.cx
-            .interp
-            .run_construct_sync(&context, &target, target, args)
-            .map_err(|err| native_function::vm_to_native_error(self.cx.interp, err, "construct"))
+        self.cx.with_parts(|interp, stack| {
+            interp
+                .run_construct_sync_rooted(stack, &context, &target, target, args)
+                .map_err(|err| native_function::vm_to_native_error(interp, err, "construct"))
+        })
     }
 
     /// Invoke a callable synchronously with an explicit receiver.
@@ -766,6 +826,39 @@ impl<'rt> NativeCtx<'rt> {
         self.call_owned(target, this_value, args.iter().copied().collect())
     }
 
+    /// Compile a CommonJS wrapper on the current runtime turn.
+    ///
+    /// The synthesized module executes above an activation floor on this
+    /// context's shared stack, so nested `require` never publishes a detached
+    /// frame stack.
+    pub fn create_commonjs_wrapper(
+        &mut self,
+        module_url: &str,
+        body: &str,
+    ) -> Result<Value, NativeError> {
+        self.cx.with_parts(|interp, stack| {
+            interp
+                .create_commonjs_wrapper(stack, module_url, body)
+                .map_err(|error| {
+                    native_function::vm_to_native_error(interp, error, "CommonJS wrapper")
+                })
+        })
+    }
+
+    /// Evaluate a linked module graph on the current runtime turn.
+    ///
+    /// Host loaders open one [`NativeCtx::with_host_context`] boundary; module
+    /// init, top-level await, and nested dynamic import then share its exact
+    /// activation stack.
+    pub fn evaluate_module(
+        &mut self,
+        url: &str,
+    ) -> Result<Option<crate::promise::JsPromiseHandle>, VmError> {
+        let context = self.context.cloned().ok_or(VmError::InvalidOperand)?;
+        self.cx
+            .with_parts(|interp, stack| interp.evaluate_module(stack, &context, url))
+    }
+
     pub(crate) fn call_owned(
         &mut self,
         target: Value,
@@ -779,10 +872,11 @@ impl<'rt> NativeCtx<'rt> {
                 name: "call",
                 reason: "missing execution context".to_string(),
             })?;
-        self.cx
-            .interp
-            .run_callable_sync(&context, &target, this_value, args)
-            .map_err(|err| native_function::vm_to_native_error(self.cx.interp, err, "call"))
+        self.cx.with_parts(|interp, stack| {
+            interp
+                .run_callable_sync_rooted(stack, &context, &target, this_value, args)
+                .map_err(|err| native_function::vm_to_native_error(interp, err, "call"))
+        })
     }
 
     /// Create a pending Promise together with its resolving functions.
@@ -866,10 +960,11 @@ impl<'rt> NativeCtx<'rt> {
                 name: "instanceof",
                 reason: "missing execution context".to_string(),
             })?;
-        self.cx
-            .interp
-            .ordinary_has_instance(&context, &constructor, &value)
-            .map_err(|err| native_function::vm_to_native_error(self.cx.interp, err, "instanceof"))
+        self.cx.with_parts(|interp, stack| {
+            interp
+                .ordinary_has_instance(stack, &context, &constructor, &value)
+                .map_err(|err| native_function::vm_to_native_error(interp, err, "instanceof"))
+        })
     }
 
     /// ECMAScript `===` comparison for two rooted/current values.
@@ -895,10 +990,11 @@ impl<'rt> NativeCtx<'rt> {
                 name: "get property",
                 reason: "missing execution context".to_string(),
             })?;
-        self.cx
-            .interp
-            .get_property(&context, receiver, key)
-            .map_err(|err| native_function::vm_to_native_error(self.cx.interp, err, "get property"))
+        self.cx.with_parts(|interp, stack| {
+            interp
+                .get_property(stack, &context, receiver, key)
+                .map_err(|err| native_function::vm_to_native_error(interp, err, "get property"))
+        })
     }
 
     /// Return enumerable own string keys through the target's JavaScript
@@ -914,12 +1010,13 @@ impl<'rt> NativeCtx<'rt> {
                 name: "enumerate properties",
                 reason: "missing execution context".to_string(),
             })?;
-        self.cx
-            .interp
-            .enumerable_own_string_keys_for_value(&context, target, 0)
-            .map_err(|err| {
-                native_function::vm_to_native_error(self.cx.interp, err, "enumerate properties")
-            })
+        self.cx.with_parts(|interp, stack| {
+            interp
+                .enumerable_own_string_keys_for_value(stack, &context, target, 0)
+                .map_err(|err| {
+                    native_function::vm_to_native_error(interp, err, "enumerate properties")
+                })
+        })
     }
 
     /// Perform JavaScript `Set(receiver, key, value, true)` through the active
@@ -937,20 +1034,19 @@ impl<'rt> NativeCtx<'rt> {
                 name: "set property",
                 reason: "missing execution context".to_string(),
             })?;
-        let ok = self
-            .cx
-            .interp
-            .ordinary_set_data_value(
-                &context,
-                receiver,
-                &crate::VmPropertyKey::String(key),
-                value,
-                receiver,
-                0,
-            )
-            .map_err(|err| {
-                native_function::vm_to_native_error(self.cx.interp, err, "set property")
-            })?;
+        let ok = self.cx.with_parts(|interp, stack| {
+            interp
+                .ordinary_set_data_value(
+                    stack,
+                    &context,
+                    receiver,
+                    &crate::VmPropertyKey::String(key),
+                    value,
+                    receiver,
+                    0,
+                )
+                .map_err(|err| native_function::vm_to_native_error(interp, err, "set property"))
+        })?;
         if ok {
             Ok(())
         } else {
@@ -1834,6 +1930,30 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         result.map_err(|error| self.vm_error(error, "NativeScope::set"))
     }
 
+    /// Store a symbol-keyed property on a rooted ordinary object or Array
+    /// exotic. The symbol and value are resolved from their handle slots at
+    /// the write boundary, so earlier allocations cannot leave stale handles.
+    pub fn set_symbol(
+        &mut self,
+        object: Local<'_>,
+        key: Local<'_>,
+        value: Local<'_>,
+    ) -> Result<(), NativeError> {
+        let symbol =
+            self.raw(key)
+                .as_symbol(self.ctx.heap())
+                .ok_or_else(|| NativeError::TypeError {
+                    name: "NativeScope::set_symbol",
+                    reason: "property key is not a symbol".to_string(),
+                })?;
+        let result = self
+            .ctx
+            .cx
+            .interp
+            .scoped_set_symbol(self.token, object, symbol, value);
+        result.map_err(|error| self.vm_error(error, "NativeScope::set_symbol"))
+    }
+
     /// Define a data property with explicit descriptor flags.
     pub fn define(
         &mut self,
@@ -2237,6 +2357,48 @@ mod tests {
         assert!(
             after > before,
             "NativeCtx::array_from_elements should allocate through root-aware young allocation"
+        );
+    }
+
+    #[test]
+    fn native_call_info_slots_follow_moving_gc() {
+        let mut interp = Interpreter::new();
+        let receiver = with_default_ctx(&mut interp, |ctx| {
+            Value::object(ctx.alloc_object().expect("native receiver allocation"))
+        });
+        let before = receiver.as_raw_gc().expect("receiver is a heap cell").0;
+
+        let (this_value, new_target) = with_ctx(
+            &mut interp,
+            NativeCallInfo::construct(receiver, Some(receiver)),
+            |ctx| {
+                let mut moved = false;
+                for _ in 0..8 {
+                    let _churn = ctx.alloc_object().expect("young-space churn");
+                    ctx.cx.interp.collect_minor_tracing_runtime_roots();
+                    let current = ctx
+                        .this_value()
+                        .as_raw_gc()
+                        .expect("rooted receiver remains a heap cell")
+                        .0;
+                    if current != before {
+                        moved = true;
+                        break;
+                    }
+                }
+                assert!(
+                    moved,
+                    "native call receiver did not relocate under minor GC"
+                );
+                (*ctx.this_value(), *ctx.new_target().expect("new.target"))
+            },
+        );
+
+        assert_eq!(this_value, new_target);
+        assert!(this_value.as_object().is_some());
+        assert_ne!(
+            this_value.as_raw_gc().expect("forwarded receiver").0,
+            before
         );
     }
 

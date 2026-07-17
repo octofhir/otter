@@ -1137,8 +1137,8 @@ impl Interpreter {
         context: &ExecutionContext,
         iterable: &Value,
     ) -> Result<(Value, Value), VmError> {
-        let anchor_base = self.module_root_depth();
         let iterable_anchor = self.push_iteration_anchor(*iterable) - 1;
+        let anchor_base = iterable_anchor;
         let result = (|interp: &mut Self| -> Result<(Value, Value), VmError> {
             let iterator_sym = interp.well_known_symbols.get(symbol::WellKnown::Iterator);
             let iterable = interp.iteration_anchor(iterable_anchor);

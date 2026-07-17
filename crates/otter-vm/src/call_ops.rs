@@ -2288,8 +2288,8 @@ impl Interpreter {
         context: &ExecutionContext,
         callee: &Value,
     ) -> Result<Option<Value>, VmError> {
-        let anchor_base = self.module_root_depth();
         let callee_anchor = self.push_iteration_anchor(*callee) - 1;
+        let anchor_base = callee_anchor;
         let result = (|| -> Result<Option<Value>, VmError> {
             let key = VmPropertyKey::String("prototype");
             let callee = self.iteration_anchor(callee_anchor);

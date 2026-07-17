@@ -3,8 +3,8 @@
 //! [`otter_gc::RootScope`] speaks raw `RawGc` slots; this module supplies
 //! the erased tracers for VM value shapes (`Value`, value vectors) so call
 //! sites can root locals without hand-rolling a [`otter_gc::FrameRoots`]
-//! provider per function. Preferred over the legacy patterns (per-alloc
-//! `*_with_roots` closures, module-root re-fetch dances) for new code.
+//! provider per function. Preferred over legacy per-allocation
+//! `*_with_roots` closure patterns for new internal VM code.
 //!
 //! # Contents
 //! - [`RootScopeExt`] — typed `add_*` methods on `RootScope`.

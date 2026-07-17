@@ -1785,6 +1785,20 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         Ok(self.value(Value::array_buffer(buffer)))
     }
 
+    /// Clone the shared backing-store owner from an exact
+    /// `SharedArrayBuffer`. The returned `Arc` owns no VM handle and may be
+    /// rewrapped with [`Self::shared_array_buffer`] without consulting mutable
+    /// JavaScript constructors.
+    #[must_use]
+    pub fn shared_array_buffer_body(
+        &self,
+        value: Local<'_>,
+    ) -> Option<std::sync::Arc<crate::binary::array_buffer::SharedBody>> {
+        self.raw(value)
+            .as_array_buffer()?
+            .as_shared_arc(self.ctx.heap())
+    }
+
     /// Allocate a JavaScript string from UTF-8.
     pub fn string(&mut self, text: &str) -> Result<Local<'scope>, NativeError> {
         let result = self.ctx.cx.interp.scoped_string(self.token, text);
@@ -1795,6 +1809,62 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
     pub fn set_collection(&mut self) -> Result<Local<'scope>, NativeError> {
         let result = self.ctx.cx.interp.scoped_collection_set(self.token);
         result.map_err(|error| self.vm_error(error, "NativeScope::set_collection"))
+    }
+
+    /// Allocate a `Map` collection.
+    pub fn map_collection(&mut self) -> Result<Local<'scope>, NativeError> {
+        let result = self.ctx.cx.interp.scoped_collection_map(self.token);
+        result.map_err(|error| self.vm_error(error, "NativeScope::map_collection"))
+    }
+
+    /// Insert rooted key/value handles into a rooted `Map`.
+    ///
+    /// Collection growth traces the local map, key, and value slots, so a
+    /// moving collection cannot strand any operand while reserving storage.
+    pub fn map_set(
+        &mut self,
+        map: Local<'_>,
+        key: Local<'_>,
+        value: Local<'_>,
+    ) -> Result<(), NativeError> {
+        let mut map = self
+            .raw(map)
+            .as_map()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "NativeScope::map_set",
+                reason: "value is not a Map".to_string(),
+            })?;
+        let key = self.raw(key);
+        let value = self.raw(value);
+        self.ctx
+            .map_set(&mut map, key, value)
+            .map_err(|error| self.vm_error(VmError::from(error), "NativeScope::map_set"))
+    }
+
+    /// Snapshot a rooted `Map` in insertion order and immediately park each
+    /// key and value in this scope's collector-rewritten arena.
+    pub fn map_entries(
+        &mut self,
+        map: Local<'_>,
+    ) -> Result<Vec<(Local<'scope>, Local<'scope>)>, NativeError> {
+        let map = self
+            .raw(map)
+            .as_map()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "NativeScope::map_entries",
+                reason: "value is not a Map".to_string(),
+            })?;
+        let raw_len = collections::map_raw_len(map, self.ctx.heap());
+        let mut entries = Vec::with_capacity(collections::map_len(map, self.ctx.heap()));
+        for index in 0..raw_len {
+            let Some((key, value)) = collections::map_entry_at(map, self.ctx.heap(), index) else {
+                continue;
+            };
+            let key = self.value(key);
+            let value = self.value(value);
+            entries.push((key, value));
+        }
+        Ok(entries)
     }
 
     /// Insert a rooted value into a rooted `Set` without exposing its raw GC
@@ -1812,6 +1882,27 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         self.ctx
             .set_add(&mut set, value)
             .map_err(|error| self.vm_error(VmError::from(error), "NativeScope::set_add"))
+    }
+
+    /// Snapshot a rooted `Set` in insertion order and immediately park every
+    /// live value in this scope's collector-rewritten arena.
+    pub fn set_values(&mut self, set: Local<'_>) -> Result<Vec<Local<'scope>>, NativeError> {
+        let set = self
+            .raw(set)
+            .as_set()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "NativeScope::set_values",
+                reason: "value is not a Set".to_string(),
+            })?;
+        let raw_len = collections::set_raw_len(set, self.ctx.heap());
+        let mut values = Vec::with_capacity(collections::set_len(set, self.ctx.heap()));
+        for index in 0..raw_len {
+            let Some(value) = collections::set_value_at(set, self.ctx.heap(), index) else {
+                continue;
+            };
+            values.push(self.value(value));
+        }
+        Ok(values)
     }
 
     /// Seal a host-owned `Set` snapshot against every JavaScript mutator.
@@ -1925,6 +2016,206 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
     #[must_use]
     pub fn buffer_source_bytes(&self, value: Local<'_>) -> Option<Vec<u8>> {
         self.with_buffer_source_bytes(value, <[u8]>::to_vec)
+    }
+
+    /// Copy the bytes from an exact `ArrayBuffer`/`SharedArrayBuffer` value.
+    ///
+    /// Unlike [`Self::buffer_source_bytes`], typed-array views are not
+    /// accepted. Detached buffers return an empty byte vector; callers that
+    /// distinguish detachment inspect [`Self::array_buffer_is_detached`].
+    #[must_use]
+    pub fn array_buffer_bytes(&self, value: Local<'_>) -> Option<Vec<u8>> {
+        self.raw(value)
+            .as_array_buffer()
+            .map(|buffer| buffer.with_bytes(self.ctx.heap(), <[u8]>::to_vec))
+    }
+
+    /// Return whether an exact array-buffer value is detached.
+    #[must_use]
+    pub fn array_buffer_is_detached(&self, value: Local<'_>) -> Option<bool> {
+        self.raw(value)
+            .as_array_buffer()
+            .map(|buffer| buffer.is_detached(self.ctx.heap()))
+    }
+
+    /// Return whether an exact array-buffer value uses shared storage.
+    #[must_use]
+    pub fn array_buffer_is_shared(&self, value: Local<'_>) -> Option<bool> {
+        self.raw(value).as_array_buffer().map(|buffer| {
+            matches!(
+                buffer.storage(),
+                crate::binary::array_buffer::BufferStorage::Shared(_)
+            )
+        })
+    }
+
+    /// Detach a local `ArrayBuffer`.
+    ///
+    /// Non-buffer values, shared buffers, and already-detached buffers are
+    /// rejected so transactional callers cannot silently accept an invalid
+    /// transfer entry.
+    pub fn detach_array_buffer(&mut self, value: Local<'_>) -> Result<(), NativeError> {
+        let buffer = self
+            .raw(value)
+            .as_array_buffer()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "NativeScope::detach_array_buffer",
+                reason: "value is not an ArrayBuffer".to_string(),
+            })?;
+        if matches!(
+            buffer.storage(),
+            crate::binary::array_buffer::BufferStorage::Shared(_)
+        ) {
+            return Err(NativeError::TypeError {
+                name: "NativeScope::detach_array_buffer",
+                reason: "SharedArrayBuffer cannot be detached".to_string(),
+            });
+        }
+        if buffer.is_detached(self.ctx.heap()) {
+            return Err(NativeError::TypeError {
+                name: "NativeScope::detach_array_buffer",
+                reason: "ArrayBuffer is already detached".to_string(),
+            });
+        }
+        buffer.detach(self.ctx.heap_mut());
+        Ok(())
+    }
+
+    /// Read typed-array metadata and immediately park its backing buffer.
+    ///
+    /// The returned offset and length are the construction-time internal
+    /// slots, even when the source buffer has since detached or shrunk. This
+    /// lets callers validate the separately rooted backing buffer without
+    /// losing the view's original shape.
+    #[must_use]
+    pub fn typed_array_info(
+        &mut self,
+        value: Local<'_>,
+    ) -> Option<(crate::binary::TypedArrayKind, Local<'scope>, usize, usize)> {
+        let typed = self.raw(value).as_typed_array(self.ctx.heap())?;
+        let kind = typed.kind();
+        let byte_offset = typed.raw_byte_offset(self.ctx.heap());
+        let length = typed.raw_length(self.ctx.heap());
+        let buffer = typed.buffer(self.ctx.heap());
+        let buffer = self.value(Value::array_buffer(buffer));
+        Some((kind, buffer, byte_offset, length))
+    }
+
+    /// Read DataView metadata and immediately park its backing buffer.
+    #[must_use]
+    pub fn data_view_info(&mut self, value: Local<'_>) -> Option<(Local<'scope>, usize, usize)> {
+        let view = self.raw(value).as_data_view()?;
+        let byte_offset = view.byte_offset(self.ctx.heap());
+        let byte_length = view.byte_length(self.ctx.heap());
+        let buffer = view.buffer(self.ctx.heap());
+        let buffer = self.value(Value::array_buffer(buffer));
+        Some((buffer, byte_offset, byte_length))
+    }
+
+    /// Create a typed-array view directly from a rooted local ArrayBuffer.
+    ///
+    /// This bypasses observable global constructors. Detached buffers,
+    /// misaligned offsets, arithmetic overflow, and out-of-bounds ranges are
+    /// rejected before allocation. Local and shared backing stores are both
+    /// valid typed-array buffers.
+    pub fn typed_array_view(
+        &mut self,
+        buffer: Local<'_>,
+        kind: crate::binary::TypedArrayKind,
+        byte_offset: usize,
+        length: usize,
+    ) -> Result<Local<'scope>, NativeError> {
+        let buffer = self
+            .raw(buffer)
+            .as_array_buffer()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "NativeScope::typed_array_view",
+                reason: "backing value is not an ArrayBuffer".to_string(),
+            })?;
+        if buffer.is_detached(self.ctx.heap()) {
+            return Err(NativeError::TypeError {
+                name: "NativeScope::typed_array_view",
+                reason: "backing ArrayBuffer is detached".to_string(),
+            });
+        }
+        let element_size = kind.bytes_per_element();
+        let Some(end) = length
+            .checked_mul(element_size)
+            .and_then(|byte_length| byte_offset.checked_add(byte_length))
+        else {
+            return Err(NativeError::TypeError {
+                name: "NativeScope::typed_array_view",
+                reason: "typed-array range overflows usize".to_string(),
+            });
+        };
+        if !byte_offset.is_multiple_of(element_size) || end > buffer.byte_length(self.ctx.heap()) {
+            return Err(NativeError::TypeError {
+                name: "NativeScope::typed_array_view",
+                reason: "typed-array range is misaligned or out of bounds".to_string(),
+            });
+        }
+        let view = match crate::binary::JsTypedArray::new(
+            self.ctx.heap_mut(),
+            buffer,
+            kind,
+            byte_offset,
+            length,
+        ) {
+            Ok(view) => view,
+            Err(error) => {
+                return Err(self.vm_error(VmError::from(error), "NativeScope::typed_array_view"));
+            }
+        };
+        Ok(self.value(Value::typed_array(view)))
+    }
+
+    /// Create a DataView directly from a rooted local ArrayBuffer.
+    ///
+    /// Like [`Self::typed_array_view`], this is non-observable construction and
+    /// accepts any live local/shared buffer with an in-bounds range.
+    pub fn data_view(
+        &mut self,
+        buffer: Local<'_>,
+        byte_offset: usize,
+        byte_length: usize,
+    ) -> Result<Local<'scope>, NativeError> {
+        let buffer = self
+            .raw(buffer)
+            .as_array_buffer()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "NativeScope::data_view",
+                reason: "backing value is not an ArrayBuffer".to_string(),
+            })?;
+        if buffer.is_detached(self.ctx.heap()) {
+            return Err(NativeError::TypeError {
+                name: "NativeScope::data_view",
+                reason: "backing ArrayBuffer is detached".to_string(),
+            });
+        }
+        let Some(end) = byte_offset.checked_add(byte_length) else {
+            return Err(NativeError::TypeError {
+                name: "NativeScope::data_view",
+                reason: "DataView range overflows usize".to_string(),
+            });
+        };
+        if end > buffer.byte_length(self.ctx.heap()) {
+            return Err(NativeError::TypeError {
+                name: "NativeScope::data_view",
+                reason: "DataView range is out of bounds".to_string(),
+            });
+        }
+        let view = match crate::binary::JsDataView::new(
+            self.ctx.heap_mut(),
+            buffer,
+            byte_offset,
+            byte_length,
+        ) {
+            Ok(view) => view,
+            Err(error) => {
+                return Err(self.vm_error(VmError::from(error), "NativeScope::data_view"));
+            }
+        };
+        Ok(self.value(Value::data_view(view)))
     }
 
     /// Root a number immediate.
@@ -2342,10 +2633,156 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         self.raw(value).as_string(self.ctx.heap()).is_some()
     }
 
+    /// Whether a local currently holds a JavaScript BigInt primitive.
+    #[must_use]
+    pub fn is_bigint(&self, value: Local<'_>) -> bool {
+        self.raw(value).as_big_int().is_some()
+    }
+
+    /// Whether a local currently holds a JavaScript Symbol primitive.
+    #[must_use]
+    pub fn is_symbol(&self, value: Local<'_>) -> bool {
+        self.raw(value).as_symbol(self.ctx.heap()).is_some()
+    }
+
     /// Whether a local currently holds any object-shaped JavaScript value.
     #[must_use]
     pub fn is_object(&self, value: Local<'_>) -> bool {
         self.raw(value).is_object_type()
+    }
+
+    /// Whether a local is an exact Array exotic rather than a Proxy whose
+    /// target happens to be an Array.
+    #[must_use]
+    pub fn is_exact_array(&self, value: Local<'_>) -> bool {
+        self.raw(value).as_array().is_some()
+    }
+
+    /// Whether a local is an exact ordinary-object representation.
+    ///
+    /// Arrays, collection exotics, promises, proxies, binary views, and other
+    /// tagged object families do not pass this test. Callers still inspect
+    /// ordinary-object internal slots such as Date/Error before treating the
+    /// value as a plain record.
+    #[must_use]
+    pub fn is_ordinary_object(&self, value: Local<'_>) -> bool {
+        self.raw(value).as_object().is_some()
+    }
+
+    /// Whether an ordinary object has an own string-named property.
+    ///
+    /// This is a descriptor probe only: it does not walk the prototype chain
+    /// or invoke an accessor.
+    #[must_use]
+    pub fn has_own_string_property(&self, value: Local<'_>, key: &str) -> bool {
+        self.raw(value).as_object().is_some_and(|object| {
+            object::get_own_descriptor(object, self.ctx.heap(), key).is_some()
+        })
+    }
+
+    /// Return an ordinary object's `[[DateValue]]`, if present.
+    #[must_use]
+    pub fn date_value(&self, value: Local<'_>) -> Option<f64> {
+        let object = self.raw(value).as_object()?;
+        object::date_data(object, self.ctx.heap())
+    }
+
+    /// Allocate a canonical Date instance without consulting `globalThis.Date`.
+    pub fn date(&mut self, milliseconds: f64) -> Result<Local<'scope>, NativeError> {
+        let prototype = self
+            .ctx
+            .cx
+            .interp
+            .realm_intrinsics()
+            .date_prototype
+            .ok_or_else(|| NativeError::TypeError {
+                name: "NativeScope::date",
+                reason: "canonical Date prototype is unavailable".to_string(),
+            })?;
+        let prototype = self.value(Value::object(prototype));
+        let instance = self.bare_object()?;
+        self.set_prototype(instance, Some(prototype))?;
+        let object = self
+            .raw(instance)
+            .as_object()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "NativeScope::date",
+                reason: "Date shell is not an ordinary object".to_string(),
+            })?;
+        object::set_date_data(object, self.ctx.heap_mut(), milliseconds);
+        Ok(instance)
+    }
+
+    /// Snapshot a RegExp's source, canonical flags, and numeric `lastIndex`.
+    #[must_use]
+    pub fn regexp_snapshot(&self, value: Local<'_>) -> Option<(String, String, u32)> {
+        let regexp = self.raw(value).as_regexp()?;
+        Some((
+            regexp.source(self.ctx.heap()),
+            regexp.flags(self.ctx.heap()).to_js_string(),
+            regexp.last_index(self.ctx.heap()),
+        ))
+    }
+
+    /// Compile a canonical RegExp instance without consulting
+    /// `globalThis.RegExp`. `lastIndex` starts at zero as required for a
+    /// structured clone.
+    pub fn regexp(&mut self, pattern: &str, flags: &str) -> Result<Local<'scope>, NativeError> {
+        let pattern: Vec<u16> = pattern.encode_utf16().collect();
+        let regexp = self
+            .with_turn_parts(|interp, _| {
+                crate::regexp::JsRegExp::compile_cached(
+                    &mut interp.gc_heap,
+                    &mut interp.regex_compile_cache,
+                    &pattern,
+                    flags,
+                )
+            })
+            .map_err(|error| NativeError::SyntaxError {
+                name: "NativeScope::regexp",
+                reason: error.to_string(),
+            })?;
+        Ok(self.value(Value::regexp(regexp)))
+    }
+
+    /// Whether an ordinary object carries the exact `[[ErrorData]]` slot.
+    #[must_use]
+    pub fn has_error_data(&self, value: Local<'_>) -> bool {
+        self.raw(value)
+            .as_object()
+            .is_some_and(|object| object::has_error_data(object, self.ctx.heap()))
+    }
+
+    /// Allocate a canonical Error instance without consulting mutable globals.
+    ///
+    /// The intrinsic prototype comes from the interpreter-owned error-class
+    /// registry. `message` is installed with the standard non-enumerable Error
+    /// descriptor shape; callers may subsequently define `cause`.
+    pub fn error(
+        &mut self,
+        kind: crate::error_classes::ErrorKind,
+        message: &str,
+    ) -> Result<Local<'scope>, NativeError> {
+        let prototype = self.ctx.cx.interp.error_classes_clone().prototype(kind);
+        let prototype = self.value(Value::object(prototype));
+        let instance = self.bare_object()?;
+        self.set_prototype(instance, Some(prototype))?;
+        let object = self
+            .raw(instance)
+            .as_object()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "NativeScope::error",
+                reason: "Error shell is not an ordinary object".to_string(),
+            })?;
+        object::set_error_data(object, self.ctx.heap_mut());
+        let message = self.string(message)?;
+        self.define(
+            instance,
+            "message",
+            message,
+            object::PropertyFlags::new(true, false, true),
+        )?;
+        Ok(instance)
     }
 
     /// Whether a local is callable under the active VM's `[[Call]]` rules.

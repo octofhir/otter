@@ -437,6 +437,17 @@ impl Interpreter {
         Ok(self.scoped_value(scope, Value::set(set)))
     }
 
+    /// Allocate a Map collection and park it in the current scope.
+    pub(crate) fn scoped_collection_map<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+    ) -> Result<Local<'s>, VmError> {
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
+        let mut external_visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        let map = crate::collections::alloc_map_with_roots(&mut self.gc_heap, &mut external_visit)?;
+        Ok(self.scoped_value(scope, Value::map(map)))
+    }
+
     /// Allocate a Proxy over scoped target and handler handles, keeping both
     /// live and relocatable across old-space allocation.
     pub(crate) fn scoped_proxy<'s>(

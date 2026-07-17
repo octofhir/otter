@@ -14,6 +14,9 @@
 //! - `MakeClosure` reads the executable operand slice because its upvalue list
 //!   is variadic.
 //! - Arrow closures snapshot the enclosing frame's `this` value at construction.
+//! - Function property-descriptor results remain in a handle-arena slot across
+//!   every field write; shape allocation never leaves the builder with a stale
+//!   raw object handle.
 //!
 //! # See also
 //! - [`crate::executable`]
@@ -1700,7 +1703,7 @@ impl Interpreter {
             }
             return match desc {
                 Some(desc) => Ok(Some(Value::object(
-                    self.function_static_descriptor_to_object(&*stack, &desc, &[&target], args)?,
+                    self.function_static_descriptor_to_object(&desc, &[&target], args)?,
                 ))),
                 None => Ok(Some(Value::undefined())),
             };
@@ -1802,12 +1805,7 @@ impl Interpreter {
                 };
                 match desc {
                     Some(desc) => Ok(Some(Value::object(
-                        self.function_static_descriptor_to_object(
-                            &*stack,
-                            &desc,
-                            &[&target],
-                            args,
-                        )?,
+                        self.function_static_descriptor_to_object(&desc, &[&target], args)?,
                     ))),
                     None => Ok(Some(Value::undefined())),
                 }
@@ -1927,46 +1925,28 @@ impl Interpreter {
 
     fn function_static_descriptor_to_object(
         &mut self,
-        stack: &ActivationStack,
         desc: &object::PropertyDescriptor,
         value_roots: &[&Value],
         slice_roots: &[Value],
     ) -> Result<JsObject, VmError> {
-        let object_proto = self.constructor_prototype_value("Object").ok();
-        let mut roots = Vec::with_capacity(value_roots.len() + 3);
-        roots.extend_from_slice(value_roots);
-        if let Some(proto) = object_proto.as_ref() {
-            roots.push(proto);
-        }
-        match &desc.kind {
-            object::DescriptorKind::Data { value } => roots.push(value),
-            object::DescriptorKind::Accessor { getter, setter } => {
-                if let Some(getter) = getter {
-                    roots.push(getter);
-                }
-                if let Some(setter) = setter {
-                    roots.push(setter);
-                }
+        self.with_handle_scope(|interp, scope| {
+            // Keep the caller-supplied boundary values in the same canonical
+            // arena as the descriptor fields. `scoped_descriptor_object`
+            // parks its result before the first property write and resolves
+            // that slot again for every later write, so a shape/slab
+            // allocation cannot strand a copied `JsObject`.
+            for value in value_roots {
+                let _ = interp.scoped_value(scope, **value);
             }
-        }
-        let result =
-            self.alloc_stack_rooted_object_with_value_roots(stack, roots.as_slice(), slice_roots)?;
-        if let Some(proto_obj) = object_proto.and_then(|v| v.as_object()) {
-            object::set_prototype(result, &mut self.gc_heap, Some(proto_obj));
-        }
-        match &desc.kind {
-            object::DescriptorKind::Data { value } => {
-                self.set_property(result, "value", *value)?;
-                self.set_property(result, "writable", Value::boolean(desc.writable()))?;
+            for value in slice_roots {
+                let _ = interp.scoped_value(scope, *value);
             }
-            object::DescriptorKind::Accessor { getter, setter } => {
-                self.set_property(result, "get", (*getter).unwrap_or(Value::undefined()))?;
-                self.set_property(result, "set", (*setter).unwrap_or(Value::undefined()))?;
-            }
-        }
-        self.set_property(result, "enumerable", Value::boolean(desc.enumerable()))?;
-        self.set_property(result, "configurable", Value::boolean(desc.configurable()))?;
-        Ok(result)
+            let result = interp.scoped_descriptor_object(scope, desc)?;
+            interp
+                .escape_scoped(result)
+                .as_object()
+                .ok_or(VmError::TypeMismatch)
+        })
     }
 
     /// Preflight dispatcher for `Object.<X>(target)` calls whose

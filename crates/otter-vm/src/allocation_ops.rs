@@ -75,7 +75,8 @@ impl Interpreter {
         // allocation-heavy native paths such as `RegExp.prototype.exec`'s
         // per-match result building. Hand back an empty set and let the heap
         // pull roots lazily, exactly as `collect_allocation_roots` already does.
-        if self.gc_heap.has_extra_roots() {
+        let runtime_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
+        if self.gc_heap.has_extra_root_source(runtime_roots) {
             return Vec::new();
         }
         let mut roots = Vec::new();
@@ -493,18 +494,27 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
-        let mut roots = Vec::with_capacity(value_roots.len() + 1);
-        roots.push(&value);
-        roots.extend_from_slice(value_roots);
-        let obj = self.alloc_runtime_rooted_object_with_roots(&roots, slice_roots)?;
-        // §7.4.12 CreateIteratorResultObject — OrdinaryObjectCreate
-        // from %Object.prototype%.
-        if let Some(object_proto) = self.object_prototype_object_opt() {
-            crate::object::set_prototype(obj, &mut self.gc_heap, Some(object_proto));
-        }
-        self.set_property(obj, "value", value)?;
-        self.set_property(obj, "done", Value::boolean(done))?;
-        Ok(Value::object(obj))
+        self.with_handle_scope(|interp, scope| {
+            let value = interp.scoped_value(scope, value);
+            for root in value_roots {
+                let _ = interp.scoped_value(scope, **root);
+            }
+            for slice in slice_roots {
+                for root in *slice {
+                    let _ = interp.scoped_value(scope, *root);
+                }
+            }
+
+            // §7.4.12 CreateIteratorResultObject —
+            // OrdinaryObjectCreate(%Object.prototype%). Each property write
+            // can allocate a child shape, so the result stays in its canonical
+            // arena slot and is re-read by every scoped mutation.
+            let result = interp.scoped_object(scope)?;
+            interp.scoped_set(scope, result, "value", value)?;
+            let done = interp.scoped_boolean(scope, done);
+            interp.scoped_set(scope, result, "done", done)?;
+            Ok(interp.escape_scoped(result))
+        })
     }
 
     pub(crate) fn alloc_stack_rooted_object_with_extra_roots(

@@ -23,6 +23,8 @@
 //! - Constructor prototype lookup preserves existing global-object semantics.
 //! - The array-index accessor protector epoch advances only on the existing
 //!   latch's `false -> true` transition.
+//! - Proxy descriptor trap objects are assembled through canonical scoped
+//!   handles; every optional field write re-reads collector-forwarded slots.
 //! - The shape epoch covers only actual ordinary-`JsObject` prototype changes
 //!   through `set_prototype_value_proxy_aware` (including proxy fallthrough and
 //!   class-statics recursion). Array, TypedArray, function-side-table, direct
@@ -2385,37 +2387,46 @@ impl Interpreter {
         descriptor: &object::PartialPropertyDescriptor,
         value_roots: &[&Value],
     ) -> Result<object::JsObject, VmError> {
-        let mut roots = Vec::with_capacity(value_roots.len() + 3);
-        roots.extend_from_slice(value_roots);
-        if let Some(v) = &descriptor.value {
-            roots.push(v);
-        }
-        if let Some(v) = &descriptor.get {
-            roots.push(v);
-        }
-        if let Some(v) = &descriptor.set {
-            roots.push(v);
-        }
-        let obj = self.alloc_runtime_rooted_object_with_roots(roots.as_slice(), &[])?;
-        if let Some(v) = &descriptor.value {
-            self.set_property(obj, "value", *v)?;
-        }
-        if let Some(w) = descriptor.writable {
-            self.set_property(obj, "writable", Value::boolean(w))?;
-        }
-        if let Some(g) = &descriptor.get {
-            self.set_property(obj, "get", *g)?;
-        }
-        if let Some(s) = &descriptor.set {
-            self.set_property(obj, "set", *s)?;
-        }
-        if let Some(e) = descriptor.enumerable {
-            self.set_property(obj, "enumerable", Value::boolean(e))?;
-        }
-        if let Some(c) = descriptor.configurable {
-            self.set_property(obj, "configurable", Value::boolean(c))?;
-        }
-        Ok(obj)
+        self.with_handle_scope(|interp, scope| {
+            for value in value_roots {
+                let _ = interp.scoped_value(scope, **value);
+            }
+            let value = descriptor
+                .value
+                .map(|value| interp.scoped_value(scope, value));
+            let get = descriptor
+                .get
+                .map(|value| interp.scoped_value(scope, value));
+            let set = descriptor
+                .set
+                .map(|value| interp.scoped_value(scope, value));
+            let obj = interp.scoped_object(scope)?;
+            if let Some(value) = value {
+                interp.scoped_set(scope, obj, "value", value)?;
+            }
+            if let Some(writable) = descriptor.writable {
+                let writable = interp.scoped_boolean(scope, writable);
+                interp.scoped_set(scope, obj, "writable", writable)?;
+            }
+            if let Some(get) = get {
+                interp.scoped_set(scope, obj, "get", get)?;
+            }
+            if let Some(set) = set {
+                interp.scoped_set(scope, obj, "set", set)?;
+            }
+            if let Some(enumerable) = descriptor.enumerable {
+                let enumerable = interp.scoped_boolean(scope, enumerable);
+                interp.scoped_set(scope, obj, "enumerable", enumerable)?;
+            }
+            if let Some(configurable) = descriptor.configurable {
+                let configurable = interp.scoped_boolean(scope, configurable);
+                interp.scoped_set(scope, obj, "configurable", configurable)?;
+            }
+            interp
+                .escape_scoped(obj)
+                .as_object()
+                .ok_or(VmError::TypeMismatch)
+        })
     }
     /// §7.1.1 ToPrimitive synchronous helper. Used by sync callers
     /// (Reflect dispatcher, set / has / define paths) that need

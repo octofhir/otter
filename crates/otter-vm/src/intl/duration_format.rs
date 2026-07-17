@@ -1,15 +1,21 @@
-//! `Intl.DurationFormat` — locale-aware duration formatting (ECMA-402
-//! §1, Intl DurationFormat proposal).
+//! `Intl.DurationFormat` — locale-aware duration formatting.
 //!
-//! Like `Intl.Locale`, the constructor must fire its `options` getters
-//! in spec order, so it is built through a `NativeCtx`-based
-//! constructor rather than the heap-only
-//! its own `NativeCtx` constructor path.
+//! The constructor resolves its option bag in ECMA-402 observation order,
+//! while formatting partitions the ten Temporal duration units into localized
+//! number and list segments.
 //!
 //! # Contents
 //! - [`duration_format_ctor`] — `new Intl.DurationFormat(locales,
 //!   options?)` (option resolution + `GetDurationUnitOptions`).
+//! - `format` and `formatToParts` duration partitioning.
 //! - [`resolved_options`] — `Intl.DurationFormat.prototype.resolvedOptions()`.
+//!
+//! # Invariants
+//! - JS-visible part arrays and option objects are built through
+//!   [`crate::NativeScope`], so values retained across allocation are rooted
+//!   handles rather than copied raw values.
+//! - Part records are installed directly into their result array; construction
+//!   is linear in the number of emitted parts.
 //!
 //! # See also
 //! - <https://tc39.es/proposal-intl-duration-format/>
@@ -24,44 +30,65 @@ use crate::{NativeCtx, NativeError, Value};
 
 const CLASS: &str = "DurationFormat";
 
-/// The ten duration units in spec order: `(name, stylesList,
+/// The ten duration units in spec order: `(name, displayKey, stylesList,
 /// digitalBase)`. Years..days take only word styles (digital base
 /// `"short"`); hours/minutes/seconds additionally accept `numeric` /
 /// `2-digit` (digital base `"numeric"` for hours, `"2-digit"` for
 /// minutes/seconds); sub-second units accept `numeric` (digital base
 /// `"numeric"`).
-const UNITS: &[(&str, &[&str], &str)] = &[
-    ("years", &["long", "short", "narrow"], "short"),
-    ("months", &["long", "short", "narrow"], "short"),
-    ("weeks", &["long", "short", "narrow"], "short"),
-    ("days", &["long", "short", "narrow"], "short"),
+const UNITS: &[(&str, &str, &[&str], &str)] = &[
+    (
+        "years",
+        "yearsDisplay",
+        &["long", "short", "narrow"],
+        "short",
+    ),
+    (
+        "months",
+        "monthsDisplay",
+        &["long", "short", "narrow"],
+        "short",
+    ),
+    (
+        "weeks",
+        "weeksDisplay",
+        &["long", "short", "narrow"],
+        "short",
+    ),
+    ("days", "daysDisplay", &["long", "short", "narrow"], "short"),
     (
         "hours",
+        "hoursDisplay",
         &["long", "short", "narrow", "numeric", "2-digit"],
         "numeric",
     ),
     (
         "minutes",
+        "minutesDisplay",
         &["long", "short", "narrow", "numeric", "2-digit"],
         "2-digit",
     ),
     (
         "seconds",
+        "secondsDisplay",
         &["long", "short", "narrow", "numeric", "2-digit"],
         "2-digit",
     ),
     (
         "milliseconds",
+        "millisecondsDisplay",
         &["long", "short", "narrow", "numeric"],
         "numeric",
     ),
     (
         "microseconds",
+        "microsecondsDisplay",
         &["long", "short", "narrow", "numeric"],
         "numeric",
     ),
     (
         "nanoseconds",
+        "nanosecondsDisplay",
         &["long", "short", "narrow", "numeric"],
         "numeric",
     ),
@@ -202,7 +229,7 @@ pub(crate) fn duration_format_ctor(
     // `prev_internal` carries the previous unit's *internal* resolved
     // style, which may be `"fractional"` (sub-second numeric).
     let mut prev_internal: Option<String> = None;
-    for (unit, styles, digital_base) in UNITS {
+    for (unit, _, styles, digital_base) in UNITS {
         let unit = *unit;
         let is_hms = matches!(unit, "hours" | "minutes" | "seconds");
         let is_min_sec = matches!(unit, "minutes" | "seconds");
@@ -791,31 +818,22 @@ pub(crate) fn format_to_parts(
         flat.extend(group);
     }
 
-    let mut elements: Vec<Value> = Vec::with_capacity(flat.len());
-    for part in &flat {
-        let ty_s = Value::string(JsString::from_str(part.ty, ctx.heap_mut())?);
-        let val_s = Value::string(JsString::from_str(&part.value, ctx.heap_mut())?);
-        let unit_v = match part.unit {
-            Some(u) => Some(Value::string(JsString::from_str(u, ctx.heap_mut())?)),
-            None => None,
-        };
-        let snapshot = elements.clone();
-        let mut obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s], &[&snapshot])?;
-        crate::object::set(&mut obj, ctx.heap_mut(), "type", ty_s);
-        crate::object::set(&mut obj, ctx.heap_mut(), "value", val_s);
-        if let Some(u) = unit_v {
-            crate::object::set(&mut obj, ctx.heap_mut(), "unit", u);
+    ctx.scope(|mut scope| {
+        let result = scope.array(flat.len())?;
+        for (index, emitted) in flat.iter().enumerate() {
+            let part = scope.object()?;
+            let ty = scope.string(emitted.ty)?;
+            scope.set(part, "type", ty)?;
+            let value = scope.string(&emitted.value)?;
+            scope.set(part, "value", value)?;
+            if let Some(unit) = emitted.unit {
+                let unit = scope.string(unit)?;
+                scope.set(part, "unit", unit)?;
+            }
+            scope.set_index(result, index, part)?;
         }
-        elements.push(Value::object(obj));
-    }
-    let element_roots = elements.clone();
-    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        for v in &element_roots {
-            v.trace_value_slots(visitor);
-        }
-    };
-    let arr = crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut visit)?;
-    Ok(Value::array(arr))
+        Ok(scope.finish(result))
+    })
 }
 
 fn require_payload(ctx: &NativeCtx<'_>) -> Result<DurationFormatPayload, NativeError> {
@@ -832,31 +850,25 @@ pub(crate) fn resolved_options(
     _args: &[Value],
 ) -> Result<Value, NativeError> {
     let p = require_payload(ctx)?;
-    let locale = Value::string(JsString::from_str(&p.locale, ctx.heap_mut())?);
-    let numbering = Value::string(JsString::from_str(&p.numbering_system, ctx.heap_mut())?);
-    let style = Value::string(JsString::from_str(&p.style, ctx.heap_mut())?);
-    let mut obj = ctx.alloc_object_with_roots(&[&locale, &numbering, &style], &[])?;
-    let proto = ctx.cx.interp.object_prototype_object_opt();
-    if let Some(proto) = proto {
-        crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto));
-    }
-    crate::object::set(&mut obj, ctx.heap_mut(), "locale", locale);
-    crate::object::set(&mut obj, ctx.heap_mut(), "numberingSystem", numbering);
-    crate::object::set(&mut obj, ctx.heap_mut(), "style", style);
-    for ((unit, _, _), (unit_style, display)) in UNITS.iter().zip(p.units.iter()) {
-        let sv = Value::string(JsString::from_str(unit_style, ctx.heap_mut())?);
-        crate::object::set(&mut obj, ctx.heap_mut(), unit, sv);
-        let dv = Value::string(JsString::from_str(display, ctx.heap_mut())?);
-        let display_key = format!("{unit}Display");
-        crate::object::set(&mut obj, ctx.heap_mut(), &display_key, dv);
-    }
-    if let Some(fd) = p.fractional_digits {
-        crate::object::set(
-            &mut obj,
-            ctx.heap_mut(),
-            "fractionalDigits",
-            Value::number_i32(fd as i32),
-        );
-    }
-    Ok(Value::object(obj))
+    ctx.scope(|mut scope| {
+        let options = scope.object()?;
+        let locale = scope.string(&p.locale)?;
+        scope.set(options, "locale", locale)?;
+        let numbering = scope.string(&p.numbering_system)?;
+        scope.set(options, "numberingSystem", numbering)?;
+        let style = scope.string(&p.style)?;
+        scope.set(options, "style", style)?;
+
+        for ((unit, display_key, _, _), (unit_style, display)) in UNITS.iter().zip(p.units.iter()) {
+            let style = scope.string(unit_style)?;
+            scope.set(options, unit, style)?;
+            let display = scope.string(display)?;
+            scope.set(options, display_key, display)?;
+        }
+        if let Some(fd) = p.fractional_digits {
+            let digits = scope.number(f64::from(fd));
+            scope.set(options, "fractionalDigits", digits)?;
+        }
+        Ok(scope.finish(options))
+    })
 }

@@ -783,6 +783,20 @@ impl GcHeap {
         !self.extra_roots.is_empty()
     }
 
+    /// Whether `roots` is already registered as this exact source.
+    ///
+    /// A caller that needs one particular owner (rather than merely any
+    /// transient root provider) uses this to avoid both an unsound false
+    /// positive and a duplicate registration. Source identity includes the
+    /// concrete dispatch thunk, so equal data addresses of different source
+    /// types do not alias.
+    #[must_use]
+    pub fn has_extra_root_source(&self, roots: ExtraRoots) -> bool {
+        self.extra_roots
+            .iter()
+            .any(|registered| registered.same_source(&roots))
+    }
+
     /// Truncate the extra-roots stack back down to `depth`.
     #[doc(hidden)]
     pub fn pop_extra_roots_to(&mut self, depth: usize) {

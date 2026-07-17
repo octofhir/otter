@@ -4,6 +4,17 @@
 //! formatter data, which implements CLDR list patterns for the selected
 //! locale, type, and style.
 //!
+//! # Contents
+//! - Locale and option resolution for `Intl.ListFormat`.
+//! - ICU-backed `format` and `formatToParts`.
+//! - Rooted `resolvedOptions` result construction.
+//!
+//! # Invariants
+//! - Every JS value retained across an allocation lives in one native handle
+//!   scope; list-part arrays never rely on copied raw-value root snapshots.
+//! - Part objects are installed into their result array as they are built, so
+//!   construction is linear in the number of formatted parts.
+//!
 //! # See also
 //! - <https://tc39.es/ecma402/#listformat-objects>
 
@@ -13,12 +24,10 @@ use std::str::FromStr;
 use icu_list::options::{ListFormatterOptions, ListLength};
 use icu_list::{ListFormatter, ListFormatterPreferences};
 use icu_locale::Locale;
-use otter_gc::raw::RawGc;
 use writeable::{Part, PartsWrite, Writeable};
 
 use crate::intl::helpers::{DEFAULT_LOCALE, get_string_option, require_options_object};
 use crate::intl::payload::{IntlPayload, ListFormatPayload};
-use crate::string::JsString;
 use crate::{NativeCtx, NativeError, Value};
 
 const CLASS: &str = "ListFormat";
@@ -106,10 +115,10 @@ pub(crate) fn list_format_format(
     let payload = require_payload(ctx, "format")?;
     let items = crate::intl::helpers::string_list_from_iterable(ctx, args.first(), "format")?;
     let rendered = join(&items, &payload);
-    Ok(Value::string(JsString::from_str(
-        &rendered,
-        ctx.heap_mut(),
-    )?))
+    ctx.scope(|mut scope| {
+        let rendered = scope.string(&rendered)?;
+        Ok(scope.finish(rendered))
+    })
 }
 
 /// §13.5.4 `Intl.ListFormat.prototype.formatToParts(list)`.
@@ -122,24 +131,18 @@ pub(crate) fn list_format_format_to_parts(
         crate::intl::helpers::string_list_from_iterable(ctx, args.first(), "formatToParts")?;
     let parts = parts_layout(&items, &payload);
 
-    let mut elements: Vec<Value> = Vec::with_capacity(parts.len());
-    for (ty, val) in &parts {
-        let ty_s = Value::string(JsString::from_str(ty, ctx.heap_mut())?);
-        let val_s = Value::string(JsString::from_str(val, ctx.heap_mut())?);
-        let snapshot = elements.clone();
-        let mut obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s], &[&snapshot])?;
-        crate::object::set(&mut obj, ctx.heap_mut(), "type", ty_s);
-        crate::object::set(&mut obj, ctx.heap_mut(), "value", val_s);
-        elements.push(Value::object(obj));
-    }
-    let element_roots = elements.clone();
-    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        for v in &element_roots {
-            v.trace_value_slots(visitor);
+    ctx.scope(|mut scope| {
+        let result = scope.array(parts.len())?;
+        for (index, (ty, value)) in parts.iter().enumerate() {
+            let part = scope.object()?;
+            let ty = scope.string(ty)?;
+            scope.set(part, "type", ty)?;
+            let value = scope.string(value)?;
+            scope.set(part, "value", value)?;
+            scope.set_index(result, index, part)?;
         }
-    };
-    let arr = crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut visit)?;
-    Ok(Value::array(arr))
+        Ok(scope.finish(result))
+    })
 }
 
 /// Build the `element` / `literal` part layout matching [`join`].
@@ -228,16 +231,14 @@ pub(crate) fn list_format_resolved_options(
     _args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "resolvedOptions")?;
-    let locale = Value::string(JsString::from_str(&payload.locale, ctx.heap_mut())?);
-    let kind = Value::string(JsString::from_str(&payload.kind, ctx.heap_mut())?);
-    let style = Value::string(JsString::from_str(&payload.style, ctx.heap_mut())?);
-    let mut obj = ctx.alloc_object_with_roots(&[&locale, &kind, &style], &[])?;
-    if let Some(proto) = ctx.cx.interp.object_prototype_object_opt() {
-        crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto));
-    }
-    let heap = ctx.heap_mut();
-    crate::object::set(&mut obj, heap, "locale", locale);
-    crate::object::set(&mut obj, heap, "type", kind);
-    crate::object::set(&mut obj, heap, "style", style);
-    Ok(Value::object(obj))
+    ctx.scope(|mut scope| {
+        let options = scope.object()?;
+        let locale = scope.string(&payload.locale)?;
+        scope.set(options, "locale", locale)?;
+        let kind = scope.string(&payload.kind)?;
+        scope.set(options, "type", kind)?;
+        let style = scope.string(&payload.style)?;
+        scope.set(options, "style", style)?;
+        Ok(scope.finish(options))
+    })
 }

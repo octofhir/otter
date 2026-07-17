@@ -4,10 +4,21 @@
 //! `"in 3 days"` / `"5 minutes ago"`. The full ICU CLDR pattern
 //! database is filed alongside the wider Intl follow-up.
 //!
+//! # Contents
+//!
+//! - Relative-time option resolution and ICU-backed rendering.
+//! - Number-pattern partitioning for `formatToParts`.
+//! - Rooted builders for parts arrays and `resolvedOptions`.
+//!
+//! # Invariants
+//!
+//! - Every GC value retained across an allocation lives in a handle-scope
+//!   [`crate::Local`] and is reread at each mutation boundary.
+//! - Parts arrays are allocated once and filled directly without cloning
+//!   accumulated GC values or materializing root snapshots.
+//!
 //! # See also
 //! - <https://tc39.es/ecma402/#relativetimeformat-objects>
-
-use otter_gc::raw::RawGc;
 
 use crate::intl::helpers::{
     DEFAULT_LOCALE, coerce_options_object, get_numbering_system_option, get_string_option,
@@ -388,40 +399,34 @@ pub(crate) fn relative_time_format_format_to_parts(
     }
 
     let singular = singular_unit(&unit).to_string();
-    let mut elements: Vec<Value> = Vec::with_capacity(triples.len());
-    for (ty, val, has_unit) in &triples {
-        let ty_s = Value::string(JsString::from_str(ty, ctx.heap_mut())?);
-        let val_s = Value::string(JsString::from_str(val, ctx.heap_mut())?);
-        let unit_s = if *has_unit {
-            Some(Value::string(JsString::from_str(
-                &singular,
-                ctx.heap_mut(),
-            )?))
+    ctx.scope(|mut scope| {
+        let result = scope.array(triples.len())?;
+        let unit = if triples.iter().any(|(_, _, has_unit)| *has_unit) {
+            Some(scope.string(&singular)?)
         } else {
             None
         };
-        let snapshot = elements.clone();
-        let mut roots = vec![&ty_s, &val_s];
-        if let Some(u) = &unit_s {
-            roots.push(u);
+
+        for (index, (ty, value, has_unit)) in triples.iter().enumerate() {
+            scope.scope(|mut part_scope| {
+                let part = part_scope.object()?;
+                let ty = part_scope.string(ty)?;
+                part_scope.set(part, "type", ty)?;
+                let value = part_scope.string(value)?;
+                part_scope.set(part, "value", value)?;
+                if *has_unit {
+                    part_scope.set(
+                        part,
+                        "unit",
+                        unit.expect("numeric relative-time part has a rooted unit"),
+                    )?;
+                }
+                part_scope.set_index(result, index, part)
+            })?;
         }
-        let mut part = ctx.alloc_object_with_roots(&roots, &[&snapshot])?;
-        crate::object::set(&mut part, ctx.heap_mut(), "type", ty_s);
-        crate::object::set(&mut part, ctx.heap_mut(), "value", val_s);
-        if let Some(u) = unit_s {
-            crate::object::set(&mut part, ctx.heap_mut(), "unit", u);
-        }
-        elements.push(Value::object(part));
-    }
-    let element_roots = elements.clone();
-    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        for v in &element_roots {
-            v.trace_value_slots(visitor);
-        }
-    };
-    let arr =
-        crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut external_visit)?;
-    Ok(Value::array(arr))
+
+        Ok(scope.finish(result))
+    })
 }
 
 /// Split a locale-formatted number into ECMA-402 numeric part types.
@@ -475,19 +480,16 @@ pub(crate) fn relative_time_format_resolved_options(
     _args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "resolvedOptions")?;
-    let locale = Value::string(JsString::from_str(&payload.locale, ctx.heap_mut())?);
-    let style = Value::string(JsString::from_str(&payload.style, ctx.heap_mut())?);
-    let numeric = Value::string(JsString::from_str(&payload.numeric, ctx.heap_mut())?);
-    let numbering_system = Value::string(JsString::from_str(
-        &payload.numbering_system,
-        ctx.heap_mut(),
-    )?);
-    let mut obj =
-        ctx.alloc_object_with_roots(&[&locale, &style, &numeric, &numbering_system], &[])?;
-    let heap = ctx.heap_mut();
-    crate::object::set(&mut obj, heap, "locale", locale);
-    crate::object::set(&mut obj, heap, "style", style);
-    crate::object::set(&mut obj, heap, "numeric", numeric);
-    crate::object::set(&mut obj, heap, "numberingSystem", numbering_system);
-    Ok(Value::object(obj))
+    ctx.scope(|mut scope| {
+        let result = scope.object()?;
+        let locale = scope.string(&payload.locale)?;
+        scope.set(result, "locale", locale)?;
+        let style = scope.string(&payload.style)?;
+        scope.set(result, "style", style)?;
+        let numeric = scope.string(&payload.numeric)?;
+        scope.set(result, "numeric", numeric)?;
+        let numbering_system = scope.string(&payload.numbering_system)?;
+        scope.set(result, "numberingSystem", numbering_system)?;
+        Ok(scope.finish(result))
+    })
 }

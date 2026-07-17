@@ -1,10 +1,26 @@
-//! Shared installer helpers used by every `intrinsics/<name>.rs`
-//! module.
+//! Shared rooted primitives for intrinsic installers and constructor helpers.
 //!
 //! These are the small, value-rooted allocation / native-function /
 //! global-property primitives that the per-intrinsic installers
 //! compose. They live here (not in `bootstrap.rs`) so the registry
 //! file stays focused on entry-list bookkeeping.
+//!
+//! # Contents
+//! - Root-aware object and static-native allocation for bootstrap installers.
+//! - Descriptor helpers for intrinsic properties and globals.
+//! - Shared constructor helpers used at native-call boundaries.
+//!
+//! # Invariants
+//! - Every value crossing an installer allocation is present in the supplied
+//!   root set and reloaded after a moving collection.
+//! - Observable VM failures cross the native boundary through the canonical
+//!   error mapper so an exact pending JavaScript throw is preserved.
+//! - Constructor helpers receive execution state through `NativeCtx`; they do
+//!   not discover an active stack through ambient pointers or registries.
+//!
+//! # See also
+//! - [`crate::runtime_cx::NativeScope`]
+//! - [`crate::js_surface`]
 
 use crate::js_surface::{Attr, JsSurfaceError};
 use crate::object::{self, JsObject, PropertyDescriptor};
@@ -137,14 +153,13 @@ pub(crate) fn native_new_target_prototype(
         let proto = if let Some(exec) = exec {
             let key = VmPropertyKey::String("prototype");
             let receiver = scope.raw(new_target);
-            match scope
-                .with_turn_parts(|interp, stack| {
-                    interp.ordinary_get_value(stack, &exec, receiver, receiver, &key, 0)
-                })
-                .map_err(|err| NativeError::TypeError {
-                    name,
-                    reason: err.to_string(),
-                })? {
+            match scope.with_turn_parts(|interp, stack| {
+                interp
+                    .ordinary_get_value(stack, &exec, receiver, receiver, &key, 0)
+                    .map_err(|error| {
+                        crate::native_function::vm_to_native_error(interp, error, name)
+                    })
+            })? {
                 VmGetOutcome::Value(value) => Some(scope.value(value)),
                 VmGetOutcome::InvokeGetter { getter } => {
                     let getter = scope.value(getter);

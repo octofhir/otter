@@ -28,10 +28,9 @@
 //! - Type-of-Object checks accept any heap-bound value
 //!   ([`is_type_object`]) so Reflect mirrors the spec's `Object`
 //!   type, not just plain objects.
-//! - Property-key coercion (§7.1.19 ToPropertyKey) is shallow at
-//!   this slice: primitive keys are stringified, symbols pass
-//!   through, and non-primitive keys raise `TypeMismatch`. A future
-//!   slice will invoke the full `[[ToPrimitive]]` ladder.
+//! - Property-key coercion (§7.1.19 ToPropertyKey) stringifies primitive
+//!   keys directly, passes symbols through, and drives the observable
+//!   `[[ToPrimitive]]` ladder for object keys.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-reflect-object>
@@ -146,75 +145,10 @@ pub fn call(
                 .ordinary_get_own_property_descriptor_value(stack, context, target, &key, 0)?
             {
                 None => Ok(Value::undefined()),
-                Some(desc) => {
-                    let flags = desc.flags;
-                    let descriptor_roots: Vec<Value> = match &desc.kind {
-                        crate::object::DescriptorKind::Data { value } => vec![*value],
-                        crate::object::DescriptorKind::Accessor { getter, setter } => vec![
-                            (*getter).unwrap_or(Value::undefined()),
-                            (*setter).unwrap_or(Value::undefined()),
-                        ],
-                    };
-                    let obj = interp.alloc_stack_rooted_object_with_value_roots(
-                        stack,
-                        &[],
-                        descriptor_roots.as_slice(),
-                    )?;
-                    match &desc.kind {
-                        crate::object::DescriptorKind::Data { .. } => {
-                            let mut external_visit =
-                                |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                                    for value in &descriptor_roots {
-                                        value.trace_value_slots(visitor);
-                                    }
-                                };
-                            interp.set_property_with_extra_roots(
-                                obj,
-                                "value",
-                                descriptor_roots[0],
-                                &mut external_visit,
-                            )?;
-                            interp.set_property(
-                                obj,
-                                "writable",
-                                Value::boolean(flags.writable()),
-                            )?;
-                        }
-                        crate::object::DescriptorKind::Accessor { .. } => {
-                            let mut external_visit =
-                                |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                                    for value in &descriptor_roots {
-                                        value.trace_value_slots(visitor);
-                                    }
-                                };
-                            interp.set_property_with_extra_roots(
-                                obj,
-                                "get",
-                                descriptor_roots[0],
-                                &mut external_visit,
-                            )?;
-                            let mut external_visit =
-                                |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                                    for value in &descriptor_roots {
-                                        value.trace_value_slots(visitor);
-                                    }
-                                };
-                            interp.set_property_with_extra_roots(
-                                obj,
-                                "set",
-                                descriptor_roots[1],
-                                &mut external_visit,
-                            )?;
-                        }
-                    }
-                    interp.set_property(obj, "enumerable", Value::boolean(flags.enumerable()))?;
-                    interp.set_property(
-                        obj,
-                        "configurable",
-                        Value::boolean(flags.configurable()),
-                    )?;
-                    Ok(Value::object(obj))
-                }
+                Some(desc) => interp.with_handle_scope(|interp, scope| {
+                    let result = interp.scoped_descriptor_object(scope, &desc)?;
+                    Ok(interp.escape_scoped(result))
+                }),
             }
         }
         // §28.1.8 Reflect.getPrototypeOf(target)

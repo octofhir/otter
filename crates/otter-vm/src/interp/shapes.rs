@@ -1,9 +1,9 @@
 //! Shape-transition helpers and property definition slow paths.
 //!
 //! # Contents
-//! `shape_root`/`shape_child` (with rooting variants), data-property
-//! stores (`set_property`, `ordinary_set_data_property`), partial
-//! descriptor definition, freeze/seal, and shape-from-slots rebuild.
+//! `shape_root`/`shape_child` (with rooted object/value transitions),
+//! data-property stores (`set_property`, `ordinary_set_data_property`),
+//! partial descriptor definition, freeze/seal, and shape-from-slots rebuild.
 //!
 //! # Invariants
 //! Shape children are interned via the shape runtime; allocating a
@@ -50,24 +50,6 @@ impl Interpreter {
         obj: &mut object::JsObject,
         value: &Value,
     ) -> Result<object::ShapeHandle, VmError> {
-        let mut no_extra_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        self.shape_child_rooting_object_value_with_extra_roots(
-            parent,
-            key,
-            obj,
-            value,
-            &mut no_extra_roots,
-        )
-    }
-
-    pub(crate) fn shape_child_rooting_object_value_with_extra_roots(
-        &mut self,
-        parent: object::ShapeHandle,
-        key: &str,
-        obj: &mut object::JsObject,
-        value: &Value,
-        extra_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
-    ) -> Result<object::ShapeHandle, VmError> {
         // Fast path: a previously seen field-shape transition resolves with no
         // allocation, so it needs no rooting. Building an object whose layout
         // already exists (every object after the first of its class) lands
@@ -83,7 +65,6 @@ impl Interpreter {
         }
         let roots = self.collect_runtime_roots_without_shape_runtime();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            extra_visit(visitor);
             for &slot in &roots {
                 visitor(slot);
             }
@@ -241,40 +222,6 @@ impl Interpreter {
             self.should_add_property(obj, key) && (old_count as u32) < object::MAX_FAST_PROPERTIES;
         let next_shape = if should_add_shape {
             Some(self.shape_child_rooting_object_value(shape, key, &mut obj, &value)?)
-        } else {
-            None
-        };
-
-        if let Some(next_shape) = next_shape {
-            object::set_with_shape(obj, &mut self.gc_heap, key, value, next_shape, old_count);
-        } else {
-            object::set(&mut obj, &mut self.gc_heap, key, value);
-        }
-        self.update_array_prototype_length_after_index_store(obj, key);
-        Ok(())
-    }
-
-    /// Construction-time data store with caller-supplied roots for native
-    /// binding contexts that hold live values outside VM frames.
-    pub(crate) fn set_property_with_extra_roots(
-        &mut self,
-        mut obj: object::JsObject,
-        key: &str,
-        value: Value,
-        extra_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
-    ) -> Result<(), VmError> {
-        let shape = object::shape(obj, &self.gc_heap);
-        let old_count = object::shape_property_count(shape, &self.gc_heap) as usize;
-        let should_add_shape =
-            self.should_add_property(obj, key) && (old_count as u32) < object::MAX_FAST_PROPERTIES;
-        let next_shape = if should_add_shape {
-            Some(self.shape_child_rooting_object_value_with_extra_roots(
-                shape,
-                key,
-                &mut obj,
-                &value,
-                extra_visit,
-            )?)
         } else {
             None
         };

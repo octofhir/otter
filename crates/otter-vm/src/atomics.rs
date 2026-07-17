@@ -29,6 +29,8 @@
 //!   `TypeError`.
 //! - View kind is validated before any other argument is coerced
 //!   (validate-arraytype-before-value-coercion).
+//! - `waitAsync` result labels, promises, and result objects remain in one
+//!   handle scope until both `async` and `value` have been published.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-atomics-object>
@@ -716,20 +718,20 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
     })?;
     if is_async {
         if !values_equal_strict(&current, &expected, heap) {
-            return wait_async_result(ctx, args, method_name, false, "not-equal");
+            return wait_async_result(ctx, method_name, false, "not-equal");
         }
         if timeout == 0.0 {
-            return wait_async_result(ctx, args, method_name, false, "timed-out");
+            return wait_async_result(ctx, method_name, false, "timed-out");
         }
         if timeout.is_finite() {
             let ms = timeout.min(u64::MAX as f64) as u64;
             if ms <= WAIT_ASYNC_INLINE_TIMEOUT_LIMIT_MS {
                 wait_async_sleep_for_timeout(ctx, ms)?;
-                return wait_async_result(ctx, args, method_name, true, "timed-out");
+                return wait_async_result(ctx, method_name, true, "timed-out");
             }
         }
         atomics_wait::register_async_waiter(buf_id, idx);
-        return wait_async_result(ctx, args, method_name, true, "ok");
+        return wait_async_result(ctx, method_name, true, "ok");
     }
 
     let label = if !values_equal_strict(&current, &expected, heap) {
@@ -779,28 +781,33 @@ fn wait_async_sleep_for_timeout(ctx: &mut NativeCtx<'_>, ms: u64) -> Result<(), 
 
 fn wait_async_result(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
     method_name: &'static str,
     is_async: bool,
     label: &str,
 ) -> Result<Value, NativeError> {
-    let label_value = string_value(ctx, method_name, label)?;
-    let value = if is_async {
-        let promise = ctx
-            .fulfilled_promise_with_roots(label_value, &[], &[args])
-            .map_err(|e| type_err(method_name, format!("promise allocation failed: {e}")))?;
-        Value::promise(promise)
-    } else {
-        label_value
-    };
-    let result = ctx
-        .alloc_object_with_roots(&[&label_value, &value], &[args])
-        .map_err(|e| type_err(method_name, format!("object allocation failed: {e}")))?;
-    ctx.set_property(result, "async", Value::boolean(is_async))
-        .map_err(|e| type_err(method_name, e.to_string()))?;
-    ctx.set_property(result, "value", value)
-        .map_err(|e| type_err(method_name, e.to_string()))?;
-    Ok(Value::object(result))
+    ctx.scope(|mut scope| {
+        let label = scope
+            .string(label)
+            .map_err(|error| type_err(method_name, format!("string allocation failed: {error}")))?;
+        let value = if is_async {
+            scope.promise_fulfilled(label).map_err(|error| {
+                type_err(method_name, format!("promise allocation failed: {error}"))
+            })?
+        } else {
+            label
+        };
+        let result = scope
+            .object()
+            .map_err(|error| type_err(method_name, format!("object allocation failed: {error}")))?;
+        let is_async = scope.boolean(is_async);
+        scope
+            .set(result, "async", is_async)
+            .map_err(|error| type_err(method_name, error.to_string()))?;
+        scope
+            .set(result, "value", value)
+            .map_err(|error| type_err(method_name, error.to_string()))?;
+        Ok(scope.finish(result))
+    })
 }
 
 fn string_value(

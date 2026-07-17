@@ -1316,33 +1316,13 @@ pub(crate) fn iterator_proto_next(
                 name: "Iterator.prototype.next",
                 reason: "missing execution context".to_string(),
             })?;
-    let iter_value = Value::iterator(handle);
     let next = ctx
         .cx
         .with_parts(|interp, stack| interp.iterator_next_full(&exec_ctx, stack, &handle));
     let (value, done) = next.map_err(|e| {
         crate::native_function::vm_to_native_error(ctx.cx.interp, e, "Iterator.prototype.next")
     })?;
-    let obj = ctx
-        .alloc_object_with_roots(&[&iter_value, &value], &[])
-        .map_err(|_| crate::NativeError::TypeError {
-            name: "Iterator.prototype.next",
-            reason: "result allocation failed".to_string(),
-        })?;
-    // §7.4.12 CreateIteratorResultObject — OrdinaryObjectCreate from
-    // %Object.prototype%.
-    if let Some(object_proto) = ctx.cx.interp.object_prototype_object_opt() {
-        crate::object::set_prototype(obj, ctx.heap_mut(), Some(object_proto));
-    }
-    let set_value = ctx.set_property(obj, "value", value);
-    set_value.map_err(|e| {
-        crate::native_function::vm_to_native_error(ctx.cx.interp, e, "Iterator.prototype.next")
-    })?;
-    let set_done = ctx.set_property(obj, "done", Value::boolean(done));
-    set_done.map_err(|e| {
-        crate::native_function::vm_to_native_error(ctx.cx.interp, e, "Iterator.prototype.next")
-    })?;
-    Ok(Value::object(obj))
+    create_owned_iterator_result(ctx, value, done)
 }
 
 /// §27.1.4 — the `%IteratorHelperPrototype%` `next` / `return` methods
@@ -1493,26 +1473,12 @@ fn regexp_string_iterator_proto_next(
                 name,
                 reason: "missing execution context".to_string(),
             })?;
-    let iter_value = Value::iterator(handle);
     let next = ctx
         .cx
         .with_parts(|interp, stack| interp.iterator_next_full(&exec_ctx, stack, &handle));
     let (value, done) =
         next.map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, name))?;
-    let obj = ctx
-        .alloc_object_with_roots(&[&iter_value, &value], &[])
-        .map_err(|_| crate::NativeError::TypeError {
-            name,
-            reason: "result allocation failed".to_string(),
-        })?;
-    if let Some(object_proto) = ctx.cx.interp.object_prototype_object_opt() {
-        crate::object::set_prototype(obj, ctx.heap_mut(), Some(object_proto));
-    }
-    let set_value = ctx.set_property(obj, "value", value);
-    set_value.map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, name))?;
-    let set_done = ctx.set_property(obj, "done", Value::boolean(done));
-    set_done.map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, name))?;
-    Ok(Value::object(obj))
+    create_owned_iterator_result(ctx, value, done)
 }
 
 /// §27.1.5.1.3 `%IteratorPrototype%.return(value)` — mark the
@@ -1585,7 +1551,7 @@ fn iterator_proto_return(
             }
             return ctx.call(return_method, target, &[]);
         }
-        return create_iterator_return_result(ctx, iter_value, arg);
+        return create_iterator_return_result(ctx, arg);
     } else if !receiver_is_async_generator {
         let exec_ctx =
             ctx.execution_context()
@@ -1611,34 +1577,28 @@ fn iterator_proto_return(
         .with_payload(handle, |state| {
             state.exhaust();
         });
-    create_iterator_return_result(ctx, iter_value, arg)
+    create_iterator_return_result(ctx, arg)
 }
 
 fn create_iterator_return_result(
     ctx: &mut crate::NativeCtx<'_>,
-    iter_value: Value,
     value: Value,
 ) -> Result<Value, crate::NativeError> {
-    let obj = ctx
-        .alloc_object_with_roots(&[&iter_value, &value], &[])
-        .map_err(|_| crate::NativeError::TypeError {
-            name: "Iterator.prototype.return",
-            reason: "result allocation failed".to_string(),
-        })?;
-    // §7.4.12 CreateIteratorResultObject — OrdinaryObjectCreate from
-    // %Object.prototype%.
-    if let Some(object_proto) = ctx.cx.interp.object_prototype_object_opt() {
-        crate::object::set_prototype(obj, ctx.heap_mut(), Some(object_proto));
-    }
-    let set_value = ctx.set_property(obj, "value", value);
-    set_value.map_err(|e| {
-        crate::native_function::vm_to_native_error(ctx.cx.interp, e, "Iterator.prototype.return")
-    })?;
-    let set_done = ctx.set_property(obj, "done", Value::boolean(true));
-    set_done.map_err(|e| {
-        crate::native_function::vm_to_native_error(ctx.cx.interp, e, "Iterator.prototype.return")
-    })?;
-    Ok(Value::object(obj))
+    create_owned_iterator_result(ctx, value, true)
+}
+
+/// Build only VM-owned iterator results. Wrapped user iterators return their
+/// `next` / `return` values directly and must never pass through this helper.
+fn create_owned_iterator_result(
+    ctx: &mut crate::NativeCtx<'_>,
+    value: Value,
+    done: bool,
+) -> Result<Value, crate::NativeError> {
+    ctx.scope(|mut scope| {
+        let value = scope.value(value);
+        let result = scope.iterator_result(value, done)?;
+        Ok(scope.finish(result))
+    })
 }
 
 /// §27.1.5.1.4 `%IteratorPrototype%.throw(value)` — propagate the

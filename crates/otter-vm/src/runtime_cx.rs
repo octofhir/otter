@@ -50,7 +50,7 @@ use crate::{
     collections,
     handles::HandleScope,
     native_function, object,
-    promise::{JsPromise, JsPromiseHandle, PromiseState},
+    promise::{JsPromise, PromiseState},
     weak_refs,
 };
 
@@ -605,49 +605,6 @@ impl<'rt> NativeCtx<'rt> {
         Ok(object)
     }
 
-    /// Set an ordinary string-keyed property while keeping the native-call
-    /// root set alive during any ShapeBody allocation.
-    pub(crate) fn set_property(
-        &mut self,
-        obj: object::JsObject,
-        key: &str,
-        value: Value,
-    ) -> Result<(), VmError> {
-        self.set_property_with_roots(obj, key, value, &[], &[])
-    }
-
-    /// Set an ordinary string-keyed property while keeping additional native
-    /// local values alive during any ShapeBody allocation.
-    pub(crate) fn set_property_with_roots(
-        &mut self,
-        obj: object::JsObject,
-        key: &str,
-        value: Value,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
-    ) -> Result<(), VmError> {
-        let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value;
-        let new_target = self.call_info.new_target;
-        let value_root = value;
-        let mut combined_roots = Vec::with_capacity(value_roots.len() + 1);
-        combined_roots.push(&value_root);
-        combined_roots.extend_from_slice(value_roots);
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            visit_native_roots(
-                visitor,
-                &roots,
-                &this_value,
-                new_target.as_ref(),
-                combined_roots.as_slice(),
-                slice_roots,
-            );
-        };
-        self.cx
-            .interp
-            .set_property_with_extra_roots(obj, key, value, &mut external_visit)
-    }
-
     /// Allocate a host-data object through the native root contract.
     pub fn alloc_host_object<T: object::HostObjectData>(
         &mut self,
@@ -772,33 +729,6 @@ impl<'rt> NativeCtx<'rt> {
             &mut external_visit,
             call,
         )
-    }
-
-    /// Allocate a pre-fulfilled promise through the native root contract.
-    pub(crate) fn fulfilled_promise_with_roots(
-        &mut self,
-        value: Value,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
-    ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
-        let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value;
-        let new_target = self.call_info.new_target;
-        let value_root = value;
-        let mut combined_roots = Vec::with_capacity(value_roots.len() + 1);
-        combined_roots.push(&value_root);
-        combined_roots.extend_from_slice(value_roots);
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            visit_native_roots(
-                visitor,
-                &roots,
-                &this_value,
-                new_target.as_ref(),
-                combined_roots.as_slice(),
-                slice_roots,
-            );
-        };
-        JsPromiseHandle::fulfilled_with_roots(self.heap_mut(), value, &mut external_visit)
     }
 
     /// Allocate a `Map` body through the native root contract.
@@ -1739,6 +1669,23 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         result.map_err(|error| self.vm_error(error, "NativeScope::object"))
     }
 
+    /// Build a rooted CreateIteratorResultObject record.
+    ///
+    /// The receiver stays in this scope while the `value` and `done` shape
+    /// transitions allocate, and every mutation re-reads both operands from
+    /// their handle slots.
+    pub fn iterator_result(
+        &mut self,
+        value: Local<'_>,
+        done: bool,
+    ) -> Result<Local<'scope>, NativeError> {
+        let result = self.object()?;
+        self.set(result, "value", value)?;
+        let done = self.boolean(done);
+        self.set(result, "done", done)?;
+        Ok(result)
+    }
+
     /// Allocate a null-prototype object.
     pub fn bare_object(&mut self) -> Result<Local<'scope>, NativeError> {
         let result = self.ctx.cx.interp.scoped_object_bare(self.token);
@@ -1775,6 +1722,33 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
             .interp
             .scoped_array_buffer_from_bytes(self.token, bytes);
         result.map_err(|error| self.vm_error(error, "NativeScope::array_buffer_from_bytes"))
+    }
+
+    /// Allocate a pre-fulfilled Promise carrying the rooted `value`.
+    ///
+    /// The payload is re-read from its handle slot at the allocation boundary,
+    /// and the Promise is parked before returning, so neither value can become
+    /// stale under a moving collection.
+    pub fn promise_fulfilled(&mut self, value: Local<'_>) -> Result<Local<'scope>, NativeError> {
+        let result = self
+            .ctx
+            .cx
+            .interp
+            .scoped_promise_fulfilled(self.token, value);
+        result.map_err(|error| self.vm_error(error, "NativeScope::promise_fulfilled"))
+    }
+
+    /// Allocate a pre-rejected Promise carrying the rooted `reason`.
+    ///
+    /// Like [`Self::promise_fulfilled`], this keeps both the settlement payload
+    /// and the returned Promise in the current handle scope.
+    pub fn promise_rejected(&mut self, reason: Local<'_>) -> Result<Local<'scope>, NativeError> {
+        let result = self
+            .ctx
+            .cx
+            .interp
+            .scoped_promise_rejected(self.token, reason);
+        result.map_err(|error| self.vm_error(error, "NativeScope::promise_rejected"))
     }
 
     /// Rewrap shared backing storage as a rooted `SharedArrayBuffer`.

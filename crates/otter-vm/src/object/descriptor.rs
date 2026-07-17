@@ -21,6 +21,9 @@
 //! - `[[Writable]]` is meaningful only on `DescriptorKind::Data`.
 //! - `complete_for_new_property` applies §10.1.6.3 step 5 defaults
 //!   when a partial descriptor reaches storage.
+//! - Completing against an existing property preserves omitted
+//!   `[[Enumerable]]` / `[[Configurable]]` attributes across data/accessor
+//!   kind changes.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-property-descriptor-specification-type>
@@ -326,6 +329,56 @@ impl PartialPropertyDescriptor {
         }
     }
 
+    /// Complete a partial update against an existing fully-specified
+    /// descriptor.
+    ///
+    /// Same-kind updates inherit every omitted field. A configurable
+    /// data/accessor kind change first creates the opposite kind with the
+    /// current `[[Enumerable]]` and `[[Configurable]]` attributes, then applies
+    /// the fields present in this descriptor (§10.1.6.3 steps 9–10).
+    #[must_use]
+    pub(crate) fn complete_against_current(
+        &self,
+        current: &PropertyDescriptor,
+    ) -> PropertyDescriptor {
+        match &current.kind {
+            DescriptorKind::Data { value } if !self.is_accessor() => PropertyDescriptor::data(
+                self.value.unwrap_or(*value),
+                self.writable.unwrap_or(current.writable()),
+                self.enumerable.unwrap_or(current.enumerable()),
+                self.configurable.unwrap_or(current.configurable()),
+            ),
+            DescriptorKind::Accessor { getter, setter } if !self.is_data() => {
+                PropertyDescriptor::accessor(
+                    if self.get.is_some() {
+                        normalized_accessor_slot(self.get)
+                    } else {
+                        *getter
+                    },
+                    if self.set.is_some() {
+                        normalized_accessor_slot(self.set)
+                    } else {
+                        *setter
+                    },
+                    self.enumerable.unwrap_or(current.enumerable()),
+                    self.configurable.unwrap_or(current.configurable()),
+                )
+            }
+            _ if self.is_accessor() => PropertyDescriptor::accessor(
+                normalized_accessor_slot(self.get),
+                normalized_accessor_slot(self.set),
+                self.enumerable.unwrap_or(current.enumerable()),
+                self.configurable.unwrap_or(current.configurable()),
+            ),
+            _ => PropertyDescriptor::data(
+                self.value.unwrap_or(Value::undefined()),
+                self.writable.unwrap_or(false),
+                self.enumerable.unwrap_or(current.enumerable()),
+                self.configurable.unwrap_or(current.configurable()),
+            ),
+        }
+    }
+
     /// Build a partial descriptor that fully describes `desc` (every
     /// field is present). Used when converting a stored
     /// [`PropertyDescriptor`] back to the user-facing form.
@@ -348,6 +401,24 @@ impl PartialPropertyDescriptor {
                 enumerable: Some(desc.flags.enumerable()),
                 configurable: Some(desc.flags.configurable()),
             },
+        }
+    }
+}
+
+fn normalized_accessor_slot(value: Option<Value>) -> Option<Value> {
+    value.filter(|value| !value.is_undefined())
+}
+
+impl crate::pelt::PeltField for PartialPropertyDescriptor {
+    fn pelt_trace(&mut self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        if let Some(value) = &mut self.value {
+            value.trace_value_slot_mut(visitor);
+        }
+        if let Some(getter) = &mut self.get {
+            getter.trace_value_slot_mut(visitor);
+        }
+        if let Some(setter) = &mut self.set {
+            setter.trace_value_slot_mut(visitor);
         }
     }
 }

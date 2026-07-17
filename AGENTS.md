@@ -316,6 +316,10 @@ Pure Rust implementation - no external JavaScript engine dependencies.
 ## Debugging
 
 - Long-running scripts/servers: use `--timeout 0` (disables the timeout).
+- Reproducible tier selection: use
+  `--jit-tier=production-tiered`, `--jit-tier=template`, or
+  `--jit-tier=interpreter`. Legacy JIT environment variables are translated
+  only at the CLI boundary.
 - When editing embedded JS shims: they are compiled in via `include_str!` and passed through `CString::new(...)` (no `\0` bytes).
 - Bytecode disassembly (compile and exit):
   - Text: `cargo run -p otter-cli -- --dump-bytecode <file>`
@@ -332,6 +336,8 @@ Pure Rust implementation - no external JavaScript engine dependencies.
   - Produces both `.cpuprofile` (DevTools/Speedscope) and `.folded` (inferno/flamegraph.pl).
   - Stack samples are captured by an opt-in bytecode-dispatch sampler from live
     VM frames. Native JIT execution is currently a sampling blind spot.
+  - The direct synchronous runtime used by `--cpu-prof` does not enforce
+    `--timeout` yet; bound potentially hanging profiler runs externally.
   - Baseline overhead sanity check (`cpu-prof` should stay opt-in): compare `/usr/bin/time -p target/release/otter run <file>` vs `/usr/bin/time -p target/release/otter run --cpu-prof --cpu-prof-dir /tmp/otter-prof <file>` and watch `real` / `sys` delta.
   - Script args are forwarded to `process.argv`: `cargo run -p otter-cli -- run benchmarks/cpu/flamegraph.ts math 2`
   - Shorthand mode also forwards args: `cargo run -p otter-cli -- benchmarks/cpu/flamegraph.ts json 1`

@@ -50,12 +50,14 @@ annotated assembly are not shipped yet.
 
 ## Known Debt
 
-- The CLI currently copies top-level timeout and trace arguments through
-  process-global atomic/mutex state.
 - Internal JIT diagnostics use the ambient `OTTER_JIT_TRACE` variable and
   unstructured `stderr` output.
 - Step tracing and CPU sampling happen at interpreter dispatch. JIT-heavy
   execution therefore has a diagnostic blind spot.
+- The direct synchronous runtime used by `--cpu-prof` does not enforce its
+  informational timeout yet.
+- A single file trace target is truncated when a command creates multiple
+  sequential runtimes (notably multiple `otter test` files).
 - Compiled code retains executable bytes and runtime metadata but exposes no
   stable artifact bundle or code-offset map to tooling.
 - There is no standard way to correlate bytecode PC, tier plan/IR, native code
@@ -67,8 +69,8 @@ annotated assembly are not shipped yet.
 
 - [ ] Add an owned, default-empty diagnostics request shared by runtime, VM,
   and JIT compile requests.
-- [ ] Replace CLI timeout/trace globals with normal execution configuration.
-- [ ] Add an explicit CLI tier selector for reproducible interpreter,
+- [x] Replace CLI timeout/trace globals with normal execution configuration.
+- [x] Add an explicit CLI tier selector for reproducible interpreter,
   template-only, and production-tiered runs; keep legacy environment parsing
   only at the CLI compatibility boundary.
 - [ ] Replace `OTTER_JIT_TRACE` reads with structured requested events or

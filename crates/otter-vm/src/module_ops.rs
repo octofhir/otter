@@ -24,6 +24,8 @@
 //!   siblings keep evaluating (§16.2.1.5 never awaits a dependency).
 //! - Static namespace imports must already be present in the linked module
 //!   namespace table.
+//! - `import.meta` is a null-prototype object whose receiver and URL remain in
+//!   one handle scope until the allocating string/property build is complete.
 //! - Dynamic import always writes a Promise to the destination register.
 //! - `import.meta.resolve` accepts only string specifiers.
 //! - Module init, deferred-namespace accessors, and async continuation jobs
@@ -1146,11 +1148,16 @@ impl Interpreter {
 
     /// Build a module's `import.meta` object with its `url` property.
     fn build_import_meta(&mut self, url: &str) -> Result<Value, VmError> {
-        let mut obj = self.alloc_host_object_with_roots(&[], &[])?;
-        let url_str =
-            JsString::from_str(url, &mut self.gc_heap).map_err(|_| VmError::TypeMismatch)?;
-        crate::object::set(&mut obj, &mut self.gc_heap, "url", Value::string(url_str));
-        Ok(Value::object(obj))
+        self.with_handle_scope(|interp, scope| {
+            // `import.meta` is created with a null prototype. Keep its shell in
+            // the canonical handle arena before allocating the URL string:
+            // under a moving collection the arena slot is rewritten, and the
+            // property write resolves the current receiver from that slot.
+            let meta = interp.scoped_object_bare(scope)?;
+            let url = interp.scoped_string(scope, url)?;
+            interp.scoped_set(scope, meta, "url", url)?;
+            Ok(interp.escape_scoped(meta))
+        })
     }
 
     /// Deferred namespace object for `target_url`, created on first use

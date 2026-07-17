@@ -16,7 +16,14 @@
 //! - `invoke` remains the shared call path for bytecode, closures, native
 //!   callables, bound functions, class constructors, and proxies.
 //! - Constructor dispatch preserves `new.target` and receiver substitution
-//!   invariants used by `pop_frame`.
+//!   invariants used by `pop_frame`. Base dispatch roots the prototype lookup
+//!   it owns, records whether the receiver used generic `%Object.prototype%`
+//!   fallback, and passes that rooted receiver plus provenance through the
+//!   native boundary. Constructor arguments remain in their canonical root
+//!   slots until that observable lookup and receiver allocation finish.
+//! - Derived bytecode constructors enter with no receiver and preserve the
+//!   caller's stable argument window; their direct `super(...)` dispatch owns
+//!   the single prototype lookup and receiver allocation.
 //! - Nested call/construct dispatch appends above an `ActivationFloor` on the
 //!   current rooted stack; native boundary slots are collector-rewritten in
 //!   their original storage.
@@ -77,10 +84,58 @@ impl JsCallRootSlot {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_construct_argument_layout_does_not_acquire_cold_record() {
+        let function = CodeBlock::jit_test_stub(0, 2, 1, &[]);
+        let mut interp = Interpreter::new();
+        let receiver = interp
+            .alloc_host_object_with_roots(&[], &[])
+            .expect("construct receiver");
+        let window = interp.alloc_reg_window(1).expect("register window");
+        let mut frame = Frame::with_exec_return_upvalues_and_this(
+            &function,
+            None,
+            Frame::empty_upvalues(),
+            Value::object(receiver),
+            window,
+        );
+        let live_before = interp.cold_frames().live_len();
+
+        let error = interp
+            .bind_construct_arguments_and_publish_cold(
+                &function,
+                &mut frame,
+                smallvec::smallvec![Value::number_i32(1), Value::number_i32(2)],
+                false,
+                None,
+                Some(receiver),
+                Value::function(0),
+            )
+            .expect_err("invalid register layout must fail");
+
+        assert!(matches!(error, VmError::InvalidOperand));
+        assert!(
+            frame.cold.is_none(),
+            "failed unpublished frame must not own a cold record"
+        );
+        assert_eq!(
+            interp.cold_frames().live_len(),
+            live_before,
+            "invalid construct metadata must not leak a cold-frame slot"
+        );
+        interp.reclaim_registers(&mut frame);
+    }
+}
+
 pub(crate) struct SyncJsCallRoots {
     current: JsCallRootSlot,
     receiver: JsCallRootSlot,
     new_target: JsCallRootSlot,
+    proxy_target: JsCallRootSlot,
     args: UnsafeCell<SmallVec<[Value; 8]>>,
     scratch_0: JsCallRootSlot,
     scratch_1: JsCallRootSlot,
@@ -92,6 +147,7 @@ impl SyncJsCallRoots {
             current: JsCallRootSlot::new(current),
             receiver: JsCallRootSlot::new(receiver),
             new_target: JsCallRootSlot::new(Value::undefined()),
+            proxy_target: JsCallRootSlot::new(Value::undefined()),
             args: UnsafeCell::new(args),
             scratch_0: JsCallRootSlot::new(Value::undefined()),
             scratch_1: JsCallRootSlot::new(Value::undefined()),
@@ -103,6 +159,7 @@ impl SyncJsCallRoots {
             current: JsCallRootSlot::new(current),
             receiver: JsCallRootSlot::new(Value::undefined()),
             new_target: JsCallRootSlot::new(new_target),
+            proxy_target: JsCallRootSlot::new(Value::undefined()),
             args: UnsafeCell::new(args),
             scratch_0: JsCallRootSlot::new(Value::undefined()),
             scratch_1: JsCallRootSlot::new(Value::undefined()),
@@ -148,9 +205,26 @@ impl SyncJsCallRoots {
         unsafe { *self.args.get() = args };
     }
 
+    fn prepend_args(&self, prefix: &[Value]) {
+        if prefix.is_empty() {
+            return;
+        }
+        // SAFETY: this is one Rust-only mutation on the mutator thread.
+        // SmallVec may use Rust's allocator, but no JavaScript allocation or
+        // collection can overlap the temporary slice rearrangement.
+        unsafe {
+            let args = &mut *self.args.get();
+            let old_len = args.len();
+            args.resize(old_len + prefix.len(), Value::undefined());
+            args.copy_within(0..old_len, prefix.len());
+            args[..prefix.len()].copy_from_slice(prefix);
+        }
+    }
+
     pub(crate) fn take_args(&self) -> SmallVec<[Value; 8]> {
-        // SAFETY: the destination installs its own root provider before the
-        // first possible collection; moving the SmallVec itself cannot run GC.
+        // SAFETY: moving the SmallVec itself cannot run GC. The caller must
+        // transfer it into traced frame storage or install a slice provider
+        // before the next possible collection.
         unsafe { std::mem::take(&mut *self.args.get()) }
     }
 }
@@ -160,6 +234,7 @@ impl otter_gc::ExtraRootSource for SyncJsCallRoots {
         self.current.trace(visitor);
         self.receiver.trace(visitor);
         self.new_target.trace(visitor);
+        self.proxy_target.trace(visitor);
         self.scratch_0.trace(visitor);
         self.scratch_1.trace(visitor);
         // SAFETY: root tracing is the only operation active on this state while
@@ -415,6 +490,33 @@ impl Interpreter {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn bind_construct_arguments_and_publish_cold(
+        &mut self,
+        function: &CodeBlock,
+        frame: &mut Frame,
+        args: SmallVec<[Value; 8]>,
+        is_derived: bool,
+        derived_this_cell: Option<crate::UpvalueCell>,
+        receiver: Option<JsObject>,
+        new_target: Value,
+    ) -> Result<(), VmError> {
+        // Bind before acquiring constructor cold state. Invalid bytecode can
+        // reject an oversized parameter layout here; if cold storage were
+        // attached first, dropping this unpublished frame would leak the pool
+        // record and keep its receiver/new.target roots live indefinitely.
+        self.bind_bytecode_call_arguments(function, frame, args)?;
+        let cold = self.frame_ensure_cold(frame);
+        if is_derived {
+            cold.is_derived_constructor = true;
+            cold.derived_this_cell = derived_this_cell;
+        } else {
+            cold.construct_target = receiver;
+        }
+        cold.new_target = Some(new_target);
+        Ok(())
+    }
+
     fn bind_lean_bytecode_call_arguments(
         function: &CodeBlock,
         frame: &mut Frame,
@@ -510,10 +612,10 @@ impl Interpreter {
     fn build_construct_bytecode_frame(
         &mut self,
         context: &ExecutionContext,
-        current: Value,
-        receiver: JsObject,
-        new_target: Value,
-        args: SmallVec<[Value; 8]>,
+        mut current: Value,
+        mut receiver: Option<JsObject>,
+        mut new_target: Value,
+        mut args: SmallVec<[Value; 8]>,
         return_register: Option<u16>,
     ) -> Result<Frame, VmError> {
         let (function_id, parent_upvalues) =
@@ -531,11 +633,13 @@ impl Interpreter {
         // is not yet on any traced stack: a collection triggered by the cell
         // allocations must rewrite them in place or they go stale.
         let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            current.trace_value_slots(visitor);
-            new_target.trace_value_slots(visitor);
-            visitor(&receiver as *const JsObject as *mut RawGc);
-            for value in &args {
-                value.trace_value_slots(visitor);
+            current.trace_value_slot_mut(visitor);
+            new_target.trace_value_slot_mut(visitor);
+            if let Some(receiver) = &mut receiver {
+                visitor(receiver as *mut JsObject as *mut RawGc);
+            }
+            for value in &mut args {
+                value.trace_value_slot_mut(visitor);
             }
         };
         let upvalues = Frame::build_upvalues_for_exec_with_roots(
@@ -549,10 +653,14 @@ impl Interpreter {
         // constructor receives the freshly-allocated receiver as
         // `this` immediately.
         let is_derived = function.is_derived_constructor;
+        debug_assert!(
+            !is_derived || receiver.is_none(),
+            "derived construction must not materialize an outer receiver"
+        );
         let this_value = if is_derived {
             Value::hole()
         } else {
-            Value::object(receiver)
+            Value::object(receiver.ok_or(VmError::InvalidOperand)?)
         };
         let window_rollback = self.register_window_rollback();
         let window = self.alloc_reg_window(function.register_count as usize)?;
@@ -567,11 +675,13 @@ impl Interpreter {
         let derived_this_cell = if is_derived {
             let mut frame_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
                 frame.trace_frame_slots(visitor);
-                current.trace_value_slots(visitor);
-                new_target.trace_value_slots(visitor);
-                visitor(&receiver as *const JsObject as *mut RawGc);
-                for value in &args {
-                    value.trace_value_slots(visitor);
+                current.trace_value_slot_mut(visitor);
+                new_target.trace_value_slot_mut(visitor);
+                if let Some(receiver) = &mut receiver {
+                    visitor(receiver as *mut JsObject as *mut RawGc);
+                }
+                for value in &mut args {
+                    value.trace_value_slot_mut(visitor);
                 }
             };
             Some(crate::alloc_upvalue_with_roots(
@@ -582,17 +692,15 @@ impl Interpreter {
         } else {
             None
         };
-        {
-            let cold = self.frame_ensure_cold(&mut frame);
-            if is_derived {
-                cold.is_derived_constructor = true;
-                cold.derived_this_cell = derived_this_cell;
-            } else {
-                cold.construct_target = Some(receiver);
-            }
-            cold.new_target = Some(new_target);
-        }
-        self.bind_bytecode_call_arguments(function, &mut frame, args)?;
+        self.bind_construct_arguments_and_publish_cold(
+            function,
+            &mut frame,
+            args,
+            is_derived,
+            derived_this_cell,
+            receiver,
+            new_target,
+        )?;
         window_rollback.commit();
         Ok(frame)
     }
@@ -600,9 +708,9 @@ impl Interpreter {
     fn build_construct_bytecode_frame_from_window(
         &mut self,
         context: &ExecutionContext,
-        current: Value,
-        receiver: JsObject,
-        new_target: Value,
+        mut current: Value,
+        mut receiver: Option<JsObject>,
+        mut new_target: Value,
         args: &BytecodeArgumentWindow<'_, '_>,
         return_register: Option<u16>,
     ) -> Result<Frame, VmError> {
@@ -619,9 +727,11 @@ impl Interpreter {
         // See `build_construct_bytecode_frame`: the frame is not yet on a
         // traced stack, so every local must ride through the allocations.
         let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            current.trace_value_slots(visitor);
-            new_target.trace_value_slots(visitor);
-            visitor(&receiver as *const JsObject as *mut RawGc);
+            current.trace_value_slot_mut(visitor);
+            new_target.trace_value_slot_mut(visitor);
+            if let Some(receiver) = &mut receiver {
+                visitor(receiver as *mut JsObject as *mut RawGc);
+            }
         };
         let upvalues = Frame::build_upvalues_for_exec_with_roots(
             &mut self.gc_heap,
@@ -630,10 +740,14 @@ impl Interpreter {
             &mut build_roots,
         )?;
         let is_derived = function.is_derived_constructor;
+        debug_assert!(
+            !is_derived || receiver.is_none(),
+            "derived construction must preserve the caller register window without a receiver"
+        );
         let this_value = if is_derived {
             Value::hole()
         } else {
-            Value::object(receiver)
+            Value::object(receiver.ok_or(VmError::InvalidOperand)?)
         };
         let window_rollback = self.register_window_rollback();
         let window = self.alloc_reg_window(function.register_count as usize)?;
@@ -645,18 +759,20 @@ impl Interpreter {
             window,
         );
         frame.self_value = current;
-        let extras = args.bind_into(function, &mut frame)?;
+        let mut extras = args.bind_into(function, &mut frame)?;
         let derived_this_cell = if is_derived {
             let mut frame_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
                 frame.trace_frame_slots(visitor);
-                current.trace_value_slots(visitor);
-                new_target.trace_value_slots(visitor);
-                visitor(&receiver as *const JsObject as *mut RawGc);
-                for value in &extras.rest_args {
-                    value.trace_value_slots(visitor);
+                current.trace_value_slot_mut(visitor);
+                new_target.trace_value_slot_mut(visitor);
+                if let Some(receiver) = &mut receiver {
+                    visitor(receiver as *mut JsObject as *mut RawGc);
                 }
-                for value in &extras.incoming_args {
-                    value.trace_value_slots(visitor);
+                for value in &mut extras.rest_args {
+                    value.trace_value_slot_mut(visitor);
+                }
+                for value in &mut extras.incoming_args {
+                    value.trace_value_slot_mut(visitor);
                 }
             };
             Some(crate::alloc_upvalue_with_roots(
@@ -673,7 +789,7 @@ impl Interpreter {
                 cold.is_derived_constructor = true;
                 cold.derived_this_cell = derived_this_cell;
             } else {
-                cold.construct_target = Some(receiver);
+                cold.construct_target = receiver;
             }
             cold.new_target = Some(new_target);
             if !extras.is_empty() {
@@ -692,10 +808,15 @@ impl Interpreter {
         native: NativeFunction,
         this_value: &Value,
         new_target: &Value,
+        used_object_prototype_fallback: bool,
         args: &[Value],
     ) -> Result<Value, VmError> {
         let call = native.call_target(&self.gc_heap);
-        let call_info = NativeCallInfo::construct(*this_value, Some(*new_target));
+        let call_info = NativeCallInfo::construct_with_receiver(
+            *this_value,
+            Some(*new_target),
+            used_object_prototype_fallback,
+        );
         self.record_runtime_native_call();
         // Same root coverage as the call path (`invoke_native_call_with_roots`):
         // trace the interpreter's full root set (crucially the scope-handle
@@ -1406,35 +1527,18 @@ impl Interpreter {
         }
         // §28.2.4.13 Proxy.[[Call]] — delegate to the `apply`
         // trap when present; otherwise call through to the
-        // target as a function.
-        if let Some(proxy) = current.as_proxy() {
-            let argv_array = self.alloc_stack_rooted_array_from_values(
+        // target as a function. Reuse the same-stack rooted dispatcher rather
+        // than materialising an argv array before GetMethod: it captures the
+        // target in a dedicated root slot before the observable trap lookup,
+        // then allocates the arguments array only when a callable trap exists.
+        if current.as_proxy().is_some() {
+            let result = self.run_callable_sync_rooted(
                 stack,
-                effective_args.iter().cloned(),
-                &[&current, &effective_this],
-                effective_args.as_slice(),
-            )?;
-            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                proxy.target(&self.gc_heap),
+                context,
+                &current,
                 effective_this,
-                Value::array(argv_array),
-            ];
-            let result = match self.invoke_proxy_trap(stack, context, &proxy, "apply", trap_args)? {
-                Some(v) => v,
-                None => {
-                    // Fall through to the target's [[Call]] —
-                    // `proxy.target(&self.gc_heap)` returns the original Value,
-                    // which may be a callable directly.
-                    let underlying = proxy.target(&self.gc_heap);
-                    self.run_callable_sync_rooted(
-                        stack,
-                        context,
-                        &underlying,
-                        effective_this,
-                        effective_args,
-                    )?
-                }
-            };
+                effective_args,
+            )?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(());
@@ -1491,6 +1595,7 @@ impl Interpreter {
             stack,
             context,
             callee,
+            callee_reg,
             operands,
             3,
             argc as usize,
@@ -1508,13 +1613,14 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         callee: Value,
+        callee_reg: u16,
         operands: OperandView<'_>,
         first_arg_operand: usize,
         argc: usize,
         dst: u16,
     ) -> Result<bool, VmError> {
         let mut current = callee;
-        let effective_new_target = current;
+        let mut effective_new_target = current;
         let is_direct_class_construct = current.as_class_constructor().is_some();
         if let Some(class) = current.as_class_constructor() {
             current = class.ctor(&self.gc_heap);
@@ -1524,7 +1630,45 @@ impl Interpreter {
         }
 
         self.record_runtime_construct_call();
+        let function_id = current
+            .as_function()
+            .or_else(|| current.as_closure(&self.gc_heap).map(|c| c.function_id()));
+        if function_id
+            .and_then(|id| context.exec_function(id))
+            .is_some_and(|function| function.is_derived_constructor)
+        {
+            // A derived constructor has no receiver until `super(...)`.
+            // Preserve the caller's stable argument window and push the frame
+            // directly: no prototype lookup, receiver allocation, or Vec copy
+            // belongs at this outer boundary.
+            let top_idx = stack.len() - 1;
+            let frame = {
+                let caller = &stack[top_idx];
+                let args = BytecodeArgumentWindow::new(caller, operands, first_arg_operand, argc);
+                self.build_construct_bytecode_frame_from_window(
+                    context,
+                    current,
+                    None,
+                    effective_new_target,
+                    &args,
+                    Some(dst),
+                )?
+            };
+            stack.push(frame);
+            return Ok(true);
+        }
+
         let proto = self.construct_prototype_for_callee(stack, context, &effective_new_target)?;
+        // An observable getter may have scavenged the caller's callee. Its
+        // register is the canonical traced slot for this fast path; refresh
+        // both values before any later use instead of trusting pre-Get locals.
+        let rooted_callee = *read_register(&stack[stack.len() - 1], callee_reg)?;
+        effective_new_target = rooted_callee;
+        current = if let Some(class) = rooted_callee.as_class_constructor() {
+            class.ctor(&self.gc_heap)
+        } else {
+            rooted_callee
+        };
         // OrdinaryCreateFromConstructor — a missing or non-object
         // `prototype` falls back to %Object.prototype% (§10.1.13).
         let proto = match proto {
@@ -1547,6 +1691,15 @@ impl Interpreter {
         let proto = self.iteration_anchor(proto_anchor);
         self.pop_iteration_anchors_to(proto_anchor);
         crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
+        // Receiver allocation can scavenge as well. Reload the dispatch values
+        // from the caller register before simple-init matching or frame setup.
+        let rooted_callee = *read_register(&stack[stack.len() - 1], callee_reg)?;
+        effective_new_target = rooted_callee;
+        current = if let Some(class) = rooted_callee.as_class_constructor() {
+            class.ctor(&self.gc_heap)
+        } else {
+            rooted_callee
+        };
         if is_direct_class_construct
             && let Some(function_id) = current
                 .as_function()
@@ -1577,7 +1730,7 @@ impl Interpreter {
             self.build_construct_bytecode_frame_from_window(
                 context,
                 current,
-                receiver,
+                Some(receiver),
                 effective_new_target,
                 &args,
                 Some(dst),
@@ -1784,80 +1937,166 @@ impl Interpreter {
         dst: u16,
     ) -> Result<(), VmError> {
         self.record_runtime_construct_call();
-        let mut callee = callee;
-        let mut new_target = new_target;
-        let mut args = args;
+        let roots = SyncJsCallRoots::construct(callee, new_target, args);
+        let _roots_guard = self
+            .gc_heap
+            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
         let mut hops: u32 = 0;
-        while let Some(bound) = callee.as_bound_function() {
+        loop {
             if hops >= self.max_stack_depth {
                 return Err(VmError::StackOverflow {
                     limit: self.max_stack_depth,
                 });
             }
-            hops += 1;
-            let (target, _bound_this, bound_args) = bound.parts(&self.gc_heap);
-            let mut combined: SmallVec<[Value; 8]> =
-                SmallVec::with_capacity(bound_args.len() + args.len());
-            combined.extend(bound_args);
-            combined.extend(args);
-            if abstract_ops::same_value(&callee, &new_target, &self.gc_heap) {
-                new_target = target;
+            if let Some(bound) = roots.target().as_bound_function() {
+                hops += 1;
+                let current = roots.target();
+                let effective_new_target = roots.new_target.get();
+                let (target, _bound_this, bound_args) = bound.parts(&self.gc_heap);
+                roots.prepend_args(bound_args.as_slice());
+                if abstract_ops::same_value(&current, &effective_new_target, &self.gc_heap) {
+                    roots.new_target.set(target);
+                }
+                roots.current.set(target);
+                continue;
             }
-            callee = target;
-            args = combined;
-        }
-        // §28.2.4.14 Proxy.[[Construct]] — `new <proxy>(args)`
-        // routes through the `construct` trap when present;
-        // otherwise delegates to the target.
-        if let Some(proxy) = callee.as_proxy() {
-            let argv_array = self.alloc_stack_rooted_array_from_values(
-                stack,
-                args.iter().cloned(),
-                &[&callee, &new_target],
-                args.as_slice(),
-            )?;
-            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                proxy.target(&self.gc_heap),
-                Value::array(argv_array),
-                new_target,
-            ];
-            let result =
-                match self.invoke_proxy_trap(stack, context, &proxy, "construct", trap_args)? {
-                    Some(v) => {
-                        // §10.5.13 step 9 — trap result must be an Object;
-                        // primitive returns surface as TypeError.
-                        if !v.is_object_type() {
-                            return Err(self.err_type(
-                                ("Proxy construct trap returned non-object".to_string()).into(),
-                            ));
+
+            // §28.2.4.14 Proxy.[[Construct]]. Keep the proxy, handler,
+            // new.target, and arguments in the registered slots through the
+            // observable trap lookup. A missing trap continues this same
+            // direct dispatch loop instead of synchronously executing a
+            // bytecode target.
+            if roots.target().as_proxy().is_some() {
+                hops += 1;
+                let proxy = roots
+                    .target()
+                    .as_proxy()
+                    .expect("checked direct construct proxy");
+                if proxy.is_revoked(&self.gc_heap) {
+                    return Err(self.err_type(
+                        ("Cannot perform 'construct' on a revoked proxy".to_string()).into(),
+                    ));
+                }
+                // Proxy.[[Construct]] captures [[ProxyTarget]] before the
+                // observable GetMethod(handler, "construct"). The getter may
+                // revoke the proxy; both trap dispatch and the missing-trap
+                // fallback must still use this rooted pre-Get target.
+                roots.proxy_target.set(proxy.target(&self.gc_heap));
+                roots.scratch_0.set(proxy.handler(&self.gc_heap));
+                let trap_key = VmPropertyKey::String("construct");
+                let trap_value = {
+                    let handler = roots.scratch_0.get();
+                    match self.ordinary_get_value(stack, context, handler, handler, &trap_key, 0)? {
+                        VmGetOutcome::Value(value) => value,
+                        VmGetOutcome::InvokeGetter { getter } => {
+                            let handler = roots.scratch_0.get();
+                            self.run_callable_sync_rooted(
+                                stack,
+                                context,
+                                &getter,
+                                handler,
+                                SmallVec::new(),
+                            )?
                         }
-                        v
-                    }
-                    None => {
-                        // Fall through to [[Construct]] on the underlying
-                        // target via `run_construct_sync`, which honours
-                        // bound/proxy/native paths and re-checks the
-                        // constructor-return invariants.
-                        self.run_construct_sync_rooted(
-                            stack,
-                            context,
-                            &proxy.target(&self.gc_heap),
-                            new_target,
-                            args,
-                        )?
                     }
                 };
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, result)?;
+                roots.scratch_1.set(trap_value);
+                if self.is_callable_runtime(&roots.scratch_1.get()) {
+                    // Move only at the root-aware array allocation boundary.
+                    // Its slice visitor rewrites this exact owned buffer; park
+                    // it back in the canonical slot before the observable
+                    // trap call.
+                    let effective_args = roots.take_args();
+                    let current = roots.target();
+                    let effective_new_target = roots.new_target.get();
+                    let handler = roots.scratch_0.get();
+                    let trap = roots.scratch_1.get();
+                    let argv_array = self.alloc_stack_rooted_array_from_values(
+                        stack,
+                        effective_args.iter().copied(),
+                        &[&current, &effective_new_target, &handler, &trap],
+                        effective_args.as_slice(),
+                    )?;
+                    roots.replace_args(effective_args);
+                    // Reload every value used after the allocation from its
+                    // collector-rewritten slot.
+                    let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                        roots.proxy_target.get(),
+                        Value::array(argv_array),
+                        roots.new_target.get(),
+                    ];
+                    let result = self.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &roots.scratch_1.get(),
+                        roots.scratch_0.get(),
+                        trap_args,
+                    )?;
+                    if !result.is_object_type() {
+                        return Err(self.err_type(
+                            ("Proxy construct trap returned non-object".to_string()).into(),
+                        ));
+                    }
+                    let top_idx = stack.len() - 1;
+                    write_register(&mut stack[top_idx], dst, result)?;
+                    return Ok(());
+                }
+                if roots.scratch_1.get().is_nullish() {
+                    let target = roots.proxy_target.get();
+                    roots.current.set(target);
+                    roots.proxy_target.set(Value::undefined());
+                    roots.scratch_0.set(Value::undefined());
+                    roots.scratch_1.set(Value::undefined());
+                    continue;
+                }
+                return Err(
+                    self.err_type(("Proxy construct trap is not callable".to_string()).into())
+                );
+            }
+            break;
+        }
+
+        // A derived bytecode constructor creates no receiver until its
+        // `super(...)` call. In particular, do not observe
+        // `new.target.prototype` or allocate a throwaway object at this outer
+        // boundary; the direct super-construct path below will perform the
+        // one OrdinaryCreateFromConstructor operation with the same rooted
+        // new.target.
+        let bytecode_callee = if let Some(class) = roots.target().as_class_constructor() {
+            class.ctor(&self.gc_heap)
+        } else {
+            roots.target()
+        };
+        if let Ok((function_id, _)) =
+            Self::bytecode_construct_target_parts(bytecode_callee, &self.gc_heap)
+            && context
+                .exec_function(function_id)
+                .is_some_and(|function| function.is_derived_constructor)
+        {
+            let new_target = roots.new_target.get();
+            let args = roots.take_args();
+            let frame = self.build_construct_bytecode_frame(
+                context,
+                bytecode_callee,
+                None,
+                new_target,
+                args,
+                Some(dst),
+            )?;
+            stack.push(frame);
             return Ok(());
         }
-        if let Some(native) = self.native_promise_constructor(&callee) {
+
+        if let Some(native) = self.native_promise_constructor(&roots.target()) {
+            let new_target = roots.new_target.get();
+            let args = roots.take_args();
             let constructed = self.invoke_native_construct_rooted(
                 stack,
                 context,
                 native,
                 &Value::undefined(),
                 &new_target,
+                false,
                 args.as_slice(),
             )?;
             let top_idx = stack.len() - 1;
@@ -1868,43 +2107,40 @@ impl Interpreter {
         // the new frame. The constructor might mutate the receiver
         // immediately, so the prototype link must already be in
         // place.
+        let new_target = roots.new_target.get();
         let proto = self.construct_prototype_for_callee(stack, context, &new_target)?;
+        let used_object_prototype_fallback = proto.is_none();
         // OrdinaryCreateFromConstructor — a missing or non-object
         // `prototype` falls back to %Object.prototype% (§10.1.13).
         let proto = match proto {
             Some(proto) => proto,
             None => self.constructor_prototype_value("Object")?,
         };
-        // Park `proto` on the traced iteration-anchor stack across the receiver
-        // allocation. A moving collection triggered by the allocation relocates
-        // a young prototype (e.g. `%Date.prototype%`, not in the directly-rooted
-        // realm-intrinsic set), and the ad-hoc value-root external visit does not
-        // reliably rewrite this detached stack local; the anchor slot is a real
-        // GC root, so reading it back yields the relocated handle before it wires
-        // the receiver's `[[Prototype]]`.
-        let proto_anchor = self.push_iteration_anchor(proto) - 1;
-        let receiver =
-            self.alloc_stack_rooted_object_with_value_roots(stack, &[&callee, &new_target], &args)?;
-        let proto = self.iteration_anchor(proto_anchor);
-        self.pop_iteration_anchors_to(proto_anchor);
+        roots.scratch_0.set(proto);
+        let receiver = self.alloc_stack_rooted_object_with_extra_roots(stack, &[])?;
+        roots.receiver.set(Value::object(receiver));
+        let proto = roots.scratch_0.get();
         crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
-        let this_value = Value::object(receiver);
         // Built-in constructor objects (`Number`, `Boolean`, …)
         // surface as a `Value::Object` with an internal native
         // constructor slot. Promote to the native-function construct
         // path so the JS-visible callee can also carry own
         // properties (statics + `prototype`) without leaking the
         // implementation slot through reflection.
-        if let Some(obj) = callee.as_object()
+        if let Some(obj) = roots.target().as_object()
             && let Some(native) = crate::object::constructor_native(obj, &self.gc_heap)
                 .and_then(|v| v.as_native_function())
         {
+            let this_value = roots.receiver.get();
+            let new_target = roots.new_target.get();
+            let args = roots.take_args();
             let constructed = self.invoke_native_construct_rooted(
                 stack,
                 context,
                 native,
                 &this_value,
                 &new_target,
+                used_object_prototype_fallback,
                 args.as_slice(),
             )?;
             let top_idx = stack.len() - 1;
@@ -1916,44 +2152,59 @@ impl Interpreter {
         // (e.g. `new Number(x)`). The native callback inspects
         // `NativeCtx::is_construct_call()` to differentiate the
         // call shape.
-        if let Some(native) = callee.as_native_function() {
+        if let Some(native) = roots.target().as_native_function() {
+            let this_value = roots.receiver.get();
+            let new_target = roots.new_target.get();
+            let args = roots.take_args();
             let constructed = self.invoke_native_construct_rooted(
                 stack,
                 context,
                 native,
                 &this_value,
                 &new_target,
+                used_object_prototype_fallback,
                 args.as_slice(),
             )?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, constructed)?;
             return Ok(());
         }
-        if let Some(class) = callee.as_class_constructor()
+        if let Some(class) = roots.target().as_class_constructor()
             && let Some(native) = class.ctor(&self.gc_heap).as_native_function()
         {
+            let this_value = roots.receiver.get();
+            let new_target = roots.new_target.get();
+            let args = roots.take_args();
             let constructed = self.invoke_native_construct_rooted(
                 stack,
                 context,
                 native,
                 &this_value,
                 &new_target,
+                used_object_prototype_fallback,
                 args.as_slice(),
             )?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, constructed)?;
             return Ok(());
         }
-        let bytecode_callee = if let Some(class) = callee.as_class_constructor() {
+        let bytecode_callee = if let Some(class) = roots.target().as_class_constructor() {
             class.ctor(&self.gc_heap)
         } else {
-            callee
+            roots.target()
         };
         if bytecode_callee.is_function() || bytecode_callee.is_closure() {
+            let receiver = roots
+                .receiver
+                .get()
+                .as_object()
+                .ok_or(VmError::TypeMismatch)?;
+            let new_target = roots.new_target.get();
+            let args = roots.take_args();
             let frame = self.build_construct_bytecode_frame(
                 context,
                 bytecode_callee,
-                receiver,
+                Some(receiver),
                 new_target,
                 args,
                 Some(dst),
@@ -1961,13 +2212,16 @@ impl Interpreter {
             stack.push(frame);
             return Ok(());
         }
+        let callee = roots.target();
+        let this_value = roots.receiver.get();
+        let args = roots.take_args();
         self.invoke(stack, context, &callee, this_value, args, dst)?;
         // The pushed frame is now on top; mark it so `pop_frame`
         // can substitute the receiver for any non-object return.
         if let Some(top) = stack.last_mut() {
             let cold = self.frame_ensure_cold(top);
-            cold.construct_target = Some(receiver);
-            cold.new_target = Some(new_target);
+            cold.construct_target = roots.receiver.get().as_object();
+            cold.new_target = Some(roots.new_target.get());
         }
         Ok(())
     }
@@ -2034,20 +2288,33 @@ impl Interpreter {
         context: &ExecutionContext,
         callee: &Value,
     ) -> Result<Option<Value>, VmError> {
-        let proxy = callee.as_proxy();
-        let key = VmPropertyKey::String("prototype");
-        let proto = match self.ordinary_get_value(stack, context, *callee, *callee, &key, 0)? {
-            VmGetOutcome::Value(value) => value,
-            VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync_rooted(stack, context, &getter, *callee, SmallVec::new())?
+        let anchor_base = self.module_root_depth();
+        let callee_anchor = self.push_iteration_anchor(*callee) - 1;
+        let result = (|| -> Result<Option<Value>, VmError> {
+            let key = VmPropertyKey::String("prototype");
+            let callee = self.iteration_anchor(callee_anchor);
+            let proto = match self.ordinary_get_value(stack, context, callee, callee, &key, 0)? {
+                VmGetOutcome::Value(value) => value,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    let callee = self.iteration_anchor(callee_anchor);
+                    self.run_callable_sync_rooted(stack, context, &getter, callee, SmallVec::new())?
+                }
+            };
+            // The getter may have collected or revoked a Proxy. Reload the
+            // callee from the anchor before consulting its post-Get state.
+            let revoked_proxy = self
+                .iteration_anchor(callee_anchor)
+                .as_proxy()
+                .is_some_and(|proxy| proxy.is_revoked(&self.gc_heap));
+            if !proto.is_object_type() && revoked_proxy {
+                return Err(
+                    self.err_type(("Cannot get prototype from a revoked proxy".to_string()).into())
+                );
             }
-        };
-        if !proto.is_object_type() && proxy.is_some_and(|proxy| proxy.is_revoked(&self.gc_heap)) {
-            return Err(
-                self.err_type(("Cannot get prototype from a revoked proxy".to_string()).into())
-            );
-        }
-        Ok(proto.is_object_type().then_some(proto))
+            Ok(proto.is_object_type().then_some(proto))
+        })();
+        self.pop_iteration_anchors_to(anchor_base);
+        result
     }
 
     fn native_promise_constructor(&self, callee: &Value) -> Option<NativeFunction> {
@@ -2238,6 +2505,9 @@ impl Interpreter {
                     ));
                 }
                 hops += 1;
+                // §10.5.12 captures [[ProxyTarget]] before observable
+                // GetMethod(handler, "apply"), just like [[Construct]] below.
+                roots.proxy_target.set(proxy.target(&self.gc_heap));
                 roots.scratch_0.set(proxy.handler(&self.gc_heap));
                 let trap_key = VmPropertyKey::String("apply");
                 let trap_value = {
@@ -2268,9 +2538,8 @@ impl Interpreter {
                         &[&current, &effective_this, &handler, &trap_value],
                         &[effective_args.as_slice()],
                     )?;
-                    let proxy = roots.current.get().as_proxy().ok_or(VmError::NotCallable)?;
                     let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                        proxy.target(&self.gc_heap),
+                        roots.proxy_target.get(),
                         roots.receiver.get(),
                         Value::array(argv_array),
                     ];
@@ -2282,8 +2551,8 @@ impl Interpreter {
                         trap_args,
                     );
                 } else if trap_value.is_undefined() || trap_value.is_null() {
-                    let proxy = roots.current.get().as_proxy().ok_or(VmError::NotCallable)?;
-                    roots.current.set(proxy.target(&self.gc_heap));
+                    roots.current.set(roots.proxy_target.get());
+                    roots.proxy_target.set(Value::undefined());
                 } else {
                     return Err(
                         self.err_type(("Proxy apply trap is not callable".to_string()).into())
@@ -2995,6 +3264,7 @@ impl Interpreter {
                     ));
                 }
                 hops += 1;
+                roots.proxy_target.set(proxy.target(&self.gc_heap));
                 roots.scratch_0.set(proxy.handler(&self.gc_heap));
                 let trap_key = VmPropertyKey::String("construct");
                 let trap_value = {
@@ -3016,10 +3286,7 @@ impl Interpreter {
                 roots.scratch_1.set(trap_value);
                 if self.is_callable_runtime(&trap_value) {
                     let current = roots.current.get();
-                    let target_value = current
-                        .as_proxy()
-                        .ok_or(VmError::NotCallable)?
-                        .target(&self.gc_heap);
+                    let target_value = roots.proxy_target.get();
                     let effective_new_target = roots.new_target.get();
                     let handler = roots.scratch_0.get();
                     let trap_value = roots.scratch_1.get();
@@ -3035,6 +3302,9 @@ impl Interpreter {
                         ],
                         &[effective_args.as_slice()],
                     )?;
+                    // The allocation may relocate the captured target. Reload
+                    // it from its dedicated registered slot.
+                    let target_value = roots.proxy_target.get();
                     let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                         target_value,
                         Value::array(argv_array),
@@ -3054,8 +3324,8 @@ impl Interpreter {
                     }
                     return Ok(result);
                 } else if trap_value.is_undefined() || trap_value.is_null() {
-                    let proxy = roots.current.get().as_proxy().ok_or(VmError::NotCallable)?;
-                    roots.current.set(proxy.target(&self.gc_heap));
+                    roots.current.set(roots.proxy_target.get());
+                    roots.proxy_target.set(Value::undefined());
                 } else {
                     return Err(
                         self.err_type(("Proxy construct trap is not callable".to_string()).into())
@@ -3066,8 +3336,8 @@ impl Interpreter {
             }
         }
 
-        let effective_args = roots.take_args();
         if let Some(native) = self.native_promise_constructor(&roots.current.get()) {
+            let effective_args = roots.take_args();
             let new_target = roots.new_target.get();
             return self.invoke_native_construct_rooted(
                 stack,
@@ -3075,6 +3345,7 @@ impl Interpreter {
                 native,
                 &Value::undefined(),
                 &new_target,
+                false,
                 effective_args.as_slice(),
             );
         }
@@ -3098,6 +3369,7 @@ impl Interpreter {
                     | "BigUint64Array"
             )
         {
+            let effective_args = roots.take_args();
             let new_target = roots.new_target.get();
             return self.invoke_native_construct_rooted(
                 stack,
@@ -3105,50 +3377,67 @@ impl Interpreter {
                 native,
                 &Value::undefined(),
                 &new_target,
+                false,
                 effective_args.as_slice(),
             );
+        }
+
+        let bytecode_callee = if let Some(class) = roots.current.get().as_class_constructor() {
+            class.ctor(&self.gc_heap)
+        } else {
+            roots.current.get()
+        };
+        if let Ok((function_id, _)) =
+            Self::bytecode_construct_target_parts(bytecode_callee, &self.gc_heap)
+            && context
+                .exec_function(function_id)
+                .is_some_and(|function| function.is_derived_constructor)
+        {
+            let new_target = roots.new_target.get();
+            let effective_args = roots.take_args();
+            let new_frame = self.build_construct_bytecode_frame(
+                context,
+                bytecode_callee,
+                None,
+                new_target,
+                effective_args,
+                None,
+            )?;
+            let floor = stack.floor();
+            stack.push(new_frame);
+            return self.dispatch_loop_above_rooted(context, stack, floor);
         }
 
         let effective_new_target = roots.new_target.get();
         let mut proto =
             self.construct_prototype_for_callee(stack, context, &effective_new_target)?;
-        if proto.is_none()
-            && roots
+        let mut used_object_prototype_fallback = false;
+        if proto.is_none() {
+            if roots
                 .current
                 .get()
                 .as_native_function()
                 .is_some_and(|native| native.name(&self.gc_heap) == "Date")
-        {
-            proto = Some(self.constructor_prototype_value("Date")?);
-        }
-        // The receiver allocation roots `proto` through the ad-hoc
-        // external-visit path, which — unlike the frame-stack root walk the
-        // interpreter's `do_construct` uses — does not reliably relocate this
-        // detached local across a moving scavenge. Park it on the traced
-        // iteration-anchor stack and read the relocated handle back before it
-        // becomes the receiver's `[[Prototype]]`.
-        let proto_anchor = proto.map(|value| self.push_iteration_anchor(value) - 1);
-        let receiver = {
-            let current = roots.current.get();
-            let effective_new_target = roots.new_target.get();
-            let mut value_roots: SmallVec<[&Value; 4]> =
-                smallvec::smallvec![&current, &effective_new_target];
-            if let Some(proto_value) = proto.as_ref() {
-                value_roots.push(proto_value);
+            {
+                proto = Some(self.constructor_prototype_value("Date")?);
+            } else {
+                proto = Some(self.constructor_prototype_value("Object")?);
+                used_object_prototype_fallback = true;
             }
-            self.alloc_runtime_rooted_object_with_roots(
-                value_roots.as_slice(),
-                &[effective_args.as_slice()],
-            )?
-        };
-        if let Some(index) = proto_anchor {
-            proto = Some(self.iteration_anchor(index));
-            self.pop_iteration_anchors_to(index);
         }
-        if let Some(proto) = proto {
-            crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
-        }
+        let proto = proto.expect("construct prototype fallback always resolves");
+        roots.scratch_0.set(proto);
+        let receiver = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
         roots.receiver.set(Value::object(receiver));
+        let proto = roots.scratch_0.get();
+        crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
+        // Keep arguments in `SyncJsCallRoots` through the observable
+        // new-target prototype lookup and receiver allocation. Taking the
+        // SmallVec earlier detached it from the registered root provider, so
+        // a getter-triggered scavenge left AggregateError's iterable stale.
+        // Every destination below either registers the slice immediately
+        // (native) or transfers it into a frame builder with its own roots.
+        let effective_args = roots.take_args();
 
         if let Some(obj) = roots.current.get().as_object()
             && let Some(native) = crate::object::constructor_native(obj, &self.gc_heap)
@@ -3162,6 +3451,7 @@ impl Interpreter {
                 native,
                 &this_value,
                 &new_target,
+                used_object_prototype_fallback,
                 effective_args.as_slice(),
             );
         }
@@ -3174,6 +3464,7 @@ impl Interpreter {
                 native,
                 &this_value,
                 &new_target,
+                used_object_prototype_fallback,
                 effective_args.as_slice(),
             );
         }
@@ -3188,6 +3479,7 @@ impl Interpreter {
                 native,
                 &this_value,
                 &new_target,
+                used_object_prototype_fallback,
                 effective_args.as_slice(),
             );
         }
@@ -3200,7 +3492,7 @@ impl Interpreter {
         let new_frame = self.build_construct_bytecode_frame(
             context,
             current,
-            receiver,
+            Some(receiver),
             new_target,
             effective_args,
             None,

@@ -31,8 +31,12 @@
 //!   object.
 //! - The registry never re-allocates its prototype/constructor table after
 //!   construction. Active native constructor paths allocate instances through
-//!   `NativeCtx` so receiver, `new.target`, arguments, pending causes, and
-//!   AggregateError element buffers stay visible across young allocation.
+//!   one `NativeScope`: the selected prototype, instance, message, cause,
+//!   iterator state, and direct-filled AggregateError result array remain
+//!   canonical handles across allocation and JavaScript re-entry.
+//! - Construct calls reuse the receiver already created by VM dispatch and
+//!   never repeat `new.target.prototype`; ordinary calls allocate a fresh
+//!   receiver and never mutate their explicit `this` value.
 //! - Error stack capture walks the explicit activation stack carried by the
 //!   current `NativeCtx`; it never reaches through interpreter ambient state.
 //!
@@ -48,7 +52,7 @@ use crate::number::NumberValue;
 use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::rooting::RootScopeExt;
 use crate::string::JsString;
-use crate::{ExecutionContext, Value};
+use crate::{ExecutionContext, Local, NativeScope, Value};
 use crate::{NativeCtx, NativeError};
 use otter_gc::raw::RawGc;
 
@@ -733,24 +737,6 @@ impl ErrorClassRegistry {
                         name: "set Error.prototype.stack",
                         reason: "missing execution context".to_string(),
                     })?;
-            fn map_err(interp: &mut crate::Interpreter, err: crate::VmError) -> NativeError {
-                match err {
-                    crate::VmError::Uncaught => {
-                        let value = match interp.take_error_detail() {
-                            Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                            _ => Default::default(),
-                        };
-                        NativeError::Thrown {
-                            name: "set Error.prototype.stack",
-                            message: value.into(),
-                        }
-                    }
-                    other => NativeError::TypeError {
-                        name: "set Error.prototype.stack",
-                        reason: other.to_string(),
-                    },
-                }
-            }
             ctx.scope(|mut scope| {
                 let receiver = scope.value(receiver);
                 let value = scope.value(value);
@@ -782,7 +768,13 @@ impl ErrorClassRegistry {
                             &crate::VmPropertyKey::String("stack"),
                             0,
                         )
-                        .map_err(|error| map_err(interp, error))
+                        .map_err(|error| {
+                            crate::native_function::vm_to_native_error(
+                                interp,
+                                error,
+                                "set Error.prototype.stack",
+                            )
+                        })
                 })?;
                 let receiver_value = scope.raw(receiver);
                 let value = scope.raw(value);
@@ -798,7 +790,13 @@ impl ErrorClassRegistry {
                                     "stack",
                                     value,
                                 )
-                                .map_err(|error| map_err(interp, error))
+                                .map_err(|error| {
+                                    crate::native_function::vm_to_native_error(
+                                        interp,
+                                        error,
+                                        "set Error.prototype.stack",
+                                    )
+                                })
                         })?;
                     }
                     // step 5 — own "stack" exists: Set(this, p, v, true).
@@ -812,7 +810,13 @@ impl ErrorClassRegistry {
                                     "stack",
                                     value,
                                 )
-                                .map_err(|error| map_err(interp, error))
+                                .map_err(|error| {
+                                    crate::native_function::vm_to_native_error(
+                                        interp,
+                                        error,
+                                        "set Error.prototype.stack",
+                                    )
+                                })
                         })?;
                     }
                 }
@@ -901,8 +905,9 @@ impl ErrorClassRegistry {
         }
 
         // §20.5.1.1 / §20.5.6.1.1 NativeError(message, options) —
-        // each constructor allocates an instance with its prototype
-        // and stamps `message` (when provided), then performs
+        // each constructor obtains its rooted instance (reusing the VM-created
+        // construct receiver or allocating a fresh ordinary-call shell), stamps
+        // `message` when provided, then performs
         // [`InstallErrorCause`] when `options` is an object with
         // an own `cause` property. The seven static dispatchers
         // below close over their `ErrorKind` so the shared
@@ -913,28 +918,6 @@ impl ErrorClassRegistry {
             kind: ErrorKind,
             args: &[Value],
         ) -> Result<Value, NativeError> {
-            fn map_vm_err(
-                ctx: &mut NativeCtx<'_>,
-                kind: ErrorKind,
-                err: crate::VmError,
-            ) -> NativeError {
-                match err {
-                    crate::VmError::Uncaught => {
-                        let value = match ctx.interp_mut().take_error_detail() {
-                            Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                            _ => Default::default(),
-                        };
-                        NativeError::Thrown {
-                            name: kind.class_name(),
-                            message: value.into(),
-                        }
-                    }
-                    other => NativeError::TypeError {
-                        name: kind.class_name(),
-                        reason: other.to_string(),
-                    },
-                }
-            }
             let context =
                 ctx.execution_context()
                     .cloned()
@@ -942,131 +925,120 @@ impl ErrorClassRegistry {
                         name: kind.class_name(),
                         reason: "missing execution context".to_string(),
                     })?;
-            // §20.5.1.1 step 3 — when `message` is not undefined,
-            // `msg = ? ToString(message)`.
-            let message = if let Some(v) = args.first() {
-                if v.is_undefined() {
-                    None
-                } else {
-                    let coerced = ctx.with_turn_parts(|interp, stack| {
-                        interp.coerce_to_string(stack, &context, v)
+            let default_prototype = ctx.interp_mut().error_classes_clone().prototype(kind);
+            ctx.scope(|mut scope| {
+                let message = scope.argument(args, 0);
+                let options = args.get(1).copied().map(|value| scope.value(value));
+                // Park the live intrinsic fallback before the observable
+                // message/options work. For construct calls the VM boundary has
+                // already performed the one observable new-target lookup and
+                // allocated/rooted `this`.
+                let default_prototype = scope.value(Value::object(default_prototype));
+                let instance = ErrorClassRegistry::instance_for_native_call_scoped(
+                    &mut scope,
+                    default_prototype,
+                )?;
+
+                // §20.5.1.1 step 3 — when `message` is not undefined,
+                // `msg = ? ToString(message)` followed by the non-enumerable
+                // own data property.
+                if !scope.is_undefined(message) {
+                    let message_value = scope.raw(message);
+                    let coerced = scope.with_turn_parts(|interp, stack| {
+                        interp.coerce_to_string(stack, &context, &message_value)
                     });
-                    Some(match coerced {
-                        Ok(v) => v,
-                        Err(e) => return Err(map_vm_err(ctx, kind, e)),
-                    })
+                    let coerced = match coerced {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return Err(crate::native_function::vm_to_native_error(
+                                scope.context().interp_mut(),
+                                error,
+                                kind.class_name(),
+                            ));
+                        }
+                    };
+                    ErrorClassRegistry::define_error_message_native_scoped(
+                        &mut scope, instance, &coerced,
+                    )?;
                 }
-            } else {
-                None
-            };
-            // §20.5.6.1.1 step 4 — install cause from
-            // `options[1]` (or `options[2]` for AggregateError).
-            let options = match kind {
-                ErrorKind::AggregateError => args.get(2),
-                _ => args.get(1),
-            };
-            let cause = match read_options_cause(ctx, &context, options) {
-                Ok(v) => v,
-                Err(e) => return Err(map_vm_err(ctx, kind, e)),
-            };
-            let registry = ctx.interp_mut().error_classes_clone();
-            let mut extra_roots = Vec::with_capacity(1);
-            if let Some(cause) = &cause {
-                extra_roots.push(cause);
-            }
-            let obj = registry
-                .make_instance_native_rooted(ctx, kind, message.as_deref(), &extra_roots, &[args])
-                .map_err(|err| NativeError::TypeError {
-                    name: kind.class_name(),
-                    reason: err.to_string(),
-                })?;
-            if let Some(proto) =
-                crate::bootstrap::native_new_target_prototype(ctx, kind.class_name())?
-            {
-                let _ = object::set_prototype_value(obj, ctx.heap_mut(), Some(proto));
-            }
-            if let Some(cause) = cause {
-                install_error_cause(obj, cause, ctx.heap_mut());
-            }
-            // Capture the construction-site JS call stack for
-            // `Error.prototype.stack` (matches V8: frames recorded
-            // eagerly at construction, bounded by `Error.stackTraceLimit`,
-            // formatted lazily on first `.stack` access).
-            let limit = stack_trace_limit(ctx);
-            if limit > 0 {
-                let mut frames = ctx.capture_active_frames(&context);
-                if frames.len() > limit {
-                    frames.truncate(limit);
+
+                // §20.5.1.1 step 4 — InstallErrorCause runs after message
+                // coercion and keeps a getter-produced cause in the same arena.
+                let cause = match read_options_cause_scoped(&mut scope, &context, options) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Err(crate::native_function::vm_to_native_error(
+                            scope.context().interp_mut(),
+                            error,
+                            kind.class_name(),
+                        ));
+                    }
+                };
+                if let Some(cause) = cause {
+                    scope.define(
+                        instance,
+                        "cause",
+                        cause,
+                        crate::object::PropertyFlags::new(true, false, true),
+                    )?;
                 }
-                if !frames.is_empty() {
-                    object::set_error_stack_frames(obj, ctx.heap_mut(), frames);
+
+                // Capture the construction-site JS call stack for
+                // `Error.prototype.stack` (matches V8: frames recorded
+                // eagerly at construction, bounded by `Error.stackTraceLimit`,
+                // formatted lazily on first `.stack` access).
+                let limit = stack_trace_limit(scope.context());
+                if limit > 0 {
+                    let mut frames = scope.context().capture_active_frames(&context);
+                    if frames.len() > limit {
+                        frames.truncate(limit);
+                    }
+                    if !frames.is_empty() {
+                        let object = scope
+                            .raw(instance)
+                            .as_object()
+                            .expect("scoped Error instance remains an object");
+                        object::set_error_stack_frames(object, scope.context().heap_mut(), frames);
+                    }
                 }
-            }
-            Ok(Value::object(obj))
+                Ok(scope.finish(instance))
+            })
         }
 
         /// §7.3.13 HasProperty + §7.3.2 Get for the `cause` field
         /// of the constructor's options bag. Returns `None` when
         /// `options` is missing / non-object, or when `cause` is
-        /// not an own / inherited property of the options bag.
-        fn read_options_cause(
-            ctx: &mut NativeCtx<'_>,
+        /// not an own or inherited property of the options bag.
+        fn read_options_cause_scoped<'scope>(
+            scope: &mut NativeScope<'scope, '_>,
             context: &ExecutionContext,
-            options: Option<&Value>,
-        ) -> Result<Option<Value>, crate::VmError> {
+            options: Option<Local<'scope>>,
+        ) -> Result<Option<Local<'scope>>, crate::VmError> {
             let Some(options) = options else {
                 return Ok(None);
             };
-            if !options.is_object_type() {
+            if !scope.raw(options).is_object_type() {
                 return Ok(None);
             }
             let key = crate::VmPropertyKey::String("cause");
-            ctx.scope(|mut scope| {
-                let options = scope.value(*options);
-                let options_value = scope.raw(options);
-                let present = scope.with_turn_parts(|interp, stack| {
-                    interp.ordinary_has_property_value(stack, context, options_value, &key, 0)
-                })?;
-                if !present {
-                    return Ok(None);
+            let options_value = scope.raw(options);
+            let present = scope.with_turn_parts(|interp, stack| {
+                interp.ordinary_has_property_value(stack, context, options_value, &key, 0)
+            })?;
+            if !present {
+                return Ok(None);
+            }
+            let options_value = scope.raw(options);
+            let outcome = scope.with_turn_parts(|interp, stack| {
+                interp.ordinary_get_value(stack, context, options_value, options_value, &key, 0)
+            })?;
+            match outcome {
+                crate::VmGetOutcome::Value(value) => Ok(Some(scope.value(value))),
+                crate::VmGetOutcome::InvokeGetter { getter } => {
+                    let getter = scope.value(getter);
+                    scope.call_vm(getter, options, &[]).map(Some)
                 }
-                let options_value = scope.raw(options);
-                let outcome = scope.with_turn_parts(|interp, stack| {
-                    interp.ordinary_get_value(stack, context, options_value, options_value, &key, 0)
-                })?;
-                let value = match outcome {
-                    crate::VmGetOutcome::Value(value) => value,
-                    crate::VmGetOutcome::InvokeGetter { getter } => {
-                        let getter = scope.value(getter);
-                        let receiver = scope.raw(options);
-                        let getter = scope.raw(getter);
-                        scope.with_turn_parts(|interp, stack| {
-                            interp.run_callable_sync_rooted(
-                                stack,
-                                context,
-                                &getter,
-                                receiver,
-                                smallvec::SmallVec::<[Value; 8]>::new(),
-                            )
-                        })?
-                    }
-                };
-                let value = scope.value(value);
-                Ok(Some(scope.finish(value)))
-            })
-        }
-
-        /// §20.5.6.1.1 InstallErrorCause step 1.b —
-        /// `CreateNonEnumerableDataPropertyOrThrow(O, "cause", cause)`.
-        /// Spec property descriptor: writable, **non-enumerable**,
-        /// configurable.
-        fn install_error_cause(obj: JsObject, cause: Value, gc_heap: &mut otter_gc::GcHeap) {
-            let _ = object::define_own_property(
-                obj,
-                gc_heap,
-                "cause",
-                PropertyDescriptor::data(cause, true, false, true),
-            );
+            }
         }
 
         fn ctor_error(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
@@ -1093,28 +1065,10 @@ impl ErrorClassRegistry {
         /// §20.5.7.1 AggregateError(errors, message [, options]).
         /// Differs from the regular native-error constructors:
         ///   - `errors` (arg 0) is an iterable to materialise as a
-        ///     non-enumerable readonly `errors` own property,
+        ///     writable, non-enumerable, configurable `errors` own property,
         ///   - `message` is arg 1,
         ///   - `options.cause` lives at arg 2.
         fn ctor_aggregate(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
-            fn map_vm_err(c: &mut NativeCtx<'_>, err: crate::VmError) -> NativeError {
-                match err {
-                    crate::VmError::Uncaught => {
-                        let value = match c.interp_mut().take_error_detail() {
-                            Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                            _ => Default::default(),
-                        };
-                        NativeError::Thrown {
-                            name: "AggregateError",
-                            message: value.into(),
-                        }
-                    }
-                    other => NativeError::TypeError {
-                        name: "AggregateError",
-                        reason: other.to_string(),
-                    },
-                }
-            }
             let context = c
                 .execution_context()
                 .cloned()
@@ -1122,123 +1076,139 @@ impl ErrorClassRegistry {
                     name: "AggregateError",
                     reason: "missing execution context".to_string(),
                 })?;
-            let message = if let Some(v) = a.get(1) {
-                if v.is_undefined() {
-                    None
-                } else {
-                    let coerced = c.with_turn_parts(|interp, stack| {
-                        interp.coerce_to_string(stack, &context, v)
-                    });
-                    Some(match coerced {
-                        Ok(v) => v,
-                        Err(e) => return Err(map_vm_err(c, e)),
-                    })
-                }
-            } else {
-                None
-            };
-            let errors_arg = a.first().cloned().unwrap_or(Value::undefined());
-            let cause = match read_options_cause(c, &context, a.get(2)) {
-                Ok(v) => v,
-                Err(e) => return Err(map_vm_err(c, e)),
-            };
+            let default_prototype = c
+                .interp_mut()
+                .error_classes_clone()
+                .prototype(ErrorKind::AggregateError);
+            c.scope(|mut scope| {
+                let errors_arg = scope.argument(a, 0);
+                let message = scope.argument(a, 1);
+                let options = a.get(2).copied().map(|value| scope.value(value));
+                let default_prototype = scope.value(Value::object(default_prototype));
 
-            // §20.5.7.1 step 4 — IterableToList(errors). Spec
-            // throws `TypeError` for `null`/`undefined`. Spread
-            // through a dense array fast path before falling back
-            // to the iterator protocol.
-            let errors_list = iterable_to_value_list(c, &context, &errors_arg)?;
-            let registry = c.interp_mut().error_classes_clone();
-            let mut extra_roots = Vec::with_capacity(2);
-            extra_roots.push(&errors_arg);
-            if let Some(cause) = &cause {
-                extra_roots.push(cause);
-            }
-            let obj = registry
-                .make_aggregate_instance_native_rooted(
-                    c,
-                    errors_list.as_slice(),
-                    message.as_deref(),
-                    &extra_roots,
-                    &[a],
-                )
-                .map_err(|err| NativeError::TypeError {
-                    name: "AggregateError",
-                    reason: err.to_string(),
-                })?;
-            if let Some(proto) = crate::bootstrap::native_new_target_prototype(c, "AggregateError")?
-            {
-                let _ = object::set_prototype_value(obj, c.heap_mut(), Some(proto));
-            }
-            if let Some(cause) = cause {
-                install_error_cause(obj, cause, c.heap_mut());
-            }
-            Ok(Value::object(obj))
+                // The construct boundary already performed
+                // OrdinaryCreateFromConstructor. Reuse that receiver; only the
+                // recorded generic Object fallback is replaced with
+                // %AggregateError.prototype%.
+                let instance = ErrorClassRegistry::instance_for_native_call_scoped(
+                    &mut scope,
+                    default_prototype,
+                )?;
+
+                // Message coercion and definition precede InstallErrorCause.
+                if !scope.is_undefined(message) {
+                    let message_value = scope.raw(message);
+                    let coerced = scope.with_turn_parts(|interp, stack| {
+                        interp.coerce_to_string(stack, &context, &message_value)
+                    });
+                    let coerced = match coerced {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return Err(crate::native_function::vm_to_native_error(
+                                scope.context().interp_mut(),
+                                error,
+                                "AggregateError",
+                            ));
+                        }
+                    };
+                    ErrorClassRegistry::define_error_message_native_scoped(
+                        &mut scope, instance, &coerced,
+                    )?;
+                }
+
+                // InstallErrorCause is observably before iterator acquisition
+                // and also determines own-key insertion order.
+                let cause = match read_options_cause_scoped(&mut scope, &context, options) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Err(crate::native_function::vm_to_native_error(
+                            scope.context().interp_mut(),
+                            error,
+                            "AggregateError",
+                        ));
+                    }
+                };
+                if let Some(cause) = cause {
+                    scope.define(
+                        instance,
+                        "cause",
+                        cause,
+                        crate::object::PropertyFlags::new(true, false, true),
+                    )?;
+                }
+
+                // IterableToList + CreateArrayFromList without an intermediate
+                // Vec<Value>: the final rooted array is filled as each iterator
+                // value arrives, so callback allocation can move neither the
+                // destination nor a retained prior element out from under us.
+                let errors = materialize_aggregate_errors_scoped(&mut scope, &context, errors_arg)?;
+                scope.define(
+                    instance,
+                    "errors",
+                    errors,
+                    crate::object::PropertyFlags::new(true, false, true),
+                )?;
+                Ok(scope.finish(instance))
+            })
         }
 
-        /// IterableToList helper for AggregateError.
-        ///
-        /// Spec §7.4.3 IterableToList allocates an iterator and
-        /// drains it through IteratorStep/IteratorValue.
-        fn iterable_to_value_list(
-            ctx: &mut NativeCtx<'_>,
+        /// Materialize AggregateError's input directly into its final rooted
+        /// Array while preserving iterator re-entry and abrupt completions.
+        fn materialize_aggregate_errors_scoped<'scope>(
+            scope: &mut NativeScope<'scope, '_>,
             context: &ExecutionContext,
-            value: &Value,
-        ) -> Result<Vec<Value>, NativeError> {
-            fn map_err(interp: &mut crate::Interpreter, err: crate::VmError) -> NativeError {
-                match err {
-                    crate::VmError::Uncaught => {
-                        let value = match interp.take_error_detail() {
-                            Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                            _ => Default::default(),
-                        };
-                        NativeError::Thrown {
-                            name: "AggregateError",
-                            message: value.into(),
-                        }
-                    }
-                    other => NativeError::TypeError {
-                        name: "AggregateError",
-                        reason: other.to_string(),
-                    },
-                }
-            }
-            if value.is_undefined() || value.is_null() {
+            value: Local<'scope>,
+        ) -> Result<Local<'scope>, NativeError> {
+            if scope.is_undefined(value) || scope.is_null(value) {
                 return Err(NativeError::TypeError {
                     name: "AggregateError",
                     reason: "errors argument is not iterable".to_string(),
                 });
             }
-            if let Some(arr) = value.as_array() {
-                let heap = ctx.heap();
-                return Ok(crate::array::with_elements(arr, heap, <[Value]>::to_vec));
-            }
-            ctx.scope(|mut scope| {
-                let value = scope.value(*value);
-                let value_raw = scope.raw(value);
-                let (iterator, next_method) = scope.with_turn_parts(|interp, stack| {
-                    interp
-                        .get_iterator_sync(stack, context, &value_raw)
-                        .map_err(|error| map_err(interp, error))
-                })?;
-                let iterator = scope.value(iterator);
-                let next_method = scope.value(next_method);
-                let mut values = Vec::new();
-                loop {
-                    let iterator_raw = scope.raw(iterator);
-                    let next_method_raw = scope.raw(next_method);
-                    let next = scope.with_turn_parts(|interp, stack| {
-                        interp
-                            .iterator_step_sync(stack, context, &iterator_raw, &next_method_raw)
-                            .map_err(|error| map_err(interp, error))
-                    })?;
-                    match next {
-                        Some(value) => values.push(scope.value(value)),
-                        None => break,
+
+            let value_raw = scope.raw(value);
+            let iterator_result = scope.with_turn_parts(|interp, stack| {
+                interp.get_iterator_sync(stack, context, &value_raw)
+            });
+            let (iterator, next_method) = match iterator_result {
+                Ok(handles) => handles,
+                Err(error) => {
+                    return Err(crate::native_function::vm_to_native_error(
+                        scope.context().interp_mut(),
+                        error,
+                        "AggregateError",
+                    ));
+                }
+            };
+            let iterator = scope.value(iterator);
+            let next_method = scope.value(next_method);
+            let result = scope.array(0)?;
+            let mut index = 0usize;
+            loop {
+                let iterator_raw = scope.raw(iterator);
+                let next_method_raw = scope.raw(next_method);
+                let next = scope.with_turn_parts(|interp, stack| {
+                    interp.iterator_step_sync(stack, context, &iterator_raw, &next_method_raw)
+                });
+                match next {
+                    Ok(Some(value)) => {
+                        scope.scope(|mut child| {
+                            let value = child.value(value);
+                            child.set_index(result, index, value)
+                        })?;
+                        index += 1;
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        return Err(crate::native_function::vm_to_native_error(
+                            scope.context().interp_mut(),
+                            error,
+                            "AggregateError",
+                        ));
                     }
                 }
-                Ok(values.into_iter().map(|value| scope.raw(value)).collect())
-            })
+            }
+            Ok(result)
         }
 
         // Error itself. §20.5.3 — `Error.prototype.constructor`
@@ -1651,114 +1621,73 @@ impl ErrorClassRegistry {
         self.entry(kind).prototype
     }
 
-    /// Allocate a fresh error instance of the given kind with the supplied
-    /// message through the native root contract.
-    ///
-    /// # Algorithm
-    /// 1. Allocate a plain `JsObject`.
-    /// 2. Link its `[[Prototype]]` to `kind`'s prototype, so it
-    ///    inherits `name` and `message` defaults plus
-    ///    `Error.prototype.toString` once that is wired (task 61
-    ///    backfills the toString implementation).
-    /// 3. When `message` is `Some`, stamp it as an own property
-    ///    so `e.message` resolves to the constructor argument
-    ///    rather than the empty default. `None` leaves the
-    ///    inherited empty-string default in place per
-    ///    §20.5.1.1 step 4 (omitted argument).
-    ///
-    /// # Errors
-    /// Returns [`StringError::OutOfMemory`] if the message string
-    /// allocation fails.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-error-message>
-    pub(crate) fn make_instance_native_rooted(
-        &self,
-        ctx: &mut NativeCtx<'_>,
-        kind: ErrorKind,
-        message: Option<&str>,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
-    ) -> Result<JsObject, otter_gc::OutOfMemory> {
-        let proto = self.prototype(kind);
-        let proto_value = Value::object(proto);
-        let mut roots = Vec::with_capacity(value_roots.len() + 1);
-        roots.push(&proto_value);
-        roots.extend_from_slice(value_roots);
-        let obj = ctx
-            .alloc_object_with_roots(roots.as_slice(), slice_roots)
-            .map_err(|_| otter_gc::OutOfMemory::HeapCapExceeded {
-                requested_bytes: 0,
-                heap_limit_bytes: ctx.heap().max_heap_bytes(),
-            })?;
-        crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto));
-        // §20.5.* — the instance carries the `[[ErrorData]]` internal slot.
-        crate::object::set_error_data(obj, ctx.heap_mut());
-        if let Some(text) = message {
-            let s = JsString::from_str(text, ctx.heap_mut())?;
-            // §20.5.1.1 step 4.c — `msgDesc` is `{ [[Value]]: msg,
-            // [[Writable]]: true, [[Enumerable]]: false,
-            // [[Configurable]]: true }`. Going through ordinary
-            // `set_property` would install an enumerable slot;
-            // route through `define_own_property` so reflective
-            // property descriptors match the spec.
-            let _ = crate::object::define_own_property(
-                obj,
-                ctx.heap_mut(),
-                "message",
-                crate::object::PropertyDescriptor::data(Value::string(s), true, false, true),
-            );
-            let _ = value_roots;
-            let _ = slice_roots;
-        }
-        Ok(obj)
+    /// Allocate the fresh Error shell used by ordinary calls.
+    /// `prototype` is the intrinsic default and remains current in the same
+    /// scope as the returned instance.
+    fn make_instance_shell_native_scoped<'scope, 'rt>(
+        scope: &mut NativeScope<'scope, 'rt>,
+        prototype: Local<'scope>,
+    ) -> Result<Local<'scope>, NativeError> {
+        let instance = scope.bare_object()?;
+        scope.set_prototype(instance, Some(prototype))?;
+        Self::initialize_error_instance_native_scoped(scope, instance)?;
+        Ok(instance)
     }
 
-    /// §20.5.7.1 `AggregateError(errors, message?)` — allocate an
-    /// AggregateError with the supplied errors list attached as the
-    /// `errors` own property. The `errors` argument's elements are
-    /// shallow-copied into a fresh `JsArray`.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-aggregate-error>
-    pub(crate) fn make_aggregate_instance_native_rooted(
-        &self,
-        ctx: &mut NativeCtx<'_>,
-        errors: &[Value],
-        message: Option<&str>,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
-    ) -> Result<JsObject, otter_gc::OutOfMemory> {
-        let mut object_slice_roots = Vec::with_capacity(slice_roots.len() + 1);
-        object_slice_roots.push(errors);
-        object_slice_roots.extend_from_slice(slice_roots);
-        let obj = self.make_instance_native_rooted(
-            ctx,
-            ErrorKind::AggregateError,
-            message,
-            value_roots,
-            object_slice_roots.as_slice(),
-        )?;
-        let obj_value = Value::object(obj);
-        let mut array_roots = Vec::with_capacity(value_roots.len() + 1);
-        array_roots.push(&obj_value);
-        array_roots.extend_from_slice(value_roots);
-        let arr = ctx
-            .array_from_elements_with_roots(
-                errors.iter().cloned(),
-                array_roots.as_slice(),
-                slice_roots,
-            )
-            .map_err(|_| otter_gc::OutOfMemory::HeapCapExceeded {
-                requested_bytes: 0,
-                heap_limit_bytes: ctx.heap().max_heap_bytes(),
+    fn initialize_error_instance_native_scoped(
+        scope: &mut NativeScope<'_, '_>,
+        instance: Local<'_>,
+    ) -> Result<(), NativeError> {
+        // §20.5.* — the instance carries the [[ErrorData]] internal slot.
+        // This is non-allocating and reloads the receiver from its canonical
+        // Local immediately before the internal write.
+        let object = scope
+            .raw(instance)
+            .as_object()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "Error",
+                reason: "construct receiver is not an ordinary object".to_string(),
             })?;
-        let _ = object::define_own_property(
-            obj,
-            ctx.heap_mut(),
-            "errors",
-            PropertyDescriptor::data(Value::array(arr), true, false, true),
-        );
-        Ok(obj)
+        crate::object::set_error_data(object, scope.context().heap_mut());
+        Ok(())
+    }
+
+    /// Reuse the receiver OrdinaryCreateFromConstructor already allocated.
+    /// Ordinary calls such as `Error("message")` have no construct receiver
+    /// and allocate their one scoped shell here instead.
+    fn instance_for_native_call_scoped<'scope, 'rt>(
+        scope: &mut NativeScope<'scope, 'rt>,
+        default_prototype: Local<'scope>,
+    ) -> Result<Local<'scope>, NativeError> {
+        if !scope.context().is_construct_call() {
+            return Self::make_instance_shell_native_scoped(scope, default_prototype);
+        }
+
+        let instance = scope.this();
+        if scope
+            .context()
+            .construct_receiver_used_object_prototype_fallback()
+        {
+            // Only the proven generic fallback is replaced. An accessor that
+            // explicitly returned `%Object.prototype%` has provenance=false
+            // and remains untouched.
+            scope.set_prototype(instance, Some(default_prototype))?;
+        }
+        Self::initialize_error_instance_native_scoped(scope, instance)?;
+        Ok(instance)
+    }
+
+    fn define_error_message_native_scoped(
+        scope: &mut NativeScope<'_, '_>,
+        instance: Local<'_>,
+        text: &str,
+    ) -> Result<(), NativeError> {
+        let message = scope.string(text)?;
+        scope.define(
+            instance,
+            "message",
+            message,
+            crate::object::PropertyFlags::new(true, false, true),
+        )
     }
 }

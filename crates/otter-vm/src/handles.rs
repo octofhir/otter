@@ -768,7 +768,9 @@ impl Interpreter {
     }
 
     /// Set an object's prototype from scoped handles. `None` installs a null
-    /// prototype; a non-object prototype is rejected.
+    /// prototype; every object-like [`Value`] (including arrays, functions,
+    /// and proxies) is accepted, while an invalid or rejected transition maps
+    /// to [`VmError::TypeMismatch`].
     pub(crate) fn scoped_set_prototype(
         &mut self,
         _scope: &HandleScope,
@@ -780,16 +782,12 @@ impl Interpreter {
             .get(obj.index())
             .as_object()
             .ok_or(VmError::TypeMismatch)?;
-        let prototype = prototype
-            .map(|handle| {
-                self.handle_arena
-                    .get(handle.index())
-                    .as_object()
-                    .ok_or(VmError::TypeMismatch)
-            })
-            .transpose()?;
-        crate::object::set_prototype(object, &mut self.gc_heap, prototype);
-        Ok(())
+        let prototype = prototype.map(|handle| self.handle_arena.get(handle.index()));
+        if crate::object::set_prototype_value(object, &mut self.gc_heap, prototype) {
+            Ok(())
+        } else {
+            Err(VmError::TypeMismatch)
+        }
     }
 
     /// Store `value` at array index `index` on the array handle `arr`,
@@ -1040,6 +1038,44 @@ mod tests {
         });
         assert!(moved);
         assert_eq!(content, "payload");
+    }
+
+    #[test]
+    fn scoped_prototype_accepts_array_and_proxy_values() {
+        let mut interp = Interpreter::new();
+        interp.with_handle_scope(|interp, scope| {
+            let object = interp.scoped_object_bare(scope).expect("receiver");
+            let array = interp.scoped_array(scope, 0).expect("array prototype");
+            interp
+                .scoped_set_prototype(scope, object, Some(array))
+                .expect("array is an object-like prototype");
+
+            let object_handle = interp
+                .escape_scoped(object)
+                .as_object()
+                .expect("ordinary receiver");
+            assert_eq!(
+                crate::object::prototype_value(object_handle, interp.gc_heap()),
+                Some(interp.escape_scoped(array)),
+            );
+
+            let target = interp.scoped_object(scope).expect("proxy target");
+            let handler = interp.scoped_object(scope).expect("proxy handler");
+            let proxy = interp
+                .scoped_proxy(scope, target, handler)
+                .expect("proxy prototype");
+            interp
+                .scoped_set_prototype(scope, object, Some(proxy))
+                .expect("proxy is an object-like prototype");
+            let object_handle = interp
+                .escape_scoped(object)
+                .as_object()
+                .expect("relocated ordinary receiver");
+            assert_eq!(
+                crate::object::prototype_value(object_handle, interp.gc_heap()),
+                Some(interp.escape_scoped(proxy)),
+            );
+        });
     }
 
     #[test]

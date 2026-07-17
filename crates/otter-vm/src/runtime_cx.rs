@@ -26,6 +26,10 @@
 //!   diagnostic raw pointer; it receives the current stack through the turn.
 //! - A native-call root record traces only its call-local slots; the enclosing
 //!   runtime turn owns the single interpreter and activation-root traversal.
+//! - Construct metadata carries the already-created rooted receiver and
+//!   whether its prototype came from the generic `%Object.prototype%`
+//!   fallback, allowing migrated native constructors to avoid repeating the
+//!   observable `new.target.prototype` lookup.
 //! - Neither context crosses `.await` or escapes the mutator turn.
 //! - Heap allocation and mutation stay rooted through `NativeCtx`/`NativeScope`.
 //!
@@ -155,11 +159,18 @@ impl<'rt> RuntimeTurn<'rt> {
 ///
 /// The values are the collector-rewritten root slots for the active call.
 /// Native code may inspect them synchronously, but must not store them or move
-/// them into async work.
+/// them into async work. Construct calls additionally preserve the provenance
+/// of the VM-created receiver's prototype fallback so intrinsic constructors
+/// can substitute their own default without repeating an observable lookup.
 #[derive(Debug, Clone)]
 pub struct NativeCallInfo {
     this_value: Value,
     new_target: Option<Value>,
+    /// The construct boundary created `this` with `%Object.prototype%`
+    /// because `new.target.prototype` was missing or non-object. Builtins with
+    /// a different intrinsic default (Error subclasses in particular) replace
+    /// only this proven fallback, never an explicit `%Object.prototype%`.
+    used_object_prototype_fallback: bool,
 }
 
 impl NativeCallInfo {
@@ -169,6 +180,7 @@ impl NativeCallInfo {
         Self {
             this_value,
             new_target: None,
+            used_object_prototype_fallback: false,
         }
     }
 
@@ -178,6 +190,22 @@ impl NativeCallInfo {
         Self {
             this_value,
             new_target,
+            used_object_prototype_fallback: false,
+        }
+    }
+
+    /// Constructor metadata from the VM's already-completed
+    /// OrdinaryCreateFromConstructor boundary.
+    #[must_use]
+    pub(crate) fn construct_with_receiver(
+        this_value: Value,
+        new_target: Option<Value>,
+        used_object_prototype_fallback: bool,
+    ) -> Self {
+        Self {
+            this_value,
+            new_target,
+            used_object_prototype_fallback,
         }
     }
 
@@ -443,6 +471,13 @@ impl<'rt> NativeCtx<'rt> {
     #[must_use]
     pub fn is_construct_call(&self) -> bool {
         self.call_info.new_target.is_some()
+    }
+
+    /// Whether the VM-created construct receiver used generic
+    /// `%Object.prototype%` fallback rather than an explicit prototype value.
+    #[must_use]
+    pub(crate) fn construct_receiver_used_object_prototype_fallback(&self) -> bool {
+        self.call_info.used_object_prototype_fallback
     }
 
     /// Clone the isolate's cooperative-cancellation handle.
@@ -2344,7 +2379,7 @@ pub(crate) fn visit_native_roots(
 #[cfg(test)]
 mod tests {
     use super::{NativeCallInfo, NativeCtx};
-    use crate::{Interpreter, NativeError, Value, error_classes::ErrorKind, native_value_static};
+    use crate::{Interpreter, NativeError, Value, native_value_static};
 
     fn with_ctx<R>(
         interp: &mut Interpreter,
@@ -2497,61 +2532,6 @@ mod tests {
         assert!(
             after > before,
             "NativeCtx weak-ref helpers should allocate through root-aware young allocation"
-        );
-    }
-
-    #[test]
-    fn native_ctx_error_allocation_uses_young_space() {
-        let mut interp = Interpreter::new();
-        let before = interp.gc_heap().stats().new_allocated_bytes;
-        with_ctx(
-            &mut interp,
-            NativeCallInfo::construct(Value::undefined(), Some(Value::undefined())),
-            |ctx| {
-                let registry = ctx.interp_mut().error_classes_clone();
-                let error = registry
-                    .make_instance_native_rooted(ctx, ErrorKind::TypeError, Some("boom"), &[], &[])
-                    .expect("native error allocation");
-                assert!(
-                    crate::object::get(error, ctx.heap(), "message").is_some_and(|v| v.is_string())
-                );
-            },
-        );
-        let after = interp.gc_heap().stats().new_allocated_bytes;
-        assert!(
-            after > before,
-            "Native error constructors should allocate through root-aware young allocation"
-        );
-    }
-
-    #[test]
-    fn native_ctx_aggregate_error_allocation_roots_errors_array() {
-        let mut interp = Interpreter::new();
-        let before = interp.gc_heap().stats().new_allocated_bytes;
-        with_ctx(
-            &mut interp,
-            NativeCallInfo::construct(Value::undefined(), Some(Value::undefined())),
-            |ctx| {
-                let registry = ctx.interp_mut().error_classes_clone();
-                let errors = [Value::number_i32(1)];
-                let error = registry
-                    .make_aggregate_instance_native_rooted(
-                        ctx,
-                        errors.as_slice(),
-                        Some("all rejected"),
-                        &[],
-                        &[],
-                    )
-                    .expect("native aggregate error allocation");
-                assert!(
-                    crate::object::get(error, ctx.heap(), "errors").is_some_and(|v| v.is_array())
-                );
-            },
-        );
-        let after = interp.gc_heap().stats().new_allocated_bytes;
-        assert!(
-            after > before,
-            "Native AggregateError should allocate the error and errors array through root-aware young allocation"
         );
     }
 

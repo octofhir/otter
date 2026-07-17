@@ -4,6 +4,7 @@
 //! - A public high-level native binding that invokes one rooted JS callback.
 //! - Interpreter/template parity for success, throw cleanup, stack diagnostics,
 //!   and a compiled callback's uncommon bailout path.
+//! - Promise executor rejection preserving the exact thrown value across GC.
 //! - A second script on the same runtime proving the activation state remains
 //!   reusable after every nested completion mode.
 //!
@@ -13,6 +14,8 @@
 //!   native boundary.
 //! - Return, throw, and JIT bailout all clean back to the native call floor.
 //! - No callback value or result crosses an allocation without a scoped root.
+//! - Promise construction catches on the same turn and roots the abrupt value
+//!   before invoking the captured reject function.
 
 use otter_runtime::{
     JitSelection, NativeCtx, NativeError, Runtime, RuntimeExecutionStats, SourceInput, Value,
@@ -175,4 +178,55 @@ fn native_scope_call_reuses_the_current_activation_stack() {
         compiled.stats.jit_reentrant_stub_transitions > 0,
         "uncommon nested callback path must cross a JIT bailout transition"
     );
+}
+
+#[test]
+fn promise_executor_rejection_preserves_the_thrown_value() {
+    let mut runtime = Runtime::builder().build().expect("runtime");
+    runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+                function churn(seed) {
+                    let tail = null;
+                    for (let i = 0; i < 24; i++) {
+                        tail = { seed, i, text: "promise-" + seed + "-" + i, tail };
+                    }
+                    return tail;
+                }
+
+                const sentinel = { id: 91 };
+                globalThis.__promiseExecutorResult = "pending";
+                new Promise(() => {
+                    const held = sentinel;
+                    const allocated = churn(100);
+                    if (held.id !== 91 || allocated.seed !== 100) {
+                        throw new Error("executor roots");
+                    }
+                    throw held;
+                }).catch(reason => {
+                    const held = reason;
+                    const allocated = churn(200);
+                    globalThis.__promiseExecutorResult =
+                        held === sentinel && allocated.seed === 200
+                            ? "same"
+                            : "wrong";
+                });
+                "scheduled";
+                "#,
+            ),
+            "promise-executor-rooting.js",
+        )
+        .expect("promise executor fixture");
+
+    let completion = runtime
+        .run_script(
+            SourceInput::from_javascript("globalThis.__promiseExecutorResult;"),
+            "promise-executor-result.js",
+        )
+        .expect("read settled rejection result")
+        .completion_string()
+        .to_owned();
+
+    assert_eq!(completion, "same");
 }

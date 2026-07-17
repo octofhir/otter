@@ -671,25 +671,26 @@ fn clear_worker_poll_timer(
     let Some(token) = object::get(worker, ctx.heap(), "__otterPoll") else {
         return Ok(());
     };
-    let clear_interval = {
-        let (interp, _exec) = ctx.interp_mut_and_context();
-        object::get(*interp.global_this(), interp.gc_heap(), "clearInterval")
-    }
-    .ok_or_else(|| {
-        type_err(
+    if ctx.execution_context().is_none() {
+        return Err(type_err(
             "Worker.terminate",
-            "clearInterval is not installed".to_string(),
-        )
-    })?;
-    let exec = ctx
-        .interp_mut_and_context()
-        .1
-        .ok_or_else(|| type_err("Worker.terminate", "missing execution context".to_string()))?;
-    let (interp, _) = ctx.interp_mut_and_context();
-    interp
-        .run_callable_sync(&exec, &clear_interval, Value::undefined(), smallvec![token])
-        .map(|_| ())
-        .map_err(vm_error_to_native)
+            "missing execution context".to_string(),
+        ));
+    }
+    ctx.scope(|mut scope| {
+        let token = scope.value(token);
+        let clear_interval = scope.global("clearInterval").ok_or_else(|| {
+            type_err(
+                "Worker.terminate",
+                "clearInterval is not installed".to_string(),
+            )
+        })?;
+        let this_value = scope.undefined();
+        scope
+            .call(clear_interval, this_value, &[token])
+            .map(|_| ())
+            .map_err(worker_reentry_error)
+    })
 }
 
 fn worker_id_from_this(ctx: &NativeCtx<'_>, name: &'static str) -> Result<u64, NativeError> {
@@ -710,11 +711,11 @@ fn worker_id_from_object(
     numeric_worker_id(&value)
 }
 
-fn vm_error_to_native(err: otter_vm::VmError) -> NativeError {
+fn worker_reentry_error(err: NativeError) -> NativeError {
     match err {
-        otter_vm::VmError::Uncaught => NativeError::Thrown {
+        NativeError::Thrown { message, .. } => NativeError::Thrown {
             name: "Worker",
-            message: err.to_string(),
+            message,
         },
         other => type_err("Worker", other.to_string()),
     }

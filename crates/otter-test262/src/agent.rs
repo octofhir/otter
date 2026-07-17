@@ -21,9 +21,9 @@
 //!   channel without thread-local state.
 //! - The shared buffer rides through the channel as an
 //!   `Arc<SharedBody>`. The receiving agent rewraps it via
-//!   [`JsArrayBuffer::from_shared_arc`] before handing it to the
-//!   user handler, so both sides observe the same backing storage
-//!   and the same `Atomics.wait` registry id.
+//!   [`otter_vm::NativeScope::shared_array_buffer`] before handing
+//!   it to the user handler, so both sides observe the same backing
+//!   storage and the same `Atomics.wait` registry id.
 //!
 //! Hardening:
 //!
@@ -48,7 +48,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use otter_runtime::{InterruptHandle, OtterError, Runtime, RuntimeGlobalInstaller, SourceInput};
-use otter_vm::binary::JsArrayBuffer;
 use otter_vm::binary::array_buffer::SharedBody;
 use otter_vm::string::JsString;
 use otter_vm::{NativeCtx, NativeError, NativeFastFn, Value};
@@ -531,7 +530,7 @@ fn agent_receive_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     let Some(rx) = rx else {
         return Err(type_err("receiveBroadcast called outside an agent thread"));
     };
-    let interrupt = ctx.interp_mut().interrupt_handle();
+    let interrupt = ctx.interrupt_handle();
     let result = loop {
         if interrupt.is_set() {
             break Err(mpsc::RecvTimeoutError::Timeout);
@@ -565,34 +564,27 @@ fn agent_receive_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
         }
     };
 
-    let (interp, exec) = ctx.interp_mut_and_context();
-    let exec = exec.ok_or_else(|| type_err("missing execution context"))?;
-
-    // Rewrap the shared buffer on this agent's heap.
-    let sab_handle = JsArrayBuffer::from_shared_arc(interp.gc_heap_mut(), msg.sab)
-        .map_err(|_| type_err("out of memory while wrapping SharedArrayBuffer"))?;
-    let sab_value = Value::array_buffer(sab_handle);
-
-    let num_value = match msg.num {
-        Some(n) => Value::number_f64(n),
-        None => Value::undefined(),
-    };
-
-    let mut args_vec = smallvec::SmallVec::<[Value; 8]>::new();
-    args_vec.push(sab_value);
-    args_vec.push(num_value);
-
-    let result = interp.run_callable_sync(&exec, &handler, Value::undefined(), args_vec);
-    let uncaught_msg = match interp.take_error_detail() {
-        Some(otter_vm::ErrorDetail::Uncaught(m)) => m.to_string(),
-        _ => String::new(),
-    };
-    result.map_err(|e| match e {
-        otter_vm::VmError::Uncaught => NativeError::Thrown {
-            name: "$262.agent.receiveBroadcast",
-            message: uncaught_msg,
-        },
-        other => type_err(other.to_string()),
+    if ctx.execution_context().is_none() {
+        return Err(type_err("missing execution context"));
+    }
+    ctx.scope(|mut scope| {
+        let handler = scope.value(handler);
+        let sab = scope
+            .shared_array_buffer(msg.sab)
+            .map_err(|_| type_err("out of memory while wrapping SharedArrayBuffer"))?;
+        let num = scope.value(match msg.num {
+            Some(n) => Value::number_f64(n),
+            None => Value::undefined(),
+        });
+        let this_value = scope.undefined();
+        match scope.call(handler, this_value, &[sab, num]) {
+            Ok(result) => Ok(scope.finish(result)),
+            Err(NativeError::Thrown { message, .. }) => Err(NativeError::Thrown {
+                name: "$262.agent.receiveBroadcast",
+                message,
+            }),
+            Err(other) => Err(type_err(other.to_string())),
+        }
     })
 }
 

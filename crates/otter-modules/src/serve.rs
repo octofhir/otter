@@ -30,7 +30,7 @@ use hyper::{Request as HyperRequest, Response as HyperResponse};
 use hyper_util::rt::TokioIo;
 use otter_runtime::{
     CapabilitySet, HostedModule, HostedModuleInstall, HostedNativeCall, OtterError, Runtime,
-    RuntimeAttr as Attr, RuntimeGlobalInstaller, RuntimeKeepAlive, RuntimeLiveness,
+    RuntimeAttr as Attr, RuntimeGlobalInstaller, RuntimeKeepAlive, RuntimeLiveness, RuntimeLocal,
     RuntimeNativeCall, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
     RuntimeNativeFn, RuntimePersistentRootId, RuntimeTask, RuntimeTaskSpawner,
     RuntimeValue as Value, SourceInput, object, runtime_this_object, runtime_with_host_data,
@@ -1028,20 +1028,27 @@ fn call_js(
     this_value: Value,
     args: SmallVec<[Value; 8]>,
 ) -> Result<Value, NativeError> {
-    let (interp, context) = ctx.interp_mut_and_context();
-    let context = context.ok_or_else(|| crate::type_error(name, "missing execution context"))?;
-    match interp.run_callable_sync(&context, &callee, this_value, args) {
-        Ok(value) => Ok(value),
-        Err(err) => {
-            if let Some(thrown) = interp.take_pending_uncaught_throw() {
-                Err(NativeError::Thrown {
-                    name,
-                    message: thrown.display_string(interp.gc_heap()),
-                })
-            } else {
-                Err(crate::type_error(name, err.to_string()))
-            }
-        }
+    if ctx.execution_context().is_none() {
+        return Err(crate::type_error(name, "missing execution context"));
+    }
+    ctx.scope(|mut scope| {
+        let callee = scope.value(callee);
+        let this_value = scope.value(this_value);
+        let args: SmallVec<[RuntimeLocal<'_>; 8]> = args
+            .into_iter()
+            .map(|argument| scope.value(argument))
+            .collect();
+        let result = scope
+            .call(callee, this_value, &args)
+            .map_err(|error| serve_reentry_error(name, error))?;
+        Ok(scope.finish(result))
+    })
+}
+
+fn serve_reentry_error(name: &'static str, error: NativeError) -> NativeError {
+    match error {
+        NativeError::Thrown { message, .. } => NativeError::Thrown { name, message },
+        other => crate::type_error(name, other.to_string()),
     }
 }
 

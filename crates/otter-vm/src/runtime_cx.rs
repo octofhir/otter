@@ -445,6 +445,12 @@ impl<'rt> NativeCtx<'rt> {
         self.call_info.new_target.is_some()
     }
 
+    /// Clone the isolate's cooperative-cancellation handle.
+    #[must_use]
+    pub fn interrupt_handle(&self) -> crate::InterruptFlag {
+        self.cx.interp.interrupt_handle()
+    }
+
     /// Borrow the GC heap immutably.
     #[must_use]
     pub fn heap(&self) -> &otter_gc::GcHeap {
@@ -1736,6 +1742,21 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         result.map_err(|error| self.vm_error(error, "NativeScope::array_buffer_from_bytes"))
     }
 
+    /// Rewrap shared backing storage as a rooted `SharedArrayBuffer`.
+    pub fn shared_array_buffer(
+        &mut self,
+        body: std::sync::Arc<crate::binary::array_buffer::SharedBody>,
+    ) -> Result<Local<'scope>, NativeError> {
+        let buffer =
+            crate::binary::JsArrayBuffer::from_shared_arc(self.ctx.cx.interp.gc_heap_mut(), body)
+                .map_err(|error| NativeError::OutOfMemory {
+                name: "NativeScope::shared_array_buffer",
+                requested_bytes: error.requested_bytes(),
+                heap_limit_bytes: error.heap_limit_bytes(),
+            })?;
+        Ok(self.value(Value::array_buffer(buffer)))
+    }
+
     /// Allocate a JavaScript string from UTF-8.
     pub fn string(&mut self, text: &str) -> Result<Local<'scope>, NativeError> {
         let result = self.ctx.cx.interp.scoped_string(self.token, text);
@@ -2213,11 +2234,27 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         this_value: Local<'_>,
         args: &[Local<'_>],
     ) -> Result<Local<'scope>, NativeError> {
+        self.call_vm(target, this_value, args)
+            .map_err(|error| self.vm_error(error, "NativeScope::call"))
+    }
+
+    /// VM-internal variant of [`Self::call`] that keeps the exact abrupt
+    /// completion available to algorithms which must catch it as a JavaScript
+    /// value (notably the Promise constructor).
+    pub(crate) fn call_vm(
+        &mut self,
+        target: Local<'_>,
+        this_value: Local<'_>,
+        args: &[Local<'_>],
+    ) -> Result<Local<'scope>, VmError> {
+        let context = self.ctx.context.clone().ok_or(VmError::InvalidOperand)?;
         let target = self.raw(target);
         let this_value = self.raw(this_value);
         let args: smallvec::SmallVec<[Value; 8]> =
             args.iter().map(|value| self.raw(*value)).collect();
-        let result = self.ctx.call_owned(target, this_value, args)?;
+        let result = self.ctx.cx.with_parts(|interp, stack| {
+            interp.run_callable_sync_rooted(stack, &context, &target, this_value, args)
+        })?;
         Ok(self.value(result))
     }
 

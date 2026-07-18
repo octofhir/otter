@@ -7,8 +7,8 @@
     }
   },
   "provenance": {
-    "capturedAtUnixMs": 1784402360957,
-    "commit": "640c07fc13f55003da81e7f0c41611bed13ecbab",
+    "capturedAtUnixMs": 1784403525070,
+    "commit": "84642327c3758a822d3248ec6600b931ab11070f",
     "dirty": false,
     "platform": {
       "os": "macos",
@@ -41,15 +41,15 @@
       "direction": "lower-is-better",
       "role": "primary",
       "samples": [
-        1135102375,
-        1104242500,
-        1090771667,
-        1118708084,
-        1165571292
+        1119551792,
+        1077714000,
+        1084824416,
+        1068469833,
+        1069287000
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 1118708084
+        "value": 1077714000
       }
     },
     {
@@ -58,15 +58,15 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
-        1133328208,
-        1103000625,
-        1089405542,
-        1117458042,
-        1164306417
+        1118183333,
+        1076504667,
+        1083484625,
+        1067246125,
+        1068086792
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 1117458042
+        "value": 1076504667
       }
     },
     {
@@ -92,15 +92,15 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
-        33485875,
-        32084625,
-        32103167,
-        34908626,
-        35891375
+        33676834,
+        31960794,
+        31218917,
+        31457791,
+        31560041
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 33485875
+        "value": 31560041
       }
     },
     {

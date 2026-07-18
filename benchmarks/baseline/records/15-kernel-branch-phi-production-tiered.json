@@ -1,0 +1,127 @@
+{
+  "benchmark": {
+    "suite": "engine",
+    "name": "kernel-branch-phi",
+    "parameters": {
+      "expected": "-6000000",
+      "function": "engineKernel",
+      "source": "benchmarks/scripts/branch-phi.js"
+    }
+  },
+  "provenance": {
+    "capturedAtUnixMs": 1784371581723,
+    "commit": "8739ff7b992cd4859ce543e61f0a6139749542c7",
+    "dirty": false,
+    "platform": {
+      "os": "macos",
+      "arch": "aarch64",
+      "kernel": "Darwin 25.5.0",
+      "cpu": "aarch64"
+    },
+    "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2",
+    "buildProfile": "release"
+  },
+  "configuration": {
+    "surface": "vm",
+    "jitPolicy": "production-tiered",
+    "jitOsrThreshold": null,
+    "gcPolicy": "normal",
+    "gcStressStride": null,
+    "runtimeReuse": "not-applicable",
+    "cacheState": "not-applicable"
+  },
+  "sampling": {
+    "warmupCount": 5,
+    "sampleCount": 20,
+    "iterationsPerSample": 1,
+    "timeoutMs": null
+  },
+  "metrics": [
+    {
+      "name": "wall-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "primary",
+      "samples": [
+        7505875,
+        7144583,
+        7576667,
+        7445583,
+        7373042,
+        7461542,
+        7160791,
+        7565667,
+        7352417,
+        7268416,
+        7348500,
+        7174666,
+        7501250,
+        7405917,
+        7821000,
+        7320291,
+        7598000,
+        7108916,
+        7361625,
+        7197958
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 7367333.5
+      }
+    },
+    {
+      "name": "execution-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        7505875,
+        7144583,
+        7576667,
+        7445583,
+        7373042,
+        7461542,
+        7160791,
+        7565667,
+        7352417,
+        7268416,
+        7348500,
+        7174666,
+        7501250,
+        7405917,
+        7821000,
+        7320291,
+        7598000,
+        7108916,
+        7361625,
+        7197958
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 7367333.5
+      }
+    }
+  ],
+  "outcome": {
+    "status": "validated",
+    "validationMarker": "return=-6000000;bits=0xc156e36000000000;function=engineKernel",
+    "processExitCode": null,
+    "failure": null
+  },
+  "command": [
+    "target/release/otter-engine-benchmark",
+    "kernel",
+    "--source",
+    "benchmarks/scripts/branch-phi.js",
+    "--function",
+    "engineKernel",
+    "--expected",
+    "-6000000",
+    "--jit-tier",
+    "production-tiered",
+    "--samples",
+    "20",
+    "--warmup",
+    "5"
+  ]
+}

@@ -2213,7 +2213,7 @@ impl Interpreter {
                         .exec_register(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_neg_regs(frame, dst, src)?;
+                    self.run_neg_regs(frame, dst, src, feedback)?;
                     continue;
                 }
                 Op::BitwiseNot => {

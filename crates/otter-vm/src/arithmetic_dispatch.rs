@@ -10,6 +10,7 @@
 //!   native tiers.
 //! - Value-in/value-out arithmetic kernels independent of frame storage.
 //! - Register-based binary numeric dispatch.
+//! - Unary/update feedback publication for optimizing-tier specialization.
 //! - `+` string-or-numeric dispatch.
 //! - Relational comparison dispatch.
 //! - BigInt adapter functions used by opcode arms.
@@ -334,8 +335,12 @@ impl Interpreter {
         frame: &mut Frame,
         dst: u16,
         src: u16,
+        feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
         let value = *read_register(frame, src)?;
+        if let Some(feedback) = feedback {
+            feedback.record_arith(value, value);
+        }
         let result = self.neg_value(value)?;
         commit_frame_result(frame, dst, result)
     }

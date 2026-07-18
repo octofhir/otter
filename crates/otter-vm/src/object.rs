@@ -2078,20 +2078,13 @@ pub(crate) fn store_own_data_slot_atom(
     hit: AtomOwnPropertyHit,
     value: &Value,
 ) -> Option<()> {
-    let mut obj = obj;
-    let compressed = compress_or_abort(heap, &mut obj, *value);
-    // Every pre-write guard reads the same immutable body under `&heap` (to walk
-    // the hidden class) — no mutation runs between them — so a single payload
-    // snapshot computes them all instead of re-indexing the slot table four
-    // times. Shaped receivers match on the interned shape handle (one offset
-    // compare, no shape-body deref); dictionary mode falls back to the per-object
-    // shape id plus a name compare. See `load_own_data_slot_atom`. The per-slot
-    // attributes are read under the same shape the write below revalidates, so
-    // `with_payload` (which cannot reborrow the heap to walk the hidden class)
-    // sees a consistent `(writable, is_accessor)` pair.
-    let (mapped_cell, shape_ok, key_matches, slot_attrs) = heap.read_payload(obj, |body| {
+    // Validate before compressing. Boxing a double or wide int32 may scavenge
+    // and relocate `obj`; a failed IC probe cannot communicate that relocated
+    // handle to its caller, which still owns the canonical rooted slot. A miss
+    // must therefore remain allocation-free so fallback can safely re-read or
+    // reuse the caller's receiver.
+    let guard_matches = heap.read_payload(obj, |body| {
         let offset = hit.slot as usize;
-        let mapped_cell = mapped_argument_cell(body, key.name());
         let shape_ok = if !body.shape.is_null() {
             body.shape == hit.shape
         } else {
@@ -2100,35 +2093,33 @@ pub(crate) fn store_own_data_slot_atom(
         let key_matches = !body.shape.is_null() || body_key_matches(heap, body, offset, key.name());
         let slot_attrs =
             (offset < body_property_count(heap, body)).then(|| body.slot_attrs(heap, offset));
-        (mapped_cell, shape_ok, key_matches, slot_attrs)
+        shape_ok
+            && key.atom().id() == hit.atom_id
+            && key_matches
+            && slot_attrs.is_some_and(|(flags, is_accessor)| flags.writable() && !is_accessor)
     });
-    debug_assert!(
-        !shape_ok
-            || heap.read_payload(obj, |body| body_key_matches(
-                heap,
-                body,
-                hit.slot as usize,
-                key.name()
-            )),
-        "shape-id store hit resolved to a slot whose key differs from the request"
-    );
-    let success = heap.with_payload(obj, |body| {
-        let offset = hit.slot as usize;
-        if !shape_ok || key.atom().id() != hit.atom_id || !key_matches {
-            return false;
-        }
-        let Some((flags, is_accessor)) = slot_attrs else {
-            return false;
-        };
-        if !flags.writable() || is_accessor {
-            return false;
-        }
-        body.set_data_value(offset, compressed);
-        true
-    });
-    if !success {
+    if !guard_matches {
         return None;
     }
+    debug_assert!(
+        heap.read_payload(obj, |body| body_key_matches(
+            heap,
+            body,
+            hit.slot as usize,
+            key.name()
+        )),
+        "shape-id store hit resolved to a slot whose key differs from the request"
+    );
+
+    let mut obj = obj;
+    let compressed = compress_or_abort(heap, &mut obj, *value);
+    // `mapped_cell` is itself movable. Re-read it only after boxing has
+    // refreshed `obj` from the allocation root.
+    let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key.name()));
+    heap.with_payload(obj, |body| {
+        let offset = hit.slot as usize;
+        body.set_data_value(offset, compressed);
+    });
     if let Some(cell) = mapped_cell {
         store_upvalue(heap, cell, *value);
     }
@@ -4264,6 +4255,14 @@ mod tests {
         GcHeap::new().expect("init heap")
     }
 
+    fn total_allocations(heap: &mut GcHeap) -> u64 {
+        heap.gc_stats()
+            .by_type
+            .iter()
+            .map(|row| row.alloc_count_total)
+            .sum()
+    }
+
     #[test]
     fn empty_object_starts_with_zero_props() {
         let mut heap = fresh_heap();
@@ -4698,20 +4697,33 @@ mod tests {
         );
         let hit = lookup_own_atom(o, &heap, key).hit.expect("atom hit");
 
+        let allocations_before_hit = total_allocations(&mut heap);
         assert_eq!(
-            store_own_data_slot_atom(o, &mut heap, key, hit, &Value::boolean(false)),
+            store_own_data_slot_atom(o, &mut heap, key, hit, &Value::number_f64(1.25)),
             Some(())
         );
+        assert!(
+            total_allocations(&mut heap) > allocations_before_hit,
+            "a matching store IC must still box and commit its numeric RHS"
+        );
         assert_eq!(
-            load_own_data_slot_atom(o, &heap, key, hit),
-            Some(Value::boolean(false))
+            load_own_data_slot_atom(o, &heap, key, hit)
+                .and_then(|value| value.as_number())
+                .map(|number| number.as_f64()),
+            Some(1.25)
         );
 
         set(&mut o, &mut heap, "y", Value::null());
 
+        let allocations_before_miss = total_allocations(&mut heap);
         assert_eq!(
-            store_own_data_slot_atom(o, &mut heap, key, hit, &Value::boolean(true)),
+            store_own_data_slot_atom(o, &mut heap, key, hit, &Value::number_f64(1.25)),
             None
+        );
+        assert_eq!(
+            total_allocations(&mut heap),
+            allocations_before_miss,
+            "a rejected store IC must validate before boxing its numeric RHS"
         );
     }
 
@@ -4767,15 +4779,21 @@ mod tests {
         let second = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(second, &mut heap, Some(proto));
 
+        let allocations_before_miss = total_allocations(&mut heap);
         assert_eq!(
             replay_store_property_transition(
                 second,
                 &mut heap,
                 key,
                 &transition,
-                &Value::boolean(false),
+                &Value::number_f64(1.25),
             ),
             None
+        );
+        assert_eq!(
+            total_allocations(&mut heap),
+            allocations_before_miss,
+            "a rejected transition replay must validate before boxing its numeric RHS"
         );
     }
 

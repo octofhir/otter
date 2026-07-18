@@ -4,6 +4,7 @@
 //! - [`CompiledCode`] — owns a finalized W^X executable mapping plus its entry
 //!   offset, and hands out a raw entry pointer for the caller to transmute and
 //!   call.
+//! - AArch64 byte publication for relocation-free secondary code generators.
 //!
 //! # Invariants
 //! - The executable mapping lives exactly as long as the [`CompiledCode`]; the
@@ -34,6 +35,35 @@ impl CompiledCode {
             buf,
             entry: entry.0,
         }
+    }
+
+    /// Copy relocation-free AArch64 machine bytes into the canonical dynasm
+    /// W^X allocation and publish `entry_offset` as the compiled entry.
+    ///
+    /// Secondary code generators produce ordinary non-executable bytes only;
+    /// this constructor deliberately keeps executable-memory ownership,
+    /// instruction-cache synchronization, and lifetime in [`CompiledCode`].
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn from_aarch64_bytes(
+        bytes: &[u8],
+        entry_offset: usize,
+    ) -> Result<Self, crate::Unsupported> {
+        if bytes.is_empty()
+            || !bytes.len().is_multiple_of(4)
+            || !entry_offset.is_multiple_of(4)
+            || entry_offset >= bytes.len()
+        {
+            return Err(crate::Unsupported::OperandShape(
+                "relocation-free AArch64 code bytes",
+            ));
+        }
+        let mut assembler = dynasmrt::aarch64::Assembler::new_with_capacity(bytes.len())
+            .map_err(|_| crate::Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
+        assembler.extend(bytes.iter().copied());
+        let buffer = assembler
+            .finalize()
+            .map_err(|_| crate::Unsupported::Backend(crate::BackendFailure::Finalization))?;
+        Ok(Self::new(buffer, AssemblyOffset(entry_offset)))
     }
 
     /// Raw pointer to the entry instruction of the compiled code.

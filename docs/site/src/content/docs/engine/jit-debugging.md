@@ -89,7 +89,7 @@ identity, entry kind, bytecode size, code size, and explicit `filesPresent` /
 | --- | --- |
 | `bytecode.txt` | Deterministic logical-PC and encoded-byte-PC listing. |
 | `template-plan.txt` | The already-built template lowering plan and its decoded operand side buffers. |
-| `optimized-ir.txt` | The already-built optimizing unit in deterministic reverse-postorder. |
+| `optimized-ir.txt` | The input owned by the selected optimizing backend: Otter's deterministic reverse-postorder unit or Cranelift IR for a numeric leaf. |
 | `code.bin` | Exact finalized executable bytes for this runtime process. |
 | `code-normalized.bin` | Non-executable semantic instruction stream with symbolic relocations and logical branch targets. |
 | `asm.txt` | Versioned annotated AArch64 assembly over the exact bytes in `code.bin`. |
@@ -105,6 +105,27 @@ as a portable golden file.
 All native locations are offsets into the matching `code.bin`, never absolute
 executable addresses. A range must satisfy
 `0 <= startOffset <= endOffset <= manifest.codeBytes`.
+
+The first line of `optimized-ir.txt` identifies the backend. The general Otter
+backend starts with its optimized-unit banner. A Cranelift numeric leaf starts
+with:
+
+```text
+; backend=cranelift numeric-leaf
+; parameters=<n> registers=<n> arithmetic-ops=<n>
+```
+
+The remaining text is the exact CLIF function compiled for that code object.
+Its `code-map.json` contains a `craneliftNumericLeaf` structural region,
+bytecode-PC/opcode instruction ranges, and explicit `craneliftBackendGlue`
+ranges for entry guards, backend scaffolding, and padding that has no
+JavaScript operation identity. Every four-byte machine instruction is covered
+by an instruction or glue range. Cranelift ranges deliberately omit
+`operationIndex`: CLIF text does not expose Otter optimizer operation ids, so a
+synthetic join key would be misleading. Because this subset is pure,
+call-free, and restartable before effects, its relocation, safepoint, and
+deopt inventories are empty. These files still belong to the same optimizing
+artifact contract; there is no parallel tier or format generation.
 
 ## Annotated ARM64 assembly
 
@@ -140,13 +161,14 @@ L<8-hex-offset>:
 Comments are derived from metadata the compiler already owns. They identify
 the overlapping `code-map.json` region and, when applicable, its function,
 logical/encoded bytecode PC, template operation or optimized-IR operation,
-structural block/edge, OSR entry, or deopt exit. A baked address load is
-replaced by one offset-bearing `relocation …` pseudo-line with the typed
-symbolic target from `relocations.json`; its resolved pointer and immediate
-chunks are deliberately redacted. Instruction annotations use stable `pc=`
-and `tier-op=` fields for bytecode/tier correlation. Use `code.bin` when exact
-executable bytes matter and `code-normalized.bin` for portable cross-process
-comparisons.
+structural block/edge/backend glue, OSR entry, or deopt exit. A baked address
+load is replaced by one offset-bearing `relocation …` pseudo-line with the
+typed symbolic target from `relocations.json`; its resolved pointer and
+immediate chunks are deliberately redacted. Instruction annotations use stable
+`pc=` and `tier-op=` fields for bytecode/tier correlation; explicit backend
+glue ranges prevent unattributed holes without inventing a source PC. Use
+`code.bin` when exact executable bytes matter and `code-normalized.bin` for
+portable cross-process comparisons.
 
 All joins use the same `code.bin` offset basis:
 
@@ -199,7 +221,8 @@ fallback:
 2. Capture `--jit-events` and find the function's `compilePrepared`,
    `compileFinished`, OSR, bail, or deopt records.
 3. Join a successful `compileFinished` to `manifest.json` by `codeObjectId`.
-4. Read `bytecode.txt` and the tier input to identify the logical operation.
+4. Read `bytecode.txt` and the first line of the tier input to identify the
+   backend and logical operation.
 5. Use `code-map.json` to map its logical PC and encoded byte PC to the exact
    native byte range.
 6. Open `asm.txt` at the matching `+0x<8-hex>:` offset to inspect the emitted

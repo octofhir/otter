@@ -2427,6 +2427,9 @@ dependencies = [
 name = "otter-jit"
 version = "0.1.0"
 dependencies = [
+ "cranelift-codegen",
+ "cranelift-frontend",
+ "cranelift-native",
  "dynasm",
  "dynasmrt",
  "otter-bytecode",

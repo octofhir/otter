@@ -3,10 +3,12 @@
 //! The baseline compiler is a Sparkplug-style template macro-assembler that
 //! lowers Otter register bytecode directly to native machine code with no
 //! register allocation or deopt. Backend-independent optimizing analyses are
-//! inert until a separate compiler consumes them. Native execution reuses the
-//! interpreter's frame array and explicit safepoint records for moving-GC
-//! rooting. Backend chosen by the `JIT_DESIGN.md` §3.2 prototype gate
-//! (dynasm-rs template assembler).
+//! consumed by the general optimizing emitter, while profitable straight-line
+//! Number leaves use Cranelift inside the same optimizing tier. Native
+//! execution reuses the interpreter's frame array and explicit safepoint
+//! records for moving-GC rooting. Cranelift produces relocation-free bytes
+//! only; the existing dynasm-backed [`CompiledCode`] remains the sole W^X
+//! executable-memory owner.
 //!
 //! # Contents
 //! - [`CompiledCode`] — a finalized, owned block of W^X executable machine code
@@ -81,6 +83,9 @@ pub struct OtterJitCompiler {
     /// safely outlive this compiler hook.
     #[cfg(target_arch = "aarch64")]
     call_trampoline: Result<std::sync::Arc<arm64::CallTrampoline>, Unsupported>,
+    /// Immutable host ISA used only by the profitable numeric-leaf backend.
+    #[cfg(target_arch = "aarch64")]
+    numeric_leaf_backend: Option<optimizing::NumericLeafBackend>,
 }
 
 impl Default for OtterJitCompiler {
@@ -114,11 +119,17 @@ impl OtterJitCompiler {
         let transitions = TransitionTable::resolve();
         #[cfg(target_arch = "aarch64")]
         let call_trampoline = arm64::CallTrampoline::compile(&transitions).map(std::sync::Arc::new);
+        #[cfg(target_arch = "aarch64")]
+        let numeric_leaf_backend = (policy == JitTierPolicy::ProductionTiered)
+            .then(optimizing::NumericLeafBackend::for_host)
+            .flatten();
         Self {
             policy,
             transitions,
             #[cfg(target_arch = "aarch64")]
             call_trampoline,
+            #[cfg(target_arch = "aarch64")]
+            numeric_leaf_backend,
         }
     }
 }
@@ -223,6 +234,8 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
                     request.code_object_id,
                     &self.transitions,
                     std::sync::Arc::clone(call_trampoline),
+                    self.numeric_leaf_backend.as_ref(),
+                    request.osr_pc,
                     artifact_request,
                 )
             });

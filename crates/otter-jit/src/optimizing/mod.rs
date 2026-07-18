@@ -1,12 +1,13 @@
-//! Feedback-guided optimizing tier for reducible numeric and element-access functions.
+//! Feedback-guided optimizing tier with specialized and general AArch64 backends.
 //!
-//! This module compiles multi-block int32 and float64 arithmetic functions,
-//! including reducible loops entered at function entry or by on-stack
-//! replacement at a hot loop header. It runs
-//! the complete CFG, dominance, SSA, liveness, register-allocation,
-//! representation, frame-state, and deopt-lowering pipeline before the arm64
-//! backend checks the deliberately narrow eligibility contract. CFG edges
-//! carry sequentialized phi moves, while every back-edge polls the VM thread's
+//! Profitable straight-line, side-effect-free Number leaves first use a narrow
+//! Cranelift backend. Other supported functions run the complete CFG,
+//! dominance, SSA, liveness, register-allocation, representation, frame-state,
+//! and deopt-lowering pipeline before the general AArch64 emitter checks its
+//! eligibility contract. That path compiles multi-block int32 and float64
+//! arithmetic, element access, and reducible loops entered at function entry
+//! or by on-stack replacement at a hot loop header. CFG edges carry
+//! sequentialized phi moves, while every back-edge polls the VM thread's
 //! interrupt and fuel cells before returning to its dominating header.
 //! Installed code enters through the shared reentrant `JitCtx` ABI and
 //! homes transition operands in the canonical native register window and
@@ -15,6 +16,7 @@
 //! # Contents
 //! - [`compile_optimized`] — whole-pipeline compilation entry point.
 //! - [`OptimizedCode`] — executable code plus deopt and allocation metadata.
+//! - `cranelift` — restartable, call-free Number leaves.
 //! - `pipeline` / `unit` — backend-neutral orchestration and its owned,
 //!   verified analysis product.
 //!
@@ -35,6 +37,10 @@
 //! - Bail writeback is generated from the same [`DeoptTable`] published with
 //!   the code object; every interpreter register and the exact logical resume
 //!   PC are published before return.
+//! - Cranelift leaves mutate no VM slot and guard every parameter before
+//!   arithmetic, so a miss restarts at logical PC zero before effects.
+//! - Every backend publishes bytes through the same [`CompiledCode`], code
+//!   registry, native-frame kind, artifact bundle, and W^X lifecycle.
 //!
 //! # See also
 //! - [`crate::ir`] — the reusable optimizing analyses consumed here.
@@ -59,8 +65,13 @@ use crate::{
 mod arm64;
 #[cfg(target_arch = "aarch64")]
 mod artifact;
+#[cfg(target_arch = "aarch64")]
+mod cranelift;
 pub(crate) mod pipeline;
 pub(crate) mod unit;
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) use cranelift::NumericLeafBackend;
 
 /// Deterministic metadata for one optimized compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,15 +290,26 @@ impl JitFunctionCode for OptimizedCode {
     }
 }
 
-/// Compile the minimal numeric optimizing subset after running every existing IR
-/// analysis, or return [`Unsupported`] without producing executable code.
+/// Compile through the first eligible backend of the existing optimizing tier,
+/// or return [`Unsupported`] without producing executable code.
 #[cfg(target_arch = "aarch64")]
 pub fn compile_optimized(
     view: &JitCompileSnapshot,
     code_object_id: u64,
 ) -> Result<OptimizedCode, Unsupported> {
     let transitions = TransitionTable::resolve();
-    arm64::compile_with_transitions(view, code_object_id, &transitions)
+    let call_trampoline = std::sync::Arc::new(CallTrampoline::compile(&transitions)?);
+    let numeric_leaf = NumericLeafBackend::for_host();
+    compile_optimized_with_artifacts(
+        view,
+        code_object_id,
+        &transitions,
+        call_trampoline,
+        numeric_leaf.as_ref(),
+        None,
+        None,
+    )
+    .map(|output| output.code)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -296,8 +318,21 @@ pub(crate) fn compile_optimized_with_artifacts(
     code_object_id: u64,
     transitions: &TransitionTable,
     call_trampoline: std::sync::Arc<CallTrampoline>,
+    numeric_leaf: Option<&NumericLeafBackend>,
+    osr_pc: Option<u32>,
     artifact_request: Option<crate::artifact::ArtifactRequest>,
 ) -> Result<crate::artifact::NativeCompileOutput<OptimizedCode>, Unsupported> {
+    if let Some(numeric_leaf) = numeric_leaf
+        && let Some(output) = numeric_leaf.try_compile(
+            view,
+            code_object_id,
+            std::sync::Arc::clone(&call_trampoline),
+            osr_pc,
+            artifact_request.clone(),
+        )?
+    {
+        return Ok(output);
+    }
     arm64::compile_with_trampoline_artifacts(
         view,
         code_object_id,

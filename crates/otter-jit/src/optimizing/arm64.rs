@@ -274,6 +274,7 @@ fn compile(view: &JitCompileSnapshot, code_object_id: u64) -> Result<OptimizedCo
     compile_with_transitions(view, code_object_id, &transitions)
 }
 
+#[cfg(test)]
 pub(super) fn compile_with_transitions(
     view: &JitCompileSnapshot,
     code_object_id: u64,
@@ -283,6 +284,7 @@ pub(super) fn compile_with_transitions(
     compile_with_trampoline(view, code_object_id, transitions, call_trampoline)
 }
 
+#[cfg(test)]
 pub(super) fn compile_with_trampoline(
     view: &JitCompileSnapshot,
     code_object_id: u64,

@@ -7,7 +7,8 @@
 //! - label lowering
 //!
 //! # Invariants
-//! - Statement lowering leaves expression results in the current scratch register when needed.
+//! - Statement lowering keeps transient results in scratch registers and may
+//!   lower a declaration initializer directly into its register-backed binding.
 //!
 //! # See also
 //! - `for_loops` and `try_catch`
@@ -347,8 +348,16 @@ pub(crate) fn compile_statement(
                         }
                         // §14.3.1.2 — `BindingIdentifier = AnonymousFunction`
                         // infers the binding's name.
-                        let init_reg =
-                            crate::expr::compile_expr_with_inferred_name(cx, init, &name, span)?;
+                        let init_reg = match cx.lookup_binding(&name).map(|info| info.storage) {
+                            Some(BindingStorage::Register { reg }) => {
+                                crate::expr::compile_expr_into_with_inferred_name(
+                                    cx, init, &name, reg, span,
+                                )?
+                            }
+                            _ => {
+                                crate::expr::compile_expr_with_inferred_name(cx, init, &name, span)?
+                            }
+                        };
                         emit_var_binding_store(cx, &name, init_reg, span)?;
                         continue;
                     }
@@ -412,9 +421,16 @@ pub(crate) fn compile_statement(
                     let init_reg = match &declarator.init {
                         // §14.3.1.2 — NamedEvaluation infers the binding name
                         // for an anonymous function initializer.
-                        Some(init) => {
-                            crate::expr::compile_expr_with_inferred_name(cx, init, &name, span)?
-                        }
+                        Some(init) => match storage {
+                            BindingStorage::Register { reg } => {
+                                crate::expr::compile_expr_into_with_inferred_name(
+                                    cx, init, &name, reg, span,
+                                )?
+                            }
+                            BindingStorage::Upvalue { .. } => {
+                                crate::expr::compile_expr_with_inferred_name(cx, init, &name, span)?
+                            }
+                        },
                         None => {
                             let dst = cx.alloc_scratch();
                             cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);

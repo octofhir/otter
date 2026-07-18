@@ -252,6 +252,53 @@ mod tests {
     }
 
     #[test]
+    fn binary_initializer_writes_its_register_binding_directly() {
+        let module =
+            compile_script_src("function add(left, right) { var sum = left + right; return sum; }");
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name == "add")
+            .expect("compiled add");
+
+        assert_eq!(
+            function
+                .code
+                .iter()
+                .filter(|instruction| instruction.op == Op::StoreLocal)
+                .count(),
+            0,
+            "binary initializer should write the binding register directly"
+        );
+    }
+
+    #[test]
+    fn branch_initializers_keep_one_shared_destination() {
+        let module = compile_script_src(
+            "function choose(flag, left, right) {
+                let logical = flag && left;
+                let conditional = flag ? logical : right;
+                return conditional;
+            }",
+        );
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name == "choose")
+            .expect("compiled choose");
+
+        assert_eq!(
+            function
+                .code
+                .iter()
+                .filter(|instruction| instruction.op == Op::StoreLocal)
+                .count(),
+            4,
+            "logical and conditional branches should write only their shared destinations"
+        );
+    }
+
+    #[test]
     fn captured_formal_still_initializes_its_upvalue_cell() {
         let module =
             compile_script_src("function capture(value) { return () => value; } capture(1);");

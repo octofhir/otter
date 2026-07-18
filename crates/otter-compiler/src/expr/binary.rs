@@ -4,6 +4,13 @@
 //! - [`compile_binary`] — lowers ordinary binary expressions.
 //! - [`compile_logical`] — lowers logical short-circuit expressions.
 //! - [`compile_private_in`] — lowers private-name membership probes.
+//! - Destination-aware variants reuse a caller-owned result register.
+//!
+//! # Invariants
+//! - Left-to-right evaluation and observable coercion order are preserved.
+//! - An explicit destination changes only the final result location; operand
+//!   values remain independent snapshots.
+//! - Logical branches converge on one reserved result register.
 //!
 //! # See also
 //! - [`super`] — expression dispatch and shared helpers.
@@ -91,16 +98,24 @@ pub(crate) fn compile_logical(
     l: &LogicalExpression<'_>,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
+    let destination = cx.alloc_scratch();
+    compile_logical_into(cx, l, span, destination)
+}
+
+pub(crate) fn compile_logical_into(
+    cx: &mut Compiler,
+    l: &LogicalExpression<'_>,
+    span: (u32, u32),
+    destination: u16,
+) -> Result<u16, CompileError> {
     let _ = span;
     let span = (l.span.start, l.span.end);
     // Lower `a && b`, `a || b`, `a ?? b` with short-circuit
-    // semantics. The result lands in a fresh register and
-    // both branches store into the same slot.
+    // semantics. Both branches store into the same caller-owned slot.
     let left = compile_expr(cx, &l.left, span)?;
-    let dst = cx.alloc_scratch();
     cx.emit(
         Op::StoreLocal,
-        [Operand::Register(left), Operand::Imm32(dst as i32)],
+        [Operand::Register(left), Operand::Imm32(destination as i32)],
         span,
     );
     // Note: locals and scratch share the same register
@@ -124,19 +139,11 @@ pub(crate) fn compile_logical(
             let right = compile_expr(cx, &l.right, span)?;
             cx.emit(
                 Op::StoreLocal,
-                [Operand::Register(right), Operand::Imm32(dst as i32)],
+                [Operand::Register(right), Operand::Imm32(destination as i32)],
                 span,
             );
             cx.patch_branch_to_here(skip);
-            return Ok({
-                let out = cx.alloc_scratch();
-                cx.emit(
-                    Op::LoadLocal,
-                    [Operand::Register(out), Operand::Imm32(dst as i32)],
-                    span,
-                );
-                out
-            });
+            return Ok(destination);
         }
     };
     // Falling here for `&&` / `||`: evaluate `right` and
@@ -144,17 +151,11 @@ pub(crate) fn compile_logical(
     let right = compile_expr(cx, &l.right, span)?;
     cx.emit(
         Op::StoreLocal,
-        [Operand::Register(right), Operand::Imm32(dst as i32)],
+        [Operand::Register(right), Operand::Imm32(destination as i32)],
         span,
     );
     cx.patch_branch_to_here(short_circuit);
-    let out = cx.alloc_scratch();
-    cx.emit(
-        Op::LoadLocal,
-        [Operand::Register(out), Operand::Imm32(dst as i32)],
-        span,
-    );
-    Ok(out)
+    Ok(destination)
 }
 
 pub(crate) fn compile_private_in(
@@ -183,6 +184,24 @@ pub(crate) fn compile_binary(
     cx: &mut Compiler,
     b: &BinaryExpression<'_>,
     span: (u32, u32),
+) -> Result<u16, CompileError> {
+    compile_binary_to(cx, b, span, None)
+}
+
+pub(crate) fn compile_binary_into(
+    cx: &mut Compiler,
+    b: &BinaryExpression<'_>,
+    span: (u32, u32),
+    destination: u16,
+) -> Result<u16, CompileError> {
+    compile_binary_to(cx, b, span, Some(destination))
+}
+
+fn compile_binary_to(
+    cx: &mut Compiler,
+    b: &BinaryExpression<'_>,
+    span: (u32, u32),
+    destination: Option<u16>,
 ) -> Result<u16, CompileError> {
     let _ = span;
     let span = (b.span.start, b.span.end);
@@ -338,7 +357,7 @@ pub(crate) fn compile_binary(
         _ => (lhs, rhs),
     };
     cx.reset_scratch(mark);
-    let dst = cx.alloc_scratch();
+    let dst = destination.unwrap_or_else(|| cx.alloc_scratch());
     cx.emit(
         op,
         vec![

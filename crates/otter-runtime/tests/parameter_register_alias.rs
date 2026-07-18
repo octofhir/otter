@@ -4,6 +4,7 @@
 //! - Plain reads and writes through incoming argument registers.
 //! - Sloppy duplicate formal parameters.
 //! - Captured and mapped-arguments parameters that remain upvalue-backed.
+//! - Expression reads snapshot a register before later operands can mutate it.
 //! - Interpreter, template, and production-tier parity.
 //!
 //! # Invariants
@@ -36,12 +37,28 @@ function mapped(value) {
   return value;
 }
 
+function first(value) {
+  return value;
+}
+
+function binarySnapshot() {
+  let value = 1;
+  return value + (value = 2);
+}
+
+function argumentSnapshot() {
+  let value = 1;
+  return first(value, value = 2);
+}
+
 for (let i = 0; i < 100; i++) {
   add(i, 1);
   increment(i);
   duplicate(i, i + 1);
   capture(i)();
   mapped(i);
+  binarySnapshot();
+  argumentSnapshot();
 }
 
 JSON.stringify([
@@ -49,7 +66,9 @@ JSON.stringify([
   increment(1),
   duplicate(1, 2),
   capture(7)(),
-  mapped(1)
+  mapped(1),
+  binarySnapshot(),
+  argumentSnapshot()
 ]);
 "#;
 
@@ -76,6 +95,6 @@ fn parameter_storage_matches_across_execution_tiers() {
         JitSelection::Template,
         JitSelection::ProductionTiered,
     ] {
-        assert_eq!(run(selection), "[42,2,2,7,9]", "{selection:?}");
+        assert_eq!(run(selection), "[42,2,2,7,9,3,1]", "{selection:?}");
     }
 }

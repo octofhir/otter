@@ -6,6 +6,11 @@
 //! - [`compile_regexp_literal`] — lowers regular expression literals.
 //! - [`compile_numeric_literal`] — lowers numeric literals.
 //! - [`compile_boolean_literal`] — lowers boolean literals.
+//! - Destination-aware variants lower directly into an existing register.
+//!
+//! # Invariants
+//! - Each successful literal lowering writes exactly one result register.
+//! - BigInt and RegExp payloads are validated before their load is emitted.
 //!
 //! # See also
 //! - [`super`] — expression dispatch and shared helpers.
@@ -18,8 +23,17 @@ pub(crate) fn compile_string_literal(
     lit: &StringLiteral<'_>,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
+    let destination = cx.alloc_scratch();
+    compile_string_literal_into(cx, lit, span, destination)
+}
+
+pub(crate) fn compile_string_literal_into(
+    cx: &mut Compiler,
+    lit: &StringLiteral<'_>,
+    span: (u32, u32),
+    destination: u16,
+) -> Result<u16, CompileError> {
     let _ = span;
-    let dst = cx.alloc_scratch();
     let const_idx = if lit.lone_surrogates {
         let utf16 = decode_lone_surrogate_string(&lit.value);
         cx.intern_utf16_string_constant(utf16)
@@ -28,10 +42,13 @@ pub(crate) fn compile_string_literal(
     };
     cx.emit(
         Op::LoadString,
-        [Operand::Register(dst), Operand::ConstIndex(const_idx)],
+        [
+            Operand::Register(destination),
+            Operand::ConstIndex(const_idx),
+        ],
         (lit.span.start, lit.span.end),
     );
-    Ok(dst)
+    Ok(destination)
 }
 
 /// §13.2.5.5 — a `BigInt` literal used as a property key becomes the
@@ -51,9 +68,18 @@ pub(crate) fn compile_bigint_literal(
     lit: &BigIntLiteral<'_>,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
+    let destination = cx.alloc_scratch();
+    compile_bigint_literal_into(cx, lit, span, destination)
+}
+
+pub(crate) fn compile_bigint_literal_into(
+    cx: &mut Compiler,
+    lit: &BigIntLiteral<'_>,
+    span: (u32, u32),
+    destination: u16,
+) -> Result<u16, CompileError> {
     let _ = span;
     let span = (lit.span.start, lit.span.end);
-    let dst = cx.alloc_scratch();
     let decimal = lit.value.as_str().to_string();
     // Compile-time syntactic validation so the runtime
     // parse path can stay strict (treats failure as
@@ -67,16 +93,29 @@ pub(crate) fn compile_bigint_literal(
     let const_idx = cx.intern_bigint_constant(&decimal);
     cx.emit(
         Op::LoadBigInt,
-        [Operand::Register(dst), Operand::ConstIndex(const_idx)],
+        [
+            Operand::Register(destination),
+            Operand::ConstIndex(const_idx),
+        ],
         span,
     );
-    Ok(dst)
+    Ok(destination)
 }
 
 pub(crate) fn compile_regexp_literal(
     cx: &mut Compiler,
     lit: &RegExpLiteral<'_>,
     span: (u32, u32),
+) -> Result<u16, CompileError> {
+    let destination = cx.alloc_scratch();
+    compile_regexp_literal_into(cx, lit, span, destination)
+}
+
+pub(crate) fn compile_regexp_literal_into(
+    cx: &mut Compiler,
+    lit: &RegExpLiteral<'_>,
+    span: (u32, u32),
+    destination: u16,
 ) -> Result<u16, CompileError> {
     let _ = span;
     let span = (lit.span.start, lit.span.end);
@@ -130,14 +169,16 @@ pub(crate) fn compile_regexp_literal(
         });
     }
     let pattern_utf16: Vec<u16> = pattern_text.encode_utf16().collect();
-    let dst = cx.alloc_scratch();
     let const_idx = cx.intern_regexp_constant(&pattern_utf16, &flags_str);
     cx.emit(
         Op::LoadRegExp,
-        [Operand::Register(dst), Operand::ConstIndex(const_idx)],
+        [
+            Operand::Register(destination),
+            Operand::ConstIndex(const_idx),
+        ],
         span,
     );
-    Ok(dst)
+    Ok(destination)
 }
 
 pub(crate) fn compile_numeric_literal(
@@ -145,8 +186,17 @@ pub(crate) fn compile_numeric_literal(
     lit: &NumericLiteral<'_>,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
+    let destination = cx.alloc_scratch();
+    compile_numeric_literal_into(cx, lit, span, destination)
+}
+
+pub(crate) fn compile_numeric_literal_into(
+    cx: &mut Compiler,
+    lit: &NumericLiteral<'_>,
+    span: (u32, u32),
+    destination: u16,
+) -> Result<u16, CompileError> {
     let _ = span;
-    let dst = cx.alloc_scratch();
     let span = (lit.span.start, lit.span.end);
     // Smi fast path: integer-valued literal in i32 range.
     if lit.value.fract() == 0.0
@@ -156,18 +206,24 @@ pub(crate) fn compile_numeric_literal(
     {
         cx.emit(
             Op::LoadInt32,
-            [Operand::Register(dst), Operand::Imm32(lit.value as i32)],
+            [
+                Operand::Register(destination),
+                Operand::Imm32(lit.value as i32),
+            ],
             span,
         );
     } else {
         let const_idx = cx.intern_number_constant(lit.value);
         cx.emit(
             Op::LoadNumber,
-            [Operand::Register(dst), Operand::ConstIndex(const_idx)],
+            [
+                Operand::Register(destination),
+                Operand::ConstIndex(const_idx),
+            ],
             span,
         );
     }
-    Ok(dst)
+    Ok(destination)
 }
 
 pub(crate) fn compile_boolean_literal(
@@ -175,8 +231,17 @@ pub(crate) fn compile_boolean_literal(
     lit: &BooleanLiteral,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
+    let destination = cx.alloc_scratch();
+    compile_boolean_literal_into(cx, lit, span, destination)
+}
+
+pub(crate) fn compile_boolean_literal_into(
+    cx: &mut Compiler,
+    lit: &BooleanLiteral,
+    span: (u32, u32),
+    destination: u16,
+) -> Result<u16, CompileError> {
     let _ = span;
-    let dst = cx.alloc_scratch();
     let span = (lit.span.start, lit.span.end);
     cx.emit(
         if lit.value {
@@ -184,8 +249,8 @@ pub(crate) fn compile_boolean_literal(
         } else {
             Op::LoadFalse
         },
-        [Operand::Register(dst)],
+        [Operand::Register(destination)],
         span,
     );
-    Ok(dst)
+    Ok(destination)
 }

@@ -2,6 +2,8 @@
 //!
 //! # Contents
 //! - [`compile_expr`] — main expression dispatch.
+//! - [`compile_expr_into_with_inferred_name`] — destination-aware declaration
+//!   initializer lowering.
 //! - [`compile_expr_as_property_key`] — property-key coercion for patterns.
 //! - [`coerce_compound_operands`] — compound assignment operand coercion.
 //! - [`emit_to_primitive`] — ToPrimitive bytecode emission helper.
@@ -17,6 +19,8 @@
 //!
 //! # Invariants
 //! - Expression lowering writes its result to the requested destination register.
+//! - Destination-aware lowering preserves operand snapshots; it changes only
+//!   the final result location.
 //!
 //! # See also
 //! - `statements`, `calls`, and `class`
@@ -101,32 +105,8 @@ pub(crate) fn compile_expr(
         Expression::LogicalExpression(l) => binary::compile_logical(cx, l, enclosing_span),
 
         Expression::ConditionalExpression(c) => {
-            let span = (c.span.start, c.span.end);
-            let cond = compile_expr(cx, &c.test, span)?;
-            let dst = cx.alloc_scratch();
-            let to_alt = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(cond), span);
-            let cons = compile_expr(cx, &c.consequent, span)?;
-            cx.emit(
-                Op::StoreLocal,
-                [Operand::Register(cons), Operand::Imm32(dst as i32)],
-                span,
-            );
-            let to_end = cx.emit_branch_placeholder(Op::Jump, None, span);
-            cx.patch_branch_to_here(to_alt);
-            let alt = compile_expr(cx, &c.alternate, span)?;
-            cx.emit(
-                Op::StoreLocal,
-                [Operand::Register(alt), Operand::Imm32(dst as i32)],
-                span,
-            );
-            cx.patch_branch_to_here(to_end);
-            let out = cx.alloc_scratch();
-            cx.emit(
-                Op::LoadLocal,
-                [Operand::Register(out), Operand::Imm32(dst as i32)],
-                span,
-            );
-            Ok(out)
+            let destination = cx.alloc_scratch();
+            compile_conditional_into(cx, c, destination)
         }
 
         Expression::AssignmentExpression(a) => compile_assignment(cx, a),
@@ -376,6 +356,143 @@ pub(crate) fn compile_expr_with_inferred_name(
             compile_class(cx, class, Some(inferred_name))
         }
         _ => compile_expr(cx, expr, enclosing_span),
+    }
+}
+
+/// Lower a declaration initializer directly into `destination` when its
+/// expression family supports an explicit result register.
+///
+/// Nested operands still use ordinary [`compile_expr`] snapshots, so later
+/// operand side effects cannot mutate an earlier value before it is consumed.
+/// Unsupported expression families fall back to a normal result plus one move.
+pub(crate) fn compile_expr_into_with_inferred_name(
+    cx: &mut Compiler,
+    expr: &Expression<'_>,
+    inferred_name: &str,
+    destination: u16,
+    enclosing_span: (u32, u32),
+) -> Result<u16, CompileError> {
+    let expr = unwrap_ts_expr(expr);
+    match expr {
+        Expression::Identifier(id)
+            if id.name.as_str() == "undefined" && cx.active_with_envs.is_empty() =>
+        {
+            cx.emit(
+                Op::LoadUndefined,
+                [Operand::Register(destination)],
+                enclosing_span,
+            );
+            Ok(destination)
+        }
+        Expression::Identifier(id)
+            if id.name.as_str() == "globalThis"
+                && cx.active_with_envs.is_empty()
+                && cx.lookup_binding("globalThis").is_none()
+                && find_module_import_binding(cx, "globalThis").is_none() =>
+        {
+            cx.emit(
+                Op::LoadGlobalThis,
+                [Operand::Register(destination)],
+                enclosing_span,
+            );
+            Ok(destination)
+        }
+        Expression::NullLiteral(literal) => {
+            cx.emit(
+                Op::LoadNull,
+                [Operand::Register(destination)],
+                (literal.span.start, literal.span.end),
+            );
+            Ok(destination)
+        }
+        Expression::ThisExpression(this) => {
+            cx.emit(
+                Op::LoadThis,
+                [Operand::Register(destination)],
+                (this.span.start, this.span.end),
+            );
+            Ok(destination)
+        }
+        Expression::ParenthesizedExpression(parenthesized) => compile_expr_into_with_inferred_name(
+            cx,
+            &parenthesized.expression,
+            inferred_name,
+            destination,
+            (parenthesized.span.start, parenthesized.span.end),
+        ),
+        Expression::BinaryExpression(binary) => {
+            binary::compile_binary_into(cx, binary, enclosing_span, destination)
+        }
+        Expression::LogicalExpression(logical) => {
+            binary::compile_logical_into(cx, logical, enclosing_span, destination)
+        }
+        Expression::ConditionalExpression(conditional) => {
+            compile_conditional_into(cx, conditional, destination)
+        }
+        Expression::StringLiteral(literal) => {
+            literal::compile_string_literal_into(cx, literal, enclosing_span, destination)
+        }
+        Expression::BigIntLiteral(literal) => {
+            literal::compile_bigint_literal_into(cx, literal, enclosing_span, destination)
+        }
+        Expression::RegExpLiteral(literal) => {
+            literal::compile_regexp_literal_into(cx, literal, enclosing_span, destination)
+        }
+        Expression::NumericLiteral(literal) => {
+            literal::compile_numeric_literal_into(cx, literal, enclosing_span, destination)
+        }
+        Expression::BooleanLiteral(literal) => {
+            literal::compile_boolean_literal_into(cx, literal, enclosing_span, destination)
+        }
+        Expression::SequenceExpression(sequence) => {
+            let span = (sequence.span.start, sequence.span.end);
+            let Some((last, preceding)) = sequence.expressions.split_last() else {
+                cx.emit(Op::LoadUndefined, [Operand::Register(destination)], span);
+                return Ok(destination);
+            };
+            for expression in preceding {
+                let _ = compile_expr(cx, expression, span)?;
+            }
+            let result = compile_expr(cx, last, span)?;
+            move_result_into(cx, result, destination, span);
+            Ok(destination)
+        }
+        _ => {
+            let result = compile_expr_with_inferred_name(cx, expr, inferred_name, enclosing_span)?;
+            move_result_into(cx, result, destination, enclosing_span);
+            Ok(destination)
+        }
+    }
+}
+
+fn compile_conditional_into(
+    cx: &mut Compiler,
+    conditional: &oxc_ast::ast::ConditionalExpression<'_>,
+    destination: u16,
+) -> Result<u16, CompileError> {
+    let span = (conditional.span.start, conditional.span.end);
+    let condition = compile_expr(cx, &conditional.test, span)?;
+    let to_alternate = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(condition), span);
+    let consequent = compile_expr(cx, &conditional.consequent, span)?;
+    move_result_into(cx, consequent, destination, span);
+    let to_end = cx.emit_branch_placeholder(Op::Jump, None, span);
+    cx.patch_branch_to_here(to_alternate);
+    let alternate = compile_expr(cx, &conditional.alternate, span)?;
+    move_result_into(cx, alternate, destination, span);
+    cx.patch_branch_to_here(to_end);
+    Ok(destination)
+}
+
+fn move_result_into(cx: &mut Compiler, source: u16, destination: u16, span: (u32, u32)) {
+    if source != destination {
+        cx.emit(
+            Op::StoreLocal,
+            [
+                Operand::Register(source),
+                Operand::Imm32(i32::from(destination)),
+            ],
+            span,
+        );
     }
 }
 

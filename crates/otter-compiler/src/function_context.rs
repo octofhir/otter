@@ -10,6 +10,7 @@
 //! - Instruction spans are emitted alongside bytecode positions.
 //! - Plain uncaptured formals may bind their incoming ABI register directly;
 //!   all later scratch allocation starts above the reserved argument window.
+//! - Storing a value into its existing register is a bytecode no-op.
 //!
 //! # See also
 //! - `compiler` for the context stack
@@ -851,11 +852,15 @@ impl FunctionContext {
         span: (u32, u32),
     ) {
         match storage {
-            BindingStorage::Register { reg } => self.emit(
-                Op::StoreLocal,
-                [Operand::Register(src), Operand::Imm32(reg as i32)],
-                span,
-            ),
+            BindingStorage::Register { reg } => {
+                if src != reg {
+                    self.emit(
+                        Op::StoreLocal,
+                        [Operand::Register(src), Operand::Imm32(reg as i32)],
+                        span,
+                    );
+                }
+            }
             BindingStorage::Upvalue { idx } => self.emit(
                 Op::StoreUpvalue,
                 [Operand::Register(src), Operand::Imm32(idx as i32)],

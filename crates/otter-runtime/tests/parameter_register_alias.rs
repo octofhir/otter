@@ -51,6 +51,12 @@ function argumentSnapshot() {
   return first(value, value = 2);
 }
 
+function initializerSnapshot() {
+  let value = 1;
+  let result = value + (value = 2);
+  return result;
+}
+
 for (let i = 0; i < 100; i++) {
   add(i, 1);
   increment(i);
@@ -59,6 +65,7 @@ for (let i = 0; i < 100; i++) {
   mapped(i);
   binarySnapshot();
   argumentSnapshot();
+  initializerSnapshot();
 }
 
 JSON.stringify([
@@ -68,7 +75,8 @@ JSON.stringify([
   capture(7)(),
   mapped(1),
   binarySnapshot(),
-  argumentSnapshot()
+  argumentSnapshot(),
+  initializerSnapshot()
 ]);
 "#;
 
@@ -95,6 +103,6 @@ fn parameter_storage_matches_across_execution_tiers() {
         JitSelection::Template,
         JitSelection::ProductionTiered,
     ] {
-        assert_eq!(run(selection), "[42,2,2,7,9,3,1]", "{selection:?}");
+        assert_eq!(run(selection), "[42,2,2,7,9,3,1,3]", "{selection:?}");
     }
 }

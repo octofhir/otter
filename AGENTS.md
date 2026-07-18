@@ -360,6 +360,10 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     portable semantic `code-normalized.bin`, typed `relocations.json`,
     annotated ARM64 `asm.txt`, `bytecode.txt`, tier input, `code-map.json`,
     `safepoints.json`, and optimizer `deopt.json` when applicable.
+  - Inspect the first line of `optimized-ir.txt` before reading it: the general
+    backend emits the Otter optimized unit, while a Cranelift numeric leaf
+    starts with `; backend=cranelift numeric-leaf` and then contains CLIF. Its
+    code map uses the `craneliftNumericLeaf` structural region.
   - Exact code may contain process addresses and is not a portable golden.
     Compare `code-normalized.bin` across processes; its relocation tokens and
     branch targets are symbolic, and it is not executable. `relocations.json`

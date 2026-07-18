@@ -49,11 +49,14 @@ needed to optimize the VM and JIT safely.
   abrupt completion, and includes JIT work performed by event-loop callbacks.
 - [x] Owned, schema-versioned JIT compile bundles through
   `--jit-artifacts[=<directory>]`: exact runtime-local code, bytecode,
-  template plan or optimized IR, typed symbolic relocations, portable
-  normalized code, annotated ARM64 assembly, native offset maps, deopt
-  metadata, and safepoints. The CLI writes a new root atomically under a
-  cooperative single-writer contract and never intentionally merges with an
-  existing target.
+  template plan or the selected optimizing backend input (Otter unit or CLIF),
+  typed symbolic relocations, portable normalized code, annotated ARM64
+  assembly, native offset maps, deopt metadata, and safepoints. The CLI writes
+  a new root atomically under a cooperative single-writer contract and never
+  intentionally merges with an existing target.
+- [x] Capture Cranelift numeric leaves through the existing optimizing bundle:
+  backend-marked CLIF, the exact installed code object, one structural code-map
+  region, and empty relocation/safepoint/deopt inventories.
 
 The text step trace is not a Chrome/Perfetto trace. Async/op tracing, timeout
 ring-buffer dumps, and Test262 failure traces are not shipped yet. Structured
@@ -158,9 +161,10 @@ manifest rather than emitted as placeholders.
 
 Deterministic unit coverage is green for direct branch/call labels, relocation
 redaction, decoder `.word` fallback, OSR annotations, deopt summaries/region
-joins, and the explicit safepoint-unavailable summary. The combined golden item
-remains open until emission records a real safepoint return offset and a test
-can cover that exact native range without inference.
+joins, Cranelift numeric-leaf source-or-backend-glue coverage at every
+four-byte machine offset, and the explicit safepoint-unavailable summary. The
+combined golden item remains open until emission records a real safepoint
+return offset and a test can cover that exact native range without inference.
 
 ### 4. JIT-aware profiling and traces
 

@@ -99,6 +99,11 @@ unicode-segmentation = "1.12"
 # Benchmarks.
 criterion   = { version = "0.8", features = ["html_reports"] }
 
+# Optimizing machine-code backend.
+cranelift-codegen  = { version = "0.133.1", default-features = false, features = ["std", "arm64"] }
+cranelift-frontend = { version = "0.133.1", default-features = false, features = ["std"] }
+cranelift-native   = { version = "0.133.1", default-features = false, features = ["std"] }
+
 # Workspace-internal crates.
 otter-bytecode  = { path = "crates/otter-bytecode" }
 otter-syntax    = { path = "crates/otter-syntax" }

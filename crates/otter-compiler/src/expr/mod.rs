@@ -16,8 +16,7 @@
 //! - [`import_meta`] — `import.meta`, `new.target`, and dynamic import lowering.
 //!
 //! # Invariants
-//! - Expression lowering returns a register containing its result; immutable
-//!   reads may alias an existing register-backed binding directly.
+//! - Expression lowering writes its result to the requested destination register.
 //!
 //! # See also
 //! - `statements`, `calls`, and `class`

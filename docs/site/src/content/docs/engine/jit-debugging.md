@@ -106,6 +106,11 @@ All native locations are offsets into the matching `code.bin`, never absolute
 executable addresses. A range must satisfy
 `0 <= startOffset <= endOffset <= manifest.codeBytes`.
 
+`code-map.json` schema version 1 is additive: readers must ignore unknown
+fields and region kinds while continuing to validate every native range.
+This lets newer compilers expose finer structural regions without making older
+offset-based readers reject an otherwise valid bundle.
+
 The first line of `optimized-ir.txt` identifies the backend. The general Otter
 backend starts with its optimized-unit banner. A Cranelift numeric leaf starts
 with:
@@ -126,6 +131,76 @@ synthetic join key would be misleading. Because this subset is pure,
 call-free, and restartable before effects, its relocation, safepoint, and
 deopt inventories are empty. These files still belong to the same optimizing
 artifact contract; there is no parallel tier or format generation.
+
+### Template method-inline regions
+
+A template-tier `MethodCall` may contain nested regions that expose a
+replay-safe spliced method:
+
+| Region kind | Meaning |
+| --- | --- |
+| `inlineMethodGuard` | Receiver shape, holder, method identity, and bound-state guards. |
+| `inlineScratchSetup` | Compact stack allocation and live entry-value materialization. |
+| `inlineInstruction` | Exact native range for one callee operation. |
+| `inlineMethodBody` | Aggregate range containing all `inlineInstruction` ranges. |
+| `inlineMethodHitEpilogue` | Scratch release, result publication, and jump to call completion. |
+| `inlineMethodMissTeardown` | Scratch release used only by misses reached after body entry. |
+| `inlineMethodMissReplay` | Common post-teardown ordinary method-call bridge. |
+
+All these regions carry the same `inlineSite`:
+
+```json
+{
+  "callerFunctionId": 438,
+  "logicalPc": 12,
+  "bytePc": 47,
+  "hasReceiverProperty": true
+}
+```
+
+The region's top-level `functionId` is the inlined callee. The `inlineSite`
+identifies the caller `MethodCall`; its logical and encoded PCs join back to
+the enclosing caller instruction. Each `inlineInstruction` uses callee-local
+`logicalPc`, `bytePc`, and dense `operationIndex` values starting at zero.
+A coalesced `Move` or `LoadThis` may have `startOffset == endOffset`: the
+operation remains inspectable even when it emits no machine instruction.
+
+`inlineScratchSetup.inlineScratchLayout` describes the complete compact
+assignment:
+
+```json
+{
+  "parameterCount": 1,
+  "virtualRegisterCount": 6,
+  "scratchSlotCount": 2,
+  "slotBytes": 8,
+  "stackAlignmentBytes": 16,
+  "scratchBytes": 16,
+  "offsetBasis": "postAllocationSp",
+  "registerSlots": [0, 0, 1, 0, 1, null],
+  "receiverSlot": 1,
+  "entryValues": [
+    { "kind": "argument", "argument": 0, "register": 0, "slot": 0 },
+    { "kind": "receiver", "slot": 1 }
+  ]
+}
+```
+
+`registerSlots` is indexed by callee virtual register; `null` means the
+register is unused. `entryValues` is ordered arguments, receiver, then
+function-entry `undefined` locals. Its third typed form is
+`{"kind":"undefined","register":<r>,"slot":<s>}`. Every slot offset is relative
+to `sp` after allocation, and
+`scratchBytes = align_up(scratchSlotCount * slotBytes, stackAlignmentBytes)`.
+Distinct virtual registers may share a slot only when their live ranges do not
+overlap under source-read-before-destination-write semantics.
+
+Ranges reveal both control paths without claiming which one executed:
+guard precedes setup, setup precedes body, the body contains every inline
+instruction, and the hit epilogue begins at body end. Body misses pass through
+`inlineMethodMissTeardown`; early guard misses skip it. Both meet exactly at
+the start of `inlineMethodMissReplay`, which stays inside the enclosing caller
+`MethodCall` range.
 
 ## Annotated ARM64 assembly
 
@@ -153,6 +228,7 @@ use these stable forms:
 
 ```text
   ; region kind=<kind> range=+0x<start>..+0x<end> ... pc=<pc> byte-pc=<byte-pc> tier-op="<operation>"
+  ; region kind=inlineScratchSetup ... inline-site=caller:<function>:pc:<pc>:byte:<byte-pc> receiver-property=<bool> parameters=<n> virtual-registers=<n> scratch-slots=<n> slot-bytes=8 stack-alignment=16 scratch-bytes=<n> offset-basis=postAllocationSp register-slots=[...] receiver-slot=<slot|-> entry-values=[...]
 L<8-hex-offset>:
 +0x<8-hex>: <8-hex-word>  <decoded instruction or .word fallback>
 +0x<8-hex>: relocation <register>, <symbolic target> ; encoded-bytes=<n> redacted
@@ -225,6 +301,9 @@ fallback:
    backend and logical operation.
 5. Use `code-map.json` to map its logical PC and encoded byte PC to the exact
    native byte range.
+   For a template method inline, first identify the caller through
+   `inlineSite`, then inspect its guard, compact scratch assignment,
+   callee-local instructions, and separate teardown/replay ranges.
 6. Open `asm.txt` at the matching `+0x<8-hex>:` offset to inspect the emitted
    instructions and local branch labels.
 7. Inspect `relocations.json` when the range materializes a runtime-local

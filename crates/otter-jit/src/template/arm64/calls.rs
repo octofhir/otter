@@ -15,10 +15,11 @@
 //! - Prepared callees enter through the common owned AArch64 call trampoline,
 //!   which owns frame publication and cleanup for every native tier.
 //! - Inlined method bodies contain no call, allocation, branch, or mutation;
-//!   every guard failure restores the caller register base and completes the
+//!   every guard failure balances compact scratch storage and completes the
 //!   original method call through the ordinary bridge.
-//! - Inline scratch registers are initialized only when the accepted
-//!   straight-line body can read them before its first write.
+//! - `x19` remains the caller register base throughout an inline body. Callee
+//!   virtual registers use explicit `sp`-relative compact slots initialized
+//!   only for live entry values.
 //! - A raw receiver pointer retained in `x17` is live only between the entry
 //!   identity guard and the end of a call-free, safepoint-free inline body.
 //! - Ineligible call resolutions complete through the descriptor-classified
@@ -45,22 +46,66 @@ use crate::arm64::{CallTrampoline, emit_prepared_call};
 use crate::artifact::relocation::{
     RelocationCapture, RelocationTarget, TemplateOperandArena, TemplateOperandRole,
 };
+use crate::artifact::{
+    CodeMapCapture, CodeRegion, InlineScratchEntryArtifact, InlineScratchLayoutArtifact,
+    InlineSiteArtifact,
+};
 use crate::entry::{NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, Unsupported, VALUE_UNDEFINED};
-use crate::template::{ArithKind, TemplateOp, TemplatePlan, TemplateTail};
+use crate::template::{
+    ArithKind, InlineEntryValue, InlineMethodPlan, InlineScratchSlot, TemplateOp, TemplatePlan,
+    TemplateTail,
+};
 
-const INLINE_METHOD_MAX_REGISTERS: u16 = 24;
-const INLINE_METHOD_MAX_INSTRUCTIONS: usize = 48;
-const INLINE_METHOD_MAX_ARGUMENTS: usize = 2;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum InlineValueKind {
-    Unknown,
-    This,
+#[derive(Debug, Clone, Copy)]
+struct InlineMethodEmission {
+    miss_replay_start: usize,
+    inline_site: InlineSiteArtifact,
+    function_id: u32,
 }
 
-struct InlineMethodAnalysis {
-    undefined_registers: Vec<u16>,
-    has_receiver_property: bool,
+fn inline_scratch_artifact(
+    method: &JitInlineMethod,
+    plan: &InlineMethodPlan<'_>,
+) -> InlineScratchLayoutArtifact {
+    let register_slots = (0..method.register_count)
+        .map(|register| plan.register_slot(register).map(InlineScratchSlot::index))
+        .collect();
+    let entry_values = plan
+        .entry_values()
+        .iter()
+        .map(|entry| match *entry {
+            InlineEntryValue::Argument {
+                argument,
+                register,
+                slot,
+            } => InlineScratchEntryArtifact::Argument {
+                argument,
+                register,
+                slot: slot.index(),
+            },
+            InlineEntryValue::Receiver { slot } => {
+                InlineScratchEntryArtifact::Receiver { slot: slot.index() }
+            }
+            InlineEntryValue::Undefined { register, slot } => {
+                InlineScratchEntryArtifact::Undefined {
+                    register,
+                    slot: slot.index(),
+                }
+            }
+        })
+        .collect();
+    InlineScratchLayoutArtifact {
+        parameter_count: method.param_count,
+        virtual_register_count: method.register_count,
+        scratch_slot_count: plan.slot_count(),
+        slot_bytes: 8,
+        stack_alignment_bytes: 16,
+        scratch_bytes: plan.aligned_scratch_bytes(),
+        offset_basis: "postAllocationSp",
+        register_slots,
+        receiver_slot: plan.receiver_slot().map(InlineScratchSlot::index),
+        entry_values,
+    }
 }
 
 /// Build the current template plan for one baked method body.
@@ -68,7 +113,7 @@ struct InlineMethodAnalysis {
 /// PORT NOTE: the deleted legacy baseline emitter decoded the method body a
 /// second time. This port deliberately reuses the current typed TemplatePlan,
 /// keeping operand validation and opcode shapes in one backend-neutral path.
-fn inline_method_plan(
+fn inline_method_template_plan(
     view: &JitCompileSnapshot,
     method: &JitInlineMethod,
 ) -> Result<TemplatePlan, Unsupported> {
@@ -85,121 +130,6 @@ fn inline_method_plan(
     TemplatePlan::build(&method_view)
 }
 
-fn note_inline_register_read(defined: &[bool], needs_undefined: &mut [bool], register: u16) {
-    let index = usize::from(register);
-    if !defined[index] {
-        needs_undefined[index] = true;
-    }
-}
-
-/// Accept only straight-line, read-only bodies whose guarded misses can replay
-/// the original method call without duplicating an observable effect.
-///
-/// The same pass derives the exact set of registers that can observe the
-/// function-entry `undefined` state. Parameters begin defined; every other
-/// register is initialized only if the accepted instruction stream reads it
-/// before its first write.
-fn analyze_inline_numeric_method(
-    method: &JitInlineMethod,
-    plan: &TemplatePlan,
-    argc: usize,
-) -> Option<InlineMethodAnalysis> {
-    if argc != usize::from(method.param_count)
-        || argc > INLINE_METHOD_MAX_ARGUMENTS
-        || method.register_count > INLINE_METHOD_MAX_REGISTERS
-        || plan.instructions.len() > INLINE_METHOD_MAX_INSTRUCTIONS
-        || plan.register_count != method.register_count
-    {
-        return None;
-    }
-    let mut kinds = vec![InlineValueKind::Unknown; usize::from(method.register_count)];
-    let mut defined = vec![false; usize::from(method.register_count)];
-    defined.iter_mut().take(argc).for_each(|slot| *slot = true);
-    let mut needs_undefined = vec![false; usize::from(method.register_count)];
-    let mut has_receiver_property = false;
-    let mut saw_return = false;
-    for (index, instruction) in plan.instructions.iter().enumerate() {
-        if saw_return {
-            return None;
-        }
-        match instruction.op {
-            TemplateOp::LoadImmediate { dst, .. } => {
-                kinds[usize::from(dst)] = InlineValueKind::Unknown;
-                defined[usize::from(dst)] = true;
-            }
-            TemplateOp::Move { dst, src } => {
-                note_inline_register_read(&defined, &mut needs_undefined, src);
-                kinds[usize::from(dst)] = kinds[usize::from(src)];
-                defined[usize::from(dst)] = true;
-            }
-            TemplateOp::LoadThis { dst } => {
-                kinds[usize::from(dst)] = InlineValueKind::This;
-                defined[usize::from(dst)] = true;
-            }
-            TemplateOp::LoadProperty { dst, object, .. } => {
-                note_inline_register_read(&defined, &mut needs_undefined, object);
-                if kinds[usize::from(object)] != InlineValueKind::This
-                    || !method.prop_offsets.contains_key(&instruction.byte_pc)
-                    || method.prop_shapes.contains_key(&instruction.byte_pc)
-                {
-                    return None;
-                }
-                has_receiver_property = true;
-                kinds[usize::from(dst)] = InlineValueKind::Unknown;
-                defined[usize::from(dst)] = true;
-            }
-            TemplateOp::ToPrimitive { dst, src, .. } | TemplateOp::ToNumeric { dst, src } => {
-                note_inline_register_read(&defined, &mut needs_undefined, src);
-                kinds[usize::from(dst)] = InlineValueKind::Unknown;
-                defined[usize::from(dst)] = true;
-            }
-            TemplateOp::AddGeneric { dst, lhs, rhs, .. } => {
-                note_inline_register_read(&defined, &mut needs_undefined, lhs);
-                note_inline_register_read(&defined, &mut needs_undefined, rhs);
-                kinds[usize::from(dst)] = InlineValueKind::Unknown;
-                defined[usize::from(dst)] = true;
-            }
-            TemplateOp::BinaryArith {
-                dst,
-                lhs,
-                rhs,
-                kind,
-            } => {
-                if matches!(kind, ArithKind::Rem | ArithKind::Pow) {
-                    return None;
-                }
-                note_inline_register_read(&defined, &mut needs_undefined, lhs);
-                note_inline_register_read(&defined, &mut needs_undefined, rhs);
-                kinds[usize::from(dst)] = InlineValueKind::Unknown;
-                defined[usize::from(dst)] = true;
-            }
-            TemplateOp::Return { src } => {
-                note_inline_register_read(&defined, &mut needs_undefined, src);
-                saw_return = true;
-                if index + 1 != plan.instructions.len() {
-                    return None;
-                }
-            }
-            TemplateOp::ReturnUndefined => {
-                saw_return = true;
-                if index + 1 != plan.instructions.len() {
-                    return None;
-                }
-            }
-            _ => return None,
-        }
-    }
-    saw_return.then(|| InlineMethodAnalysis {
-        undefined_registers: needs_undefined
-            .into_iter()
-            .enumerate()
-            .filter(|(_, needs_undefined)| *needs_undefined)
-            .map(|(register, _)| u16::try_from(register).expect("inline register fits u16"))
-            .collect(),
-        has_receiver_property,
-    })
-}
-
 pub(super) fn has_emit_eligible_inline_method(view: &JitCompileSnapshot) -> bool {
     if view.inline_methods.is_empty() {
         return false;
@@ -214,38 +144,50 @@ pub(super) fn has_emit_eligible_inline_method(view: &JitCompileSnapshot) -> bool
         let Some(method) = view.inline_methods.get(&byte_pc) else {
             return false;
         };
-        inline_method_plan(view, method).is_ok_and(|method_plan| {
+        inline_method_template_plan(view, method).is_ok_and(|method_plan| {
             view.cage_base != 0
-                && analyze_inline_numeric_method(method, &method_plan, usize::from(argc)).is_some()
+                && InlineMethodPlan::build(method, &method_plan, usize::from(argc)).is_some()
         })
     })
 }
 
+/// Load one compact inline slot without changing the caller register base.
+fn emit_load_inline_slot(ops: &mut Assembler, target: u8, slot: InlineScratchSlot) {
+    dynasm!(ops ; .arch aarch64 ; ldr X(target), [sp, slot.byte_offset()]);
+}
+
+/// Store one compact inline slot without changing the caller register base.
+fn emit_store_inline_slot(ops: &mut Assembler, source: u8, slot: InlineScratchSlot) {
+    dynasm!(ops ; .arch aarch64 ; str X(source), [sp, slot.byte_offset()]);
+}
+
 fn emit_inline_number_identity(
     ops: &mut Assembler,
-    dst: u16,
-    src: u16,
+    dst: InlineScratchSlot,
+    src: InlineScratchSlot,
     miss: DynamicLabel,
-) -> Result<(), Unsupported> {
-    emit_load_reg(ops, 9, src)?;
+) {
+    emit_load_inline_slot(ops, 9, src);
     dynasm!(ops
         ; .arch aarch64
         ; movz x15, NUMBER_TAG_HI16, lsl #48
         ; tst x9, x15
         ; b.eq =>miss
     );
-    emit_store_reg(ops, 9, dst)
+    if dst != src {
+        emit_store_inline_slot(ops, 9, dst);
+    }
 }
 
 fn emit_inline_numeric_add(
     ops: &mut Assembler,
-    dst: u16,
-    lhs: u16,
-    rhs: u16,
+    dst: InlineScratchSlot,
+    lhs: InlineScratchSlot,
+    rhs: InlineScratchSlot,
     miss: DynamicLabel,
-) -> Result<(), Unsupported> {
-    emit_load_reg(ops, 9, lhs)?;
-    emit_load_reg(ops, 10, rhs)?;
+) {
+    emit_load_inline_slot(ops, 9, lhs);
+    emit_load_inline_slot(ops, 10, rhs);
     let float_path = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops
@@ -261,30 +203,29 @@ fn emit_inline_numeric_add(
         ; b.vs =>float_path
     );
     emit_box_int32(ops, 13, 12);
-    emit_store_reg(ops, 13, dst)?;
+    emit_store_inline_slot(ops, 13, dst);
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>float_path);
     emit_num_to_double(ops, 9, 0, miss);
     emit_num_to_double(ops, 10, 1, miss);
     dynasm!(ops ; .arch aarch64 ; fadd d2, d0, d1);
     emit_box_double(ops, 2, 13);
-    emit_store_reg(ops, 13, dst)?;
+    emit_store_inline_slot(ops, 13, dst);
     dynasm!(ops ; .arch aarch64 ; =>done);
-    Ok(())
 }
 
 fn emit_inline_numeric_binary(
     ops: &mut Assembler,
-    dst: u16,
-    lhs: u16,
-    rhs: u16,
+    dst: InlineScratchSlot,
+    lhs: InlineScratchSlot,
+    rhs: InlineScratchSlot,
     kind: ArithKind,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported> {
     if matches!(kind, ArithKind::Pow) {
         return Err(Unsupported::Opcode(otter_bytecode::Op::Pow));
     }
-    emit_load_reg(ops, 9, lhs)?;
-    emit_load_reg(ops, 10, rhs)?;
+    emit_load_inline_slot(ops, 9, lhs);
+    emit_load_inline_slot(ops, 10, rhs);
     emit_num_to_double(ops, 9, 0, miss);
     emit_num_to_double(ops, 10, 1, miss);
     match kind {
@@ -298,14 +239,15 @@ fn emit_inline_numeric_binary(
         }
     }
     emit_box_double(ops, 2, 13);
-    emit_store_reg(ops, 13, dst)
+    emit_store_inline_slot(ops, 13, dst);
+    Ok(())
 }
 
 fn emit_inline_receiver_property(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
-    dst: u16,
+    dst: InlineScratchSlot,
     value_byte: u32,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported> {
@@ -315,7 +257,8 @@ fn emit_inline_receiver_property(
     // can move or change before this load.
     dynasm!(ops ; .arch aarch64 ; ldr w9, [x17, value_byte]);
     emit_decompress_slot(ops, relocations, view.cage_base as u64, miss);
-    emit_store_reg(ops, 9, dst)
+    emit_store_inline_slot(ops, 9, dst);
+    Ok(())
 }
 
 /// Emit one exact receiver/method guard plus a replay-safe scratch body.
@@ -333,11 +276,14 @@ fn try_emit_inline_numeric_method(
     argc: u16,
     arg0: Option<u16>,
     arg1: Option<u16>,
+    call_logical_pc: u32,
+    call_byte_pc: u32,
+    mut code_map: Option<&mut CodeMapCapture>,
     done: DynamicLabel,
-) -> Result<bool, Unsupported> {
-    let plan = inline_method_plan(view, method)?;
-    let Some(analysis) = (view.cage_base != 0)
-        .then(|| analyze_inline_numeric_method(method, &plan, usize::from(argc)))
+) -> Result<Option<InlineMethodEmission>, Unsupported> {
+    let template_plan = inline_method_template_plan(view, method)?;
+    let Some(plan) = (view.cage_base != 0)
+        .then(|| InlineMethodPlan::build(method, &template_plan, usize::from(argc)))
         .flatten()
     else {
         if std::env::var_os("OTTER_JIT_TRACE").is_some() {
@@ -347,31 +293,43 @@ fn try_emit_inline_numeric_method(
                 argc,
                 method.param_count,
                 method.register_count,
-                plan.instructions
+                template_plan
+                    .instructions
                     .iter()
                     .map(|instruction| instruction.op)
                     .collect::<Vec<_>>(),
             );
         }
-        return Ok(false);
+        return Ok(None);
     };
     if std::env::var_os("OTTER_JIT_TRACE").is_some() {
         eprintln!(
-            "[otter-jit] template inline method emit fid={} argc={} regs={}",
-            method.method_fid, argc, method.register_count,
+            "[otter-jit] template inline method emit fid={} argc={} regs={} scratch_slots={} scratch_bytes={}",
+            method.method_fid,
+            argc,
+            method.register_count,
+            plan.slot_count(),
+            plan.aligned_scratch_bytes(),
         );
     }
+    let inline_site = InlineSiteArtifact {
+        caller_function_id: view.code_block.id,
+        logical_pc: call_logical_pc,
+        byte_pc: call_byte_pc,
+        has_receiver_property: plan.has_receiver_property(),
+    };
     let arguments = match (argc, arg0, arg1) {
         (0, _, _) => [None, None],
         (1, Some(first), _) => [Some(first), None],
         (2, Some(first), Some(second)) => [Some(first), Some(second)],
-        _ => return Ok(false),
+        _ => return Ok(None),
     };
     let miss = ops.new_dynamic_label();
     let body_miss = ops.new_dynamic_label();
     let inline_done = ops.new_dynamic_label();
     let method_closure = ops.new_dynamic_label();
     let method_guarded = ops.new_dynamic_label();
+    let guard_start = ops.offset().0;
 
     // Receiver tag/type/shape guard.
     emit_load_reg(ops, 9, receiver)?;
@@ -400,7 +358,7 @@ fn try_emit_inline_numeric_method(
     );
     emit_load_u64(ops, 15, u64::from(method.recv_shape));
     dynasm!(ops ; .arch aarch64 ; cmp w14, w15 ; b.ne =>miss);
-    if analysis.has_receiver_property {
+    if plan.has_receiver_property() {
         // Preserve the exact shape-guarded receiver body while `x13` chases
         // the possibly distinct prototype holder of the method slot.
         dynasm!(ops ; .arch aarch64 ; mov x17, x13);
@@ -499,7 +457,7 @@ fn try_emit_inline_numeric_method(
         ; b.ne =>miss
         ; =>method_guarded
     );
-    if analysis.has_receiver_property {
+    if plan.has_receiver_property() {
         // Receiver-property offsets were baked from `recv_shape`, whose guard
         // already succeeded above. Materialize its slab once for every sealed
         // receiver-property load in the straight-line inline body.
@@ -512,41 +470,101 @@ fn try_emit_inline_numeric_method(
         );
     }
 
-    // Scratch registers are unobservable and contain no safepoint. The
-    // receiver occupies one extra slot used by LoadThis.
-    let this_slot = method.register_count;
-    let scratch_slots = u32::from(method.register_count) + 1;
-    let scratch_bytes = (scratch_slots * 8).next_multiple_of(16);
-    dynasm!(ops ; .arch aarch64 ; sub sp, sp, scratch_bytes);
-    for (slot, argument) in arguments.iter().take(usize::from(argc)).enumerate() {
-        emit_load_reg(ops, 9, argument.expect("validated inline method argument"))?;
-        dynasm!(ops ; .arch aarch64 ; str x9, [sp, (slot as u32) * 8]);
+    let guard_end = ops.offset().0;
+    if let Some(code_map) = code_map.as_deref_mut() {
+        code_map.record(CodeRegion::inline_structural(
+            "inlineMethodGuard",
+            guard_start,
+            guard_end,
+            inline_site,
+            method.method_fid,
+        ));
     }
-    emit_load_reg(ops, 9, receiver)?;
-    dynasm!(ops ; .arch aarch64 ; str x9, [sp, u32::from(this_slot) * 8]);
-    if !analysis.undefined_registers.is_empty() {
-        emit_load_u64(ops, 9, VALUE_UNDEFINED);
-        for &slot in &analysis.undefined_registers {
-            dynasm!(ops ; .arch aarch64 ; str x9, [sp, u32::from(slot) * 8]);
+
+    // Compact scratch is unobservable and contains no safepoint. `x19` stays
+    // on the published caller window; only explicit `sp`-relative helpers may
+    // touch callee values.
+    let scratch_start = ops.offset().0;
+    let scratch_bytes = plan.aligned_scratch_bytes();
+    if scratch_bytes != 0 {
+        dynasm!(ops ; .arch aarch64 ; sub sp, sp, scratch_bytes);
+    }
+    let mut undefined_loaded = false;
+    for &entry in plan.entry_values() {
+        match entry {
+            InlineEntryValue::Argument { argument, slot, .. } => {
+                let caller_register = arguments
+                    .get(usize::from(argument))
+                    .copied()
+                    .flatten()
+                    .expect("validated inline method argument");
+                emit_load_reg(ops, 9, caller_register)?;
+                emit_store_inline_slot(ops, 9, slot);
+            }
+            InlineEntryValue::Receiver { slot } => {
+                emit_load_reg(ops, 9, receiver)?;
+                emit_store_inline_slot(ops, 9, slot);
+            }
+            InlineEntryValue::Undefined { slot, .. } => {
+                if !undefined_loaded {
+                    emit_load_u64(ops, 9, VALUE_UNDEFINED);
+                    undefined_loaded = true;
+                }
+                emit_store_inline_slot(ops, 9, slot);
+            }
         }
     }
-    dynasm!(ops ; .arch aarch64 ; mov x19, sp);
 
-    for instruction in &plan.instructions {
+    let scratch_end = ops.offset().0;
+    if let Some(code_map) = code_map.as_deref_mut() {
+        code_map.record(CodeRegion::inline_scratch(
+            scratch_start,
+            scratch_end,
+            inline_site,
+            method.method_fid,
+            inline_scratch_artifact(method, &plan),
+        ));
+    }
+
+    let body_start = ops.offset().0;
+    for (operation_index, instruction) in plan.instructions().iter().enumerate() {
+        let instruction_start = ops.offset().0;
         match instruction.op {
             TemplateOp::LoadImmediate { dst, bits } => {
                 emit_load_u64(ops, 9, bits);
-                emit_store_reg(ops, 9, dst)?;
+                let dst = plan
+                    .register_slot(dst)
+                    .ok_or(Unsupported::OperandShape("inline scratch destination"))?;
+                emit_store_inline_slot(ops, 9, dst);
             }
             TemplateOp::Move { dst, src } => {
-                emit_load_reg(ops, 9, src)?;
-                emit_store_reg(ops, 9, dst)?;
+                let dst = plan
+                    .register_slot(dst)
+                    .ok_or(Unsupported::OperandShape("inline scratch destination"))?;
+                let src = plan
+                    .register_slot(src)
+                    .ok_or(Unsupported::OperandShape("inline scratch source"))?;
+                if dst != src {
+                    emit_load_inline_slot(ops, 9, src);
+                    emit_store_inline_slot(ops, 9, dst);
+                }
             }
             TemplateOp::LoadThis { dst } => {
-                emit_load_reg(ops, 9, this_slot)?;
-                emit_store_reg(ops, 9, dst)?;
+                let dst = plan
+                    .register_slot(dst)
+                    .ok_or(Unsupported::OperandShape("inline scratch destination"))?;
+                let receiver = plan
+                    .receiver_slot()
+                    .ok_or(Unsupported::OperandShape("inline scratch receiver"))?;
+                if dst != receiver {
+                    emit_load_inline_slot(ops, 9, receiver);
+                    emit_store_inline_slot(ops, 9, dst);
+                }
             }
             TemplateOp::LoadProperty { dst, .. } => {
+                let dst = plan
+                    .register_slot(dst)
+                    .ok_or(Unsupported::OperandShape("inline scratch destination"))?;
                 let value_byte = *method
                     .prop_offsets
                     .get(&instruction.byte_pc)
@@ -554,10 +572,25 @@ fn try_emit_inline_numeric_method(
                 emit_inline_receiver_property(ops, relocations, view, dst, value_byte, body_miss)?;
             }
             TemplateOp::ToPrimitive { dst, src, .. } | TemplateOp::ToNumeric { dst, src } => {
-                emit_inline_number_identity(ops, dst, src, body_miss)?;
+                let dst = plan
+                    .register_slot(dst)
+                    .ok_or(Unsupported::OperandShape("inline scratch destination"))?;
+                let src = plan
+                    .register_slot(src)
+                    .ok_or(Unsupported::OperandShape("inline scratch source"))?;
+                emit_inline_number_identity(ops, dst, src, body_miss);
             }
             TemplateOp::AddGeneric { dst, lhs, rhs, .. } => {
-                emit_inline_numeric_add(ops, dst, lhs, rhs, body_miss)?;
+                let dst = plan
+                    .register_slot(dst)
+                    .ok_or(Unsupported::OperandShape("inline scratch destination"))?;
+                let lhs = plan
+                    .register_slot(lhs)
+                    .ok_or(Unsupported::OperandShape("inline scratch lhs"))?;
+                let rhs = plan
+                    .register_slot(rhs)
+                    .ok_or(Unsupported::OperandShape("inline scratch rhs"))?;
+                emit_inline_numeric_add(ops, dst, lhs, rhs, body_miss);
             }
             TemplateOp::BinaryArith {
                 dst,
@@ -565,10 +598,22 @@ fn try_emit_inline_numeric_method(
                 rhs,
                 kind,
             } => {
+                let dst = plan
+                    .register_slot(dst)
+                    .ok_or(Unsupported::OperandShape("inline scratch destination"))?;
+                let lhs = plan
+                    .register_slot(lhs)
+                    .ok_or(Unsupported::OperandShape("inline scratch lhs"))?;
+                let rhs = plan
+                    .register_slot(rhs)
+                    .ok_or(Unsupported::OperandShape("inline scratch rhs"))?;
                 emit_inline_numeric_binary(ops, dst, lhs, rhs, kind, body_miss)?;
             }
             TemplateOp::Return { src } => {
-                emit_load_reg(ops, 9, src)?;
+                let src = plan
+                    .register_slot(src)
+                    .ok_or(Unsupported::OperandShape("inline scratch return"))?;
+                emit_load_inline_slot(ops, 9, src);
                 dynasm!(ops ; .arch aarch64 ; b =>inline_done);
             }
             TemplateOp::ReturnUndefined => {
@@ -577,26 +622,67 @@ fn try_emit_inline_numeric_method(
             }
             _ => unreachable!("inline eligibility accepted unsupported template op"),
         }
+        if let Some(code_map) = code_map.as_deref_mut() {
+            code_map.record(CodeRegion::inline_instruction(
+                instruction_start,
+                ops.offset().0,
+                inline_site,
+                method.method_fid,
+                instruction.pc,
+                instruction.byte_pc,
+                u32::try_from(operation_index).unwrap_or(u32::MAX),
+                format!("{:?}", instruction.op),
+            ));
+        }
+    }
+    let body_end = ops.offset().0;
+    if let Some(code_map) = code_map.as_deref_mut() {
+        code_map.record(CodeRegion::inline_structural(
+            "inlineMethodBody",
+            body_start,
+            body_end,
+            inline_site,
+            method.method_fid,
+        ));
     }
 
-    dynasm!(ops
-        ; .arch aarch64
-        ; =>inline_done
-        ; add sp, sp, scratch_bytes
-        ; ldr x10, [x20, crate::entry::NATIVE_FRAME_OFFSET]
-        ; ldr x19, [x10, crate::entry::NATIVE_FRAME_REGISTER_BASE_OFFSET]
-    );
+    let hit_epilogue_start = ops.offset().0;
+    dynasm!(ops ; .arch aarch64 ; =>inline_done);
+    if scratch_bytes != 0 {
+        dynasm!(ops ; .arch aarch64 ; add sp, sp, scratch_bytes);
+    }
     emit_store_reg(ops, 9, dst)?;
-    dynasm!(ops
-        ; .arch aarch64
-        ; b =>done
-        ; =>body_miss
-        ; add sp, sp, scratch_bytes
-        ; ldr x10, [x20, crate::entry::NATIVE_FRAME_OFFSET]
-        ; ldr x19, [x10, crate::entry::NATIVE_FRAME_REGISTER_BASE_OFFSET]
-        ; =>miss
-    );
-    Ok(true)
+    dynasm!(ops ; .arch aarch64 ; b =>done ; =>body_miss);
+    let hit_epilogue_end = ops.offset().0;
+    if let Some(code_map) = code_map.as_deref_mut() {
+        code_map.record(CodeRegion::inline_structural(
+            "inlineMethodHitEpilogue",
+            hit_epilogue_start,
+            hit_epilogue_end,
+            inline_site,
+            method.method_fid,
+        ));
+    }
+    let miss_replay_start = ops.offset().0;
+    if scratch_bytes != 0 {
+        dynasm!(ops ; .arch aarch64 ; add sp, sp, scratch_bytes);
+    }
+    dynasm!(ops ; .arch aarch64 ; =>miss);
+    let miss_entry = ops.offset().0;
+    if let Some(code_map) = code_map {
+        code_map.record(CodeRegion::inline_structural(
+            "inlineMethodMissTeardown",
+            miss_replay_start,
+            miss_entry,
+            inline_site,
+            method.method_fid,
+        ));
+    }
+    Ok(Some(InlineMethodEmission {
+        miss_replay_start: miss_entry,
+        inline_site,
+        function_id: method.method_fid,
+    }))
 }
 
 fn emit_packed_args(
@@ -788,6 +874,7 @@ pub(super) fn emit_method_call(
     table: &TransitionTable,
     call_trampoline: &CallTrampoline,
     view: &JitCompileSnapshot,
+    mut code_map: Option<&mut CodeMapCapture>,
     dst: u16,
     receiver: u16,
     name: u32,
@@ -795,6 +882,7 @@ pub(super) fn emit_method_call(
     argc: u16,
     packed_args: u64,
     packed_args_tail: Option<TemplateTail>,
+    logical_pc: u32,
     byte_pc: u32,
     arg0: Option<u16>,
     arg1: Option<u16>,
@@ -809,8 +897,9 @@ pub(super) fn emit_method_call(
         arg0,
         arg1,
     };
+    let mut inline_emission = None;
     if let Some(method) = view.inline_methods.get(&byte_pc) {
-        try_emit_inline_numeric_method(
+        inline_emission = try_emit_inline_numeric_method(
             ops,
             relocations,
             view,
@@ -820,6 +909,9 @@ pub(super) fn emit_method_call(
             argc,
             arg0,
             arg1,
+            logical_pc,
+            byte_pc,
+            code_map.as_deref_mut(),
             done,
         )?;
     }
@@ -957,5 +1049,14 @@ pub(super) fn emit_method_call(
         ; b.eq =>bail
         ; =>done
     );
+    if let (Some(emission), Some(code_map)) = (inline_emission, code_map) {
+        code_map.record(CodeRegion::inline_structural(
+            "inlineMethodMissReplay",
+            emission.miss_replay_start,
+            ops.offset().0,
+            emission.inline_site,
+            emission.function_id,
+        ));
+    }
     Ok(())
 }

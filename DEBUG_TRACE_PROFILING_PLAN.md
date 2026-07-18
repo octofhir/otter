@@ -54,6 +54,10 @@ needed to optimize the VM and JIT safely.
   assembly, native offset maps, deopt metadata, and safepoints. The CLI writes
   a new root atomically under a cooperative single-writer contract and never
   intentionally merges with an existing target.
+- [x] Template method-inline artifacts expose caller/callee identity, exact
+  guard/setup/body/hit/miss-replay native ranges, per-callee-operation ranges,
+  and the compact live virtual-register/receiver scratch assignment. Coalesced
+  operations remain visible as zero-width source regions.
 - [x] Capture Cranelift numeric leaves through the existing optimizing bundle:
   backend-marked CLIF, the exact installed code object, one structural code-map
   region, and empty relocation/safepoint/deopt inventories.
@@ -120,6 +124,9 @@ replacements for the planned Chrome/Perfetto timeline.
 - [x] Emit tier input from the already-owned compiler representation:
   template plan for the template tier and optimized unit/IR for the optimizing
   tier.
+- [x] Expose replay-safe template method inlining as typed additive code-map
+  regions, including compact scratch slots, deterministic entry values, and
+  the common post-teardown replay boundary.
 - [ ] Cover multiple functions, recompilation, OSR entry, abrupt compile
   failure, nested JIT re-entry, and full-GC relocation.
 
@@ -155,6 +162,9 @@ manifest rather than emitted as placeholders.
   OSR entry, and deopt/side-exit id when known. Safepoints are included as an
   explicit summary with unavailable native offsets rather than attached to a
   fabricated instruction.
+- [x] Annotate template method-inline caller/callee identity, compact scratch
+  layout, callee operation index, and distinct hit, teardown, and replay
+  regions without inferring runtime execution.
 - [x] Use code offsets in annotations and render baked address sites as
   symbolic relocations. Never print absolute executable addresses in ASM;
   exact `code.bin` remains explicitly runtime-local.

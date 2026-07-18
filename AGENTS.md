@@ -377,6 +377,15 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     fallback. Join assembly ranges to bytecode/tier operations through
     `code-map.json`, then inspect `deopt.json` or `safepoints.json` as
     applicable; safepoint `nativeReturnOffset` is currently explicitly `null`.
+  - Template method inlines expose `inlineMethodGuard`,
+    `inlineScratchSetup`, per-op `inlineInstruction`, aggregate body, hit
+    epilogue, miss teardown, and common miss replay regions. `inlineSite`
+    identifies the caller PC while top-level `functionId` identifies the
+    callee. Inspect `inlineScratchLayout` for compact register/receiver slots
+    and ordered argument/receiver/`undefined` entry values. A zero-width
+    `inlineInstruction` is an intentionally coalesced operation, not missing
+    capture. Code-map schema v1 readers must ignore unknown additive fields and
+    region kinds while still validating offsets.
   - Assembly decoding and formatting run only when `--jit-artifacts` is
     requested. The disabled path does not clone code, disassemble it, or build
     artifact text.

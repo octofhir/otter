@@ -5,7 +5,8 @@
 //!   VM-owned diagnostics request.
 //! - [`NativeCompileOutput`] — finalized code plus an optional sidecar.
 //! - [`CodeMapCapture`] and [`CodeRegion`] — emission-order native offset
-//!   correlation.
+//!   correlation, including template inline-method subregions and compact
+//!   scratch layouts.
 //! - [`relocation`] — typed address sites and portable semantic code.
 //! - [`assembly`] — deterministic annotated AArch64 disassembly.
 //! - Deterministic bytecode, safepoint, deopt, and bundle renderers.
@@ -63,6 +64,51 @@ pub(crate) struct NativeCompileOutput<T> {
     pub(crate) artifact: Option<Box<JitArtifactBundle>>,
 }
 
+/// Machine-readable compact scratch assignment attached to an inline setup
+/// region when artifact capture is enabled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InlineScratchLayoutArtifact {
+    pub(crate) parameter_count: u16,
+    pub(crate) virtual_register_count: u16,
+    pub(crate) scratch_slot_count: u16,
+    pub(crate) slot_bytes: u32,
+    pub(crate) stack_alignment_bytes: u32,
+    pub(crate) scratch_bytes: u32,
+    pub(crate) offset_basis: &'static str,
+    pub(crate) register_slots: Vec<Option<u16>>,
+    pub(crate) receiver_slot: Option<u16>,
+    pub(crate) entry_values: Vec<InlineScratchEntryArtifact>,
+}
+
+/// Caller site that owns one template-spliced method body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InlineSiteArtifact {
+    pub(crate) caller_function_id: u32,
+    pub(crate) logical_pc: u32,
+    pub(crate) byte_pc: u32,
+    pub(crate) has_receiver_property: bool,
+}
+
+/// One live-in value materialized by an inline scratch setup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub(crate) enum InlineScratchEntryArtifact {
+    Argument {
+        argument: u16,
+        register: u16,
+        slot: u16,
+    },
+    Receiver {
+        slot: u16,
+    },
+    Undefined {
+        register: u16,
+        slot: u16,
+    },
+}
+
 /// One emitted native region.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,6 +134,10 @@ pub(crate) struct CodeRegion {
     operation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     deopt_exit_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inline_scratch_layout: Option<InlineScratchLayoutArtifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inline_site: Option<InlineSiteArtifact>,
 }
 
 impl CodeRegion {
@@ -105,6 +155,8 @@ impl CodeRegion {
             operation_index: None,
             operation: None,
             deopt_exit_id: None,
+            inline_scratch_layout: None,
+            inline_site: None,
         }
     }
 
@@ -133,7 +185,55 @@ impl CodeRegion {
             operation_index,
             operation: Some(operation),
             deopt_exit_id: None,
+            inline_scratch_layout: None,
+            inline_site: None,
         }
+    }
+
+    pub(crate) fn inline_structural(
+        kind: &'static str,
+        start: usize,
+        end: usize,
+        inline_site: InlineSiteArtifact,
+        function_id: u32,
+    ) -> Self {
+        let mut region = Self::structural(kind, start, end);
+        region.function_id = Some(function_id);
+        region.inline_site = Some(inline_site);
+        region
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn inline_instruction(
+        start: usize,
+        end: usize,
+        inline_site: InlineSiteArtifact,
+        function_id: u32,
+        logical_pc: u32,
+        byte_pc: u32,
+        operation_index: u32,
+        operation: String,
+    ) -> Self {
+        let mut region =
+            Self::inline_structural("inlineInstruction", start, end, inline_site, function_id);
+        region.logical_pc = Some(logical_pc);
+        region.byte_pc = Some(byte_pc);
+        region.operation_index = Some(operation_index);
+        region.operation = Some(operation);
+        region
+    }
+
+    pub(crate) fn inline_scratch(
+        start: usize,
+        end: usize,
+        inline_site: InlineSiteArtifact,
+        function_id: u32,
+        layout: InlineScratchLayoutArtifact,
+    ) -> Self {
+        let mut region =
+            Self::inline_structural("inlineScratchSetup", start, end, inline_site, function_id);
+        region.inline_scratch_layout = Some(layout);
+        region
     }
 
     pub(crate) fn deopt(start: usize, end: usize, exit_id: u32, logical_pc: u32) -> Self {
@@ -499,5 +599,82 @@ mod tests {
         assert_eq!(value["regions"][0]["startOffset"], 4);
         assert_eq!(value["regions"][0]["bytePc"], 19);
         assert_eq!(value["osrEntries"][0]["logicalPc"], 2);
+    }
+
+    #[test]
+    fn code_map_inline_scratch_schema_is_typed_and_additive() {
+        let inline_site = InlineSiteArtifact {
+            caller_function_id: 7,
+            logical_pc: 2,
+            byte_pc: 19,
+            has_receiver_property: true,
+        };
+        let layout = InlineScratchLayoutArtifact {
+            parameter_count: 1,
+            virtual_register_count: 3,
+            scratch_slot_count: 3,
+            slot_bytes: 8,
+            stack_alignment_bytes: 16,
+            scratch_bytes: 32,
+            offset_basis: "postAllocationSp",
+            register_slots: vec![Some(0), None, Some(1)],
+            receiver_slot: Some(2),
+            entry_values: vec![
+                InlineScratchEntryArtifact::Argument {
+                    argument: 0,
+                    register: 0,
+                    slot: 0,
+                },
+                InlineScratchEntryArtifact::Receiver { slot: 2 },
+                InlineScratchEntryArtifact::Undefined {
+                    register: 2,
+                    slot: 1,
+                },
+            ],
+        };
+        let mut map = CodeMapCapture::default();
+        map.record(CodeRegion::structural("entry", 0, 4));
+        map.record(CodeRegion::inline_scratch(4, 20, inline_site, 11, layout));
+
+        let value: serde_json::Value =
+            serde_json::from_str(&map.render(0)).expect("valid code-map JSON");
+        let ordinary = &value["regions"][0];
+        assert!(ordinary.get("inlineSite").is_none());
+        assert!(ordinary.get("inlineScratchLayout").is_none());
+
+        let inline = &value["regions"][1];
+        assert_eq!(inline["kind"], "inlineScratchSetup");
+        assert_eq!(inline["functionId"], 11);
+        assert_eq!(inline["inlineSite"]["callerFunctionId"], 7);
+        assert_eq!(inline["inlineSite"]["logicalPc"], 2);
+        assert_eq!(inline["inlineSite"]["bytePc"], 19);
+        assert_eq!(inline["inlineSite"]["hasReceiverProperty"], true);
+
+        let layout = &inline["inlineScratchLayout"];
+        assert_eq!(layout["parameterCount"], 1);
+        assert_eq!(layout["virtualRegisterCount"], 3);
+        assert_eq!(layout["scratchSlotCount"], 3);
+        assert_eq!(layout["slotBytes"], 8);
+        assert_eq!(layout["stackAlignmentBytes"], 16);
+        assert_eq!(layout["scratchBytes"], 32);
+        assert_eq!(layout["offsetBasis"], "postAllocationSp");
+        assert_eq!(layout["registerSlots"][0], 0);
+        assert!(layout["registerSlots"][1].is_null());
+        assert_eq!(layout["receiverSlot"], 2);
+
+        let entries = layout["entryValues"]
+            .as_array()
+            .expect("typed entry values");
+        assert_eq!(entries[0]["kind"], "argument");
+        assert_eq!(entries[0]["argument"], 0);
+        assert_eq!(entries[0]["register"], 0);
+        assert_eq!(entries[0]["slot"], 0);
+        assert_eq!(entries[1]["kind"], "receiver");
+        assert_eq!(entries[1]["slot"], 2);
+        assert!(entries[1].get("register").is_none());
+        assert_eq!(entries[2]["kind"], "undefined");
+        assert_eq!(entries[2]["register"], 2);
+        assert_eq!(entries[2]["slot"], 1);
+        assert!(entries[2].get("argument").is_none());
     }
 }

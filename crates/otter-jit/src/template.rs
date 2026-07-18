@@ -13,6 +13,8 @@
 //!
 //! # Contents
 //! - [`plan`] — machine-independent operation stream over typed lowering.
+//! - [`inline_method`] — replay-safe method validation and compact scratch
+//!   planning.
 //! - [`arm64`] — the AArch64 dynasm backend (first machine target).
 //! - [`code`] — finalized [`TemplateCode`] objects and VM entry publication.
 //! - [`compile`] — the whole-function compile entry point.
@@ -36,9 +38,11 @@ use otter_vm::JitCompileSnapshot;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod arm64;
 mod code;
+mod inline_method;
 mod plan;
 
 pub use code::TemplateCode;
+pub(crate) use inline_method::{InlineEntryValue, InlineMethodPlan, InlineScratchSlot};
 pub(crate) use plan::{
     ArithKind, BitwiseKind, CompareKind, TemplateOp, TemplatePlan, TemplateTail,
 };

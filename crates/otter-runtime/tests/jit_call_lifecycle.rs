@@ -9,8 +9,10 @@
 //!   the compiled-call boundary entirely.
 //! - A prototype-held method whose inline body reads an own receiver property.
 //! - An inline method whose hoisted local observes function-entry `undefined`.
+//! - Compact scratch reuse across two arguments, assigned locals, and an
+//!   overlapping parameter-assignment snapshot.
 //! - Guarded numeric method splicing plus replay through the ordinary method
-//!   bridge after receiver, callee, bound-state, or operand guards miss.
+//!   bridge after receiver, callee, bound-state, or late operand guards miss.
 //! - Direct callees that allocate their own captured cells while retaining the
 //!   current receiver across moving-GC safepoints.
 //! - Frameless direct callees that mint distinct capture-free function values.
@@ -28,6 +30,8 @@
 //!   method identity; every rejected guard preserves full method-call semantics.
 //! - Scratch-register trimming preserves the entry `undefined` state of every
 //!   local that the accepted inline body can read before writing.
+//! - Compact slots never alias simultaneously live values; parameter
+//!   reassignment cannot overwrite an earlier expression snapshot.
 //! - Upvalue-spine construction roots inherited cells and dynamic call state
 //!   until the new frame is published.
 //! - Capture-free function construction uses the published SELF/register
@@ -414,6 +418,110 @@ JSON.stringify([
         "jit-inline-uninitialized-local-hit",
         "[null,null]",
         true,
+    );
+}
+
+const COMPACT_INLINE_METHOD_SETUP: &str = r#"
+globalThis.__jitCompactInlineMethodFixture = (() => {
+  function apply(left, right) {
+    let sum = left + right;
+    return sum + this.bias;
+  }
+  function callMethod(receiver, left, right) {
+    return receiver.apply(left, right);
+  }
+
+  const receiver = { bias: 4, apply };
+  for (let i = 0; i < 5000; i++) {
+    callMethod(receiver, i, 2);
+  }
+  return { callMethod, receiver };
+})();
+"#;
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn method_inline_compacts_two_arguments_and_assigned_local() {
+    assert_inline_method_probe(
+        COMPACT_INLINE_METHOD_SETUP,
+        r#"
+const fixture = globalThis.__jitCompactInlineMethodFixture;
+JSON.stringify([
+  fixture.callMethod(fixture.receiver, 3, 5),
+  fixture.callMethod(fixture.receiver, 10, 13)
+]);
+"#,
+        "jit-inline-compact-two-argument-hit",
+        "[12,27]",
+        true,
+    );
+}
+
+const SNAPSHOT_INLINE_METHOD_SETUP: &str = r#"
+globalThis.__jitSnapshotInlineMethodFixture = (() => {
+  function apply(value) {
+    return value + (value = 2) + this.bias;
+  }
+  function callMethod(receiver, value) {
+    return receiver.apply(value);
+  }
+
+  const receiver = { bias: 4, apply };
+  for (let i = 0; i < 5000; i++) {
+    callMethod(receiver, i);
+  }
+  return { callMethod, receiver };
+})();
+"#;
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn method_inline_keeps_parameter_assignment_snapshot_live() {
+    assert_inline_method_probe(
+        SNAPSHOT_INLINE_METHOD_SETUP,
+        r#"
+const fixture = globalThis.__jitSnapshotInlineMethodFixture;
+JSON.stringify([
+  fixture.callMethod(fixture.receiver, 9),
+  fixture.callMethod(fixture.receiver, 20)
+]);
+"#,
+        "jit-inline-parameter-snapshot-hit",
+        "[15,26]",
+        true,
+    );
+}
+
+const LATE_REPLAY_INLINE_METHOD_SETUP: &str = r#"
+globalThis.__jitLateReplayInlineMethodFixture = (() => {
+  function apply(value, suffix) {
+    const numeric = value + this.bias;
+    return numeric + suffix;
+  }
+  function callMethod(receiver, value, suffix) {
+    return receiver.apply(value, suffix);
+  }
+
+  const receiver = { bias: 4, apply };
+  for (let i = 0; i < 5000; i++) {
+    callMethod(receiver, i, 1);
+  }
+  return { callMethod, receiver };
+})();
+"#;
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn method_inline_replays_after_late_guard_overwrites_scratch() {
+    assert_inline_method_probe(
+        LATE_REPLAY_INLINE_METHOD_SETUP,
+        r#"
+const fixture = globalThis.__jitLateReplayInlineMethodFixture;
+JSON.stringify(fixture.callMethod(fixture.receiver, 3, "!"));
+"#,
+        "jit-inline-late-operand-miss",
+        r#""7!""#,
+        false,
     );
 }
 

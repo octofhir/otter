@@ -20,6 +20,7 @@ engine = [
     "dep:otter-syntax",
     "dep:otter-vm",
     "dep:smallvec",
+    "dep:sysinfo",
 ]
 rss = ["dep:sysinfo"]
 

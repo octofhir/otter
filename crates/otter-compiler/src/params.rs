@@ -8,6 +8,8 @@
 //!
 //! # Invariants
 //! - Parameter order follows source order and preserves mapped arguments aliases.
+//! - Uncaptured simple formals bind their incoming ABI registers without a
+//!   second local slot or prologue copy.
 //!
 //! # See also
 //! - `functions` for function body lowering
@@ -156,6 +158,20 @@ pub(crate) fn predeclare_formal_parameters(
     allow_duplicate_formals: bool,
     span: (u32, u32),
 ) -> Result<(), CompileError> {
+    // The last occurrence owns a duplicate simple formal's binding. Mapping
+    // that name directly to the last incoming slot gives the specified
+    // last-argument value without copying earlier occurrences over it.
+    let mut direct_registers = HashMap::<String, u16>::new();
+    for (ordinal, param) in params.items.iter().enumerate() {
+        if param.initializer.is_none()
+            && let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &param.pattern
+        {
+            direct_registers.insert(
+                id.name.to_string(),
+                u16::try_from(ordinal).expect("too many parameters"),
+            );
+        }
+    }
     let mut names = Vec::new();
     for param in &params.items {
         collect_pattern_var_names(&param.pattern, &mut names);
@@ -168,7 +184,11 @@ pub(crate) fn predeclare_formal_parameters(
         if allow_duplicate_formals && !seen.insert(name.clone()) {
             continue;
         }
-        parent.declare_binding(&name, false, span)?;
+        if let Some(&argument_register) = direct_registers.get(&name) {
+            parent.declare_parameter_binding(&name, argument_register, span)?;
+        } else {
+            parent.declare_binding(&name, false, span)?;
+        }
     }
     Ok(())
 }
@@ -190,7 +210,14 @@ pub(crate) fn bind_simple_formal_parameter(
     } else {
         parent.declare_binding(name, false, span)?
     };
-    parent.emit_store_storage(ordinal, storage, span);
+    let aliases_incoming_register = matches!(
+        storage,
+        BindingStorage::Register { reg }
+            if reg == ordinal || allow_duplicate_formals
+    );
+    if !aliases_incoming_register {
+        parent.emit_store_storage(ordinal, storage, span);
+    }
     parent.mark_initialized(name);
     Ok(())
 }

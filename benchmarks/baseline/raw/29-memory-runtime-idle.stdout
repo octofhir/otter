@@ -9,8 +9,8 @@
     }
   },
   "provenance": {
-    "capturedAtUnixMs": 1784404630877,
-    "commit": "f3777c0a81684f3a7e9a2b84563f7afd1b588c33",
+    "capturedAtUnixMs": 1784404188048,
+    "commit": "5df704867ed13dba88db80d2d609f96a21e95f4f",
     "dirty": false,
     "platform": {
       "os": "macos",
@@ -43,15 +43,15 @@
       "direction": "lower-is-better",
       "role": "diagnostic",
       "samples": [
-        257584750,
-        274540875,
-        278134250,
-        276324333,
-        269984584
+        268719583,
+        278752541,
+        277980917,
+        273440125,
+        265504000
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 274540875
+        "value": 273440125
       }
     },
     {
@@ -60,15 +60,15 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
-        9417,
-        16667,
-        28167,
-        27000,
-        13416
+        9792,
+        27375,
+        26792,
+        27417,
+        11208
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 16667
+        "value": 26792
       }
     },
     {
@@ -94,15 +94,15 @@
       "direction": "lower-is-better",
       "role": "primary",
       "samples": [
-        4938458,
-        10485875,
-        15678166,
-        14216542,
-        7216500
+        4867208,
+        14855625,
+        14037167,
+        15132500,
+        6375541
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 10485875
+        "value": 14037167
       }
     },
     {
@@ -111,15 +111,15 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
+        12484608,
+        12484608,
         12500992,
-        12451840,
-        12353536,
-        12435456,
-        12386304
+        12419072,
+        12435456
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 12435456
+        "value": 12484608
       }
     },
     {
@@ -128,15 +128,15 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
+        13729792,
+        13729792,
         13746176,
         13697024,
-        13631488,
-        13680640,
-        13647872
+        13697024
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 13680640
+        "value": 13729792
       }
     },
     {
@@ -145,15 +145,15 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
+        13729792,
+        13729792,
         13746176,
         13697024,
-        13631488,
-        13680640,
-        13647872
+        13697024
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 13680640
+        "value": 13729792
       }
     },
     {

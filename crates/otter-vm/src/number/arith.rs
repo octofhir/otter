@@ -2,8 +2,9 @@
 //!
 //! These four operators stay on the integer fast path whenever
 //! both operands are `Smi` and the result is representable in
-//! `i32`. The `Smi → Double` demotion is automatic via
-//! [`NumberValue::canonicalize`].
+//! `i32`. Once either operand requires IEEE-754 arithmetic, the result stays
+//! `Double`; this preserves representation feedback across exact-integer
+//! floating-point results.
 //!
 //! # Contents
 //! - [`add`], [`sub`], [`mul`], [`div`], [`rem`], [`neg`].
@@ -22,7 +23,7 @@ pub fn add(lhs: NumberValue, rhs: NumberValue) -> NumberValue {
     {
         return NumberValue::Smi(r);
     }
-    NumberValue::Double(lhs.as_f64() + rhs.as_f64()).canonicalize()
+    NumberValue::Double(lhs.as_f64() + rhs.as_f64())
 }
 
 /// `lhs - rhs`.
@@ -33,7 +34,7 @@ pub fn sub(lhs: NumberValue, rhs: NumberValue) -> NumberValue {
     {
         return NumberValue::Smi(r);
     }
-    NumberValue::Double(lhs.as_f64() - rhs.as_f64()).canonicalize()
+    NumberValue::Double(lhs.as_f64() - rhs.as_f64())
 }
 
 /// `lhs * rhs`.
@@ -51,15 +52,13 @@ pub fn mul(lhs: NumberValue, rhs: NumberValue) -> NumberValue {
         }
         return NumberValue::Smi(r);
     }
-    NumberValue::Double(lhs.as_f64() * rhs.as_f64()).canonicalize()
+    NumberValue::Double(lhs.as_f64() * rhs.as_f64())
 }
 
-/// `lhs / rhs`. Always returns `Double` because integer division
-/// rarely yields an exact integer; canonicalization promotes
-/// integer-valued results back to `Smi`.
+/// `lhs / rhs`. Always returns `Double`.
 #[must_use]
 pub fn div(lhs: NumberValue, rhs: NumberValue) -> NumberValue {
-    NumberValue::Double(lhs.as_f64() / rhs.as_f64()).canonicalize()
+    NumberValue::Double(lhs.as_f64() / rhs.as_f64())
 }
 
 /// `lhs % rhs` per IEEE-754 remainder semantics.
@@ -80,7 +79,7 @@ pub fn rem(lhs: NumberValue, rhs: NumberValue) -> NumberValue {
         }
         return NumberValue::Double(-0.0);
     }
-    NumberValue::Double(lhs.as_f64() % rhs.as_f64()).canonicalize()
+    NumberValue::Double(lhs.as_f64() % rhs.as_f64())
 }
 
 /// Unary `-`.
@@ -90,9 +89,9 @@ pub fn neg(value: NumberValue) -> NumberValue {
         NumberValue::Smi(0) => NumberValue::Double(-0.0),
         NumberValue::Smi(n) => match n.checked_neg() {
             Some(r) => NumberValue::Smi(r),
-            None => NumberValue::Double(-f64::from(n)).canonicalize(),
+            None => NumberValue::Double(-f64::from(n)),
         },
-        NumberValue::Double(d) => NumberValue::Double(-d).canonicalize(),
+        NumberValue::Double(d) => NumberValue::Double(-d),
     }
 }
 
@@ -118,6 +117,26 @@ mod tests {
             NumberValue::Double(d) => assert!((d - (i32::MAX as f64 + 1.0)).abs() < 1e-9),
             other => panic!("expected Double, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn float_path_preserves_representation_for_exact_integer_results() {
+        assert!(matches!(
+            mul(NumberValue::Double(0.5), NumberValue::Smi(8)),
+            NumberValue::Double(4.0)
+        ));
+        assert!(matches!(
+            add(NumberValue::Smi(1), NumberValue::Double(4.0)),
+            NumberValue::Double(5.0)
+        ));
+        assert!(matches!(
+            div(NumberValue::Smi(8), NumberValue::Smi(2)),
+            NumberValue::Double(4.0)
+        ));
+        assert!(matches!(
+            neg(NumberValue::Double(-4.0)),
+            NumberValue::Double(4.0)
+        ));
     }
 
     #[test]

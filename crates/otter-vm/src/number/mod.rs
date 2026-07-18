@@ -8,14 +8,15 @@
 //!   a non-integer division remainder, in which case it
 //!   demotes to [`NumberValue::Double`].
 //! - [`NumberValue::Double`] — IEEE-754 fallback. Carries `NaN`,
-//!   `±Infinity`, and `-0.0`. `-0.0` is **never** representable as
-//!   `Smi`.
+//!   `±Infinity`, and `-0.0`. Arithmetic that enters this path stays here so
+//!   feedback and optimized representations do not oscillate at exact integer
+//!   results.
 //!
 //! # Invariants
 //! - The value `0_i32` is always represented as `Smi(0)`, never
 //!   `Double(+0.0)`. Negative zero is always `Double(-0.0)`.
 //! - `NaN` is always `Double(f64::NAN)`.
-//! - Conversions through [`NumberValue::canonicalize`] normalize
+//! - Explicit conversions through [`NumberValue::canonicalize`] normalize
 //!   `Double` payloads back to `Smi` when they hold an exact
 //!   `i32`-range integer **and** are not `-0.0`.
 //!

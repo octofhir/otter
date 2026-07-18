@@ -28,6 +28,61 @@ fn assert_success(output: &Output) {
     );
 }
 
+#[cfg(target_arch = "aarch64")]
+fn assert_persisted_assembly(path: &std::path::Path) {
+    let assembly = std::fs::read_to_string(path).expect("read UTF-8 annotated assembly");
+    let mut lines = assembly.lines();
+    assert_eq!(
+        lines.next(),
+        Some("; otter jit aarch64 assembly v1"),
+        "versioned assembly header"
+    );
+    assert_eq!(
+        lines.next(),
+        Some("; offset-basis=code.bin"),
+        "assembly offsets use code.bin"
+    );
+    assert!(
+        assembly.lines().any(|line| {
+            line.strip_prefix('L')
+                .and_then(|label| label.strip_suffix(':'))
+                .is_some_and(|offset| {
+                    offset.len() == 8 && offset.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        }),
+        "assembly retains stable branch labels:\n{assembly}"
+    );
+    assert!(
+        assembly.lines().any(|line| {
+            line.strip_prefix("+0x")
+                .and_then(|instruction| instruction.split_once(':'))
+                .is_some_and(|(offset, _)| {
+                    offset.len() == 8 && offset.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        }),
+        "assembly retains exact native offsets:\n{assembly}"
+    );
+    assert!(
+        assembly.contains("pc=")
+            && assembly.contains("tier-op=")
+            && assembly.contains("relocation "),
+        "assembly retains code-map and symbolic relocation annotations:\n{assembly}"
+    );
+    for line in assembly.lines().filter(|line| line.contains("relocation ")) {
+        let (_, rendered) = line
+            .split_once(':')
+            .unwrap_or_else(|| panic!("relocation lacks an exact offset: {line}"));
+        assert!(
+            rendered.trim_start().starts_with("relocation ") && !rendered.contains("0x"),
+            "relocation must replace address-bearing instructions with a symbol: {line}"
+        );
+    }
+    assert!(
+        !assembly.contains("resolvedValue") && !assembly.contains("0xdead"),
+        "assembly must redact resolved process values:\n{assembly}"
+    );
+}
+
 #[test]
 fn explicit_jit_tier_modes_are_accepted() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -286,6 +341,7 @@ fn jit_artifacts_are_versioned_complete_and_offset_consistent() {
         "template-plan.txt",
         "code.bin",
         "code-normalized.bin",
+        "asm.txt",
         "code-map.json",
         "relocations.json",
         "safepoints.json",
@@ -297,7 +353,7 @@ fn jit_artifacts_are_versioned_complete_and_offset_consistent() {
         assert!(directory.join(name).is_file(), "missing payload {name}");
     }
     let absent = manifest["filesAbsent"].as_array().expect("absent files");
-    for name in ["optimized-ir.txt", "asm.txt", "deopt.json"] {
+    for name in ["optimized-ir.txt", "deopt.json"] {
         assert!(
             absent.iter().any(|value| value == name),
             "missing absent inventory entry {name}"
@@ -310,6 +366,7 @@ fn jit_artifacts_are_versioned_complete_and_offset_consistent() {
     let normalized =
         std::fs::read(directory.join("code-normalized.bin")).expect("read normalized code");
     assert!(normalized.starts_with(b"OTJNCODE"));
+    assert_persisted_assembly(&directory.join("asm.txt"));
     let relocations_bytes =
         std::fs::read(directory.join("relocations.json")).expect("read relocations");
     let relocations: serde_json::Value =
@@ -449,6 +506,10 @@ fn abrupt_failure_still_writes_partial_jit_artifacts() {
             .is_some_and(|bundles| !bundles.is_empty()),
         "partial artifact batch retains successful compiles"
     );
+    let bundle = index["bundles"][0]
+        .as_str()
+        .expect("first partial artifact bundle");
+    assert_persisted_assembly(&artifacts_path.join(bundle).join("asm.txt"));
 }
 
 #[cfg(target_arch = "aarch64")]

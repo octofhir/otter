@@ -207,13 +207,16 @@ impl RelocationCapture {
             });
         }
 
-        let relocations = validate_relocations(&self.records, code)?;
-        let logical_items = build_logical_items(&relocations, code);
-        let normalized_code = render_normalized(&relocations, &logical_items, code)?;
-        let json = render_json(&relocations);
+        let validated = ValidatedRelocations {
+            records: validate_relocations(&self.records, code)?,
+        };
+        let logical_items = build_logical_items(&validated.records, code);
+        let normalized_code = render_normalized(&validated.records, &logical_items, code)?;
+        let json = render_json(&validated.records);
         Ok(RenderedRelocations {
             json,
             normalized_code,
+            validated,
         })
     }
 }
@@ -223,6 +226,7 @@ impl RelocationCapture {
 pub(crate) struct RenderedRelocations {
     pub(crate) json: String,
     pub(crate) normalized_code: Vec<u8>,
+    pub(super) validated: ValidatedRelocations,
 }
 
 /// A relocation range or PC-relative instruction violated portability rules.
@@ -470,13 +474,13 @@ struct MovWideChunk {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ValidatedRelocation {
-    start_offset: u64,
-    end_offset: u64,
-    register: u8,
-    width_bits: u8,
+pub(super) struct ValidatedRelocation {
+    pub(super) start_offset: u64,
+    pub(super) end_offset: u64,
+    pub(super) register: u8,
+    pub(super) width_bits: u8,
     chunks: Vec<MovWideChunk>,
-    target: RelocationTarget,
+    pub(super) target: RelocationTarget,
 }
 
 impl ValidatedRelocation {
@@ -487,6 +491,15 @@ impl ValidatedRelocation {
     fn end(&self) -> usize {
         self.end_offset as usize
     }
+}
+
+/// Validated address sites shared by every renderer in one artifact build.
+///
+/// The emission-side records are sorted and decoded exactly once. Both the
+/// portable relocation files and annotated assembly borrow this immutable DTO.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ValidatedRelocations {
+    pub(super) records: Vec<ValidatedRelocation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -821,7 +834,7 @@ fn branch_target_ordinal(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DirectBranchKind {
+pub(super) enum DirectBranchKind {
     B,
     Bl,
     BCond { condition: u8 },
@@ -832,9 +845,9 @@ enum DirectBranchKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DirectBranch {
-    kind: DirectBranchKind,
-    target: i64,
+pub(super) struct DirectBranch {
+    pub(super) kind: DirectBranchKind,
+    pub(super) target: i64,
 }
 
 impl DirectBranch {
@@ -876,7 +889,7 @@ impl DirectBranch {
     }
 }
 
-fn decode_direct_branch(instruction: u32, offset: usize) -> Option<DirectBranch> {
+pub(super) fn decode_direct_branch(instruction: u32, offset: usize) -> Option<DirectBranch> {
     if instruction & 0x7c00_0000 == 0x1400_0000 {
         let displacement = sign_extend(instruction & 0x03ff_ffff, 26) << 2;
         return Some(DirectBranch {
@@ -1066,7 +1079,7 @@ fn read_instruction(code: &[u8], offset: usize) -> u32 {
 
 fn sign_extend(value: u32, bits: u32) -> i64 {
     let shift = 64 - bits;
-    ((i64::from(value) << shift) >> shift) as i64
+    (i64::from(value) << shift) >> shift
 }
 
 #[cfg(test)]

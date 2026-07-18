@@ -11,6 +11,8 @@
 //! - Every retained payload owns its bytes and contains no VM or GC handle.
 //! - Exact code and every native offset in its code map agree on one finalized
 //!   executable mapping.
+//! - Annotated assembly is UTF-8, offset-based, and never exposes resolved
+//!   process-local relocation values.
 //!
 //! # See also
 //! - `otter_vm::jit_artifact` for the versioned manifest and bounded batch.
@@ -94,6 +96,72 @@ fn code_map(bundle: &JitArtifactBundle) -> serde_json::Value {
     .expect("valid code-map JSON")
 }
 
+fn assert_assembly_is_symbolic(bundle: &JitArtifactBundle) {
+    let assembly = std::str::from_utf8(
+        bundle
+            .file(JitArtifactFileName::Assembly)
+            .expect("annotated assembly payload")
+            .contents(),
+    )
+    .expect("annotated assembly is UTF-8");
+    let mut lines = assembly.lines();
+    assert_eq!(
+        lines.next(),
+        Some("; otter jit aarch64 assembly v1"),
+        "versioned assembly header"
+    );
+    assert_eq!(
+        lines.next(),
+        Some("; offset-basis=code.bin"),
+        "assembly offsets use exact code.bin"
+    );
+    assert!(
+        assembly.lines().any(|line| {
+            line.strip_prefix('L')
+                .and_then(|label| label.strip_suffix(':'))
+                .is_some_and(|offset| {
+                    offset.len() == 8 && offset.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        }),
+        "branch targets must have stable offset labels:\n{assembly}"
+    );
+    assert!(
+        assembly.lines().any(|line| {
+            line.strip_prefix("+0x")
+                .and_then(|instruction| instruction.split_once(':'))
+                .is_some_and(|(offset, _)| {
+                    offset.len() == 8 && offset.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        }),
+        "instructions must carry exact code.bin offsets:\n{assembly}"
+    );
+    assert!(
+        assembly.contains("pc=") && assembly.contains("tier-op="),
+        "assembly must retain bytecode/IR correlation annotations:\n{assembly}"
+    );
+    let relocation_lines = assembly
+        .lines()
+        .filter(|line| line.contains("relocation "))
+        .collect::<Vec<_>>();
+    assert!(
+        !relocation_lines.is_empty(),
+        "baked process values must render as symbolic relocations:\n{assembly}"
+    );
+    for line in relocation_lines {
+        let (_, rendered) = line
+            .split_once(':')
+            .unwrap_or_else(|| panic!("relocation lacks an exact offset: {line}"));
+        assert!(
+            rendered.trim_start().starts_with("relocation ") && !rendered.contains("0x"),
+            "relocation must replace address-bearing instructions with a symbol: {line}"
+        );
+    }
+    assert!(
+        !assembly.contains("resolvedValue") && !assembly.contains("0xdead"),
+        "assembly must not expose resolved relocation values:\n{assembly}"
+    );
+}
+
 fn assert_bundle_is_self_consistent(bundle: &JitArtifactBundle) {
     let manifest = bundle.manifest();
     let code = bundle
@@ -166,6 +234,7 @@ fn assert_bundle_is_self_consistent(bundle: &JitArtifactBundle) {
         assert!(start < end, "empty OSR entry: {entry}");
         assert!(end <= code_len, "OSR entry escapes code.bin: {entry}");
     }
+    assert_assembly_is_symbolic(bundle);
 }
 
 fn first_tier_bundle(batch: &JitArtifactBatch, tier: JitDebugTier) -> &JitArtifactBundle {
@@ -231,7 +300,7 @@ fn template_osr_returns_a_versioned_owned_bundle_without_events() {
     assert!(bundle.file(JitArtifactFileName::Safepoints).is_some());
     assert!(bundle.file(JitArtifactFileName::Relocations).is_some());
     assert!(bundle.file(JitArtifactFileName::NormalizedCode).is_some());
-    assert!(bundle.file(JitArtifactFileName::Assembly).is_none());
+    assert!(bundle.file(JitArtifactFileName::Assembly).is_some());
     assert_bundle_is_self_consistent(bundle);
 }
 
@@ -256,6 +325,7 @@ fn optimizing_osr_returns_ir_deopt_and_safepoint_payloads() {
     assert!(bundle.file(JitArtifactFileName::TemplatePlan).is_none());
     assert!(bundle.file(JitArtifactFileName::Deopt).is_some());
     assert!(bundle.file(JitArtifactFileName::Safepoints).is_some());
+    assert!(bundle.file(JitArtifactFileName::Assembly).is_some());
     let deopt: serde_json::Value = serde_json::from_slice(
         bundle
             .file(JitArtifactFileName::Deopt)

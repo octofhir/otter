@@ -41,6 +41,46 @@ const MEMORY_SAMPLES: u32 = 5;
 const MODULE_SAMPLES: u32 = 20;
 const MODULE_WARMUPS: u32 = 5;
 
+#[derive(Debug, Clone, Copy)]
+struct KernelSpec {
+    slug: &'static str,
+    source: &'static str,
+    expected: &'static str,
+    warmups: u32,
+    samples: u32,
+}
+
+const KERNELS: [KernelSpec; 4] = [
+    KernelSpec {
+        slug: "method-call-monomorphic",
+        source: "benchmarks/scripts/method-call-monomorphic.js",
+        expected: "500003500000",
+        warmups: 8,
+        samples: 15,
+    },
+    KernelSpec {
+        slug: "branch-phi",
+        source: "benchmarks/scripts/branch-phi.js",
+        expected: "-6000000",
+        warmups: 5,
+        samples: 20,
+    },
+    KernelSpec {
+        slug: "boxed-double-property",
+        source: "benchmarks/scripts/boxed-double-property.js",
+        expected: "4000000",
+        warmups: 5,
+        samples: 15,
+    },
+    KernelSpec {
+        slug: "dense-array",
+        source: "benchmarks/scripts/dense-array.js",
+        expected: "5234688",
+        warmups: 5,
+        samples: 15,
+    },
+];
+
 #[derive(Debug, Parser)]
 #[command(about = "Capture or publish the current Otter engine baseline")]
 struct Args {
@@ -269,8 +309,45 @@ fn module_case(entry: &str, reuse: RuntimeReuse, tier: Tier) -> BaselineCase {
     }
 }
 
+fn kernel_case(spec: KernelSpec, tier: Tier) -> BaselineCase {
+    BaselineCase {
+        id: format!("kernel-{}-{}", spec.slug, tier.cli),
+        args: vec![
+            "kernel".into(),
+            "--source".into(),
+            spec.source.into(),
+            "--function".into(),
+            "engineKernel".into(),
+            "--expected".into(),
+            spec.expected.into(),
+            "--jit-tier".into(),
+            tier.cli.into(),
+            "--samples".into(),
+            spec.samples.to_string(),
+            "--warmup".into(),
+            spec.warmups.to_string(),
+        ],
+        benchmark: BenchmarkIdentity {
+            suite: "engine".into(),
+            name: format!("kernel-{}", spec.slug),
+            parameters: parameters([
+                ("source", spec.source.into()),
+                ("function", "engineKernel".into()),
+                ("expected", spec.expected.into()),
+            ]),
+        },
+        configuration: configuration(
+            ExecutionSurface::Vm,
+            tier.policy,
+            GcPolicy::Normal,
+            RuntimeReuse::NotApplicable,
+        ),
+        sampling: sampling(spec.warmups, spec.samples, 1),
+    }
+}
+
 fn baseline_cases() -> Vec<BaselineCase> {
-    let mut cases = Vec::with_capacity(18);
+    let mut cases = Vec::with_capacity(30);
     for arity in [0, 4] {
         for tier in TIERS {
             cases.push(call_case("bytecode", arity, tier));
@@ -278,6 +355,11 @@ fn baseline_cases() -> Vec<BaselineCase> {
     }
     for tier in TIERS {
         cases.push(call_case("host", 1, tier));
+    }
+    for spec in KERNELS {
+        for tier in TIERS {
+            cases.push(kernel_case(spec, tier));
+        }
     }
     cases.push(BaselineCase {
         id: "jit-compile-engine-target".into(),
@@ -954,21 +1036,80 @@ fn copy_capture_snapshot(capture_dir: &Path, snapshot_dir: &Path) -> Result<(), 
     Ok(())
 }
 
+fn install_published_baseline(
+    temporary: &Path,
+    output: &Path,
+    previous: &Path,
+) -> Result<(), String> {
+    if previous.exists() {
+        return Err(format!(
+            "previous-baseline staging path exists: {}",
+            previous.display()
+        ));
+    }
+    if !output.exists() {
+        return fs::rename(temporary, output).map_err(|error| {
+            format!(
+                "publish {} to {}: {error}",
+                temporary.display(),
+                output.display()
+            )
+        });
+    }
+    if !output.is_dir() {
+        return Err(format!(
+            "published baseline is not a directory: {}",
+            output.display()
+        ));
+    }
+
+    fs::rename(output, previous).map_err(|error| {
+        format!(
+            "stage previous baseline {} at {}: {error}",
+            output.display(),
+            previous.display()
+        )
+    })?;
+    if let Err(error) = fs::rename(temporary, output) {
+        return match fs::rename(previous, output) {
+            Ok(()) => Err(format!(
+                "publish {} to {}: {error}; previous baseline restored",
+                temporary.display(),
+                output.display()
+            )),
+            Err(rollback_error) => Err(format!(
+                "publish {} to {}: {error}; restore {} failed: {rollback_error}",
+                temporary.display(),
+                output.display(),
+                previous.display()
+            )),
+        };
+    }
+    if let Err(error) = fs::remove_dir_all(previous) {
+        eprintln!(
+            "warning: published {}, but retained previous baseline {}: {error}",
+            output.display(),
+            previous.display()
+        );
+    }
+    Ok(())
+}
+
 fn publish(capture: PathBuf) -> Result<PathBuf, String> {
     let root = repo_root()?;
     std::env::set_current_dir(&root).map_err(|error| format!("enter repo root: {error}"))?;
     let capture_dir = absolute_from(&root, &capture);
     let output = root.join("benchmarks/baseline");
-    if output.exists() {
-        return Err(format!(
-            "published baseline already exists: {}",
-            output.display()
-        ));
-    }
+    let publish_nonce = unix_ms();
     let temporary = root.join("benchmarks/results").join(format!(
         ".baseline-publish-{}-{}",
         std::process::id(),
-        unix_ms()
+        publish_nonce
+    ));
+    let previous = root.join("benchmarks/results").join(format!(
+        ".baseline-previous-{}-{}",
+        std::process::id(),
+        publish_nonce
     ));
     if temporary.exists() {
         return Err(format!(
@@ -988,14 +1129,11 @@ fn publish(capture: PathBuf) -> Result<PathBuf, String> {
         let _ = fs::remove_dir_all(&temporary);
         return Err(error);
     }
-    fs::rename(&temporary, &output).map_err(|error| {
+    if let Err(error) = require_ignored(&root, &previous) {
         let _ = fs::remove_dir_all(&temporary);
-        format!(
-            "publish {} to {}: {error}",
-            temporary.display(),
-            output.display()
-        )
-    })?;
+        return Err(error);
+    }
+    install_published_baseline(&temporary, &output, &previous)?;
     Ok(output)
 }
 
@@ -1081,7 +1219,7 @@ mod tests {
     #[test]
     fn matrix_is_exact_engine_only_and_unique() {
         let cases = baseline_cases();
-        assert_eq!(cases.len(), 18);
+        assert_eq!(cases.len(), 30);
         let ids = cases
             .iter()
             .map(|case| case.id.as_str())
@@ -1110,6 +1248,13 @@ mod tests {
                 .filter(|case| case.args.first().is_some_and(|arg| arg == "module"))
                 .count(),
             7
+        );
+        assert_eq!(
+            cases
+                .iter()
+                .filter(|case| case.args.first().is_some_and(|arg| arg == "kernel"))
+                .count(),
+            12
         );
     }
 
@@ -1174,6 +1319,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn published_baseline_replaces_current_and_rolls_back_on_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "otter-baseline-publish-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        let output = root.join("baseline");
+        let temporary = root.join("new");
+        let previous = root.join("previous");
+        fs::create_dir_all(&output).unwrap();
+        fs::create_dir_all(&temporary).unwrap();
+        fs::write(output.join("marker"), "old").unwrap();
+        fs::write(temporary.join("marker"), "new").unwrap();
+
+        install_published_baseline(&temporary, &output, &previous).unwrap();
+        assert_eq!(fs::read_to_string(output.join("marker")).unwrap(), "new");
+        assert!(!temporary.exists());
+        assert!(!previous.exists());
+
+        let missing = root.join("missing");
+        let error = install_published_baseline(&missing, &output, &previous).unwrap_err();
+        assert!(error.contains("previous baseline restored"));
+        assert_eq!(fs::read_to_string(output.join("marker")).unwrap(), "new");
+        assert!(!previous.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn outer_timeout_is_bounded_and_does_not_fabricate_a_record() {
@@ -1227,7 +1401,7 @@ mod tests {
         let first = render_summary(&manifest, &records);
         let second = render_summary(&manifest, &records);
         assert_eq!(first, second);
-        assert_eq!(first.matches("\n| ").count(), 20);
+        assert_eq!(first.matches("\n| ").count(), 32);
         assert!(first.contains("production-tiered"));
     }
 }

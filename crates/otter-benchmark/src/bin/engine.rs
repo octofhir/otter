@@ -2,19 +2,22 @@
 //!
 //! # Contents
 //! - `call` measures a precompiled direct-call workload under an explicit tier.
+//! - `kernel` measures a named, precompiled JavaScript fixture under an explicit tier.
 //! - `jit-compile` measures the production template compiler directly.
 //! - `memory` records interpreter allocation, retained-heap, and GC samples.
 //! - `module` records module-graph phases with explicit runtime reuse.
 //!
 //! # Invariants
 //! - Tier selection and OSR thresholds come only from command-line arguments.
-//! - Parsing and bytecode lowering are outside call execution samples.
+//! - Parsing and bytecode lowering are outside call and kernel execution samples.
+//! - Kernel fixture setup runs once before warmup; samples run a precompiled call stub.
+//! - One interpreter owns all warmup and measured kernel executions.
 //! - JIT snapshot construction is outside template-emitter samples.
 //! - Raw observations are retained alongside their median aggregates.
 //! - Every successful record is semantically validated.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -101,6 +104,23 @@ enum Command {
         #[arg(long, default_value_t = 10_000)]
         iterations: u32,
         #[arg(long, default_value_t = 30)]
+        samples: u32,
+        #[arg(long, default_value_t = 3)]
+        warmup: u32,
+    },
+    /// Measure a validated, named JavaScript kernel from precompiled bytecode.
+    Kernel {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        function: String,
+        #[arg(long)]
+        expected: f64,
+        #[arg(long, value_enum)]
+        jit_tier: EngineJitTier,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        jit_osr_threshold: Option<u32>,
+        #[arg(long, default_value_t = 20)]
         samples: u32,
         #[arg(long, default_value_t = 3)]
         warmup: u32,
@@ -630,6 +650,265 @@ fn run_call(
         primary_metric: "wall-time",
         measurements,
         validation_marker: Some(format!("return={iterations}")),
+        failure: None,
+    }
+}
+
+fn validate_kernel_checksum(actual: f64, expected: f64) -> Result<(), String> {
+    if !expected.is_finite() {
+        return Err(format!("expected checksum {expected:?} is not finite"));
+    }
+    if !actual.is_finite() {
+        return Err(format!("kernel checksum {actual:?} is not finite"));
+    }
+    if actual.to_bits() != expected.to_bits() {
+        return Err(format!(
+            "kernel checksum {actual:?} (0x{:016x}) did not match {expected:?} (0x{:016x})",
+            actual.to_bits(),
+            expected.to_bits()
+        ));
+    }
+    Ok(())
+}
+
+const KERNEL_INVOCATION_FUNCTION: &str = "__otter_benchmark_kernel_invocation__";
+
+fn compile_kernel_context(
+    source: &str,
+    source_path: &Path,
+    function_name: &str,
+) -> Result<(ExecutionContext, u32), RunFailure> {
+    if function_name == KERNEL_INVOCATION_FUNCTION {
+        return Err(RunFailure {
+            kind: RunFailureKind::Input,
+            message: format!(
+                "function name {function_name:?} is reserved by the benchmark harness"
+            ),
+        });
+    }
+    let source =
+        format!("{source}\nfunction {KERNEL_INVOCATION_FUNCTION}(){{return {function_name}();}}\n");
+    let module = compile_script_source(
+        &source,
+        SourceKind::JavaScript,
+        source_path.to_string_lossy().as_ref(),
+    )
+    .map_err(|error| RunFailure {
+        kind: RunFailureKind::Compile,
+        message: format!("bytecode compile failed: {error}"),
+    })?;
+
+    let matching_functions = module
+        .functions
+        .iter()
+        .filter(|function| function.name == function_name)
+        .count();
+    match matching_functions {
+        1 => {}
+        0 => {
+            return Err(RunFailure {
+                kind: RunFailureKind::Input,
+                message: format!("function {function_name:?} not found"),
+            });
+        }
+        count => {
+            return Err(RunFailure {
+                kind: RunFailureKind::Input,
+                message: format!("function {function_name:?} is ambiguous ({count} definitions)"),
+            });
+        }
+    }
+
+    let invocation_functions = module
+        .functions
+        .iter()
+        .filter(|function| function.name == KERNEL_INVOCATION_FUNCTION)
+        .count();
+    if invocation_functions != 1 {
+        return Err(RunFailure {
+            kind: RunFailureKind::Input,
+            message: format!(
+                "fixture collides with reserved harness function {KERNEL_INVOCATION_FUNCTION:?}"
+            ),
+        });
+    }
+    let invocation_id = module
+        .functions
+        .iter()
+        .find(|function| function.name == KERNEL_INVOCATION_FUNCTION)
+        .expect("exactly one invocation function was counted")
+        .id;
+    Ok((ExecutionContext::from_module(module), invocation_id))
+}
+
+fn run_kernel_invocation(
+    interpreter: &mut Interpreter,
+    context: &ExecutionContext,
+    invocation_id: u32,
+) -> Result<otter_vm::Value, otter_vm::VmError> {
+    let invocation = otter_vm::Value::function_id(invocation_id);
+    interpreter.run_callable_sync(
+        context,
+        &invocation,
+        otter_vm::Value::undefined(),
+        Default::default(),
+    )
+}
+
+fn run_kernel(
+    source_path: PathBuf,
+    function_name: String,
+    expected: f64,
+    jit_tier: EngineJitTier,
+    jit_osr_threshold: Option<u32>,
+    samples: u32,
+    warmup: u32,
+) -> RunRecord {
+    let fixture_name = source_path
+        .file_stem()
+        .map(|name| name.to_string_lossy())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "fixture".into());
+    let name = format!("kernel-{fixture_name}");
+    let parameters = BTreeMap::from([
+        ("source".into(), source_path.display().to_string()),
+        ("function".into(), function_name.clone()),
+        ("expected".into(), expected.to_string()),
+    ]);
+    let fail = |kind: RunFailureKind, failure: String| {
+        RunRecord::failure(
+            name.clone(),
+            RunSurface::Vm,
+            jit_tier,
+            jit_osr_threshold,
+            RunGcPolicy::Normal,
+            None,
+            warmup,
+            samples,
+            parameters.clone(),
+            Some(1),
+            "wall-time",
+            kind,
+            failure,
+        )
+    };
+    if samples == 0 {
+        return fail(
+            RunFailureKind::Configuration,
+            "samples must be greater than zero".into(),
+        );
+    }
+    if jit_tier == EngineJitTier::Interpreter && jit_osr_threshold.is_some() {
+        return fail(
+            RunFailureKind::Configuration,
+            "--jit-osr-threshold requires a JIT tier".into(),
+        );
+    }
+    if !expected.is_finite() {
+        return fail(
+            RunFailureKind::Configuration,
+            format!("expected checksum {expected:?} is not finite"),
+        );
+    }
+    let source = match std::fs::read_to_string(&source_path) {
+        Ok(source) => source,
+        Err(error) => {
+            return fail(
+                RunFailureKind::Io,
+                format!("read {}: {error}", source_path.display()),
+            );
+        }
+    };
+    let (context, invocation_id) =
+        match compile_kernel_context(&source, &source_path, &function_name) {
+            Ok(prepared) => prepared,
+            Err(error) => return fail(error.kind, error.message),
+        };
+    let mut interpreter = Interpreter::new();
+    configure_interpreter(&mut interpreter, jit_tier, jit_osr_threshold);
+    if let Err(error) = interpreter.run(&context) {
+        return fail(
+            RunFailureKind::Runtime,
+            format!("fixture setup failed: {error}"),
+        );
+    }
+    for index in 0..warmup {
+        let value = match run_kernel_invocation(&mut interpreter, &context, invocation_id) {
+            Ok(value) => value,
+            Err(error) => {
+                return fail(
+                    RunFailureKind::Runtime,
+                    format!("warmup {} failed: {error}", index + 1),
+                );
+            }
+        };
+        let Some(actual) = value.as_f64() else {
+            return fail(
+                RunFailureKind::Validation,
+                format!(
+                    "warmup {} returned non-Number {value:?}, expected {expected:?}",
+                    index + 1
+                ),
+            );
+        };
+        if let Err(error) = validate_kernel_checksum(actual, expected) {
+            return fail(
+                RunFailureKind::Validation,
+                format!("warmup {}: {error}", index + 1),
+            );
+        }
+    }
+
+    let mut measurements = Measurements::default();
+    for index in 0..samples {
+        let started = Instant::now();
+        let execution = run_kernel_invocation(&mut interpreter, &context, invocation_id);
+        let elapsed = elapsed_ns(started);
+        let value = match execution {
+            Ok(value) => value,
+            Err(error) => {
+                return fail(
+                    RunFailureKind::Runtime,
+                    format!("sample {} failed: {error}", index + 1),
+                );
+            }
+        };
+        let Some(actual) = value.as_f64() else {
+            return fail(
+                RunFailureKind::Validation,
+                format!(
+                    "sample {} returned non-Number {value:?}, expected {expected:?}",
+                    index + 1
+                ),
+            );
+        };
+        if let Err(error) = validate_kernel_checksum(actual, expected) {
+            return fail(
+                RunFailureKind::Validation,
+                format!("sample {}: {error}", index + 1),
+            );
+        }
+        measurements.wall_time_ns.push(elapsed);
+        measurements.execution_time_ns.push(elapsed);
+    }
+
+    RunRecord {
+        name,
+        parameters,
+        surface: RunSurface::Vm,
+        jit_tier,
+        jit_osr_threshold,
+        gc_policy: RunGcPolicy::Normal,
+        runtime_reuse: None,
+        warmup,
+        samples,
+        iterations_per_sample: Some(1),
+        primary_metric: "wall-time",
+        measurements,
+        validation_marker: Some(format!(
+            "return={expected};bits=0x{:016x};function={function_name}",
+            expected.to_bits()
+        )),
         failure: None,
     }
 }
@@ -1227,6 +1506,23 @@ fn main() {
             samples,
             warmup,
         ),
+        Command::Kernel {
+            source,
+            function,
+            expected,
+            jit_tier,
+            jit_osr_threshold,
+            samples,
+            warmup,
+        } => run_kernel(
+            source,
+            function,
+            expected,
+            jit_tier,
+            jit_osr_threshold,
+            samples,
+            warmup,
+        ),
         Command::JitCompile {
             source,
             function,
@@ -1355,6 +1651,114 @@ mod tests {
             }
             _ => panic!("expected module command"),
         }
+    }
+
+    #[test]
+    fn clap_accepts_named_kernel_fixture() {
+        let args = Args::try_parse_from([
+            "otter-engine-benchmark",
+            "kernel",
+            "--source",
+            "kernel.js",
+            "--function",
+            "engineKernel",
+            "--expected",
+            "42",
+            "--jit-tier",
+            "production-tiered",
+            "--jit-osr-threshold",
+            "7",
+        ])
+        .expect("kernel arguments");
+        match args.command {
+            Command::Kernel {
+                source,
+                function,
+                expected,
+                jit_tier,
+                jit_osr_threshold,
+                ..
+            } => {
+                assert_eq!(source, PathBuf::from("kernel.js"));
+                assert_eq!(function, "engineKernel");
+                assert_eq!(expected, 42.0);
+                assert_eq!(jit_tier, EngineJitTier::ProductionTiered);
+                assert_eq!(jit_osr_threshold, Some(7));
+            }
+            _ => panic!("expected kernel command"),
+        }
+    }
+
+    #[test]
+    fn kernel_checksum_is_finite_and_bit_exact() {
+        assert!(validate_kernel_checksum(42.0, 42.0).is_ok());
+        assert!(validate_kernel_checksum(-0.0, 0.0).is_err());
+        assert!(validate_kernel_checksum(f64::NAN, 42.0).is_err());
+        assert!(validate_kernel_checksum(42.0, f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn kernel_reuses_one_interpreter_and_rejects_wrong_checksum() {
+        let source_path = std::env::temp_dir().join(format!(
+            "otter-engine-kernel-test-{}.js",
+            std::process::id()
+        ));
+        std::fs::write(
+            &source_path,
+            "function engineKernel(){let sum=0;\
+             for(let i=0;i<4;i=i+1){sum=sum+i;}return sum;}",
+        )
+        .expect("write kernel fixture");
+
+        let passed = run_kernel(
+            source_path.clone(),
+            "engineKernel".into(),
+            6.0,
+            EngineJitTier::Interpreter,
+            None,
+            2,
+            1,
+        );
+        assert!(passed.failure.is_none(), "{:?}", passed.failure);
+        assert_eq!(
+            passed.name,
+            format!("kernel-otter-engine-kernel-test-{}", std::process::id())
+        );
+        assert_eq!(passed.measurements.wall_time_ns.len(), 2);
+        assert_eq!(passed.measurements.execution_time_ns.len(), 2);
+        assert_eq!(passed.iterations_per_sample, Some(1));
+
+        let failed = benchmark_result(run_kernel(
+            source_path.clone(),
+            "engineKernel".into(),
+            7.0,
+            EngineJitTier::Interpreter,
+            None,
+            2,
+            1,
+        ));
+        assert_eq!(failed.outcome.status, OutcomeStatus::Failed);
+        assert_eq!(
+            failed.outcome.failure.as_ref().map(|failure| failure.kind),
+            Some(FailureKind::Validation)
+        );
+        assert!(!failed.is_scoreable());
+
+        std::fs::remove_file(source_path).expect("remove kernel fixture");
+    }
+
+    #[test]
+    fn kernel_invocation_survives_full_gc_after_setup() {
+        let source = "function engineKernel(){return 42;}";
+        let (context, invocation_id) =
+            compile_kernel_context(source, Path::new("kernel.js"), "engineKernel")
+                .expect("compile kernel");
+        let mut interpreter = Interpreter::new();
+        interpreter.run(&context).expect("evaluate setup");
+        interpreter.force_gc().expect("force full GC");
+        let value = run_kernel_invocation(&mut interpreter, &context, invocation_id)
+            .expect("invoke after full GC");
+        assert_eq!(value.as_f64(), Some(42.0));
     }
 
     #[test]

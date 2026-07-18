@@ -9,6 +9,8 @@
 //! - Array sort/toSorted comparator operands retained across allocation.
 //! - `Reflect.construct` of the native Map constructor with a custom
 //!   `newTarget` prototype.
+//! - NativeScope data definition on a Set whose expando allocation moves the
+//!   stored function.
 //!
 //! # Invariants
 //! - Callback arguments, receivers, captures, accumulators, and comparator
@@ -17,6 +19,7 @@
 //!   a relocated wrapper is neither lost nor reused for the next invocation.
 //! - Native constructor `this`/`newTarget` state remains live through prototype
 //!   lookup and result publication.
+//! - Set expando creation re-reads every stored `Local` after allocation.
 //! - A host-forced full collection between warmup and observation preserves all
 //!   fixture state. `OTTER_GC_STRESS=full` additionally relocates values at the
 //!   allocation boundaries inside each callback.
@@ -63,6 +66,45 @@ fn assert_interpreter_and_template(setup: &str, probe: &str, name: &str, expecte
     assert!(
         compiled.compile_attempts > 0,
         "{name} must exercise template compilation"
+    );
+}
+
+const NATIVE_SET_EXPANDO_SETUP: &str = r#"
+globalThis.__gcNativeSetExpandoFixture = (() => {
+  const flags = process.allowedNodeEnvironmentFlags;
+  const has = flags.has;
+
+  function churn(seed) {
+    let tail = null;
+    for (let i = 0; i < 8; i++) {
+      tail = { seed, i, text: "native-set-" + seed + "-" + i, tail };
+    }
+    return tail;
+  }
+
+  let pressure = null;
+  for (let i = 0; i < 128; i++) pressure = churn(i);
+  return { flags, has, pressure };
+})();
+"#;
+
+#[test]
+fn native_set_expando_value_survives_allocation_and_full_gc() {
+    assert_interpreter_and_template(
+        NATIVE_SET_EXPANDO_SETUP,
+        r#"
+const fixture = globalThis.__gcNativeSetExpandoFixture;
+JSON.stringify([
+  typeof fixture.has,
+  fixture.has === fixture.flags.has,
+  fixture.has.call(fixture.flags, "-r"),
+  fixture.flags.has("--stack-trace-limit=100"),
+  fixture.flags.has("--cheeseburgers"),
+  fixture.pressure.i
+]);
+"#,
+        "gc-native-set-expando",
+        r#"["function",true,true,true,false,7]"#,
     );
 }
 

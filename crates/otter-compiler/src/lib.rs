@@ -233,6 +233,43 @@ mod tests {
     }
 
     #[test]
+    fn simple_formals_alias_their_incoming_registers() {
+        let module =
+            compile_script_src("function add(left, right) { return left + right; } add(1, 2);");
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name == "add")
+            .expect("compiled add");
+
+        assert!(
+            !function
+                .code
+                .iter()
+                .any(|instruction| instruction.op == Op::StoreLocal),
+            "uncaptured simple formals should need no prologue copies"
+        );
+    }
+
+    #[test]
+    fn captured_formal_still_initializes_its_upvalue_cell() {
+        let module =
+            compile_script_src("function capture(value) { return () => value; } capture(1);");
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name == "capture")
+            .expect("compiled capture");
+
+        assert!(
+            function
+                .code
+                .iter()
+                .any(|instruction| instruction.op == Op::StoreUpvalue)
+        );
+    }
+
+    #[test]
     fn jsx_element_lowers_to_react_create_element() {
         let module = compile_tsx_script_src("const x = <div id=\"a\">hi</div>;");
         let main = &module.functions[0];

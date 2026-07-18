@@ -8,6 +8,8 @@
 //!
 //! # Invariants
 //! - Instruction spans are emitted alongside bytecode positions.
+//! - Plain uncaptured formals may bind their incoming ABI register directly;
+//!   all later scratch allocation starts above the reserved argument window.
 //!
 //! # See also
 //! - `compiler` for the context stack
@@ -375,6 +377,32 @@ impl FunctionContext {
         self.declare_binding_with_capture(name, is_const, span, true)
     }
 
+    /// Declare one simple formal parameter over its incoming ABI register.
+    ///
+    /// Captured and mapped-arguments formals still need stable upvalue cells;
+    /// every other simple formal can use the argument slot directly and avoid
+    /// a prologue copy into a second register.
+    pub(crate) fn declare_parameter_binding(
+        &mut self,
+        name: &str,
+        argument_register: u16,
+        span: (u32, u32),
+    ) -> Result<BindingStorage, CompileError> {
+        debug_assert!(
+            argument_register < self.scratch,
+            "parameter register must be inside the reserved argument window"
+        );
+        self.ensure_binding_name_available(name, span)?;
+        let storage = self.allocate_own_upvalue(name).map_or(
+            BindingStorage::Register {
+                reg: argument_register,
+            },
+            |idx| BindingStorage::Upvalue { idx },
+        );
+        self.insert_binding_info(name, storage, false);
+        Ok(storage)
+    }
+
     pub(crate) fn declare_binding_with_capture(
         &mut self,
         name: &str,
@@ -382,10 +410,27 @@ impl FunctionContext {
         span: (u32, u32),
         allow_capture: bool,
     ) -> Result<BindingStorage, CompileError> {
+        self.ensure_binding_name_available(name, span)?;
+        let storage = if allow_capture && let Some(idx) = self.allocate_own_upvalue(name) {
+            BindingStorage::Upvalue { idx }
+        } else {
+            let reg = self.scratch;
+            self.scratch = self.scratch.checked_add(1).expect("register overflow");
+            BindingStorage::Register { reg }
+        };
+        self.insert_binding_info(name, storage, is_const);
+        Ok(storage)
+    }
+
+    fn ensure_binding_name_available(
+        &self,
+        name: &str,
+        span: (u32, u32),
+    ) -> Result<(), CompileError> {
         if self
             .scopes
             .last()
-            .expect("declare_binding called outside any scope")
+            .expect("binding declaration called outside any scope")
             .bindings
             .contains_key(name)
         {
@@ -394,17 +439,14 @@ impl FunctionContext {
                 span,
             });
         }
-        let storage = if allow_capture && let Some(idx) = self.allocate_own_upvalue(name) {
-            BindingStorage::Upvalue { idx }
-        } else {
-            let reg = self.scratch;
-            self.scratch = self.scratch.checked_add(1).expect("register overflow");
-            BindingStorage::Register { reg }
-        };
+        Ok(())
+    }
+
+    fn insert_binding_info(&mut self, name: &str, storage: BindingStorage, is_const: bool) {
         let scope = self
             .scopes
             .last_mut()
-            .expect("declare_binding called outside any scope");
+            .expect("binding declaration called outside any scope");
         scope.bindings.insert(
             name.to_string(),
             BindingInfo {
@@ -414,7 +456,6 @@ impl FunctionContext {
                 fn_self_name: false,
             },
         );
-        Ok(storage)
     }
 
     pub(crate) fn lookup_binding(&self, name: &str) -> Option<BindingInfo> {

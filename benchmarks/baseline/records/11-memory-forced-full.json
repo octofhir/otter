@@ -1,0 +1,138 @@
+{
+  "benchmark": {
+    "suite": "engine",
+    "name": "memory-allocation-churn-forced-full",
+    "parameters": {
+      "iterations": "1000000"
+    }
+  },
+  "provenance": {
+    "capturedAtUnixMs": 1784367752148,
+    "commit": "56aa401611db3ea0cb88c35c94070080c57d9318",
+    "dirty": false,
+    "platform": {
+      "os": "macos",
+      "arch": "aarch64",
+      "kernel": "Darwin 25.5.0",
+      "cpu": "aarch64"
+    },
+    "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2",
+    "buildProfile": "release"
+  },
+  "configuration": {
+    "surface": "vm",
+    "jitPolicy": "interpreter",
+    "jitOsrThreshold": null,
+    "gcPolicy": "forced-full",
+    "gcStressStride": null,
+    "runtimeReuse": "not-applicable",
+    "cacheState": "not-applicable"
+  },
+  "sampling": {
+    "warmupCount": 0,
+    "sampleCount": 5,
+    "iterationsPerSample": 1000000,
+    "timeoutMs": null
+  },
+  "metrics": [
+    {
+      "name": "wall-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "primary",
+      "samples": [
+        1155145042,
+        1106677291,
+        1102310792,
+        1091736666,
+        1089491000
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 1102310792
+      }
+    },
+    {
+      "name": "execution-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        1153673833,
+        1105280583,
+        1100993167,
+        1090168333,
+        1088281708
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 1100993167
+      }
+    },
+    {
+      "name": "allocations",
+      "unit": "count",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        2000004,
+        2000004,
+        2000004,
+        2000004,
+        2000004
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 2000004
+      }
+    },
+    {
+      "name": "gc-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        35085209,
+        33001583,
+        32877750,
+        32653627,
+        33728584
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 33001583
+      }
+    },
+    {
+      "name": "retained-heap",
+      "unit": "bytes",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        314104,
+        314104,
+        314104,
+        314104,
+        314104
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 314104
+      }
+    }
+  ],
+  "outcome": {
+    "status": "validated",
+    "validationMarker": "return=500000500000",
+    "processExitCode": null,
+    "failure": null
+  },
+  "command": [
+    "target/release/otter-engine-benchmark",
+    "memory",
+    "--iterations",
+    "1000000",
+    "--samples",
+    "5"
+  ]
+}

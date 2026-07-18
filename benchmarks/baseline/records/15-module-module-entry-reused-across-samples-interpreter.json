@@ -1,0 +1,283 @@
+{
+  "benchmark": {
+    "suite": "engine",
+    "name": "module-phases-module-entry.mjs",
+    "parameters": {
+      "entry": "benchmarks/fixtures/engine/module-entry.mjs"
+    }
+  },
+  "provenance": {
+    "capturedAtUnixMs": 1784367754075,
+    "commit": "56aa401611db3ea0cb88c35c94070080c57d9318",
+    "dirty": false,
+    "platform": {
+      "os": "macos",
+      "arch": "aarch64",
+      "kernel": "Darwin 25.5.0",
+      "cpu": "aarch64"
+    },
+    "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2",
+    "buildProfile": "release"
+  },
+  "configuration": {
+    "surface": "runtime",
+    "jitPolicy": "interpreter",
+    "jitOsrThreshold": null,
+    "gcPolicy": "normal",
+    "gcStressStride": null,
+    "runtimeReuse": "reused-across-samples",
+    "cacheState": "not-applicable"
+  },
+  "sampling": {
+    "warmupCount": 5,
+    "sampleCount": 20,
+    "iterationsPerSample": 1,
+    "timeoutMs": null
+  },
+  "metrics": [
+    {
+      "name": "wall-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "primary",
+      "samples": [
+        134875,
+        129791,
+        127208,
+        141667,
+        134375,
+        130042,
+        127417,
+        126167,
+        125542,
+        125625,
+        123791,
+        137167,
+        128000,
+        126583,
+        122167,
+        122750,
+        123958,
+        131791,
+        129666,
+        125708
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 127312.5
+      }
+    },
+    {
+      "name": "execution-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        8667,
+        8792,
+        8417,
+        15833,
+        13708,
+        8375,
+        9583,
+        8459,
+        9583,
+        8125,
+        8334,
+        18625,
+        8208,
+        11250,
+        8166,
+        8125,
+        8625,
+        8292,
+        8375,
+        8250
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 8438
+      }
+    },
+    {
+      "name": "parse-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        1916,
+        1833,
+        1792,
+        1751,
+        1666,
+        1749,
+        1583,
+        1583,
+        1667,
+        1625,
+        1625,
+        1625,
+        1542,
+        1583,
+        1500,
+        1625,
+        1541,
+        1543,
+        1584,
+        1541
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 1625
+      }
+    },
+    {
+      "name": "compile-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        17207,
+        14999,
+        12875,
+        16624,
+        14293,
+        12500,
+        11876,
+        12125,
+        11959,
+        12167,
+        11668,
+        11959,
+        13708,
+        11792,
+        11459,
+        11834,
+        11709,
+        11792,
+        12125,
+        13667
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 12125
+      }
+    },
+    {
+      "name": "resolve-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        62709,
+        62208,
+        62667,
+        62417,
+        62250,
+        62542,
+        61584,
+        61583,
+        61708,
+        62542,
+        61500,
+        61583,
+        61500,
+        61625,
+        61000,
+        61167,
+        61292,
+        61917,
+        63792,
+        61584
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 61666.5
+      }
+    },
+    {
+      "name": "load-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        26166,
+        26042,
+        26124,
+        25875,
+        25792,
+        25791,
+        25417,
+        25709,
+        25625,
+        26041,
+        25667,
+        25625,
+        25958,
+        25584,
+        25542,
+        25458,
+        25833,
+        27792,
+        28333,
+        25500
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 25791.5
+      }
+    },
+    {
+      "name": "link-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        13125,
+        11000,
+        10625,
+        13250,
+        12084,
+        13167,
+        12666,
+        12417,
+        10667,
+        10542,
+        10625,
+        13292,
+        12541,
+        10417,
+        10041,
+        10209,
+        10667,
+        16124,
+        10792,
+        10625
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 10896
+      }
+    }
+  ],
+  "outcome": {
+    "status": "validated",
+    "validationMarker": "module assertions passed",
+    "processExitCode": null,
+    "failure": null
+  },
+  "command": [
+    "target/release/otter-engine-benchmark",
+    "module",
+    "--entry",
+    "benchmarks/fixtures/engine/module-entry.mjs",
+    "--runtime-reuse",
+    "reused-across-samples",
+    "--jit-tier",
+    "interpreter",
+    "--samples",
+    "20",
+    "--warmup",
+    "5"
+  ]
+}

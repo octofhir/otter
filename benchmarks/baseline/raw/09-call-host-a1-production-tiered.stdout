@@ -1,0 +1,127 @@
+{
+  "benchmark": {
+    "suite": "engine",
+    "name": "call-host-arity-1",
+    "parameters": {
+      "arity": "1",
+      "iterations": "100000",
+      "kind": "host"
+    }
+  },
+  "provenance": {
+    "capturedAtUnixMs": 1784367745855,
+    "commit": "56aa401611db3ea0cb88c35c94070080c57d9318",
+    "dirty": false,
+    "platform": {
+      "os": "macos",
+      "arch": "aarch64",
+      "kernel": "Darwin 25.5.0",
+      "cpu": "aarch64"
+    },
+    "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2",
+    "buildProfile": "release"
+  },
+  "configuration": {
+    "surface": "vm",
+    "jitPolicy": "production-tiered",
+    "jitOsrThreshold": null,
+    "gcPolicy": "normal",
+    "gcStressStride": null,
+    "runtimeReuse": "not-applicable",
+    "cacheState": "not-applicable"
+  },
+  "sampling": {
+    "warmupCount": 3,
+    "sampleCount": 20,
+    "iterationsPerSample": 100000,
+    "timeoutMs": null
+  },
+  "metrics": [
+    {
+      "name": "wall-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "primary",
+      "samples": [
+        52016166,
+        49703125,
+        53496250,
+        54144250,
+        52326250,
+        88665375,
+        72282166,
+        72484458,
+        61590917,
+        52891291,
+        49906250,
+        48591000,
+        49028250,
+        48628959,
+        48804750,
+        48089416,
+        48884125,
+        48425625,
+        47820125,
+        48247000
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 49804687.5
+      }
+    },
+    {
+      "name": "execution-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        52016166,
+        49703125,
+        53496250,
+        54144250,
+        52326250,
+        88665375,
+        72282166,
+        72484458,
+        61590917,
+        52891291,
+        49906250,
+        48591000,
+        49028250,
+        48628959,
+        48804750,
+        48089416,
+        48884125,
+        48425625,
+        47820125,
+        48247000
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 49804687.5
+      }
+    }
+  ],
+  "outcome": {
+    "status": "validated",
+    "validationMarker": "return=100000",
+    "processExitCode": null,
+    "failure": null
+  },
+  "command": [
+    "target/release/otter-engine-benchmark",
+    "call",
+    "--kind",
+    "host",
+    "--arity",
+    "1",
+    "--jit-tier",
+    "production-tiered",
+    "--iterations",
+    "100000",
+    "--samples",
+    "20",
+    "--warmup",
+    "3"
+  ]
+}

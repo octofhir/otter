@@ -1,6 +1,6 @@
 {
-  "commit": "02b2c2972574cda40e5b0a34b622187a720aaa6b",
-  "capturedAtUnixMs": 1784393582704,
+  "commit": "1e638e06cb26ee30d818583813c62b217b63d4ae",
+  "capturedAtUnixMs": 1784395206872,
   "outerTimeoutMs": 120000,
   "engineArgv0": "target/release/otter-engine-benchmark",
   "complete": true,
@@ -743,7 +743,7 @@
         "--samples",
         "20",
         "--warmup",
-        "0"
+        "5"
       ],
       "status": "completed",
       "processExitCode": 0,
@@ -766,7 +766,7 @@
         "--samples",
         "20",
         "--warmup",
-        "0"
+        "5"
       ],
       "status": "completed",
       "processExitCode": 0,
@@ -789,7 +789,7 @@
         "--samples",
         "20",
         "--warmup",
-        "0"
+        "5"
       ],
       "status": "completed",
       "processExitCode": 0,
@@ -881,7 +881,7 @@
         "--samples",
         "20",
         "--warmup",
-        "0"
+        "5"
       ],
       "status": "completed",
       "processExitCode": 0,

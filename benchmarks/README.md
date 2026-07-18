@@ -50,7 +50,9 @@ Tier choice is explicit whenever a workload permits tier selection:
 `--jit-osr-threshold` records a deliberate threshold override. `jit-compile`
 requires `--compile-tier template|optimizing` and one or more explicit numeric
 `--argument` values. `memory` always measures the interpreter with a post-run
-full GC. Do not infer a benchmark tier from legacy JIT environment variables.
+full GC. `idle-memory` aggregates fresh-process interpreter runtimes at a
+forced-full-GC idle boundary. Do not infer a benchmark tier from legacy JIT
+environment variables.
 
 ### JavaScript kernel corpus
 
@@ -137,6 +139,31 @@ cargo run --release -p otter-benchmark --features engine \
   memory --iterations 1000000 --samples 5
 ```
 
+### Idle runtime memory
+
+`idle-memory` launches every raw sample as a separate copy of the current
+release benchmark executable. Each child constructs one interpreter-only
+`Runtime`, executes an empty script turn (whose normal runtime boundary drains
+microtasks), proves that no timer callbacks or host-settlement promises remain,
+forces a full GC, and waits through a controlled idle window.
+
+The parent measures startup from process spawn until the child publishes its
+post-bootstrap marker. The child records current process RSS after bootstrap,
+after full GC, and at the end of the idle window; it also records full-GC
+cycles and pause time, retained/live heap, allocated managed-heap bytes,
+managed page capacity, off-heap reservations, and the exact measured
+executable size. Metrics are emitted only when the host exposes a real RSS
+reading. The sysinfo process table is initialized before runtime construction,
+so its benchmark-only bookkeeping remains stable across all three RSS phases;
+ordinary runtime construction does not enable a sampler, lock, or diagnostic
+heap walk.
+
+```bash
+cargo run --release -p otter-benchmark --features engine \
+  --bin otter-engine-benchmark -- \
+  idle-memory --idle-ms 250 --samples 5
+```
+
 ### Module graph
 
 `--runtime-reuse fresh-per-sample` gives every measured graph execution a fresh
@@ -197,13 +224,14 @@ keep the recorder alive past the declared wall cap.
 
 ## Capturing a baseline
 
-The baseline driver owns one fixed, ordered 35-case engine matrix: bytecode
+The baseline driver owns one fixed, ordered 36-case engine matrix: bytecode
 calls at arity 0 and 4 across all tiers, the extracted host call across all
 tiers, five JavaScript kernels across all tiers, one existing template compile
 row, template and optimizing numeric-leaf compile rows, forced-full-GC
-allocation churn, fresh and reused module runtimes across all tiers, and
-isolated package-import resolution. It runs serially and does not install
-packages, enable Web/Node surfaces, or start a profiler.
+allocation churn, fresh-process idle runtime memory, fresh and reused module
+runtimes across all tiers, and isolated package-import resolution. It runs
+serially and does not install packages, enable Web/Node surfaces, or start a
+profiler.
 
 Capture from a clean commit with the release driver:
 
@@ -224,7 +252,7 @@ record.
 
 The driver rejects `OTTER_JIT*`, `OTTER_GC*`, and `RUST_LOG` overrides so the
 recorded configuration remains the complete performance policy. A capture is
-publishable only when all 35 exact commands returned zero, every result passes
+publishable only when all 36 exact commands returned zero, every result passes
 the live contract, every result is clean/release/baseline-eligible, and commit,
 platform, toolchain, argv, configuration, and sampling protocol remain
 identical to the fixed matrix.

@@ -9,7 +9,7 @@ Node/Web product surfaces.
 
 ## The measured matrix
 
-`otter-engine-baseline` owns an ordered 35-case matrix:
+`otter-engine-baseline` owns an ordered 36-case matrix:
 
 - bytecode calls with zero and four arguments under `interpreter`, `template`,
   and `production-tiered`;
@@ -21,11 +21,21 @@ Node/Web product surfaces.
   entered with explicit numeric arguments, and required to return the expected
   result;
 - managed allocation churn followed by a forced full GC;
+- fresh-process runtime startup and idle memory after an empty, drained turn
+  and a forced full GC, including phased RSS, live/allocated/page/off-heap
+  accounting, GC deltas, and release binary size;
 - fresh and reused module runtimes under all three tier policies;
 - package-import-map resolution in an isolated interpreter runtime.
 
 Every result retains its raw samples and typed aggregate. Tier selection is a
 command argument; legacy environment modes do not participate.
+
+Every idle-memory raw sample is a separate release process and runtime. The
+parent timestamps process spawn through the child's bootstrap marker; the child
+then verifies that no timer callbacks or host-settlement promises remain,
+forces a full collection, and samples RSS again before and after the fixed idle
+window. The process observer is benchmark-local and initialized before runtime
+construction, so the normal runtime path does not enable diagnostics.
 
 ## Capture
 

@@ -5,6 +5,8 @@
 //! - `kernel` measures a named, precompiled JavaScript fixture under an explicit tier.
 //! - `jit-compile` measures one explicitly selected native compiler directly.
 //! - `memory` records interpreter allocation, retained-heap, and GC samples.
+//! - `idle-memory` records fresh-process runtime startup, phased RSS, heap,
+//!   GC, and binary-size samples.
 //! - `module` records module-graph phases with explicit runtime reuse.
 //!
 //! # Invariants
@@ -14,16 +16,21 @@
 //! - One interpreter owns all warmup and measured kernel executions.
 //! - Feedback seeding, JIT snapshot construction, and compiler-hook
 //!   construction are outside native-emitter samples.
+//! - Every idle-memory sample owns a fresh release process and runtime.
+//! - Idle-memory diagnostics allocate only in the benchmark process; ordinary
+//!   runtime construction does not enable background sampling.
 //! - Raw observations are retained alongside their median aggregates.
 //! - Every successful record is semantically validated.
 
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use otter_benchmark::{
@@ -35,14 +42,16 @@ use otter_benchmark::{
 };
 use otter_compiler::compile_script_source;
 use otter_jit::OtterJitCompiler;
-use otter_runtime::{JitSelection, Runtime, module_graph::ModulePhaseTimings};
+use otter_runtime::{JitSelection, Runtime, SourceInput, module_graph::ModulePhaseTimings};
 use otter_syntax::SourceKind;
 use otter_vm::{
     ExecutionContext, Interpreter, JitArtifactFileName, JitArtifactIdentity, JitCompileError,
     JitCompileRequest, JitCompileStatus, JitCompilerHook, JitDebugRequest, JitExecOutcome,
     JitFunctionCode, JitRuntimeStubBinding, VmRuntimeActivation,
 };
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
+use sysinfo::{ProcessesToUpdate, System};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CallKind {
@@ -193,6 +202,19 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         samples: u32,
     },
+    /// Measure a fresh release process/runtime at a controlled idle boundary.
+    IdleMemory {
+        #[arg(long, default_value_t = 250)]
+        idle_ms: u64,
+        #[arg(long, default_value_t = 5)]
+        samples: u32,
+    },
+    /// Private one-process probe used by the idle-memory aggregator.
+    #[command(hide = true)]
+    IdleMemorySample {
+        #[arg(long)]
+        idle_ms: u64,
+    },
     /// Measure validated module-graph phases under an explicit runtime policy.
     Module {
         #[arg(long)]
@@ -213,7 +235,7 @@ enum Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunSurface {
     Vm,
-    Module,
+    Runtime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,6 +274,15 @@ struct Measurements {
     allocations: Vec<u64>,
     gc_time_ns: Vec<u64>,
     heap_bytes: Vec<u64>,
+    startup_time_ns: Vec<u64>,
+    bootstrap_rss_bytes: Vec<u64>,
+    post_full_gc_rss_bytes: Vec<u64>,
+    idle_rss_bytes: Vec<u64>,
+    managed_heap_allocated_bytes: Vec<u64>,
+    managed_heap_page_bytes: Vec<u64>,
+    off_heap_reserved_bytes: Vec<u64>,
+    full_gc_cycles: Vec<u64>,
+    release_binary_bytes: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -467,6 +498,60 @@ fn benchmark_result(record: RunRecord) -> BenchmarkResult {
         MetricDirection::LowerIsBetter,
         &record.measurements.heap_bytes,
     );
+    push_metric(
+        "startup-latency",
+        MetricUnit::Nanoseconds,
+        MetricDirection::LowerIsBetter,
+        &record.measurements.startup_time_ns,
+    );
+    push_metric(
+        "rss-after-bootstrap",
+        MetricUnit::Bytes,
+        MetricDirection::LowerIsBetter,
+        &record.measurements.bootstrap_rss_bytes,
+    );
+    push_metric(
+        "rss-after-full-gc",
+        MetricUnit::Bytes,
+        MetricDirection::LowerIsBetter,
+        &record.measurements.post_full_gc_rss_bytes,
+    );
+    push_metric(
+        "idle-rss",
+        MetricUnit::Bytes,
+        MetricDirection::LowerIsBetter,
+        &record.measurements.idle_rss_bytes,
+    );
+    push_metric(
+        "managed-heap-allocated",
+        MetricUnit::Bytes,
+        MetricDirection::LowerIsBetter,
+        &record.measurements.managed_heap_allocated_bytes,
+    );
+    push_metric(
+        "managed-heap-page-capacity",
+        MetricUnit::Bytes,
+        MetricDirection::LowerIsBetter,
+        &record.measurements.managed_heap_page_bytes,
+    );
+    push_metric(
+        "off-heap-reserved",
+        MetricUnit::Bytes,
+        MetricDirection::LowerIsBetter,
+        &record.measurements.off_heap_reserved_bytes,
+    );
+    push_metric(
+        "full-gc-cycles",
+        MetricUnit::Count,
+        MetricDirection::LowerIsBetter,
+        &record.measurements.full_gc_cycles,
+    );
+    push_metric(
+        "release-binary-size",
+        MetricUnit::Bytes,
+        MetricDirection::LowerIsBetter,
+        &record.measurements.release_binary_bytes,
+    );
 
     let status = if record.failure.is_some() {
         OutcomeStatus::Failed
@@ -489,7 +574,7 @@ fn benchmark_result(record: RunRecord) -> BenchmarkResult {
         configuration: BenchmarkConfiguration {
             surface: match record.surface {
                 RunSurface::Vm => ExecutionSurface::Vm,
-                RunSurface::Module => ExecutionSurface::Runtime,
+                RunSurface::Runtime => ExecutionSurface::Runtime,
             },
             jit_policy: record.jit_policy,
             jit_osr_threshold: record.jit_osr_threshold,
@@ -1660,6 +1745,357 @@ fn run_memory(iterations: u32, samples: u32) -> RunRecord {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "kebab-case", deny_unknown_fields)]
+enum IdleMemoryMessage {
+    Bootstrap {
+        rss_bytes: u64,
+    },
+    Complete {
+        rss_after_full_gc_bytes: u64,
+        idle_rss_bytes: u64,
+        retained_heap_bytes: u64,
+        managed_heap_allocated_bytes: u64,
+        managed_heap_page_bytes: u64,
+        off_heap_reserved_bytes: u64,
+        full_gc_cycles: u64,
+        full_gc_time_ns: u64,
+        release_binary_bytes: u64,
+        pending_timers: u64,
+        pending_host_promises: u64,
+    },
+}
+
+fn current_rss_bytes(system: &mut System) -> Result<u64, String> {
+    let pid = sysinfo::get_current_pid().map_err(|error| format!("current process id: {error}"))?;
+    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    system
+        .process(pid)
+        .map(sysinfo::Process::memory)
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| "current process RSS is unavailable".into())
+}
+
+fn write_idle_message(output: &mut impl Write, message: &IdleMemoryMessage) -> Result<(), String> {
+    serde_json::to_writer(&mut *output, message)
+        .map_err(|error| format!("serialize idle-memory phase: {error}"))?;
+    output
+        .write_all(b"\n")
+        .and_then(|()| output.flush())
+        .map_err(|error| format!("write idle-memory phase: {error}"))
+}
+
+fn ensure_runtime_idle(runtime: &Runtime) -> Result<(), String> {
+    if runtime.has_pending_timer_callbacks() {
+        return Err("empty runtime retained pending timer callbacks".into());
+    }
+    let pending_host_promises = runtime.pending_host_promise_count();
+    if pending_host_promises != 0 {
+        return Err(format!(
+            "empty runtime retained {pending_host_promises} host promises"
+        ));
+    }
+    Ok(())
+}
+
+fn emit_idle_memory_sample(idle_ms: u64) -> Result<(), String> {
+    if current_build_profile() != "release" {
+        return Err("idle-memory samples require a release benchmark binary".into());
+    }
+    if idle_ms > 60_000 {
+        return Err("idle window must not exceed 60000 ms".into());
+    }
+    let executable =
+        std::env::current_exe().map_err(|error| format!("resolve current executable: {error}"))?;
+    let release_binary_bytes = executable
+        .metadata()
+        .map_err(|error| format!("stat {}: {error}", executable.display()))?
+        .len();
+    let mut system = System::new();
+    // Populate sysinfo's process table before runtime bootstrap so diagnostic
+    // bookkeeping is stable across the three RSS phase snapshots.
+    let _ = current_rss_bytes(&mut system)?;
+
+    let mut runtime = Runtime::builder()
+        .jit_selection(JitSelection::InterpreterOnly)
+        .build()
+        .map_err(|error| format!("idle runtime build failed: {error}"))?;
+    let execution = runtime
+        .run_script(
+            SourceInput::from_javascript(String::new()),
+            "engine-idle-memory.js",
+        )
+        .map_err(|error| format!("empty idle turn failed: {error}"))?;
+    if execution.exit_code() != 0 {
+        return Err(format!(
+            "empty idle turn requested exit code {}",
+            execution.exit_code()
+        ));
+    }
+    // run_script drains the microtask queue before returning.
+    ensure_runtime_idle(&runtime)?;
+    let bootstrap_rss_bytes = current_rss_bytes(&mut system)?;
+
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    write_idle_message(
+        &mut output,
+        &IdleMemoryMessage::Bootstrap {
+            rss_bytes: bootstrap_rss_bytes,
+        },
+    )?;
+
+    let before = runtime.heap_stats().clone();
+    runtime
+        .force_gc()
+        .map_err(|error| format!("idle full GC failed: {error}"))?;
+    let after = runtime.heap_stats().clone();
+    let full_gc_cycles = after.gc_cycles.saturating_sub(before.gc_cycles);
+    if full_gc_cycles == 0 {
+        return Err("idle full GC did not advance the full-cycle counter".into());
+    }
+    ensure_runtime_idle(&runtime)?;
+    let accounting = runtime.heap_accounting_stats();
+    let rss_after_full_gc_bytes = current_rss_bytes(&mut system)?;
+    std::thread::sleep(Duration::from_millis(idle_ms));
+    ensure_runtime_idle(&runtime)?;
+    let idle_rss_bytes = current_rss_bytes(&mut system)?;
+
+    write_idle_message(
+        &mut output,
+        &IdleMemoryMessage::Complete {
+            rss_after_full_gc_bytes,
+            idle_rss_bytes,
+            retained_heap_bytes: u64::try_from(after.live_bytes).unwrap_or(u64::MAX),
+            managed_heap_allocated_bytes: u64::try_from(accounting.allocated_bytes)
+                .unwrap_or(u64::MAX),
+            managed_heap_page_bytes: u64::try_from(accounting.page_count)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(
+                    u64::try_from(otter_runtime::otter_gc::PAGE_SIZE).unwrap_or(u64::MAX),
+                ),
+            off_heap_reserved_bytes: accounting.reserved_bytes,
+            full_gc_cycles,
+            full_gc_time_ns: after
+                .full_pause_ns_total
+                .saturating_sub(before.full_pause_ns_total),
+            release_binary_bytes,
+            pending_timers: u64::from(runtime.has_pending_timer_callbacks()),
+            pending_host_promises: u64::try_from(runtime.pending_host_promise_count())
+                .unwrap_or(u64::MAX),
+        },
+    )
+}
+
+fn parse_idle_message(line: &str) -> Result<IdleMemoryMessage, String> {
+    serde_json::from_str(line).map_err(|error| format!("parse idle-memory phase: {error}"))
+}
+
+fn run_idle_memory_child(
+    executable: &Path,
+    idle_ms: u64,
+) -> Result<(u64, u64, IdleMemoryMessage, IdleMemoryMessage), String> {
+    let started = Instant::now();
+    let mut child = ProcessCommand::new(executable)
+        .arg("idle-memory-sample")
+        .arg("--idle-ms")
+        .arg(idle_ms.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("spawn idle-memory sample: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "idle-memory child stdout was not piped".to_owned())?;
+    let mut reader = BufReader::new(stdout);
+    let mut bootstrap_line = String::new();
+    reader
+        .read_line(&mut bootstrap_line)
+        .map_err(|error| format!("read idle bootstrap phase: {error}"))?;
+    let startup_time_ns = elapsed_ns(started);
+    let mut complete_line = String::new();
+    reader
+        .read_line(&mut complete_line)
+        .map_err(|error| format!("read idle complete phase: {error}"))?;
+    let mut trailing = String::new();
+    reader
+        .read_to_string(&mut trailing)
+        .map_err(|error| format!("read idle child trailing output: {error}"))?;
+    let status = child
+        .wait()
+        .map_err(|error| format!("wait for idle-memory sample: {error}"))?;
+    let wall_time_ns = elapsed_ns(started);
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr)
+            .map_err(|error| format!("read idle-memory child stderr: {error}"))?;
+    }
+    if !status.success() {
+        return Err(format!(
+            "idle-memory child failed with {status}: {}",
+            stderr.trim()
+        ));
+    }
+    if !stderr.is_empty() {
+        return Err(format!(
+            "successful idle-memory child wrote stderr: {}",
+            stderr.trim()
+        ));
+    }
+    if !trailing.trim().is_empty() {
+        return Err("idle-memory child emitted trailing protocol data".into());
+    }
+    Ok((
+        startup_time_ns,
+        wall_time_ns,
+        parse_idle_message(bootstrap_line.trim())?,
+        parse_idle_message(complete_line.trim())?,
+    ))
+}
+
+fn run_idle_memory(idle_ms: u64, samples: u32) -> RunRecord {
+    let name = "memory-runtime-idle".to_owned();
+    let parameters = BTreeMap::from([
+        ("idleWindowMs".into(), idle_ms.to_string()),
+        ("sampleIsolation".into(), "fresh-process".into()),
+        ("script".into(), "empty".into()),
+    ]);
+    let fail = |kind: RunFailureKind, failure: String| {
+        RunRecord::failure(
+            name.clone(),
+            RunSurface::Runtime,
+            JitPolicy::Interpreter,
+            None,
+            RunGcPolicy::ForcedFull,
+            Some(RuntimeReuse::FreshPerSample),
+            0,
+            samples,
+            parameters.clone(),
+            Some(1),
+            "startup-latency",
+            kind,
+            failure,
+        )
+    };
+    if samples == 0 {
+        return fail(
+            RunFailureKind::Configuration,
+            "samples must be greater than zero".into(),
+        );
+    }
+    if current_build_profile() != "release" {
+        return fail(
+            RunFailureKind::Configuration,
+            "idle-memory requires a release benchmark binary".into(),
+        );
+    }
+    if idle_ms > 60_000 {
+        return fail(
+            RunFailureKind::Configuration,
+            "idle window must not exceed 60000 ms".into(),
+        );
+    }
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => {
+            return fail(
+                RunFailureKind::Io,
+                format!("resolve current executable: {error}"),
+            );
+        }
+    };
+    let mut measurements = Measurements::default();
+    for sample in 0..samples {
+        let (startup_time_ns, wall_time_ns, bootstrap, complete) =
+            match run_idle_memory_child(&executable, idle_ms) {
+                Ok(sample) => sample,
+                Err(error) => {
+                    return fail(
+                        RunFailureKind::Runtime,
+                        format!("idle-memory sample {}: {error}", sample + 1),
+                    );
+                }
+            };
+        let bootstrap_rss_bytes = match bootstrap {
+            IdleMemoryMessage::Bootstrap { rss_bytes } => rss_bytes,
+            IdleMemoryMessage::Complete { .. } => {
+                return fail(
+                    RunFailureKind::Validation,
+                    format!("idle-memory sample {} omitted bootstrap phase", sample + 1),
+                );
+            }
+        };
+        let IdleMemoryMessage::Complete {
+            rss_after_full_gc_bytes,
+            idle_rss_bytes,
+            retained_heap_bytes,
+            managed_heap_allocated_bytes,
+            managed_heap_page_bytes,
+            off_heap_reserved_bytes,
+            full_gc_cycles,
+            full_gc_time_ns,
+            release_binary_bytes,
+            pending_timers,
+            pending_host_promises,
+        } = complete
+        else {
+            return fail(
+                RunFailureKind::Validation,
+                format!("idle-memory sample {} omitted complete phase", sample + 1),
+            );
+        };
+        if pending_timers != 0 || pending_host_promises != 0 {
+            return fail(
+                RunFailureKind::Validation,
+                format!(
+                    "idle-memory sample {} ended non-idle: timers={pending_timers}, host-promises={pending_host_promises}",
+                    sample + 1
+                ),
+            );
+        }
+        measurements.startup_time_ns.push(startup_time_ns);
+        measurements.wall_time_ns.push(wall_time_ns);
+        measurements.bootstrap_rss_bytes.push(bootstrap_rss_bytes);
+        measurements
+            .post_full_gc_rss_bytes
+            .push(rss_after_full_gc_bytes);
+        measurements.idle_rss_bytes.push(idle_rss_bytes);
+        measurements.heap_bytes.push(retained_heap_bytes);
+        measurements
+            .managed_heap_allocated_bytes
+            .push(managed_heap_allocated_bytes);
+        measurements
+            .managed_heap_page_bytes
+            .push(managed_heap_page_bytes);
+        measurements
+            .off_heap_reserved_bytes
+            .push(off_heap_reserved_bytes);
+        measurements.full_gc_cycles.push(full_gc_cycles);
+        measurements.gc_time_ns.push(full_gc_time_ns);
+        measurements.release_binary_bytes.push(release_binary_bytes);
+    }
+
+    RunRecord {
+        name,
+        parameters,
+        surface: RunSurface::Runtime,
+        jit_policy: JitPolicy::Interpreter,
+        jit_osr_threshold: None,
+        gc_policy: RunGcPolicy::ForcedFull,
+        runtime_reuse: Some(RuntimeReuse::FreshPerSample),
+        warmup: 0,
+        samples,
+        iterations_per_sample: Some(1),
+        primary_metric: "startup-latency",
+        measurements,
+        validation_marker: Some(format!(
+            "empty-turn;fresh-processes={samples};idle-ms={idle_ms};pending-timers=0;pending-host-promises=0"
+        )),
+        failure: None,
+    }
+}
+
 fn build_runtime(
     jit_tier: EngineJitTier,
     jit_osr_threshold: Option<u32>,
@@ -1725,7 +2161,7 @@ fn run_module(
     let fail = |kind: RunFailureKind, failure: String| {
         RunRecord::failure(
             name.clone(),
-            RunSurface::Module,
+            RunSurface::Runtime,
             jit_policy(jit_tier),
             jit_osr_threshold,
             RunGcPolicy::Normal,
@@ -1795,7 +2231,7 @@ fn run_module(
     RunRecord {
         name,
         parameters,
-        surface: RunSurface::Module,
+        surface: RunSurface::Runtime,
         jit_policy: jit_policy(jit_tier),
         jit_osr_threshold,
         gc_policy: RunGcPolicy::Normal,
@@ -1870,6 +2306,14 @@ fn main() {
             iterations,
             samples,
         } => run_memory(iterations, samples),
+        Command::IdleMemory { idle_ms, samples } => run_idle_memory(idle_ms, samples),
+        Command::IdleMemorySample { idle_ms } => {
+            if let Err(error) = emit_idle_memory_sample(idle_ms) {
+                eprintln!("idle-memory sample failed: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
         Command::Module {
             entry,
             runtime_reuse,
@@ -1987,6 +2431,46 @@ mod tests {
             }
             _ => panic!("expected module command"),
         }
+    }
+
+    #[test]
+    fn clap_accepts_fresh_process_idle_memory() {
+        let args = Args::try_parse_from([
+            "otter-engine-benchmark",
+            "idle-memory",
+            "--idle-ms",
+            "25",
+            "--samples",
+            "3",
+        ])
+        .expect("idle-memory arguments");
+        match args.command {
+            Command::IdleMemory { idle_ms, samples } => {
+                assert_eq!(idle_ms, 25);
+                assert_eq!(samples, 3);
+            }
+            _ => panic!("expected idle-memory command"),
+        }
+    }
+
+    #[test]
+    fn empty_runtime_turn_reaches_a_full_gc_idle_boundary() {
+        let mut runtime = Runtime::builder()
+            .jit_selection(JitSelection::InterpreterOnly)
+            .build()
+            .expect("idle runtime");
+        runtime
+            .run_script(
+                SourceInput::from_javascript(String::new()),
+                "engine-idle-memory-test.js",
+            )
+            .expect("empty turn");
+        ensure_runtime_idle(&runtime).expect("drained runtime");
+        let cycles_before = runtime.heap_stats().gc_cycles;
+        runtime.force_gc().expect("full GC");
+        assert!(runtime.heap_stats().gc_cycles > cycles_before);
+        assert!(runtime.heap_accounting_stats().page_count > 0);
+        ensure_runtime_idle(&runtime).expect("idle after full GC");
     }
 
     #[test]

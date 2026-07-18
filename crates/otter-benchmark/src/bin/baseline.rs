@@ -38,6 +38,8 @@ const COMPILE_SAMPLES: u32 = 100;
 const COMPILE_WARMUPS: u32 = 10;
 const MEMORY_ITERATIONS: u32 = 1_000_000;
 const MEMORY_SAMPLES: u32 = 5;
+const IDLE_MEMORY_WINDOW_MS: u64 = 250;
+const IDLE_MEMORY_SAMPLES: u32 = 5;
 const MODULE_SAMPLES: u32 = 20;
 const MODULE_WARMUPS: u32 = 5;
 
@@ -422,7 +424,7 @@ fn compile_case(
 }
 
 fn baseline_cases() -> Vec<BaselineCase> {
-    let mut cases = Vec::with_capacity(35);
+    let mut cases = Vec::with_capacity(36);
     for arity in [0, 4] {
         for tier in TIERS {
             cases.push(call_case("bytecode", arity, tier));
@@ -487,6 +489,32 @@ fn baseline_cases() -> Vec<BaselineCase> {
             RuntimeReuse::NotApplicable,
         ),
         sampling: sampling(0, MEMORY_SAMPLES, u64::from(MEMORY_ITERATIONS)),
+    });
+    cases.push(BaselineCase {
+        id: "memory-runtime-idle".into(),
+        args: vec![
+            "idle-memory".into(),
+            "--idle-ms".into(),
+            IDLE_MEMORY_WINDOW_MS.to_string(),
+            "--samples".into(),
+            IDLE_MEMORY_SAMPLES.to_string(),
+        ],
+        benchmark: BenchmarkIdentity {
+            suite: "engine".into(),
+            name: "memory-runtime-idle".into(),
+            parameters: parameters([
+                ("idleWindowMs", IDLE_MEMORY_WINDOW_MS.to_string()),
+                ("sampleIsolation", "fresh-process".into()),
+                ("script", "empty".into()),
+            ]),
+        },
+        configuration: configuration(
+            ExecutionSurface::Runtime,
+            JitPolicy::Interpreter,
+            GcPolicy::ForcedFull,
+            RuntimeReuse::FreshPerSample,
+        ),
+        sampling: sampling(0, IDLE_MEMORY_SAMPLES, 1),
     });
     for tier in TIERS {
         cases.push(module_case(
@@ -1292,7 +1320,7 @@ mod tests {
     #[test]
     fn matrix_is_exact_engine_only_and_unique() {
         let cases = baseline_cases();
-        assert_eq!(cases.len(), 35);
+        assert_eq!(cases.len(), 36);
         let ids = cases
             .iter()
             .map(|case| case.id.as_str())
@@ -1336,6 +1364,20 @@ mod tests {
                 .count(),
             3
         );
+        assert_eq!(
+            cases
+                .iter()
+                .filter(|case| case.args.first().is_some_and(|arg| arg == "idle-memory"))
+                .count(),
+            1
+        );
+        assert!(cases.iter().any(|case| {
+            case.id == "memory-runtime-idle"
+                && case.configuration.surface == ExecutionSurface::Runtime
+                && case.configuration.runtime_reuse == RuntimeReuse::FreshPerSample
+                && case.configuration.gc_policy == GcPolicy::ForcedFull
+                && case.sampling.sample_count == IDLE_MEMORY_SAMPLES
+        }));
         assert!(cases.iter().any(|case| {
             case.id == "jit-compile-numeric-leaf-optimizing"
                 && case.configuration.jit_policy == JitPolicy::Optimizing
@@ -1493,7 +1535,7 @@ mod tests {
         let first = render_summary(&manifest, &records);
         let second = render_summary(&manifest, &records);
         assert_eq!(first, second);
-        assert_eq!(first.matches("\n| ").count(), 37);
+        assert_eq!(first.matches("\n| ").count(), 38);
         assert!(first.contains("production-tiered"));
     }
 }

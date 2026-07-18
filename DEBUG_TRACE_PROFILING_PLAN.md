@@ -57,6 +57,11 @@ needed to optimize the VM and JIT safely.
 - [x] Capture Cranelift numeric leaves through the existing optimizing bundle:
   backend-marked CLIF, the exact installed code object, one structural code-map
   region, and empty relocation/safepoint/deopt inventories.
+- [x] Benchmark-only fresh-process idle-memory capture: runtime bootstrap and
+  empty-turn drain, phased process RSS, forced-full-GC counters, live/space/
+  off-heap accounting, controlled idle RSS, and release binary size. The
+  normal runtime path enables no sampler; its public snapshots copy existing
+  counters only.
 
 The text step trace is not a Chrome/Perfetto trace. Async/op tracing, timeout
 ring-buffer dumps, and Test262 failure traces are not shipped yet. Structured

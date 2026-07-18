@@ -473,13 +473,15 @@ Practical rules when adding/altering APIs:
 - Test262 conformance: `cargo test -p otter-test262`
 - Focused engine harness:
   `cargo run --release -p otter-benchmark --features engine --bin otter-engine-benchmark -- <subcommand>`
-  - Current subcommands are `call`, `jit-compile`, `memory`, and `module`.
+  - Current subcommands are `call`, `idle-memory`, `jit-compile`, `memory`,
+    and `module`.
   - `call` and `module` require `--jit-tier=interpreter`,
     `--jit-tier=template`, or `--jit-tier=production-tiered`. `jit-compile`
     requires `--compile-tier=template` or `--compile-tier=optimizing` plus
     explicit numeric `--argument` values. `memory` is intrinsically
-    interpreter/full-GC. Do not infer a benchmark tier from legacy JIT
-    environment variables.
+    interpreter/full-GC; `idle-memory` aggregates fresh release
+    process/runtime samples across a controlled post-full-GC idle window. Do
+    not infer a benchmark tier from legacy JIT environment variables.
   - `module --runtime-reuse=fresh-per-sample` uses a new runtime for every
     measured execution; `reused-across-samples` reuses one validated runtime.
     Runtime reuse is not a module-cache hit.

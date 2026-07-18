@@ -2999,6 +2999,16 @@ impl Runtime {
         !self.interp.timer_callbacks().is_empty()
     }
 
+    /// Number of host-settlement promises still retained by this runtime.
+    ///
+    /// This is a cheap diagnostic snapshot for shutdown and idle-state
+    /// validation. It does not inspect ordinary JavaScript promises, whose
+    /// reactions are drained by the normal microtask queue boundary.
+    #[must_use]
+    pub fn pending_host_promise_count(&self) -> usize {
+        self.promise_registry.len()
+    }
+
     /// Register a fresh pending JS promise and return the
     /// `(PromiseId, Value::Promise)` pair. The caller — typically
     /// a native function exposed to JS — returns the
@@ -3189,6 +3199,16 @@ impl Runtime {
     /// allocations through [`Self::gc_heap_mut`].
     pub fn heap_stats(&mut self) -> &GcStats {
         self.interp.gc_heap_mut().gc_stats()
+    }
+
+    /// Snapshot collector space and off-heap reservation accounting.
+    ///
+    /// Unlike a heap snapshot, this copies fixed-size counters only: it does
+    /// not walk the heap, allocate diagnostic objects, or enable background
+    /// instrumentation.
+    #[must_use]
+    pub fn heap_accounting_stats(&self) -> otter_gc::HeapStats {
+        self.interp.gc_heap().stats()
     }
 
     /// Return the VM's observational runtime budget policy.

@@ -9,8 +9,8 @@
     }
   },
   "provenance": {
-    "capturedAtUnixMs": 1784407045000,
-    "commit": "4fb4bcf833b129f1f022e59477689bba861307e4",
+    "capturedAtUnixMs": 1784410282918,
+    "commit": "be4aae99351fe695a941951b24bb74d5d1823da9",
     "dirty": false,
     "platform": {
       "os": "macos",
@@ -43,15 +43,15 @@
       "direction": "lower-is-better",
       "role": "diagnostic",
       "samples": [
-        263946625,
-        269016750,
-        271830833,
-        273957375,
-        267107000
+        260405042,
+        274530708,
+        270111041,
+        272164792,
+        269173792
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 269016750
+        "value": 270111041
       }
     },
     {
@@ -60,15 +60,15 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
-        10042,
-        11333,
-        34375,
-        23333,
-        13875
+        10166,
+        30625,
+        15042,
+        27958,
+        49250
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 13875
+        "value": 27958
       }
     },
     {
@@ -94,15 +94,15 @@
       "direction": "lower-is-better",
       "role": "primary",
       "samples": [
-        6061041,
-        9879750,
-        15675250,
-        16010208,
-        8837166
+        6197417,
+        14814083,
+        11031458,
+        15162584,
+        12384709
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 9879750
+        "value": 12384709
       }
     },
     {
@@ -111,11 +111,11 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
+        12402688,
         12435456,
         12419072,
-        12419072,
-        12419072,
-        12402688
+        12369920,
+        12468224
       ],
       "aggregate": {
         "statistic": "median",
@@ -128,15 +128,15 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
+        13631488,
         13680640,
-        13664256,
-        13664256,
-        13664256,
-        13631488
+        13631488,
+        13582336,
+        13697024
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 13664256
+        "value": 13631488
       }
     },
     {
@@ -145,15 +145,15 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
+        13631488,
         13680640,
-        13664256,
-        13664256,
-        13664256,
-        13631488
+        13631488,
+        13582336,
+        13697024
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 13664256
+        "value": 13631488
       }
     },
     {
@@ -230,15 +230,15 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
-        21328760,
-        21328760,
-        21328760,
-        21328760,
-        21328760
+        21328744,
+        21328744,
+        21328744,
+        21328744,
+        21328744
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 21328760
+        "value": 21328744
       }
     }
   ],

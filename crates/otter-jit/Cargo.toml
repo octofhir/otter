@@ -16,6 +16,10 @@ missing_docs = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
+# Machine emitters mirror fixed ABI operands explicitly; packing unrelated
+# assembler state into tuple/context bags would hide rather than simplify those
+# boundaries.
+too_many_arguments = "allow"
 
 [dependencies]
 otter-bytecode = { workspace = true }

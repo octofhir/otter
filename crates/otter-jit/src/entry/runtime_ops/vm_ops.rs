@@ -99,7 +99,6 @@ pub(crate) extern "C" fn jit_load_property_stub(
         name_idx as u32,
         site as usize,
     );
-    drop(runtime);
     match result {
         Ok(fill) => {
             if cell != 0 && fill != 0 {
@@ -147,7 +146,6 @@ pub(crate) extern "C" fn jit_store_property_stub(
         src as u16,
         site as usize,
     );
-    drop(runtime);
     match result {
         Ok(fill) => {
             if cell != 0 && fill != 0 {
@@ -181,7 +179,6 @@ pub(crate) extern "C" fn jit_write_barrier_stub(ctx: *mut JitCtx, obj: u64, src:
         }
     };
     let result = runtime.write_barrier(obj as u16, src as u16);
-    drop(runtime);
     match result {
         Ok(()) => 0,
         Err(err) => {
@@ -210,7 +207,6 @@ pub(crate) extern "C" fn jit_load_element_stub(
         }
     };
     let result = runtime.load_element(dst as u16, recv as u16, idx as u16);
-    drop(runtime);
     match result {
         Ok(()) => 0,
         Err(err) => {
@@ -240,7 +236,6 @@ pub(crate) extern "C" fn jit_load_global_stub(
         }
     };
     let result = runtime.load_global(function_id as u32, dst as u16, name_idx as u32);
-    drop(runtime);
     match result {
         Ok(()) => 0,
         Err(err) => {
@@ -265,7 +260,6 @@ pub(crate) extern "C" fn jit_load_upvalue_stub(ctx: *mut JitCtx, dst: u64, idx: 
         }
     };
     let result = runtime.load_upvalue(dst as u16, idx as u32 as i32);
-    drop(runtime);
     match result {
         Ok(()) => 0,
         Err(err) => {
@@ -289,7 +283,6 @@ pub(crate) extern "C" fn jit_store_upvalue_stub(ctx: *mut JitCtx, src: u64, idx:
         }
     };
     let result = runtime.store_upvalue(src as u16, idx as u32 as i32);
-    drop(runtime);
     match result {
         Ok(()) => 0,
         Err(err) => {
@@ -313,7 +306,6 @@ pub(crate) extern "C" fn jit_new_object_stub(ctx: *mut JitCtx, dst: u64) -> u64 
         }
     };
     let result = runtime.new_object(dst as u16);
-    drop(runtime);
     match result {
         Ok(()) => 0,
         Err(err) => {
@@ -336,7 +328,6 @@ pub(crate) extern "C" fn jit_load_regexp_stub(ctx: *mut JitCtx, dst: u64, idx: u
         }
     };
     let result = runtime.load_regexp(dst as u16, idx as u32);
-    drop(runtime);
     match result {
         Ok(()) => 0,
         Err(err) => {
@@ -375,7 +366,6 @@ pub(crate) extern "C" fn jit_call_collection_method_ic_stub(
     let mut inline_args = [0u16; crate::entry::MAX_METHOD_ARGS];
     let args = crate::entry::decode_packed_arg_regs(argc as usize, packed_args, &mut inline_args);
     let result = runtime.try_collection_method(dst as u16, recv as u16, site as usize, args);
-    drop(runtime);
     match result {
         Ok(Some(true)) => 0,
         Ok(Some(false) | None) => 2,
@@ -406,7 +396,6 @@ pub(crate) extern "C" fn jit_store_element_stub(
         }
     };
     let result = runtime.store_element(recv as u16, idx as u16, src as u16);
-    drop(runtime);
     match result {
         Ok(()) => 0,
         Err(err) => {

@@ -1,0 +1,259 @@
+{
+  "benchmark": {
+    "suite": "engine",
+    "name": "memory-runtime-idle",
+    "parameters": {
+      "idleWindowMs": "250",
+      "sampleIsolation": "fresh-process",
+      "script": "empty"
+    }
+  },
+  "provenance": {
+    "capturedAtUnixMs": 1784390379652,
+    "commit": "ac7962b95a8098e365485141e4c8f75e46e819b0",
+    "dirty": false,
+    "platform": {
+      "os": "macos",
+      "arch": "aarch64",
+      "kernel": "Darwin 25.5.0",
+      "cpu": "aarch64"
+    },
+    "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2",
+    "buildProfile": "release"
+  },
+  "configuration": {
+    "surface": "runtime",
+    "jitPolicy": "interpreter",
+    "jitOsrThreshold": null,
+    "gcPolicy": "forced-full",
+    "gcStressStride": null,
+    "runtimeReuse": "fresh-per-sample",
+    "cacheState": "not-applicable"
+  },
+  "sampling": {
+    "warmupCount": 0,
+    "sampleCount": 5,
+    "iterationsPerSample": 1,
+    "timeoutMs": null
+  },
+  "metrics": [
+    {
+      "name": "wall-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "diagnostic",
+      "samples": [
+        265875083,
+        276441459,
+        272717250,
+        266184125,
+        270701792
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 270701792
+      }
+    },
+    {
+      "name": "gc-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        9750,
+        20041,
+        28291,
+        19459,
+        23250
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 20041
+      }
+    },
+    {
+      "name": "retained-heap",
+      "unit": "bytes",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        357480,
+        357480,
+        357480,
+        357480,
+        357480
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 357480
+      }
+    },
+    {
+      "name": "startup-latency",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "primary",
+      "samples": [
+        5501000,
+        12262375,
+        14220833,
+        11836250,
+        9661834
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 11836250
+      }
+    },
+    {
+      "name": "rss-after-bootstrap",
+      "unit": "bytes",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        12451840,
+        12468224,
+        12451840,
+        12468224,
+        12500992
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 12468224
+      }
+    },
+    {
+      "name": "rss-after-full-gc",
+      "unit": "bytes",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        13697024,
+        13713408,
+        13697024,
+        13729792,
+        13762560
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 13713408
+      }
+    },
+    {
+      "name": "idle-rss",
+      "unit": "bytes",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        13697024,
+        13713408,
+        13697024,
+        13729792,
+        13762560
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 13713408
+      }
+    },
+    {
+      "name": "managed-heap-allocated",
+      "unit": "bytes",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        357480,
+        357480,
+        357480,
+        357480,
+        357480
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 357480
+      }
+    },
+    {
+      "name": "managed-heap-page-capacity",
+      "unit": "bytes",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        8912896,
+        8912896,
+        8912896,
+        8912896,
+        8912896
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 8912896
+      }
+    },
+    {
+      "name": "off-heap-reserved",
+      "unit": "bytes",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        1913,
+        1913,
+        1913,
+        1913,
+        1913
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 1913
+      }
+    },
+    {
+      "name": "full-gc-cycles",
+      "unit": "count",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 1
+      }
+    },
+    {
+      "name": "release-binary-size",
+      "unit": "bytes",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        21273192,
+        21273192,
+        21273192,
+        21273192,
+        21273192
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 21273192
+      }
+    }
+  ],
+  "outcome": {
+    "status": "validated",
+    "validationMarker": "empty-turn;fresh-processes=5;idle-ms=250;pending-timers=0;pending-host-promises=0",
+    "processExitCode": null,
+    "failure": null
+  },
+  "command": [
+    "target/release/otter-engine-benchmark",
+    "idle-memory",
+    "--idle-ms",
+    "250",
+    "--samples",
+    "5"
+  ]
+}

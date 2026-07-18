@@ -1,6 +1,6 @@
 {
-  "commit": "bdb28d84c6ae5004bf8c82e94da554097b1922e6",
-  "capturedAtUnixMs": 1784388413018,
+  "commit": "ac7962b95a8098e365485141e4c8f75e46e819b0",
+  "capturedAtUnixMs": 1784390288785,
   "outerTimeoutMs": 120000,
   "engineArgv0": "target/release/otter-engine-benchmark",
   "complete": true,
@@ -713,6 +713,23 @@
       "error": null
     },
     {
+      "id": "memory-runtime-idle",
+      "argv": [
+        "target/release/otter-engine-benchmark",
+        "idle-memory",
+        "--idle-ms",
+        "250",
+        "--samples",
+        "5"
+      ],
+      "status": "completed",
+      "processExitCode": 0,
+      "recordPath": "records/29-memory-runtime-idle.json",
+      "stdoutPath": "raw/29-memory-runtime-idle.stdout",
+      "stderrPath": "raw/29-memory-runtime-idle.stderr",
+      "error": null
+    },
+    {
       "id": "module-module-entry-fresh-per-sample-interpreter",
       "argv": [
         "target/release/otter-engine-benchmark",
@@ -730,9 +747,9 @@
       ],
       "status": "completed",
       "processExitCode": 0,
-      "recordPath": "records/29-module-module-entry-fresh-per-sample-interpreter.json",
-      "stdoutPath": "raw/29-module-module-entry-fresh-per-sample-interpreter.stdout",
-      "stderrPath": "raw/29-module-module-entry-fresh-per-sample-interpreter.stderr",
+      "recordPath": "records/30-module-module-entry-fresh-per-sample-interpreter.json",
+      "stdoutPath": "raw/30-module-module-entry-fresh-per-sample-interpreter.stdout",
+      "stderrPath": "raw/30-module-module-entry-fresh-per-sample-interpreter.stderr",
       "error": null
     },
     {
@@ -753,9 +770,9 @@
       ],
       "status": "completed",
       "processExitCode": 0,
-      "recordPath": "records/30-module-module-entry-fresh-per-sample-template.json",
-      "stdoutPath": "raw/30-module-module-entry-fresh-per-sample-template.stdout",
-      "stderrPath": "raw/30-module-module-entry-fresh-per-sample-template.stderr",
+      "recordPath": "records/31-module-module-entry-fresh-per-sample-template.json",
+      "stdoutPath": "raw/31-module-module-entry-fresh-per-sample-template.stdout",
+      "stderrPath": "raw/31-module-module-entry-fresh-per-sample-template.stderr",
       "error": null
     },
     {
@@ -776,9 +793,9 @@
       ],
       "status": "completed",
       "processExitCode": 0,
-      "recordPath": "records/31-module-module-entry-fresh-per-sample-production-tiered.json",
-      "stdoutPath": "raw/31-module-module-entry-fresh-per-sample-production-tiered.stdout",
-      "stderrPath": "raw/31-module-module-entry-fresh-per-sample-production-tiered.stderr",
+      "recordPath": "records/32-module-module-entry-fresh-per-sample-production-tiered.json",
+      "stdoutPath": "raw/32-module-module-entry-fresh-per-sample-production-tiered.stdout",
+      "stderrPath": "raw/32-module-module-entry-fresh-per-sample-production-tiered.stderr",
       "error": null
     },
     {
@@ -799,9 +816,9 @@
       ],
       "status": "completed",
       "processExitCode": 0,
-      "recordPath": "records/32-module-module-entry-reused-across-samples-interpreter.json",
-      "stdoutPath": "raw/32-module-module-entry-reused-across-samples-interpreter.stdout",
-      "stderrPath": "raw/32-module-module-entry-reused-across-samples-interpreter.stderr",
+      "recordPath": "records/33-module-module-entry-reused-across-samples-interpreter.json",
+      "stdoutPath": "raw/33-module-module-entry-reused-across-samples-interpreter.stdout",
+      "stderrPath": "raw/33-module-module-entry-reused-across-samples-interpreter.stderr",
       "error": null
     },
     {
@@ -822,9 +839,9 @@
       ],
       "status": "completed",
       "processExitCode": 0,
-      "recordPath": "records/33-module-module-entry-reused-across-samples-template.json",
-      "stdoutPath": "raw/33-module-module-entry-reused-across-samples-template.stdout",
-      "stderrPath": "raw/33-module-module-entry-reused-across-samples-template.stderr",
+      "recordPath": "records/34-module-module-entry-reused-across-samples-template.json",
+      "stdoutPath": "raw/34-module-module-entry-reused-across-samples-template.stdout",
+      "stderrPath": "raw/34-module-module-entry-reused-across-samples-template.stderr",
       "error": null
     },
     {
@@ -845,9 +862,9 @@
       ],
       "status": "completed",
       "processExitCode": 0,
-      "recordPath": "records/34-module-module-entry-reused-across-samples-production-tiered.json",
-      "stdoutPath": "raw/34-module-module-entry-reused-across-samples-production-tiered.stdout",
-      "stderrPath": "raw/34-module-module-entry-reused-across-samples-production-tiered.stderr",
+      "recordPath": "records/35-module-module-entry-reused-across-samples-production-tiered.json",
+      "stdoutPath": "raw/35-module-module-entry-reused-across-samples-production-tiered.stdout",
+      "stderrPath": "raw/35-module-module-entry-reused-across-samples-production-tiered.stderr",
       "error": null
     },
     {
@@ -868,9 +885,9 @@
       ],
       "status": "completed",
       "processExitCode": 0,
-      "recordPath": "records/35-package-entry-fresh-per-sample-interpreter.json",
-      "stdoutPath": "raw/35-package-entry-fresh-per-sample-interpreter.stdout",
-      "stderrPath": "raw/35-package-entry-fresh-per-sample-interpreter.stderr",
+      "recordPath": "records/36-package-entry-fresh-per-sample-interpreter.json",
+      "stdoutPath": "raw/36-package-entry-fresh-per-sample-interpreter.stdout",
+      "stderrPath": "raw/36-package-entry-fresh-per-sample-interpreter.stderr",
       "error": null
     }
   ]

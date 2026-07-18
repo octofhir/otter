@@ -9,8 +9,8 @@
     }
   },
   "provenance": {
-    "capturedAtUnixMs": 1784390379652,
-    "commit": "ac7962b95a8098e365485141e4c8f75e46e819b0",
+    "capturedAtUnixMs": 1784392741526,
+    "commit": "48ce1d0d659be6d7c0acfd29b589da0543808df0",
     "dirty": false,
     "platform": {
       "os": "macos",
@@ -43,15 +43,15 @@
       "direction": "lower-is-better",
       "role": "diagnostic",
       "samples": [
-        265875083,
-        276441459,
-        272717250,
-        266184125,
-        270701792
+        268122833,
+        277746375,
+        276407666,
+        269997959,
+        270639708
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 270701792
+        "value": 270639708
       }
     },
     {
@@ -60,15 +60,15 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
-        9750,
-        20041,
-        28291,
-        19459,
-        23250
+        9958,
+        22541,
+        22708,
+        19542,
+        22209
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 20041
+        "value": 22209
       }
     },
     {
@@ -94,15 +94,15 @@
       "direction": "lower-is-better",
       "role": "primary",
       "samples": [
-        5501000,
-        12262375,
-        14220833,
-        11836250,
-        9661834
+        6553000,
+        13029667,
+        12559583,
+        12539084,
+        7791666
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 11836250
+        "value": 12539084
       }
     },
     {
@@ -111,15 +111,15 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
-        12451840,
+        12435456,
         12468224,
-        12451840,
-        12468224,
-        12500992
+        12419072,
+        12419072,
+        12484608
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 12468224
+        "value": 12435456
       }
     },
     {
@@ -128,15 +128,15 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
+        13680640,
         13697024,
-        13713408,
-        13697024,
-        13729792,
-        13762560
+        13647872,
+        13647872,
+        13729792
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 13713408
+        "value": 13680640
       }
     },
     {
@@ -145,15 +145,15 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
+        13680640,
         13697024,
-        13713408,
-        13697024,
-        13729792,
-        13762560
+        13647872,
+        13647872,
+        13729792
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 13713408
+        "value": 13680640
       }
     },
     {
@@ -230,15 +230,15 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
-        21273192,
-        21273192,
-        21273192,
-        21273192,
-        21273192
+        21289720,
+        21289720,
+        21289720,
+        21289720,
+        21289720
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 21273192
+        "value": 21289720
       }
     }
   ],

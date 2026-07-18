@@ -17,8 +17,8 @@
 //! - Every bundle owns all strings and bytes. It contains no GC handles,
 //!   executable pointers, isolate borrows, sinks, locks, or registries.
 //! - Exact [`JitArtifactFileName::Code`] bytes are runtime-local. Portable
-//!   comparisons require the separately inventoried normalized and relocation
-//!   files; a bundle that cannot supply them lists them as absent.
+//!   comparisons use the required normalized and relocation files. The
+//!   normalized stream is semantic data and is never executable.
 //! - This module performs no I/O. The outer host owns atomic persistence and
 //!   write failures.
 //!
@@ -330,7 +330,9 @@ impl JitArtifactBundle {
             .ok_or(JitArtifactBuildError::MissingCode)?;
         for required in [
             JitArtifactFileName::Bytecode,
+            JitArtifactFileName::NormalizedCode,
             JitArtifactFileName::CodeMap,
+            JitArtifactFileName::Relocations,
             JitArtifactFileName::Safepoints,
         ] {
             if !files.iter().any(|file| file.name == required) {
@@ -608,7 +610,9 @@ mod tests {
                 JitArtifactFile::text(JitArtifactFileName::TemplatePlan, "plan\n".to_string()),
                 JitArtifactFile::text(JitArtifactFileName::Bytecode, "code\n".to_string()),
                 JitArtifactFile::binary(JitArtifactFileName::Code, vec![1, 2, 3, 4]),
+                JitArtifactFile::binary(JitArtifactFileName::NormalizedCode, b"OTJNCODE".to_vec()),
                 JitArtifactFile::text(JitArtifactFileName::CodeMap, "{}\n".to_string()),
+                JitArtifactFile::text(JitArtifactFileName::Relocations, "{}\n".to_string()),
                 JitArtifactFile::text(JitArtifactFileName::Safepoints, "{}\n".to_string()),
             ],
         )
@@ -640,14 +644,14 @@ mod tests {
                     "bytecode.txt",
                     "template-plan.txt",
                     "code.bin",
+                    "code-normalized.bin",
                     "code-map.json",
+                    "relocations.json",
                     "safepoints.json"
                 ],
                 "filesAbsent": [
                     "optimized-ir.txt",
-                    "code-normalized.bin",
                     "asm.txt",
-                    "relocations.json",
                     "deopt.json"
                 ]
             })
@@ -698,7 +702,9 @@ mod tests {
                     JitArtifactFile::binary(JitArtifactFileName::Code, vec![0]),
                     JitArtifactFile::text(JitArtifactFileName::TemplatePlan, String::new()),
                     JitArtifactFile::text(JitArtifactFileName::Bytecode, String::new()),
+                    JitArtifactFile::binary(JitArtifactFileName::NormalizedCode, Vec::new()),
                     JitArtifactFile::text(JitArtifactFileName::CodeMap, String::new()),
+                    JitArtifactFile::text(JitArtifactFileName::Relocations, String::new()),
                     JitArtifactFile::text(JitArtifactFileName::Safepoints, String::new()),
                 ],
             )
@@ -712,7 +718,9 @@ mod tests {
                     JitArtifactFile::binary(JitArtifactFileName::Code, vec![0]),
                     JitArtifactFile::text(JitArtifactFileName::TemplatePlan, String::new()),
                     JitArtifactFile::text(JitArtifactFileName::Bytecode, String::new()),
+                    JitArtifactFile::binary(JitArtifactFileName::NormalizedCode, Vec::new()),
                     JitArtifactFile::text(JitArtifactFileName::CodeMap, String::new()),
+                    JitArtifactFile::text(JitArtifactFileName::Relocations, String::new()),
                     JitArtifactFile::text(JitArtifactFileName::Safepoints, String::new()),
                 ],
             )

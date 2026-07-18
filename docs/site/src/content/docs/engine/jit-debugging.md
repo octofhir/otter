@@ -6,8 +6,8 @@ Otter can capture two independent, default-off JIT diagnostic channels:
 
 - structured events explain when and why compilation, inlining, OSR, side
   exits, and deoptimization happened;
-- artifact bundles preserve the exact compiler input and native output of each
-  successful compile.
+- artifact bundles preserve the compiler input, exact native output, symbolic
+  address sites, and a portable comparison stream for each successful compile.
 
 Neither channel writes from the VM or JIT compiler. The engine returns bounded,
 owned data to the outer runtime, and the CLI performs filesystem I/O only when
@@ -56,14 +56,18 @@ jit-artifacts/
     bytecode.txt
     template-plan.txt
     code.bin
+    code-normalized.bin
     code-map.json
+    relocations.json
     safepoints.json
   jit-0001-optimizing-f9-c12/
     manifest.json
     bytecode.txt
     optimized-ir.txt
     code.bin
+    code-normalized.bin
     code-map.json
+    relocations.json
     deopt.json
     safepoints.json
 ```
@@ -85,19 +89,42 @@ identity, entry kind, bytecode size, code size, and explicit `filesPresent` /
 | `template-plan.txt` | The already-built template lowering plan and its decoded operand side buffers. |
 | `optimized-ir.txt` | The already-built optimizing unit in deterministic reverse-postorder. |
 | `code.bin` | Exact finalized executable bytes for this runtime process. |
+| `code-normalized.bin` | Non-executable semantic instruction stream with symbolic relocations and logical branch targets. |
 | `code-map.json` | Native offset ranges correlated with bytecode/tier operations, structural regions, and OSR entries. |
+| `relocations.json` | Typed runtime-local address sites and their exact `code.bin` ranges, without resolved address values. |
 | `deopt.json` | Optimizer frame reconstruction metadata; omitted for template code. |
 | `safepoints.json` | Tagged frame/register/spill locations known to moving GC. |
 
 `code.bin` is intentionally marked runtime-local. It can contain baked process
 addresses and can differ across identical runs because of ASLR. Do not use it
-as a portable golden file. Symbolic `relocations.json`,
-`code-normalized.bin`, and annotated `asm.txt` are not emitted yet; manifests
-list them as absent until those follow-up slices land.
+as a portable golden file. Annotated `asm.txt` is not emitted yet and remains
+listed as absent.
 
 All native locations are offsets into the matching `code.bin`, never absolute
 executable addresses. A range must satisfy
 `0 <= startOffset <= endOffset <= manifest.codeBytes`.
+
+## Portable code comparisons
+
+`relocations.json` uses `otterJitRelocationSchemaVersion: 1` and
+`offsetBasis: "code.bin"`. Each sorted record describes the exact
+`MOVZ`/`MOVK` range, destination register, emitted chunk shape, and a typed
+symbolic target such as a runtime-stub descriptor, call trampoline, GC cage
+base, property IC cell, or code-owned operand slice. Chunk immediates and
+resolved pointer values are deliberately absent.
+
+`code-normalized.bin` starts with the `OTJNCODE` schema marker. It is a
+semantic comparison stream, not ARM64 executable code:
+
+- a one-to-four instruction address load becomes one symbolic relocation
+  token;
+- local branch displacements become logical item targets, so ASLR-driven
+  changes in address-load length do not move the comparison target;
+- ordinary non-PC-relative instructions retain their exact instruction word.
+
+Match bundles by module, function, tier, and entry, then compare their
+normalized streams. Continue to use `code.bin` offsets when joining the code
+map, relocation records, OSR entries, deopt exits, or safepoints.
 
 ## Correlate an execution
 
@@ -111,7 +138,9 @@ fallback:
 4. Read `bytecode.txt` and the tier input to identify the logical operation.
 5. Use `code-map.json` to map its logical PC and encoded byte PC to the exact
    native byte range.
-6. Inspect `deopt.json` and `safepoints.json` when the range crosses a deopt or
+6. Inspect `relocations.json` when the range materializes a runtime-local
+   address.
+7. Inspect `deopt.json` and `safepoints.json` when the range crosses a deopt or
    allocation boundary.
 
 The interpreter [step trace](/otter/engine/step-trace/) complements this

@@ -64,6 +64,17 @@ function onceOverflow(limit) {
 String(onceOverflow(20));
 "#;
 
+const OPTIMIZING_MATH: &str = r#"
+function sumAbsoluteOffsets(limit) {
+  let total = 0;
+  for (let index = 0; index < limit; index++) {
+    total += Math.abs(index - 32);
+  }
+  return total;
+}
+String(sumAbsoluteOffsets(96));
+"#;
+
 fn runtime_with_artifacts(selection: JitSelection, threshold: u32) -> Runtime {
     Runtime::builder()
         .jit_selection(selection)
@@ -88,13 +99,52 @@ fn assert_bundle_is_self_consistent(bundle: &JitArtifactBundle) {
     let code = bundle
         .file(JitArtifactFileName::Code)
         .expect("exact code payload");
+    let normalized = bundle
+        .file(JitArtifactFileName::NormalizedCode)
+        .expect("portable normalized code payload");
+    let relocations_file = bundle
+        .file(JitArtifactFileName::Relocations)
+        .expect("typed relocation payload");
     assert_eq!(code.contents().len() as u64, manifest.code_bytes());
+    assert!(
+        normalized.contents().starts_with(b"OTJNCODE"),
+        "normalized code must carry its binary schema marker"
+    );
     assert!(manifest.bytecode_bytes() > 0);
     assert!(!manifest.function_name().is_empty());
     assert!(!manifest.module().is_empty());
     assert!(!manifest.target().is_empty());
     assert_eq!(manifest.architecture(), std::env::consts::ARCH);
     assert_eq!(manifest.operating_system(), std::env::consts::OS);
+
+    let relocations: serde_json::Value =
+        serde_json::from_slice(relocations_file.contents()).expect("valid relocation JSON");
+    assert_eq!(relocations["otterJitRelocationSchemaVersion"], 1);
+    assert_eq!(relocations["offsetBasis"], "code.bin");
+    assert!(
+        !String::from_utf8_lossy(relocations_file.contents()).contains("resolvedValue"),
+        "relocation payload must not expose resolved process addresses"
+    );
+    let mut previous_end = 0;
+    for relocation in relocations["relocations"]
+        .as_array()
+        .expect("relocation records")
+    {
+        let start = relocation["startOffset"]
+            .as_u64()
+            .expect("relocation start");
+        let end = relocation["endOffset"].as_u64().expect("relocation end");
+        assert!(
+            previous_end <= start,
+            "overlapping relocations: {relocation}"
+        );
+        assert!(start < end, "empty relocation: {relocation}");
+        assert!(
+            end <= manifest.code_bytes(),
+            "relocation escapes code.bin: {relocation}"
+        );
+        previous_end = end;
+    }
 
     let map = code_map(bundle);
     assert_eq!(map["otterJitCodeMapSchemaVersion"], 1);
@@ -126,6 +176,35 @@ fn first_tier_bundle(batch: &JitArtifactBatch, tier: JitDebugTier) -> &JitArtifa
         .unwrap_or_else(|| panic!("missing {tier:?} bundle in {batch:?}"))
 }
 
+fn bundle_relocation_target_kinds(bundle: &JitArtifactBundle) -> BTreeSet<String> {
+    let document: serde_json::Value = serde_json::from_slice(
+        bundle
+            .file(JitArtifactFileName::Relocations)
+            .expect("relocation payload")
+            .contents(),
+    )
+    .expect("valid relocation JSON");
+    document["relocations"]
+        .as_array()
+        .expect("relocation records")
+        .iter()
+        .map(|relocation| {
+            relocation["target"]["kind"]
+                .as_str()
+                .expect("typed relocation kind")
+                .to_string()
+        })
+        .collect()
+}
+
+fn relocation_target_kinds(batch: &JitArtifactBatch) -> BTreeSet<String> {
+    batch
+        .bundles()
+        .iter()
+        .flat_map(bundle_relocation_target_kinds)
+        .collect()
+}
+
 #[test]
 fn template_osr_returns_a_versioned_owned_bundle_without_events() {
     let mut runtime = runtime_with_artifacts(JitSelection::Template, 1);
@@ -150,8 +229,8 @@ fn template_osr_returns_a_versioned_owned_bundle_without_events() {
     assert!(bundle.file(JitArtifactFileName::TemplatePlan).is_some());
     assert!(bundle.file(JitArtifactFileName::OptimizedIr).is_none());
     assert!(bundle.file(JitArtifactFileName::Safepoints).is_some());
-    assert!(bundle.file(JitArtifactFileName::Relocations).is_none());
-    assert!(bundle.file(JitArtifactFileName::NormalizedCode).is_none());
+    assert!(bundle.file(JitArtifactFileName::Relocations).is_some());
+    assert!(bundle.file(JitArtifactFileName::NormalizedCode).is_some());
     assert!(bundle.file(JitArtifactFileName::Assembly).is_none());
     assert_bundle_is_self_consistent(bundle);
 }
@@ -216,6 +295,85 @@ fn optimizing_osr_returns_ir_deopt_and_safepoint_payloads() {
         }
     }
     assert_bundle_is_self_consistent(bundle);
+}
+
+#[test]
+fn optimizing_math_artifact_types_code_owned_argument_slice() {
+    let mut runtime = runtime_with_artifacts(JitSelection::ProductionTiered, 4);
+    let result = runtime
+        .run_script(
+            SourceInput::from_javascript(OPTIMIZING_MATH),
+            "jit-artifact-optimizing-math.js",
+        )
+        .expect("optimizing Math fixture");
+    let batch = result.jit_artifacts().expect("enabled artifact batch");
+    let bundle = first_tier_bundle(batch, JitDebugTier::Optimizing);
+    let kinds = bundle_relocation_target_kinds(bundle);
+
+    assert_eq!(result.completion_string(), "2544");
+    assert!(
+        kinds.contains("optimizedMathArguments"),
+        "optimizing Math arguments must be represented symbolically: {kinds:?}"
+    );
+    assert!(
+        kinds.contains("runtimeStub"),
+        "optimizing Math call must retain its runtime entry identity: {kinds:?}"
+    );
+}
+
+#[test]
+fn template_artifacts_type_every_non_stub_address_class() {
+    let mut runtime = runtime_with_artifacts(JitSelection::Template, 4);
+    let result = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+const receiver = { value: 3 };
+const entries = new Map();
+entries.set("key", 5);
+
+function sumMany(a, b, c, d, e, f, g) {
+  return a + b + c + d + e + f + g;
+}
+
+function hot(limit) {
+  const bias = 2;
+  const addBias = value => value + bias;
+  let total = 0;
+  for (let i = 0; i < limit; i++) {
+    const row = [1, 2, 3];
+    total += receiver.value;
+    total += row[0];
+    total += entries.get("key");
+    total += addBias(i);
+    total += sumMany(1, 2, 3, 4, 5, 6, 7);
+  }
+  return total;
+}
+
+String(hot(48));
+"#,
+            ),
+            "jit-artifact-target-classes.js",
+        )
+        .expect("rich template relocation fixture");
+    let batch = result.jit_artifacts().expect("enabled artifact batch");
+    let kinds = relocation_target_kinds(batch);
+
+    for expected in [
+        "runtimeStub",
+        "callTrampoline",
+        "gcCageBase",
+        "propertyIcCell",
+        "templateOperandSlice",
+        "collectionHeapReference",
+        "collectionBuiltinFunction",
+    ] {
+        assert!(
+            kinds.contains(expected),
+            "missing relocation target {expected}: {kinds:?}"
+        );
+    }
 }
 
 #[test]

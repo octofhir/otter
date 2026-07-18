@@ -16,13 +16,15 @@
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::native_abi as abi;
 
-use super::values::emit_load_u64;
+use super::values::{emit_load_runtime_stub, emit_load_u64};
+use crate::artifact::relocation::RelocationCapture;
 use crate::entry::{STATUS_BAILED, STATUS_THREW};
 
 /// Emit `Op::BindFunction`. `packed_meta` is `dst | callee<<16 | this<<32 |
 /// argc<<48`; `packed_args` holds the bound-argument registers, one per lane.
 pub(super) fn emit_bind_function(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
     packed_meta: u64,
     packed_args: u64,
@@ -33,10 +35,12 @@ pub(super) fn emit_bind_function(
     dynasm!(ops ; .arch aarch64 ; mov x0, x20);
     emit_load_u64(ops, 1, packed_meta);
     emit_load_u64(ops, 2, packed_args);
-    emit_load_u64(
+    emit_load_runtime_stub(
         ops,
+        relocations,
         16,
         transitions.variadic_entry(abi::STUB_JIT_BIND_FUNCTION),
+        abi::STUB_JIT_BIND_FUNCTION,
     );
     dynasm!(ops
         ; .arch aarch64

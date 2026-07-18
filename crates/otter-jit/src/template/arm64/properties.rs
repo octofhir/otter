@@ -18,6 +18,8 @@
 //!   window transition.
 //! - Store misses publish the frame window before entering the VM, so setters,
 //!   proxies, exceptions, reentry, and moving GC complete without replay.
+//! - Cage bases, IC cells, and transition entries carry semantic relocation
+//!   identities; IC ordinals are assigned before emission in ownership order.
 //!
 //! # See also
 //! - [`super::values`] — slot compression/decompression primitives.
@@ -31,14 +33,16 @@ use otter_vm::native_abi as abi;
 use super::transitions::TransitionTable;
 use super::values::{
     BoxedSlotSlowPath, emit_box_int32, emit_compress_slot_or_bail, emit_decompress_slot,
-    emit_load_u64, emit_slab_base,
+    emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64, emit_slab_base,
 };
+use crate::artifact::relocation::{PropertyIcAccess, RelocationCapture, RelocationTarget};
 use crate::entry::{IC_WAYS, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, Unsupported, reg_offset};
 
 /// Emit `dst = obj.name` with the inline WhiskerIC probe.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_load_property(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     view: &JitCompileSnapshot,
     dst: u16,
@@ -47,6 +51,7 @@ pub(super) fn emit_load_property(
     site: u64,
     array_length: bool,
     cell_addr: usize,
+    cell_ordinal: u32,
     boxed_slot_slow_paths: &mut Vec<BoxedSlotSlowPath>,
     threw: DynamicLabel,
 ) -> Result<(), Unsupported> {
@@ -68,7 +73,13 @@ pub(super) fn emit_load_property(
             ; b.ne =>miss
             ; mov w12, w9              // low-32 Gc offset
         );
-        emit_load_u64(ops, 13, cage_base as u64);
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            13,
+            cage_base as u64,
+            RelocationTarget::GcCageBase,
+        );
         dynasm!(ops
             ; .arch aarch64
             ; add x13, x13, x12        // x13 = GcHeader ptr
@@ -108,7 +119,13 @@ pub(super) fn emit_load_property(
             ; b.ne =>miss
             ; mov w12, w9              // low-32 Gc offset (zero-ext)
         );
-        emit_load_u64(ops, 13, cage_base as u64);
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            13,
+            cage_base as u64,
+            RelocationTarget::GcCageBase,
+        );
         dynasm!(ops
             ; .arch aarch64
             ; add x13, x13, x12        // x13 = GcHeader ptr
@@ -118,7 +135,16 @@ pub(super) fn emit_load_property(
             ; ldr w14, [x13, shape_byte] // receiver shape handle
             ; cbz w14, =>miss
         );
-        emit_load_u64(ops, 15, cell_addr as u64);
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            15,
+            cell_addr as u64,
+            RelocationTarget::PropertyIcCell {
+                access: PropertyIcAccess::Load,
+                ordinal: cell_ordinal,
+            },
+        );
         // Walk the IC ways: a hit loads that way's value byte into w17 and
         // shares the slab read.
         let do_load = ops.new_dynamic_label();
@@ -150,7 +176,7 @@ pub(super) fn emit_load_property(
             continuation,
             miss,
         });
-        emit_decompress_slot(ops, cage_base as u64, boxed_entry);
+        emit_decompress_slot(ops, relocations, cage_base as u64, boxed_entry);
         dynasm!(ops
             ; .arch aarch64
             ; =>continuation
@@ -170,9 +196,24 @@ pub(super) fn emit_load_property(
     );
     emit_load_u64(ops, 3, u64::from(name));
     emit_load_u64(ops, 4, site);
-    emit_load_u64(ops, 5, cell_addr as u64);
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        5,
+        cell_addr as u64,
+        RelocationTarget::PropertyIcCell {
+            access: PropertyIcAccess::Load,
+            ordinal: cell_ordinal,
+        },
+    );
     emit_load_u64(ops, 6, u64::from(view.code_block.id));
-    emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_LOAD_PROPERTY));
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        16,
+        table.entry(abi::STUB_JIT_LOAD_PROPERTY),
+        abi::STUB_JIT_LOAD_PROPERTY,
+    );
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
@@ -187,6 +228,7 @@ pub(super) fn emit_load_property(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_store_property(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     view: &JitCompileSnapshot,
     object: u16,
@@ -194,6 +236,7 @@ pub(super) fn emit_store_property(
     value: u16,
     site: u64,
     cell_addr: usize,
+    cell_ordinal: u32,
     threw: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let cage_base = view.cage_base;
@@ -215,7 +258,13 @@ pub(super) fn emit_store_property(
             ; b.ne =>miss
             ; mov w12, w9              // low-32 Gc offset
         );
-        emit_load_u64(ops, 13, cage_base as u64);
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            13,
+            cage_base as u64,
+            RelocationTarget::GcCageBase,
+        );
         dynasm!(ops
             ; .arch aarch64
             ; add x13, x13, x12        // x13 = GcHeader ptr
@@ -225,7 +274,16 @@ pub(super) fn emit_store_property(
             ; ldr w14, [x13, shape_byte] // receiver shape handle
             ; cbz w14, =>miss
         );
-        emit_load_u64(ops, 15, cell_addr as u64);
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            15,
+            cell_addr as u64,
+            RelocationTarget::PropertyIcCell {
+                access: PropertyIcAccess::Store,
+                ordinal: cell_ordinal,
+            },
+        );
         let do_store = ops.new_dynamic_label();
         for way in 0..IC_WAYS as u32 {
             let shape_off = way * 8;
@@ -265,7 +323,13 @@ pub(super) fn emit_store_property(
             ; movz x1, object as u32
             ; movz x2, value as u32
         );
-        emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_WRITE_BARRIER));
+        emit_load_runtime_stub(
+            ops,
+            relocations,
+            16,
+            table.entry(abi::STUB_JIT_WRITE_BARRIER),
+            abi::STUB_JIT_WRITE_BARRIER,
+        );
         dynasm!(ops
             ; .arch aarch64
             ; blr x16
@@ -291,9 +355,24 @@ pub(super) fn emit_store_property(
     emit_load_u64(ops, 2, u64::from(name));
     dynasm!(ops ; .arch aarch64 ; movz x3, value as u32);
     emit_load_u64(ops, 4, site);
-    emit_load_u64(ops, 5, cell_addr as u64);
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        5,
+        cell_addr as u64,
+        RelocationTarget::PropertyIcCell {
+            access: PropertyIcAccess::Store,
+            ordinal: cell_ordinal,
+        },
+    );
     emit_load_u64(ops, 6, u64::from(view.code_block.id));
-    emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_STORE_PROPERTY));
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        16,
+        table.entry(abi::STUB_JIT_STORE_PROPERTY),
+        abi::STUB_JIT_STORE_PROPERTY,
+    );
     dynasm!(ops
         ; .arch aarch64
         ; blr x16

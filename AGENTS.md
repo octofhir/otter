@@ -357,11 +357,14 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     renames the complete root into view. This is not crash-durable storage or
     a cross-process no-clobber primitive.
   - Each compile directory contains exact runtime-local `code.bin`,
+    portable semantic `code-normalized.bin`, typed `relocations.json`,
     `bytecode.txt`, tier input, `code-map.json`, `safepoints.json`, and
     optimizer `deopt.json` when applicable.
-  - Exact code may contain process addresses. Portable normalized code,
-    symbolic relocations, and annotated `asm.txt` are tracked follow-ups;
-    absent files are listed explicitly in `manifest.json`.
+  - Exact code may contain process addresses and is not a portable golden.
+    Compare `code-normalized.bin` across processes; its relocation tokens and
+    branch targets are symbolic, and it is not executable. `relocations.json`
+    uses exact `code.bin` offsets but never serializes resolved addresses.
+    Annotated `asm.txt` remains a tracked follow-up and is listed absent.
   - Full workflow and schema notes:
     `docs/site/src/content/docs/engine/jit-debugging.md`.
 - CPU profile + folded flamegraph stacks:

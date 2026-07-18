@@ -14,12 +14,14 @@
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::native_abi as abi;
 
-use super::values::emit_load_u64;
+use super::values::{emit_load_runtime_stub, emit_load_u64};
+use crate::artifact::relocation::RelocationCapture;
 use crate::entry::{STATUS_BAILED, STATUS_THREW};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_class_value_op(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
     opcode: u8,
     arg0: u64,
@@ -34,10 +36,12 @@ pub(super) fn emit_class_value_op(
     emit_load_u64(ops, 2, arg0);
     emit_load_u64(ops, 3, arg1);
     emit_load_u64(ops, 4, arg2);
-    emit_load_u64(
+    emit_load_runtime_stub(
         ops,
+        relocations,
         16,
         transitions.variadic_entry(abi::STUB_JIT_CLASS_VALUE_OP),
+        abi::STUB_JIT_CLASS_VALUE_OP,
     );
     dynasm!(ops
         ; .arch aarch64

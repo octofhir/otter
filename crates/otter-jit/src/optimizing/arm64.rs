@@ -68,12 +68,13 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dyna
 use otter_bytecode::{Op, Operand};
 use otter_vm::deopt::{DeoptExitId, DeoptFrame, DeoptLocation, DeoptRepr, DeoptTable};
 use otter_vm::native_abi::{
-    FrameMap, NO_FRAME_STATE, STUB_JIT_BACKEDGE_POLL, STUB_JIT_CALL_GENERIC,
+    FrameMap, NO_FRAME_STATE, RuntimeStubDescriptor, STUB_JIT_BACKEDGE_POLL, STUB_JIT_CALL_GENERIC,
     STUB_JIT_CALL_METHOD_GENERIC, STUB_JIT_CONSTRUCT, STUB_JIT_DEOPT_REIFY_FRAME,
     STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROPERTY, STUB_JIT_LOAD_UPVALUE,
     STUB_JIT_LOOSE_EQ, STUB_JIT_MATH_CALL, STUB_JIT_PREPARE_DIRECT_CALL,
     STUB_JIT_PREPARE_DIRECT_METHOD_CALL, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY,
-    STUB_JIT_STORE_UPVALUE, STUB_JIT_STORE_UPVALUE_CHECKED, SafepointId, SafepointRecord,
+    STUB_JIT_STORE_UPVALUE, STUB_JIT_STORE_UPVALUE_CHECKED, STUB_JIT_WRITE_BARRIER, SafepointId,
+    SafepointRecord,
 };
 use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG};
 
@@ -87,7 +88,10 @@ use super::{
 use crate::{
     CompiledCode,
     arm64::CallTrampoline,
-    artifact::{ArtifactRequest, CodeMapCapture, CodeRegion, NativeCompileOutput, build_bundle},
+    artifact::{
+        ArtifactRequest, CodeMapCapture, CodeRegion, NativeCompileOutput, build_bundle,
+        relocation::{PropertyIcAccess, RelocationCapture, RelocationTarget},
+    },
     entry::{
         CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, IC_WAYS, MAX_METHOD_ARGS, NATIVE_FRAME_OFFSET,
         NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_THIS_OFFSET,
@@ -192,6 +196,21 @@ struct EligibilityAnalyses<'a> {
     frame_states: &'a FrameStateTable,
 }
 
+#[derive(Clone, Copy)]
+struct ResolvedRuntimeEntry {
+    descriptor: RuntimeStubDescriptor,
+    address: u64,
+}
+
+impl ResolvedRuntimeEntry {
+    const fn new(descriptor: RuntimeStubDescriptor, address: u64) -> Self {
+        Self {
+            descriptor,
+            address,
+        }
+    }
+}
+
 struct EmissionPlan<'a> {
     reprs: &'a ReprMap,
     allocation: &'a Allocation,
@@ -203,36 +222,40 @@ struct EmissionPlan<'a> {
     /// This unit's frames; a spliced call guards its callee against the body
     /// the tree chose, and chain exits resolve per-frame logical PCs here.
     tree: &'a InlineTree,
-    load_element_entry: u64,
-    store_element_entry: u64,
-    load_property_entry: u64,
-    store_property_entry: u64,
-    load_global_entry: u64,
-    loose_eq_entry: u64,
-    call_method_entry: u64,
-    construct_entry: u64,
+    load_element_entry: ResolvedRuntimeEntry,
+    store_element_entry: ResolvedRuntimeEntry,
+    load_property_entry: ResolvedRuntimeEntry,
+    store_property_entry: ResolvedRuntimeEntry,
+    load_global_entry: ResolvedRuntimeEntry,
+    loose_eq_entry: ResolvedRuntimeEntry,
+    call_method_entry: ResolvedRuntimeEntry,
+    construct_entry: ResolvedRuntimeEntry,
     /// Rebuilds a spliced callee's interpreter frame at a deopt exit.
-    reify_frame_entry: u64,
+    reify_frame_entry: ResolvedRuntimeEntry,
     /// Dispatches a `Math.<method>` intrinsic through the window transition.
-    math_call_entry: u64,
+    math_call_entry: ResolvedRuntimeEntry,
     /// Refills the back-edge budget and reports raised interrupts.
-    poll_entry: u64,
+    poll_entry: ResolvedRuntimeEntry,
     /// Resolves a method through its IC and stages a compiled-to-compiled call.
-    prepare_direct_method_entry: u64,
+    prepare_direct_method_entry: ResolvedRuntimeEntry,
     /// Resolves a plain callee and stages a compiled-to-compiled call.
-    prepare_direct_call_entry: u64,
+    prepare_direct_call_entry: ResolvedRuntimeEntry,
     /// Completes an ineligible plain call in place.
-    call_generic_entry: u64,
+    call_generic_entry: ResolvedRuntimeEntry,
     /// Reads one captured binding into a window slot; TDZ reads throw.
-    load_upvalue_entry: u64,
+    load_upvalue_entry: ResolvedRuntimeEntry,
     /// Writes one captured binding with the generational barrier.
-    store_upvalue_entry: u64,
+    store_upvalue_entry: ResolvedRuntimeEntry,
     /// TDZ-checked captured-binding write.
-    store_upvalue_checked_entry: u64,
+    store_upvalue_checked_entry: ResolvedRuntimeEntry,
+    /// Generational barrier for the inline property-store hit path.
+    write_barrier_entry: ResolvedRuntimeEntry,
+    /// Total leaf `ToBoolean` probe used by tagged truthiness reduction.
+    to_boolean_entry: ResolvedRuntimeEntry,
+    /// Exact non-allocating IEEE-754 remainder probe.
+    number_rem_entry: ResolvedRuntimeEntry,
     /// Hook/code-object-owned compiled-to-compiled call lifecycle.
     call_trampoline: &'a CallTrampoline,
-    /// Hook-lifetime transition inventory used by allocating slow paths.
-    transitions: &'a TransitionTable,
     /// Owning function id, baked into property/global transitions so the stub
     /// resolves the name constant against this function's constant pool.
     function_id: u64,
@@ -242,6 +265,7 @@ struct OptimizedEmission {
     code: CompiledCode,
     osr_entries: BTreeMap<u32, usize>,
     code_map: Option<CodeMapCapture>,
+    relocations: RelocationCapture,
 }
 
 #[cfg(test)]
@@ -331,25 +355,87 @@ pub(super) fn compile_with_trampoline_artifacts(
             deopt_table: unit.deopt.table(),
             frame_states: &unit.frame_states,
             tree: &unit.tree,
-            load_element_entry: transitions.variadic_entry(STUB_JIT_LOAD_ELEMENT),
-            store_element_entry: transitions.variadic_entry(STUB_JIT_STORE_ELEMENT),
-            load_property_entry: transitions.variadic_entry(STUB_JIT_LOAD_PROPERTY),
-            store_property_entry: transitions.variadic_entry(STUB_JIT_STORE_PROPERTY),
-            load_global_entry: transitions.variadic_entry(STUB_JIT_LOAD_GLOBAL),
-            loose_eq_entry: transitions.variadic_entry(STUB_JIT_LOOSE_EQ),
-            call_method_entry: transitions.variadic_entry(STUB_JIT_CALL_METHOD_GENERIC),
-            construct_entry: transitions.variadic_entry(STUB_JIT_CONSTRUCT),
-            reify_frame_entry: transitions.variadic_entry(STUB_JIT_DEOPT_REIFY_FRAME),
-            math_call_entry: transitions.variadic_entry(STUB_JIT_MATH_CALL),
-            poll_entry: transitions.entry(STUB_JIT_BACKEDGE_POLL),
-            prepare_direct_method_entry: transitions.entry(STUB_JIT_PREPARE_DIRECT_METHOD_CALL),
-            prepare_direct_call_entry: transitions.entry(STUB_JIT_PREPARE_DIRECT_CALL),
-            call_generic_entry: transitions.entry(STUB_JIT_CALL_GENERIC),
-            load_upvalue_entry: transitions.variadic_entry(STUB_JIT_LOAD_UPVALUE),
-            store_upvalue_entry: transitions.variadic_entry(STUB_JIT_STORE_UPVALUE),
-            store_upvalue_checked_entry: transitions.variadic_entry(STUB_JIT_STORE_UPVALUE_CHECKED),
+            load_element_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_LOAD_ELEMENT,
+                transitions.variadic_entry(STUB_JIT_LOAD_ELEMENT),
+            ),
+            store_element_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_STORE_ELEMENT,
+                transitions.variadic_entry(STUB_JIT_STORE_ELEMENT),
+            ),
+            load_property_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_LOAD_PROPERTY,
+                transitions.variadic_entry(STUB_JIT_LOAD_PROPERTY),
+            ),
+            store_property_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_STORE_PROPERTY,
+                transitions.variadic_entry(STUB_JIT_STORE_PROPERTY),
+            ),
+            load_global_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_LOAD_GLOBAL,
+                transitions.variadic_entry(STUB_JIT_LOAD_GLOBAL),
+            ),
+            loose_eq_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_LOOSE_EQ,
+                transitions.variadic_entry(STUB_JIT_LOOSE_EQ),
+            ),
+            call_method_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_CALL_METHOD_GENERIC,
+                transitions.variadic_entry(STUB_JIT_CALL_METHOD_GENERIC),
+            ),
+            construct_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_CONSTRUCT,
+                transitions.variadic_entry(STUB_JIT_CONSTRUCT),
+            ),
+            reify_frame_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_DEOPT_REIFY_FRAME,
+                transitions.variadic_entry(STUB_JIT_DEOPT_REIFY_FRAME),
+            ),
+            math_call_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_MATH_CALL,
+                transitions.variadic_entry(STUB_JIT_MATH_CALL),
+            ),
+            poll_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_BACKEDGE_POLL,
+                transitions.entry(STUB_JIT_BACKEDGE_POLL),
+            ),
+            prepare_direct_method_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_PREPARE_DIRECT_METHOD_CALL,
+                transitions.entry(STUB_JIT_PREPARE_DIRECT_METHOD_CALL),
+            ),
+            prepare_direct_call_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_PREPARE_DIRECT_CALL,
+                transitions.entry(STUB_JIT_PREPARE_DIRECT_CALL),
+            ),
+            call_generic_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_CALL_GENERIC,
+                transitions.entry(STUB_JIT_CALL_GENERIC),
+            ),
+            load_upvalue_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_LOAD_UPVALUE,
+                transitions.variadic_entry(STUB_JIT_LOAD_UPVALUE),
+            ),
+            store_upvalue_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_STORE_UPVALUE,
+                transitions.variadic_entry(STUB_JIT_STORE_UPVALUE),
+            ),
+            store_upvalue_checked_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_STORE_UPVALUE_CHECKED,
+                transitions.variadic_entry(STUB_JIT_STORE_UPVALUE_CHECKED),
+            ),
+            write_barrier_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_WRITE_BARRIER,
+                transitions.entry(STUB_JIT_WRITE_BARRIER),
+            ),
+            to_boolean_entry: ResolvedRuntimeEntry::new(
+                otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.descriptor,
+                otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
+            ),
+            number_rem_entry: ResolvedRuntimeEntry::new(
+                otter_vm::runtime_stubs::NUMBER_REM_LEAF.descriptor,
+                otter_vm::runtime_stubs::NUMBER_REM_LEAF.entry_addr() as u64,
+            ),
             call_trampoline: call_trampoline.as_ref(),
-            transitions,
             function_id: u64::from(view.code_block.id),
         },
         artifact_request.is_some(),
@@ -379,7 +465,7 @@ pub(super) fn compile_with_trampoline_artifacts(
     let tier_input = artifact_request
         .as_ref()
         .map(|_| render_optimized_unit(&unit));
-    let artifact = artifact_request.and_then(|request| {
+    let artifact = artifact_request.map(|request| {
         build_bundle(
             request,
             view,
@@ -391,6 +477,7 @@ pub(super) fn compile_with_trampoline_artifacts(
                 .code_map
                 .take()
                 .expect("requested artifact has code map"),
+            std::mem::take(&mut emission.relocations),
             Some(unit.deopt.table()),
             &safepoint_records,
         )
@@ -1505,7 +1592,12 @@ fn is_boolean_value(ssa: &SsaFunction, value: ValueId) -> bool {
 /// through the total leaf `ToBoolean` probe, whose only miss is an isolate-less
 /// null heap (never on a live VM) and side-exits at `bail`. Clobbers
 /// `x14`/`x15` and the leaf-call argument registers.
-fn emit_truthiness_reduce(ops: &mut Assembler, bail: DynamicLabel) {
+fn emit_truthiness_reduce(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    to_boolean_entry: ResolvedRuntimeEntry,
+    bail: DynamicLabel,
+) {
     let int_case = ops.new_dynamic_label();
     let double_case = ops.new_dynamic_label();
     let truthy = ops.new_dynamic_label();
@@ -1531,11 +1623,7 @@ fn emit_truthiness_reduce(ops: &mut Assembler, bail: DynamicLabel) {
         ; mov x1, x9
         ; movz x2, #0
     );
-    emit_load_u64(
-        ops,
-        16,
-        otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
-    );
+    emit_runtime_entry(ops, relocations, 16, to_boolean_entry);
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
@@ -1677,12 +1765,15 @@ fn emit(
         load_upvalue_entry,
         store_upvalue_entry,
         store_upvalue_checked_entry,
+        write_barrier_entry,
+        to_boolean_entry,
+        number_rem_entry,
         call_trampoline,
-        transitions,
         function_id,
     } = plan;
     let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
     let mut code_map = capture_artifacts.then(CodeMapCapture::default);
+    let mut relocations = RelocationCapture::new(capture_artifacts);
     let mut next_load_ic = 0usize;
     let mut next_store_ic = 0usize;
     let mut ops = Assembler::new()
@@ -1947,6 +2038,7 @@ fn emit(
                     let done = ops.new_dynamic_label();
                     emit_dense_element_guards(
                         &mut ops,
+                        &mut relocations,
                         view,
                         reprs,
                         allocation,
@@ -1988,7 +2080,7 @@ fn emit(
                         ; movz x2, receiver as u32
                         ; movz x3, index as u32
                     );
-                    emit_load_u64(&mut ops, 16, load_element_entry);
+                    emit_runtime_entry(&mut ops, &mut relocations, 16, load_element_entry);
                     let succeeded = ops.new_dynamic_label();
                     dynasm!(ops
                         ; .arch aarch64
@@ -2039,6 +2131,7 @@ fn emit(
                     if store_fast {
                         emit_dense_element_guards(
                             &mut ops,
+                            &mut relocations,
                             view,
                             reprs,
                             allocation,
@@ -2097,7 +2190,7 @@ fn emit(
                         ; movz x2, index as u32
                         ; movz x3, value as u32
                     );
-                    emit_load_u64(&mut ops, 16, store_element_entry);
+                    emit_runtime_entry(&mut ops, &mut relocations, 16, store_element_entry);
                     let succeeded = ops.new_dynamic_label();
                     dynasm!(ops
                         ; .arch aarch64
@@ -2125,6 +2218,8 @@ fn emit(
                     let ic_site = view.instructions[instruction.pc as usize]
                         .property_ic_site(view.code_block.as_ref())
                         .unwrap_or(usize::MAX) as u64;
+                    let cell_ordinal = u32::try_from(next_load_ic)
+                        .map_err(|_| Unsupported::OperandShape("optimizing property IC ordinal"))?;
                     let cell = load_ic_cells
                         .get_mut(next_load_ic)
                         .ok_or(Unsupported::OperandShape("optimizing property IC cell"))?;
@@ -2162,7 +2257,13 @@ fn emit(
                             ; b.ne =>miss
                             ; mov w12, w9              // low-32 Gc offset
                         );
-                        emit_load_u64(&mut ops, 13, view.cage_base as u64);
+                        emit_load_symbolic_u64(
+                            &mut ops,
+                            &mut relocations,
+                            13,
+                            view.cage_base as u64,
+                            RelocationTarget::GcCageBase,
+                        );
                         dynasm!(ops
                             ; .arch aarch64
                             ; add x13, x13, x12        // x13 = GcHeader ptr
@@ -2172,7 +2273,16 @@ fn emit(
                             ; ldr w14, [x13, shape_byte]
                             ; cbz w14, =>miss          // empty-cell sentinel
                         );
-                        emit_load_u64(&mut ops, 15, cell_addr as u64);
+                        emit_load_symbolic_u64(
+                            &mut ops,
+                            &mut relocations,
+                            15,
+                            cell_addr as u64,
+                            RelocationTarget::PropertyIcCell {
+                                access: PropertyIcAccess::Load,
+                                ordinal: cell_ordinal,
+                            },
+                        );
                         let do_load = ops.new_dynamic_label();
                         for way in 0..IC_WAYS as u32 {
                             let shape_off = way * 8;
@@ -2206,6 +2316,7 @@ fn emit(
                         );
                         crate::template::arm64::values::emit_decompress_slot(
                             &mut ops,
+                            &mut relocations,
                             view.cage_base as u64,
                             boxed_entry,
                         );
@@ -2235,9 +2346,18 @@ fn emit(
                     );
                     emit_load_u64(&mut ops, 3, u64::from(name));
                     emit_load_u64(&mut ops, 4, ic_site);
-                    emit_load_u64(&mut ops, 5, cell_addr as u64);
+                    emit_load_symbolic_u64(
+                        &mut ops,
+                        &mut relocations,
+                        5,
+                        cell_addr as u64,
+                        RelocationTarget::PropertyIcCell {
+                            access: PropertyIcAccess::Load,
+                            ordinal: cell_ordinal,
+                        },
+                    );
                     emit_load_u64(&mut ops, 6, function_id);
-                    emit_load_u64(&mut ops, 16, load_property_entry);
+                    emit_runtime_entry(&mut ops, &mut relocations, 16, load_property_entry);
                     let succeeded = ops.new_dynamic_label();
                     dynasm!(ops
                         ; .arch aarch64
@@ -2263,6 +2383,8 @@ fn emit(
                     let ic_site = view.instructions[instruction.pc as usize]
                         .property_ic_site(view.code_block.as_ref())
                         .unwrap_or(usize::MAX) as u64;
+                    let cell_ordinal = u32::try_from(next_store_ic)
+                        .map_err(|_| Unsupported::OperandShape("optimizing store IC ordinal"))?;
                     let cell = store_ic_cells
                         .get_mut(next_store_ic)
                         .ok_or(Unsupported::OperandShape("optimizing store IC cell"))?;
@@ -2301,7 +2423,13 @@ fn emit(
                             ; b.ne =>miss
                             ; mov w12, w9              // low-32 Gc offset
                         );
-                        emit_load_u64(&mut ops, 13, view.cage_base as u64);
+                        emit_load_symbolic_u64(
+                            &mut ops,
+                            &mut relocations,
+                            13,
+                            view.cage_base as u64,
+                            RelocationTarget::GcCageBase,
+                        );
                         dynasm!(ops
                             ; .arch aarch64
                             ; add x13, x13, x12
@@ -2311,7 +2439,16 @@ fn emit(
                             ; ldr w14, [x13, shape_byte]
                             ; cbz w14, =>miss
                         );
-                        emit_load_u64(&mut ops, 15, cell_addr as u64);
+                        emit_load_symbolic_u64(
+                            &mut ops,
+                            &mut relocations,
+                            15,
+                            cell_addr as u64,
+                            RelocationTarget::PropertyIcCell {
+                                access: PropertyIcAccess::Store,
+                                ordinal: cell_ordinal,
+                            },
+                        );
                         let do_store = ops.new_dynamic_label();
                         for way in 0..IC_WAYS as u32 {
                             let shape_off = way * 8;
@@ -2388,11 +2525,7 @@ fn emit(
                             ; movz x1, object as u32
                             ; movz x2, value as u32
                         );
-                        emit_load_u64(
-                            &mut ops,
-                            16,
-                            transitions.entry(otter_vm::native_abi::STUB_JIT_WRITE_BARRIER),
-                        );
+                        emit_runtime_entry(&mut ops, &mut relocations, 16, write_barrier_entry);
                         dynasm!(ops
                             ; .arch aarch64
                             ; blr x16
@@ -2425,9 +2558,18 @@ fn emit(
                     emit_load_u64(&mut ops, 2, u64::from(name));
                     dynasm!(ops ; .arch aarch64 ; movz x3, value as u32);
                     emit_load_u64(&mut ops, 4, ic_site);
-                    emit_load_u64(&mut ops, 5, cell_addr as u64);
+                    emit_load_symbolic_u64(
+                        &mut ops,
+                        &mut relocations,
+                        5,
+                        cell_addr as u64,
+                        RelocationTarget::PropertyIcCell {
+                            access: PropertyIcAccess::Store,
+                            ordinal: cell_ordinal,
+                        },
+                    );
                     emit_load_u64(&mut ops, 6, function_id);
-                    emit_load_u64(&mut ops, 16, store_property_entry);
+                    emit_runtime_entry(&mut ops, &mut relocations, 16, store_property_entry);
                     let succeeded = ops.new_dynamic_label();
                     dynasm!(ops
                         ; .arch aarch64
@@ -2465,7 +2607,13 @@ fn emit(
                                     ; cbz x9, =>miss
                                     ; ldr w9, [x9, spine_offset]
                                 );
-                        emit_load_u64(&mut ops, 13, view.cage_base as u64);
+                        emit_load_symbolic_u64(
+                            &mut ops,
+                            &mut relocations,
+                            13,
+                            view.cage_base as u64,
+                            RelocationTarget::GcCageBase,
+                        );
                         dynasm!(ops
                             ; .arch aarch64
                             ; add x13, x13, x9
@@ -2490,7 +2638,7 @@ fn emit(
                         ; movz x1, dst as u32
                     );
                     emit_load_u64(&mut ops, 2, u64::from(index as u32));
-                    emit_load_u64(&mut ops, 16, load_upvalue_entry);
+                    emit_runtime_entry(&mut ops, &mut relocations, 16, load_upvalue_entry);
                     let succeeded = ops.new_dynamic_label();
                     dynasm!(ops
                         ; .arch aarch64
@@ -2524,8 +2672,9 @@ fn emit(
                         ; movz x1, src as u32
                     );
                     emit_load_u64(&mut ops, 2, u64::from(index as u32));
-                    emit_load_u64(
+                    emit_runtime_entry(
                         &mut ops,
+                        &mut relocations,
                         16,
                         if instruction.op == Op::StoreUpvalueChecked {
                             store_upvalue_checked_entry
@@ -2574,7 +2723,7 @@ fn emit(
                     );
                     emit_load_u64(&mut ops, 2, u64::from(name));
                     emit_load_u64(&mut ops, 3, function_id);
-                    emit_load_u64(&mut ops, 16, load_global_entry);
+                    emit_runtime_entry(&mut ops, &mut relocations, 16, load_global_entry);
                     let succeeded = ops.new_dynamic_label();
                     dynasm!(ops
                         ; .arch aarch64
@@ -2630,7 +2779,7 @@ fn emit(
                         ; movz x3, rhs as u32
                     );
                     emit_load_u64(&mut ops, 4, negate);
-                    emit_load_u64(&mut ops, 16, loose_eq_entry);
+                    emit_runtime_entry(&mut ops, &mut relocations, 16, loose_eq_entry);
                     let succeeded = ops.new_dynamic_label();
                     dynasm!(ops
                         ; .arch aarch64
@@ -2664,6 +2813,9 @@ fn emit(
                         .math_call_arguments
                         .get(&instruction.pc)
                         .ok_or(Unsupported::OperandShape("math-call argument arena"))?;
+                    let arguments_len = u32::try_from(arguments.len()).map_err(|_| {
+                        Unsupported::OperandShape("optimizing math-call argument length")
+                    })?;
                     let site = eligibility
                         .element_transitions
                         .sites
@@ -2691,9 +2843,19 @@ fn emit(
                     // The boxed argument-register slice is owned by the produced
                     // code object, so its interior pointer is stable for the
                     // code's whole life.
-                    emit_load_u64(&mut ops, 3, arguments.as_ptr() as u64);
+                    emit_load_symbolic_u64(
+                        &mut ops,
+                        &mut relocations,
+                        3,
+                        arguments.as_ptr() as u64,
+                        RelocationTarget::OptimizedMathArguments {
+                            inline_frame: instruction.inline.0,
+                            logical_pc: instruction.pc,
+                            len: arguments_len,
+                        },
+                    );
                     emit_load_u64(&mut ops, 4, arguments.len() as u64);
-                    emit_load_u64(&mut ops, 16, math_call_entry);
+                    emit_runtime_entry(&mut ops, &mut relocations, 16, math_call_entry);
                     let succeeded = ops.new_dynamic_label();
                     dynasm!(ops
                         ; .arch aarch64
@@ -2770,7 +2932,7 @@ fn emit(
                     emit_load_u64(&mut ops, 3, ic_site);
                     dynasm!(ops ; .arch aarch64 ; movz x4, argc);
                     emit_load_u64(&mut ops, 5, packed);
-                    emit_load_u64(&mut ops, 16, prepare_direct_method_entry);
+                    emit_runtime_entry(&mut ops, &mut relocations, 16, prepare_direct_method_entry);
                     dynasm!(ops
                         ; .arch aarch64
                         ; blr x16
@@ -2781,6 +2943,7 @@ fn emit(
                     );
                     crate::arm64::emit_prepared_call(
                         &mut ops,
+                        &mut relocations,
                         call_trampoline,
                         dst,
                         bail,
@@ -2801,7 +2964,7 @@ fn emit(
                     emit_load_u64(&mut ops, 4, ic_site);
                     dynasm!(ops ; .arch aarch64 ; movz x5, argc);
                     emit_load_u64(&mut ops, 6, packed);
-                    emit_load_u64(&mut ops, 16, call_method_entry);
+                    emit_runtime_entry(&mut ops, &mut relocations, 16, call_method_entry);
                     dynasm!(ops
                         ; .arch aarch64
                         ; blr x16
@@ -2868,7 +3031,7 @@ fn emit(
                         ; movz x3, argc
                     );
                     emit_load_u64(&mut ops, 4, packed);
-                    emit_load_u64(&mut ops, 16, construct_entry);
+                    emit_runtime_entry(&mut ops, &mut relocations, 16, construct_entry);
                     let succeeded = ops.new_dynamic_label();
                     let bail = ops.new_dynamic_label();
                     dynasm!(ops
@@ -2909,7 +3072,7 @@ fn emit(
                         .expect("eligibility checked logical-not result");
                     emit_load_boxed_value(&mut ops, reprs, allocation, instruction.inputs[0], 9)?;
                     let bail = ops.new_dynamic_label();
-                    emit_truthiness_reduce(&mut ops, bail);
+                    emit_truthiness_reduce(&mut ops, &mut relocations, to_boolean_entry, bail);
                     emit_load_u32(&mut ops, 10, VALUE_TRUE as u32);
                     dynasm!(ops
                         ; .arch aarch64
@@ -3107,11 +3270,11 @@ fn emit(
                                         ; ldr x0, [x20, THREAD_OFFSET]
                                         ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
                                     );
-                                    emit_load_u64(
+                                    emit_runtime_entry(
                                         &mut ops,
+                                        &mut relocations,
                                         16,
-                                        otter_vm::runtime_stubs::NUMBER_REM_LEAF.entry_addr()
-                                            as u64,
+                                        number_rem_entry,
                                     );
                                     let deopt = ops.new_dynamic_label();
                                     dynasm!(ops
@@ -3290,6 +3453,7 @@ fn emit(
                         )?;
                         crate::template::arm64::arith::emit_strict_eq_tagged(
                             &mut ops,
+                            &mut relocations,
                             instruction.op == Op::NotEqual,
                             deopt,
                         );
@@ -3307,6 +3471,7 @@ fn emit(
                     let target = block.normal_succs[0];
                     emit_cfg_edge(
                         &mut ops,
+                        &mut relocations,
                         allocation,
                         eligibility,
                         poll_entry,
@@ -3329,7 +3494,7 @@ fn emit(
                     // tagged value is reduced to `VALUE_TRUE`/`VALUE_FALSE` first.
                     if !is_boolean_value(ssa, instruction.inputs[0]) {
                         let bail = ops.new_dynamic_label();
-                        emit_truthiness_reduce(&mut ops, bail);
+                        emit_truthiness_reduce(&mut ops, &mut relocations, to_boolean_entry, bail);
                         deopt_exits.push((
                             bail,
                             deopt_exit_at(frame_states, instruction)?,
@@ -3346,6 +3511,7 @@ fn emit(
 
                     emit_cfg_edge(
                         &mut ops,
+                        &mut relocations,
                         allocation,
                         eligibility,
                         poll_entry,
@@ -3358,6 +3524,7 @@ fn emit(
 
                     emit_cfg_edge(
                         &mut ops,
+                        &mut relocations,
                         allocation,
                         eligibility,
                         poll_entry,
@@ -3408,7 +3575,7 @@ fn emit(
                         ; movz x2, argc
                     );
                     emit_load_u64(&mut ops, 3, packed);
-                    emit_load_u64(&mut ops, 16, prepare_direct_call_entry);
+                    emit_runtime_entry(&mut ops, &mut relocations, 16, prepare_direct_call_entry);
                     dynasm!(ops
                         ; .arch aarch64
                         ; blr x16
@@ -3419,6 +3586,7 @@ fn emit(
                     );
                     crate::arm64::emit_prepared_call(
                         &mut ops,
+                        &mut relocations,
                         call_trampoline,
                         dst,
                         bail,
@@ -3434,7 +3602,7 @@ fn emit(
                         ; movz x3, argc
                     );
                     emit_load_u64(&mut ops, 4, packed);
-                    emit_load_u64(&mut ops, 16, call_generic_entry);
+                    emit_runtime_entry(&mut ops, &mut relocations, 16, call_generic_entry);
                     dynasm!(ops
                         ; .arch aarch64
                         ; blr x16
@@ -3493,7 +3661,13 @@ fn emit(
                         ; b.ne =>deopt
                         ; mov w12, w9              // low-32 Gc offset
                     );
-                    emit_load_u64(&mut ops, 13, view.cage_base as u64);
+                    emit_load_symbolic_u64(
+                        &mut ops,
+                        &mut relocations,
+                        13,
+                        view.cage_base as u64,
+                        RelocationTarget::GcCageBase,
+                    );
                     dynasm!(ops
                         ; .arch aarch64
                         ; add x13, x13, x12        // x13 = GcHeader ptr
@@ -3578,6 +3752,7 @@ fn emit(
             let target = block.normal_succs[0];
             emit_cfg_edge(
                 &mut ops,
+                &mut relocations,
                 allocation,
                 eligibility,
                 poll_entry,
@@ -3617,6 +3792,7 @@ fn emit(
     let boxed_slow_start = ops.offset().0;
     crate::template::arm64::values::emit_boxed_slot_slow_paths(
         &mut ops,
+        &mut relocations,
         view,
         boxed_slot_slow_paths,
     );
@@ -3678,7 +3854,7 @@ fn emit(
             dynasm!(ops ; .arch aarch64 ; mov x0, x20);
             emit_load_u64(&mut ops, 1, u64::from(call_pc));
             emit_load_u64(&mut ops, 2, u64::from(callee_pc));
-            emit_load_u64(&mut ops, 16, reify_frame_entry);
+            emit_runtime_entry(&mut ops, &mut relocations, 16, reify_frame_entry);
             dynasm!(ops
                 ; .arch aarch64
                 ; blr x16
@@ -3739,6 +3915,7 @@ fn emit(
         code: CompiledCode::new(buffer, entry),
         osr_entries,
         code_map,
+        relocations,
     })
 }
 
@@ -3747,9 +3924,10 @@ fn emit(
 #[allow(clippy::too_many_arguments)]
 fn emit_cfg_edge(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     allocation: &Allocation,
     eligibility: &Eligibility,
-    poll_entry: u64,
+    poll_entry: ResolvedRuntimeEntry,
     threw: DynamicLabel,
     block_labels: &[DynamicLabel],
     predecessor: BlockId,
@@ -3761,7 +3939,7 @@ fn emit_cfg_edge(
         edge_moves(allocation, predecessor, target)?,
     )?;
     if eligibility.back_edges.contains_key(&(predecessor, target)) {
-        emit_backedge_poll(ops, poll_entry, threw);
+        emit_backedge_poll(ops, relocations, poll_entry, threw);
     }
     let target_label = block_labels[target.0 as usize];
     dynasm!(ops ; .arch aarch64 ; b =>target_label);
@@ -3783,7 +3961,12 @@ fn emit_cfg_edge(
 /// calls the leaf poll stub, which refills the budget and returns to the
 /// compiled loop, or raises (interrupt, timeout) through the throw epilogue.
 /// Deoptimizing here would abandon the compiled loop once per budget window.
-fn emit_backedge_poll(ops: &mut Assembler, poll_entry: u64, threw: DynamicLabel) {
+fn emit_backedge_poll(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    poll_entry: ResolvedRuntimeEntry,
+    threw: DynamicLabel,
+) {
     let slow = ops.new_dynamic_label();
     let cont = ops.new_dynamic_label();
     dynasm!(ops
@@ -3800,7 +3983,7 @@ fn emit_backedge_poll(ops: &mut Assembler, poll_entry: u64, threw: DynamicLabel)
         ; =>slow
         ; mov x0, x20
     );
-    emit_load_u64(ops, 16, poll_entry);
+    emit_runtime_entry(ops, relocations, 16, poll_entry);
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
@@ -4809,6 +4992,7 @@ fn emit_store_tagged_location(
 #[allow(clippy::too_many_arguments)]
 fn emit_dense_element_guards(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     reprs: &ReprMap,
     allocation: &Allocation,
@@ -4827,7 +5011,13 @@ fn emit_dense_element_guards(
         ; b.ne =>miss
         ; mov w12, w9              // low-32 Gc offset
     );
-    emit_load_u64(ops, 13, view.cage_base as u64);
+    emit_load_symbolic_u64(
+        ops,
+        relocations,
+        13,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
     dynasm!(ops
         ; .arch aarch64
         ; add x13, x13, x12        // x13 = GcHeader ptr
@@ -4925,6 +5115,33 @@ fn emit_load_u64(ops: &mut Assembler, register: u8, value: u64) {
             ; movk X(register), ((value >> 48) & 0xffff) as u32, lsl #48
         );
     }
+}
+
+fn emit_load_symbolic_u64(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    register: u8,
+    value: u64,
+    target: RelocationTarget,
+) {
+    let start = ops.offset().0;
+    emit_load_u64(ops, register, value);
+    relocations.record_mov_wide(start, ops.offset().0, register, target);
+}
+
+fn emit_runtime_entry(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    register: u8,
+    entry: ResolvedRuntimeEntry,
+) {
+    emit_load_symbolic_u64(
+        ops,
+        relocations,
+        register,
+        entry.address,
+        RelocationTarget::runtime_stub(entry.descriptor),
+    );
 }
 
 fn emit_prologue(ops: &mut Assembler, spill_frame_bytes: u32) {

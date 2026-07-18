@@ -569,12 +569,21 @@ impl TemplatePlan {
 
     /// Resolve a call's packed-argument word for emission: a spilled list
     /// (`argc > MAX_METHOD_ARGS`) becomes the baked address of its table in
-    /// the frozen decoded-operand buffer; an inline pack passes through.
-    pub(crate) fn resolve_packed_args(&self, argc: u16, packed_args: u64) -> u64 {
+    /// the frozen decoded-operand buffer and returns its stable logical range
+    /// for relocation metadata; an inline pack passes through without a range.
+    pub(crate) fn resolve_packed_args(
+        &self,
+        argc: u16,
+        packed_args: u64,
+    ) -> (u64, Option<TemplateTail>) {
         if usize::from(argc) > MAX_METHOD_ARGS {
-            self.register_operands[packed_args as usize..].as_ptr() as u64
+            let tail = TemplateTail {
+                start: packed_args as usize,
+                len: usize::from(argc),
+            };
+            (self.register_tail(tail).as_ptr() as u64, Some(tail))
         } else {
-            packed_args
+            (packed_args, None)
         }
     }
 

@@ -13,6 +13,9 @@
 //!   bits and can neither allocate nor re-enter JS.
 //! - The allocating entry runs over the frozen call packet with the
 //!   snapshot-assigned safepoint; operands re-load from the rooted frame.
+//! - Prototype offsets/shapes, builtin identities, cage bases, and stub entries
+//!   are captured with the source byte-PC and feedback class when diagnostics
+//!   are enabled.
 //!
 //! # See also
 //! - `otter_vm::runtime_stubs` — the compile-time-resolved typed entries.
@@ -23,7 +26,13 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dyna
 use otter_vm::runtime_stubs::{alloc_value_stub_by_id, leaf_no_alloc_stub2_by_id};
 use otter_vm::{JitCollectionAllocMethod, JitCollectionLeafMethod, JitCompileSnapshot};
 
-use super::values::{emit_decompress_slot, emit_load_reg, emit_load_u64, emit_store_reg};
+use super::values::{
+    emit_decompress_slot, emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64,
+    emit_load_u64, emit_store_reg,
+};
+use crate::artifact::relocation::{
+    CollectionFeedbackKind, CollectionHeapComponent, RelocationCapture, RelocationTarget,
+};
 use crate::entry::{
     ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
     ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG,
@@ -45,11 +54,15 @@ pub(super) struct MethodSite {
 #[allow(clippy::too_many_arguments)]
 fn emit_receiver_guards(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     receiver: u16,
     receiver_type_tag: u32,
     proto_offset: u32,
     proto_shape: u32,
+    feedback_kind: CollectionFeedbackKind,
+    byte_pc: u32,
+    runtime_stub_id: u32,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let guard_flags_byte = view.collection_layout.guard_flags_byte;
@@ -64,7 +77,13 @@ fn emit_receiver_guards(
         ; b.ne =>miss
         ; mov w12, w9
     );
-    emit_load_u64(ops, 13, view.cage_base as u64);
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        13,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
     dynasm!(ops
         ; .arch aarch64
         ; add x13, x13, x12
@@ -74,8 +93,25 @@ fn emit_receiver_guards(
         ; ldr w14, [x13, guard_flags_byte]
         ; cbnz w14, =>miss
     );
-    emit_load_u64(ops, 15, view.cage_base as u64);
-    emit_load_u64(ops, 12, u64::from(proto_offset));
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        15,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        12,
+        u64::from(proto_offset),
+        RelocationTarget::CollectionHeapReference {
+            component: CollectionHeapComponent::Prototype,
+            feedback_kind,
+            byte_pc,
+            runtime_stub_id,
+        },
+    );
     dynasm!(ops
         ; .arch aarch64
         ; add x15, x15, x12
@@ -84,7 +120,18 @@ fn emit_receiver_guards(
         ; b.ne =>miss
         ; ldr w14, [x15, object_shape_byte]
     );
-    emit_load_u64(ops, 12, u64::from(proto_shape));
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        12,
+        u64::from(proto_shape),
+        RelocationTarget::CollectionHeapReference {
+            component: CollectionHeapComponent::PrototypeShape,
+            feedback_kind,
+            byte_pc,
+            runtime_stub_id,
+        },
+    );
     dynasm!(ops
         ; .arch aarch64
         ; cmp w14, w12
@@ -99,10 +146,14 @@ fn emit_receiver_guards(
 /// the prototype slab pointer in `x15`; leaves nothing live.
 fn emit_builtin_identity_guard(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     method_value_byte: u32,
     builtin_fn_addr: usize,
     decompress_via_slot: bool,
+    feedback_kind: CollectionFeedbackKind,
+    byte_pc: u32,
+    runtime_stub_id: u32,
     miss: DynamicLabel,
 ) {
     let native_function_type_tag = u32::from(view.collection_layout.native_function_type_tag);
@@ -112,7 +163,7 @@ fn emit_builtin_identity_guard(
             ; .arch aarch64
             ; ldr w17, [x15, method_value_byte]
         );
-        emit_decompress_slot(ops, view.cage_base as u64, miss);
+        emit_decompress_slot(ops, relocations, view.cage_base as u64, miss);
         dynasm!(ops
             ; .arch aarch64
             ; mov x9, x17
@@ -135,7 +186,13 @@ fn emit_builtin_identity_guard(
             ; mov w12, w9
         );
     }
-    emit_load_u64(ops, 13, view.cage_base as u64);
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        13,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
     dynasm!(ops
         ; .arch aarch64
         ; add x13, x13, x12
@@ -144,7 +201,17 @@ fn emit_builtin_identity_guard(
         ; b.ne =>miss
         ; ldr x14, [x13, native_static_fn_byte]
     );
-    emit_load_u64(ops, 15, builtin_fn_addr as u64);
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        15,
+        builtin_fn_addr as u64,
+        RelocationTarget::CollectionBuiltinFunction {
+            feedback_kind,
+            byte_pc,
+            runtime_stub_id,
+        },
+    );
     dynasm!(ops
         ; .arch aarch64
         ; cmp x14, x15
@@ -157,8 +224,10 @@ fn emit_builtin_identity_guard(
 /// `false` when the site cannot take the fast path at all.
 pub(super) fn emit_leaf_method_guarded_call(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     leaf: &JitCollectionLeafMethod,
+    byte_pc: u32,
     site: &MethodSite,
     miss: DynamicLabel,
     done: DynamicLabel,
@@ -172,19 +241,27 @@ pub(super) fn emit_leaf_method_guarded_call(
     debug_assert!(stub.is_valid());
     emit_receiver_guards(
         ops,
+        relocations,
         view,
         site.receiver,
         u32::from(leaf.receiver_type_tag),
         leaf.proto_offset,
         leaf.proto_shape,
+        CollectionFeedbackKind::Leaf,
+        byte_pc,
+        leaf.leaf_stub_id,
         miss,
     )?;
     emit_builtin_identity_guard(
         ops,
+        relocations,
         view,
         leaf.method_value_byte,
         leaf.builtin_fn_addr,
         true,
+        CollectionFeedbackKind::Leaf,
+        byte_pc,
+        leaf.leaf_stub_id,
         miss,
     );
     // Leaf machine call: `(heap, receiver bits, key bits) -> pair`.
@@ -199,7 +276,13 @@ pub(super) fn emit_leaf_method_guarded_call(
     } else {
         emit_load_u64(ops, 2, VALUE_UNDEFINED);
     }
-    emit_load_u64(ops, 16, stub.entry_addr() as u64);
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        16,
+        stub.entry_addr() as u64,
+        stub.descriptor,
+    );
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
@@ -217,8 +300,10 @@ pub(super) fn emit_leaf_method_guarded_call(
 /// when the site cannot take the fast path at all.
 pub(super) fn emit_alloc_method_guarded_call(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     alloc: &JitCollectionAllocMethod,
+    byte_pc: u32,
     site: &MethodSite,
     miss: DynamicLabel,
     done: DynamicLabel,
@@ -226,26 +311,35 @@ pub(super) fn emit_alloc_method_guarded_call(
     if view.cage_base == 0 || alloc.value_arg_count != 3 {
         return Ok(false);
     }
-    let Some(stub_addr) =
-        alloc_value_stub_by_id(alloc.alloc_stub_id).and_then(|stub| stub.entry_addr())
-    else {
+    let Some(stub) = alloc_value_stub_by_id(alloc.alloc_stub_id) else {
+        return Ok(false);
+    };
+    let Some(stub_addr) = stub.entry_addr() else {
         return Ok(false);
     };
     emit_receiver_guards(
         ops,
+        relocations,
         view,
         site.receiver,
         u32::from(alloc.receiver_type_tag),
         alloc.proto_offset,
         alloc.proto_shape,
+        CollectionFeedbackKind::Alloc,
+        byte_pc,
+        alloc.alloc_stub_id,
         miss,
     )?;
     emit_builtin_identity_guard(
         ops,
+        relocations,
         view,
         alloc.method_value_byte,
         alloc.builtin_fn_addr,
         false,
+        CollectionFeedbackKind::Alloc,
+        byte_pc,
+        alloc.alloc_stub_id,
         miss,
     );
     let arg1 = if site.argc <= 1
@@ -278,7 +372,7 @@ pub(super) fn emit_alloc_method_guarded_call(
     } else {
         emit_load_u64(ops, 4, VALUE_UNDEFINED);
     }
-    emit_load_u64(ops, 16, stub_addr as u64);
+    emit_load_runtime_stub(ops, relocations, 16, stub_addr as u64, stub.descriptor);
     dynasm!(ops
         ; .arch aarch64
         ; blr x16

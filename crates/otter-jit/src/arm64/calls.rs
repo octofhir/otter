@@ -16,6 +16,8 @@
 //!   before compiled entry and removed exactly once on every completed entry.
 //! - Runtime-stub addresses come from [`TransitionTable`]; the callee machine
 //!   entry comes only from an acquired registry-owned `CodeEntryCell`.
+//! - A call site's owned trampoline address is recorded as one typed
+//!   relocation without changing its `movz`/`movk` sequence.
 //!
 //! # See also
 //! - [`crate::entry`] — the shared context, frame, and transition ABI.
@@ -24,6 +26,7 @@
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::native_abi as abi;
 
+use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::entry::{
     ACTIVATION_BASE_OFFSET, ACTIVATION_LIMIT_OFFSET, ACTIVATION_TOP_PTR_OFFSET,
     CODE_ENTRY_ACTIVE_COUNT_OFFSET, CODE_ENTRY_CODE_OBJECT_ID_OFFSET, CODE_ENTRY_FLAGS_OFFSET,
@@ -122,18 +125,39 @@ fn emit_load_u64(ops: &mut Assembler, t: u8, v: u64) {
     }
 }
 
+/// Materialize one symbolic process-local address while preserving the
+/// variable-width call-site sequence used without artifact capture.
+fn emit_load_symbol_u64(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    t: u8,
+    value: u64,
+    target: RelocationTarget,
+) {
+    let start = ops.offset().0;
+    emit_load_u64(ops, t, value);
+    relocations.record_mov_wide(start, ops.offset().0, t, target);
+}
+
 /// Emit the small call-site bridge after a prepare transition returned status
 /// `0`. The call site's owner must retain the same [`CallTrampoline`] for the
 /// complete lifetime of this baked address.
 pub(crate) fn emit_prepared_call(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     trampoline: &CallTrampoline,
     dst: u16,
     bail: DynamicLabel,
     threw: DynamicLabel,
     done: DynamicLabel,
 ) {
-    emit_load_u64(ops, 16, trampoline.entry_addr());
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        16,
+        trampoline.entry_addr(),
+        RelocationTarget::CallTrampoline,
+    );
     dynasm!(ops
         ; .arch aarch64
         ; mov x0, x20

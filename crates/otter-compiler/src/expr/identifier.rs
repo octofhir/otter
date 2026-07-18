@@ -3,6 +3,10 @@
 //! # Contents
 //! - [`compile_identifier`] — lowers ordinary identifier reads after inline fast paths.
 //!
+//! # Invariants
+//! - Initialized register-backed bindings are already values and need no
+//!   `LoadLocal`; upvalues and dynamic environments still emit real loads.
+//!
 //! # See also
 //! - [`super`] — expression dispatch and shared helpers.
 
@@ -180,9 +184,15 @@ pub(crate) fn compile_identifier_without_with(
         return Ok(dst);
     }
     if let Some(info) = cx.lookup_binding(name) {
-        let dst = cx.alloc_scratch();
         if info.initialized {
-            cx.emit_load_storage(dst, info.storage, span);
+            match info.storage {
+                BindingStorage::Register { reg } => return Ok(reg),
+                BindingStorage::Upvalue { .. } => {
+                    let dst = cx.alloc_scratch();
+                    cx.emit_load_storage(dst, info.storage, span);
+                    return Ok(dst);
+                }
+            }
         } else {
             // Reading a `let` / `const` binding before its
             // initializer ran — runtime raises
@@ -193,6 +203,7 @@ pub(crate) fn compile_identifier_without_with(
             };
             cx.emit(Op::TdzError, [Operand::Imm32(diag_idx as i32)], span);
         }
+        let dst = cx.alloc_scratch();
         return Ok(dst);
     }
     // Walk the parent chain for a closure capture.

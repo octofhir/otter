@@ -249,6 +249,13 @@ mod tests {
                 .any(|instruction| instruction.op == Op::StoreLocal),
             "uncaptured simple formals should need no prologue copies"
         );
+        assert!(
+            !function
+                .code
+                .iter()
+                .any(|instruction| instruction.op == Op::LoadLocal),
+            "register-backed identifier reads should use their binding slots directly"
+        );
     }
 
     #[test]

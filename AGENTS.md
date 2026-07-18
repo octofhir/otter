@@ -490,6 +490,14 @@ Practical rules when adding/altering APIs:
 - External suite runners and the baseline capture protocol are documented in
   `benchmarks/README.md`. Raw local results belong under the ignored
   `benchmarks/results/` directory.
+- Clean engine baseline capture:
+  `cargo run --locked --release -p otter-benchmark --features engine --bin otter-engine-baseline -- capture`
+  - The fixed matrix runs serially and keeps its outer watchdog in the
+    unversioned capture manifest; successful engine records retain
+    `sampling.timeoutMs: null`.
+  - Publish only with the same binary's `publish --capture <ignored-dir>`
+    command. It revalidates every record and creates the one current
+    `benchmarks/baseline/` directory only after measurement is complete.
 - Files under `benchmarks/archive/` are historical evidence only. Their old
   binary names, commands, tier labels, and data formats are unsupported and
   must not be presented as the current baseline.

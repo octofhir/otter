@@ -27,10 +27,9 @@ Failed, timed-out, unavailable, and unvalidated observations remain explicit
 and non-scoreable. `timeoutMs` stays null unless that exact timeout was enforced
 by the process producing the record.
 
-There is intentionally no checked-in current performance baseline during the
-benchmark hard cut. Publish a new baseline only from a clean commit after the
-engine validation matrix passes. The former Phase 0 evidence and dashboard are
-historical artifacts, not inputs to the next baseline.
+The former Phase 0 evidence and dashboard are historical artifacts, not inputs
+to the current baseline. A current baseline is published only through the
+clean-commit capture workflow below.
 
 ## Engine benchmark binary
 
@@ -157,11 +156,50 @@ keep the recorder alive past the declared wall cap.
 
 ## Capturing a baseline
 
-Use a release build, run workloads serially on an otherwise idle host, and
-record the exact command, full commit, worktree state, platform, toolchain,
-profile, tier, sample count, warmup count, statistic, metric unit/direction,
-timeout, and validation result. Compare identical workload identities and
-measurement settings only.
+The baseline driver owns one fixed, ordered 18-case engine matrix: bytecode
+calls at arity 0 and 4 across all tiers, the extracted host call across all
+tiers, exact-artifact template compilation, forced-full-GC allocation churn,
+fresh and reused module runtimes across all tiers, and isolated package-import
+resolution. It runs serially and does not install packages, enable Web/Node
+surfaces, or start a profiler.
+
+Capture from a clean commit with the release driver:
+
+```bash
+cargo run --locked --release -p otter-benchmark --features engine \
+  --bin otter-engine-baseline -- capture
+```
+
+`capture` builds the release engine binary with `--locked`, rechecks the same
+clean HEAD, and writes raw stdout/stderr, exact benchmark records, an
+unversioned manifest, and a derived summary below the ignored
+`benchmarks/results/` directory. Every child therefore continues to report
+`dirty: false`. The default 120-second outer watchdog exists only in
+`capture.json`; child records keep `sampling.timeoutMs: null` because the
+engine process itself did not enforce that timeout. An outer timeout preserves
+raw evidence and prevents publication; it never fabricates a benchmark
+record.
+
+The driver rejects `OTTER_JIT*`, `OTTER_GC*`, and `RUST_LOG` overrides so the
+recorded configuration remains the complete performance policy. A capture is
+publishable only when all 18 exact commands returned zero, every result passes
+the live contract, every result is clean/release/baseline-eligible, and commit,
+platform, toolchain, argv, configuration, and sampling protocol remain
+identical to the fixed matrix.
+
+Publish the successful ignored capture explicitly:
+
+```bash
+cargo run --locked --release -p otter-benchmark --features engine \
+  --bin otter-engine-baseline -- publish \
+  --capture benchmarks/results/engine-<commit>-<timestamp>
+```
+
+`publish` revalidates every byte and regenerates the summary before atomically
+creating the one current `benchmarks/baseline/` directory. It refuses an
+existing output directory, incomplete capture, changed/dirty HEAD, edited
+summary, non-scoreable row, legacy tier, or mismatched provenance. There is no
+format generation, compatibility reader, or fallback to archived data.
 
 Raw logs and local captures belong under `benchmarks/results/`, which is
 ignored by git. A curated baseline must retain non-scoreable observations

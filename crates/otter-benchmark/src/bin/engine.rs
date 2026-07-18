@@ -114,7 +114,7 @@ enum Command {
         source: PathBuf,
         #[arg(long)]
         function: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         expected: f64,
         #[arg(long, value_enum)]
         jit_tier: EngineJitTier,
@@ -131,7 +131,7 @@ enum Command {
         source: PathBuf,
         #[arg(long)]
         function: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         expected: f64,
         #[arg(long, default_value_t = 100)]
         samples: u32,
@@ -1663,7 +1663,7 @@ mod tests {
             "--function",
             "engineKernel",
             "--expected",
-            "42",
+            "-42",
             "--jit-tier",
             "production-tiered",
             "--jit-osr-threshold",
@@ -1681,11 +1681,30 @@ mod tests {
             } => {
                 assert_eq!(source, PathBuf::from("kernel.js"));
                 assert_eq!(function, "engineKernel");
-                assert_eq!(expected, 42.0);
+                assert_eq!(expected, -42.0);
                 assert_eq!(jit_tier, EngineJitTier::ProductionTiered);
                 assert_eq!(jit_osr_threshold, Some(7));
             }
             _ => panic!("expected kernel command"),
+        }
+    }
+
+    #[test]
+    fn clap_accepts_negative_jit_compile_checksum() {
+        let args = Args::try_parse_from([
+            "otter-engine-benchmark",
+            "jit-compile",
+            "--source",
+            "kernel.js",
+            "--function",
+            "engineKernel",
+            "--expected",
+            "-42",
+        ])
+        .expect("negative compile checksum");
+        match args.command {
+            Command::JitCompile { expected, .. } => assert_eq!(expected, -42.0),
+            _ => panic!("expected JIT compile command"),
         }
     }
 

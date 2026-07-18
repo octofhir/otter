@@ -7,6 +7,8 @@
 //!   method-call site.
 //! - A monomorphic production-tier method site whose guarded splice removes
 //!   the compiled-call boundary entirely.
+//! - A prototype-held method whose inline body reads an own receiver property.
+//! - An inline method whose hoisted local observes function-entry `undefined`.
 //! - Guarded numeric method splicing plus replay through the ordinary method
 //!   bridge after receiver, callee, bound-state, or operand guards miss.
 //! - Direct callees that allocate their own captured cells while retaining the
@@ -24,6 +26,8 @@
 //!   while preserving the same result as the interpreter.
 //! - A template-spliced method body runs only for the exact baked receiver and
 //!   method identity; every rejected guard preserves full method-call semantics.
+//! - Scratch-register trimming preserves the entry `undefined` state of every
+//!   local that the accepted inline body can read before writing.
 //! - Upvalue-spine construction roots inherited cells and dynamic call state
 //!   until the new frame is published.
 //! - Capture-free function construction uses the published SELF/register
@@ -336,6 +340,79 @@ JSON.stringify([
 "#,
         "jit-inline-method-hit",
         "[13,24]",
+        true,
+    );
+}
+
+const PROTOTYPE_INLINE_METHOD_SETUP: &str = r#"
+globalThis.__jitPrototypeInlineMethodFixture = (() => {
+  function apply(value) {
+    return value + this.bias;
+  }
+  function callMethod(receiver, value) {
+    return receiver.apply(value);
+  }
+
+  const prototype = { apply };
+  const receiver = Object.create(prototype);
+  receiver.bias = 4;
+  for (let i = 0; i < 5000; i++) {
+    callMethod(receiver, i);
+  }
+  return { callMethod, receiver };
+})();
+"#;
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn prototype_method_inline_reuses_guarded_receiver_property() {
+    assert_inline_method_probe(
+        PROTOTYPE_INLINE_METHOD_SETUP,
+        r#"
+const fixture = globalThis.__jitPrototypeInlineMethodFixture;
+JSON.stringify([
+  fixture.callMethod(fixture.receiver, 9),
+  fixture.callMethod(fixture.receiver, 20)
+]);
+"#,
+        "jit-inline-prototype-method-hit",
+        "[13,24]",
+        true,
+    );
+}
+
+const UNINITIALIZED_LOCAL_INLINE_METHOD_SETUP: &str = r#"
+globalThis.__jitUninitializedLocalInlineMethodFixture = (() => {
+  function apply() {
+    var missing;
+    return missing;
+  }
+  function callMethod(receiver) {
+    return receiver.apply();
+  }
+
+  const receiver = { apply };
+  for (let i = 0; i < 5000; i++) {
+    callMethod(receiver);
+  }
+  return { callMethod, receiver };
+})();
+"#;
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn method_inline_initializes_only_read_before_write_locals() {
+    assert_inline_method_probe(
+        UNINITIALIZED_LOCAL_INLINE_METHOD_SETUP,
+        r#"
+const fixture = globalThis.__jitUninitializedLocalInlineMethodFixture;
+JSON.stringify([
+  fixture.callMethod(fixture.receiver),
+  fixture.callMethod(fixture.receiver)
+]);
+"#,
+        "jit-inline-uninitialized-local-hit",
+        "[null,null]",
         true,
     );
 }

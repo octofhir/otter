@@ -230,6 +230,32 @@ impl Interpreter {
         })
     }
 
+    /// Pair a freshly decoded method callable with an epoch-validated
+    /// optimizing cache plan without cloning its code owner.
+    pub(super) fn resolve_cached_optimizing_jit_call_target<'a>(
+        &mut self,
+        context: &'a ExecutionContext,
+        callable: Value,
+        effective_this: Value,
+        expected_fid: u32,
+        plan: jit::JitDirectCallPlan,
+    ) -> Option<frame::ResolvedCallTarget<'a>> {
+        let decoded =
+            self.decode_jit_call_target(context, callable, effective_this, Some(expected_fid))?;
+        debug_assert_eq!(plan.function_id, expected_fid);
+        debug_assert_eq!(plan.param_count, decoded.function.param_count);
+        debug_assert_eq!(plan.register_count, decoded.function.register_count);
+        Some(frame::ResolvedCallTarget {
+            function: decoded.function,
+            parent_upvalues: decoded.parent_upvalues,
+            self_value: decoded.self_value,
+            this_value: decoded.this_value,
+            plan,
+            tier: native_abi::NativeFrameKind::Optimizing,
+            code: None,
+        })
+    }
+
     /// Resolve an already installed optimizing body without sampling tier
     /// policy or touching baseline state. Once promoted, direct edges stay on
     /// this constant-time path.

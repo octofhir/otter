@@ -5,6 +5,8 @@
 //!   compiled plain-call site.
 //! - Polymorphic receiver shapes and method identities through one compiled
 //!   method-call site.
+//! - A monomorphic optimizing method-cache hit that reuses its cache-owned code
+//!   generation without per-invocation refcount traffic.
 //! - Direct callees that allocate their own captured cells while retaining the
 //!   current receiver across moving-GC safepoints.
 //! - Frameless direct callees that mint distinct capture-free function values.
@@ -16,6 +18,8 @@
 //!   SELF and upvalues are selected from the current callee on every call.
 //! - Method dispatch selects both the current function and current receiver;
 //!   neither method identity nor `this` leaks between polymorphic calls.
+//! - An epoch-validated optimizing method cache still reloads and decodes the
+//!   current method value before entering its ownerless prepared-call path.
 //! - Upvalue-spine construction roots inherited cells and dynamic call state
 //!   until the new frame is published.
 //! - Capture-free function construction uses the published SELF/register
@@ -37,6 +41,7 @@ struct RunResult {
     osr_attempts: u64,
     reentrant_transitions: u64,
     direct_calls: u64,
+    optimized_entries: u64,
 }
 
 fn run(source: &str, name: &str, selection: JitSelection) -> RunResult {
@@ -57,6 +62,7 @@ fn run(source: &str, name: &str, selection: JitSelection) -> RunResult {
         osr_attempts: stats.jit_osr_attempts,
         reentrant_transitions: stats.jit_reentrant_stub_transitions,
         direct_calls: stats.jit_direct_calls,
+        optimized_entries: stats.jit_optimized_entries,
     }
 }
 
@@ -184,6 +190,49 @@ fn polymorphic_method_site_keeps_current_method_and_this() {
         "[100,7,498,797,104,35,494,793,108,63,490,789]"
     );
     assert_whole_function_direct_calls(&compiled);
+}
+
+const OPTIMIZING_METHOD_CACHE: &str = r#"
+function apply(value) {
+  return value + this.bias;
+}
+function callMethod(receiver, value) {
+  return receiver.apply(value);
+}
+
+const receiver = { bias: 4, apply };
+for (let i = 0; i < 5000; i++) {
+  callMethod(receiver, i);
+}
+
+let checksum = 0;
+for (let i = 0; i < 256; i++) {
+  checksum += callMethod(receiver, i);
+}
+JSON.stringify([checksum, callMethod(receiver, 9)]);
+"#;
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn optimizing_method_cache_reloads_value_without_cloning_code_owner() {
+    let oracle = run(
+        OPTIMIZING_METHOD_CACHE,
+        "jit-call-optimizing-method-cache.js",
+        JitSelection::InterpreterOnly,
+    );
+    let compiled = run(
+        OPTIMIZING_METHOD_CACHE,
+        "jit-call-optimizing-method-cache.js",
+        JitSelection::ProductionTiered,
+    );
+
+    assert_eq!(compiled.completion, oracle.completion);
+    assert_eq!(compiled.completion, "[33664,13]");
+    assert_whole_function_direct_calls(&compiled);
+    assert!(
+        compiled.optimized_entries > 0,
+        "fixture must enter an optimizing method body"
+    );
 }
 
 const UPVALUE_FRAME_BUILD: &str = r#"

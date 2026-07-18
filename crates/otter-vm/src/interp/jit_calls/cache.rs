@@ -7,8 +7,8 @@
 //!
 //! # Invariants
 //! - Cache records contain only immortal shape/slot metadata, a function id,
-//!   scalar entry plan, invalidation epoch, and the exact owning code `Arc`.
-//!   They never retain a raw or movable callable/closure value.
+//!   scalar entry plan/tier, invalidation epoch, and the exact owning code
+//!   `Arc`. They never retain a raw or movable callable/closure value.
 //! - Every hit reloads the method slot and decodes that fresh callable, so
 //!   closure upvalues and effective `this` belong to the current invocation.
 //! - A cached plan is used only at its installation epoch and travels with the
@@ -33,6 +33,8 @@ pub(crate) struct JitDirectMethodCache {
     code: Arc<dyn jit::JitFunctionCode>,
     /// Entry and frame-layout metadata frozen at installation.
     plan: jit::JitDirectCallPlan,
+    /// Native tier copied from `code`; optimizing hits need no per-call clone.
+    tier: native_abi::NativeFrameKind,
     /// Registry invalidation epoch at installation.
     plan_epoch: u64,
 }
@@ -102,13 +104,29 @@ impl Interpreter {
                 method,
                 cache.function_id,
                 cache.plan,
-                cache.code.clone(),
+                cache.tier,
+                (cache.tier != native_abi::NativeFrameKind::Optimizing).then(|| cache.code.clone()),
             ));
             break;
         }
-        let Some((way, shape_id, method, function_id, plan, code)) = resolved else {
+        let Some((way, shape_id, method, function_id, plan, tier, code)) = resolved else {
             return Ok(None);
         };
+        if tier == native_abi::NativeFrameKind::Optimizing {
+            let Some(target) = self.resolve_cached_optimizing_jit_call_target(
+                context,
+                method,
+                recv,
+                function_id,
+                plan,
+            ) else {
+                return Ok(None);
+            };
+            return self
+                .prepare_jit_resolved_call(target, arg_regs, caller_regs)
+                .map(Some);
+        }
+        let code = code.expect("baseline method-cache hits retain their code owner");
         let Some(target) = self.resolve_cached_jit_call_target(
             context,
             method,
@@ -135,6 +153,7 @@ impl Interpreter {
             {
                 cache.code = promoted_code;
                 cache.plan = target.plan;
+                cache.tier = target.tier;
             }
         }
         self.prepare_jit_resolved_call(target, arg_regs, caller_regs)
@@ -204,6 +223,7 @@ impl Interpreter {
                 let entry = JitDirectMethodCache {
                     hit,
                     function_id,
+                    tier: code.native_frame_kind(),
                     code,
                     plan,
                     plan_epoch: self.jit_code_registry.invalidation_epoch(),

@@ -7,6 +7,8 @@
 //!
 //! # Invariants
 //! - Pre-passes collect names without emitting unrelated runtime effects.
+//! - Register-backed `var` bindings inherit the VM register-window
+//!   initialization to `undefined`; captured cells are initialized explicitly.
 //!
 //! # See also
 //! - `entry` and `statements`
@@ -173,11 +175,13 @@ pub(crate) fn collect_pattern_var_names(
 
 /// Pre-declare each hoisted `var` name on the current scope per
 /// §10.2.11 FunctionDeclarationInstantiation step 28: bind to
-/// `undefined` with `[[Mutable]]`, no TDZ. Names that already live
-/// in the current scope (formal parameters, `let`/`const` shadowing,
-/// the function's self-name) are skipped — this matches §10.2.11
-/// step 27 ("If the same name is bound by both a parameter and a
-/// VarDeclaration, the parameter binding wins").
+/// `undefined` with `[[Mutable]]`, no TDZ. Register-backed bindings need no
+/// bytecode store because every fresh VM register window is already filled
+/// with `undefined`; upvalue cells still need an explicit initialization.
+/// Names that already live in the current scope (formal parameters,
+/// `let`/`const` shadowing, the function's self-name) are skipped — this
+/// matches §10.2.11 step 27 ("If the same name is bound by both a parameter
+/// and a VarDeclaration, the parameter binding wins").
 pub(crate) fn pre_declare_var_bindings(
     cx: &mut Compiler,
     names: &[String],
@@ -194,9 +198,11 @@ pub(crate) fn pre_declare_var_bindings(
             continue;
         }
         let storage = cx.declare_binding(name, false, span)?;
-        let dst = cx.alloc_scratch();
-        cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
-        cx.emit_store_storage(dst, storage, span);
+        if matches!(storage, BindingStorage::Upvalue { .. }) {
+            let dst = cx.alloc_scratch();
+            cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
+            cx.emit_store_storage(dst, storage, span);
+        }
         cx.mark_initialized(name);
     }
     Ok(())

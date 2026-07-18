@@ -467,16 +467,32 @@ Practical rules when adding/altering APIs:
 - VM tests: `cargo test -p otter-vm`
 - Runtime tests: `cargo test -p otter-runtime`
 - Test262 conformance: `cargo test -p otter-test262`
-- Phase-by-phase cross-runtime baseline (Otter/Node/Deno/other runtimes): `benchmarks/cpu/phase_baseline.sh`
-  - Runs Otter in release mode (`target/release/otter`) and enforces `OTTER_TIMEOUT_SECONDS <= 45` for comparability.
-  - Otter perf classification in artifacts:
-    - `critical-timeout` = phase hit timeout cap (`45s`)
-    - `bad-slow` = phase completed but `phase_ms > 25000`
-    - `ok` = phase completed within `<= 25000ms`
-  - Writes regression artifacts to `benchmarks/results/`:
-    - `PHASE_REGRESSION_DASHBOARD.md`
-    - `phase-baseline-<timestamp>.json`
-    - `phase-baseline-<timestamp>.tsv`
+- Focused engine harness:
+  `cargo run --release -p otter-benchmark --features engine --bin otter-engine-benchmark -- <subcommand>`
+  - Current subcommands are `call`, `jit-compile`, `memory`, and `module`.
+  - `call` and `module` require `--jit-tier=interpreter`,
+    `--jit-tier=template`, or `--jit-tier=production-tiered`. `jit-compile`
+    is intrinsically template-tier and `memory` is intrinsically
+    interpreter/full-GC; those commands do not accept `--jit-tier`. Do not
+    infer a benchmark tier from legacy JIT environment variables.
+  - `module --runtime-reuse=fresh-per-sample` uses a new runtime for every
+    measured execution; `reused-across-samples` reuses one validated runtime.
+    Runtime reuse is not a module-cache hit.
+  - Every command emits the one live machine-readable result format. Format
+    changes are hard breaking: update the runner, fixtures, tests, and
+    `benchmarks/README.md` together; do not add compatibility readers or
+    legacy output modes.
+  - Failed, timed-out, unavailable, and unvalidated observations are
+    non-scoreable and must remain visible. A dirty but validated observation
+    may remain scoreable for local investigation, but is never
+    baseline-eligible.
+  - Engine fixtures live under `benchmarks/fixtures/engine/`.
+- External suite runners and the baseline capture protocol are documented in
+  `benchmarks/README.md`. Raw local results belong under the ignored
+  `benchmarks/results/` directory.
+- Files under `benchmarks/archive/` are historical evidence only. Their old
+  binary names, commands, tier labels, and data formats are unsupported and
+  must not be presented as the current baseline.
 
 ## Test-Driven Workflow
 

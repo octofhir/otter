@@ -1,164 +1,218 @@
 # Benchmarks
 
-Otter uses standard JavaScript benchmark suites here, not local microbenchmarks.
-The goal is to measure workloads other JS engines and papers already recognize:
-V8 v7, Octane, ARES-6, V8 Web Tooling Benchmark, and yt-dlp/ejs.
+Otter has two deliberately separate benchmark surfaces:
 
-The old `benchmarks/scripts/*.js` microbench set was removed because it mostly
-measured hand-picked hot loops and process startup. Those numbers were useful
-while debugging early VM bugs, but they are a poor performance target.
+- `otter-engine-benchmark` provides controlled VM/runtime/JIT measurements for
+  engine stabilization and optimization work.
+- The checked-in suite runners exercise recognized JavaScript workloads after
+  an engine change clears its focused gates.
 
-## Suites
+The current engine baseline does not install packages or bootstrap Node/Web API
+surfaces. ARES-6, Web Tooling, and yt-dlp/ejs remain useful compatibility and
+macro-performance suites, but they are outside the engine-only baseline.
 
-| Suite | Runner | Signal |
-| --- | --- | --- |
-| V8 v7 | `benchmarks/run-v8-v7.sh` | Classic language/runtime throughput; higher is better. |
-| Octane | `benchmarks/run-octane.sh` | Larger historical V8 workloads; higher is better. |
-| ARES-6 | `benchmarks/run-ares6.sh` | Modern compiler/parser/runtime workloads; lower ms is better. |
-| Web Tooling Benchmark | `benchmarks/run-web-tooling.sh` | Real JS tooling bundles such as Babel/Terser/Acorn; lower ms is better. |
-| yt-dlp/ejs | `benchmarks/run-ejs.sh` | Real TypeScript/ESM parser-transform workload over cached YouTube player JS fixtures; lower ms is better. |
+## Current result contract
 
-Downloaded checkouts and generated bundles live under
-`benchmarks/.suite-cache/` and are ignored by git. Raw logs are written to
-`benchmarks/results/` and are also ignored. Curated current results belong in
-[`RESULTS.md`](RESULTS.md).
+Every engine benchmark command writes one machine-readable JSON record. There
+is one live format: changes are intentionally breaking and land together with
+the runner, fixtures, tests, and this documentation. There is no compatibility
+reader or legacy output mode.
 
-The current cross-runtime snapshot and in-progress vertical-slice measurements
-are recorded in [`PERF_DASHBOARD.json`](PERF_DASHBOARD.json). Invalid, timed-out,
-and unavailable workloads remain explicit and are excluded from aggregates.
+A record is scoreable only when the workload completes successfully, its
+semantic result is validated, and it contains a primary metric. Baseline
+eligibility is stricter: provenance must report a clean worktree and the
+capture must use a release build. A dirty but otherwise valid observation can
+remain scoreable for local investigation, but it is never baseline-eligible.
+Failed, timed-out, unavailable, and unvalidated observations remain explicit
+and non-scoreable. `timeoutMs` stays null unless that exact timeout was enforced
+by the process producing the record.
 
-Phase 0 VM/JIT refactor evidence, correctness blockers, and reproduction
-commands are tracked in [`PHASE0_BASELINE.md`](PHASE0_BASELINE.md).
+There is intentionally no checked-in current performance baseline during the
+benchmark hard cut. Publish a new baseline only from a clean commit after the
+engine validation matrix passes. The former Phase 0 evidence and dashboard are
+historical artifacts, not inputs to the next baseline.
 
-## Machine-readable result envelope
+## Engine benchmark binary
 
-Use `otter-benchmark` to wrap new benchmark commands. Its versioned JSON record
-always includes environment/mode/cache/correctness fields and explicit `null`
-values for counters that the wrapped command cannot yet provide. A missing
-validation marker makes the result non-scoreable.
+Build or run the focused harness with the `engine` feature:
 
 ```bash
-cargo run -p otter-benchmark -- \
-  --name smoke --runtime-mode cli --jit-mode baseline \
-  --gc-mode normal --cache-state cold --validation-marker ok -- \
-  target/release/otter -p '"ok"'
+cargo build --release -p otter-benchmark --features engine \
+  --bin otter-engine-benchmark
 ```
 
-The active opcode-effect/support inventory is emitted with:
+Tier choice is explicit whenever a workload permits tier selection:
+
+- `interpreter` runs without native compilation.
+- `template` uses the production template compiler only.
+- `production-tiered` uses the current production tier policy.
+
+`call` and `module` require `--jit-tier`; their optional
+`--jit-osr-threshold` records a deliberate threshold override. `jit-compile`
+always measures the template compiler, and `memory` always measures the
+interpreter with a post-run full GC, so those commands do not accept a tier
+argument. Do not infer a benchmark tier from legacy JIT environment variables.
+
+### Call execution
+
+The call workload is parsed and lowered before sampling. Every warmup and
+measured execution validates the returned sum.
+
+```bash
+cargo run --release -p otter-benchmark --features engine \
+  --bin otter-engine-benchmark -- \
+  call --kind bytecode --arity 4 --jit-tier production-tiered \
+  --iterations 100000 --samples 20 --warmup 3
+```
+
+Direct calls wider than the active bytecode format must be recorded as
+non-scoreable failures. Do not rewrite them into a spread-call workload.
+
+### JIT compilation
+
+The compile fixture retains the final measured machine-code artifact, installs
+that exact object through an isolate-local validation hook, enters it, and
+checks the program result before emitter samples are accepted. Source parsing,
+bytecode lowering, snapshot construction, and semantic validation remain
+outside the compile timer; executable-buffer finalization remains inside it.
+
+```bash
+cargo run --release -p otter-benchmark --features engine \
+  --bin otter-engine-benchmark -- \
+  jit-compile --source benchmarks/fixtures/engine/jit-compile.js \
+  --function engineJitTarget --expected 3300 \
+  --samples 100 --warmup 10
+```
+
+### Managed memory
+
+The memory workload uses fresh interpreter isolates. Its execution timer covers
+JavaScript execution; wall time also includes one post-run forced full GC.
+Allocation and cumulative pause deltas exclude bootstrap, and retained heap is
+sampled only after full reconciliation.
+
+```bash
+cargo run --release -p otter-benchmark --features engine \
+  --bin otter-engine-benchmark -- \
+  memory --iterations 1000000 --samples 5
+```
+
+### Module graph
+
+`--runtime-reuse fresh-per-sample` gives every measured graph execution a fresh
+runtime. `--runtime-reuse reused-across-samples` validates one runtime during
+warmup and then reuses it for measured executions. In both modes the graph is
+resolved, loaded, parsed, compiled, linked, and executed again; runtime reuse is
+not a module cache hit. Fresh-per-sample captures require `--warmup 0`.
+
+```bash
+# Fresh runtime per sample.
+cargo run --release -p otter-benchmark --features engine \
+  --bin otter-engine-benchmark -- \
+  module --entry benchmarks/fixtures/engine/module-entry.mjs \
+  --jit-tier production-tiered --runtime-reuse fresh-per-sample \
+  --samples 20 --warmup 0
+
+# One persistent runtime after validated warmup.
+cargo run --release -p otter-benchmark --features engine \
+  --bin otter-engine-benchmark -- \
+  module --entry benchmarks/fixtures/engine/module-entry.mjs \
+  --jit-tier production-tiered --runtime-reuse reused-across-samples \
+  --samples 20 --warmup 5
+
+# Package-import-map resolution without a generated node_modules tree.
+cargo run --release -p otter-benchmark --features engine \
+  --bin otter-engine-benchmark -- \
+  module --entry benchmarks/fixtures/engine/package/entry.mjs \
+  --jit-tier production-tiered --runtime-reuse fresh-per-sample \
+  --samples 20 --warmup 0
+```
+
+The package fixture resolves `#engine-dep` through its checked-in
+`package.json#imports` map.
+
+## External command recorder
+
+`otter-benchmark` wraps one child process in the same live result contract. It
+records the complete recorder invocation, a real child exit code when one
+exists, and the exact enforced timeout. The default path uses
+`Command::output`; timeout polling and RSS sampling stay opt-in.
+
+```bash
+cargo run --release -p otter-benchmark --features rss -- \
+  --suite comparison --name otter-richards \
+  --surface cli-process --jit-policy production-tiered \
+  --validation-marker 'Richards:' \
+  --build-profile release --timeout-ms 45000 --rss-sample-ms 100 -- \
+  target/release/otter run benchmarks/scripts/richards.js
+```
+
+`--build-profile` is an explicit assertion about the measured executable, not
+the recorder itself. Omit it for external binaries whose build profile cannot
+be verified; the record then uses `unknown` and cannot enter a checked-in
+baseline. When RSS is enabled, the requested cadence is preserved in the
+reserved `recorder.rss-sample-ms` benchmark parameter. A timeout also bounds
+pipe collection, so descendants retaining inherited output descriptors cannot
+keep the recorder alive past the declared wall cap.
+
+## Capturing a baseline
+
+Use a release build, run workloads serially on an otherwise idle host, and
+record the exact command, full commit, worktree state, platform, toolchain,
+profile, tier, sample count, warmup count, statistic, metric unit/direction,
+timeout, and validation result. Compare identical workload identities and
+measurement settings only.
+
+Raw logs and local captures belong under `benchmarks/results/`, which is
+ignored by git. A curated baseline must retain non-scoreable observations
+rather than silently dropping them, and its Markdown summary must be derived
+from the same machine-readable records.
+
+The active opcode effect and tier-support inventory is available separately:
 
 ```bash
 cargo run -p otter-bytecode --bin opcode-audit
 ```
 
-Focused Phase 0 call and baseline-emitter measurements use `otter-phase0`.
-Both subcommands emit the same schema-v1 JSON envelope and refuse to score a
-sample whose expected result was not observed:
+## External suites
+
+| Suite | Runner | Signal |
+| --- | --- | --- |
+| V8 v7 | `benchmarks/run-v8-v7.sh` | Classic language/runtime throughput; higher is better. |
+| Octane | `benchmarks/run-octane.sh` | Larger historical V8 workloads; higher is better. |
+| ARES-6 | `benchmarks/run-ares6.sh` | Compiler/parser/runtime workloads; lower ms is better. |
+| Web Tooling Benchmark | `benchmarks/run-web-tooling.sh` | Babel/Terser/Acorn bundles; lower ms is better. |
+| yt-dlp/ejs | `benchmarks/run-ejs.sh` | TypeScript/ESM parser-transform workload; lower ms is better. |
+
+Downloaded checkouts and generated bundles live under
+`benchmarks/.suite-cache/` and are ignored by git.
 
 ```bash
-cargo run --release -p otter-benchmark --features phase0 --bin otter-phase0 -- \
-  call --kind bytecode --arity 4 --jit-mode baseline \
-  --iterations 100000 --samples 20 --warmup 3
-
-cargo run --release -p otter-benchmark --features phase0 --bin otter-phase0 -- \
-  jit-compile --source benchmarks/fixtures/phase0/jit-compile.js \
-  --function phase0JitTarget --expected 3300 --samples 100 --warmup 10
-
-cargo run --release -p otter-benchmark --features phase0 --bin otter-phase0 -- \
-  memory --iterations 1000000 --samples 5
-
-cargo run --release -p otter-benchmark --features phase0 --bin otter-phase0 -- \
-  module --entry benchmarks/fixtures/phase0/module-entry.mjs \
-  --cache-state cold --samples 20 --warmup 0
-
-cargo run --release -p otter-benchmark --features phase0 --bin otter-phase0 -- \
-  module --entry benchmarks/fixtures/phase0/module-entry.mjs \
-  --cache-state warm --samples 20 --warmup 5
-
-cargo run --release -p otter-benchmark --features phase0 --bin otter-phase0 -- \
-  module --entry benchmarks/fixtures/phase0/package/entry.mjs \
-  --cache-state cold --samples 20 --warmup 0
-
-cargo run --release -p otter-benchmark --features phase0,rss --bin otter-phase0 -- \
-  macro-memory --name v8-v7-richards-memory \
-  --source benchmarks/.suite-cache/v8-v7/base.js \
-           benchmarks/.suite-cache/v8-v7/richards.js \
-           benchmarks/.suite-cache/v8-v7/driver.js \
-  --validation-marker 'Score (version 7):' --samples 5 --rss-sample-ms 5
-```
-
-Direct calls wider than the current bytecode format should be recorded as
-failures, not rewritten into a different spread-call workload and not assigned
-a performance score.
-
-The `memory` workload uses fresh interpreter isolates. Its execution timer
-covers JS only; wall time additionally includes one post-run forced full GC.
-Allocation and cumulative pause deltas exclude bootstrap, and `heap_bytes` is
-sampled after that full reconciliation so it represents retained live heap
-rather than allocation-accounting bytes awaiting collection.
-
-For the `module` workload, `cold` means a fresh `Runtime` for every measured
-graph execution. `warm` means one persistent `Runtime`, five validated
-pre-executions by default, then repeated measured executions. Both modes still
-resolve, read, parse, compile, and link a fresh graph: Otter has no persistent
-CodeBlock or module cache yet. The warm label therefore describes runtime and
-host filesystem state, not a module-cache hit.
-
-The package-backed fixture resolves `#phase0-dep` through its checked-in
-`package.json#imports` map, so the same `module` command also captures package
-scope/manifest resolution without a generated `node_modules` tree.
-
-`macro-memory` preserves the CLI multi-file script semantics: every input is
-compiled as a classic script in one CLI-equivalent runtime, in source order.
-Each sample must emit the requested suite marker, then the runner forces a full
-GC and records retained managed heap, cumulative workload/GC pause time, and
-the deduplicated finalized bytes reachable from all JIT entry/OSR/direct-call
-caches. RSS polling is opt-in and runs on a separate sampler thread only when
-`--rss-sample-ms` is non-zero. Prepare the V8 v7 cache/driver with
-`benchmarks/run-v8-v7.sh richards` before invoking the command directly.
-
-Peak RSS sampling is opt-in on the generic recorder and therefore adds no
-polling overhead to ordinary runs:
-
-```bash
-cargo run --release -p otter-benchmark --features rss -- \
-  --name memory-rss --runtime-mode vm --jit-mode interpreter-only \
-  --gc-mode forced-full --rss-sample-ms 5 \
-  --validation-marker 'return=500000500000' -- \
-  target/release/otter-phase0 memory --iterations 1000000 --samples 5
-```
-
-## Run
-
-```bash
-# Fast baseline: V8 v7 + a small Octane smoke selection.
+# Fast suite smoke after focused engine gates.
 just bench
 
-# Full individual suites.
+# Full or selected suites.
 benchmarks/run-v8-v7.sh
-benchmarks/run-octane.sh
-benchmarks/run-ares6.sh
-benchmarks/run-web-tooling.sh --only babel
-benchmarks/run-ejs.sh
-
-# Selected workloads.
 benchmarks/run-v8-v7.sh richards regexp
+benchmarks/run-octane.sh
 benchmarks/run-octane.sh richards crypto splay
 benchmarks/run-ares6.sh air basic
+benchmarks/run-web-tooling.sh --only babel
+benchmarks/run-ejs.sh
 ```
 
-All runners build `target/release/otter` unless `OTTER_BIN=/path/to/otter` is
-set. `OTTER_JIT=1` is the default for benchmark runs.
-
-V8 v7 and Octane are run through Otter's shell-style multi-file CLI loading:
+V8 v7 and Octane use shell-style multi-file loading in one runtime/realm:
 
 ```bash
 otter run base.js richards.js run-driver.js
 ```
 
-That mode executes each file as a global script in one runtime/realm, matching
-the shell model used by these suites.
+## Historical artifacts
 
-## Updating Results
+These files preserve evidence at their captured commits. Their paths, commands,
+tier names, and data formats are unsupported and must not be treated as the
+current benchmark contract:
 
-Run the suites you want to publish, then summarize the generated logs into
-`benchmarks/RESULTS.md`. Do not commit raw `benchmarks/results/*.log` files.
+- [`archive/PHASE0_BASELINE.md`](archive/PHASE0_BASELINE.md)
+- [`archive/PERF_DASHBOARD-2026-07-16-69988580.json`](archive/PERF_DASHBOARD-2026-07-16-69988580.json)
+- [`archive/RESULTS-2026-07-09.md`](archive/RESULTS-2026-07-09.md)

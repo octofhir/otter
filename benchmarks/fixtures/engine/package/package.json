@@ -1,0 +1,8 @@
+{
+  "name": "otter-engine-benchmark-package-fixture",
+  "private": true,
+  "type": "module",
+  "imports": {
+    "#engine-dep": "./dep.mjs"
+  }
+}

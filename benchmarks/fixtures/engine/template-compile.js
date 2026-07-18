@@ -1,4 +1,4 @@
-function phase0TemplateTarget(a, b) {
+function engineTemplateTarget(a, b) {
   let value = 0;
   if (a) {
     value = 3300;
@@ -9,8 +9,8 @@ function phase0TemplateTarget(a, b) {
   return value;
 }
 
-let phase0TemplateLast = 0;
+let engineTemplateLast = 0;
 for (let sample = 0; sample < 100; sample = sample + 1) {
-  phase0TemplateLast = phase0TemplateTarget(true, true);
+  engineTemplateLast = engineTemplateTarget(true, true);
 }
-phase0TemplateLast;
+engineTemplateLast;

@@ -209,6 +209,12 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
             return Ok(otter_vm::JitCompileStatus::Unavailable);
         }
         let fid = request.snapshot.code_block.id;
+        #[cfg(target_arch = "aarch64")]
+        if template::has_emit_eligible_inline_method(&request.snapshot) {
+            return Ok(otter_vm::JitCompileStatus::Unsupported {
+                reason: format!("function {fid} prefers the template method-inline path"),
+            });
+        }
         let artifact_request = request
             .debug
             .artifacts_enabled()

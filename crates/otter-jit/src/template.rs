@@ -45,6 +45,13 @@ pub(crate) use plan::{
 
 use crate::entry::{TransitionTable, Unsupported};
 
+/// Whether the current machine backend can replace at least one bridged
+/// method site with its guarded read-only numeric inline path.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn has_emit_eligible_inline_method(view: &JitCompileSnapshot) -> bool {
+    arm64::has_emit_eligible_inline_method(view)
+}
+
 /// Compile a function view to template machine code under the
 /// isolate-assigned unique code-object identity, or report why not. The
 /// caller provides the hook-lifetime [`TransitionTable`] so per-compile work

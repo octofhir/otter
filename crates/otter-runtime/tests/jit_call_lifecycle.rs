@@ -5,8 +5,10 @@
 //!   compiled plain-call site.
 //! - Polymorphic receiver shapes and method identities through one compiled
 //!   method-call site.
-//! - A monomorphic optimizing method-cache hit that reuses its cache-owned code
-//!   generation without per-invocation refcount traffic.
+//! - A monomorphic production-tier method site whose guarded splice removes
+//!   the compiled-call boundary entirely.
+//! - Guarded numeric method splicing plus replay through the ordinary method
+//!   bridge after receiver, callee, bound-state, or operand guards miss.
 //! - Direct callees that allocate their own captured cells while retaining the
 //!   current receiver across moving-GC safepoints.
 //! - Frameless direct callees that mint distinct capture-free function values.
@@ -18,8 +20,10 @@
 //!   SELF and upvalues are selected from the current callee on every call.
 //! - Method dispatch selects both the current function and current receiver;
 //!   neither method identity nor `this` leaks between polymorphic calls.
-//! - An epoch-validated optimizing method cache still reloads and decodes the
-//!   current method value before entering its ownerless prepared-call path.
+//! - A production-tier inline candidate bypasses the prepared-call lifecycle
+//!   while preserving the same result as the interpreter.
+//! - A template-spliced method body runs only for the exact baked receiver and
+//!   method identity; every rejected guard preserves full method-call semantics.
 //! - Upvalue-spine construction roots inherited cells and dynamic call state
 //!   until the new frame is published.
 //! - Capture-free function construction uses the published SELF/register
@@ -41,7 +45,12 @@ struct RunResult {
     osr_attempts: u64,
     reentrant_transitions: u64,
     direct_calls: u64,
-    optimized_entries: u64,
+}
+
+struct SplitRunResult {
+    completion: String,
+    compile_attempts: u64,
+    runtime_stub_delta: u64,
 }
 
 fn run(source: &str, name: &str, selection: JitSelection) -> RunResult {
@@ -62,7 +71,67 @@ fn run(source: &str, name: &str, selection: JitSelection) -> RunResult {
         osr_attempts: stats.jit_osr_attempts,
         reentrant_transitions: stats.jit_reentrant_stub_transitions,
         direct_calls: stats.jit_direct_calls,
-        optimized_entries: stats.jit_optimized_entries,
+    }
+}
+
+fn run_after_warmup(
+    setup: &str,
+    probe: &str,
+    name: &str,
+    selection: JitSelection,
+) -> SplitRunResult {
+    let mut runtime = Runtime::builder()
+        .jit_selection(selection)
+        .jit_osr_threshold(u32::MAX)
+        .build()
+        .expect("runtime");
+    let setup_name = format!("{name}-setup.js");
+    runtime
+        .run_script(SourceInput::from_javascript(setup.to_string()), &setup_name)
+        .expect("method-inline warmup");
+    let before = runtime.execution_stats();
+    let probe_name = format!("{name}-probe.js");
+    let completion = runtime
+        .run_script(SourceInput::from_javascript(probe.to_string()), &probe_name)
+        .expect("method-inline probe")
+        .completion_string()
+        .to_owned();
+    let after = runtime.execution_stats();
+    SplitRunResult {
+        completion,
+        compile_attempts: before.jit_compile_attempts,
+        runtime_stub_delta: after
+            .jit_runtime_stub_transitions
+            .saturating_sub(before.jit_runtime_stub_transitions),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn assert_inline_method_probe(
+    setup: &str,
+    probe: &str,
+    name: &str,
+    expected: &str,
+    expect_inline_hit: bool,
+) {
+    let oracle = run_after_warmup(setup, probe, name, JitSelection::InterpreterOnly);
+    let compiled = run_after_warmup(setup, probe, name, JitSelection::ProductionTiered);
+    assert_eq!(compiled.completion, oracle.completion);
+    assert_eq!(compiled.completion, expected);
+    assert!(
+        compiled.compile_attempts > 0,
+        "{name} must compile the warmed method caller"
+    );
+    if expect_inline_hit {
+        assert_eq!(
+            compiled.runtime_stub_delta, 0,
+            "{name} must complete through the spliced method body"
+        );
+    } else {
+        assert!(
+            compiled.runtime_stub_delta > 0,
+            "{name} must replay through the ordinary method bridge"
+        );
     }
 }
 
@@ -214,7 +283,7 @@ JSON.stringify([checksum, callMethod(receiver, 9)]);
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn optimizing_method_cache_reloads_value_without_cloning_code_owner() {
+fn production_method_inline_eliminates_compiled_call_boundary() {
     let oracle = run(
         OPTIMIZING_METHOD_CACHE,
         "jit-call-optimizing-method-cache.js",
@@ -228,10 +297,111 @@ fn optimizing_method_cache_reloads_value_without_cloning_code_owner() {
 
     assert_eq!(compiled.completion, oracle.completion);
     assert_eq!(compiled.completion, "[33664,13]");
-    assert_whole_function_direct_calls(&compiled);
-    assert!(
-        compiled.optimized_entries > 0,
-        "fixture must enter an optimizing method body"
+    assert!(compiled.compile_attempts > 0, "fixture must compile");
+    assert_eq!(compiled.osr_attempts, 0, "fixture must not use loop OSR");
+    assert_eq!(
+        compiled.direct_calls, 0,
+        "spliced method calls must bypass the prepared-call trampoline"
+    );
+}
+
+const INLINE_METHOD_SETUP: &str = r#"
+globalThis.__jitInlineMethodFixture = (() => {
+  function apply(value) {
+    return value + this.bias;
+  }
+  function callMethod(receiver, value) {
+    return receiver.apply(value);
+  }
+
+  const receiver = { bias: 4, apply };
+  for (let i = 0; i < 5000; i++) {
+    callMethod(receiver, i);
+  }
+  return { apply, callMethod, receiver };
+})();
+"#;
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn numeric_method_inline_hit_avoids_method_bridge() {
+    assert_inline_method_probe(
+        INLINE_METHOD_SETUP,
+        r#"
+const fixture = globalThis.__jitInlineMethodFixture;
+JSON.stringify([
+  fixture.callMethod(fixture.receiver, 9),
+  fixture.callMethod(fixture.receiver, 20)
+]);
+"#,
+        "jit-inline-method-hit",
+        "[13,24]",
+        true,
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn numeric_method_inline_replays_after_receiver_shape_change() {
+    assert_inline_method_probe(
+        INLINE_METHOD_SETUP,
+        r#"
+const fixture = globalThis.__jitInlineMethodFixture;
+fixture.receiver.extra = true;
+JSON.stringify(fixture.callMethod(fixture.receiver, 11));
+"#,
+        "jit-inline-method-shape-miss",
+        "15",
+        false,
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn numeric_method_inline_replays_after_method_replacement() {
+    assert_inline_method_probe(
+        INLINE_METHOD_SETUP,
+        r#"
+const fixture = globalThis.__jitInlineMethodFixture;
+fixture.receiver.apply = function replacement(value) {
+  return value * 3;
+};
+JSON.stringify(fixture.callMethod(fixture.receiver, 7));
+"#,
+        "jit-inline-method-identity-miss",
+        "21",
+        false,
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn numeric_method_inline_rejects_bound_closure_state() {
+    assert_inline_method_probe(
+        INLINE_METHOD_SETUP,
+        r#"
+const fixture = globalThis.__jitInlineMethodFixture;
+fixture.receiver.apply = fixture.apply.bind({ bias: 1000 });
+JSON.stringify(fixture.callMethod(fixture.receiver, 6));
+"#,
+        "jit-inline-method-bound-miss",
+        "1006",
+        false,
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn numeric_method_inline_replays_nonnumeric_operands() {
+    assert_inline_method_probe(
+        INLINE_METHOD_SETUP,
+        r#"
+const fixture = globalThis.__jitInlineMethodFixture;
+JSON.stringify(fixture.callMethod(fixture.receiver, "value="));
+"#,
+        "jit-inline-method-operand-miss",
+        r#""value=4""#,
+        false,
     );
 }
 

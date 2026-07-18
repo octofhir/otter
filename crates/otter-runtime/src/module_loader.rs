@@ -835,8 +835,8 @@ impl ModuleLoader {
     /// Read a source whose canonical URL was already resolved by this loader.
     ///
     /// The graph builder uses this after recording resolution separately, so a
-    /// dependency is not resolved twice and Phase 0 can distinguish resolver
-    /// time from source-loading time.
+    /// dependency is not resolved twice and benchmark timing can distinguish
+    /// resolver time from source-loading time.
     pub(crate) fn load_resolved(&self, url: String) -> Result<ResolvedSource, LoaderError> {
         if self.is_hosted_url(&url) {
             return Ok(ResolvedSource {

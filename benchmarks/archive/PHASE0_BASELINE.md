@@ -1,5 +1,12 @@
 # JIT refactor Phase 0/1 evidence
 
+> [!WARNING]
+> This is an archived historical record captured during the Phase 0/1
+> refactor. It is not the current benchmark contract or a current performance
+> baseline. Its binary names, fixture paths, tier terminology, commands, and
+> result format are intentionally unsupported. Statements using “current”
+> describe only the recorded checkpoint; this document is not maintained.
+
 Captured 2026-07-10. The differential/GC-slot-verification matrix, detailed
 module/package timings, representative macro memory/RSS, whole-runtime JIT code
 residency, macro suite reruns, same-commit optimizer comparison, and fresh full

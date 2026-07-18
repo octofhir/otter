@@ -1,4 +1,6 @@
 {
+  "archived": true,
+  "archive_reason": "Historical architecture-slice snapshot at commit 69988580; unsupported and not the current benchmark format or performance baseline.",
   "schema_version": 1,
   "status": "architecture_slice_correctness_validated_performance_deferred",
   "as_of": "2026-07-16",

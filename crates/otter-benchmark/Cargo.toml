@@ -12,15 +12,12 @@ workspace = true
 
 [features]
 default = []
-phase0 = [
+engine = [
     "dep:otter-compiler",
     "dep:otter-jit",
-    "dep:otter-modules",
-    "dep:otter-node",
     "dep:otter-runtime",
     "dep:otter-syntax",
     "dep:otter-vm",
-    "dep:otter-web",
 ]
 rss = ["dep:sysinfo"]
 
@@ -28,12 +25,9 @@ rss = ["dep:sysinfo"]
 clap = { workspace = true }
 otter-compiler = { workspace = true, optional = true }
 otter-jit = { workspace = true, optional = true }
-otter-modules = { workspace = true, optional = true }
-otter-node = { workspace = true, optional = true }
 otter-runtime = { workspace = true, optional = true }
 otter-syntax = { workspace = true, optional = true }
 otter-vm = { workspace = true, optional = true }
-otter-web = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sysinfo = { workspace = true, optional = true }
@@ -43,6 +37,6 @@ name = "otter-benchmark"
 path = "src/main.rs"
 
 [[bin]]
-name = "otter-phase0"
-path = "src/bin/phase0.rs"
-required-features = ["phase0"]
+name = "otter-engine-benchmark"
+path = "src/bin/engine.rs"
+required-features = ["engine"]

@@ -1,6 +1,6 @@
 {
-  "commit": "48ce1d0d659be6d7c0acfd29b589da0543808df0",
-  "capturedAtUnixMs": 1784392650406,
+  "commit": "02b2c2972574cda40e5b0a34b622187a720aaa6b",
+  "capturedAtUnixMs": 1784393582704,
   "outerTimeoutMs": 120000,
   "engineArgv0": "target/release/otter-engine-benchmark",
   "complete": true,

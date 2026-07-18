@@ -921,10 +921,7 @@ fn check_eligibility(
                         || instruction.input_registers.is_empty()
                         || instruction.input_registers.len() > 1 + MAX_METHOD_ARGS
                         || instruction.inputs.len() != instruction.input_registers.len()
-                        || instruction
-                            .inputs
-                            .iter()
-                            .any(|&input| reprs.representation(input) != Representation::Tagged)
+                        || reprs.representation(instruction.inputs[0]) != Representation::Tagged
                     {
                         return Err(Unsupported::Opcode(instruction.op));
                     }
@@ -5655,6 +5652,86 @@ mod tests {
         let result = execute(&code, &[box_i32(7)]);
         assert_eq!(result.status, STATUS_RETURNED);
         assert_eq!(result.value, box_i32(7));
+    }
+
+    #[test]
+    fn method_call_accepts_boxed_numeric_arguments() {
+        let view = view(
+            1,
+            3,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(7)]),
+                (
+                    Op::CallMethodValue,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::ConstIndex(1),
+                        Operand::ConstIndex(1),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        );
+        let code = compile(&view, 142)
+            .expect("numeric method arguments are boxed into the transition frame");
+
+        assert_eq!(code.safepoint_count(), 1);
+        let record = code.safepoint_record(0).expect("method-call safepoint");
+        assert_eq!(
+            record.tagged_locations,
+            vec![otter_vm::native_abi::TaggedLocation::frame_slot(0)]
+        );
+        let frame_map = code.frame_map(0).expect("method-call frame map");
+        assert_eq!(frame_map.slot_count, 3);
+        assert_eq!(frame_map.bitmap_word_count, 1);
+        assert_eq!(
+            code.frame_map_bitmap_words(),
+            &[0b1],
+            "the receiver is rooted while the boxed primitive argument is not traced"
+        );
+    }
+
+    #[test]
+    fn method_call_accepts_boxed_float_argument() {
+        let view = float_view(
+            1,
+            3,
+            vec![
+                (
+                    Op::LoadNumber,
+                    vec![Operand::Register(1), Operand::ConstIndex(0)],
+                ),
+                (
+                    Op::CallMethodValue,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::ConstIndex(1),
+                        Operand::ConstIndex(1),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+            &[],
+            &[(0, 7.5)],
+        );
+        let code = compile(&view, 143)
+            .expect("float method arguments are boxed into the transition frame");
+
+        assert_eq!(code.safepoint_count(), 1);
+        let record = code.safepoint_record(0).expect("method-call safepoint");
+        assert_eq!(
+            record.tagged_locations,
+            vec![otter_vm::native_abi::TaggedLocation::frame_slot(0)]
+        );
+        assert_eq!(
+            code.frame_map_bitmap_words(),
+            &[0b1],
+            "the receiver is rooted while the boxed float argument is not traced"
+        );
     }
 
     fn construct_transitions(entry: usize) -> TransitionTable {

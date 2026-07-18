@@ -3,6 +3,7 @@
 //! # Contents
 //! - Default-off behavior and ordered template compile events.
 //! - Optimizing OSR consumes unary feedback without an immediate side exit.
+//! - Optimizing method calls box numeric arguments without rejecting the loop.
 //! - Abrupt completion followed by explicit report draining.
 //! - Report ownership across full GC, later allocation, and nested JIT entry.
 //! - Async [`otter_runtime::Otter`] event-loop success and abrupt-failure
@@ -19,12 +20,12 @@
 
 use std::collections::BTreeSet;
 
+#[cfg(target_arch = "aarch64")]
+use otter_runtime::JitDebugCompileOutcome;
 use otter_runtime::{
     JitDebugEvent, JitDebugRequest, JitDebugTarget, JitDebugTier, JitSelection, Otter, Runtime,
     SourceInput,
 };
-#[cfg(target_arch = "aarch64")]
-use otter_runtime::JitDebugCompileOutcome;
 
 const HOT_LOOP: &str = r#"
 let total = 0;
@@ -200,6 +201,85 @@ fn unary_feedback_keeps_extracted_native_call_loop_optimized() {
             }
         )),
         "recorded unary feedback must prevent an immediate optimizing bail: {:?}",
+        report.events()
+    );
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn numeric_method_argument_keeps_monomorphic_loop_optimized() {
+    let mut runtime = Runtime::builder()
+        .jit_selection(JitSelection::ProductionTiered)
+        .jit_osr_threshold(1)
+        .jit_debug(JitDebugRequest::events())
+        .build()
+        .expect("production-tiered runtime with events");
+    let result = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+function apply(value) {
+  return this.base + value;
+}
+
+const receiver = { base: 4, apply };
+
+function engineKernel(limit) {
+  let total = 0;
+  for (let i = 0; i < limit; i = i + 1) {
+    total = total + receiver.apply(i);
+  }
+  return total;
+}
+
+engineKernel(128);
+"#,
+            ),
+            "jit-debug-numeric-method-argument.js",
+        )
+        .expect("monomorphic method loop");
+    let report = result
+        .jit_debug_report()
+        .expect("enabled run owns a report");
+
+    assert_eq!(result.completion_string(), "8640");
+    let engine_kernel = report
+        .events()
+        .iter()
+        .find_map(|event| match event {
+            JitDebugEvent::CompilePrepared {
+                function_id,
+                function_name,
+                tier: JitDebugTier::Optimizing,
+                target: JitDebugTarget::Osr { .. },
+                ..
+            } if function_name == "engineKernel" => Some(*function_id),
+            _ => None,
+        })
+        .expect("engineKernel optimizing OSR preparation");
+    assert!(
+        report.events().iter().any(|event| matches!(
+            event,
+            JitDebugEvent::CompileFinished {
+                function_id,
+                tier: JitDebugTier::Optimizing,
+                target: JitDebugTarget::Osr { .. },
+                outcome: JitDebugCompileOutcome::Compiled { .. },
+            } if *function_id == engine_kernel
+        )),
+        "numeric method arguments must not reject engineKernel: {:?}",
+        report.events()
+    );
+    assert!(
+        !report.events().iter().any(|event| matches!(
+            event,
+            JitDebugEvent::Bail {
+                function_id,
+                tier: JitDebugTier::Optimizing,
+                ..
+            } if *function_id == engine_kernel
+        )),
+        "optimized engineKernel must not side-exit at the method call: {:?}",
         report.events()
     );
 }

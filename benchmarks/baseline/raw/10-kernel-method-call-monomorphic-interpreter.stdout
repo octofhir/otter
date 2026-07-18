@@ -1,0 +1,117 @@
+{
+  "benchmark": {
+    "suite": "engine",
+    "name": "kernel-method-call-monomorphic",
+    "parameters": {
+      "expected": "500003500000",
+      "function": "engineKernel",
+      "source": "benchmarks/scripts/method-call-monomorphic.js"
+    }
+  },
+  "provenance": {
+    "capturedAtUnixMs": 1784371558311,
+    "commit": "8739ff7b992cd4859ce543e61f0a6139749542c7",
+    "dirty": false,
+    "platform": {
+      "os": "macos",
+      "arch": "aarch64",
+      "kernel": "Darwin 25.5.0",
+      "cpu": "aarch64"
+    },
+    "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2",
+    "buildProfile": "release"
+  },
+  "configuration": {
+    "surface": "vm",
+    "jitPolicy": "interpreter",
+    "jitOsrThreshold": null,
+    "gcPolicy": "normal",
+    "gcStressStride": null,
+    "runtimeReuse": "not-applicable",
+    "cacheState": "not-applicable"
+  },
+  "sampling": {
+    "warmupCount": 8,
+    "sampleCount": 15,
+    "iterationsPerSample": 1,
+    "timeoutMs": null
+  },
+  "metrics": [
+    {
+      "name": "wall-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "primary",
+      "samples": [
+        643017417,
+        637088916,
+        642529916,
+        645544833,
+        703365791,
+        662423709,
+        638214334,
+        636020209,
+        638047000,
+        638130458,
+        647752333,
+        650702084,
+        644648917,
+        726869500,
+        707320000
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 644648917
+      }
+    },
+    {
+      "name": "execution-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        643017417,
+        637088916,
+        642529916,
+        645544833,
+        703365791,
+        662423709,
+        638214334,
+        636020209,
+        638047000,
+        638130458,
+        647752333,
+        650702084,
+        644648917,
+        726869500,
+        707320000
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 644648917
+      }
+    }
+  ],
+  "outcome": {
+    "status": "validated",
+    "validationMarker": "return=500003500000;bits=0x425d1aa1fbf80000;function=engineKernel",
+    "processExitCode": null,
+    "failure": null
+  },
+  "command": [
+    "target/release/otter-engine-benchmark",
+    "kernel",
+    "--source",
+    "benchmarks/scripts/method-call-monomorphic.js",
+    "--function",
+    "engineKernel",
+    "--expected",
+    "500003500000",
+    "--jit-tier",
+    "interpreter",
+    "--samples",
+    "15",
+    "--warmup",
+    "8"
+  ]
+}

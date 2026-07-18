@@ -1,0 +1,127 @@
+{
+  "benchmark": {
+    "suite": "engine",
+    "name": "kernel-branch-phi",
+    "parameters": {
+      "expected": "-6000000",
+      "function": "engineKernel",
+      "source": "benchmarks/scripts/branch-phi.js"
+    }
+  },
+  "provenance": {
+    "capturedAtUnixMs": 1784371581143,
+    "commit": "8739ff7b992cd4859ce543e61f0a6139749542c7",
+    "dirty": false,
+    "platform": {
+      "os": "macos",
+      "arch": "aarch64",
+      "kernel": "Darwin 25.5.0",
+      "cpu": "aarch64"
+    },
+    "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2",
+    "buildProfile": "release"
+  },
+  "configuration": {
+    "surface": "vm",
+    "jitPolicy": "template",
+    "jitOsrThreshold": null,
+    "gcPolicy": "normal",
+    "gcStressStride": null,
+    "runtimeReuse": "not-applicable",
+    "cacheState": "not-applicable"
+  },
+  "sampling": {
+    "warmupCount": 5,
+    "sampleCount": 20,
+    "iterationsPerSample": 1,
+    "timeoutMs": null
+  },
+  "metrics": [
+    {
+      "name": "wall-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "primary",
+      "samples": [
+        13159875,
+        12743541,
+        12778709,
+        12801750,
+        12740125,
+        12914458,
+        14591708,
+        13577917,
+        13234458,
+        13177125,
+        12697042,
+        12852750,
+        13033208,
+        12971250,
+        12904708,
+        12744167,
+        12869666,
+        12805417,
+        12866042,
+        13184333
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 12887187
+      }
+    },
+    {
+      "name": "execution-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        13159875,
+        12743541,
+        12778709,
+        12801750,
+        12740125,
+        12914458,
+        14591708,
+        13577917,
+        13234458,
+        13177125,
+        12697042,
+        12852750,
+        13033208,
+        12971250,
+        12904708,
+        12744167,
+        12869666,
+        12805417,
+        12866042,
+        13184333
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 12887187
+      }
+    }
+  ],
+  "outcome": {
+    "status": "validated",
+    "validationMarker": "return=-6000000;bits=0xc156e36000000000;function=engineKernel",
+    "processExitCode": null,
+    "failure": null
+  },
+  "command": [
+    "target/release/otter-engine-benchmark",
+    "kernel",
+    "--source",
+    "benchmarks/scripts/branch-phi.js",
+    "--function",
+    "engineKernel",
+    "--expected",
+    "-6000000",
+    "--jit-tier",
+    "template",
+    "--samples",
+    "20",
+    "--warmup",
+    "5"
+  ]
+}

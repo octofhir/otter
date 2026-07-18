@@ -1,0 +1,117 @@
+{
+  "benchmark": {
+    "suite": "engine",
+    "name": "kernel-boxed-double-property",
+    "parameters": {
+      "expected": "4000000",
+      "function": "engineKernel",
+      "source": "benchmarks/scripts/boxed-double-property.js"
+    }
+  },
+  "provenance": {
+    "capturedAtUnixMs": 1784371593925,
+    "commit": "8739ff7b992cd4859ce543e61f0a6139749542c7",
+    "dirty": false,
+    "platform": {
+      "os": "macos",
+      "arch": "aarch64",
+      "kernel": "Darwin 25.5.0",
+      "cpu": "aarch64"
+    },
+    "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2",
+    "buildProfile": "release"
+  },
+  "configuration": {
+    "surface": "vm",
+    "jitPolicy": "template",
+    "jitOsrThreshold": null,
+    "gcPolicy": "normal",
+    "gcStressStride": null,
+    "runtimeReuse": "not-applicable",
+    "cacheState": "not-applicable"
+  },
+  "sampling": {
+    "warmupCount": 5,
+    "sampleCount": 15,
+    "iterationsPerSample": 1,
+    "timeoutMs": null
+  },
+  "metrics": [
+    {
+      "name": "wall-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "primary",
+      "samples": [
+        16012792,
+        16468291,
+        15359292,
+        15292667,
+        15267792,
+        16014583,
+        16094417,
+        15388959,
+        15209000,
+        15993250,
+        16610125,
+        15467542,
+        15240291,
+        15259833,
+        16391625
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 15467542
+      }
+    },
+    {
+      "name": "execution-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        16012792,
+        16468291,
+        15359292,
+        15292667,
+        15267792,
+        16014583,
+        16094417,
+        15388959,
+        15209000,
+        15993250,
+        16610125,
+        15467542,
+        15240291,
+        15259833,
+        16391625
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 15467542
+      }
+    }
+  ],
+  "outcome": {
+    "status": "validated",
+    "validationMarker": "return=4000000;bits=0x414e848000000000;function=engineKernel",
+    "processExitCode": null,
+    "failure": null
+  },
+  "command": [
+    "target/release/otter-engine-benchmark",
+    "kernel",
+    "--source",
+    "benchmarks/scripts/boxed-double-property.js",
+    "--function",
+    "engineKernel",
+    "--expected",
+    "4000000",
+    "--jit-tier",
+    "template",
+    "--samples",
+    "15",
+    "--warmup",
+    "5"
+  ]
+}

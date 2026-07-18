@@ -16,6 +16,8 @@
 //!
 //! # Invariants
 //! - Replay only applies to fast-shape ordinary objects.
+//! - Replay guards run before value boxing, so a failed probe is
+//!   allocation-free and cannot relocate a caller-owned receiver handle.
 //! - Prototype guards are complete here: null prototype, direct prototype with
 //!   missing key and no deeper chain, or direct prototype with a writable data
 //!   slot.
@@ -187,8 +189,6 @@ pub(crate) fn replay_store_property_transition(
     transition: &StorePropertyTransition,
     value: &Value,
 ) -> Option<()> {
-    let mut obj = obj;
-    let compressed = super::compress_or_abort(heap, &mut obj, *value);
     if !transition_kind_matches(obj, heap, transition) {
         return None;
     }
@@ -207,7 +207,7 @@ pub(crate) fn replay_store_property_transition(
     // shape walk, so confirm the invariant in debug builds only.
     #[cfg(debug_assertions)]
     let current_count = heap.read_payload(obj, |body| super::body_property_count(heap, body));
-    let success = heap.with_payload(obj, |body| {
+    let guard_matches = heap.read_payload(obj, |body| {
         if !is_fast_shape_body(body)
             || current_shape_id != transition.from_shape_id
             || key.atom().id() != transition.atom_id
@@ -216,13 +216,31 @@ pub(crate) fn replay_store_property_transition(
         {
             return false;
         }
-        let offset = usize::from(transition.slot);
         debug_assert_eq!(existing_offset, None);
         #[cfg(debug_assertions)]
         debug_assert_eq!(
-            current_count, offset,
+            current_count,
+            usize::from(transition.slot),
             "replay count diverged from slot offset"
         );
+        true
+    });
+    if !guard_matches {
+        return None;
+    }
+
+    // Only a confirmed hit may box the RHS. `compress_or_abort` roots and
+    // refreshes this local receiver if boxing scavenges; on a miss the caller
+    // retains its original raw handle, so allocating before guard validation
+    // would leave fallback holding a forwarded cell.
+    let mut obj = obj;
+    let compressed = super::compress_or_abort(heap, &mut obj, *value);
+    // Shape nodes are allocated with `alloc_old_with_roots` and pinned for the
+    // isolate lifetime because JIT guards bake their offsets. `to_shape`
+    // therefore cannot relocate during the boxing allocation and needs no
+    // post-allocation reload; only the young receiver above does.
+    heap.with_payload(obj, |body| {
+        let offset = usize::from(transition.slot);
         if to_shape.is_null() {
             body.dictionary_shape_id = transition.to_shape_id;
             super::dict_push_key(body, key.name().to_owned());
@@ -232,11 +250,7 @@ pub(crate) fn replay_store_property_transition(
             body.shape = to_shape;
         }
         body.push_slot(offset, SlotMeta::data_default(), compressed);
-        true
     });
-    if !success {
-        return None;
-    }
     super::record_slot_write(heap, obj, compressed);
     if !to_shape.is_null() {
         heap.record_write(obj, &to_shape);

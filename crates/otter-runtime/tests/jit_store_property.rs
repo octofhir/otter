@@ -3,10 +3,13 @@
 //! # Contents
 //! - Interpreter/template parity for own data, shape transitions, accessors,
 //!   non-writable inheritance, proxies, exotics, primitives, and megamorphism.
+//! - A polymorphic shape miss whose float RHS would allocate during boxing.
 //! - Reentrant/allocating setters and throwing-setter effect/PC ordering.
 //!
 //! # Invariants
 //! - Every scenario executes the store after loop OSR has entered compiled code.
+//! - Rejected store guards remain allocation-free, so fallback never observes
+//!   a receiver handle forwarded by RHS boxing.
 //! - A committed setter effect is observed exactly once; the opcode is never
 //!   replayed after an in-place slow transition.
 
@@ -25,6 +28,13 @@ let transitionObjects = [
 function shapeTransitions(items) {
   for (let i = 0; i < items.length; i++) items[i].x = i;
   return items[7].x;
+}
+
+let floatStoreA = { a: 0 };
+let floatStoreB = { b: 0 };
+function polymorphicFloatStore(o, value) {
+  for (let i = 0; i < 8; i++) o.x = value + i * 0.25;
+  return o.x;
 }
 
 let setterCalls = 0;
@@ -113,6 +123,8 @@ function reentrantSetter(o) {
 
 ownHit(own);
 shapeTransitions(transitionObjects);
+let floatStoreFirst = polymorphicFloatStore(floatStoreA, 1.25);
+let floatStoreMiss = polymorphicFloatStore(floatStoreB, 2.5);
 inheritedSetter(setterReceiver);
 let throwName = "";
 try { throwingSetter(throwingReceiver); } catch (e) { throwName = e.message; }
@@ -128,6 +140,8 @@ delete Number.prototype.jitStore;
 JSON.stringify([
   own.x,
   transitionObjects[7].x,
+  floatStoreFirst,
+  floatStoreMiss,
   setterCalls,
   setterSum,
   throwCalls,
@@ -171,7 +185,7 @@ fn store_property_misses_complete_in_place_with_interpreter_parity() {
     let (oracle, _, _) = run(JitSelection::InterpreterOnly);
     assert_eq!(
         oracle,
-        "[7,7,6,15,4,3,\"setter boom\",\"TypeError\",false,6,5,5,15,6,576]"
+        "[7,7,3,4.25,6,15,4,3,\"setter boom\",\"TypeError\",false,6,5,5,15,6,576]"
     );
     let (compiled, osr_attempts, property_stubs) = run(JitSelection::Template);
     assert_eq!(compiled, oracle);

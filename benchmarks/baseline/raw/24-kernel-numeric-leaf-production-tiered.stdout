@@ -1,0 +1,127 @@
+{
+  "benchmark": {
+    "suite": "engine",
+    "name": "kernel-numeric-leaf",
+    "parameters": {
+      "expected": "-700000",
+      "function": "engineKernel",
+      "source": "benchmarks/scripts/numeric-leaf.js"
+    }
+  },
+  "provenance": {
+    "capturedAtUnixMs": 1784388494511,
+    "commit": "bdb28d84c6ae5004bf8c82e94da554097b1922e6",
+    "dirty": false,
+    "platform": {
+      "os": "macos",
+      "arch": "aarch64",
+      "kernel": "Darwin 25.5.0",
+      "cpu": "aarch64"
+    },
+    "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2",
+    "buildProfile": "release"
+  },
+  "configuration": {
+    "surface": "vm",
+    "jitPolicy": "production-tiered",
+    "jitOsrThreshold": null,
+    "gcPolicy": "normal",
+    "gcStressStride": null,
+    "runtimeReuse": "not-applicable",
+    "cacheState": "not-applicable"
+  },
+  "sampling": {
+    "warmupCount": 5,
+    "sampleCount": 20,
+    "iterationsPerSample": 1,
+    "timeoutMs": null
+  },
+  "metrics": [
+    {
+      "name": "wall-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "primary",
+      "samples": [
+        12465000,
+        12476292,
+        12553167,
+        12465209,
+        16758958,
+        29438750,
+        15816208,
+        12950542,
+        12752167,
+        13661709,
+        13774292,
+        12393334,
+        12423417,
+        12535625,
+        14396959,
+        13155917,
+        12536417,
+        12464250,
+        12628667,
+        15033083
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 12690417
+      }
+    },
+    {
+      "name": "execution-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        12465000,
+        12476292,
+        12553167,
+        12465209,
+        16758958,
+        29438750,
+        15816208,
+        12950542,
+        12752167,
+        13661709,
+        13774292,
+        12393334,
+        12423417,
+        12535625,
+        14396959,
+        13155917,
+        12536417,
+        12464250,
+        12628667,
+        15033083
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 12690417
+      }
+    }
+  ],
+  "outcome": {
+    "status": "validated",
+    "validationMarker": "return=-700000;bits=0xc1255cc000000000;function=engineKernel",
+    "processExitCode": null,
+    "failure": null
+  },
+  "command": [
+    "target/release/otter-engine-benchmark",
+    "kernel",
+    "--source",
+    "benchmarks/scripts/numeric-leaf.js",
+    "--function",
+    "engineKernel",
+    "--expected",
+    "-700000",
+    "--jit-tier",
+    "production-tiered",
+    "--samples",
+    "20",
+    "--warmup",
+    "5"
+  ]
+}

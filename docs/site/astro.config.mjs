@@ -86,7 +86,10 @@ export default defineConfig({
 				},
 				{
 					label: 'Performance',
-					items: [{ label: 'Startup', slug: 'performance/startup' }],
+					items: [
+						{ label: 'Engine Baselines', slug: 'performance/baselines' },
+						{ label: 'Startup', slug: 'performance/startup' },
+					],
 				},
 				{
 					label: 'Deployment',

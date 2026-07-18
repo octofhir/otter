@@ -40,3 +40,8 @@ path = "src/main.rs"
 name = "otter-engine-benchmark"
 path = "src/bin/engine.rs"
 required-features = ["engine"]
+
+[[bin]]
+name = "otter-engine-baseline"
+path = "src/bin/baseline.rs"
+required-features = ["engine"]

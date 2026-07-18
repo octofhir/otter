@@ -443,6 +443,7 @@ impl Interpreter {
     pub(crate) fn invalidate_jit_function(&mut self, fid: u32) {
         self.jit_optimized_code.remove(&fid);
         self.jit_optimized_code_cache = None;
+        self.jit_direct_call_cache = None;
         self.jit_code.remove(&fid);
         self.jit_entry_osr_only.remove(&fid);
         self.jit_code_cache = None;

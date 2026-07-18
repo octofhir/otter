@@ -960,6 +960,13 @@ pub struct Interpreter {
         rustc_hash::FxHashMap<u32, Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
     /// Single-entry cache over [`Self::jit_optimized_code`] for hot leaf calls.
     jit_optimized_code_cache: Option<(u32, std::sync::Arc<dyn jit::JitFunctionCode>)>,
+    /// Single-entry direct-call plan cache for the last optimizing callee.
+    ///
+    /// Unlike `jit_optimized_code_cache`, this snapshots the registry-derived
+    /// entry cell and its invalidation epoch. A repeated compiled→compiled call
+    /// therefore skips both installed-code map probes and registry dependency
+    /// walks after freshly decoding the current callable.
+    jit_direct_call_cache: Option<jit::JitDirectCallCache>,
     /// Feedback epoch at which a hot function last failed optimizing compilation.
     /// A back-edge only re-attempts the whole-body optimizer when the epoch has
     /// advanced, so a structurally-ineligible body is not recompiled on every hot

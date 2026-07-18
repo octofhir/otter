@@ -10,8 +10,11 @@
 //!   effective `this`, and exact SELF are never taken from a call-site cache.
 //! - Inherited closure upvalues remain an allocation-neutral stable source;
 //!   owner publication roots the exact callable instead of cloning its spine.
-//! - A [`frame::ResolvedCallTarget`] owns the exact code `Arc` whose scalar
-//!   entry plan it carries; owner publication pins that same `Arc`.
+//! - The registry retains every installed code generation. Method resolution
+//!   additionally carries the exact code `Arc` needed by its cache; hot plain
+//!   calls reuse the isolate cache owner without cloning it per invocation.
+//! - An optimizing plan can be reused only when its freshly decoded function
+//!   id and the registry invalidation epoch both match the cached record.
 //! - Resolution returns `None` before entering synchronous re-entry; only
 //!   [`frame::prepare_jit_resolved_call`] owns the prepare transaction.
 //!
@@ -115,7 +118,45 @@ impl Interpreter {
         callable: Value,
         effective_this: Value,
     ) -> Option<frame::ResolvedCallTarget<'a>> {
+        self.resolve_jit_call_target_impl(context, callable, effective_this, true)
+    }
+
+    /// Resolve a plain call while letting a hot plan-cache hit borrow the
+    /// isolate-owned code lifetime instead of cloning its `Arc`.
+    fn resolve_jit_plain_call_target<'a>(
+        &mut self,
+        context: &'a ExecutionContext,
+        callable: Value,
+        effective_this: Value,
+    ) -> Option<frame::ResolvedCallTarget<'a>> {
+        self.resolve_jit_call_target_impl(context, callable, effective_this, false)
+    }
+
+    fn resolve_jit_call_target_impl<'a>(
+        &mut self,
+        context: &'a ExecutionContext,
+        callable: Value,
+        effective_this: Value,
+        retain_code: bool,
+    ) -> Option<frame::ResolvedCallTarget<'a>> {
         let decoded = self.decode_jit_call_target(context, callable, effective_this, None)?;
+        let plan_epoch = self.jit_code_registry.invalidation_epoch();
+        if !retain_code
+            && let Some(cache) = &self.jit_direct_call_cache
+            && cache.function_id == decoded.function.id
+            && cache.plan_epoch == plan_epoch
+        {
+            debug_assert_eq!(cache.plan.function_id, decoded.function.id);
+            return Some(frame::ResolvedCallTarget {
+                function: decoded.function,
+                parent_upvalues: decoded.parent_upvalues,
+                self_value: decoded.self_value,
+                this_value: decoded.this_value,
+                plan: cache.plan,
+                tier: cache.tier,
+                code: None,
+            });
+        }
         let (plan, code) =
             if let Some(optimized) = self.installed_optimized_direct_call_code(decoded.function) {
                 optimized
@@ -123,13 +164,15 @@ impl Interpreter {
                 let baseline = self.jit_resolve_compiled_cached(decoded.function.id)?;
                 self.promote_direct_call_code(context, decoded.function, baseline)?
             };
+        let tier = code.native_frame_kind();
         Some(frame::ResolvedCallTarget {
             function: decoded.function,
             parent_upvalues: decoded.parent_upvalues,
             self_value: decoded.self_value,
             this_value: decoded.this_value,
             plan,
-            code,
+            tier,
+            code: retain_code.then_some(code),
         })
     }
 
@@ -175,13 +218,15 @@ impl Interpreter {
             self.promote_direct_call_code(context, decoded.function, code)?
         };
 
+        let tier = code.native_frame_kind();
         Some(frame::ResolvedCallTarget {
             function: decoded.function,
             parent_upvalues: decoded.parent_upvalues,
             self_value: decoded.self_value,
             this_value: decoded.this_value,
             plan,
-            code,
+            tier,
+            code: Some(code),
         })
     }
 
@@ -193,6 +238,14 @@ impl Interpreter {
         function: &crate::executable::CodeBlock,
     ) -> Option<(jit::JitDirectCallPlan, Arc<dyn jit::JitFunctionCode>)> {
         let fid = function.id;
+        let plan_epoch = self.jit_code_registry.invalidation_epoch();
+        if let Some(cache) = &self.jit_direct_call_cache
+            && cache.function_id == fid
+            && cache.plan_epoch == plan_epoch
+        {
+            debug_assert_eq!(cache.plan.function_id, fid);
+            return Some((cache.plan, cache.code.clone()));
+        }
         let code = if let Some((cached_fid, code)) = &self.jit_optimized_code_cache
             && *cached_fid == fid
             && self.jit_code_registry.is_current_for_entry(code.as_ref())
@@ -209,6 +262,13 @@ impl Interpreter {
         let plan = self
             .jit_code_registry
             .direct_call_plan(function, code.as_ref())?;
+        self.jit_direct_call_cache = Some(jit::JitDirectCallCache {
+            function_id: fid,
+            plan,
+            code: code.clone(),
+            tier: code.native_frame_kind(),
+            plan_epoch,
+        });
         Some((plan, code))
     }
 
@@ -227,6 +287,15 @@ impl Interpreter {
         let plan = self
             .jit_code_registry
             .direct_call_plan(function, code.as_ref())?;
+        if code.native_frame_kind() == native_abi::NativeFrameKind::Optimizing {
+            self.jit_direct_call_cache = Some(jit::JitDirectCallCache {
+                function_id: function.id,
+                plan,
+                code: code.clone(),
+                tier: code.native_frame_kind(),
+                plan_epoch: self.jit_code_registry.invalidation_epoch(),
+            });
+        }
         Some((plan, code))
     }
 
@@ -330,7 +399,11 @@ impl Interpreter {
             key,
             method,
             target.function.id,
-            target.code.clone(),
+            target
+                .code
+                .as_ref()
+                .expect("method resolution retains its exact code owner")
+                .clone(),
             target.plan,
         );
 
@@ -360,7 +433,8 @@ impl Interpreter {
             self.jit_runtime_stats.runtime_calls.saturating_add(1);
         // SAFETY: `callee_reg` is a compiler-emitted index into the caller window.
         let callee = unsafe { *caller_regs.add(callee_reg as usize) };
-        let Some(target) = self.resolve_jit_call_target(context, callee, Value::undefined()) else {
+        let Some(target) = self.resolve_jit_plain_call_target(context, callee, Value::undefined())
+        else {
             return Ok(None);
         };
         self.prepare_jit_resolved_call(target, arg_regs, caller_regs)

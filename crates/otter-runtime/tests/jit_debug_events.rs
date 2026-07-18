@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - Default-off behavior and ordered template compile events.
+//! - Optimizing OSR consumes unary feedback without an immediate side exit.
 //! - Abrupt completion followed by explicit report draining.
 //! - Report ownership across full GC, later allocation, and nested JIT entry.
 //! - Async [`otter_runtime::Otter`] event-loop success and abrupt-failure
@@ -22,6 +23,8 @@ use otter_runtime::{
     JitDebugEvent, JitDebugRequest, JitDebugTarget, JitDebugTier, JitSelection, Otter, Runtime,
     SourceInput,
 };
+#[cfg(target_arch = "aarch64")]
+use otter_runtime::JitDebugCompileOutcome;
 
 const HOT_LOOP: &str = r#"
 let total = 0;
@@ -142,6 +145,62 @@ fn template_osr_emits_ordered_compile_events() {
             }
         )),
         "threshold-one loop must exercise the template OSR request"
+    );
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn unary_feedback_keeps_extracted_native_call_loop_optimized() {
+    let mut runtime = Runtime::builder()
+        .jit_selection(JitSelection::ProductionTiered)
+        .jit_osr_threshold(1)
+        .jit_debug(JitDebugRequest::events())
+        .build()
+        .expect("production-tiered runtime with events");
+    let result = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+(function () {
+  const target = Math.abs;
+  let sum = 0;
+  for (let i = 0; i < 128; i = i + 1) {
+    sum = sum + target(-1);
+  }
+  return sum;
+})();
+"#,
+            ),
+            "jit-debug-unary-feedback.js",
+        )
+        .expect("extracted native call loop");
+    let report = result
+        .jit_debug_report()
+        .expect("enabled run owns a report");
+
+    assert_eq!(result.completion_string(), "128");
+    assert!(
+        report.events().iter().any(|event| matches!(
+            event,
+            JitDebugEvent::CompileFinished {
+                tier: JitDebugTier::Optimizing,
+                outcome: JitDebugCompileOutcome::Compiled { .. },
+                ..
+            }
+        )),
+        "fixture must compile its loop through optimizing OSR: {:?}",
+        report.events()
+    );
+    assert!(
+        !report.events().iter().any(|event| matches!(
+            event,
+            JitDebugEvent::Bail {
+                tier: JitDebugTier::Optimizing,
+                ..
+            }
+        )),
+        "recorded unary feedback must prevent an immediate optimizing bail: {:?}",
+        report.events()
     );
 }
 

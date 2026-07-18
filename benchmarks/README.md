@@ -46,11 +46,41 @@ Tier choice is explicit whenever a workload permits tier selection:
 - `template` uses the production template compiler only.
 - `production-tiered` uses the current production tier policy.
 
-`call` and `module` require `--jit-tier`; their optional
+`call`, `kernel`, and `module` require `--jit-tier`; their optional
 `--jit-osr-threshold` records a deliberate threshold override. `jit-compile`
 always measures the template compiler, and `memory` always measures the
 interpreter with a post-run full GC, so those commands do not accept a tier
 argument. Do not infer a benchmark tier from legacy JIT environment variables.
+
+### JavaScript kernel corpus
+
+Engine-only JavaScript kernels live in `benchmarks/scripts/`. Each file is a
+plain script that declares one global, zero-argument `engineKernel` function.
+Loading and compiling the file, compiling the invocation stub, and evaluating
+top-level fixture setup happen outside measured samples. A measured sample
+executes the precompiled global lookup and `engineKernel()` call, and accepts
+only the exact finite `Number` listed below. Kernels must not read clocks,
+print output, access the filesystem, install packages, or depend on host APIs.
+
+| Fixture | Engine signal | Exact result |
+| --- | --- | ---: |
+| `method-call-monomorphic.js` | Stable receiver shape and monomorphic method dispatch | `500003500000` |
+| `branch-phi.js` | Alternating control flow and numeric value merge | `-6000000` |
+| `boxed-double-property.js` | Repeated double-valued object property loads | `4000000` |
+| `dense-array.js` | Repeated dense indexed array loads | `5234688` |
+
+Run one fixture per isolate. Warmups and measured samples reuse that isolate
+and the same precompiled invocation stub, but every invocation must return the
+same exact result. The fixtures contain no timers or validation output; the
+harness owns timing, tier selection, sampling, and checksum validation.
+
+```bash
+cargo run --release -p otter-benchmark --features engine \
+  --bin otter-engine-benchmark -- \
+  kernel --source benchmarks/scripts/method-call-monomorphic.js \
+  --function engineKernel --expected 500003500000 \
+  --jit-tier production-tiered --samples 20 --warmup 3
+```
 
 ### Call execution
 
@@ -156,12 +186,12 @@ keep the recorder alive past the declared wall cap.
 
 ## Capturing a baseline
 
-The baseline driver owns one fixed, ordered 18-case engine matrix: bytecode
+The baseline driver owns one fixed, ordered 30-case engine matrix: bytecode
 calls at arity 0 and 4 across all tiers, the extracted host call across all
-tiers, exact-artifact template compilation, forced-full-GC allocation churn,
-fresh and reused module runtimes across all tiers, and isolated package-import
-resolution. It runs serially and does not install packages, enable Web/Node
-surfaces, or start a profiler.
+tiers, four JavaScript kernels across all tiers, exact-artifact template
+compilation, forced-full-GC allocation churn, fresh and reused module runtimes
+across all tiers, and isolated package-import resolution. It runs serially and
+does not install packages, enable Web/Node surfaces, or start a profiler.
 
 Capture from a clean commit with the release driver:
 
@@ -182,7 +212,7 @@ record.
 
 The driver rejects `OTTER_JIT*`, `OTTER_GC*`, and `RUST_LOG` overrides so the
 recorded configuration remains the complete performance policy. A capture is
-publishable only when all 18 exact commands returned zero, every result passes
+publishable only when all 30 exact commands returned zero, every result passes
 the live contract, every result is clean/release/baseline-eligible, and commit,
 platform, toolchain, argv, configuration, and sampling protocol remain
 identical to the fixed matrix.
@@ -195,11 +225,13 @@ cargo run --locked --release -p otter-benchmark --features engine \
   --capture benchmarks/results/engine-<commit>-<timestamp>
 ```
 
-`publish` revalidates every byte and regenerates the summary before atomically
-creating the one current `benchmarks/baseline/` directory. It refuses an
-existing output directory, incomplete capture, changed/dirty HEAD, edited
-summary, non-scoreable row, legacy tier, or mismatched provenance. There is no
-format generation, compatibility reader, or fallback to archived data.
+`publish` revalidates every byte and regenerates the summary before installing
+the one current `benchmarks/baseline/` directory. An existing current baseline
+is moved to ignored staging and restored if installation fails; a successful
+publication removes it. The command refuses an incomplete capture,
+changed/dirty HEAD, edited summary, non-scoreable row, legacy tier, or
+mismatched provenance. There is no format generation, compatibility reader, or
+fallback to archived data.
 
 Raw logs and local captures belong under `benchmarks/results/`, which is
 ignored by git. A curated baseline must retain non-scoreable observations

@@ -483,8 +483,9 @@ Practical rules when adding/altering APIs:
     process/runtime samples across a controlled post-full-GC idle window. Do
     not infer a benchmark tier from legacy JIT environment variables.
   - `module --runtime-reuse=fresh-per-sample` uses a new runtime for every
-    measured execution; `reused-across-samples` reuses one validated runtime.
-    Runtime reuse is not a module-cache hit.
+    warmup and measured execution, discarding warmup runtimes;
+    `reused-across-samples` reuses one validated runtime. Runtime reuse is not
+    a module-cache hit.
   - Every command emits the one live machine-readable result format. Format
     changes are hard breaking: update the runner, fixtures, tests, and
     `benchmarks/README.md` together; do not add compatibility readers or

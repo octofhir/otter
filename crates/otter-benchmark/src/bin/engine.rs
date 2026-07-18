@@ -19,6 +19,8 @@
 //! - Every idle-memory sample owns a fresh release process and runtime.
 //! - Idle-memory diagnostics allocate only in the benchmark process; ordinary
 //!   runtime construction does not enable background sampling.
+//! - Fresh-per-sample module warmups each own and discard a fresh runtime;
+//!   measured samples remain independently fresh.
 //! - Raw observations are retained alongside their median aggregates.
 //! - Every successful record is semantically validated.
 
@@ -2187,15 +2189,18 @@ fn run_module(
             "--jit-osr-threshold requires a JIT tier".into(),
         );
     }
-    if runtime_reuse == RuntimeReuse::FreshPerSample && warmup != 0 {
-        return fail(
-            RunFailureKind::Configuration,
-            "--warmup must be zero when --runtime-reuse=fresh-per-sample".into(),
-        );
-    }
     let mut measurements = Measurements::default();
     match runtime_reuse {
         RuntimeReuse::FreshPerSample => {
+            for _ in 0..warmup {
+                let (mut runtime, _) = match build_runtime(jit_tier, jit_osr_threshold) {
+                    Ok(built) => built,
+                    Err(error) => return fail(RunFailureKind::Runtime, error),
+                };
+                if let Err(error) = validate_module_run(&mut runtime, &entry) {
+                    return fail(RunFailureKind::Runtime, error);
+                }
+            }
             for _ in 0..samples {
                 let (mut runtime, build_time) = match build_runtime(jit_tier, jit_osr_threshold) {
                     Ok(built) => built,
@@ -2431,6 +2436,24 @@ mod tests {
             }
             _ => panic!("expected module command"),
         }
+    }
+
+    #[test]
+    fn fresh_module_warmups_use_discarded_runtimes() {
+        let record = run_module(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../benchmarks/fixtures/engine/module-entry.mjs"),
+            RuntimeReuse::FreshPerSample,
+            EngineJitTier::Interpreter,
+            None,
+            2,
+            3,
+        );
+        assert!(record.failure.is_none(), "{:?}", record.failure);
+        assert_eq!(record.warmup, 3);
+        assert_eq!(record.samples, 2);
+        assert_eq!(record.measurements.wall_time_ns.len(), 2);
+        assert_eq!(record.measurements.runtime_build_time_ns.len(), 2);
     }
 
     #[test]

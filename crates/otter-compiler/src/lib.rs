@@ -190,6 +190,49 @@ mod tests {
     }
 
     #[test]
+    fn register_var_hoist_reuses_undefined_frame_initialization() {
+        let module = compile_script_src("function f() { return value; var value; }");
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name == "f")
+            .expect("compiled f");
+
+        assert!(
+            !function
+                .code
+                .iter()
+                .any(|instruction| matches!(instruction.op, Op::LoadUndefined | Op::StoreLocal)),
+            "register-backed var hoist should not rewrite an already-undefined frame slot"
+        );
+    }
+
+    #[test]
+    fn captured_var_hoist_still_initializes_its_upvalue_cell() {
+        let module = compile_script_src(
+            "function f() { function read() { return value; } return read; var value; }",
+        );
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name == "f")
+            .expect("compiled f");
+
+        assert!(
+            function
+                .code
+                .iter()
+                .any(|instruction| instruction.op == Op::LoadUndefined)
+        );
+        assert!(
+            function
+                .code
+                .iter()
+                .any(|instruction| instruction.op == Op::StoreUpvalue)
+        );
+    }
+
+    #[test]
     fn jsx_element_lowers_to_react_create_element() {
         let module = compile_tsx_script_src("const x = <div id=\"a\">hi</div>;");
         let main = &module.functions[0];

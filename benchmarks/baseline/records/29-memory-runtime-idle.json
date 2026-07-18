@@ -9,8 +9,8 @@
     }
   },
   "provenance": {
-    "capturedAtUnixMs": 1784399783787,
-    "commit": "a61aa7a18faa9e33ce2aa96f260095ce3b507c8b",
+    "capturedAtUnixMs": 1784401741003,
+    "commit": "c3a7d26f9f45ea1b3b7b800268b30503b1c9df75",
     "dirty": false,
     "platform": {
       "os": "macos",
@@ -43,15 +43,15 @@
       "direction": "lower-is-better",
       "role": "diagnostic",
       "samples": [
-        259627584,
-        269950333,
-        264744459,
-        266758125,
-        264643584
+        267887083,
+        278309458,
+        278418084,
+        270284583,
+        266363875
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 264744459
+        "value": 270284583
       }
     },
     {
@@ -60,15 +60,15 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
-        10208,
-        23167,
-        19750,
-        17000,
-        13375
+        9667,
+        22375,
+        22291,
+        26833,
+        9916
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 17000
+        "value": 22291
       }
     },
     {
@@ -94,15 +94,15 @@
       "direction": "lower-is-better",
       "role": "primary",
       "samples": [
-        5206667,
-        12285917,
-        10257042,
-        9936334,
-        10607584
+        5700333,
+        14155750,
+        13376292,
+        13123542,
+        7095625
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 10257042
+        "value": 13123542
       }
     },
     {
@@ -112,14 +112,14 @@
       "role": "secondary",
       "samples": [
         12435456,
-        12451840,
-        12451840,
-        12451840,
-        12500992
+        12533760,
+        12484608,
+        12468224,
+        12517376
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 12451840
+        "value": 12484608
       }
     },
     {
@@ -128,15 +128,15 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
-        13713408,
-        13746176,
         13729792,
-        13713408,
+        13811712,
+        13746176,
+        13746176,
         13795328
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 13729792
+        "value": 13746176
       }
     },
     {
@@ -145,15 +145,15 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
-        13713408,
-        13746176,
         13729792,
-        13713408,
+        13811712,
+        13746176,
+        13746176,
         13795328
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 13729792
+        "value": 13746176
       }
     },
     {
@@ -230,15 +230,15 @@
       "direction": "lower-is-better",
       "role": "secondary",
       "samples": [
-        21310680,
-        21310680,
-        21310680,
-        21310680,
-        21310680
+        21310328,
+        21310328,
+        21310328,
+        21310328,
+        21310328
       ],
       "aggregate": {
         "statistic": "median",
-        "value": 21310680
+        "value": 21310328
       }
     }
   ],

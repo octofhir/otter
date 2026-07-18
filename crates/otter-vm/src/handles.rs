@@ -741,12 +741,12 @@ impl Interpreter {
         flags: crate::object::PropertyFlags,
     ) -> Result<(), VmError> {
         let receiver = self.handle_arena.get(obj.index());
-        let stored = self.handle_arena.get(value.index());
-        let descriptor = crate::object::PropertyDescriptor {
-            kind: crate::object::DescriptorKind::Data { value: stored },
-            flags,
-        };
         if let Some(native) = receiver.as_native_function() {
+            let stored = self.handle_arena.get(value.index());
+            let descriptor = crate::object::PropertyDescriptor {
+                kind: crate::object::DescriptorKind::Data { value: stored },
+                flags,
+            };
             return if native.define_own_property(&mut self.gc_heap, key, descriptor) {
                 Ok(())
             } else {
@@ -759,6 +759,14 @@ impl Interpreter {
             crate::property_dispatch::set_ensure_expando_pub(&mut self.gc_heap, set)?
         } else {
             return Err(VmError::TypeMismatch);
+        };
+        // A Set creates its expando lazily. That allocation can move `value`,
+        // so resolve the stored handle only after the receiver-specific
+        // allocation has completed.
+        let stored = self.handle_arena.get(value.index());
+        let descriptor = crate::object::PropertyDescriptor {
+            kind: crate::object::DescriptorKind::Data { value: stored },
+            flags,
         };
         if crate::object::define_own_property(object, &mut self.gc_heap, key, descriptor) {
             Ok(())

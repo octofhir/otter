@@ -24,9 +24,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use otter_benchmark::{
-    BenchmarkConfiguration, BenchmarkIdentity, BenchmarkResult, CacheState, ExecutionSurface,
-    GcPolicy, JitPolicy, MetricRole, MetricValue, RuntimeReuse, SamplingPlan,
-    current_build_profile,
+    BenchmarkConfiguration, BenchmarkIdentity, BenchmarkResult, CacheState,
+    ENGINE_COMPILE_FEEDBACK_SEED_CALLS, ExecutionSurface, GcPolicy, JitPolicy, MetricRole,
+    MetricValue, RuntimeReuse, SamplingPlan, current_build_profile,
 };
 use serde::{Deserialize, Serialize};
 
@@ -50,7 +50,7 @@ struct KernelSpec {
     samples: u32,
 }
 
-const KERNELS: [KernelSpec; 4] = [
+const KERNELS: [KernelSpec; 5] = [
     KernelSpec {
         slug: "method-call-monomorphic",
         source: "benchmarks/scripts/method-call-monomorphic.js",
@@ -78,6 +78,13 @@ const KERNELS: [KernelSpec; 4] = [
         expected: "5234688",
         warmups: 5,
         samples: 15,
+    },
+    KernelSpec {
+        slug: "numeric-leaf",
+        source: "benchmarks/scripts/numeric-leaf.js",
+        expected: "-700000",
+        warmups: 5,
+        samples: 20,
     },
 ];
 
@@ -346,8 +353,76 @@ fn kernel_case(spec: KernelSpec, tier: Tier) -> BaselineCase {
     }
 }
 
+fn compile_case(
+    slug: &str,
+    source: &str,
+    function: &str,
+    expected: &str,
+    arguments: &[&str],
+    compile_tier: &str,
+    jit_policy: JitPolicy,
+    expected_backend: Option<&str>,
+) -> BaselineCase {
+    let mut args = vec![
+        "jit-compile".into(),
+        "--source".into(),
+        source.into(),
+        "--function".into(),
+        function.into(),
+        "--expected".into(),
+        expected.into(),
+        "--compile-tier".into(),
+        compile_tier.into(),
+    ];
+    for argument in arguments {
+        args.push("--argument".into());
+        args.push((*argument).into());
+    }
+    if let Some(backend) = expected_backend {
+        args.push("--expect-backend".into());
+        args.push(backend.into());
+    }
+    args.extend([
+        "--samples".into(),
+        COMPILE_SAMPLES.to_string(),
+        "--warmup".into(),
+        COMPILE_WARMUPS.to_string(),
+    ]);
+
+    let mut benchmark_parameters = parameters([
+        ("source", source.into()),
+        ("function", function.into()),
+        ("expected", expected.into()),
+        ("arguments", arguments.join(",")),
+        (
+            "feedbackSeedCalls",
+            ENGINE_COMPILE_FEEDBACK_SEED_CALLS.to_string(),
+        ),
+    ]);
+    if let Some(backend) = expected_backend {
+        benchmark_parameters.insert("expectedBackend".into(), backend.into());
+    }
+
+    BaselineCase {
+        id: format!("jit-compile-{slug}-{compile_tier}"),
+        args,
+        benchmark: BenchmarkIdentity {
+            suite: "engine".into(),
+            name: format!("jit-compile-{function}"),
+            parameters: benchmark_parameters,
+        },
+        configuration: configuration(
+            ExecutionSurface::Vm,
+            jit_policy,
+            GcPolicy::Normal,
+            RuntimeReuse::NotApplicable,
+        ),
+        sampling: sampling(COMPILE_WARMUPS, COMPILE_SAMPLES, 1),
+    }
+}
+
 fn baseline_cases() -> Vec<BaselineCase> {
-    let mut cases = Vec::with_capacity(30);
+    let mut cases = Vec::with_capacity(35);
     for arity in [0, 4] {
         for tier in TIERS {
             cases.push(call_case("bytecode", arity, tier));
@@ -361,38 +436,36 @@ fn baseline_cases() -> Vec<BaselineCase> {
             cases.push(kernel_case(spec, tier));
         }
     }
-    cases.push(BaselineCase {
-        id: "jit-compile-engine-target".into(),
-        args: vec![
-            "jit-compile".into(),
-            "--source".into(),
-            "benchmarks/fixtures/engine/jit-compile.js".into(),
-            "--function".into(),
-            "engineJitTarget".into(),
-            "--expected".into(),
-            "3300".into(),
-            "--samples".into(),
-            COMPILE_SAMPLES.to_string(),
-            "--warmup".into(),
-            COMPILE_WARMUPS.to_string(),
-        ],
-        benchmark: BenchmarkIdentity {
-            suite: "engine".into(),
-            name: "jit-compile-engineJitTarget".into(),
-            parameters: parameters([
-                ("source", "benchmarks/fixtures/engine/jit-compile.js".into()),
-                ("function", "engineJitTarget".into()),
-                ("expected", "3300".into()),
-            ]),
-        },
-        configuration: configuration(
-            ExecutionSurface::Vm,
-            JitPolicy::Template,
-            GcPolicy::Normal,
-            RuntimeReuse::NotApplicable,
-        ),
-        sampling: sampling(COMPILE_WARMUPS, COMPILE_SAMPLES, 1),
-    });
+    cases.push(compile_case(
+        "engine-target",
+        "benchmarks/fixtures/engine/jit-compile.js",
+        "engineJitTarget",
+        "33",
+        &["1", "2"],
+        "template",
+        JitPolicy::Template,
+        None,
+    ));
+    cases.push(compile_case(
+        "numeric-leaf",
+        "benchmarks/scripts/numeric-leaf.js",
+        "engineNumericLeaf",
+        "-7",
+        &["2", "2"],
+        "template",
+        JitPolicy::Template,
+        None,
+    ));
+    cases.push(compile_case(
+        "numeric-leaf",
+        "benchmarks/scripts/numeric-leaf.js",
+        "engineNumericLeaf",
+        "-7",
+        &["2", "2"],
+        "optimizing",
+        JitPolicy::Optimizing,
+        Some("cranelift-numeric-leaf"),
+    ));
     cases.push(BaselineCase {
         id: "memory-forced-full".into(),
         args: vec![
@@ -1219,7 +1292,7 @@ mod tests {
     #[test]
     fn matrix_is_exact_engine_only_and_unique() {
         let cases = baseline_cases();
-        assert_eq!(cases.len(), 30);
+        assert_eq!(cases.len(), 35);
         let ids = cases
             .iter()
             .map(|case| case.id.as_str())
@@ -1254,8 +1327,23 @@ mod tests {
                 .iter()
                 .filter(|case| case.args.first().is_some_and(|arg| arg == "kernel"))
                 .count(),
-            12
+            15
         );
+        assert_eq!(
+            cases
+                .iter()
+                .filter(|case| case.args.first().is_some_and(|arg| arg == "jit-compile"))
+                .count(),
+            3
+        );
+        assert!(cases.iter().any(|case| {
+            case.id == "jit-compile-numeric-leaf-optimizing"
+                && case.configuration.jit_policy == JitPolicy::Optimizing
+                && case
+                    .args
+                    .windows(2)
+                    .any(|pair| pair == ["--expect-backend", "cranelift-numeric-leaf"])
+        }));
     }
 
     #[test]
@@ -1295,6 +1383,10 @@ mod tests {
         let value = serde_json::to_value(manifest).unwrap();
         assert!(value.get("version").is_none());
         assert!(value.get("schemaVersion").is_none());
+
+        let record_value = serde_json::to_value(record_for(case, case.argv("engine"))).unwrap();
+        assert!(record_value.get("version").is_none());
+        assert!(record_value.get("schemaVersion").is_none());
     }
 
     #[test]
@@ -1401,7 +1493,7 @@ mod tests {
         let first = render_summary(&manifest, &records);
         let second = render_summary(&manifest, &records);
         assert_eq!(first, second);
-        assert_eq!(first.matches("\n| ").count(), 32);
+        assert_eq!(first.matches("\n| ").count(), 37);
         assert!(first.contains("production-tiered"));
     }
 }

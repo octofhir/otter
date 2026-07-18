@@ -13,16 +13,19 @@ workspace = true
 [features]
 default = []
 engine = [
+    "dep:otter-bytecode",
     "dep:otter-compiler",
     "dep:otter-jit",
     "dep:otter-runtime",
     "dep:otter-syntax",
     "dep:otter-vm",
+    "dep:smallvec",
 ]
 rss = ["dep:sysinfo"]
 
 [dependencies]
 clap = { workspace = true }
+otter-bytecode = { workspace = true, optional = true }
 otter-compiler = { workspace = true, optional = true }
 otter-jit = { workspace = true, optional = true }
 otter-runtime = { workspace = true, optional = true }
@@ -30,6 +33,7 @@ otter-syntax = { workspace = true, optional = true }
 otter-vm = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+smallvec = { workspace = true, optional = true }
 sysinfo = { workspace = true, optional = true }
 
 [[bin]]

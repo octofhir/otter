@@ -50,14 +50,15 @@ needed to optimize the VM and JIT safely.
 - [x] Owned, schema-versioned JIT compile bundles through
   `--jit-artifacts[=<directory>]`: exact runtime-local code, bytecode,
   template plan or optimized IR, typed symbolic relocations, portable
-  normalized code, native offset maps, deopt metadata, and safepoints. The CLI
-  writes a new root atomically under a cooperative single-writer contract and
-  never intentionally merges with an existing target.
+  normalized code, annotated ARM64 assembly, native offset maps, deopt
+  metadata, and safepoints. The CLI writes a new root atomically under a
+  cooperative single-writer contract and never intentionally merges with an
+  existing target.
 
 The text step trace is not a Chrome/Perfetto trace. Async/op tracing, timeout
-ring-buffer dumps, Test262 failure traces, and annotated assembly are not
-shipped yet. Structured JIT events and artifact manifests are Otter diagnostic
-schemas, not replacements for the planned Chrome/Perfetto timeline.
+ring-buffer dumps, and Test262 failure traces are not shipped yet. Structured
+JIT events and artifact manifests are Otter diagnostic schemas, not
+replacements for the planned Chrome/Perfetto timeline.
 
 ## Known Debt
 
@@ -72,12 +73,13 @@ schemas, not replacements for the planned Chrome/Perfetto timeline.
   not write a misleading empty artifact; bounded timeout snapshots remain a
   later slice.
 - Exact native bytes and native-offset maps are available alongside typed
-  symbolic relocations and a portable semantic code stream. The normalized
-  stream is intentionally not executable and still lacks annotated
-  disassembly.
+  symbolic relocations, a portable semantic code stream, and offset-based
+  annotated ARM64 assembly. The normalized stream is intentionally not
+  executable; assembly address sites remain symbolic and redact resolved
+  process-local values.
 - Bytecode PC, tier plan/IR, native code offsets, OSR entries, and deopt exits
-  can be correlated. Safepoint-to-native-return offsets and annotated
-  disassembly remain open.
+  can be correlated. Safepoint-to-native-return offsets remain open and stay
+  explicit `null` in `safepoints.json`.
 - Successful JIT compile events join to artifact manifests by `codeObjectId`.
   Native entry, side-exit, and deopt execution counters remain open.
 
@@ -118,7 +120,7 @@ re-entry, full-GC ownership, typed relocations, and portable code comparison
 are covered. Recompilation and abrupt compiler failure remain follow-ups in
 this roadmap item.
 
-Planned bundle shape:
+Bundle shape:
 
 ```text
 jit-<ordinal>-<tier>-f<function-id>/
@@ -139,16 +141,26 @@ manifest rather than emitted as placeholders.
 
 ### 3. Annotated ARM64 assembly
 
-- [ ] Disassemble emitted AArch64 bytes without executing them.
-- [ ] Annotate native offsets with function, entry kind, bytecode PC,
+- [x] Disassemble emitted AArch64 bytes without executing them.
+- [x] Annotate native offsets with function, entry kind, bytecode PC,
   template operation or optimized IR instruction, runtime transition,
-  safepoint, and deopt/side-exit id when known.
-- [ ] Use code offsets in annotations and render baked address sites as
+  OSR entry, and deopt/side-exit id when known. Safepoints are included as an
+  explicit summary with unavailable native offsets rather than attached to a
+  fabricated instruction.
+- [x] Use code offsets in annotations and render baked address sites as
   symbolic relocations. Never print absolute executable addresses in ASM;
   exact `code.bin` remains explicitly runtime-local.
 - [ ] Add golden tests for branches, calls, safepoints, OSR entries, and deopt
   exits.
+- [ ] Record exact safepoint native return offsets and join each safepoint to
+  the corresponding assembly range.
 - [ ] Add a separate runtime code-range map only for live profiler symbolization.
+
+Deterministic unit coverage is green for direct branch/call labels, relocation
+redaction, decoder `.word` fallback, OSR annotations, deopt summaries/region
+joins, and the explicit safepoint-unavailable summary. The combined golden item
+remains open until emission records a real safepoint return offset and a test
+can cover that exact native range without inference.
 
 ### 4. JIT-aware profiling and traces
 
@@ -171,7 +183,7 @@ manifest rather than emitted as placeholders.
 ### 6. Documentation and compatibility
 
 - [x] Add a docs-site JIT debugging guide once the artifact CLI is real.
-- [ ] Document bundle schemas, annotated assembly, source correlation, and
+- [x] Document bundle schemas, annotated assembly, source correlation, and
   before/after optimization workflow.
 - [ ] Add compatibility tests that load every machine-readable output in its
   target tool or validate the corresponding published schema.

@@ -7,6 +7,7 @@
 //! - [`CodeMapCapture`] and [`CodeRegion`] — emission-order native offset
 //!   correlation.
 //! - [`relocation`] — typed address sites and portable semantic code.
+//! - [`assembly`] — deterministic annotated AArch64 disassembly.
 //! - Deterministic bytecode, safepoint, deopt, and bundle renderers.
 //!
 //! # Invariants
@@ -31,6 +32,8 @@
 
 #![cfg_attr(not(target_arch = "aarch64"), allow(dead_code, unused_imports))]
 
+#[cfg(target_arch = "aarch64")]
+mod assembly;
 pub(crate) mod relocation;
 
 use std::fmt::Write as _;
@@ -229,6 +232,29 @@ pub(crate) fn build_bundle(
     let rendered_relocations = relocations
         .render(code.bytes())
         .unwrap_or_else(|error| panic!("compiler built invalid JIT relocations: {error}"));
+    let metadata = JitArtifactMetadata {
+        target: env!("OTTER_JIT_TARGET").to_string(),
+        architecture: std::env::consts::ARCH.to_string(),
+        operating_system: std::env::consts::OS.to_string(),
+        tier: request.tier,
+        function_id: view.code_block.id,
+        function_name: request.identity.function_name,
+        module: request.identity.module,
+        code_object_id,
+        entry: request.entry,
+        bytecode_bytes: u64::from(view.code_block.bytecode_byte_len()),
+        code_bytes: u64::try_from(code.len()).unwrap_or(u64::MAX),
+    };
+    #[cfg(target_arch = "aarch64")]
+    let rendered_assembly = assembly::render(
+        &metadata,
+        code.bytes(),
+        code.entry_offset(),
+        &code_map,
+        &rendered_relocations.validated,
+        deopt_table,
+        safepoints,
+    );
     let mut files = vec![
         JitArtifactFile::text(JitArtifactFileName::Bytecode, render_bytecode(view)),
         JitArtifactFile::text(tier_input_name, tier_input),
@@ -247,25 +273,17 @@ pub(crate) fn build_bundle(
             render_safepoints(safepoints),
         ),
     ];
+    #[cfg(target_arch = "aarch64")]
+    files.push(JitArtifactFile::text(
+        JitArtifactFileName::Assembly,
+        rendered_assembly,
+    ));
     if let Some(table) = deopt_table {
         files.push(JitArtifactFile::text(
             JitArtifactFileName::Deopt,
             render_deopt(table),
         ));
     }
-    let metadata = JitArtifactMetadata {
-        target: env!("OTTER_JIT_TARGET").to_string(),
-        architecture: std::env::consts::ARCH.to_string(),
-        operating_system: std::env::consts::OS.to_string(),
-        tier: request.tier,
-        function_id: view.code_block.id,
-        function_name: request.identity.function_name,
-        module: request.identity.module,
-        code_object_id,
-        entry: request.entry,
-        bytecode_bytes: u64::from(view.code_block.bytecode_byte_len()),
-        code_bytes: u64::try_from(code.len()).unwrap_or(u64::MAX),
-    };
     Box::new(
         JitArtifactBundle::new(metadata, files)
             .unwrap_or_else(|error| panic!("compiler built an invalid JIT artifact: {error}")),

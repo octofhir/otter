@@ -358,13 +358,24 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     a cross-process no-clobber primitive.
   - Each compile directory contains exact runtime-local `code.bin`,
     portable semantic `code-normalized.bin`, typed `relocations.json`,
-    `bytecode.txt`, tier input, `code-map.json`, `safepoints.json`, and
-    optimizer `deopt.json` when applicable.
+    annotated ARM64 `asm.txt`, `bytecode.txt`, tier input, `code-map.json`,
+    `safepoints.json`, and optimizer `deopt.json` when applicable.
   - Exact code may contain process addresses and is not a portable golden.
     Compare `code-normalized.bin` across processes; its relocation tokens and
     branch targets are symbolic, and it is not executable. `relocations.json`
     uses exact `code.bin` offsets but never serializes resolved addresses.
-    Annotated `asm.txt` remains a tracked follow-up and is listed absent.
+  - `asm.txt` starts with `; otter jit aarch64 assembly v1` and
+    `; offset-basis=code.bin`. Native locations use `+0x<8-hex>:` offsets,
+    local branch targets use `L<8-hex-offset>` labels, and baked address sites
+    replace the address-bearing sequence with a symbolic `relocation …` line
+    rather than printing its resolved value or immediate chunks.
+    Words the decoder does not recognize remain visible through a `.word`
+    fallback. Join assembly ranges to bytecode/tier operations through
+    `code-map.json`, then inspect `deopt.json` or `safepoints.json` as
+    applicable; safepoint `nativeReturnOffset` is currently explicitly `null`.
+  - Assembly decoding and formatting run only when `--jit-artifacts` is
+    requested. The disabled path does not clone code, disassemble it, or build
+    artifact text.
   - Full workflow and schema notes:
     `docs/site/src/content/docs/engine/jit-debugging.md`.
 - CPU profile + folded flamegraph stacks:

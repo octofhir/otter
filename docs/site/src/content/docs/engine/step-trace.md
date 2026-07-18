@@ -85,9 +85,10 @@ returns to the interpreter.
 Use the trace to establish bytecode order and the last interpreter-visible
 PC. To correlate a compiled function with its bytecode, tier input, exact
 machine-code offsets, safepoints, or deopt exits, capture a
-[JIT artifact bundle](/otter/engine/jit-debugging/). Annotated ARM64 assembly
-remains a tracked follow-up; symbolic relocations and portable normalized code
-are already part of the bundle.
+[JIT artifact bundle](/otter/engine/jit-debugging/). Its `asm.txt` is a static
+annotated view of the exact `code.bin` bytes, with `code.bin`-relative offsets,
+local branch labels, and redacted symbolic relocations. It fills the native
+code-inspection gap but is not a live per-instruction execution trace.
 
 ## Performance
 

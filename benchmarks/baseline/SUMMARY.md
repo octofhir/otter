@@ -1,45 +1,45 @@
 # Otter Engine Baseline
 
-- Commit: `e0d4fe81c801ea20d32174a25172e5fd8cfbc753`
+- Commit: `a61aa7a18faa9e33ce2aa96f260095ce3b507c8b`
 - Outer watchdog: `120000` ms (capture-only; record timeout remains null)
 - Platform: `macos` / `aarch64` / `Darwin 25.5.0` / `aarch64`
 - Toolchain: `rustc 1.96.0 (ac68faa20 2026-05-25) binary: rustc commit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96 commit-date: 2026-05-25 host: aarch64-apple-darwin release: 1.96.0 LLVM version: 22.1.2`
 
 | # | Capture id | Benchmark | JIT | Reuse | Samples | Primary | Unit | Status | Eligible |
 | ---: | --- | --- | --- | --- | ---: | ---: | --- | --- | --- |
-| 1 | `call-bytecode-a0-interpreter` | `call-bytecode-arity-0` | `interpreter` | `not-applicable` | 20 | 45504646.5 | `nanoseconds` | `validated` | yes |
-| 2 | `call-bytecode-a0-template` | `call-bytecode-arity-0` | `template` | `not-applicable` | 20 | 7690750 | `nanoseconds` | `validated` | yes |
-| 3 | `call-bytecode-a0-production-tiered` | `call-bytecode-arity-0` | `production-tiered` | `not-applicable` | 20 | 5184854 | `nanoseconds` | `validated` | yes |
-| 4 | `call-bytecode-a4-interpreter` | `call-bytecode-arity-4` | `interpreter` | `not-applicable` | 20 | 65071729 | `nanoseconds` | `validated` | yes |
-| 5 | `call-bytecode-a4-template` | `call-bytecode-arity-4` | `template` | `not-applicable` | 20 | 8205979.5 | `nanoseconds` | `validated` | yes |
-| 6 | `call-bytecode-a4-production-tiered` | `call-bytecode-arity-4` | `production-tiered` | `not-applicable` | 20 | 5712021 | `nanoseconds` | `validated` | yes |
-| 7 | `call-host-a1-interpreter` | `call-host-arity-1` | `interpreter` | `not-applicable` | 20 | 48214333.5 | `nanoseconds` | `validated` | yes |
-| 8 | `call-host-a1-template` | `call-host-arity-1` | `template` | `not-applicable` | 20 | 7716645.5 | `nanoseconds` | `validated` | yes |
-| 9 | `call-host-a1-production-tiered` | `call-host-arity-1` | `production-tiered` | `not-applicable` | 20 | 6947354.5 | `nanoseconds` | `validated` | yes |
-| 10 | `kernel-method-call-monomorphic-interpreter` | `kernel-method-call-monomorphic` | `interpreter` | `not-applicable` | 15 | 642197584 | `nanoseconds` | `validated` | yes |
-| 11 | `kernel-method-call-monomorphic-template` | `kernel-method-call-monomorphic` | `template` | `not-applicable` | 15 | 15807875 | `nanoseconds` | `validated` | yes |
-| 12 | `kernel-method-call-monomorphic-production-tiered` | `kernel-method-call-monomorphic` | `production-tiered` | `not-applicable` | 15 | 15766750 | `nanoseconds` | `validated` | yes |
-| 13 | `kernel-branch-phi-interpreter` | `kernel-branch-phi` | `interpreter` | `not-applicable` | 20 | 618618000 | `nanoseconds` | `validated` | yes |
-| 14 | `kernel-branch-phi-template` | `kernel-branch-phi` | `template` | `not-applicable` | 20 | 14151604.5 | `nanoseconds` | `validated` | yes |
-| 15 | `kernel-branch-phi-production-tiered` | `kernel-branch-phi` | `production-tiered` | `not-applicable` | 20 | 7354021.5 | `nanoseconds` | `validated` | yes |
-| 16 | `kernel-boxed-double-property-interpreter` | `kernel-boxed-double-property` | `interpreter` | `not-applicable` | 15 | 524998625 | `nanoseconds` | `validated` | yes |
-| 17 | `kernel-boxed-double-property-template` | `kernel-boxed-double-property` | `template` | `not-applicable` | 15 | 15766125 | `nanoseconds` | `validated` | yes |
-| 18 | `kernel-boxed-double-property-production-tiered` | `kernel-boxed-double-property` | `production-tiered` | `not-applicable` | 15 | 15243958 | `nanoseconds` | `validated` | yes |
-| 19 | `kernel-dense-array-interpreter` | `kernel-dense-array` | `interpreter` | `not-applicable` | 15 | 735224667 | `nanoseconds` | `validated` | yes |
-| 20 | `kernel-dense-array-template` | `kernel-dense-array` | `template` | `not-applicable` | 15 | 13009458 | `nanoseconds` | `validated` | yes |
-| 21 | `kernel-dense-array-production-tiered` | `kernel-dense-array` | `production-tiered` | `not-applicable` | 15 | 7670916 | `nanoseconds` | `validated` | yes |
-| 22 | `kernel-numeric-leaf-interpreter` | `kernel-numeric-leaf` | `interpreter` | `not-applicable` | 20 | 192735021 | `nanoseconds` | `validated` | yes |
-| 23 | `kernel-numeric-leaf-template` | `kernel-numeric-leaf` | `template` | `not-applicable` | 20 | 21776521 | `nanoseconds` | `validated` | yes |
-| 24 | `kernel-numeric-leaf-production-tiered` | `kernel-numeric-leaf` | `production-tiered` | `not-applicable` | 20 | 11588813 | `nanoseconds` | `validated` | yes |
-| 25 | `jit-compile-engine-target-template` | `jit-compile-engineJitTarget` | `template` | `not-applicable` | 100 | 7375 | `nanoseconds` | `validated` | yes |
-| 26 | `jit-compile-numeric-leaf-template` | `jit-compile-engineNumericLeaf` | `template` | `not-applicable` | 100 | 12000 | `nanoseconds` | `validated` | yes |
-| 27 | `jit-compile-numeric-leaf-optimizing` | `jit-compile-engineNumericLeaf` | `optimizing` | `not-applicable` | 100 | 114541.5 | `nanoseconds` | `validated` | yes |
-| 28 | `memory-forced-full` | `memory-allocation-churn-forced-full` | `interpreter` | `not-applicable` | 5 | 1117156167 | `nanoseconds` | `validated` | yes |
-| 29 | `memory-runtime-idle` | `memory-runtime-idle` | `interpreter` | `fresh-per-sample` | 5 | 10525041 | `nanoseconds` | `validated` | yes |
-| 30 | `module-module-entry-fresh-per-sample-interpreter` | `module-phases-module-entry.mjs` | `interpreter` | `fresh-per-sample` | 20 | 131625 | `nanoseconds` | `validated` | yes |
-| 31 | `module-module-entry-fresh-per-sample-template` | `module-phases-module-entry.mjs` | `template` | `fresh-per-sample` | 20 | 133729 | `nanoseconds` | `validated` | yes |
-| 32 | `module-module-entry-fresh-per-sample-production-tiered` | `module-phases-module-entry.mjs` | `production-tiered` | `fresh-per-sample` | 20 | 131291.5 | `nanoseconds` | `validated` | yes |
-| 33 | `module-module-entry-reused-across-samples-interpreter` | `module-phases-module-entry.mjs` | `interpreter` | `reused-across-samples` | 20 | 130583 | `nanoseconds` | `validated` | yes |
-| 34 | `module-module-entry-reused-across-samples-template` | `module-phases-module-entry.mjs` | `template` | `reused-across-samples` | 20 | 120042 | `nanoseconds` | `validated` | yes |
-| 35 | `module-module-entry-reused-across-samples-production-tiered` | `module-phases-module-entry.mjs` | `production-tiered` | `reused-across-samples` | 20 | 158270.5 | `nanoseconds` | `validated` | yes |
-| 36 | `package-entry-fresh-per-sample-interpreter` | `module-phases-entry.mjs` | `interpreter` | `fresh-per-sample` | 20 | 164895.5 | `nanoseconds` | `validated` | yes |
+| 1 | `call-bytecode-a0-interpreter` | `call-bytecode-arity-0` | `interpreter` | `not-applicable` | 20 | 49505708.5 | `nanoseconds` | `validated` | yes |
+| 2 | `call-bytecode-a0-template` | `call-bytecode-arity-0` | `template` | `not-applicable` | 20 | 8084146 | `nanoseconds` | `validated` | yes |
+| 3 | `call-bytecode-a0-production-tiered` | `call-bytecode-arity-0` | `production-tiered` | `not-applicable` | 20 | 5220062.5 | `nanoseconds` | `validated` | yes |
+| 4 | `call-bytecode-a4-interpreter` | `call-bytecode-arity-4` | `interpreter` | `not-applicable` | 20 | 65848625 | `nanoseconds` | `validated` | yes |
+| 5 | `call-bytecode-a4-template` | `call-bytecode-arity-4` | `template` | `not-applicable` | 20 | 9061166.5 | `nanoseconds` | `validated` | yes |
+| 6 | `call-bytecode-a4-production-tiered` | `call-bytecode-arity-4` | `production-tiered` | `not-applicable` | 20 | 5750229 | `nanoseconds` | `validated` | yes |
+| 7 | `call-host-a1-interpreter` | `call-host-arity-1` | `interpreter` | `not-applicable` | 20 | 47917187.5 | `nanoseconds` | `validated` | yes |
+| 8 | `call-host-a1-template` | `call-host-arity-1` | `template` | `not-applicable` | 20 | 7765833.5 | `nanoseconds` | `validated` | yes |
+| 9 | `call-host-a1-production-tiered` | `call-host-arity-1` | `production-tiered` | `not-applicable` | 20 | 6889125 | `nanoseconds` | `validated` | yes |
+| 10 | `kernel-method-call-monomorphic-interpreter` | `kernel-method-call-monomorphic` | `interpreter` | `not-applicable` | 15 | 641150875 | `nanoseconds` | `validated` | yes |
+| 11 | `kernel-method-call-monomorphic-template` | `kernel-method-call-monomorphic` | `template` | `not-applicable` | 15 | 15758125 | `nanoseconds` | `validated` | yes |
+| 12 | `kernel-method-call-monomorphic-production-tiered` | `kernel-method-call-monomorphic` | `production-tiered` | `not-applicable` | 15 | 15782208 | `nanoseconds` | `validated` | yes |
+| 13 | `kernel-branch-phi-interpreter` | `kernel-branch-phi` | `interpreter` | `not-applicable` | 20 | 622725708.5 | `nanoseconds` | `validated` | yes |
+| 14 | `kernel-branch-phi-template` | `kernel-branch-phi` | `template` | `not-applicable` | 20 | 12898062.5 | `nanoseconds` | `validated` | yes |
+| 15 | `kernel-branch-phi-production-tiered` | `kernel-branch-phi` | `production-tiered` | `not-applicable` | 20 | 7165104 | `nanoseconds` | `validated` | yes |
+| 16 | `kernel-boxed-double-property-interpreter` | `kernel-boxed-double-property` | `interpreter` | `not-applicable` | 15 | 531475459 | `nanoseconds` | `validated` | yes |
+| 17 | `kernel-boxed-double-property-template` | `kernel-boxed-double-property` | `template` | `not-applicable` | 15 | 15278000 | `nanoseconds` | `validated` | yes |
+| 18 | `kernel-boxed-double-property-production-tiered` | `kernel-boxed-double-property` | `production-tiered` | `not-applicable` | 15 | 15279875 | `nanoseconds` | `validated` | yes |
+| 19 | `kernel-dense-array-interpreter` | `kernel-dense-array` | `interpreter` | `not-applicable` | 15 | 735269209 | `nanoseconds` | `validated` | yes |
+| 20 | `kernel-dense-array-template` | `kernel-dense-array` | `template` | `not-applicable` | 15 | 13272542 | `nanoseconds` | `validated` | yes |
+| 21 | `kernel-dense-array-production-tiered` | `kernel-dense-array` | `production-tiered` | `not-applicable` | 15 | 8043083 | `nanoseconds` | `validated` | yes |
+| 22 | `kernel-numeric-leaf-interpreter` | `kernel-numeric-leaf` | `interpreter` | `not-applicable` | 20 | 189550750 | `nanoseconds` | `validated` | yes |
+| 23 | `kernel-numeric-leaf-template` | `kernel-numeric-leaf` | `template` | `not-applicable` | 20 | 19290958 | `nanoseconds` | `validated` | yes |
+| 24 | `kernel-numeric-leaf-production-tiered` | `kernel-numeric-leaf` | `production-tiered` | `not-applicable` | 20 | 10623833.5 | `nanoseconds` | `validated` | yes |
+| 25 | `jit-compile-engine-target-template` | `jit-compile-engineJitTarget` | `template` | `not-applicable` | 100 | 8291 | `nanoseconds` | `validated` | yes |
+| 26 | `jit-compile-numeric-leaf-template` | `jit-compile-engineNumericLeaf` | `template` | `not-applicable` | 100 | 11542 | `nanoseconds` | `validated` | yes |
+| 27 | `jit-compile-numeric-leaf-optimizing` | `jit-compile-engineNumericLeaf` | `optimizing` | `not-applicable` | 100 | 101249.5 | `nanoseconds` | `validated` | yes |
+| 28 | `memory-forced-full` | `memory-allocation-churn-forced-full` | `interpreter` | `not-applicable` | 5 | 1102282458 | `nanoseconds` | `validated` | yes |
+| 29 | `memory-runtime-idle` | `memory-runtime-idle` | `interpreter` | `fresh-per-sample` | 5 | 10257042 | `nanoseconds` | `validated` | yes |
+| 30 | `module-module-entry-fresh-per-sample-interpreter` | `module-phases-module-entry.mjs` | `interpreter` | `fresh-per-sample` | 20 | 137874.5 | `nanoseconds` | `validated` | yes |
+| 31 | `module-module-entry-fresh-per-sample-template` | `module-phases-module-entry.mjs` | `template` | `fresh-per-sample` | 20 | 143333.5 | `nanoseconds` | `validated` | yes |
+| 32 | `module-module-entry-fresh-per-sample-production-tiered` | `module-phases-module-entry.mjs` | `production-tiered` | `fresh-per-sample` | 20 | 164687.5 | `nanoseconds` | `validated` | yes |
+| 33 | `module-module-entry-reused-across-samples-interpreter` | `module-phases-module-entry.mjs` | `interpreter` | `reused-across-samples` | 20 | 122334 | `nanoseconds` | `validated` | yes |
+| 34 | `module-module-entry-reused-across-samples-template` | `module-phases-module-entry.mjs` | `template` | `reused-across-samples` | 20 | 126000.5 | `nanoseconds` | `validated` | yes |
+| 35 | `module-module-entry-reused-across-samples-production-tiered` | `module-phases-module-entry.mjs` | `production-tiered` | `reused-across-samples` | 20 | 125187.5 | `nanoseconds` | `validated` | yes |
+| 36 | `package-entry-fresh-per-sample-interpreter` | `module-phases-entry.mjs` | `interpreter` | `fresh-per-sample` | 20 | 233187.5 | `nanoseconds` | `validated` | yes |

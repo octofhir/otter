@@ -142,6 +142,9 @@ fn inline_numeric_method_eligible(
 }
 
 pub(super) fn has_emit_eligible_inline_method(view: &JitCompileSnapshot) -> bool {
+    if view.inline_methods.is_empty() {
+        return false;
+    }
     let Ok(caller_plan) = TemplatePlan::build(view) else {
         return false;
     };

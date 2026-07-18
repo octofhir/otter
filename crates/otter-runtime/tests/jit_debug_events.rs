@@ -3,7 +3,7 @@
 //! # Contents
 //! - Default-off behavior and ordered template compile events.
 //! - Optimizing OSR consumes unary feedback without an immediate side exit.
-//! - Optimizing method calls box numeric arguments without rejecting the loop.
+//! - Eligible numeric methods select the guarded template-inline backend.
 //! - Abrupt completion followed by explicit report draining.
 //! - Report ownership across full GC, later allocation, and nested JIT entry.
 //! - Async [`otter_runtime::Otter`] event-loop success and abrupt-failure
@@ -207,7 +207,7 @@ fn unary_feedback_keeps_extracted_native_call_loop_optimized() {
 
 #[test]
 #[cfg(target_arch = "aarch64")]
-fn numeric_method_argument_keeps_monomorphic_loop_optimized() {
+fn numeric_method_candidate_selects_template_inline_backend() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
         .jit_osr_threshold(1)
@@ -264,10 +264,24 @@ engineKernel(128);
                 function_id,
                 tier: JitDebugTier::Optimizing,
                 target: JitDebugTarget::Osr { .. },
+                outcome: JitDebugCompileOutcome::Unsupported { reason },
+            } if *function_id == engine_kernel
+                && reason.contains("prefers the template method-inline path")
+        )),
+        "optimizer must deliberately yield to method inlining: {:?}",
+        report.events()
+    );
+    assert!(
+        report.events().iter().any(|event| matches!(
+            event,
+            JitDebugEvent::CompileFinished {
+                function_id,
+                tier: JitDebugTier::Template,
+                target: JitDebugTarget::Osr { .. },
                 outcome: JitDebugCompileOutcome::Compiled { .. },
             } if *function_id == engine_kernel
         )),
-        "numeric method arguments must not reject engineKernel: {:?}",
+        "template fallback must compile the method-inline body: {:?}",
         report.events()
     );
     assert!(
@@ -279,7 +293,7 @@ engineKernel(128);
                 ..
             } if *function_id == engine_kernel
         )),
-        "optimized engineKernel must not side-exit at the method call: {:?}",
+        "backend selection must not be reported as a runtime side exit: {:?}",
         report.events()
     );
 }

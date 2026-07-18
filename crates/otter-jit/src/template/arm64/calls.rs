@@ -41,9 +41,7 @@ use crate::arm64::{CallTrampoline, emit_prepared_call};
 use crate::artifact::relocation::{
     RelocationCapture, RelocationTarget, TemplateOperandArena, TemplateOperandRole,
 };
-use crate::entry::{
-    FUNCTION_ID_TAG, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, Unsupported, VALUE_UNDEFINED,
-};
+use crate::entry::{NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, Unsupported, VALUE_UNDEFINED};
 use crate::template::{ArithKind, TemplateOp, TemplatePlan, TemplateTail};
 
 const INLINE_METHOD_MAX_REGISTERS: u16 = 24;
@@ -399,22 +397,29 @@ fn try_emit_inline_numeric_method(
         ; cbz x13, =>miss
         ; ldr w9, [x13, method.method_value_byte]
     );
-    emit_decompress_slot(ops, relocations, view.cage_base as u64, miss);
-    emit_load_u64(
-        ops,
-        10,
-        FUNCTION_ID_TAG | (u64::from(method.method_fid) << 16),
-    );
+    use otter_vm::value::compressed as cslot;
+    debug_assert_eq!(cslot::TAG_MASK, 0b111);
+    debug_assert_eq!(cslot::TAG_FUNCTION_ID, 0b110);
     dynasm!(ops
         ; .arch aarch64
-        ; cmp x9, x10
-        ; b.eq =>method_guarded
-        ; movz x11, NUMBER_TAG_HI16, lsl #48
-        ; orr x11, x11, #0x2
-        ; tst x9, x11
-        ; b.eq =>method_closure
+        ; and w10, w9, cslot::TAG_MASK
+        ; cbz w10, =>method_closure
+    );
+    if let Some(compressed_fid) = (method.method_fid <= u32::MAX >> 3)
+        .then_some((method.method_fid << 3) | cslot::TAG_FUNCTION_ID)
+    {
+        emit_load_u64(ops, 10, u64::from(compressed_fid));
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp w9, w10
+            ; b.eq =>method_guarded
+        );
+    }
+    dynasm!(ops
+        ; .arch aarch64
         ; b =>miss
         ; =>method_closure
+        ; cbz w9, =>miss
         ; mov w12, w9
     );
     emit_load_symbol_u64(

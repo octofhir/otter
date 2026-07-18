@@ -48,9 +48,9 @@ Tier choice is explicit whenever a workload permits tier selection:
 
 `call`, `kernel`, and `module` require `--jit-tier`; their optional
 `--jit-osr-threshold` records a deliberate threshold override. `jit-compile`
-always measures the template compiler, and `memory` always measures the
-interpreter with a post-run full GC, so those commands do not accept a tier
-argument. Do not infer a benchmark tier from legacy JIT environment variables.
+requires `--compile-tier template|optimizing` and one or more explicit numeric
+`--argument` values. `memory` always measures the interpreter with a post-run
+full GC. Do not infer a benchmark tier from legacy JIT environment variables.
 
 ### JavaScript kernel corpus
 
@@ -68,6 +68,7 @@ print output, access the filesystem, install packages, or depend on host APIs.
 | `branch-phi.js` | Alternating control flow and numeric value merge | `-6000000` |
 | `boxed-double-property.js` | Repeated double-valued object property loads | `4000000` |
 | `dense-array.js` | Repeated dense indexed array loads | `5234688` |
+| `numeric-leaf.js` | Repeated calls into a straight-line eight-operation Number leaf | `-700000` |
 
 Run one fixture per isolate. Warmups and measured samples reuse that isolate
 and the same precompiled invocation stub, but every invocation must return the
@@ -99,19 +100,29 @@ non-scoreable failures. Do not rewrite them into a spread-call workload.
 
 ### JIT compilation
 
-The compile fixture retains the final measured machine-code artifact, installs
-that exact object through an isolate-local validation hook, enters it, and
-checks the program result before emitter samples are accepted. Source parsing,
-bytecode lowering, snapshot construction, and semantic validation remain
-outside the compile timer; executable-buffer finalization remains inside it.
+The compile fixture calls the target function directly with the declared
+numeric arguments, seeds feedback, then retains the final measured machine-code
+artifact. It installs that exact object through an isolate-local validation
+hook, enters it with the same direct arguments, and checks the result before
+emitter samples are accepted. Source parsing, bytecode lowering, feedback
+seeding, snapshot construction, backend-marker preflight, and compiler-hook
+construction remain outside the timer; emitter work and executable-buffer
+finalization remain inside it.
 
 ```bash
 cargo run --release -p otter-benchmark --features engine \
   --bin otter-engine-benchmark -- \
   jit-compile --source benchmarks/fixtures/engine/jit-compile.js \
-  --function engineJitTarget --expected 3300 \
+  --function engineJitTarget --expected 33 --compile-tier template \
+  --argument 1 --argument 2 \
   --samples 100 --warmup 10
 ```
+
+The optimizing numeric-leaf row additionally passes
+`--expect-backend cranelift-numeric-leaf`. The command captures one untimed
+artifact preflight and requires `optimized-ir.txt` to begin with
+`; backend=cranelift numeric-leaf`; a silent fallback to the general optimizer
+is a validation failure.
 
 ### Managed memory
 
@@ -186,12 +197,13 @@ keep the recorder alive past the declared wall cap.
 
 ## Capturing a baseline
 
-The baseline driver owns one fixed, ordered 30-case engine matrix: bytecode
+The baseline driver owns one fixed, ordered 35-case engine matrix: bytecode
 calls at arity 0 and 4 across all tiers, the extracted host call across all
-tiers, four JavaScript kernels across all tiers, exact-artifact template
-compilation, forced-full-GC allocation churn, fresh and reused module runtimes
-across all tiers, and isolated package-import resolution. It runs serially and
-does not install packages, enable Web/Node surfaces, or start a profiler.
+tiers, five JavaScript kernels across all tiers, one existing template compile
+row, template and optimizing numeric-leaf compile rows, forced-full-GC
+allocation churn, fresh and reused module runtimes across all tiers, and
+isolated package-import resolution. It runs serially and does not install
+packages, enable Web/Node surfaces, or start a profiler.
 
 Capture from a clean commit with the release driver:
 
@@ -212,7 +224,7 @@ record.
 
 The driver rejects `OTTER_JIT*`, `OTTER_GC*`, and `RUST_LOG` overrides so the
 recorded configuration remains the complete performance policy. A capture is
-publishable only when all 30 exact commands returned zero, every result passes
+publishable only when all 35 exact commands returned zero, every result passes
 the live contract, every result is clean/release/baseline-eligible, and commit,
 platform, toolchain, argv, configuration, and sampling protocol remain
 identical to the fixed matrix.

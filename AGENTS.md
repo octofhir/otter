@@ -476,9 +476,10 @@ Practical rules when adding/altering APIs:
   - Current subcommands are `call`, `jit-compile`, `memory`, and `module`.
   - `call` and `module` require `--jit-tier=interpreter`,
     `--jit-tier=template`, or `--jit-tier=production-tiered`. `jit-compile`
-    is intrinsically template-tier and `memory` is intrinsically
-    interpreter/full-GC; those commands do not accept `--jit-tier`. Do not
-    infer a benchmark tier from legacy JIT environment variables.
+    requires `--compile-tier=template` or `--compile-tier=optimizing` plus
+    explicit numeric `--argument` values. `memory` is intrinsically
+    interpreter/full-GC. Do not infer a benchmark tier from legacy JIT
+    environment variables.
   - `module --runtime-reuse=fresh-per-sample` uses a new runtime for every
     measured execution; `reused-across-samples` reuses one validated runtime.
     Runtime reuse is not a module-cache hit.

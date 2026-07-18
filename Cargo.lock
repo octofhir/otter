@@ -2334,6 +2334,7 @@ name = "otter-benchmark"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "otter-bytecode",
  "otter-compiler",
  "otter-jit",
  "otter-runtime",
@@ -2341,6 +2342,7 @@ dependencies = [
  "otter-vm",
  "serde",
  "serde_json",
+ "smallvec",
  "sysinfo",
 ]
 

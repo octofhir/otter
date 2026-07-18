@@ -9,13 +9,17 @@ Node/Web product surfaces.
 
 ## The measured matrix
 
-`otter-engine-baseline` owns an ordered 18-case matrix:
+`otter-engine-baseline` owns an ordered 35-case matrix:
 
 - bytecode calls with zero and four arguments under `interpreter`, `template`,
   and `production-tiered`;
 - an extracted native host call under the same three policies;
-- direct template compilation whose final measured artifact is installed,
-  entered, and required to return the expected result;
+- five JavaScript kernels under the same three policies, including a
+  straight-line numeric leaf;
+- direct template compilation plus isolated template and optimizing
+  numeric-leaf compilation; every final measured artifact is installed,
+  entered with explicit numeric arguments, and required to return the expected
+  result;
 - managed allocation churn followed by a forced full GC;
 - fresh and reused module runtimes under all three tier policies;
 - package-import-map resolution in an isolated interpreter runtime.

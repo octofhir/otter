@@ -3,7 +3,7 @@
 //! # Contents
 //! - `call` measures a precompiled direct-call workload under an explicit tier.
 //! - `kernel` measures a named, precompiled JavaScript fixture under an explicit tier.
-//! - `jit-compile` measures the production template compiler directly.
+//! - `jit-compile` measures one explicitly selected native compiler directly.
 //! - `memory` records interpreter allocation, retained-heap, and GC samples.
 //! - `module` records module-graph phases with explicit runtime reuse.
 //!
@@ -12,7 +12,8 @@
 //! - Parsing and bytecode lowering are outside call and kernel execution samples.
 //! - Kernel fixture setup runs once before warmup; samples run a precompiled call stub.
 //! - One interpreter owns all warmup and measured kernel executions.
-//! - JIT snapshot construction is outside template-emitter samples.
+//! - Feedback seeding, JIT snapshot construction, and compiler-hook
+//!   construction are outside native-emitter samples.
 //! - Raw observations are retained alongside their median aggregates.
 //! - Every successful record is semantically validated.
 
@@ -27,18 +28,21 @@ use std::time::Instant;
 use clap::{Parser, Subcommand, ValueEnum};
 use otter_benchmark::{
     BenchmarkConfiguration, BenchmarkFailure, BenchmarkIdentity, BenchmarkOutcome,
-    BenchmarkProvenance, BenchmarkResult, CacheState, ExecutionSurface, FailureKind, GcPolicy,
-    JitPolicy, Metric, MetricDirection, MetricRole, MetricUnit, OutcomeStatus,
-    RuntimeReuse as SchemaRuntimeReuse, SamplingPlan, Statistic, current_build_profile,
+    BenchmarkProvenance, BenchmarkResult, CacheState, ENGINE_COMPILE_FEEDBACK_SEED_CALLS,
+    ExecutionSurface, FailureKind, GcPolicy, JitPolicy, Metric, MetricDirection, MetricRole,
+    MetricUnit, OutcomeStatus, RuntimeReuse as SchemaRuntimeReuse, SamplingPlan, Statistic,
+    current_build_profile,
 };
 use otter_compiler::compile_script_source;
-use otter_jit::{OtterJitCompiler, TransitionTable, compile};
+use otter_jit::OtterJitCompiler;
 use otter_runtime::{JitSelection, Runtime, module_graph::ModulePhaseTimings};
 use otter_syntax::SourceKind;
 use otter_vm::{
-    ExecutionContext, Interpreter, JitCompileError, JitCompileRequest, JitCompileStatus,
-    JitCompilerHook, JitExecOutcome, JitFunctionCode, JitRuntimeStubBinding, VmRuntimeActivation,
+    ExecutionContext, Interpreter, JitArtifactFileName, JitArtifactIdentity, JitCompileError,
+    JitCompileRequest, JitCompileStatus, JitCompilerHook, JitDebugRequest, JitExecOutcome,
+    JitFunctionCode, JitRuntimeStubBinding, VmRuntimeActivation,
 };
+use smallvec::SmallVec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CallKind {
@@ -54,6 +58,44 @@ enum EngineJitTier {
     Template,
     /// Production optimizer with template fallback.
     ProductionTiered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CompileTier {
+    /// Compile only through the production template emitter.
+    Template,
+    /// Compile only through the production optimizing emitter.
+    Optimizing,
+}
+
+impl CompileTier {
+    const fn jit_policy(self) -> JitPolicy {
+        match self {
+            Self::Template => JitPolicy::Template,
+            Self::Optimizing => JitPolicy::Optimizing,
+        }
+    }
+
+    const fn cli(self) -> &'static str {
+        match self {
+            Self::Template => "template",
+            Self::Optimizing => "optimizing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CompileBackend {
+    /// Require the Cranelift straight-line Number-leaf backend.
+    CraneliftNumericLeaf,
+}
+
+impl CompileBackend {
+    const fn cli(self) -> &'static str {
+        match self {
+            Self::CraneliftNumericLeaf => "cranelift-numeric-leaf",
+        }
+    }
 }
 
 impl EngineJitTier {
@@ -133,6 +175,12 @@ enum Command {
         function: String,
         #[arg(long, allow_hyphen_values = true)]
         expected: f64,
+        #[arg(long, value_enum)]
+        compile_tier: CompileTier,
+        #[arg(long = "argument", allow_hyphen_values = true, required = true)]
+        arguments: Vec<f64>,
+        #[arg(long, value_enum)]
+        expect_backend: Option<CompileBackend>,
         #[arg(long, default_value_t = 100)]
         samples: u32,
         #[arg(long, default_value_t = 10)]
@@ -211,7 +259,7 @@ struct RunRecord {
     name: String,
     parameters: BTreeMap<String, String>,
     surface: RunSurface,
-    jit_tier: EngineJitTier,
+    jit_policy: JitPolicy,
     jit_osr_threshold: Option<u32>,
     gc_policy: RunGcPolicy,
     runtime_reuse: Option<RuntimeReuse>,
@@ -228,7 +276,7 @@ impl RunRecord {
     fn failure(
         name: String,
         surface: RunSurface,
-        jit_tier: EngineJitTier,
+        jit_policy: JitPolicy,
         jit_osr_threshold: Option<u32>,
         gc_policy: RunGcPolicy,
         runtime_reuse: Option<RuntimeReuse>,
@@ -244,7 +292,7 @@ impl RunRecord {
             name,
             parameters,
             surface,
-            jit_tier,
+            jit_policy,
             jit_osr_threshold,
             gc_policy,
             runtime_reuse,
@@ -443,7 +491,7 @@ fn benchmark_result(record: RunRecord) -> BenchmarkResult {
                 RunSurface::Vm => ExecutionSurface::Vm,
                 RunSurface::Module => ExecutionSurface::Runtime,
             },
-            jit_policy: jit_policy(record.jit_tier),
+            jit_policy: record.jit_policy,
             jit_osr_threshold: record.jit_osr_threshold,
             gc_policy: gc_policy(record.gc_policy),
             gc_stress_stride: None,
@@ -552,7 +600,7 @@ fn run_call(
         RunRecord::failure(
             name.clone(),
             RunSurface::Vm,
-            jit_tier,
+            jit_policy(jit_tier),
             jit_osr_threshold,
             RunGcPolicy::Normal,
             None,
@@ -640,7 +688,7 @@ fn run_call(
         name,
         parameters,
         surface: RunSurface::Vm,
-        jit_tier,
+        jit_policy: jit_policy(jit_tier),
         jit_osr_threshold,
         gc_policy: RunGcPolicy::Normal,
         runtime_reuse: None,
@@ -779,7 +827,7 @@ fn run_kernel(
         RunRecord::failure(
             name.clone(),
             RunSurface::Vm,
-            jit_tier,
+            jit_policy(jit_tier),
             jit_osr_threshold,
             RunGcPolicy::Normal,
             None,
@@ -896,7 +944,7 @@ fn run_kernel(
         name,
         parameters,
         surface: RunSurface::Vm,
-        jit_tier,
+        jit_policy: jit_policy(jit_tier),
         jit_osr_threshold,
         gc_policy: RunGcPolicy::Normal,
         runtime_reuse: None,
@@ -913,14 +961,125 @@ fn run_kernel(
     }
 }
 
-/// Compile the snapshot once through the production template compiler.
-fn compile_once(
+const COMPILE_VALIDATION_CALL_LIMIT: u32 = 8_192;
+
+fn compile_request(
     view: &otter_vm::JitCompileSnapshot,
-    transitions: &TransitionTable,
-) -> Result<Box<dyn otter_vm::JitFunctionCode>, String> {
-    compile(view, 1, transitions)
-        .map(|code| Box::new(code) as Box<dyn otter_vm::JitFunctionCode>)
-        .map_err(|error| format!("{error:?}"))
+    function_name: &str,
+    module: &str,
+    capture_artifact: bool,
+) -> JitCompileRequest {
+    JitCompileRequest {
+        snapshot: view.clone(),
+        debug: if capture_artifact {
+            JitDebugRequest::artifacts()
+        } else {
+            JitDebugRequest::disabled()
+        },
+        artifact_identity: capture_artifact.then(|| JitArtifactIdentity {
+            function_name: function_name.to_owned(),
+            module: module.to_owned(),
+        }),
+        osr_pc: None,
+        code_object_id: 1,
+    }
+}
+
+fn compile_once(
+    compiler: &OtterJitCompiler,
+    tier: CompileTier,
+    request: JitCompileRequest,
+) -> Result<
+    (
+        Arc<dyn JitFunctionCode>,
+        Option<Box<otter_vm::JitArtifactBundle>>,
+    ),
+    String,
+> {
+    let status = match tier {
+        CompileTier::Template => compiler.compile_function(request),
+        CompileTier::Optimizing => compiler.compile_optimized_function(request),
+    }
+    .map_err(|error| error.to_string())?;
+    match status {
+        JitCompileStatus::Compiled { code, artifact } => Ok((code, artifact)),
+        JitCompileStatus::Unavailable => Err(format!("{} compiler unavailable", tier.cli())),
+        JitCompileStatus::Unsupported { reason } => {
+            Err(format!("{} compiler declined: {reason}", tier.cli()))
+        }
+    }
+}
+
+fn validate_compile_backend(
+    expected: CompileBackend,
+    artifact: Option<&otter_vm::JitArtifactBundle>,
+) -> Result<(), String> {
+    let artifact = artifact.ok_or_else(|| "compiler returned no backend artifact".to_owned())?;
+    let optimized_ir = artifact
+        .file(JitArtifactFileName::OptimizedIr)
+        .ok_or_else(|| "compiler artifact has no optimized-ir.txt".to_owned())?
+        .contents();
+    match expected {
+        CompileBackend::CraneliftNumericLeaf => {
+            const MARKER: &[u8] = b"; backend=cranelift numeric-leaf\n";
+            if !optimized_ir.starts_with(MARKER) {
+                return Err(format!(
+                    "optimizing compiler did not select {}; optimized-ir.txt starts with {:?}",
+                    expected.cli(),
+                    String::from_utf8_lossy(&optimized_ir[..optimized_ir.len().min(MARKER.len())])
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_optimizing_feedback(view: &otter_vm::JitCompileSnapshot) -> Result<(), String> {
+    let missing = view
+        .instructions
+        .iter()
+        .filter(|instruction| {
+            matches!(
+                instruction.op(&view.code_block),
+                otter_bytecode::Op::Add
+                    | otter_bytecode::Op::Sub
+                    | otter_bytecode::Op::Mul
+                    | otter_bytecode::Op::Div
+                    | otter_bytecode::Op::Neg
+            ) && instruction.arith_feedback().is_empty()
+        })
+        .map(|instruction| {
+            format!(
+                "{}:{:?}",
+                instruction.instruction_pc(&view.code_block),
+                instruction.op(&view.code_block)
+            )
+        })
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "optimizing snapshot has unseeded arithmetic feedback at {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+fn invoke_numeric_target(
+    interpreter: &mut Interpreter,
+    context: &ExecutionContext,
+    function_id: u32,
+    arguments: &[f64],
+) -> Result<otter_vm::Value, otter_vm::VmError> {
+    let mut values = SmallVec::<[otter_vm::Value; 8]>::new();
+    values.extend(arguments.iter().copied().map(otter_vm::Value::number_f64));
+    interpreter.run_callable_sync(
+        context,
+        &otter_vm::Value::function_id(function_id),
+        otter_vm::Value::undefined(),
+        values,
+    )
 }
 
 #[derive(Debug)]
@@ -1008,16 +1167,13 @@ impl JitFunctionCode for ObservedJitCode {
 
 struct ExactArtifactCompiler {
     function_id: u32,
+    tier: CompileTier,
     code: Arc<dyn JitFunctionCode>,
     runtime_stub_bindings: Vec<JitRuntimeStubBinding>,
 }
 
-impl JitCompilerHook for ExactArtifactCompiler {
-    fn runtime_stub_bindings(&self) -> Vec<JitRuntimeStubBinding> {
-        self.runtime_stub_bindings.clone()
-    }
-
-    fn compile_function(
+impl ExactArtifactCompiler {
+    fn exact_status(
         &self,
         request: JitCompileRequest,
     ) -> Result<JitCompileStatus, JitCompileError> {
@@ -1040,24 +1196,77 @@ impl JitCompilerHook for ExactArtifactCompiler {
     }
 }
 
+impl JitCompilerHook for ExactArtifactCompiler {
+    fn optimizing_tier_enabled(&self) -> bool {
+        self.tier == CompileTier::Optimizing
+    }
+
+    fn runtime_stub_bindings(&self) -> Vec<JitRuntimeStubBinding> {
+        self.runtime_stub_bindings.clone()
+    }
+
+    fn compile_function(
+        &self,
+        request: JitCompileRequest,
+    ) -> Result<JitCompileStatus, JitCompileError> {
+        if self.tier == CompileTier::Template {
+            self.exact_status(request)
+        } else {
+            Ok(JitCompileStatus::Unsupported {
+                reason: "validation hook reserves the measured artifact for optimizing entry"
+                    .into(),
+            })
+        }
+    }
+
+    fn compile_optimized_function(
+        &self,
+        request: JitCompileRequest,
+    ) -> Result<JitCompileStatus, JitCompileError> {
+        if self.tier == CompileTier::Optimizing {
+            self.exact_status(request)
+        } else {
+            Ok(JitCompileStatus::Unavailable)
+        }
+    }
+}
+
 fn run_jit_compile(
     source_path: PathBuf,
     function_name: String,
     expected: f64,
+    compile_tier: CompileTier,
+    arguments: Vec<f64>,
+    expect_backend: Option<CompileBackend>,
     samples: u32,
     warmup: u32,
 ) -> RunRecord {
     let name = format!("jit-compile-{function_name}");
-    let parameters = BTreeMap::from([
+    let mut parameters = BTreeMap::from([
         ("source".into(), source_path.display().to_string()),
         ("function".into(), function_name.clone()),
         ("expected".into(), expected.to_string()),
+        (
+            "arguments".into(),
+            arguments
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        (
+            "feedbackSeedCalls".into(),
+            ENGINE_COMPILE_FEEDBACK_SEED_CALLS.to_string(),
+        ),
     ]);
+    if let Some(backend) = expect_backend {
+        parameters.insert("expectedBackend".into(), backend.cli().into());
+    }
     let fail = |kind: RunFailureKind, failure: String| {
         RunRecord::failure(
             name.clone(),
             RunSurface::Vm,
-            EngineJitTier::Template,
+            compile_tier.jit_policy(),
             None,
             RunGcPolicy::Normal,
             None,
@@ -1074,6 +1283,24 @@ fn run_jit_compile(
         return fail(
             RunFailureKind::Configuration,
             "samples must be greater than zero".into(),
+        );
+    }
+    if arguments.is_empty() {
+        return fail(
+            RunFailureKind::Configuration,
+            "at least one --argument is required".into(),
+        );
+    }
+    if !expected.is_finite() || arguments.iter().any(|argument| !argument.is_finite()) {
+        return fail(
+            RunFailureKind::Configuration,
+            "expected result and numeric arguments must be finite".into(),
+        );
+    }
+    if expect_backend.is_some() && compile_tier != CompileTier::Optimizing {
+        return fail(
+            RunFailureKind::Configuration,
+            "--expect-backend requires --compile-tier=optimizing".into(),
         );
     }
     let source = match std::fs::read_to_string(&source_path) {
@@ -1098,21 +1325,68 @@ fn run_jit_compile(
             );
         }
     };
-    let function_id = match module
+    let mut matching_functions = module
         .functions
         .iter()
-        .find(|function| function.name == function_name)
-        .map(|function| function.id)
-    {
-        Some(function_id) => function_id,
-        None => {
+        .filter(|function| function.name == function_name)
+        .map(|function| function.id);
+    let function_id = match (matching_functions.next(), matching_functions.next()) {
+        (Some(function_id), None) => function_id,
+        (None, _) => {
             return fail(
                 RunFailureKind::Input,
                 format!("function {function_name:?} not found"),
             );
         }
+        (Some(_), Some(_)) => {
+            return fail(
+                RunFailureKind::Input,
+                format!("function {function_name:?} is ambiguous"),
+            );
+        }
     };
-    let context = ExecutionContext::from_module(module);
+    let validation_module = module.clone();
+    let mut feedback_interpreter = Interpreter::new();
+    let context = feedback_interpreter.link_module(module);
+    let compiler = Arc::new(match compile_tier {
+        CompileTier::Template => OtterJitCompiler::template_only(),
+        CompileTier::Optimizing => OtterJitCompiler::production_tiered(),
+    });
+    if compile_tier == CompileTier::Optimizing {
+        let feedback_hook: Arc<dyn JitCompilerHook> = compiler.clone();
+        feedback_interpreter.set_jit_compiler(Some(feedback_hook));
+    }
+    for seed in 0..ENGINE_COMPILE_FEEDBACK_SEED_CALLS {
+        let value = match invoke_numeric_target(
+            &mut feedback_interpreter,
+            &context,
+            function_id,
+            &arguments,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return fail(
+                    RunFailureKind::Runtime,
+                    format!("feedback seed call {} failed: {error}", seed + 1),
+                );
+            }
+        };
+        let Some(actual) = value.as_f64() else {
+            return fail(
+                RunFailureKind::Validation,
+                format!(
+                    "feedback seed call {} returned non-Number {value:?}",
+                    seed + 1
+                ),
+            );
+        };
+        if let Err(error) = validate_kernel_checksum(actual, expected) {
+            return fail(
+                RunFailureKind::Validation,
+                format!("feedback seed call {}: {error}", seed + 1),
+            );
+        }
+    }
     let view = match context.jit_compile_snapshot(function_id) {
         Some(view) => view,
         None => {
@@ -1122,9 +1396,30 @@ fn run_jit_compile(
             );
         }
     };
-    let transitions = TransitionTable::resolve();
+    if compile_tier == CompileTier::Optimizing
+        && let Err(error) = validate_optimizing_feedback(&view)
+    {
+        return fail(RunFailureKind::Validation, error);
+    }
+    let module_name = source_path.to_string_lossy();
+    if let Some(expected_backend) = expect_backend {
+        let request = compile_request(&view, &function_name, &module_name, true);
+        let (_, artifact) = match compile_once(compiler.as_ref(), compile_tier, request) {
+            Ok(compiled) => compiled,
+            Err(error) => {
+                return fail(
+                    RunFailureKind::Compile,
+                    format!("backend preflight failed: {error}"),
+                );
+            }
+        };
+        if let Err(error) = validate_compile_backend(expected_backend, artifact.as_deref()) {
+            return fail(RunFailureKind::Validation, error);
+        }
+    }
     for _ in 0..warmup {
-        if let Err(error) = compile_once(&view, &transitions) {
+        let request = compile_request(&view, &function_name, &module_name, false);
+        if let Err(error) = compile_once(compiler.as_ref(), compile_tier, request) {
             return fail(
                 RunFailureKind::Compile,
                 format!("compiler declined during warmup: {error}"),
@@ -1135,9 +1430,10 @@ fn run_jit_compile(
     let mut expected_code_bytes = None;
     let mut validation_code = None;
     for _ in 0..samples {
+        let request = compile_request(&view, &function_name, &module_name, false);
         let started = Instant::now();
-        let code = match compile_once(&view, &transitions) {
-            Ok(code) => code,
+        let (code, artifact) = match compile_once(compiler.as_ref(), compile_tier, request) {
+            Ok(compiled) => compiled,
             Err(error) => {
                 return fail(
                     RunFailureKind::Compile,
@@ -1146,18 +1442,22 @@ fn run_jit_compile(
             }
         };
         let elapsed = elapsed_ns(started);
+        debug_assert!(artifact.is_none());
         measurements.wall_time_ns.push(elapsed);
         measurements.compile_time_ns.push(elapsed);
         let code_bytes = code.code_len() as u64;
         if expected_code_bytes.is_some_and(|previous| previous != code_bytes) {
             return fail(
                 RunFailureKind::Validation,
-                "template code size changed across identical samples".into(),
+                format!(
+                    "{} code size changed across identical samples",
+                    compile_tier.cli()
+                ),
             );
         }
         expected_code_bytes = Some(code_bytes);
         measurements.code_bytes.push(code_bytes);
-        validation_code = Some(Arc::<dyn JitFunctionCode>::from(code));
+        validation_code = Some(code);
     }
     let Some(validation_code) = validation_code else {
         return fail(
@@ -1176,27 +1476,44 @@ fn run_jit_compile(
         code: validation_code,
         returned_entries: Arc::clone(&returned_entries),
     });
-    let template_compiler = OtterJitCompiler::template_only();
     let exact_compiler = ExactArtifactCompiler {
         function_id,
+        tier: compile_tier,
         code: observed_code,
-        runtime_stub_bindings: template_compiler.runtime_stub_bindings(),
+        runtime_stub_bindings: compiler.runtime_stub_bindings(),
     };
     let mut validation_interpreter = Interpreter::new();
     validation_interpreter.set_jit_compiler(Some(Arc::new(exact_compiler)));
-    match validation_interpreter.run(&context) {
-        Ok(value) if value.as_f64() == Some(expected) => {}
-        Ok(value) => {
+    let validation_context = validation_interpreter.link_module(validation_module);
+    for attempt in 0..COMPILE_VALIDATION_CALL_LIMIT {
+        let value = match invoke_numeric_target(
+            &mut validation_interpreter,
+            &validation_context,
+            function_id,
+            &arguments,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return fail(
+                    RunFailureKind::Runtime,
+                    format!("measured artifact validation failed: {error}"),
+                );
+            }
+        };
+        let Some(actual) = value.as_f64() else {
             return fail(
                 RunFailureKind::Validation,
-                format!("measured artifact returned {value:?}, expected {expected}"),
+                format!("measured artifact validation returned non-Number {value:?}"),
+            );
+        };
+        if let Err(error) = validate_kernel_checksum(actual, expected) {
+            return fail(
+                RunFailureKind::Validation,
+                format!("measured artifact validation call {}: {error}", attempt + 1),
             );
         }
-        Err(error) => {
-            return fail(
-                RunFailureKind::Runtime,
-                format!("measured artifact validation failed: {error}"),
-            );
+        if returned_entries.load(Ordering::Relaxed) != 0 {
+            break;
         }
     }
     if returned_entries.load(Ordering::Relaxed) == 0 {
@@ -1210,7 +1527,7 @@ fn run_jit_compile(
         name,
         parameters,
         surface: RunSurface::Vm,
-        jit_tier: EngineJitTier::Template,
+        jit_policy: compile_tier.jit_policy(),
         jit_osr_threshold: None,
         gc_policy: RunGcPolicy::Normal,
         runtime_reuse: None,
@@ -1220,7 +1537,14 @@ fn run_jit_compile(
         primary_metric: "compile-time",
         measurements,
         validation_marker: Some(format!(
-            "return={expected};compiled={function_name};code_bytes={code_bytes}"
+            "return={expected};bits=0x{:016x};compiled={function_name};tier={};arguments={};code_bytes={code_bytes}",
+            expected.to_bits(),
+            compile_tier.cli(),
+            arguments
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
         )),
         failure: None,
     }
@@ -1233,7 +1557,7 @@ fn run_memory(iterations: u32, samples: u32) -> RunRecord {
         RunRecord::failure(
             name.clone(),
             RunSurface::Vm,
-            EngineJitTier::Interpreter,
+            JitPolicy::Interpreter,
             None,
             RunGcPolicy::ForcedFull,
             None,
@@ -1322,7 +1646,7 @@ fn run_memory(iterations: u32, samples: u32) -> RunRecord {
         name,
         parameters,
         surface: RunSurface::Vm,
-        jit_tier: EngineJitTier::Interpreter,
+        jit_policy: JitPolicy::Interpreter,
         jit_osr_threshold: None,
         gc_policy: RunGcPolicy::ForcedFull,
         runtime_reuse: None,
@@ -1402,7 +1726,7 @@ fn run_module(
         RunRecord::failure(
             name.clone(),
             RunSurface::Module,
-            jit_tier,
+            jit_policy(jit_tier),
             jit_osr_threshold,
             RunGcPolicy::Normal,
             Some(runtime_reuse),
@@ -1472,7 +1796,7 @@ fn run_module(
         name,
         parameters,
         surface: RunSurface::Module,
-        jit_tier,
+        jit_policy: jit_policy(jit_tier),
         jit_osr_threshold,
         gc_policy: RunGcPolicy::Normal,
         runtime_reuse: Some(runtime_reuse),
@@ -1527,9 +1851,21 @@ fn main() {
             source,
             function,
             expected,
+            compile_tier,
+            arguments,
+            expect_backend,
             samples,
             warmup,
-        } => run_jit_compile(source, function, expected, samples, warmup),
+        } => run_jit_compile(
+            source,
+            function,
+            expected,
+            compile_tier,
+            arguments,
+            expect_backend,
+            samples,
+            warmup,
+        ),
         Command::Memory {
             iterations,
             samples,
@@ -1570,7 +1906,7 @@ mod tests {
             name: "raw-samples".into(),
             parameters: BTreeMap::new(),
             surface: RunSurface::Vm,
-            jit_tier: EngineJitTier::Interpreter,
+            jit_policy: JitPolicy::Interpreter,
             jit_osr_threshold: None,
             gc_policy: RunGcPolicy::Normal,
             runtime_reuse: None,
@@ -1700,10 +2036,29 @@ mod tests {
             "engineKernel",
             "--expected",
             "-42",
+            "--compile-tier",
+            "optimizing",
+            "--argument",
+            "2",
+            "--argument",
+            "-3",
+            "--expect-backend",
+            "cranelift-numeric-leaf",
         ])
         .expect("negative compile checksum");
         match args.command {
-            Command::JitCompile { expected, .. } => assert_eq!(expected, -42.0),
+            Command::JitCompile {
+                expected,
+                compile_tier,
+                arguments,
+                expect_backend,
+                ..
+            } => {
+                assert_eq!(expected, -42.0);
+                assert_eq!(compile_tier, CompileTier::Optimizing);
+                assert_eq!(arguments, vec![2.0, -3.0]);
+                assert_eq!(expect_backend, Some(CompileBackend::CraneliftNumericLeaf));
+            }
             _ => panic!("expected JIT compile command"),
         }
     }
@@ -1778,6 +2133,32 @@ mod tests {
         let value = run_kernel_invocation(&mut interpreter, &context, invocation_id)
             .expect("invoke after full GC");
         assert_eq!(value.as_f64(), Some(42.0));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn jit_compile_enters_exact_cranelift_numeric_leaf() {
+        let record = run_jit_compile(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../benchmarks/scripts/numeric-leaf.js"),
+            "engineNumericLeaf".into(),
+            -7.0,
+            CompileTier::Optimizing,
+            vec![2.0, 2.0],
+            Some(CompileBackend::CraneliftNumericLeaf),
+            1,
+            0,
+        );
+        assert!(record.failure.is_none(), "{:?}", record.failure);
+        assert_eq!(record.jit_policy, JitPolicy::Optimizing);
+        assert_eq!(record.measurements.compile_time_ns.len(), 1);
+        assert_eq!(record.measurements.code_bytes.len(), 1);
+        assert!(
+            record
+                .validation_marker
+                .as_deref()
+                .is_some_and(|marker| marker.contains("tier=optimizing"))
+        );
     }
 
     #[test]

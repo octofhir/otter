@@ -22,6 +22,10 @@ use serde::{Deserialize, Serialize};
 
 pub mod process;
 
+/// Direct target calls used to seed arithmetic feedback before an engine
+/// compile benchmark snapshots the function.
+pub const ENGINE_COMPILE_FEEDBACK_SEED_CALLS: u32 = 8;
+
 /// Stable workload identity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -164,6 +168,8 @@ pub enum JitPolicy {
     Interpreter,
     /// Template tier without optimizing compilation.
     Template,
+    /// Optimizing compiler in isolation, without template fallback.
+    Optimizing,
     /// Production template plus optimizing tier policy.
     ProductionTiered,
     /// No Otter JIT policy participates.
@@ -787,6 +793,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&JitPolicy::Template).unwrap(),
             "\"template\""
+        );
+        assert_eq!(
+            serde_json::to_string(&JitPolicy::Optimizing).unwrap(),
+            "\"optimizing\""
         );
         assert_eq!(
             serde_json::to_string(&JitPolicy::ProductionTiered).unwrap(),

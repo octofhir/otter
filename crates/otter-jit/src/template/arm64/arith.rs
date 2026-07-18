@@ -26,9 +26,11 @@ use otter_bytecode::Op;
 
 use super::transitions::{TransitionTable, emit_add_delegate, emit_string_concat_alloc_call};
 use super::values::{
-    emit_box_bool, emit_box_double, emit_box_int32, emit_guard_int32, emit_load_reg, emit_load_u64,
-    emit_num_to_double, emit_store_reg, emit_to_int32_fast, emit_to_uint32_fast,
+    emit_box_bool, emit_box_double, emit_box_int32, emit_guard_int32, emit_load_reg,
+    emit_load_runtime_stub, emit_load_u64, emit_num_to_double, emit_store_reg, emit_to_int32_fast,
+    emit_to_uint32_fast,
 };
+use crate::artifact::relocation::RelocationCapture;
 use crate::entry::{
     DOUBLE_OFFSET_HI16, FUNCTION_ID_TAG, NUMBER_TAG_HI16, THREAD_OFFSET, Unsupported, VALUE_NULL,
     VALUE_TRUE, VALUE_UNDEFINED, VM_THREAD_GC_HEAP_OFFSET,
@@ -97,6 +99,7 @@ use crate::template::{ArithKind, BitwiseKind, CompareKind};
 /// remainder of a negative dividend → `-0`).
 pub(super) fn emit_binary_arith(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     dst: u16,
     lhs: u16,
     rhs: u16,
@@ -152,10 +155,12 @@ pub(super) fn emit_binary_arith(
                 ; mov x1, x9
                 ; mov x2, x10
             );
-            emit_load_u64(
+            emit_load_runtime_stub(
                 ops,
+                relocations,
                 16,
                 otter_vm::runtime_stubs::NUMBER_REM_LEAF.entry_addr() as u64,
+                abi::STUB_NUMBER_REM_LEAF,
             );
             dynasm!(ops
                 ; .arch aarch64
@@ -220,6 +225,7 @@ pub(super) fn emit_binary_arith(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_add_generic(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     dst: u16,
     lhs: u16,
@@ -254,9 +260,18 @@ pub(super) fn emit_add_generic(
     emit_box_double(ops, 2, 13);
     emit_store_reg(ops, 13, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>runtime_path);
-    emit_string_concat_alloc_call(ops, dst, lhs, rhs, concat_safepoint, delegate_path, done)?;
+    emit_string_concat_alloc_call(
+        ops,
+        relocations,
+        dst,
+        lhs,
+        rhs,
+        concat_safepoint,
+        delegate_path,
+        done,
+    )?;
     dynasm!(ops ; .arch aarch64 ; =>delegate_path);
-    emit_add_delegate(ops, table, dst, lhs, rhs, threw);
+    emit_add_delegate(ops, relocations, table, dst, lhs, rhs, threw);
     dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
 }
@@ -271,7 +286,12 @@ pub(super) fn emit_add_generic(
 /// via `fcmp`), non-number immediates by raw bit identity, heap cells by
 /// reference identity with distinct cells completing content equality through
 /// the leaf probe. `bail` fires only on the probe's null-heap miss.
-pub(crate) fn emit_strict_eq_tagged(ops: &mut Assembler, negate: bool, bail: DynamicLabel) {
+pub(crate) fn emit_strict_eq_tagged(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    negate: bool,
+    bail: DynamicLabel,
+) {
     let kind = if negate {
         CompareKind::Ne
     } else {
@@ -334,10 +354,12 @@ pub(crate) fn emit_strict_eq_tagged(ops: &mut Assembler, negate: bool, bail: Dyn
             ; mov x1, x9
             ; mov x2, x10
         );
-        emit_load_u64(
+        emit_load_runtime_stub(
             ops,
+            relocations,
             16,
             otter_vm::runtime_stubs::STRICT_EQ_LEAF.entry_addr() as u64,
+            abi::STUB_STRICT_EQ_LEAF,
         );
         dynasm!(ops
             ; .arch aarch64
@@ -372,6 +394,7 @@ pub(crate) fn emit_strict_eq_tagged(ops: &mut Assembler, negate: bool, bail: Dyn
 /// identity and side-exits on heap cells.
 pub(super) fn emit_compare(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     dst: u16,
     lhs: u16,
     rhs: u16,
@@ -481,10 +504,12 @@ pub(super) fn emit_compare(
             ; mov x1, x9
             ; mov x2, x10
         );
-        emit_load_u64(
+        emit_load_runtime_stub(
             ops,
+            relocations,
             16,
             otter_vm::runtime_stubs::STRICT_EQ_LEAF.entry_addr() as u64,
+            abi::STUB_STRICT_EQ_LEAF,
         );
         dynasm!(ops
             ; .arch aarch64
@@ -567,6 +592,7 @@ fn emit_cset<C: ConditionSet>(ops: &mut Assembler, kind: CompareKind, _condition
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_loose_compare(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     dst: u16,
     lhs: u16,
@@ -629,7 +655,13 @@ pub(super) fn emit_loose_compare(
         ; movz x3, rhs as u32
         ; movz x4, u32::from(negate)
     );
-    emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_LOOSE_EQ));
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        16,
+        table.entry(abi::STUB_JIT_LOOSE_EQ),
+        abi::STUB_JIT_LOOSE_EQ,
+    );
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
@@ -899,6 +931,7 @@ pub(super) fn emit_to_primitive(
 /// observable conversion through interpreter resume.
 pub(super) fn emit_numeric_slow_paths(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     slow_paths: Vec<NumericSlowPath>,
     bail: DynamicLabel,
@@ -923,7 +956,7 @@ pub(super) fn emit_numeric_slow_paths(
         );
         emit_load_u64(ops, 3, rhs_or_delta);
         emit_load_u64(ops, 4, u64::from(opcode as u8));
-        emit_load_u64(ops, 16, entry);
+        emit_load_runtime_stub(ops, relocations, 16, entry, abi::STUB_JIT_NUMERIC_OP);
         dynasm!(ops
             ; .arch aarch64
             ; blr x16
@@ -941,6 +974,7 @@ pub(super) fn emit_numeric_slow_paths(
 /// back to `resume` cannot expose a partially completed operation.
 pub(super) fn emit_coercion_slow_paths(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     slow_paths: Vec<CoercionSlowPath>,
     threw: DynamicLabel,
@@ -964,7 +998,7 @@ pub(super) fn emit_coercion_slow_paths(
             ; movz x3, mode
         );
         emit_load_u64(ops, 4, u64::from(hint));
-        emit_load_u64(ops, 16, entry);
+        emit_load_runtime_stub(ops, relocations, 16, entry, abi::STUB_JIT_COERCE_UNARY);
         dynasm!(ops
             ; .arch aarch64
             ; blr x16

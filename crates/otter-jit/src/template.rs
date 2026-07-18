@@ -39,7 +39,9 @@ mod code;
 mod plan;
 
 pub use code::TemplateCode;
-pub(crate) use plan::{ArithKind, BitwiseKind, CompareKind, TemplateOp, TemplatePlan};
+pub(crate) use plan::{
+    ArithKind, BitwiseKind, CompareKind, TemplateOp, TemplatePlan, TemplateTail,
+};
 
 use crate::entry::{TransitionTable, Unsupported};
 
@@ -376,6 +378,67 @@ mod tests {
         assert_eq!(metadata.safepoint_count, 0);
         assert_eq!(code.safepoint_count(), 0);
         assert!(!code.osr_only());
+    }
+
+    #[test]
+    fn artifact_capture_preserves_exact_code_and_layout() {
+        let view = countdown_view();
+        let transitions = crate::entry::TransitionTable::resolve();
+        let call_trampoline = std::sync::Arc::new(
+            crate::arm64::CallTrampoline::compile(&transitions)
+                .expect("shared call trampoline compiles"),
+        );
+        let without_capture = super::compile_with_trampoline_artifacts(
+            &view,
+            1,
+            &transitions,
+            std::sync::Arc::clone(&call_trampoline),
+            None,
+        )
+        .expect("template compiles without artifact capture");
+        let with_capture = super::compile_with_trampoline_artifacts(
+            &view,
+            1,
+            &transitions,
+            call_trampoline,
+            Some(crate::artifact::ArtifactRequest {
+                identity: otter_vm::JitArtifactIdentity {
+                    function_name: "countdown".to_string(),
+                    module: "artifact-code-identity.js".to_string(),
+                },
+                tier: otter_vm::JitDebugTier::Template,
+                entry: otter_vm::JitDebugTarget::Entry,
+            }),
+        )
+        .expect("template compiles with artifact capture");
+
+        assert_eq!(
+            without_capture.code.exact_bytes_for_test(),
+            with_capture.code.exact_bytes_for_test(),
+            "default-off capture must not change executable bytes"
+        );
+        assert_eq!(
+            without_capture.code.metadata(),
+            with_capture.code.metadata(),
+            "capture must not change entry offset or code-object shape"
+        );
+        assert_eq!(
+            without_capture.code.osr_entries_for_test(),
+            with_capture.code.osr_entries_for_test(),
+            "capture must not move OSR entry trampolines"
+        );
+
+        let artifact = with_capture
+            .artifact
+            .expect("enabled capture returns an artifact");
+        let captured_code = artifact
+            .file(otter_vm::JitArtifactFileName::Code)
+            .expect("artifact contains exact code.bin");
+        assert_eq!(
+            captured_code.contents(),
+            with_capture.code.exact_bytes_for_test(),
+            "code.bin must be the exact installed mapping"
+        );
     }
 
     /// Executable fixtures spanning constants, branches, moves, and returns,

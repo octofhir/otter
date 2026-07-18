@@ -86,7 +86,8 @@ Use the trace to establish bytecode order and the last interpreter-visible
 PC. To correlate a compiled function with its bytecode, tier input, exact
 machine-code offsets, safepoints, or deopt exits, capture a
 [JIT artifact bundle](/otter/engine/jit-debugging/). Annotated ARM64 assembly
-and symbolic relocation normalization remain tracked follow-ups.
+remains a tracked follow-up; symbolic relocations and portable normalized code
+are already part of the bundle.
 
 ## Performance
 

@@ -13,6 +13,8 @@
 //! - Allocating calls build the frozen call-packet layout on the machine
 //!   stack, name a concrete safepoint, and are followed by no derived-pointer
 //!   reuse — operands re-load from the rooted frame window.
+//! - Runtime entries, cage bases, and plan-owned operand slices are recorded
+//!   with stable semantic identities during the existing emission pass.
 //!
 //! # See also
 //! - `crates/otter-vm/src/native_abi/runtime_stubs.rs` — the authoritative
@@ -22,25 +24,60 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dyna
 use otter_vm::native_abi::{self as abi};
 use otter_vm::runtime_stubs::alloc_value_stub_by_id;
 
-use super::values::{emit_load_reg, emit_load_u64, emit_store_reg};
+use super::values::{
+    emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64, emit_store_reg,
+};
 pub(super) use crate::entry::TransitionTable;
 use otter_vm::JitCompileSnapshot;
 
+use crate::artifact::relocation::{
+    RelocationCapture, RelocationTarget, TemplateOperandArena, TemplateOperandRole,
+};
 use crate::entry::{
     ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
     ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, NATIVE_FRAME_OFFSET,
     NATIVE_FRAME_UPVALUE_BASE_OFFSET, NUMBER_TAG_HI16, THREAD_OFFSET, Unsupported, VALUE_HOLE,
     VALUE_UNDEFINED,
 };
+use crate::template::TemplateTail;
 
 /// `blr` to a resolved transition entry and branch to `threw` on a nonzero
 /// status in `x0`. Argument registers must already be set.
-fn emit_transition_call(ops: &mut Assembler, entry: u64, threw: DynamicLabel) {
-    emit_load_u64(ops, 16, entry);
+fn emit_transition_call(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    entry: u64,
+    descriptor: abi::RuntimeStubDescriptor,
+    threw: DynamicLabel,
+) {
+    emit_load_runtime_stub(ops, relocations, 16, entry, descriptor);
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
         ; cbnz x0, =>threw
+    );
+}
+
+fn emit_operand_slice_address(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    register: u8,
+    address: u64,
+    arena: TemplateOperandArena,
+    role: TemplateOperandRole,
+    tail: TemplateTail,
+) {
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        register,
+        address,
+        RelocationTarget::TemplateOperandSlice {
+            arena,
+            role,
+            start: u32::try_from(tail.start).expect("template operand offset fits u32"),
+            len: u32::try_from(tail.len).expect("template operand length fits u32"),
+        },
     );
 }
 
@@ -51,6 +88,7 @@ fn emit_ctx_arg(ops: &mut Assembler) {
 
 pub(super) fn emit_make_function(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     dst: u16,
     constant: u32,
@@ -59,30 +97,53 @@ pub(super) fn emit_make_function(
     emit_ctx_arg(ops);
     dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
     emit_load_u64(ops, 2, u64::from(constant));
-    emit_transition_call(ops, table.variadic_entry(abi::STUB_JIT_MAKE_FN), threw);
+    emit_transition_call(
+        ops,
+        relocations,
+        table.variadic_entry(abi::STUB_JIT_MAKE_FN),
+        abi::STUB_JIT_MAKE_FN,
+        threw,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_make_closure(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     code_block_id: u32,
     dst: u16,
     function: u32,
     parents: &[u32],
+    parents_tail: TemplateTail,
     threw: DynamicLabel,
 ) {
     emit_ctx_arg(ops);
     emit_load_u64(ops, 1, u64::from(code_block_id));
     dynasm!(ops ; .arch aarch64 ; movz x2, dst as u32);
     emit_load_u64(ops, 3, u64::from(function));
-    emit_load_u64(ops, 4, parents.as_ptr() as u64);
+    emit_operand_slice_address(
+        ops,
+        relocations,
+        4,
+        parents.as_ptr() as u64,
+        TemplateOperandArena::Indices,
+        TemplateOperandRole::ClosureParents,
+        parents_tail,
+    );
     emit_load_u64(ops, 5, parents.len() as u64);
-    emit_transition_call(ops, table.variadic_entry(abi::STUB_JIT_MAKE_CLOSURE), threw);
+    emit_transition_call(
+        ops,
+        relocations,
+        table.variadic_entry(abi::STUB_JIT_MAKE_CLOSURE),
+        abi::STUB_JIT_MAKE_CLOSURE,
+        threw,
+    );
 }
 
 pub(super) fn emit_load_string(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     code_block_id: u32,
     dst: u16,
@@ -93,11 +154,18 @@ pub(super) fn emit_load_string(
     emit_load_u64(ops, 1, u64::from(code_block_id));
     dynasm!(ops ; .arch aarch64 ; movz x2, dst as u32);
     emit_load_u64(ops, 3, u64::from(constant));
-    emit_transition_call(ops, table.variadic_entry(abi::STUB_JIT_LOAD_STRING), threw);
+    emit_transition_call(
+        ops,
+        relocations,
+        table.variadic_entry(abi::STUB_JIT_LOAD_STRING),
+        abi::STUB_JIT_LOAD_STRING,
+        threw,
+    );
 }
 
 pub(super) fn emit_load_regexp(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     dst: u16,
     constant: u32,
@@ -106,11 +174,18 @@ pub(super) fn emit_load_regexp(
     emit_ctx_arg(ops);
     dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
     emit_load_u64(ops, 2, u64::from(constant));
-    emit_transition_call(ops, table.variadic_entry(abi::STUB_JIT_LOAD_REGEXP), threw);
+    emit_transition_call(
+        ops,
+        relocations,
+        table.variadic_entry(abi::STUB_JIT_LOAD_REGEXP),
+        abi::STUB_JIT_LOAD_REGEXP,
+        threw,
+    );
 }
 
 pub(super) fn emit_load_global(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     dst: u16,
     name: u32,
@@ -121,11 +196,18 @@ pub(super) fn emit_load_global(
     dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
     emit_load_u64(ops, 2, u64::from(name));
     emit_load_u64(ops, 3, u64::from(code_block_id));
-    emit_transition_call(ops, table.variadic_entry(abi::STUB_JIT_LOAD_GLOBAL), threw);
+    emit_transition_call(
+        ops,
+        relocations,
+        table.variadic_entry(abi::STUB_JIT_LOAD_GLOBAL),
+        abi::STUB_JIT_LOAD_GLOBAL,
+        threw,
+    );
 }
 
 pub(super) fn emit_load_builtin_error(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     dst: u16,
     constant: u32,
@@ -136,42 +218,69 @@ pub(super) fn emit_load_builtin_error(
     emit_load_u64(ops, 2, u64::from(constant));
     emit_transition_call(
         ops,
+        relocations,
         table.variadic_entry(abi::STUB_JIT_LOAD_BUILTIN_ERROR),
+        abi::STUB_JIT_LOAD_BUILTIN_ERROR,
         threw,
     );
 }
 
 pub(super) fn emit_new_object(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     dst: u16,
     threw: DynamicLabel,
 ) {
     emit_ctx_arg(ops);
     dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
-    emit_transition_call(ops, table.variadic_entry(abi::STUB_JIT_NEW_OBJECT), threw);
+    emit_transition_call(
+        ops,
+        relocations,
+        table.variadic_entry(abi::STUB_JIT_NEW_OBJECT),
+        abi::STUB_JIT_NEW_OBJECT,
+        threw,
+    );
 }
 
 pub(super) fn emit_new_array(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     dst: u16,
     elements: &[u16],
+    elements_tail: TemplateTail,
     threw: DynamicLabel,
 ) {
     emit_ctx_arg(ops);
     dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
-    emit_load_u64(ops, 2, elements.as_ptr() as u64);
+    emit_operand_slice_address(
+        ops,
+        relocations,
+        2,
+        elements.as_ptr() as u64,
+        TemplateOperandArena::Registers,
+        TemplateOperandRole::NewArrayElements,
+        elements_tail,
+    );
     emit_load_u64(ops, 3, elements.len() as u64);
-    emit_transition_call(ops, table.variadic_entry(abi::STUB_JIT_NEW_ARRAY), threw);
+    emit_transition_call(
+        ops,
+        relocations,
+        table.variadic_entry(abi::STUB_JIT_NEW_ARRAY),
+        abi::STUB_JIT_NEW_ARRAY,
+        threw,
+    );
 }
 
 pub(super) fn emit_math_call(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     dst: u16,
     method: u32,
     arguments: &[u16],
+    arguments_tail: TemplateTail,
     threw: DynamicLabel,
 ) -> Result<(), Unsupported> {
     if arguments.is_empty()
@@ -179,10 +288,12 @@ pub(super) fn emit_math_call(
             == Some(otter_bytecode::method_id::MathMethod::Random)
     {
         // Value-producing leaf entry: no context, no status, result in x0.
-        emit_load_u64(
+        emit_load_runtime_stub(
             ops,
+            relocations,
             16,
             table.nullary_value_entry(abi::STUB_JIT_MATH_RANDOM),
+            abi::STUB_JIT_MATH_RANDOM,
         );
         dynasm!(ops ; .arch aarch64 ; blr x16);
         return emit_store_reg(ops, 0, dst);
@@ -190,14 +301,29 @@ pub(super) fn emit_math_call(
     emit_ctx_arg(ops);
     dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
     emit_load_u64(ops, 2, u64::from(method));
-    emit_load_u64(ops, 3, arguments.as_ptr() as u64);
+    emit_operand_slice_address(
+        ops,
+        relocations,
+        3,
+        arguments.as_ptr() as u64,
+        TemplateOperandArena::Registers,
+        TemplateOperandRole::MathArguments,
+        arguments_tail,
+    );
     emit_load_u64(ops, 4, arguments.len() as u64);
-    emit_transition_call(ops, table.variadic_entry(abi::STUB_JIT_MATH_CALL), threw);
+    emit_transition_call(
+        ops,
+        relocations,
+        table.variadic_entry(abi::STUB_JIT_MATH_CALL),
+        abi::STUB_JIT_MATH_CALL,
+        threw,
+    );
     Ok(())
 }
 
 pub(super) fn emit_fresh_upvalue(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     index: i32,
     threw: DynamicLabel,
@@ -206,13 +332,16 @@ pub(super) fn emit_fresh_upvalue(
     emit_load_u64(ops, 1, u64::from(index as u32));
     emit_transition_call(
         ops,
+        relocations,
         table.variadic_entry(abi::STUB_JIT_FRESH_UPVALUE),
+        abi::STUB_JIT_FRESH_UPVALUE,
         threw,
     );
 }
 
 pub(super) fn emit_define_data_property(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     object: u16,
     key: u16,
@@ -228,13 +357,16 @@ pub(super) fn emit_define_data_property(
     );
     emit_transition_call(
         ops,
+        relocations,
         table.variadic_entry(abi::STUB_JIT_DEFINE_DATA_PROPERTY),
+        abi::STUB_JIT_DEFINE_DATA_PROPERTY,
         threw,
     );
 }
 
 pub(super) fn emit_define_own_property(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     target: u16,
     key: u16,
@@ -250,7 +382,9 @@ pub(super) fn emit_define_own_property(
     );
     emit_transition_call(
         ops,
+        relocations,
         table.variadic_entry(abi::STUB_JIT_DEFINE_OWN_PROPERTY),
+        abi::STUB_JIT_DEFINE_OWN_PROPERTY,
         threw,
     );
 }
@@ -265,6 +399,7 @@ pub(super) fn emit_define_own_property(
 /// Clobbers `x9`, `x11`-`x16`.
 fn emit_dense_element_guards(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     receiver: u16,
     index: u16,
@@ -280,7 +415,13 @@ fn emit_dense_element_guards(
         ; b.ne =>miss
         ; mov w12, w9              // low-32 Gc offset
     );
-    emit_load_u64(ops, 13, view.cage_base as u64);
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        13,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
     dynasm!(ops
         ; .arch aarch64
         ; add x13, x13, x12        // x13 = GcHeader ptr
@@ -308,6 +449,7 @@ fn emit_dense_element_guards(
 
 pub(super) fn emit_load_element(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     view: &JitCompileSnapshot,
     dst: u16,
@@ -321,7 +463,7 @@ pub(super) fn emit_load_element(
     // absent property — the prototype chain answers — so it misses like every
     // other failed guard.
     if view.cage_base != 0 {
-        emit_dense_element_guards(ops, view, receiver, index, miss)?;
+        emit_dense_element_guards(ops, relocations, view, receiver, index, miss)?;
         emit_load_u64(ops, 11, VALUE_HOLE);
         dynasm!(ops
             ; .arch aarch64
@@ -340,13 +482,20 @@ pub(super) fn emit_load_element(
         ; movz x2, receiver as u32
         ; movz x3, index as u32
     );
-    emit_transition_call(ops, table.variadic_entry(abi::STUB_JIT_LOAD_ELEMENT), threw);
+    emit_transition_call(
+        ops,
+        relocations,
+        table.variadic_entry(abi::STUB_JIT_LOAD_ELEMENT),
+        abi::STUB_JIT_LOAD_ELEMENT,
+        threw,
+    );
     dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
 }
 
 pub(super) fn emit_store_element(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     view: &JitCompileSnapshot,
     receiver: u16,
@@ -361,7 +510,7 @@ pub(super) fn emit_store_element(
     // barrier and cannot allocate. A cell value takes the stub (barrier), a
     // hole takes the stub (a prototype setter may observe the store).
     if view.cage_base != 0 {
-        emit_dense_element_guards(ops, view, receiver, index, miss)?;
+        emit_dense_element_guards(ops, relocations, view, receiver, index, miss)?;
         emit_load_u64(ops, 11, VALUE_HOLE);
         dynasm!(ops
             ; .arch aarch64
@@ -390,7 +539,9 @@ pub(super) fn emit_store_element(
     );
     emit_transition_call(
         ops,
+        relocations,
         table.variadic_entry(abi::STUB_JIT_STORE_ELEMENT),
+        abi::STUB_JIT_STORE_ELEMENT,
         threw,
     );
     dynasm!(ops ; .arch aarch64 ; =>done);
@@ -399,6 +550,7 @@ pub(super) fn emit_store_element(
 
 pub(super) fn emit_load_upvalue(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     view: &JitCompileSnapshot,
     dst: u16,
@@ -420,7 +572,13 @@ pub(super) fn emit_load_upvalue(
             ; cbz x9, =>miss
             ; ldr w9, [x9, spine_offset]
         );
-        emit_load_u64(ops, 13, view.cage_base as u64);
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            13,
+            view.cage_base as u64,
+            RelocationTarget::GcCageBase,
+        );
         dynasm!(ops
             ; .arch aarch64
             ; add x13, x13, x9
@@ -439,13 +597,20 @@ pub(super) fn emit_load_upvalue(
     emit_ctx_arg(ops);
     dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
     emit_load_u64(ops, 2, u64::from(index as u32));
-    emit_transition_call(ops, table.variadic_entry(abi::STUB_JIT_LOAD_UPVALUE), threw);
+    emit_transition_call(
+        ops,
+        relocations,
+        table.variadic_entry(abi::STUB_JIT_LOAD_UPVALUE),
+        abi::STUB_JIT_LOAD_UPVALUE,
+        threw,
+    );
     dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
 }
 
 pub(super) fn emit_store_upvalue(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     src: u16,
     index: i32,
@@ -460,12 +625,19 @@ pub(super) fn emit_store_upvalue(
     } else {
         abi::STUB_JIT_STORE_UPVALUE
     };
-    emit_transition_call(ops, table.variadic_entry(descriptor), threw);
+    emit_transition_call(
+        ops,
+        relocations,
+        table.variadic_entry(descriptor),
+        descriptor,
+        threw,
+    );
 }
 
 /// Interpreter-completing `+` delegate for coercive operands.
 pub(super) fn emit_add_delegate(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     dst: u16,
     lhs: u16,
@@ -479,7 +651,13 @@ pub(super) fn emit_add_delegate(
         ; movz x2, lhs as u32
         ; movz x3, rhs as u32
     );
-    emit_transition_call(ops, table.variadic_entry(abi::STUB_JIT_ADD), threw);
+    emit_transition_call(
+        ops,
+        relocations,
+        table.variadic_entry(abi::STUB_JIT_ADD),
+        abi::STUB_JIT_ADD,
+        threw,
+    );
 }
 
 /// Allocating string-concat call through the isolate-resolved `AllocValue3`
@@ -488,6 +666,7 @@ pub(super) fn emit_add_delegate(
 /// status branches to `miss` (the interpreter-completing delegate path).
 pub(super) fn emit_string_concat_alloc_call(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     dst: u16,
     lhs: u16,
     rhs: u16,
@@ -515,7 +694,13 @@ pub(super) fn emit_string_concat_alloc_call(
     emit_load_reg(ops, 2, lhs)?;
     emit_load_reg(ops, 3, rhs)?;
     emit_load_u64(ops, 4, VALUE_UNDEFINED);
-    emit_load_u64(ops, 16, stub_addr as u64);
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        16,
+        stub_addr as u64,
+        abi::STUB_STRING_CONCAT_ALLOC,
+    );
     dynasm!(ops
         ; .arch aarch64
         ; blr x16

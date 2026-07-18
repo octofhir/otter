@@ -6,6 +6,7 @@
 //! - [`NativeCompileOutput`] — finalized code plus an optional sidecar.
 //! - [`CodeMapCapture`] and [`CodeRegion`] — emission-order native offset
 //!   correlation.
+//! - [`relocation`] — typed address sites and portable semantic code.
 //! - Deterministic bytecode, safepoint, deopt, and bundle renderers.
 //!
 //! # Invariants
@@ -14,6 +15,11 @@
 //!   or format text.
 //! - Code regions are recorded during the existing emission pass. This module
 //!   never re-emits code or runs a second lowering/analysis traversal.
+//! - Relocation normalization scans finalized bytes only when capture is
+//!   enabled. It never changes installed code or serializes resolved
+//!   process-local addresses.
+//! - A requested bundle is either returned complete or an internal compiler
+//!   invariant fails loudly; release builds never silently drop diagnostics.
 //! - Exact executable bytes remain runtime-local and are never retained by the
 //!   installed hot code object through this sidecar.
 //! - Files are returned as owned VM DTOs; this crate performs no filesystem
@@ -25,6 +31,8 @@
 
 #![cfg_attr(not(target_arch = "aarch64"), allow(dead_code, unused_imports))]
 
+pub(crate) mod relocation;
+
 use std::fmt::Write as _;
 
 use otter_vm::{
@@ -35,6 +43,7 @@ use otter_vm::{
 };
 use serde::Serialize;
 
+use self::relocation::RelocationCapture;
 use crate::CompiledCode;
 
 /// Compiler-local capture request for one successful compile.
@@ -213,17 +222,26 @@ pub(crate) fn build_bundle(
     tier_input_name: JitArtifactFileName,
     tier_input: String,
     code_map: CodeMapCapture,
+    relocations: RelocationCapture,
     deopt_table: Option<&DeoptTable>,
     safepoints: &[SafepointRecord],
-) -> Option<Box<JitArtifactBundle>> {
+) -> Box<JitArtifactBundle> {
+    let rendered_relocations = relocations
+        .render(code.bytes())
+        .unwrap_or_else(|error| panic!("compiler built invalid JIT relocations: {error}"));
     let mut files = vec![
         JitArtifactFile::text(JitArtifactFileName::Bytecode, render_bytecode(view)),
         JitArtifactFile::text(tier_input_name, tier_input),
         JitArtifactFile::binary(JitArtifactFileName::Code, code.bytes().to_vec()),
+        JitArtifactFile::binary(
+            JitArtifactFileName::NormalizedCode,
+            rendered_relocations.normalized_code,
+        ),
         JitArtifactFile::text(
             JitArtifactFileName::CodeMap,
             code_map.render(code.entry_offset()),
         ),
+        JitArtifactFile::text(JitArtifactFileName::Relocations, rendered_relocations.json),
         JitArtifactFile::text(
             JitArtifactFileName::Safepoints,
             render_safepoints(safepoints),
@@ -248,13 +266,10 @@ pub(crate) fn build_bundle(
         bytecode_bytes: u64::from(view.code_block.bytecode_byte_len()),
         code_bytes: u64::try_from(code.len()).unwrap_or(u64::MAX),
     };
-    match JitArtifactBundle::new(metadata, files) {
-        Ok(bundle) => Some(Box::new(bundle)),
-        Err(error) => {
-            debug_assert!(false, "compiler built an invalid JIT artifact: {error}");
-            None
-        }
-    }
+    Box::new(
+        JitArtifactBundle::new(metadata, files)
+            .unwrap_or_else(|error| panic!("compiler built an invalid JIT artifact: {error}")),
+    )
 }
 
 fn render_bytecode(view: &JitCompileSnapshot) -> String {

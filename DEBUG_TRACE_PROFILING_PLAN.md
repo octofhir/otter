@@ -49,16 +49,15 @@ needed to optimize the VM and JIT safely.
   abrupt completion, and includes JIT work performed by event-loop callbacks.
 - [x] Owned, schema-versioned JIT compile bundles through
   `--jit-artifacts[=<directory>]`: exact runtime-local code, bytecode,
-  template plan or optimized IR, native offset maps, deopt metadata, and
-  safepoints. The CLI writes a new root atomically under a cooperative
-  single-writer contract and never intentionally merges with an existing
-  target.
+  template plan or optimized IR, typed symbolic relocations, portable
+  normalized code, native offset maps, deopt metadata, and safepoints. The CLI
+  writes a new root atomically under a cooperative single-writer contract and
+  never intentionally merges with an existing target.
 
 The text step trace is not a Chrome/Perfetto trace. Async/op tracing, timeout
-ring-buffer dumps, Test262 failure traces, portable normalized machine-code
-dumps, symbolic relocations, and annotated assembly are not shipped yet.
-Structured JIT events and artifact manifests are Otter diagnostic schemas, not
-replacements for the planned Chrome/Perfetto timeline.
+ring-buffer dumps, Test262 failure traces, and annotated assembly are not
+shipped yet. Structured JIT events and artifact manifests are Otter diagnostic
+schemas, not replacements for the planned Chrome/Perfetto timeline.
 
 ## Known Debt
 
@@ -72,9 +71,10 @@ replacements for the planned Chrome/Perfetto timeline.
   JIT event report. In that case the CLI preserves the timeout error and does
   not write a misleading empty artifact; bounded timeout snapshots remain a
   later slice.
-- Exact native bytes and native-offset maps are available, but address
-  immediates are not yet described by symbolic relocation records and there is
-  no portable normalized code stream.
+- Exact native bytes and native-offset maps are available alongside typed
+  symbolic relocations and a portable semantic code stream. The normalized
+  stream is intentionally not executable and still lacks annotated
+  disassembly.
 - Bytecode PC, tier plan/IR, native code offsets, OSR entries, and deopt exits
   can be correlated. Safepoint-to-native-return offsets and annotated
   disassembly remain open.
@@ -104,7 +104,7 @@ replacements for the planned Chrome/Perfetto timeline.
 - [x] Publish a versioned `manifest.json` containing target, architecture,
   tier, function identity, module, entry kind, bytecode/code sizes, and the
   files present.
-- [ ] Emit exact runtime-local `code.bin`, deterministic `code-map.json`, and
+- [x] Emit exact runtime-local `code.bin`, deterministic `code-map.json`, and
   symbolic `relocations.json`. Portable byte comparisons use a normalized view
   with relocation immediates redacted, not the exact executable bytes.
 - [x] Emit tier input from the already-owned compiler representation:
@@ -114,9 +114,9 @@ replacements for the planned Chrome/Perfetto timeline.
   failure, nested JIT re-entry, and full-GC relocation.
 
 Multiple functions, template and optimizing OSR, abrupt execution, nested JIT
-re-entry, and full-GC ownership are covered. Recompilation, abrupt compiler
-failure, typed relocations, and normalized code remain follow-ups in this
-roadmap item.
+re-entry, full-GC ownership, typed relocations, and portable code comparison
+are covered. Recompilation and abrupt compiler failure remain follow-ups in
+this roadmap item.
 
 Planned bundle shape:
 
@@ -126,6 +126,7 @@ jit-<ordinal>-<tier>-f<function-id>/
   bytecode.txt
   template-plan.txt | optimized-ir.txt
   code.bin
+  code-normalized.bin
   asm.txt
   code-map.json
   relocations.json
@@ -169,7 +170,7 @@ manifest rather than emitted as placeholders.
 
 ### 6. Documentation and compatibility
 
-- [ ] Add a docs-site JIT debugging guide once the artifact CLI is real.
+- [x] Add a docs-site JIT debugging guide once the artifact CLI is real.
 - [ ] Document bundle schemas, annotated assembly, source correlation, and
   before/after optimization workflow.
 - [ ] Add compatibility tests that load every machine-readable output in its

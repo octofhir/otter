@@ -113,6 +113,16 @@ impl TemplateCode {
         // SAFETY: tests keep `self` alive for the complete native call.
         unsafe { self.code.entry_ptr() }
     }
+
+    #[cfg(test)]
+    pub(super) fn exact_bytes_for_test(&self) -> &[u8] {
+        self.code.bytes()
+    }
+
+    #[cfg(test)]
+    pub(super) fn osr_entries_for_test(&self) -> &std::collections::BTreeMap<u32, usize> {
+        &self.osr_entries
+    }
 }
 
 impl std::fmt::Debug for TemplateCode {

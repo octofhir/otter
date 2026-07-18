@@ -17,8 +17,11 @@
 //! - Boxed-double falsiness is decided by exact bit patterns (`+0.0`, `-0.0`,
 //!   the canonical NaN); the VM's NaN-purification invariant makes this
 //!   complete.
-//! - Emitted code bakes only offsets from the shared entry-ABI module and the
-//!   frozen value-tag contract; no Rust container layout is probed.
+//! - Process-local addresses are materialized through typed relocation
+//!   capture. Disabled capture allocates no record storage and emits the same
+//!   variable-width instruction sequences.
+//! - Machine-visible offsets come only from the shared entry-ABI module and
+//!   frozen value-tag contracts; no Rust container layout is probed.
 //!
 //! # See also
 //! - [`super::plan`] — the validated operation stream consumed here.
@@ -68,12 +71,14 @@ use self::arith::{
     emit_to_numeric, emit_to_primitive, emit_unsigned_shift_right,
 };
 use self::values::{
-    BoxedSlotSlowPath, emit_boxed_slot_slow_paths, emit_load_reg, emit_load_u64, emit_store_reg,
+    BoxedSlotSlowPath, emit_boxed_slot_slow_paths, emit_load_reg, emit_load_runtime_stub,
+    emit_load_u64, emit_store_reg,
 };
 use super::{TemplateCode, TemplateOp, TemplatePlan};
 use crate::CompiledCode;
 use crate::artifact::{
     ArtifactRequest, CodeMapCapture, CodeRegion, NativeCompileOutput, build_bundle,
+    relocation::RelocationCapture,
 };
 use crate::entry::{
     CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
@@ -100,6 +105,7 @@ pub(super) fn compile(
 ) -> Result<NativeCompileOutput<TemplateCode>, Unsupported> {
     let plan = TemplatePlan::build(view)?;
     let mut code_map = artifact_request.as_ref().map(|_| CodeMapCapture::default());
+    let mut relocations = RelocationCapture::new(artifact_request.is_some());
     let poll_entry = transitions.entry(abi::STUB_JIT_BACKEDGE_POLL);
     let code_block_id = view.code_block.id;
     // Self-patching property IC cells: allocated address-stable before any
@@ -154,7 +160,7 @@ pub(super) fn compile(
             TemplateOp::Jump { target, back_edge } => {
                 let tgt = labels[&target];
                 if back_edge {
-                    emit_backedge_poll(&mut ops, poll_entry, threw);
+                    emit_backedge_poll(&mut ops, &mut relocations, poll_entry, threw);
                 }
                 dynasm!(ops ; .arch aarch64 ; b =>tgt);
             }
@@ -166,7 +172,7 @@ pub(super) fn compile(
             } => {
                 let tgt = labels[&target];
                 emit_load_reg(&mut ops, 9, condition)?;
-                emit_truthiness_bool(&mut ops, bail);
+                emit_truthiness_bool(&mut ops, &mut relocations, bail);
                 dynasm!(ops ; .arch aarch64 ; cmp x9, VALUE_TRUE_IMM);
                 if back_edge {
                     let taken = ops.new_dynamic_label();
@@ -177,7 +183,7 @@ pub(super) fn compile(
                         dynasm!(ops ; .arch aarch64 ; b.ne =>taken);
                     }
                     dynasm!(ops ; .arch aarch64 ; b =>fallthrough ; =>taken);
-                    emit_backedge_poll(&mut ops, poll_entry, threw);
+                    emit_backedge_poll(&mut ops, &mut relocations, poll_entry, threw);
                     dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
                 } else if when_truthy {
                     dynasm!(ops ; .arch aarch64 ; b.eq =>tgt);
@@ -203,13 +209,13 @@ pub(super) fn compile(
                 let fallthrough = ops.new_dynamic_label();
                 dynasm!(ops ; .arch aarch64 ; b =>fallthrough ; =>taken);
                 if back_edge {
-                    emit_backedge_poll(&mut ops, poll_entry, threw);
+                    emit_backedge_poll(&mut ops, &mut relocations, poll_entry, threw);
                 }
                 dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
             }
             TemplateOp::Truthiness { dst, src, negate } => {
                 emit_load_reg(&mut ops, 9, src)?;
-                emit_truthiness_bool(&mut ops, bail);
+                emit_truthiness_bool(&mut ops, &mut relocations, bail);
                 if negate {
                     // VALUE_TRUE and VALUE_FALSE differ exactly in bit 0.
                     dynasm!(ops ; .arch aarch64 ; eor x9, x9, #1);
@@ -222,7 +228,15 @@ pub(super) fn compile(
                 rhs,
                 kind,
             } => {
-                emit_binary_arith(&mut ops, dst, lhs, rhs, kind, &mut numeric_slow_paths)?;
+                emit_binary_arith(
+                    &mut ops,
+                    &mut relocations,
+                    dst,
+                    lhs,
+                    rhs,
+                    kind,
+                    &mut numeric_slow_paths,
+                )?;
             }
             TemplateOp::Compare {
                 dst,
@@ -230,7 +244,16 @@ pub(super) fn compile(
                 rhs,
                 kind,
             } => {
-                emit_compare(&mut ops, dst, lhs, rhs, kind, bail, &mut numeric_slow_paths)?;
+                emit_compare(
+                    &mut ops,
+                    &mut relocations,
+                    dst,
+                    lhs,
+                    rhs,
+                    kind,
+                    bail,
+                    &mut numeric_slow_paths,
+                )?;
             }
             TemplateOp::LooseCompare {
                 dst,
@@ -238,7 +261,17 @@ pub(super) fn compile(
                 rhs,
                 negate,
             } => {
-                emit_loose_compare(&mut ops, transitions, dst, lhs, rhs, negate, bail, threw)?;
+                emit_loose_compare(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    dst,
+                    lhs,
+                    rhs,
+                    negate,
+                    bail,
+                    threw,
+                )?;
             }
             TemplateOp::IntBitwise {
                 dst,
@@ -274,6 +307,7 @@ pub(super) fn compile(
             } => {
                 emit_add_generic(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     dst,
                     lhs,
@@ -303,7 +337,14 @@ pub(super) fn compile(
                 emit_store_reg(&mut ops, 9, dst)?;
             }
             TemplateOp::MakeFunction { dst, constant } => {
-                transitions::emit_make_function(&mut ops, transitions, dst, constant, threw);
+                transitions::emit_make_function(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    dst,
+                    constant,
+                    threw,
+                );
             }
             TemplateOp::MakeClosure {
                 dst,
@@ -312,17 +353,20 @@ pub(super) fn compile(
             } => {
                 transitions::emit_make_closure(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     code_block_id,
                     dst,
                     function,
                     plan.index_tail(parents),
+                    parents,
                     threw,
                 );
             }
             TemplateOp::LoadString { dst, constant } => {
                 transitions::emit_load_string(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     code_block_id,
                     dst,
@@ -331,11 +375,19 @@ pub(super) fn compile(
                 );
             }
             TemplateOp::LoadRegExp { dst, constant } => {
-                transitions::emit_load_regexp(&mut ops, transitions, dst, constant, threw);
+                transitions::emit_load_regexp(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    dst,
+                    constant,
+                    threw,
+                );
             }
             TemplateOp::LoadGlobal { dst, name } => {
                 transitions::emit_load_global(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     dst,
                     name,
@@ -344,17 +396,26 @@ pub(super) fn compile(
                 );
             }
             TemplateOp::LoadBuiltinError { dst, constant } => {
-                transitions::emit_load_builtin_error(&mut ops, transitions, dst, constant, threw);
+                transitions::emit_load_builtin_error(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    dst,
+                    constant,
+                    threw,
+                );
             }
             TemplateOp::NewObject { dst } => {
-                transitions::emit_new_object(&mut ops, transitions, dst, threw);
+                transitions::emit_new_object(&mut ops, &mut relocations, transitions, dst, threw);
             }
             TemplateOp::NewArray { dst, elements } => {
                 transitions::emit_new_array(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     dst,
                     plan.register_tail(elements),
+                    elements,
                     threw,
                 );
             }
@@ -365,19 +426,28 @@ pub(super) fn compile(
             } => {
                 transitions::emit_math_call(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     dst,
                     method,
                     plan.register_tail(arguments),
+                    arguments,
                     threw,
                 )?;
             }
             TemplateOp::FreshUpvalue { index } => {
-                transitions::emit_fresh_upvalue(&mut ops, transitions, index, threw);
+                transitions::emit_fresh_upvalue(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    index,
+                    threw,
+                );
             }
             TemplateOp::DefineDataProperty { object, key, value } => {
                 transitions::emit_define_data_property(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     object,
                     key,
@@ -392,6 +462,7 @@ pub(super) fn compile(
             } => {
                 transitions::emit_define_own_property(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     target,
                     key,
@@ -406,6 +477,7 @@ pub(super) fn compile(
             } => {
                 transitions::emit_load_element(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     view,
                     dst,
@@ -421,6 +493,7 @@ pub(super) fn compile(
             } => {
                 transitions::emit_store_element(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     view,
                     receiver,
@@ -430,13 +503,37 @@ pub(super) fn compile(
                 )?;
             }
             TemplateOp::LoadUpvalue { dst, index } => {
-                transitions::emit_load_upvalue(&mut ops, transitions, view, dst, index, threw)?;
+                transitions::emit_load_upvalue(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    view,
+                    dst,
+                    index,
+                    threw,
+                )?;
             }
             TemplateOp::StoreUpvalue { src, index } => {
-                transitions::emit_store_upvalue(&mut ops, transitions, src, index, false, threw);
+                transitions::emit_store_upvalue(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    src,
+                    index,
+                    false,
+                    threw,
+                );
             }
             TemplateOp::StoreUpvalueChecked { src, index } => {
-                transitions::emit_store_upvalue(&mut ops, transitions, src, index, true, threw);
+                transitions::emit_store_upvalue(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    src,
+                    index,
+                    true,
+                    threw,
+                );
             }
             TemplateOp::LoadProperty {
                 dst,
@@ -445,11 +542,14 @@ pub(super) fn compile(
                 site,
                 array_length,
             } => {
+                let cell_ordinal =
+                    u32::try_from(next_load_ic).expect("template load IC ordinal fits u32");
                 let cell = &mut load_ic_cells[next_load_ic];
                 next_load_ic += 1;
                 let cell_addr = cell as *mut crate::entry::WhiskerIcCell as usize;
                 properties::emit_load_property(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     view,
                     dst,
@@ -458,6 +558,7 @@ pub(super) fn compile(
                     site,
                     array_length,
                     cell_addr,
+                    cell_ordinal,
                     &mut boxed_slot_slow_paths,
                     threw,
                 )?;
@@ -468,11 +569,14 @@ pub(super) fn compile(
                 value,
                 site,
             } => {
+                let cell_ordinal =
+                    u32::try_from(next_store_ic).expect("template store IC ordinal fits u32");
                 let cell = &mut store_ic_cells[next_store_ic];
                 next_store_ic += 1;
                 let cell_addr = cell as *mut crate::entry::WhiskerIcCell as usize;
                 properties::emit_store_property(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     view,
                     object,
@@ -480,6 +584,7 @@ pub(super) fn compile(
                     value,
                     site,
                     cell_addr,
+                    cell_ordinal,
                     threw,
                 )?;
             }
@@ -490,14 +595,17 @@ pub(super) fn compile(
                 packed_args,
                 byte_pc: _,
             } => {
+                let (packed_args, packed_args_tail) = plan.resolve_packed_args(argc, packed_args);
                 calls::emit_call(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     call_trampoline.as_ref(),
                     dst,
                     callee,
                     argc,
-                    plan.resolve_packed_args(argc, packed_args),
+                    packed_args,
+                    packed_args_tail,
                     bail,
                     threw,
                 );
@@ -508,13 +616,16 @@ pub(super) fn compile(
                 argc,
                 packed_args,
             } => {
+                let (packed_args, packed_args_tail) = plan.resolve_packed_args(argc, packed_args);
                 calls::emit_construct(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     dst,
                     callee,
                     argc,
-                    plan.resolve_packed_args(argc, packed_args),
+                    packed_args,
+                    packed_args_tail,
                     bail,
                     threw,
                 );
@@ -530,8 +641,10 @@ pub(super) fn compile(
                 arg0,
                 arg1,
             } => {
+                let (packed_args, packed_args_tail) = plan.resolve_packed_args(argc, packed_args);
                 calls::emit_method_call(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     call_trampoline.as_ref(),
                     view,
@@ -540,7 +653,8 @@ pub(super) fn compile(
                     name,
                     site,
                     argc,
-                    plan.resolve_packed_args(argc, packed_args),
+                    packed_args,
+                    packed_args_tail,
                     byte_pc,
                     arg0,
                     arg1,
@@ -555,6 +669,7 @@ pub(super) fn compile(
             } => {
                 exceptions::emit_exception_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     Op::EnterTry as u8,
                     u64::from(catch_pc.unwrap_or(u32::MAX)),
@@ -568,6 +683,7 @@ pub(super) fn compile(
             TemplateOp::LeaveTry => {
                 exceptions::emit_exception_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     Op::LeaveTry as u8,
                     0,
@@ -581,6 +697,7 @@ pub(super) fn compile(
             TemplateOp::Throw { src } => {
                 exceptions::emit_exception_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     Op::Throw as u8,
                     u64::from(src),
@@ -594,6 +711,7 @@ pub(super) fn compile(
             TemplateOp::TdzError { local_index } => {
                 exceptions::emit_exception_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     Op::TdzError as u8,
                     u64::from(local_index),
@@ -607,6 +725,7 @@ pub(super) fn compile(
             TemplateOp::EndFinally => {
                 exceptions::emit_exception_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     Op::EndFinally as u8,
                     0,
@@ -620,6 +739,7 @@ pub(super) fn compile(
             TemplateOp::PopParkedFinally { count } => {
                 exceptions::emit_exception_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     Op::PopParkedFinally as u8,
                     u64::from(count),
@@ -633,6 +753,7 @@ pub(super) fn compile(
             TemplateOp::JumpViaFinally { target, floor } => {
                 exceptions::emit_exception_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     Op::JumpViaFinally as u8,
                     u64::from(target),
@@ -650,6 +771,7 @@ pub(super) fn compile(
             } => {
                 iterators::emit_iterator_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     Op::IteratorNext as u8,
                     u64::from(value_dst),
@@ -662,6 +784,7 @@ pub(super) fn compile(
             TemplateOp::IteratorClose { iterator } => {
                 iterators::emit_iterator_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     Op::IteratorClose as u8,
                     u64::from(iterator),
@@ -674,6 +797,7 @@ pub(super) fn compile(
             TemplateOp::IteratorCloseStart { iterator } => {
                 iterators::emit_iterator_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     Op::IteratorCloseStart as u8,
                     u64::from(iterator),
@@ -686,6 +810,7 @@ pub(super) fn compile(
             TemplateOp::IteratorCloseEnd { iterator } => {
                 iterators::emit_iterator_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     Op::IteratorCloseEnd as u8,
                     u64::from(iterator),
@@ -708,6 +833,7 @@ pub(super) fn compile(
                     | (u64::from(argc) << 48);
                 functions::emit_bind_function(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     packed_meta,
                     packed_args,
@@ -723,6 +849,7 @@ pub(super) fn compile(
             } => {
                 globals::emit_global_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     opcode,
                     arg0,
@@ -740,6 +867,7 @@ pub(super) fn compile(
             } => {
                 protocol::emit_object_protocol_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     opcode,
                     arg0,
@@ -757,6 +885,7 @@ pub(super) fn compile(
             } => {
                 delete::emit_delete_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     opcode,
                     arg0,
@@ -774,6 +903,7 @@ pub(super) fn compile(
             } => {
                 scalar::emit_scalar_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     opcode,
                     arg0,
@@ -791,6 +921,7 @@ pub(super) fn compile(
             } => {
                 super_access::emit_super_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     opcode,
                     arg0,
@@ -808,6 +939,7 @@ pub(super) fn compile(
             } => {
                 private_access::emit_private_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     opcode,
                     arg0,
@@ -825,6 +957,7 @@ pub(super) fn compile(
             } => {
                 value_load::emit_value_load_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     opcode,
                     arg0,
@@ -842,6 +975,7 @@ pub(super) fn compile(
             } => {
                 construct::emit_construct_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     opcode,
                     arg0,
@@ -854,6 +988,7 @@ pub(super) fn compile(
             TemplateOp::StructuralOp { opcode, arg0, arg1 } => {
                 structural::emit_structural_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     opcode,
                     arg0,
@@ -870,6 +1005,7 @@ pub(super) fn compile(
             } => {
                 class_ops::emit_class_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     opcode,
                     arg0,
@@ -887,6 +1023,7 @@ pub(super) fn compile(
             } => {
                 variadic::emit_variadic_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     opcode,
                     prefix,
@@ -904,6 +1041,7 @@ pub(super) fn compile(
             } => {
                 static_call::emit_static_call_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     opcode,
                     packed_head,
@@ -921,6 +1059,7 @@ pub(super) fn compile(
             } => {
                 control::emit_control_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     opcode,
                     arg0,
@@ -938,6 +1077,7 @@ pub(super) fn compile(
             } => {
                 spread_call::emit_spread_call_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     opcode,
                     arg0,
@@ -955,6 +1095,7 @@ pub(super) fn compile(
             } => {
                 class_value::emit_class_value_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     opcode,
                     arg0,
@@ -972,6 +1113,7 @@ pub(super) fn compile(
             } => {
                 module_op::emit_module_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     opcode,
                     arg0,
@@ -985,6 +1127,7 @@ pub(super) fn compile(
             TemplateOp::GetIterator { dst, src } => {
                 iterators::emit_iterator_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     Op::GetIterator as u8,
                     u64::from(dst),
@@ -997,6 +1140,7 @@ pub(super) fn compile(
             TemplateOp::GetAsyncIterator { dst, src } => {
                 iterators::emit_iterator_op(
                     &mut ops,
+                    &mut relocations,
                     transitions,
                     Op::GetAsyncIterator as u8,
                     u64::from(dst),
@@ -1046,9 +1190,22 @@ pub(super) fn compile(
     {
         let slow_paths_start = ops.offset().0;
         dynasm!(ops ; .arch aarch64 ; b =>bail);
-        emit_boxed_slot_slow_paths(&mut ops, view, boxed_slot_slow_paths);
-        emit_numeric_slow_paths(&mut ops, transitions, numeric_slow_paths, bail, threw);
-        emit_coercion_slow_paths(&mut ops, transitions, coercion_slow_paths, threw);
+        emit_boxed_slot_slow_paths(&mut ops, &mut relocations, view, boxed_slot_slow_paths);
+        emit_numeric_slow_paths(
+            &mut ops,
+            &mut relocations,
+            transitions,
+            numeric_slow_paths,
+            bail,
+            threw,
+        );
+        emit_coercion_slow_paths(
+            &mut ops,
+            &mut relocations,
+            transitions,
+            coercion_slow_paths,
+            threw,
+        );
         if let Some(code_map) = code_map.as_mut() {
             code_map.record(CodeRegion::structural(
                 "outlinedSlowPaths",
@@ -1103,7 +1260,13 @@ pub(super) fn compile(
         ; =>threw
         ; mov x0, x20
     );
-    emit_load_u64(&mut ops, 16, transitions.entry(abi::STUB_JIT_RESOLVE_THREW));
+    emit_load_runtime_stub(
+        &mut ops,
+        &mut relocations,
+        16,
+        transitions.entry(abi::STUB_JIT_RESOLVE_THREW),
+        abi::STUB_JIT_RESOLVE_THREW,
+    );
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
@@ -1160,7 +1323,7 @@ pub(super) fn compile(
     } = plan;
     safepoint_records.sort_by_key(|record| record.id);
     let compiled_code = CompiledCode::new(buf, entry);
-    let artifact = artifact_request.and_then(|request| {
+    let artifact = artifact_request.map(|request| {
         build_bundle(
             request,
             view,
@@ -1169,6 +1332,7 @@ pub(super) fn compile(
             otter_vm::JitArtifactFileName::TemplatePlan,
             tier_input.expect("requested artifact has tier input"),
             code_map.expect("requested artifact has code map"),
+            relocations,
             None,
             &safepoint_records,
         )
@@ -1231,7 +1395,11 @@ fn emit_stamp_pc(ops: &mut Assembler, pc: u32) {
 /// `undefined` decide inline; a heap cell or any other encoding (the hole,
 /// function-id immediates) branches to `bail` for the exact side exit.
 /// Clobbers `x14`/`x15`.
-fn emit_truthiness_bool(ops: &mut Assembler, bail: DynamicLabel) {
+fn emit_truthiness_bool(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    bail: DynamicLabel,
+) {
     let int_case = ops.new_dynamic_label();
     let double_case = ops.new_dynamic_label();
     let truthy = ops.new_dynamic_label();
@@ -1263,10 +1431,12 @@ fn emit_truthiness_bool(ops: &mut Assembler, bail: DynamicLabel) {
         ; mov x1, x9
         ; movz x2, #0
     );
-    emit_load_u64(
+    emit_load_runtime_stub(
         ops,
+        relocations,
         16,
         otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
+        abi::STUB_TO_BOOLEAN_LEAF,
     );
     dynasm!(ops
         ; .arch aarch64
@@ -1302,7 +1472,12 @@ fn emit_truthiness_bool(ops: &mut Assembler, bail: DynamicLabel) {
 /// interrupt is set or the counter reaches zero. `poll_entry` is the
 /// descriptor-resolved poll transition; a nonzero status branches to the
 /// throw epilogue.
-fn emit_backedge_poll(ops: &mut Assembler, poll_entry: u64, threw: DynamicLabel) {
+fn emit_backedge_poll(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    poll_entry: u64,
+    threw: DynamicLabel,
+) {
     let slow = ops.new_dynamic_label();
     let cont = ops.new_dynamic_label();
     dynasm!(ops
@@ -1319,7 +1494,13 @@ fn emit_backedge_poll(ops: &mut Assembler, poll_entry: u64, threw: DynamicLabel)
         ; =>slow
         ; mov x0, x20
     );
-    emit_load_u64(ops, 16, poll_entry);
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        16,
+        poll_entry,
+        abi::STUB_JIT_BACKEDGE_POLL,
+    );
     dynasm!(ops
         ; .arch aarch64
         ; blr x16

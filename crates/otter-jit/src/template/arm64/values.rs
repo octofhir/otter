@@ -1,7 +1,8 @@
 //! AArch64 tagged-value encode/decode primitives for the template backend.
 //!
 //! # Contents
-//! - Register-window loads/stores and 64-bit immediate materialization.
+//! - Register-window loads/stores, 64-bit immediate materialization, and typed
+//!   symbolic-address capture.
 //! - Number guards, int32/double boxing, and NaN-purifying double encode.
 //! - Compressed property-slot decoding with cold boxed-payload recovery.
 //! - Full-semantics `ToInt32`/`ToUint32` fast paths for bitwise operators.
@@ -14,6 +15,8 @@
 //!   exact full-Value payload is recovered.
 //! - Coercions the fast path cannot represent exactly branch to the caller's
 //!   supplied pre-effect continuation, normally an outlined VM transition.
+//! - Symbolic loads wrap the ordinary variable-width materializer, so capture
+//!   never changes installed machine code.
 //!
 //! # See also
 //! - `otter_vm::value::tag` — the frozen boxed-value contract these bake.
@@ -21,6 +24,7 @@
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::JitCompileSnapshot;
 
+use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::entry::{
     CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, FUNCTION_ID_TAG, NUMBER_TAG_HI16, Unsupported,
     VALUE_FALSE, VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, reg_offset,
@@ -59,6 +63,37 @@ pub(super) fn emit_load_u64(ops: &mut Assembler, t: u8, v: u64) {
     if (v >> 48) & 0xFFFF != 0 {
         dynasm!(ops ; .arch aarch64 ; movk X(t), ((v >> 48) & 0xFFFF) as u32, lsl #48);
     }
+}
+
+/// Materialize one process-local symbolic value without changing the
+/// variable-width `movz`/`movk` sequence used by the normal code path.
+pub(super) fn emit_load_symbol_u64(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    t: u8,
+    value: u64,
+    target: RelocationTarget,
+) {
+    let start = ops.offset().0;
+    emit_load_u64(ops, t, value);
+    relocations.record_mov_wide(start, ops.offset().0, t, target);
+}
+
+/// Materialize a validated runtime-stub entry and attach its descriptor.
+pub(super) fn emit_load_runtime_stub(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    t: u8,
+    value: u64,
+    descriptor: otter_vm::native_abi::RuntimeStubDescriptor,
+) {
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        t,
+        value,
+        RelocationTarget::runtime_stub(descriptor),
+    );
 }
 
 /// Box the int32 payload in the low 32 bits of `X(t)` by setting the number
@@ -244,7 +279,12 @@ pub(crate) fn emit_slab_base(ops: &mut Assembler, view: &JitCompileSnapshot, reg
 /// boxed slot (a heap-boxed double / wide int) branches to `boxed_bail`,
 /// where a deferred cold path reads the box. Fixed registers: `x9` is the
 /// slot in/out, `x10` scratch.
-pub(crate) fn emit_decompress_slot(ops: &mut Assembler, cage_base: u64, boxed_bail: DynamicLabel) {
+pub(crate) fn emit_decompress_slot(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    cage_base: u64,
+    boxed_bail: DynamicLabel,
+) {
     use otter_vm::value::compressed as cslot;
     // The literal slot tags below are the frozen `compressed` layout.
     debug_assert_eq!(cslot::TAG_MASK, 0b111);
@@ -284,7 +324,13 @@ pub(crate) fn emit_decompress_slot(ops: &mut Assembler, cage_base: u64, boxed_ba
         // `cage_base | offset`. The empty slot (0) decodes to `undefined`.
         ; cbz x9, =>l_undef
     );
-    emit_load_u64(ops, 10, cage_base);
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        10,
+        cage_base,
+        RelocationTarget::GcCageBase,
+    );
     dynasm!(ops
         ; .arch aarch64
         ; orr x9, x9, x10
@@ -344,6 +390,7 @@ pub(crate) struct BoxedSlotSlowPath {
 /// `Value` bits, including `-0`, NaN, and wide int32 payloads.
 pub(crate) fn emit_boxed_slot_slow_paths(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     slow_paths: Vec<BoxedSlotSlowPath>,
 ) {
@@ -371,7 +418,13 @@ pub(crate) fn emit_boxed_slot_slow_paths(
             ; b.ne =>miss
             ; and w9, w9, #0xfffffff8
         );
-        emit_load_u64(ops, 10, view.cage_base as u64);
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            10,
+            view.cage_base as u64,
+            RelocationTarget::GcCageBase,
+        );
         dynasm!(ops
             ; .arch aarch64
             ; add x9, x10, x9

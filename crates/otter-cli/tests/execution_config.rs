@@ -285,7 +285,9 @@ fn jit_artifacts_are_versioned_complete_and_offset_consistent() {
         "bytecode.txt",
         "template-plan.txt",
         "code.bin",
+        "code-normalized.bin",
         "code-map.json",
+        "relocations.json",
         "safepoints.json",
     ] {
         assert!(
@@ -295,13 +297,7 @@ fn jit_artifacts_are_versioned_complete_and_offset_consistent() {
         assert!(directory.join(name).is_file(), "missing payload {name}");
     }
     let absent = manifest["filesAbsent"].as_array().expect("absent files");
-    for name in [
-        "optimized-ir.txt",
-        "code-normalized.bin",
-        "asm.txt",
-        "relocations.json",
-        "deopt.json",
-    ] {
+    for name in ["optimized-ir.txt", "asm.txt", "deopt.json"] {
         assert!(
             absent.iter().any(|value| value == name),
             "missing absent inventory entry {name}"
@@ -311,6 +307,20 @@ fn jit_artifacts_are_versioned_complete_and_offset_consistent() {
 
     let code = std::fs::read(directory.join("code.bin")).expect("read code.bin");
     assert_eq!(code.len() as u64, code_bytes);
+    let normalized =
+        std::fs::read(directory.join("code-normalized.bin")).expect("read normalized code");
+    assert!(normalized.starts_with(b"OTJNCODE"));
+    let relocations_bytes =
+        std::fs::read(directory.join("relocations.json")).expect("read relocations");
+    let relocations: serde_json::Value =
+        serde_json::from_slice(&relocations_bytes).expect("valid relocations");
+    assert_eq!(relocations["otterJitRelocationSchemaVersion"], 1);
+    assert_eq!(relocations["offsetBasis"], "code.bin");
+    assert!(relocations["relocations"].is_array());
+    assert!(
+        !String::from_utf8_lossy(&relocations_bytes).contains("resolvedValue"),
+        "symbolic relocation output must not expose process addresses"
+    );
     assert!(
         std::fs::read_to_string(directory.join("bytecode.txt"))
             .expect("read bytecode")
@@ -350,6 +360,60 @@ fn jit_artifacts_are_versioned_complete_and_offset_consistent() {
     .expect("valid safepoints");
     assert_eq!(safepoints["otterJitSafepointSchemaVersion"], 1);
     assert!(safepoints["safepoints"].is_array());
+}
+
+#[cfg(target_arch = "aarch64")]
+fn capture_portable_template_code(
+    root: &std::path::Path,
+    directory_name: &str,
+) -> (Vec<u8>, Vec<serde_json::Value>) {
+    let artifacts_path = root.join(directory_name);
+    let output = otter_command(root)
+        .env("OTTER_JIT_OSR_THRESHOLD", "1")
+        .arg(format!("--jit-artifacts={}", artifacts_path.display()))
+        .arg("--jit-tier=template")
+        .arg("--print")
+        .arg(
+            "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
+             { s = s + i; } return s; } hot(40)",
+        )
+        .output()
+        .expect("run portable artifact capture");
+    assert_success(&output);
+
+    let index: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(artifacts_path.join("index.json")).expect("read artifact index"),
+    )
+    .expect("valid artifact index");
+    let bundle = index["bundles"][0].as_str().expect("first bundle");
+    let bundle_path = artifacts_path.join(bundle);
+    let normalized =
+        std::fs::read(bundle_path.join("code-normalized.bin")).expect("read normalized code");
+    let relocations: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(bundle_path.join("relocations.json")).expect("read relocations"),
+    )
+    .expect("valid relocations");
+    let targets = relocations["relocations"]
+        .as_array()
+        .expect("relocation records")
+        .iter()
+        .map(|relocation| relocation["target"].clone())
+        .collect();
+    (normalized, targets)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn normalized_jit_code_is_stable_across_processes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let first = capture_portable_template_code(tmp.path(), "portable-first");
+    let second = capture_portable_template_code(tmp.path(), "portable-second");
+
+    assert_eq!(first.0, second.0, "portable code changed across processes");
+    assert_eq!(
+        first.1, second.1,
+        "symbolic target sequence changed across processes"
+    );
 }
 
 #[cfg(target_arch = "aarch64")]

@@ -29,8 +29,38 @@ use super::collections::{
     MethodSite, emit_alloc_method_guarded_call, emit_leaf_method_guarded_call,
 };
 use super::transitions::TransitionTable;
-use super::values::emit_load_u64;
+use super::values::{emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64};
 use crate::arm64::{CallTrampoline, emit_prepared_call};
+use crate::artifact::relocation::{
+    RelocationCapture, RelocationTarget, TemplateOperandArena, TemplateOperandRole,
+};
+use crate::template::TemplateTail;
+
+fn emit_packed_args(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    register: u8,
+    packed_args: u64,
+    tail: Option<TemplateTail>,
+    role: TemplateOperandRole,
+) {
+    if let Some(tail) = tail {
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            register,
+            packed_args,
+            RelocationTarget::TemplateOperandSlice {
+                arena: TemplateOperandArena::Registers,
+                role,
+                start: u32::try_from(tail.start).expect("template operand offset fits u32"),
+                len: u32::try_from(tail.len).expect("template operand length fits u32"),
+            },
+        );
+    } else {
+        emit_load_u64(ops, register, packed_args);
+    }
+}
 
 /// Emit `dst = callee(args…)` (plain `Op::Call`).
 ///
@@ -43,12 +73,14 @@ use crate::arm64::{CallTrampoline, emit_prepared_call};
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_call(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     call_trampoline: &CallTrampoline,
     dst: u16,
     callee: u16,
     argc: u16,
     packed_args: u64,
+    packed_args_tail: Option<TemplateTail>,
     bail: DynamicLabel,
     threw: DynamicLabel,
 ) {
@@ -60,8 +92,21 @@ pub(super) fn emit_call(
         ; movz x1, callee as u32
         ; movz x2, argc as u32
     );
-    emit_load_u64(ops, 3, packed_args);
-    emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_PREPARE_DIRECT_CALL));
+    emit_packed_args(
+        ops,
+        relocations,
+        3,
+        packed_args,
+        packed_args_tail,
+        TemplateOperandRole::CallArguments,
+    );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        16,
+        table.entry(abi::STUB_JIT_PREPARE_DIRECT_CALL),
+        abi::STUB_JIT_PREPARE_DIRECT_CALL,
+    );
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
@@ -70,7 +115,7 @@ pub(super) fn emit_call(
         ; cmp x0, #2
         ; b.eq =>generic
     );
-    emit_prepared_call(ops, call_trampoline, dst, bail, threw, done);
+    emit_prepared_call(ops, relocations, call_trampoline, dst, bail, threw, done);
 
     // Ineligible callee: complete the whole opcode through the generic
     // in-place call transition; only its non-callable report (`2`)
@@ -83,8 +128,21 @@ pub(super) fn emit_call(
         ; movz x2, callee as u32
         ; movz x3, argc as u32
     );
-    emit_load_u64(ops, 4, packed_args);
-    emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_CALL_GENERIC));
+    emit_packed_args(
+        ops,
+        relocations,
+        4,
+        packed_args,
+        packed_args_tail,
+        TemplateOperandRole::CallArguments,
+    );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        16,
+        table.entry(abi::STUB_JIT_CALL_GENERIC),
+        abi::STUB_JIT_CALL_GENERIC,
+    );
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
@@ -106,11 +164,13 @@ pub(super) fn emit_call(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_construct(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     dst: u16,
     callee: u16,
     argc: u16,
     packed_args: u64,
+    packed_args_tail: Option<TemplateTail>,
     bail: DynamicLabel,
     threw: DynamicLabel,
 ) {
@@ -121,8 +181,21 @@ pub(super) fn emit_construct(
         ; movz x2, callee as u32
         ; movz x3, argc as u32
     );
-    emit_load_u64(ops, 4, packed_args);
-    emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_CONSTRUCT));
+    emit_packed_args(
+        ops,
+        relocations,
+        4,
+        packed_args,
+        packed_args_tail,
+        TemplateOperandRole::ConstructArguments,
+    );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        16,
+        table.entry(abi::STUB_JIT_CONSTRUCT),
+        abi::STUB_JIT_CONSTRUCT,
+    );
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
@@ -148,6 +221,7 @@ pub(super) fn emit_construct(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_method_call(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     table: &TransitionTable,
     call_trampoline: &CallTrampoline,
     view: &JitCompileSnapshot,
@@ -157,6 +231,7 @@ pub(super) fn emit_method_call(
     site: u64,
     argc: u16,
     packed_args: u64,
+    packed_args_tail: Option<TemplateTail>,
     byte_pc: u32,
     arg0: Option<u16>,
     arg1: Option<u16>,
@@ -175,13 +250,31 @@ pub(super) fn emit_method_call(
     // every guard miss lands on the next layer.
     if let Some(leaf) = view.collection_leaf_methods.get(&byte_pc) {
         let after_leaf = ops.new_dynamic_label();
-        if emit_leaf_method_guarded_call(ops, view, leaf, &method_site, after_leaf, done)? {
+        if emit_leaf_method_guarded_call(
+            ops,
+            relocations,
+            view,
+            leaf,
+            byte_pc,
+            &method_site,
+            after_leaf,
+            done,
+        )? {
             dynasm!(ops ; .arch aarch64 ; =>after_leaf);
         }
     }
     if let Some(alloc) = view.collection_alloc_methods.get(&byte_pc) {
         let after_alloc = ops.new_dynamic_label();
-        if emit_alloc_method_guarded_call(ops, view, alloc, &method_site, after_alloc, done)? {
+        if emit_alloc_method_guarded_call(
+            ops,
+            relocations,
+            view,
+            alloc,
+            byte_pc,
+            &method_site,
+            after_alloc,
+            done,
+        )? {
             dynasm!(ops ; .arch aarch64 ; =>after_alloc);
         }
     }
@@ -193,8 +286,21 @@ pub(super) fn emit_method_call(
     );
     emit_load_u64(ops, 3, site);
     dynasm!(ops ; .arch aarch64 ; movz x4, argc as u32);
-    emit_load_u64(ops, 5, packed_args);
-    emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_COLLECTION_METHOD_IC));
+    emit_packed_args(
+        ops,
+        relocations,
+        5,
+        packed_args,
+        packed_args_tail,
+        TemplateOperandRole::MethodArguments,
+    );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        16,
+        table.entry(abi::STUB_JIT_COLLECTION_METHOD_IC),
+        abi::STUB_JIT_COLLECTION_METHOD_IC,
+    );
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
@@ -212,11 +318,20 @@ pub(super) fn emit_method_call(
     emit_load_u64(ops, 2, u64::from(name));
     emit_load_u64(ops, 3, site);
     dynasm!(ops ; .arch aarch64 ; movz x4, argc as u32);
-    emit_load_u64(ops, 5, packed_args);
-    emit_load_u64(
+    emit_packed_args(
         ops,
+        relocations,
+        5,
+        packed_args,
+        packed_args_tail,
+        TemplateOperandRole::MethodArguments,
+    );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
         16,
         table.entry(abi::STUB_JIT_PREPARE_DIRECT_METHOD_CALL),
+        abi::STUB_JIT_PREPARE_DIRECT_METHOD_CALL,
     );
     dynasm!(ops
         ; .arch aarch64
@@ -226,7 +341,7 @@ pub(super) fn emit_method_call(
         ; cmp x0, #2
         ; b.eq =>generic
     );
-    emit_prepared_call(ops, call_trampoline, dst, bail, threw, done);
+    emit_prepared_call(ops, relocations, call_trampoline, dst, bail, threw, done);
 
     // Ineligible direct resolution: complete the whole opcode through the
     // generic in-place method transition; only its exotic-receiver report
@@ -241,8 +356,21 @@ pub(super) fn emit_method_call(
     emit_load_u64(ops, 3, u64::from(name));
     emit_load_u64(ops, 4, site);
     dynasm!(ops ; .arch aarch64 ; movz x5, argc as u32);
-    emit_load_u64(ops, 6, packed_args);
-    emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_CALL_METHOD_GENERIC));
+    emit_packed_args(
+        ops,
+        relocations,
+        6,
+        packed_args,
+        packed_args_tail,
+        TemplateOperandRole::MethodArguments,
+    );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        16,
+        table.entry(abi::STUB_JIT_CALL_METHOD_GENERIC),
+        abi::STUB_JIT_CALL_METHOD_GENERIC,
+    );
     dynasm!(ops
         ; .arch aarch64
         ; blr x16

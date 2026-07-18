@@ -414,8 +414,9 @@ pub struct JitInlineMethod {
     pub method_value_byte: u32,
     /// Method formal parameter count (excluding `this`); must equal argc.
     pub param_count: u16,
-    /// Method register-window length; the body runs in a scratch block of this
-    /// many slots plus one for `this`.
+    /// Method virtual-register-window length. A backend may compact the live
+    /// subset into scratch storage but must preserve entry parameter,
+    /// `undefined`, and `this` semantics.
     pub register_count: u16,
     /// Method instruction stream, emitted inline.
     pub instructions: Vec<JitInstructionMetadata>,

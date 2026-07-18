@@ -5,6 +5,8 @@
 //!   listing with code-relative offsets and stable branch labels.
 //! - Relocation, code-map, deopt, and safepoint annotations are rendered from
 //!   the already-built artifact DTOs.
+//! - Template inline-method annotations expose guard/body/replay ranges and
+//!   compact virtual-register-to-scratch assignments.
 //!
 //! # Invariants
 //! - Every native location is an offset relative to the matching `code.bin`.
@@ -35,7 +37,10 @@ use super::relocation::{
     PropertyIcAccess, RelocationTarget, TemplateOperandArena, TemplateOperandRole,
     ValidatedRelocation, ValidatedRelocations, decode_direct_branch,
 };
-use super::{CodeMapCapture, CodeRegion, OsrCodeEntry};
+use super::{
+    CodeMapCapture, CodeRegion, InlineScratchEntryArtifact, InlineScratchLayoutArtifact,
+    OsrCodeEntry,
+};
 
 const HEADER: &str = "; otter jit aarch64 assembly v1\n";
 
@@ -293,6 +298,14 @@ fn render_region_annotation(
     if let Some(inline_frame) = region.inline_frame {
         write!(output, " inline-frame={inline_frame}").expect("writing to String cannot fail");
     }
+    if let Some(site) = region.inline_site {
+        write!(
+            output,
+            " inline-site=caller:{}:pc:{}:byte:{} receiver-property={}",
+            site.caller_function_id, site.logical_pc, site.byte_pc, site.has_receiver_property,
+        )
+        .expect("writing to String cannot fail");
+    }
     if let Some(function_id) = region.function_id {
         write!(output, " function={function_id}").expect("writing to String cannot fail");
     }
@@ -308,6 +321,9 @@ fn render_region_annotation(
     }
     if let Some(operation) = &region.operation {
         write!(output, " tier-op={operation:?}").expect("writing to String cannot fail");
+    }
+    if let Some(layout) = &region.inline_scratch_layout {
+        render_inline_scratch_annotation(output, layout);
     }
     if let Some(exit_id) = region.deopt_exit_id {
         write!(output, " deopt-exit={exit_id}").expect("writing to String cannot fail");
@@ -326,6 +342,59 @@ fn render_region_annotation(
         }
     }
     output.push('\n');
+}
+
+fn render_inline_scratch_annotation(output: &mut String, layout: &InlineScratchLayoutArtifact) {
+    write!(
+        output,
+        " parameters={} virtual-registers={} scratch-slots={} slot-bytes={} stack-alignment={} scratch-bytes={} offset-basis={} register-slots=[",
+        layout.parameter_count,
+        layout.virtual_register_count,
+        layout.scratch_slot_count,
+        layout.slot_bytes,
+        layout.stack_alignment_bytes,
+        layout.scratch_bytes,
+        layout.offset_basis,
+    )
+    .expect("writing to String cannot fail");
+    for (index, slot) in layout.register_slots.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        match slot {
+            Some(slot) => write!(output, "r{index}:s{slot}"),
+            None => write!(output, "r{index}:-"),
+        }
+        .expect("writing to String cannot fail");
+    }
+    output.push_str("] receiver-slot=");
+    match layout.receiver_slot {
+        Some(slot) => {
+            write!(output, "s{slot}").expect("writing to String cannot fail");
+        }
+        None => output.push('-'),
+    }
+    output.push_str(" entry-values=[");
+    for (index, entry) in layout.entry_values.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        match *entry {
+            InlineScratchEntryArtifact::Argument {
+                argument,
+                register,
+                slot,
+            } => write!(output, "arg{argument}->r{register}:s{slot}"),
+            InlineScratchEntryArtifact::Receiver { slot } => {
+                write!(output, "receiver:s{slot}")
+            }
+            InlineScratchEntryArtifact::Undefined { register, slot } => {
+                write!(output, "undefined->r{register}:s{slot}")
+            }
+        }
+        .expect("writing to String cannot fail");
+    }
+    output.push(']');
 }
 
 fn collect_labels(

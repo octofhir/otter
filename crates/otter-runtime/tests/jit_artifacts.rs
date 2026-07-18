@@ -2,6 +2,8 @@
 //!
 //! # Contents
 //! - Template and optimizing OSR bundle contents.
+//! - Template method-inline guard/body/replay subregions and compact scratch
+//!   layout metadata.
 //! - Abrupt completion followed by explicit bundle draining.
 //! - Bundle ownership across full GC, later allocation, and nested JIT entry.
 //! - Async [`otter_runtime::Otter`] success and abrupt-failure transport.
@@ -75,6 +77,22 @@ function sumAbsoluteOffsets(limit) {
   return total;
 }
 String(sumAbsoluteOffsets(96));
+"#;
+
+const TEMPLATE_INLINE_METHOD: &str = r#"
+function apply(value) {
+  return value + this.bias;
+}
+
+function callMethod(receiver, value) {
+  return receiver.apply(value);
+}
+
+const receiver = { bias: 4, apply };
+for (let i = 0; i < 5000; i++) {
+  callMethod(receiver, i);
+}
+JSON.stringify(callMethod(receiver, 9));
 "#;
 
 fn runtime_with_artifacts(selection: JitSelection, threshold: u32) -> Runtime {
@@ -301,6 +319,231 @@ fn template_osr_returns_a_versioned_owned_bundle_without_events() {
     assert!(bundle.file(JitArtifactFileName::Relocations).is_some());
     assert!(bundle.file(JitArtifactFileName::NormalizedCode).is_some());
     assert!(bundle.file(JitArtifactFileName::Assembly).is_some());
+    assert_bundle_is_self_consistent(bundle);
+}
+
+#[test]
+fn template_method_inline_artifact_exposes_compact_scratch_and_replay_ranges() {
+    let mut runtime = runtime_with_artifacts(JitSelection::ProductionTiered, u32::MAX);
+    let result = runtime
+        .run_script(
+            SourceInput::from_javascript(TEMPLATE_INLINE_METHOD),
+            "jit-artifact-inline-method.js",
+        )
+        .expect("template inline-method artifact fixture");
+    let batch = result.jit_artifacts().expect("enabled artifact batch");
+    let (bundle, map) = batch
+        .bundles()
+        .iter()
+        .filter(|bundle| bundle.manifest().tier() == JitDebugTier::Template)
+        .find_map(|bundle| {
+            let map = code_map(bundle);
+            map["regions"]
+                .as_array()
+                .is_some_and(|regions| {
+                    regions
+                        .iter()
+                        .any(|region| region["kind"] == "inlineScratchSetup")
+                })
+                .then_some((bundle, map))
+        })
+        .expect("template method-inline bundle");
+    let regions = map["regions"].as_array().expect("code-map regions");
+    let kinds = regions
+        .iter()
+        .filter_map(|region| region["kind"].as_str())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(result.completion_string(), "13");
+    for expected in [
+        "inlineMethodGuard",
+        "inlineScratchSetup",
+        "inlineInstruction",
+        "inlineMethodBody",
+        "inlineMethodHitEpilogue",
+        "inlineMethodMissTeardown",
+        "inlineMethodMissReplay",
+    ] {
+        assert!(
+            kinds.contains(expected),
+            "missing inline region {expected}: {kinds:?}"
+        );
+    }
+
+    let scratch = regions
+        .iter()
+        .find(|region| region["kind"] == "inlineScratchSetup")
+        .expect("inline scratch setup");
+    let layout = &scratch["inlineScratchLayout"];
+    assert_eq!(layout["parameterCount"], 1);
+    assert_eq!(layout["virtualRegisterCount"], 6);
+    assert_eq!(layout["scratchSlotCount"], 2);
+    assert_eq!(layout["slotBytes"], 8);
+    assert_eq!(layout["stackAlignmentBytes"], 16);
+    assert_eq!(layout["scratchBytes"], 16);
+    assert_eq!(layout["offsetBasis"], "postAllocationSp");
+    let virtual_register_count = layout["virtualRegisterCount"]
+        .as_u64()
+        .expect("virtual register count");
+    let scratch_slot_count = layout["scratchSlotCount"]
+        .as_u64()
+        .expect("scratch slot count");
+    let slot_bytes = layout["slotBytes"].as_u64().expect("scratch slot bytes");
+    let stack_alignment = layout["stackAlignmentBytes"]
+        .as_u64()
+        .expect("scratch stack alignment");
+    let expected_scratch_bytes =
+        (scratch_slot_count * slot_bytes).div_ceil(stack_alignment) * stack_alignment;
+    assert_eq!(
+        layout["scratchBytes"].as_u64(),
+        Some(expected_scratch_bytes)
+    );
+    assert!(
+        scratch_slot_count < virtual_register_count + 1,
+        "layout must compact callee registers plus receiver: {layout}"
+    );
+    let register_slots = layout["registerSlots"]
+        .as_array()
+        .expect("virtual register slots");
+    assert_eq!(register_slots.len() as u64, virtual_register_count);
+    for slot in register_slots.iter().filter_map(serde_json::Value::as_u64) {
+        assert!(slot < scratch_slot_count, "register slot out of range");
+    }
+    assert!(register_slots[5].is_null(), "unused r5 stays unmapped");
+    assert_eq!(register_slots[0], register_slots[1]);
+    assert_eq!(register_slots[1], register_slots[3]);
+    assert_eq!(register_slots[2], register_slots[4]);
+    assert_ne!(register_slots[0], register_slots[2]);
+    assert_eq!(layout["receiverSlot"], register_slots[2]);
+    assert!(
+        layout["receiverSlot"]
+            .as_u64()
+            .is_some_and(|slot| slot < scratch_slot_count),
+        "receiver slot out of range"
+    );
+    let entry_values = layout["entryValues"].as_array().expect("entry values");
+    assert_eq!(entry_values.len(), 2);
+    assert_eq!(entry_values[0]["kind"], "argument");
+    assert_eq!(entry_values[0]["argument"], 0);
+    assert_eq!(entry_values[0]["register"], 0);
+    assert_eq!(entry_values[1]["kind"], "receiver");
+    for entry in entry_values {
+        assert!(
+            entry["slot"]
+                .as_u64()
+                .is_some_and(|slot| slot < scratch_slot_count),
+            "entry slot out of range: {entry}"
+        );
+    }
+
+    let inline_site = scratch["inlineSite"].clone();
+    assert!(inline_site["callerFunctionId"].is_u64());
+    assert!(inline_site["logicalPc"].is_u64());
+    assert!(inline_site["bytePc"].is_u64());
+    assert_eq!(inline_site["hasReceiverProperty"], true);
+    let callee_function_id = scratch["functionId"]
+        .as_u64()
+        .expect("inline callee function id");
+    let inline_regions = regions
+        .iter()
+        .filter(|region| region.get("inlineSite").is_some())
+        .collect::<Vec<_>>();
+    assert!(!inline_regions.is_empty());
+    assert!(inline_regions.iter().all(|region| {
+        region["inlineSite"] == inline_site
+            && region["functionId"].as_u64() == Some(callee_function_id)
+            && region.get("inlineFrame").is_none()
+    }));
+
+    let inline_instructions = regions
+        .iter()
+        .filter(|region| region["kind"] == "inlineInstruction")
+        .collect::<Vec<_>>();
+    assert_eq!(inline_instructions.len(), 7);
+    assert!(inline_instructions.iter().all(|region| {
+        region["functionId"].is_u64()
+            && region["logicalPc"].is_u64()
+            && region["bytePc"].is_u64()
+            && region["operationIndex"].is_u64()
+            && region["operation"].is_string()
+    }));
+    assert_eq!(
+        inline_instructions
+            .iter()
+            .map(|region| region["operationIndex"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        (0..7).collect::<Vec<_>>()
+    );
+
+    let find_region = |kind: &str| {
+        regions
+            .iter()
+            .find(|region| region["kind"] == kind)
+            .unwrap_or_else(|| panic!("missing {kind} region"))
+    };
+    let native_range = |region: &serde_json::Value| {
+        (
+            region["startOffset"].as_u64().expect("region start"),
+            region["endOffset"].as_u64().expect("region end"),
+        )
+    };
+    let guard_range = native_range(find_region("inlineMethodGuard"));
+    let scratch_range = native_range(scratch);
+    let body_range = native_range(find_region("inlineMethodBody"));
+    let hit_range = native_range(find_region("inlineMethodHitEpilogue"));
+    let teardown_range = native_range(find_region("inlineMethodMissTeardown"));
+    let replay_range = native_range(find_region("inlineMethodMissReplay"));
+    assert!(guard_range.1 <= scratch_range.0);
+    assert!(scratch_range.1 <= body_range.0);
+    assert_eq!(body_range.1, hit_range.0);
+    assert_eq!(hit_range.1, teardown_range.0);
+    assert_eq!(teardown_range.1, replay_range.0);
+    for instruction in &inline_instructions {
+        let instruction_range = native_range(instruction);
+        assert!(
+            body_range.0 <= instruction_range.0 && instruction_range.1 <= body_range.1,
+            "inline instruction escapes body: {instruction}"
+        );
+    }
+
+    let method_call = regions
+        .iter()
+        .find(|region| {
+            region["kind"] == "instruction"
+                && region["operation"]
+                    .as_str()
+                    .is_some_and(|operation| operation.contains("MethodCall"))
+                && region["logicalPc"] == inline_site["logicalPc"]
+                && region["bytePc"] == inline_site["bytePc"]
+        })
+        .expect("caller MethodCall region");
+    let method_call_range = native_range(method_call);
+    assert_eq!(
+        method_call["functionId"], inline_site["callerFunctionId"],
+        "inline site must identify caller code map"
+    );
+    assert!(
+        method_call_range.0 <= guard_range.0 && replay_range.1 <= method_call_range.1,
+        "inline ranges must stay inside caller MethodCall: {method_call}"
+    );
+
+    let assembly = std::str::from_utf8(
+        bundle
+            .file(JitArtifactFileName::Assembly)
+            .expect("annotated assembly")
+            .contents(),
+    )
+    .expect("annotated assembly is UTF-8");
+    assert!(assembly.contains("kind=inlineMethodGuard"));
+    assert!(assembly.contains("kind=inlineMethodMissReplay"));
+    assert!(assembly.contains("inline-site=caller:"));
+    assert!(assembly.contains("receiver-property=true"));
+    assert!(assembly.contains(
+        "parameters=1 virtual-registers=6 scratch-slots=2 slot-bytes=8 stack-alignment=16 scratch-bytes=16 offset-basis=postAllocationSp"
+    ));
+    assert!(assembly.contains("register-slots=["));
+    assert!(assembly.contains("entry-values=[arg0->r0:s"));
+    assert!(assembly.contains(",receiver:s"));
     assert_bundle_is_self_consistent(bundle);
 }
 

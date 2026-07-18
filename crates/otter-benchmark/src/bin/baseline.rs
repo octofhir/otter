@@ -268,11 +268,7 @@ fn module_case(entry: &str, reuse: RuntimeReuse, tier: Tier) -> BaselineCase {
         RuntimeReuse::ReusedAcrossSamples => "reused-across-samples",
         RuntimeReuse::NotApplicable => unreachable!("module cases always select runtime reuse"),
     };
-    let warmups = if reuse == RuntimeReuse::FreshPerSample {
-        0
-    } else {
-        MODULE_WARMUPS
-    };
+    let warmups = MODULE_WARMUPS;
     let fixture = Path::new(entry)
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -1349,6 +1345,22 @@ mod tests {
                 .filter(|case| case.args.first().is_some_and(|arg| arg == "module"))
                 .count(),
             7
+        );
+        let module_warmups = MODULE_WARMUPS.to_string();
+        assert!(
+            cases
+                .iter()
+                .filter(|case| {
+                    case.args.first().is_some_and(|arg| arg == "module")
+                        && case.configuration.runtime_reuse == RuntimeReuse::FreshPerSample
+                })
+                .all(|case| {
+                    case.sampling.warmup_count == MODULE_WARMUPS
+                        && case
+                            .args
+                            .windows(2)
+                            .any(|pair| pair[0] == "--warmup" && pair[1] == module_warmups)
+                })
         );
         assert_eq!(
             cases

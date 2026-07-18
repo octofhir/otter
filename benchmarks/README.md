@@ -170,7 +170,9 @@ cargo run --release -p otter-benchmark --features engine \
 runtime. `--runtime-reuse reused-across-samples` validates one runtime during
 warmup and then reuses it for measured executions. In both modes the graph is
 resolved, loaded, parsed, compiled, linked, and executed again; runtime reuse is
-not a module cache hit. Fresh-per-sample captures require `--warmup 0`.
+not a module cache hit. Fresh-per-sample warmups also construct, validate, and
+discard a new runtime each time; they stabilize process/CPU state without
+warming a runtime or module cache used by measured samples.
 
 ```bash
 # Fresh runtime per sample.
@@ -178,7 +180,7 @@ cargo run --release -p otter-benchmark --features engine \
   --bin otter-engine-benchmark -- \
   module --entry benchmarks/fixtures/engine/module-entry.mjs \
   --jit-tier production-tiered --runtime-reuse fresh-per-sample \
-  --samples 20 --warmup 0
+  --samples 20 --warmup 5
 
 # One persistent runtime after validated warmup.
 cargo run --release -p otter-benchmark --features engine \
@@ -192,7 +194,7 @@ cargo run --release -p otter-benchmark --features engine \
   --bin otter-engine-benchmark -- \
   module --entry benchmarks/fixtures/engine/package/entry.mjs \
   --jit-tier production-tiered --runtime-reuse fresh-per-sample \
-  --samples 20 --warmup 0
+  --samples 20 --warmup 5
 ```
 
 The package fixture resolves `#engine-dep` through its checked-in

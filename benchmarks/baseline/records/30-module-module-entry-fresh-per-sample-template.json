@@ -1,0 +1,315 @@
+{
+  "benchmark": {
+    "suite": "engine",
+    "name": "module-phases-module-entry.mjs",
+    "parameters": {
+      "entry": "benchmarks/fixtures/engine/module-entry.mjs"
+    }
+  },
+  "provenance": {
+    "capturedAtUnixMs": 1784388502364,
+    "commit": "bdb28d84c6ae5004bf8c82e94da554097b1922e6",
+    "dirty": false,
+    "platform": {
+      "os": "macos",
+      "arch": "aarch64",
+      "kernel": "Darwin 25.5.0",
+      "cpu": "aarch64"
+    },
+    "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2",
+    "buildProfile": "release"
+  },
+  "configuration": {
+    "surface": "runtime",
+    "jitPolicy": "template",
+    "jitOsrThreshold": null,
+    "gcPolicy": "normal",
+    "gcStressStride": null,
+    "runtimeReuse": "fresh-per-sample",
+    "cacheState": "not-applicable"
+  },
+  "sampling": {
+    "warmupCount": 0,
+    "sampleCount": 20,
+    "iterationsPerSample": 1,
+    "timeoutMs": null
+  },
+  "metrics": [
+    {
+      "name": "wall-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "primary",
+      "samples": [
+        359958,
+        168709,
+        157458,
+        153750,
+        143875,
+        164208,
+        245000,
+        167791,
+        270250,
+        161250,
+        145292,
+        141917,
+        137416,
+        134333,
+        170417,
+        159750,
+        166250,
+        157792,
+        195667,
+        157000
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 160500
+      }
+    },
+    {
+      "name": "execution-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        44125,
+        13083,
+        12750,
+        11583,
+        11666,
+        12542,
+        21708,
+        13167,
+        24750,
+        14625,
+        11667,
+        11292,
+        11125,
+        11208,
+        12750,
+        12958,
+        15166,
+        12250,
+        14500,
+        12209
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 12750
+      }
+    },
+    {
+      "name": "parse-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        28666,
+        3293,
+        2875,
+        2542,
+        2500,
+        3541,
+        8416,
+        3666,
+        11291,
+        3625,
+        2625,
+        2417,
+        2291,
+        2333,
+        3292,
+        4333,
+        4833,
+        3958,
+        4708,
+        2834
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 3417
+      }
+    },
+    {
+      "name": "compile-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        77084,
+        23085,
+        21209,
+        19250,
+        15958,
+        19666,
+        34000,
+        23000,
+        34291,
+        21792,
+        17042,
+        16334,
+        15125,
+        14917,
+        17833,
+        19375,
+        18376,
+        18917,
+        23333,
+        20083
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 19520.5
+      }
+    },
+    {
+      "name": "resolve-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        114667,
+        72667,
+        67666,
+        71583,
+        68249,
+        77791,
+        110917,
+        74708,
+        125958,
+        72291,
+        66083,
+        65083,
+        64042,
+        62875,
+        86917,
+        71917,
+        76833,
+        73584,
+        90458,
+        70041
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 72479
+      }
+    },
+    {
+      "name": "load-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        34916,
+        29208,
+        27208,
+        27292,
+        26751,
+        28291,
+        38001,
+        29667,
+        41833,
+        27834,
+        27084,
+        28291,
+        25750,
+        25875,
+        29458,
+        28792,
+        31876,
+        28500,
+        39083,
+        31834
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 28646
+      }
+    },
+    {
+      "name": "link-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "secondary",
+      "samples": [
+        28625,
+        17251,
+        16459,
+        15000,
+        12334,
+        15208,
+        19749,
+        15667,
+        19709,
+        14125,
+        14542,
+        12458,
+        11876,
+        11625,
+        13209,
+        15375,
+        12333,
+        12626,
+        15375,
+        13042
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 14771
+      }
+    },
+    {
+      "name": "runtime-build-time",
+      "unit": "nanoseconds",
+      "direction": "lower-is-better",
+      "role": "diagnostic",
+      "samples": [
+        741084,
+        469375,
+        461459,
+        477000,
+        433500,
+        488625,
+        509417,
+        548917,
+        802458,
+        510042,
+        481542,
+        432750,
+        434917,
+        430625,
+        491584,
+        509042,
+        500459,
+        490208,
+        510875,
+        509583
+      ],
+      "aggregate": {
+        "statistic": "median",
+        "value": 490896
+      }
+    }
+  ],
+  "outcome": {
+    "status": "validated",
+    "validationMarker": "module assertions passed",
+    "processExitCode": null,
+    "failure": null
+  },
+  "command": [
+    "target/release/otter-engine-benchmark",
+    "module",
+    "--entry",
+    "benchmarks/fixtures/engine/module-entry.mjs",
+    "--runtime-reuse",
+    "fresh-per-sample",
+    "--jit-tier",
+    "template",
+    "--samples",
+    "20",
+    "--warmup",
+    "0"
+  ]
+}

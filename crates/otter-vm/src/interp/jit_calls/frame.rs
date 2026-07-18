@@ -8,9 +8,10 @@
 //! # Invariants
 //! - Target resolution and guard checks finish before this module is entered;
 //!   this module never performs property lookup or executable-code selection.
-//! - The exact [`jit::JitFunctionCode`] owner remains live until the prepared
-//!   record is returned. Native linkage then leases its stable entry cell for
-//!   the complete machine-code dynamic extent.
+//! - The registry retains every installed [`jit::JitFunctionCode`] generation;
+//!   method resolution may additionally carry a cache owner through prepare.
+//!   Native linkage leases the stable entry cell for the complete machine-code
+//!   dynamic extent.
 //! - Any setup error rolls back both the register cursor and synchronous
 //!   re-entry before it escapes.
 //! - Dynamic closure state (borrowed upvalues, `this`, and exact SELF) belongs
@@ -32,7 +33,7 @@ use crate::*;
 ///
 /// Plain calls and method calls differ only in how they produce this record.
 /// Owner publication consumes the same immutable function metadata, dynamic
-/// per-call state, entry plan, and code-lifetime anchor for both call kinds.
+/// per-call state, entry plan, and native tier for both call kinds.
 pub(crate) struct ResolvedCallTarget<'a> {
     /// Authoritative executable metadata for owner construction.
     pub(crate) function: &'a crate::executable::CodeBlock,
@@ -46,10 +47,12 @@ pub(crate) struct ResolvedCallTarget<'a> {
     pub(crate) this_value: Value,
     /// Scalar compiled-entry and frame-layout metadata.
     pub(crate) plan: jit::JitDirectCallPlan,
-    /// Strong lifetime anchor upgraded/selected by the resolver. It remains
-    /// live until prepare returns the stable entry-cell address to generated
-    /// code; the registry owns the generation and native entry takes a lease.
-    pub(crate) code: Arc<dyn jit::JitFunctionCode>,
+    /// Native frame kind copied from the selected code generation.
+    pub(crate) tier: crate::native_abi::NativeFrameKind,
+    /// Optional exact code owner retained by method-cache installation and
+    /// promotion. Plain-call plan hits avoid an atomic `Arc` clone/drop pair;
+    /// the registry and isolate-local plan cache already own that generation.
+    pub(crate) code: Option<Arc<dyn jit::JitFunctionCode>>,
 }
 
 impl Interpreter {
@@ -66,7 +69,6 @@ impl Interpreter {
         arg_regs: &[u16],
         caller_regs: *const Value,
     ) -> Result<jit::JitPreparedDirectCall, VmError> {
-        let tier = target.code.native_frame_kind();
         self.enter_sync_reentry()?;
         let prepared = self.prepare_jit_direct_call_owner(
             target.function,
@@ -74,7 +76,7 @@ impl Interpreter {
             target.self_value,
             target.this_value,
             target.plan,
-            tier,
+            target.tier,
             arg_regs,
             caller_regs,
         );

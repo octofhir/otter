@@ -226,6 +226,7 @@ impl Interpreter {
             jit_code: rustc_hash::FxHashMap::default(),
             jit_optimized_code: rustc_hash::FxHashMap::default(),
             jit_optimized_code_cache: None,
+            jit_direct_call_cache: None,
             jit_optimized_declined_epoch: rustc_hash::FxHashMap::default(),
             jit_osr_code: rustc_hash::FxHashMap::default(),
             jit_code_cache: None,

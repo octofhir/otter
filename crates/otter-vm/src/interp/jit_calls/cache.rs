@@ -119,8 +119,12 @@ impl Interpreter {
         ) else {
             return Ok(None);
         };
-        if !Arc::ptr_eq(&code, &target.code) {
-            let promoted_code = target.code.clone();
+        let target_code = target
+            .code
+            .as_ref()
+            .expect("method resolution retains its exact code owner");
+        if !Arc::ptr_eq(&code, target_code) {
+            let promoted_code = target_code.clone();
             if let Some(cache) = self
                 .jit_direct_method_cache
                 .get_mut(site)

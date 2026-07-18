@@ -16,6 +16,8 @@
 //! - [`JitFunctionCode`] and [`JitCompileStatus`] — type-erased compiled-code
 //!   result handles and validity dependencies that keep executable memory
 //!   ownership outside this crate.
+//! - [`JitDirectCallPlan`] and the isolate-local direct-call cache record used
+//!   to reuse an already-validated optimizing entry.
 //!
 //! # Invariants
 //! - DTOs are owned and borrow-free. JIT compilation must not hold references
@@ -29,6 +31,8 @@
 //!   frame as baseline entries. Before bailing they reconstruct every
 //!   interpreter register in the rooted frame window and publish the exact
 //!   logical resume PC.
+//! - A cached direct-call plan is reusable only at the registry invalidation
+//!   epoch at which it was selected. Dynamic callable state is never cached.
 //!
 //! # See also
 //! - [`crate::execution_context`] for snapshot creation from frozen bytecode.
@@ -448,6 +452,25 @@ pub struct JitDirectCallPlan {
     pub param_count: u16,
     /// Total callee register-window length.
     pub register_count: u16,
+}
+
+/// One isolate-local monomorphic optimizing entry selected for direct calls.
+///
+/// The strong owner pins the exact code generation named by `plan`; the
+/// registry epoch proves its entry/dependency checks have not changed. Call
+/// resolution still decodes the current function or closure before consulting
+/// this record, so upvalues, SELF, and `this` never come from the cache.
+pub(crate) struct JitDirectCallCache {
+    /// Function identity checked after fresh callable decoding.
+    pub(crate) function_id: u32,
+    /// Exact scalar entry plan selected from the registry.
+    pub(crate) plan: JitDirectCallPlan,
+    /// Strong owner for the code generation named by `plan`.
+    pub(crate) code: Arc<dyn JitFunctionCode>,
+    /// Native frame kind copied once from the selected code object.
+    pub(crate) tier: NativeFrameKind,
+    /// Registry invalidation epoch at plan selection.
+    pub(crate) plan_epoch: u64,
 }
 
 /// VM-owned root descriptor for one native JIT activation.

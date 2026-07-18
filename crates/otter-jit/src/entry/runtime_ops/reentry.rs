@@ -1079,7 +1079,6 @@ pub(crate) extern "C" fn jit_backedge_poll_stub(ctx: *mut JitCtx) -> u64 {
         }
     };
     let result = runtime.backedge_poll();
-    drop(runtime);
     match result {
         Ok(()) => 0,
         Err(err) => {

@@ -1267,7 +1267,7 @@ mod tests {
             let target = branch_bytes + chunks.len() * 4;
             let mut words = Vec::new();
             for source in 0..7 {
-                let displacement = target as i32 - (source * 4) as i32;
+                let displacement = target as i32 - source * 4;
                 words.push(match source {
                     0 => b(displacement, false),
                     1 => b(displacement, true),

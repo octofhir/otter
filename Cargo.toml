@@ -150,17 +150,16 @@ strip = false
 panic = "unwind"
 opt-level = 3
 debug = 1
-force-frame-pointers = true
 
-# Profiling build: release codegen with full debug info and frame pointers so
-# samply / perf resolve inlined Otter frames cleanly. Build with
-# `cargo build --profile profiling -p otter-cli` (binary at target/profiling/otter).
+# Profiling build: release codegen with full debug info. Request frame pointers
+# explicitly when they are needed:
+# `RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling -p otter-cli`
+# (binary at target/profiling/otter).
 [profile.profiling]
 inherits = "release"
 debug = 2
 strip = false
 split-debuginfo = "packed"
-force-frame-pointers = true
 
 # Fast release for development iteration.
 [profile.release-fast]

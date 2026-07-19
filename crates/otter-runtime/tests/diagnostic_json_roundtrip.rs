@@ -180,11 +180,9 @@ fn assert_round_trip(err: &OtterError) {
     // exact wire shape `--json` writes to stdout.
     #[derive(Debug, serde::Deserialize, serde::Serialize)]
     struct Envelope {
-        error_schema_version: u32,
         error: OtterError,
     }
     let parsed: Envelope = serde_json::from_str(&first).expect("deserialize error envelope");
-    assert_eq!(parsed.error_schema_version, 1);
     let second_inner = parsed.error.to_json_pretty().expect("re-serialize error");
     assert_eq!(first, second_inner, "OtterError JSON round-trip diverged");
 }

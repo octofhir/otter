@@ -23,7 +23,10 @@
 //! - [`super::CodeObjectMetadata`] — immutable compiled-object identity.
 //! - [`super::CodeRegistryView`] — safepoint metadata selected by this id.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::{
+    cell::Cell,
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+};
 
 /// The compiled generation owns precise safepoint metadata.
 pub const CODE_ENTRY_HAS_SAFEPOINTS: u32 = 1 << 0;
@@ -48,6 +51,20 @@ pub struct CodeEntryCell {
     pub flags: u32,
     /// Native activations that acquired this generation and have not returned.
     pub active_count: AtomicU32,
+    /// Generated native entries observed for tiering/introspection.
+    ///
+    /// The isolate has one mutator and reconciles feedback only after native
+    /// activation returns, so these counters deliberately use ordinary
+    /// single-mutator cells instead of exclusive atomic loops on every call.
+    pub generated_entries: Cell<u64>,
+    /// Generated entries that returned normally without native bailout.
+    pub generated_returns: Cell<u64>,
+    /// Generated entries that bailed and resumed through cold deoptimization.
+    pub generated_deopts: Cell<u64>,
+    /// Generated entries that propagated a throw status.
+    pub generated_throws: Cell<u64>,
+    /// Consecutive generated native bails since the last return/throw.
+    pub generated_bail_streak: Cell<u32>,
 }
 
 impl CodeEntryCell {
@@ -71,6 +88,11 @@ impl CodeEntryCell {
             register_count,
             flags,
             active_count: AtomicU32::new(0),
+            generated_entries: Cell::new(0),
+            generated_returns: Cell::new(0),
+            generated_deopts: Cell::new(0),
+            generated_throws: Cell::new(0),
+            generated_bail_streak: Cell::new(0),
         }
     }
 
@@ -125,6 +147,18 @@ impl CodeEntryCell {
     pub fn active_count(&self) -> u32 {
         self.active_count.load(Ordering::Acquire)
     }
+
+    /// Cumulative generated-call feedback for this exact code generation.
+    #[must_use]
+    pub fn generated_feedback(&self) -> (u64, u64, u64, u64, u32) {
+        (
+            self.generated_entries.get(),
+            self.generated_returns.get(),
+            self.generated_deopts.get(),
+            self.generated_throws.get(),
+            self.generated_bail_streak.get(),
+        )
+    }
 }
 
 /// One acquired native entry generation.
@@ -155,12 +189,17 @@ impl Drop for CodeEntryLease<'_> {
     }
 }
 
-const _: [(); 32] = [(); std::mem::size_of::<CodeEntryCell>()];
+const _: [(); 72] = [(); std::mem::size_of::<CodeEntryCell>()];
 const _: [(); 8] = [(); std::mem::align_of::<CodeEntryCell>()];
 const _: [(); 0] = [(); std::mem::offset_of!(CodeEntryCell, entry_addr)];
 const _: [(); 8] = [(); std::mem::offset_of!(CodeEntryCell, code_object_id)];
 const _: [(); 24] = [(); std::mem::offset_of!(CodeEntryCell, flags)];
 const _: [(); 28] = [(); std::mem::offset_of!(CodeEntryCell, active_count)];
+const _: [(); 32] = [(); std::mem::offset_of!(CodeEntryCell, generated_entries)];
+const _: [(); 40] = [(); std::mem::offset_of!(CodeEntryCell, generated_returns)];
+const _: [(); 48] = [(); std::mem::offset_of!(CodeEntryCell, generated_deopts)];
+const _: [(); 56] = [(); std::mem::offset_of!(CodeEntryCell, generated_throws)];
+const _: [(); 64] = [(); std::mem::offset_of!(CodeEntryCell, generated_bail_streak)];
 
 #[cfg(test)]
 mod tests {

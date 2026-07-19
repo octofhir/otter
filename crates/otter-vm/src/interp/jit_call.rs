@@ -1,17 +1,17 @@
-//! JIT entry, OSR, and direct-call frame plumbing.
+//! JIT entry, OSR, and generated-call frame plumbing.
 //!
 //! # Contents
 //! Tier-up dispatch (`maybe_dispatch_jit`, backedge/OSR accounting),
 //! compiled-frame entry (`run_compiled_frame`, `jit_runtime_call`),
-//! direct-call lifecycle dispatch through focused `jit_calls` modules,
-//! and cold legacy/inlined side-exit materialization in `jit_calls/deopt`.
+//! generated-call feedback through focused `jit_calls` modules, and cold
+//! inlined/stack-call side-exit materialization in `jit_calls/deopt`.
 //! Call and back-edge accounting also feeds the additive optimizing-tier
-//! policy without consulting its decision.
+//! policy without consulting its decision. Generated-call entry feedback is
+//! reconciled once after the outer native activation returns.
 //!
 //! # Invariants
-//! Every publish of a callee frame is paired with a finish/abort helper
-//! that releases pinned code and the sync-reentry guard; bail paths must
-//! leave the frame stack exactly as the interpreter expects to resume.
+//! Every generated callee frame remains published until native return, throw,
+//! or cold deoptimization releases its entry lease and depth accounting.
 //! Every VM-side compiled entry selection requires the exact installed code
 //! generation and isolate-epoch dependency state. Safepoint resolution for
 //! already-active Invalid code remains independent.
@@ -20,21 +20,21 @@
 //! window. They use the same fully wired runtime activation, published native
 //! frame, and call-scoped VM thread as baseline entries.
 //! Canonical tier transitions retain one [`NativeFrame`] and register window;
-//! construction of Rust-owned [`Frame`] adapters is confined to the cold deopt
-//! module and legacy dispatch paths.
+//! materialized [`Frame`] construction is confined to cold deoptimization and
+//! interpreter-owned dispatch.
 #![allow(unused_imports)]
 use crate::*;
 
-#[path = "jit_calls/cache.rs"]
-pub(crate) mod cache;
+#[derive(Debug, Default)]
+struct GeneratedFunctionFeedback {
+    entries: u64,
+    baseline_entries: u64,
+}
+
 #[path = "jit_calls/deopt.rs"]
 mod deopt;
-#[path = "jit_calls/finish.rs"]
-mod finish;
-#[path = "jit_calls/frame.rs"]
-mod frame;
-#[path = "jit_calls/resolve.rs"]
-mod resolve;
+#[path = "jit_calls/generated.rs"]
+mod generated;
 
 impl Interpreter {
     /// After a call pushed a fresh bytecode callee frame as the new top of
@@ -438,23 +438,48 @@ impl Interpreter {
         }
     }
 
-    /// Drop every installed optimizing-tier body for `fid` so the next tier-up
-    /// sees the latest compile policy / feedback snapshot.
-    pub(crate) fn invalidate_jit_function(&mut self, fid: u32) {
-        self.jit_optimized_code.remove(&fid);
-        self.jit_optimized_code_cache = None;
-        self.jit_direct_call_cache = None;
-        self.jit_code.remove(&fid);
-        self.jit_entry_osr_only.remove(&fid);
-        self.jit_code_cache = None;
-        self.clear_jit_direct_method_cache_for_fid(fid);
-        self.jit_code_registry.invalidate_function(fid);
+    /// Remove cache/map ownership for every function whose installed code was
+    /// invalidated, including transitive callers with generated direct edges.
+    ///
+    /// Hotness and bounded reoptimization history survive so the next entry
+    /// can compile immediately instead of warming from zero.
+    pub(crate) fn discard_invalidated_jit_state(&mut self, affected: &[u32]) {
+        if affected.is_empty() {
+            return;
+        }
+        let affected = affected
+            .iter()
+            .copied()
+            .collect::<rustc_hash::FxHashSet<_>>();
+        for &fid in &affected {
+            self.jit_code.remove(&fid);
+            self.jit_optimized_code.remove(&fid);
+            self.jit_entry_osr_only.remove(&fid);
+            self.jit_entry_bail_counts.remove(&fid);
+            self.jit_optimized_declined_epoch.remove(&fid);
+        }
         self.jit_osr_code
-            .retain(|(entry_fid, _), _| *entry_fid != fid);
+            .retain(|(fid, _), _| !affected.contains(fid));
         self.jit_osr_disabled
-            .retain(|(entry_fid, _)| *entry_fid != fid);
+            .retain(|(fid, _)| !affected.contains(fid));
         self.jit_osr_counts
-            .retain(|(entry_fid, _), _| *entry_fid != fid);
+            .retain(|(fid, _), _| !affected.contains(fid));
+        self.jit_code_cache = None;
+        self.jit_optimized_code_cache = None;
+    }
+
+    /// Unlink every current native generation for `fid` and all generated
+    /// callers that embed an exact edge to one of those generations.
+    ///
+    /// Map/cache ownership is removed while hotness survives, so the next
+    /// entry rebuilds directly against the latest tier and feedback snapshot.
+    pub(crate) fn invalidate_jit_function(&mut self, fid: u32) {
+        let mut affected = self.jit_code_registry.invalidate_function(fid);
+        if affected.binary_search(&fid).is_err() {
+            affected.push(fid);
+            affected.sort_unstable();
+        }
+        self.discard_invalidated_jit_state(&affected);
     }
 
     /// Tier-up entry point for a synchronously-entered call frame (the
@@ -567,8 +592,9 @@ impl Interpreter {
         Some(outcome)
     }
 
-    /// Resolve a separately installed optimizing body, compiling exactly once
-    /// after the deterministic promotion policy reaches `Promote`.
+    /// Resolve the current optimizing body, replacing the baseline generation
+    /// exactly once after the deterministic promotion policy reaches
+    /// `Promote`.
     pub(crate) fn resolve_optimized_code_for_fid(
         &mut self,
         context: &ExecutionContext,
@@ -623,8 +649,7 @@ impl Interpreter {
         // callbacks, comparators, `@@iterator` drives) resolves the SAME callee
         // every call; this skips the `jit_code` FxHashMap lookup + `Arc` clone
         // churn when the last resolve matched. The cache only ever holds
-        // non-`osr_only` code (populated below + by `jit_resolve_compiled_cached`),
-        // so it needs no further filtering.
+        // non-`osr_only` code, so it needs no further filtering.
         if let Some((cached_fid, code)) = &self.jit_code_cache
             && *cached_fid == fid
             && self.jit_code_registry.is_current_for_entry(code.as_ref())
@@ -647,7 +672,6 @@ impl Interpreter {
                 self.jit_runtime_stats.compile_attempts.saturating_add(1);
             self.jit_code.insert(fid, compiled.clone());
             self.jit_code_cache = None;
-            self.clear_jit_direct_method_cache_for_fid(fid);
             compiled
         };
         // The function-entry path never runs OSR-only code (compiled with
@@ -667,12 +691,104 @@ impl Interpreter {
         code
     }
 
+    /// Reconcile generated entry-cell feedback after the outermost native
+    /// activation has been unpublished.
+    ///
+    /// Native entries stay allocation- and transition-free. This cold pass
+    /// groups exact-generation deltas by function, advances the same hotness
+    /// and call-budget counters as materialized bytecode calls, then lets the
+    /// existing optimizing resolver sample hot baseline callees. Optimizing
+    /// generations never become promotion candidates.
+    pub fn jit_reconcile_generated_feedback(&mut self, context: &ExecutionContext) {
+        if !self.jit_generated_feedback_pending || self.jit_native_activation_top != 0 {
+            return;
+        }
+        self.jit_generated_feedback_pending = false;
+
+        let feedback = self.jit_code_registry.take_generated_feedback();
+        let mut functions = rustc_hash::FxHashMap::<u32, GeneratedFunctionFeedback>::default();
+        for entry in feedback {
+            match entry.tier {
+                native_abi::NativeFrameKind::Baseline => {
+                    self.jit_runtime_stats.generated_template_entries = self
+                        .jit_runtime_stats
+                        .generated_template_entries
+                        .saturating_add(entry.entries);
+                    self.jit_runtime_stats.generated_template_returns = self
+                        .jit_runtime_stats
+                        .generated_template_returns
+                        .saturating_add(entry.returns);
+                    self.jit_runtime_stats.generated_template_deopts = self
+                        .jit_runtime_stats
+                        .generated_template_deopts
+                        .saturating_add(entry.deopts);
+                    self.jit_runtime_stats.generated_template_throws = self
+                        .jit_runtime_stats
+                        .generated_template_throws
+                        .saturating_add(entry.throws);
+                }
+                native_abi::NativeFrameKind::Optimizing => {
+                    self.jit_runtime_stats.generated_optimizing_entries = self
+                        .jit_runtime_stats
+                        .generated_optimizing_entries
+                        .saturating_add(entry.entries);
+                    self.jit_runtime_stats.generated_optimizing_returns = self
+                        .jit_runtime_stats
+                        .generated_optimizing_returns
+                        .saturating_add(entry.returns);
+                    self.jit_runtime_stats.generated_optimizing_deopts = self
+                        .jit_runtime_stats
+                        .generated_optimizing_deopts
+                        .saturating_add(entry.deopts);
+                    self.jit_runtime_stats.generated_optimizing_throws = self
+                        .jit_runtime_stats
+                        .generated_optimizing_throws
+                        .saturating_add(entry.throws);
+                }
+                native_abi::NativeFrameKind::Interpreter => {
+                    debug_assert!(false, "entry cells never describe interpreter frames");
+                }
+            }
+            if entry.entries == 0 {
+                continue;
+            }
+            let entries = entry.entries;
+            let batch = functions.entry(entry.function_id).or_default();
+            batch.entries = batch.entries.saturating_add(entries);
+            if entry.tier == native_abi::NativeFrameKind::Baseline {
+                batch.baseline_entries = batch.baseline_entries.saturating_add(entries);
+            }
+        }
+
+        let mut baseline_candidates = Vec::new();
+        for (fid, batch) in functions {
+            self.note_jit_function_entries(fid, batch.entries);
+            self.record_runtime_bytecode_calls(batch.entries);
+            if batch.baseline_entries != 0 {
+                baseline_candidates.push(fid);
+            }
+        }
+        // Compilation order determines code-object ids and artifact ordering.
+        // Keep it stable even though the aggregation map is intentionally fast.
+        baseline_candidates.sort_unstable();
+        for fid in baseline_candidates {
+            let _ = self.resolve_optimized_code_for_fid(context, fid);
+        }
+    }
+
+    /// Advance the shared function-entry hotness counter by one cold batch.
+    #[inline]
+    pub(crate) fn note_jit_function_entries(&mut self, fid: u32, entries: u64) -> u32 {
+        let entries = u32::try_from(entries).unwrap_or(u32::MAX);
+        let counter = self.jit_call_counts.entry(fid).or_insert(0);
+        *counter = counter.saturating_add(entries);
+        *counter
+    }
+
     /// Advance the shared function-entry hotness counter once.
     #[inline]
     pub(crate) fn note_jit_function_entry(&mut self, fid: u32) -> u32 {
-        let counter = self.jit_call_counts.entry(fid).or_insert(0);
-        *counter = counter.saturating_add(1);
-        *counter
+        self.note_jit_function_entries(fid, 1)
     }
 
     /// Run compiled `code` over the rooted register window of frame `top_idx`.
@@ -715,8 +831,8 @@ impl Interpreter {
     /// is valid only for the dynamic extent of the inlined body: the closure
     /// stays rooted in the caller frame and its upvalue backing allocation is
     /// immutable. A closure with runtime-setup flags declines this frameless
-    /// leaf inline; direct-call linkage routes it through the setup stub and
-    /// then resumes the compiled callee under the same native activation.
+    /// leaf inline; the containing call takes its generated-call guard path or
+    /// exact pre-effect side exit.
     pub fn jit_inline_closure_upvalues(
         &mut self,
         callee: Value,
@@ -736,33 +852,6 @@ impl Interpreter {
         usize::try_from(header.upvalue_base).ok()
     }
 
-    /// Complete one full `CallMethodValue` in place for a compiled caller
-    /// whose direct-call prepare reported an ineligible resolution
-    /// (polymorphic, native, accessor, or cold method).
-    ///
-    /// Covers exactly the receiver families whose interpreter semantics are
-    /// "resolve the method value, then call it": ordinary property-bearing
-    /// receivers (objects, arrays, collections, proxies) and primitives.
-    /// Covers callable receivers too: the resolver owns function /
-    /// class-constructor / native property walks, and the synchronous
-    /// callable path dispatches resolved VM intrinsics (`call`, `apply`,
-    /// `bind`) itself. Families the interpreter dispatches through bespoke
-    /// opcode branches — generators, iterators, and pending `bind`
-    /// continuations — report `Ok(false)` before resolution starts. Once
-    /// resolution has invoked an accessor or proxy trap, missing and
-    /// non-callable results throw here so an exact side exit cannot replay the
-    /// observable `[[Get]]`. On `Ok(true)` the destination register holds the
-    /// call result and the compiled caller continues at the next instruction.
-    ///
-    /// The callee runs through [`Self::run_callable_sync_rooted`]
-    /// under the caller's published activation: it may allocate, re-enter
-    /// arbitrary JS, and invalidate the caller's body (the entry anchor keeps
-    /// the mapping alive). Register windows live in the pinned register-stack
-    /// slab, so `caller_regs` stays valid across the nested dispatch;
-    /// receiver and argument handles are re-read from the traced window after
-    /// every allocating step.
-    ///
-    /// # Safety-adjacent contract
     /// Rebuild an inlined callee's interpreter frame at a deopt exit.
     ///
     /// The optimized code has already written the caller's registers back into
@@ -822,157 +911,6 @@ impl Interpreter {
         }
         stack[callee_index].pc = callee_pc;
         Ok(stack[callee_index].registers.as_mut_ptr())
-    }
-
-    /// `caller_regs` is the caller's live register window (`JitCtx.regs`);
-    /// compiled code guarantees the destination/receiver/argument registers
-    /// are in bounds for that window.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn jit_runtime_call_method_in_place(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        frame_index: usize,
-        dst_reg: u16,
-        recv_reg: u16,
-        name_idx: u32,
-        site: usize,
-        arg_regs: &[u16],
-        caller_regs: *mut Value,
-    ) -> Result<bool, VmError> {
-        self.record_jit_runtime_stub_class(native_abi::RuntimeStubClass::Reentrant);
-        self.jit_runtime_stats.runtime_method_stubs = self
-            .jit_runtime_stats
-            .runtime_method_stubs
-            .saturating_add(1);
-        // A parked partial `Function.prototype.bind` continuation on this
-        // frame re-enters through the interpreter's opcode branch only.
-        if self
-            .frame_cold(&stack[frame_index])
-            .is_some_and(|cold| cold.pending_bind_function.is_some())
-        {
-            return Ok(false);
-        }
-        // SAFETY: `recv_reg` is a compiler-emitted index into the caller window.
-        let recv = unsafe { *caller_regs.add(recv_reg as usize) };
-        if recv.is_nullish() || recv.is_generator() || recv.is_iterator() {
-            return Ok(false);
-        }
-        let caller_fid = stack[frame_index].function_id;
-        // Resolve through the same layers the interpreter uses: the per-site
-        // method IC for ordinary objects, then the full receiver-family walk
-        // (prototype chain, primitive intrinsic prototypes, proxy [[Get]]).
-        let Some(name) = context.string_constant_str_for_function(caller_fid, name_idx) else {
-            return Ok(false);
-        };
-        let mut method = None;
-        if let Some(obj) = recv.as_object()
-            && let Some(key) = context.property_atom_for_function(caller_fid, name_idx)
-        {
-            method = self.resolve_method_ic(obj, key, site);
-        }
-        if method.is_none() {
-            method = self.get_method_value_for_call(context, stack, recv, name)?;
-        }
-        let Some(method) = method else {
-            return Err(self.err_unknown_intrinsic(name.to_string().into()));
-        };
-        if !self.is_callable_runtime(&method) {
-            return Err(VmError::NotCallable);
-        }
-        // The resolved method is the one live handle no traced storage
-        // holds; anchor it so the feedback capture below (which may
-        // allocate) and a moving scavenge cannot strand it.
-        let method_anchor = self.push_iteration_anchor(method) - 1;
-        // Method-inline feedback, mirroring the interpreter's
-        // `Op::CallMethodValue` arm: capture the receiver/prototype layout
-        // while the pre-call handle is valid, record it only for a bytecode
-        // target after the call completes.
-        let recv = unsafe { *caller_regs.add(recv_reg as usize) };
-        let method_fid = method
-            .as_closure(&self.gc_heap)
-            .map(|closure| closure.function_id())
-            .or_else(|| method.as_function());
-        let method_site = match method_fid {
-            Some(_) if !self.method_site_feedback_saturated(site) => {
-                self.method_site_for_receiver(context, caller_fid, name_idx, recv)
-            }
-            _ => None,
-        };
-        // Re-read every handle after the allocating capture step: the
-        // receiver and arguments from the traced window, the method from
-        // its anchor slot (a moving scavenge rewrites both in place).
-        let method = self.iteration_anchor(method_anchor);
-        let recv = unsafe { *caller_regs.add(recv_reg as usize) };
-        let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
-        for &arg in arg_regs {
-            // SAFETY: compiler-emitted argument indices into the caller window.
-            args.push(unsafe { *caller_regs.add(arg as usize) });
-        }
-        let result = self.run_callable_sync_rooted(stack, context, &method, recv, args);
-        self.pop_iteration_anchors_to(method_anchor);
-        let result = result?;
-        if let (Some(method_fid), Some(method_site)) = (method_fid, method_site) {
-            self.note_method_target(site, method_fid, method_site);
-        }
-        // SAFETY: `dst_reg` is a compiler-emitted index into the caller
-        // window; the window slab is pinned, so the pointer survived the
-        // nested dispatch.
-        unsafe {
-            *caller_regs.add(dst_reg as usize) = result;
-        }
-        Ok(true)
-    }
-
-    /// Complete one full plain `Call` in place for a compiled caller whose
-    /// direct-call prepare reported an ineligible callee (native, bound, or
-    /// a bytecode function outside the direct-call plan).
-    ///
-    /// The interpreter's `Op::Call` has no exotic receiver branches — its
-    /// semantics are exactly "call the callee value with `undefined` as
-    /// `this`" — so any callable completes here through
-    /// [`Self::run_callable_sync_rooted`] under the caller's
-    /// published activation. A non-callable value reports `Ok(false)` and
-    /// side-exits, keeping the interpreter the owner of the thrown error.
-    /// On `Ok(true)` the destination register holds the call result.
-    ///
-    /// # Safety-adjacent contract
-    /// `caller_regs` is the caller's live register window (`JitCtx.regs`);
-    /// compiled code guarantees the destination/callee/argument registers
-    /// are in bounds for that window.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub fn jit_runtime_call_in_place(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        dst_reg: u16,
-        callee_reg: u16,
-        arg_regs: &[u16],
-        caller_regs: *mut Value,
-    ) -> Result<bool, VmError> {
-        self.record_jit_runtime_stub_class(native_abi::RuntimeStubClass::Reentrant);
-        self.jit_runtime_stats.runtime_calls =
-            self.jit_runtime_stats.runtime_calls.saturating_add(1);
-        // SAFETY: `callee_reg` is a compiler-emitted index into the caller window.
-        let callee = unsafe { *caller_regs.add(callee_reg as usize) };
-        if !self.is_callable_runtime(&callee) {
-            return Ok(false);
-        }
-        let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
-        for &arg in arg_regs {
-            // SAFETY: compiler-emitted argument indices into the caller window.
-            args.push(unsafe { *caller_regs.add(arg as usize) });
-        }
-        let result =
-            self.run_callable_sync_rooted(stack, context, &callee, Value::undefined(), args)?;
-        // SAFETY: `dst_reg` is a compiler-emitted index into the caller
-        // window; the window slab is pinned, so the pointer survived the
-        // nested dispatch.
-        unsafe {
-            *caller_regs.add(dst_reg as usize) = result;
-        }
-        Ok(true)
     }
 
     /// Complete one full `Op::New` construct in place for a compiled caller
@@ -1073,7 +1011,7 @@ impl Interpreter {
         Ok(())
     }
 
-    /// JIT bridge — build the closure for a `MakeFunction` from compiled code,
+    /// Build the closure for a compiled `MakeFunction`,
     /// writing it into register `dst` of frame `frame_index` (self-reference
     /// capture and upvalue binding go through the normal interpreter path).
     ///

@@ -16,7 +16,7 @@
 //! - A compile-prepared event precedes its matching compile-finished event.
 //!
 //! # See also
-//! - `otter_vm::jit_debug` for the schema and isolate-local event state.
+//! - `otter_vm::jit_debug` for the current event shape and isolate-local state.
 
 use std::collections::BTreeSet;
 
@@ -134,7 +134,6 @@ fn template_osr_emits_ordered_compile_events() {
         .expect("enabled run owns a report");
 
     assert_eq!(result.completion_string(), "4560");
-    assert_eq!(report.schema_version(), 1);
     assert_ordered_template_compile(report.events());
     assert!(
         report.events().iter().any(|event| matches!(

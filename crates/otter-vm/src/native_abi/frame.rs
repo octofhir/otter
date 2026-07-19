@@ -78,8 +78,16 @@ impl NativeFrameFlags {
     /// Frame has precise safepoint maps for tagged machine locations.
     pub const HAS_SAFEPOINTS: u8 = 1 << 0;
     /// `activation_id` names a materialized interpreter activation. Without
-    /// this bit the same word names the VM-owned frameless-call resources.
+    /// this bit the word is unused.
     pub const MATERIALIZED: u8 = 1 << 1;
+    /// `register_base` points into generated code's native stack instead of
+    /// the VM register arena. The published native activation therefore owns
+    /// precise tracing and in-place rewriting of this register window.
+    ///
+    /// Stack-owned frames have no `activation_id` owner. Their generated call
+    /// sequence owns synchronous-depth and native-stack-byte accounting until
+    /// return, throw, or cold deoptimization completes.
+    pub const STACK_REGISTERS: u8 = 1 << 2;
 
     /// Empty flag set.
     #[must_use]
@@ -163,8 +171,8 @@ pub struct NativeFrame {
     pub self_value_bits: u64,
     /// Number of initialized handles at `upvalue_base`.
     pub upvalue_count: u32,
-    /// Interpreter activation index when `MATERIALIZED` is set; otherwise the
-    /// native-call owner released or materialized at the compiled-call edge.
+    /// Interpreter activation index when `MATERIALIZED` is set; unused for
+    /// `STACK_REGISTERS`.
     pub activation_id: u32,
 }
 
@@ -238,15 +246,23 @@ impl NativeFrame {
     /// activation.
     pub fn set_materialized_activation(&mut self, activation_id: u32) {
         self.activation_id = activation_id;
-        self.header.flags =
-            NativeFrameFlags::from_bits(self.header.flags.bits() | NativeFrameFlags::MATERIALIZED);
+        self.header.flags = NativeFrameFlags::from_bits(
+            (self.header.flags.bits() | NativeFrameFlags::MATERIALIZED)
+                & !NativeFrameFlags::STACK_REGISTERS,
+        );
     }
 
-    /// Attach the VM owner of a frameless compiled call.
-    pub fn set_native_owner(&mut self, owner_id: u32) {
-        self.activation_id = owner_id;
-        self.header.flags =
-            NativeFrameFlags::from_bits(self.header.flags.bits() & !NativeFrameFlags::MATERIALIZED);
+    /// Mark the register window as generated-code stack storage.
+    ///
+    /// The frame must remain published while generated code or a cold
+    /// interpreter continuation can allocate. Publication makes every tagged
+    /// slot in the window a precise, rewriteable collector root.
+    pub fn set_stack_registers(&mut self) {
+        self.activation_id = 0;
+        self.header.flags = NativeFrameFlags::from_bits(
+            (self.header.flags.bits() | NativeFrameFlags::STACK_REGISTERS)
+                & !NativeFrameFlags::MATERIALIZED,
+        );
     }
 
     /// Switch this activation to interpreter dispatch without moving or
@@ -280,12 +296,6 @@ impl NativeFrame {
             .flags
             .contains(NativeFrameFlags::MATERIALIZED)
             .then_some(self.activation_id)
-    }
-
-    /// VM owner of this frameless native call.
-    #[must_use]
-    pub fn native_owner_id(&self) -> Option<u32> {
-        (!self.header.flags.contains(NativeFrameFlags::MATERIALIZED)).then_some(self.activation_id)
     }
 }
 
@@ -338,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn native_frame_identity_distinguishes_native_owner_from_activation() {
+    fn native_frame_identity_distinguishes_stack_from_materialized() {
         let mut frame = NativeFrame::new(
             VmFrameHeader::interpreter(7, 3),
             0x1000,
@@ -348,12 +358,22 @@ mod tests {
         assert_eq!(frame.self_value(), Value::function(7));
         assert_eq!(frame.this_value(), Value::number_i32(4));
         assert_eq!(frame.new_target(), Value::undefined());
-        frame.set_native_owner(9);
-        assert_eq!(frame.native_owner_id(), Some(9));
+        frame.set_stack_registers();
         assert_eq!(frame.materialized_frame_index(), None);
+        assert!(
+            frame
+                .header
+                .flags
+                .contains(NativeFrameFlags::STACK_REGISTERS)
+        );
         frame.set_materialized_activation(4);
         assert_eq!(frame.materialized_frame_index(), Some(4));
-        assert_eq!(frame.native_owner_id(), None);
+        assert!(
+            !frame
+                .header
+                .flags
+                .contains(NativeFrameFlags::STACK_REGISTERS)
+        );
     }
 
     #[test]

@@ -27,7 +27,10 @@ use otter_bytecode::Op;
 use otter_vm::{JitCompileSnapshot, SafepointId, SafepointRecord, Value};
 use std::fmt::Write as _;
 
-use crate::entry::{BaselinePlan, MAX_METHOD_ARGS, Unsupported, pack_method_arg_regs, value_tag};
+use crate::entry::{
+    BaselinePlan, MAX_METHOD_ARGS, Unsupported, pack_method_arg_regs, unpack_method_arg_regs,
+    value_tag,
+};
 
 /// Numeric binary operators lowered to the shared int32/double template plus
 /// the common VM numeric completion. `+` has its own operation
@@ -224,9 +227,9 @@ pub(crate) enum TemplateOp {
         value: u16,
         site: u64,
     },
-    /// `r<dst> = r<callee>(args…)` through the direct-call prepare
-    /// transition; ineligible callees take an exact side exit to normal
-    /// dispatch. Argument register indices are packed one per 16-bit lane.
+    /// `r<dst> = r<callee>(args…)` through a baked compiler-native target or
+    /// an exact pre-effect side exit. Argument register indices are packed one
+    /// per 16-bit lane.
     Call {
         dst: u16,
         callee: u16,
@@ -538,7 +541,7 @@ fn pack_or_spill_arg_regs(arguments: &[u16], register_operands: &mut Vec<u16>) -
 impl TemplatePlan {
     /// Deterministic text view of the already-built plan for artifact capture.
     pub(crate) fn render_artifact(&self) -> String {
-        let mut out = String::from("; otter template plan v1\n");
+        let mut out = String::from("; otter template plan\n");
         writeln!(
             out,
             "; registers={} register-operands={} index-operands={} safepoints={} osr-only={}",
@@ -586,6 +589,20 @@ impl TemplatePlan {
         } else {
             (packed_args, None)
         }
+    }
+
+    /// Decode one call site's immutable caller-register operands for generated
+    /// native frame construction.
+    pub(crate) fn call_argument_registers(&self, argc: u16, packed_args: u64) -> Vec<u16> {
+        if usize::from(argc) > MAX_METHOD_ARGS {
+            let tail = TemplateTail {
+                start: packed_args as usize,
+                len: usize::from(argc),
+            };
+            return self.register_tail(tail).to_vec();
+        }
+        let unpacked = unpack_method_arg_regs(packed_args);
+        unpacked[..usize::from(argc)].to_vec()
     }
 
     pub(crate) fn index_tail(&self, tail: TemplateTail) -> &[u32] {

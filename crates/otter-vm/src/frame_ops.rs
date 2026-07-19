@@ -9,7 +9,7 @@
 //! # Contents
 //! - Representation-neutral SELF, `this`, and `new.target` loads.
 //! - Representation-neutral upvalue load/store operations.
-//! - Explicit materialized-frame adapters for fresh upvalue spines, rest
+//! - Explicit materialized-frame operations for fresh upvalue spines, rest
 //!   arguments, and structured-exception cold state.
 //!
 //! # Invariants
@@ -35,7 +35,7 @@ impl Interpreter {
     /// Load the current `this` binding into `dst` for either frame storage.
     ///
     /// Derived constructors publish a hole until `super()` binds `this`; the
-    /// materialized dispatch adapter resolves lexical-arrow inheritance before
+    /// materialized dispatch path resolves lexical-arrow inheritance before
     /// entering this kernel. A remaining hole is the canonical TDZ failure.
     pub(crate) fn frame_load_this(
         &self,
@@ -139,7 +139,7 @@ impl Interpreter {
 
     /// Resolve a materialized frame's lexical `this` through the nearest
     /// derived-constructor sidecar. Native activations carry their resolved
-    /// binding directly and never call this adapter.
+    /// binding directly and never call this materialized-only operation.
     pub(crate) fn materialized_this_binding(
         &self,
         stack: &ActivationStack,
@@ -164,7 +164,7 @@ impl Interpreter {
         Ok(value)
     }
 
-    /// JIT bridge for `LoadUpvalue` over the canonical activation.
+    /// Compiled-runtime `LoadUpvalue` over the canonical activation.
     ///
     /// The compiled tier owns PC progress, so this operation performs only the
     /// captured-binding read, TDZ check, and destination commit. It does not
@@ -182,10 +182,10 @@ impl Interpreter {
         self.frame_load_upvalue(frame, dst, idx)
     }
 
-    /// JIT bridge for `StoreUpvalue` over the canonical activation.
+    /// Compiled-runtime `StoreUpvalue` over the canonical activation.
     ///
     /// Captured-cell mutation still flows through [`store_upvalue`], which
-    /// owns the GC write barrier. No interpreter-frame adapter participates.
+    /// owns the GC write barrier. No interpreter-frame conversion participates.
     ///
     /// # Errors
     /// Propagates `InvalidOperand` for a negative or out-of-range index.

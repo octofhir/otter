@@ -4,8 +4,9 @@
 //! - [`JitDebugRequest`] — the immutable capture request copied into a compile
 //!   request.
 //! - [`JitDebugEvent`] and its helper enums — structured, serializable events
-//!   for compilation, inlining, bails, and inline-frame materialization.
-//! - [`JitDebugReport`] — one owned, schema-versioned batch of events.
+//!   for compilation, inlining, bails, generated-call deopts, and inline-frame
+//!   materialization.
+//! - [`JitDebugReport`] — one owned current-format batch of events.
 //! - [`JitDebugState`] — isolate-local event storage used by the interpreter.
 //!
 //! # Invariants
@@ -27,9 +28,6 @@
 //! - [`crate::Interpreter`] for the isolate that owns the corresponding state.
 
 use serde::{Deserialize, Serialize};
-
-/// Wire-schema version for [`JitDebugReport`].
-pub const JIT_DEBUG_SCHEMA_VERSION: u32 = 1;
 
 /// Maximum number of events retained by one isolate capture batch.
 pub const JIT_DEBUG_EVENT_LIMIT: usize = 16_384;
@@ -170,6 +168,12 @@ pub enum JitDebugCompileOutcome {
 pub enum JitInlineRejectionReason {
     /// The call site observed multiple possible callees.
     Polymorphic,
+    /// The monomorphic target is a static native handled by dedicated leaf
+    /// codegen rather than bytecode-body inlining.
+    StaticNative {
+        /// Exact semantic operation selected from bootstrap identity feedback.
+        target: crate::jit::JitStaticNativeCallKind,
+    },
     /// Feedback named a callee that is absent from the execution context.
     MissingCallee,
     /// The callee cannot use the narrow synchronous inline path.
@@ -195,10 +199,163 @@ pub enum JitInlineRejectionReason {
     MissingSnapshot,
 }
 
+/// Why a monomorphic call site could not bake compiler-generated native
+/// linkage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum JitDirectCallRejectionReason {
+    /// Feedback named a function id that has no current execution-context
+    /// entry.
+    MissingCallee,
+    /// The bytecode function requires call semantics outside the synchronous
+    /// direct-entry subset.
+    IneligibleFunction,
+    /// The call targets the body currently being compiled. Initial self-linking
+    /// needs a post-install entry cell rather than a prior generation.
+    SelfRecursive,
+    /// Entry must allocate fresh callee-owned capture cells before execution.
+    OwnUpvalues {
+        /// Number of fresh cells required by every invocation.
+        count: u16,
+    },
+    /// Method feedback could not be converted into immutable
+    /// receiver/prototype/slot guard metadata.
+    MethodGuardUnavailable,
+    /// No current non-OSR installed generation advertises stack-owned entry.
+    NoEntryGeneration,
+}
+
+/// VM planning result for one monomorphic compiler-generated call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum JitDirectCallPlanOutcome {
+    /// One exact installed generation was made available to the backend.
+    Available {
+        /// Exact isolate-local code generation.
+        code_object_id: u64,
+        /// Native tier entered by the generated call.
+        target_tier: JitDebugTier,
+        /// `this` binding emitted for this call site.
+        this_mode: crate::jit::JitDirectCallThisMode,
+    },
+    /// No generated-link plan was made available to the backend.
+    Rejected {
+        /// Machine-readable planning-stage reason.
+        reason: JitDirectCallRejectionReason,
+    },
+}
+
+/// Why an available direct-call plan did not become generated linkage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JitDirectCallLoweringRejectionReason {
+    /// The exact callee register/native-stack layout exceeds the bounded
+    /// generated-call contract.
+    LayoutUnsupported,
+    /// Backend dead-code elimination removed the call site.
+    Eliminated,
+}
+
+/// Final backend lowering selected for one available direct-call plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum JitDirectCallLoweringOutcome {
+    /// The backend emitted the complete compiler-generated call frame and
+    /// direct native entry.
+    Generated {
+        /// Exact isolate-local target generation.
+        code_object_id: u64,
+        /// Native tier entered by the generated call.
+        target_tier: JitDebugTier,
+        /// `this` binding emitted for this call site.
+        this_mode: crate::jit::JitDirectCallThisMode,
+    },
+    /// The backend spliced the callee body and emitted no call boundary.
+    Inlined,
+    /// The backend emitted no generated call for an exact typed reason.
+    Rejected {
+        /// Machine-readable backend-stage reason.
+        reason: JitDirectCallLoweringRejectionReason,
+    },
+}
+
+/// Why an available static-native leaf plan was not emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JitStaticNativeCallLoweringRejectionReason {
+    /// The call operand count is outside the exact generated leaf contract.
+    ArityUnsupported,
+    /// Backend layout or target support is unavailable.
+    LayoutUnsupported,
+    /// Backend dead-code elimination removed the call site.
+    Eliminated,
+}
+
+/// Final backend lowering selected for a static-native call plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum JitStaticNativeCallLoweringOutcome {
+    /// Exact identity guard plus native machine-code leaf was emitted.
+    Generated,
+    /// The backend emitted no leaf for a typed reason.
+    Rejected {
+        /// Machine-readable backend-stage reason.
+        reason: JitStaticNativeCallLoweringRejectionReason,
+    },
+}
+
+/// Typed cold diagnostic returned by one compiler-hook invocation.
+///
+/// The VM supplies caller identity and tier from the compile request rather
+/// than trusting an external backend to repeat them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitCompilerDiagnostic {
+    /// Final backend lowering for one available direct-call plan.
+    DirectCallLowered {
+        /// Source opcode represented by this generated linkage.
+        call_kind: crate::jit::JitDirectCallKind,
+        /// Logical PC of the call instruction.
+        instruction_pc: u32,
+        /// Encoded byte PC used by the compile snapshot's call tables.
+        byte_pc: u32,
+        /// Monomorphic callee function id.
+        callee_function_id: u32,
+        /// Actual lowering emitted by the backend.
+        outcome: JitDirectCallLoweringOutcome,
+    },
+    /// Final backend lowering for one available static-native plan.
+    StaticNativeCallLowered {
+        /// Logical PC of the call instruction.
+        instruction_pc: u32,
+        /// Encoded byte PC used by the compile snapshot's call tables.
+        byte_pc: u32,
+        /// Semantic leaf operation guarded at the call site.
+        target: crate::jit::JitStaticNativeCallKind,
+        /// Actual lowering emitted by the backend.
+        outcome: JitStaticNativeCallLoweringOutcome,
+    },
+}
+
 /// One structured JIT diagnostics event.
 ///
 /// The enum uses an internally tagged representation so report consumers can
-/// dispatch on the stable `type` field without parsing human-readable text.
+/// dispatch on the current `type` field without parsing human-readable text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(
     tag = "type",
@@ -224,12 +381,19 @@ pub enum JitDebugEvent {
         call_feedback_sites: u32,
         /// Method sites carrying target feedback.
         method_feedback_sites: u32,
-        /// Direct-call callee bodies baked into the snapshot.
+        /// Exact installed generations available for generated native linkage.
+        direct_callees: u32,
+        /// Monomorphic method sites carrying guarded generated-link plans.
+        direct_methods: u32,
+        /// Monomorphic static-native targets available for guarded leaf codegen.
+        static_native_calls: u32,
+        /// Plain-call callee bodies made available to the body inliner.
         inline_callees: u32,
         /// Monomorphic method bodies baked into the snapshot.
         inline_methods: u32,
     },
-    /// One direct-call inline candidate was baked or rejected by the VM.
+    /// One plain-call inline candidate was made available or rejected by the
+    /// VM.
     InlineCandidate {
         /// Function containing the call site.
         caller_function_id: u32,
@@ -243,6 +407,69 @@ pub enum JitDebugEvent {
         /// made available to the backend, which may still reject it for final
         /// size, arity, or tier-specific eligibility constraints.
         bake_rejection: Option<JitInlineRejectionReason>,
+    },
+    /// One monomorphic call target was made available to the backend or
+    /// rejected during VM planning.
+    DirectCallPlan {
+        /// Source opcode represented by this generated linkage.
+        call_kind: crate::jit::JitDirectCallKind,
+        /// Function containing the call site.
+        caller_function_id: u32,
+        /// Logical PC of the call instruction.
+        instruction_pc: u32,
+        /// Tier for which the target was inspected.
+        tier: JitDebugTier,
+        /// Monomorphic callee function id.
+        callee_function_id: u32,
+        /// Exact generated-link planning result.
+        outcome: JitDirectCallPlanOutcome,
+    },
+    /// Final backend lowering for one available direct-call plan.
+    DirectCallLowered {
+        /// Source opcode represented by this generated linkage.
+        call_kind: crate::jit::JitDirectCallKind,
+        /// Function containing the call site.
+        caller_function_id: u32,
+        /// Exact generated caller code object.
+        caller_code_object_id: u64,
+        /// Logical PC of the call instruction.
+        instruction_pc: u32,
+        /// Encoded byte PC used by the compile snapshot's call tables.
+        byte_pc: u32,
+        /// Tier that compiled the caller.
+        tier: JitDebugTier,
+        /// Monomorphic callee function id.
+        callee_function_id: u32,
+        /// Actual lowering emitted by the backend.
+        outcome: JitDirectCallLoweringOutcome,
+    },
+    /// One monomorphic static-native target was made available to the backend.
+    StaticNativeCallPlan {
+        /// Function containing the call site.
+        caller_function_id: u32,
+        /// Logical PC of the call instruction.
+        instruction_pc: u32,
+        /// Tier for which the target was selected.
+        tier: JitDebugTier,
+        /// Exact semantic leaf operation.
+        target: crate::jit::JitStaticNativeCallKind,
+    },
+    /// Final backend lowering for one static-native plan.
+    StaticNativeCallLowered {
+        /// Function containing the call site.
+        caller_function_id: u32,
+        /// Exact generated caller code object.
+        caller_code_object_id: u64,
+        /// Logical PC of the call instruction.
+        instruction_pc: u32,
+        /// Encoded byte PC used by the compile snapshot's call tables.
+        byte_pc: u32,
+        /// Tier that compiled the caller.
+        tier: JitDebugTier,
+        /// Exact semantic leaf operation.
+        target: crate::jit::JitStaticNativeCallKind,
+        /// Actual lowering emitted by the backend.
+        outcome: JitStaticNativeCallLoweringOutcome,
     },
     /// One compiler-hook invocation completed.
     CompileFinished {
@@ -272,6 +499,27 @@ pub enum JitDebugEvent {
         /// Human-readable operand rendering, when the PC resolves.
         operands_debug: Option<String>,
     },
+    /// One already-started compiler-generated callee entered cold deopt.
+    GeneratedCallDeopt {
+        /// Source opcode represented by the generated call site.
+        call_kind: crate::jit::JitDirectCallKind,
+        /// Function containing the generated call site.
+        caller_function_id: u32,
+        /// Exact caller code generation containing the generated edge.
+        caller_code_object_id: u64,
+        /// Exact logical PC of the caller's generated `Call` instruction.
+        caller_call_pc: u32,
+        /// Global bytecode function id of the deoptimizing callee.
+        callee_function_id: u32,
+        /// Exact isolate-local generated callee code generation.
+        callee_code_object_id: u64,
+        /// Tier that owned the generated callee frame.
+        callee_tier: JitDebugTier,
+        /// Exact logical PC at which the callee resumes in the interpreter.
+        callee_resume_pc: u32,
+        /// Consecutive generated deopts observed by this exact generation.
+        consecutive_deopts: u32,
+    },
     /// One interpreter frame was materialized from an inline deopt record.
     InlineDeoptFrame {
         /// Zero-based position in the reconstructed inline-frame chain.
@@ -285,11 +533,9 @@ pub enum JitDebugEvent {
     },
 }
 
-/// Owned, schema-versioned batch of structured JIT diagnostics.
+/// Owned current-format batch of structured JIT diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct JitDebugReport {
-    #[serde(rename = "otterJitDebugSchemaVersion")]
-    schema_version: u32,
     events: Vec<JitDebugEvent>,
     #[serde(rename = "droppedEvents")]
     dropped_events: u64,
@@ -297,7 +543,7 @@ pub struct JitDebugReport {
 }
 
 impl JitDebugReport {
-    /// Construct a version-1 report from owned events.
+    /// Construct a current-format report from owned events.
     #[must_use]
     pub fn from_events(events: Vec<JitDebugEvent>) -> Self {
         let dropped_events =
@@ -313,17 +559,10 @@ impl JitDebugReport {
 
     fn from_captured(events: Vec<JitDebugEvent>, dropped_events: u64) -> Self {
         Self {
-            schema_version: JIT_DEBUG_SCHEMA_VERSION,
             events,
             dropped_events,
             truncated: dropped_events != 0,
         }
-    }
-
-    /// Report wire-schema version.
-    #[must_use]
-    pub const fn schema_version(&self) -> u32 {
-        self.schema_version
     }
 
     /// Borrow the captured events in emission order.
@@ -579,12 +818,11 @@ mod tests {
     }
 
     #[test]
-    fn enabled_state_drains_owned_versioned_reports() {
+    fn enabled_state_drains_owned_reports() {
         let mut state = JitDebugState::new(JitDebugRequest::events());
         state.record(sample_event);
 
         let report = state.take_report().expect("capture is enabled");
-        assert_eq!(report.schema_version(), JIT_DEBUG_SCHEMA_VERSION);
         assert_eq!(report.events(), &[sample_event()]);
 
         let next = state.take_report().expect("capture remains enabled");
@@ -592,7 +830,7 @@ mod tests {
     }
 
     #[test]
-    fn report_serialization_has_stable_schema_and_event_tags() {
+    fn report_serialization_has_current_shape_and_event_tags() {
         let report = JitDebugReport::from_events(vec![JitDebugEvent::CompilePrepared {
             function_id: 11,
             function_name: "hotLoop".to_string(),
@@ -602,6 +840,9 @@ mod tests {
             parameter_count: 1,
             call_feedback_sites: 2,
             method_feedback_sites: 3,
+            direct_callees: 1,
+            direct_methods: 2,
+            static_native_calls: 1,
             inline_callees: 1,
             inline_methods: 0,
         }]);
@@ -609,7 +850,6 @@ mod tests {
         assert_eq!(
             serde_json::to_value(report).expect("serialize report"),
             json!({
-                "otterJitDebugSchemaVersion": 1,
                 "events": [{
                     "type": "compilePrepared",
                     "functionId": 11,
@@ -623,6 +863,9 @@ mod tests {
                     "parameterCount": 1,
                     "callFeedbackSites": 2,
                     "methodFeedbackSites": 3,
+                    "directCallees": 1,
+                    "directMethods": 2,
+                    "staticNativeCalls": 1,
                     "inlineCallees": 1,
                     "inlineMethods": 0
                 }],
@@ -633,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn baked_inline_candidate_does_not_claim_backend_acceptance() {
+    fn available_inline_candidate_does_not_claim_backend_acceptance() {
         let value = serde_json::to_value(JitDebugEvent::InlineCandidate {
             caller_function_id: 3,
             instruction_pc: 9,

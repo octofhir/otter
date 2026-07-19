@@ -5,7 +5,6 @@
 //! category. The CLI is invoked with `--json`, stdout/stderr is
 //! parsed via `serde_json`, and we assert the typed wire shape:
 //!
-//! - `error_schema_version == 1`,
 //! - error envelope deserializes into a known
 //!   [`otter_runtime::OtterError`] variant,
 //! - the embedded diagnostic (when present) carries a
@@ -23,7 +22,6 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 struct Envelope {
-    error_schema_version: u32,
     error: OtterError,
 }
 
@@ -46,7 +44,6 @@ fn run_with_json(source: &str, file_name: &str) -> (i32, Envelope) {
             stderr
         )
     });
-    assert_eq!(envelope.error_schema_version, 1);
     (code, envelope)
 }
 

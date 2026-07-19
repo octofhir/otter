@@ -15,7 +15,7 @@ Supported suites:
 Each fixture may carry TOML metadata in the source header. The runner uses
 that metadata for expected exit codes and other fixture-level expectations.
 When `--json` is enabled, output is newline-delimited JSON records followed
-by a summary report using `HARNESS_SCHEMA_VERSION`.
+by a summary report in the one current harness shape.
 
 Discovery skips helper/package directories rather than treating them as
 standalone tests:

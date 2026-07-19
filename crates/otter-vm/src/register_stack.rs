@@ -297,54 +297,6 @@ impl RegisterStack {
         self.top = new_top;
     }
 
-    /// Describe the youngest already-published window without copying or
-    /// changing the live cursor. Used to materialize interpreter frames after
-    /// a frameless compiled call bails.
-    pub(crate) fn top_window(&mut self, count: usize) -> Result<RegisterWindow, VmError> {
-        let base = self.top.checked_sub(count).ok_or(VmError::InvalidOperand)?;
-        if count == 0 {
-            let pointer = self
-                .segments
-                .get_mut(self.active_segments.wrapping_sub(1))
-                .map_or_else(
-                    || std::ptr::NonNull::<Value>::dangling().as_ptr(),
-                    |segment| {
-                        // SAFETY: one-past the initialized prefix is valid for
-                        // a zero-length slice.
-                        unsafe { segment.slots.as_mut_ptr().add(segment.used) }
-                    },
-                );
-            return Ok(RegisterWindow::attached(
-                pointer,
-                0,
-                u32::try_from(base).map_err(|_| VmError::InvalidOperand)?,
-            ));
-        }
-        let segment = self
-            .segments
-            .get_mut(
-                self.active_segments
-                    .checked_sub(1)
-                    .ok_or(VmError::InvalidOperand)?,
-            )
-            .ok_or(VmError::InvalidOperand)?;
-        if base < segment.logical_base || self.top != segment.logical_base + segment.used {
-            return Err(VmError::InvalidOperand);
-        }
-        let offset = base - segment.logical_base;
-        if offset.checked_add(count) != Some(segment.used) {
-            return Err(VmError::InvalidOperand);
-        }
-        // SAFETY: the requested top suffix is within the active initialized
-        // prefix and the segment allocation cannot move while active.
-        let pointer = unsafe { segment.slots.as_mut_ptr().add(offset) };
-        Ok(RegisterWindow::attached(
-            pointer,
-            count,
-            u32::try_from(base).map_err(|_| VmError::InvalidOperand)?,
-        ))
-    }
-
     /// Trace the precisely published tagged prefix.
     pub(crate) fn trace(&self, heap: &GcHeap, visitor: &mut dyn FnMut(*mut RawGc)) {
         if std::env::var_os("OTTER_GC_VERIFY").is_some_and(|value| value != "0") {
@@ -456,20 +408,6 @@ mod tests {
         stack.release(2);
         stack.restore(checkpoint);
         assert_eq!(stack.checkpoint(), 2);
-    }
-
-    #[test]
-    fn top_window_resolves_only_the_youngest_segment() {
-        let mut stack = RegisterStack::new();
-        stack.allocate(REGISTER_SEGMENT_SLOTS).unwrap();
-        let youngest = stack.allocate(3).unwrap();
-
-        assert_eq!(stack.top_window(3).unwrap(), youngest);
-        assert!(matches!(
-            stack.top_window(REGISTER_SEGMENT_SLOTS + 3),
-            Err(VmError::InvalidOperand)
-        ));
-        assert!(stack.top_window(0).unwrap().is_empty());
     }
 
     #[test]

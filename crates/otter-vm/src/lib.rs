@@ -144,7 +144,6 @@ pub mod microtask;
 mod module_ops;
 mod module_records;
 pub mod native_abi;
-mod native_call_owners;
 pub mod native_function;
 pub mod number;
 pub mod object;
@@ -241,20 +240,25 @@ pub use error_classes::{ErrorClassRegistry, ErrorKind};
 pub use handles::{HandleArena, Local};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
-    JitArrayLayout, JitArrayMethod, JitArrayMethodKind, JitClosureCallLayout, JitCodeResidency,
-    JitCollectionAllocMethod, JitCollectionLayout, JitCollectionLeafMethod, JitCompileError,
-    JitCompileRequest, JitCompileSnapshot, JitCompileStatus, JitCompilerHook, JitExecOutcome,
-    JitFunctionCode, JitInlineCallee, JitInlineMethod, JitInstructionMetadata,
-    JitPrimitiveMethodGuard, JitRuntimeStubBinding, JitStringLayout, VmRuntimeActivation,
+    JitArrayLayout, JitArrayMethod, JitArrayMethodKind, JitClosureCallLayout,
+    JitCodeGenerationSnapshot, JitCodeResidency, JitCollectionAllocMethod, JitCollectionLayout,
+    JitCollectionLeafMethod, JitCompileError, JitCompileRequest, JitCompileSnapshot,
+    JitCompileStatus, JitCompilerHook, JitDirectCallKind, JitDirectCallThisMode, JitDirectCallee,
+    JitExecOutcome, JitFunctionCode, JitInlineCallee, JitInlineMethod, JitInstructionMetadata,
+    JitPrimitiveMethodGuard, JitRuntimeStubBinding, JitStaticNativeCall, JitStaticNativeCallKind,
+    JitStringLayout, VmRuntimeActivation,
 };
 pub use jit_artifact::{
-    JIT_ARTIFACT_BUNDLE_LIMIT, JIT_ARTIFACT_BYTE_LIMIT, JIT_ARTIFACT_SCHEMA_VERSION,
-    JitArtifactBatch, JitArtifactBuildError, JitArtifactBundle, JitArtifactFile,
-    JitArtifactFileName, JitArtifactIdentity, JitArtifactManifest, JitArtifactMetadata,
+    JIT_ARTIFACT_BUNDLE_LIMIT, JIT_ARTIFACT_BYTE_LIMIT, JitArtifactBatch, JitArtifactBuildError,
+    JitArtifactBundle, JitArtifactFile, JitArtifactFileName, JitArtifactIdentity,
+    JitArtifactManifest, JitArtifactMetadata,
 };
 pub use jit_debug::{
-    JIT_DEBUG_EVENT_LIMIT, JIT_DEBUG_SCHEMA_VERSION, JitDebugCompileOutcome, JitDebugEvent,
-    JitDebugReport, JitDebugRequest, JitDebugTarget, JitDebugTier, JitInlineRejectionReason,
+    JIT_DEBUG_EVENT_LIMIT, JitCompilerDiagnostic, JitDebugCompileOutcome, JitDebugEvent,
+    JitDebugReport, JitDebugRequest, JitDebugTarget, JitDebugTier, JitDirectCallLoweringOutcome,
+    JitDirectCallLoweringRejectionReason, JitDirectCallPlanOutcome, JitDirectCallRejectionReason,
+    JitInlineRejectionReason, JitStaticNativeCallLoweringOutcome,
+    JitStaticNativeCallLoweringRejectionReason,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,
@@ -444,28 +448,37 @@ pub struct JitRuntimeStats {
     pub optimized_osr_entries: u64,
     /// Optimizing-tier exits that reconstructed and resumed an interpreter frame.
     pub optimized_deopts: u64,
-    /// Compiled `Op::Call` bridge invocations.
+    /// Compiled closure-inline validation transitions.
     pub runtime_calls: u64,
-    /// Compiled `Op::New` in-place construct bridge invocations.
+    /// Compiled `Op::New` in-place construct transitions.
     pub runtime_constructs: u64,
-    /// Bridge calls that stayed on the compiled-to-compiled fast path.
-    pub direct_calls: u64,
-    /// Bridge calls that fell back to the generic Rust callable path.
-    pub rust_call_fallbacks: u64,
+    /// Compiler-generated stack-frame calls that entered native callee code.
+    pub generated_calls: u64,
+    /// Compiler-generated stack-frame calls that cold-deoptimized and resumed
+    /// through the interpreter.
+    pub generated_call_deopts: u64,
+    /// Generated template-tier callee entries.
+    pub generated_template_entries: u64,
+    /// Generated template-tier callees that returned normally.
+    pub generated_template_returns: u64,
+    /// Generated template-tier callees that cold-deoptimized.
+    pub generated_template_deopts: u64,
+    /// Generated template-tier callees that propagated a throw.
+    pub generated_template_throws: u64,
+    /// Generated optimizing-tier callee entries.
+    pub generated_optimizing_entries: u64,
+    /// Generated optimizing-tier callees that returned normally.
+    pub generated_optimizing_returns: u64,
+    /// Generated optimizing-tier callees that cold-deoptimized.
+    pub generated_optimizing_deopts: u64,
+    /// Generated optimizing-tier callees that propagated a throw.
+    pub generated_optimizing_throws: u64,
     /// Function-entry compile attempts across native tiers.
     pub compile_attempts: u64,
     /// Loop-OSR compile/entry attempts at threshold crossings.
     pub osr_attempts: u64,
     /// JIT property/method/element/global/upvalue runtime stub calls.
     pub runtime_property_stubs: u64,
-    /// JIT method-call runtime stub calls.
-    pub runtime_method_stubs: u64,
-    /// Method-call runtime stubs reached from baseline dynasm code.
-    pub runtime_method_baseline_stubs: u64,
-    /// Method-call runtime stubs reached from optimizing dynasm code.
-    pub runtime_method_optimizing_stubs: u64,
-    /// Narrow collection-IC method bridge calls from compiled code.
-    pub runtime_collection_method_ic_stubs: u64,
     /// ABI-classified runtime stub transitions from compiled code.
     pub runtime_stub_transitions: u64,
     /// ABI-classified leaf runtime stubs. These are the desired hot-path shape.
@@ -482,18 +495,6 @@ pub struct JitRuntimeStats {
     pub alloc_value_stub_out_of_memory: u64,
     /// Executed `AllocValueStub` entries that returned another non-`Ok` status.
     pub alloc_value_stub_other: u64,
-    /// JIT method bridge calls served by a live collection method IC.
-    pub method_collection_ic_hits: u64,
-    /// JIT method bridge calls served by collection prototype fast paths.
-    pub method_fast_collection_hits: u64,
-    /// JIT method bridge calls served by array fast paths.
-    pub method_array_fast_hits: u64,
-    /// JIT method bridge calls served by primitive string fast paths.
-    pub method_string_fast_hits: u64,
-    /// JIT method bridge calls served by primitive number fast paths.
-    pub method_number_fast_hits: u64,
-    /// JIT method bridge calls that reached generic callable dispatch.
-    pub method_generic_calls: u64,
 }
 
 /// Snapshot of VM-published collection method IC mirror slots.
@@ -509,21 +510,6 @@ pub struct JitCollectionMethodIcStats {
     pub leaf_stub_slots: u64,
     /// Collection slots with an allocating stub id.
     pub alloc_stub_slots: u64,
-}
-
-/// Observed-callee state for one bytecode `Op::Call` site, the feedback the
-/// baseline reads to decide whether to inline a tiny leaf callee.
-///
-/// An empty dense feedback cell means *unobserved*. `Mono(fid)` means every
-/// observed call resolved to the same bytecode callee — the inlinable case.
-/// `Poly` means two or more distinct callees were seen; such a site is never
-/// inlined.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CallTargetFeedback {
-    /// Exactly one callee function id observed so far.
-    Mono(u32),
-    /// More than one distinct callee observed; not inlinable.
-    Poly,
 }
 
 /// Observed state for one `Op::CallMethodValue` site, the feedback the baseline
@@ -542,18 +528,18 @@ pub(crate) enum CallTargetFeedback {
 /// bounding both the emitted guard-chain length and the number of
 /// reoptimization evictions a single site can trigger as its target set grows.
 ///
-/// A site with more shapes than this bakes none and takes the per-call method
-/// bridge (a frame build per call), which is far costlier than a few extra
-/// shape-guard compares — so this covers the common wide-but-not-megamorphic
-/// dispatch (e.g. six sibling classes) rather than stranding it on the bridge.
+/// A site with more shapes than this bakes none and side-exits at the method
+/// call, which is far costlier than a few extra shape-guard compares. This
+/// covers common wide-but-not-megamorphic dispatch (for example, six sibling
+/// classes) without bloating every smaller guard chain.
 /// The cap never lengthens the guard chain for a site with fewer shapes (only
 /// baked shapes are walked), so raising it only helps wider sites.
 pub(crate) const MAX_POLY_METHOD_TARGETS: usize = 8;
 
 /// Longest prototype chain a method-call site's inline identity guard walks
 /// from the receiver to the object holding the method slot. Deeper
-/// resolutions stay on the bridge (a chain this long is already rare; each
-/// hop costs one flat-prototype chase + shape compare per call).
+/// resolutions stay uninlined (a chain this long is already rare; each hop
+/// costs one flat-prototype chase plus shape compare per call).
 pub(crate) const MAX_METHOD_PROTO_CHAIN: usize = 4;
 
 /// Stable shape identities for each prototype hopped from the receiver to the method holder,
@@ -578,7 +564,7 @@ impl MethodProtoChain {
     }
 
     /// Append one hopped prototype's shape; `false` when the chain is full
-    /// (the site must stay on the bridge).
+    /// (the site must stay uninlined).
     pub(crate) fn push(&mut self, shape: object::ShapeId) -> bool {
         if (self.len as usize) == MAX_METHOD_PROTO_CHAIN {
             return false;
@@ -639,7 +625,7 @@ pub(crate) enum MethodCallFeedback {
     /// time from the live receiver so the baseline can bake a fully-inline
     /// identity guard (chase the flat prototype per hop, guard each shape,
     /// load the slot, compare the closure's `function_id`) with no per-call
-    /// resolve bridge.
+    /// runtime resolution.
     Mono {
         method_fid: u32,
         recv_shape: object::ShapeId,
@@ -649,7 +635,7 @@ pub(crate) enum MethodCallFeedback {
     /// Two-to-[`MAX_POLY_METHOD_TARGETS`] distinct inlinable targets observed
     /// at this site. The baseline bakes one inline guard+body per target into a
     /// most-frequent-first chain; a receiver matching none of the guards falls
-    /// through to the in-place method bridge. Still GC-safe and Send/Sync: each
+    /// to the exact method-call side exit. Still GC-safe and Send/Sync: each
     /// target only holds stable shape ids and a function id.
     ///
     /// Boxed: the inline target array dwarfs the `Mono` payload, and most
@@ -657,8 +643,7 @@ pub(crate) enum MethodCallFeedback {
     /// feedback-map entry `Mono`-sized.
     Poly(Box<SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]>>),
     /// More than [`MAX_POLY_METHOD_TARGETS`] distinct targets observed; the
-    /// site is too polymorphic to inline profitably and always takes the
-    /// in-place method bridge.
+    /// site is too polymorphic to inline profitably and always side-exits.
     Megamorphic,
 }
 
@@ -793,7 +778,19 @@ pub struct Interpreter {
     /// cache slot, not only the owning `shape_runtime` transition table.
     simple_constructor_shape_cache: rustc_hash::FxHashMap<u32, object::ShapeHandle>,
     max_stack_depth: u32,
+    /// Active synchronous JavaScript re-entry depth. Generated call sequences
+    /// update this same counter inline through
+    /// [`Self::jit_sync_reentry_depth_addr`].
     sync_reentry_depth: u32,
+    /// Active compiler-generated JavaScript call frames that still live only
+    /// on the native stack. Cold deoptimization temporarily transfers its
+    /// current frame out of this count while the interpreter owns a
+    /// materialized copy.
+    jit_generated_call_depth: u32,
+    /// Native-stack bytes reserved by active compiler-generated JS calls.
+    /// Generated prologues update this inline and compare against
+    /// [`Self::jit_native_stack_bytes_limit`].
+    jit_native_stack_bytes: usize,
     allow_blocking_atomics_wait: bool,
     /// Per-interpreter microtask queue. Plain field — accessed
     /// only through `&mut self`. The dispatch loop threads
@@ -960,13 +957,6 @@ pub struct Interpreter {
         rustc_hash::FxHashMap<u32, Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
     /// Single-entry cache over [`Self::jit_optimized_code`] for hot leaf calls.
     jit_optimized_code_cache: Option<(u32, std::sync::Arc<dyn jit::JitFunctionCode>)>,
-    /// Single-entry direct-call plan cache for the last optimizing callee.
-    ///
-    /// Unlike `jit_optimized_code_cache`, this snapshots the registry-derived
-    /// entry cell and its invalidation epoch. A repeated compiled→compiled call
-    /// therefore skips both installed-code map probes and registry dependency
-    /// walks after freshly decoding the current callable.
-    jit_direct_call_cache: Option<jit::JitDirectCallCache>,
     /// Feedback epoch at which a hot function last failed optimizing compilation.
     /// A back-edge only re-attempts the whole-body optimizer when the epoch has
     /// advanced, so a structurally-ineligible body is not recompiled on every hot
@@ -978,11 +968,10 @@ pub struct Interpreter {
     /// at one loop header.
     jit_osr_code:
         rustc_hash::FxHashMap<(u32, u32), Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
-    /// Single-entry monomorphic cache over [`Self::jit_code`] for the hot
-    /// compiled→compiled call bridge ([`Self::jit_runtime_call`]). Records the
-    /// last function id whose installed body is a non-OSR baseline body, so a
-    /// repeated call to the same callee skips the map probe entirely. Cleared
-    /// whenever a new entry is inserted into `jit_code`.
+    /// Single-entry monomorphic cache over [`Self::jit_code`] for repeated
+    /// synchronous function entries. Records the last function id whose
+    /// installed body is a non-OSR baseline body, so repeated resolution skips
+    /// the map probe. Cleared whenever a new entry is inserted into `jit_code`.
     jit_code_cache: Option<(u32, std::sync::Arc<dyn jit::JitFunctionCode>)>,
     /// Function ids whose installed body compiled `osr_only` (unsupported opcodes
     /// emitted as bails), so the function-entry path can never run it — only a
@@ -992,17 +981,15 @@ pub struct Interpreter {
     /// the `Arc` clone (an atomic refcount round-trip), and the `osr_only()`
     /// virtual call on every invocation of an interpreter-resident method body.
     jit_entry_osr_only: rustc_hash::FxHashSet<u32>,
-    /// Per-method-call-site compiled direct-call cache. Each entry is guarded by
-    /// the same shape/slot metadata as the load IC and re-reads the method value
-    /// before entry, so replacements are freshly decoded and mismatching targets
-    /// fall back to full resolution.
-    jit_direct_method_cache: Vec<Vec<interp::JitDirectMethodCache>>,
-    /// Lightweight JIT bridge/tiering counters for OtterLab diagnostics.
+    /// Lightweight native-tier counters for OtterLab diagnostics.
     jit_runtime_stats: JitRuntimeStats,
     /// Address-stable registry of installed code objects behind the one
     /// published safepoint-resolver view; entries are registered at compile
     /// install and retained while any native frame can name them.
     jit_code_registry: Box<jit_registry::JitCodeRegistry>,
+    /// Whether compiler-generated entry-cell feedback awaits one cold,
+    /// outermost-activation reconciliation pass.
+    jit_generated_feedback_pending: bool,
     /// Next unique code-object identity handed to a compile request.
     jit_next_code_object_id: u64,
     /// Flat register stack for JIT-built callee windows. Compiled code sets up a
@@ -1011,10 +998,6 @@ pub struct Interpreter {
     /// VM-owned native register arena. Its published prefix is a precise GC
     /// root set for in-flight compiled call windows.
     register_stack: register_stack::RegisterStack,
-    /// LIFO ownership of frameless compiled callees. A hot direct call retains
-    /// only its register window and upvalue spine here; no interpreter frame or
-    /// parent `ActivationStack` entry is constructed unless that callee bails.
-    native_call_owners: native_call_owners::NativeCallOwnerStack,
     /// Fixed VM-owned descriptors for native JIT contexts whose scalar binding
     /// slots must stay visible to a moving collection across safepoints.
     jit_native_activations: Vec<jit::JitNativeActivation>,

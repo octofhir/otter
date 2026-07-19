@@ -2,8 +2,8 @@
 //!
 //! # Contents
 //! - Self-patching property IC cells and miss handlers.
-//! - Element/global/upvalue/object runtime bridges.
-//! - Collection-method and write-barrier bridges.
+//! - Element/global/upvalue/object runtime operations.
+//! - Write-barrier entries.
 //!
 //! # Invariants
 //! Register operands address the published JIT window. Allocating or throwing
@@ -164,7 +164,7 @@ pub(crate) extern "C" fn jit_store_property_stub(
     }
 }
 
-/// Bridge stub: run the GC write barrier for an inline `StoreProperty` whose
+/// Runtime stub: run the GC write barrier for an inline `StoreProperty` whose
 /// stored value is a heap pointer. The emitted fast path skips this for
 /// primitive values (the common case); a pointer store calls here so an
 /// old→young edge marks the parent object's card. Always returns `0`.
@@ -188,7 +188,7 @@ pub(crate) extern "C" fn jit_write_barrier_stub(ctx: *mut JitCtx, obj: u64, src:
     }
 }
 
-/// Bridge stub: perform a computed `LoadElement` (`recv[idx]`) from compiled
+/// Runtime stub: perform a computed `LoadElement` (`recv[idx]`) from compiled
 /// code, delegating to the safe [`Interpreter::jit_runtime_load_element`].
 /// Returns `0` on success, `1` when the read threw (error parked in `ctx`).
 pub(crate) extern "C" fn jit_load_element_stub(
@@ -216,7 +216,7 @@ pub(crate) extern "C" fn jit_load_element_stub(
     }
 }
 
-/// Bridge stub: perform a `LoadGlobalOrThrow` from compiled code, delegating to
+/// Runtime stub: perform a `LoadGlobalOrThrow` from compiled code through
 /// the safe [`Interpreter::jit_runtime_load_global`]. Returns `0` on success,
 /// `1` when the read threw (unbound identifier / throwing accessor; error
 /// parked in `ctx`).
@@ -245,7 +245,7 @@ pub(crate) extern "C" fn jit_load_global_stub(
     }
 }
 
-/// Bridge stub: perform a `LoadUpvalue` (captured-binding read) from compiled
+/// Runtime stub: perform a `LoadUpvalue` (captured-binding read) from compiled
 /// code, delegating to [`Interpreter::jit_runtime_load_upvalue`]. `idx` carries
 /// the bytecode's signed upvalue index. Returns `0` on success, `1` on throw
 /// (TDZ `ReferenceError`, error parked in `ctx`).
@@ -269,7 +269,7 @@ pub(crate) extern "C" fn jit_load_upvalue_stub(ctx: *mut JitCtx, dst: u64, idx: 
     }
 }
 
-/// Bridge stub: perform a `StoreUpvalue` (captured-binding write) from compiled
+/// Runtime stub: perform a `StoreUpvalue` (captured-binding write) from compiled
 /// code, delegating to [`Interpreter::jit_runtime_store_upvalue`]. Returns `0`
 /// on success, `1` on throw (error parked in `ctx`).
 pub(crate) extern "C" fn jit_store_upvalue_stub(ctx: *mut JitCtx, src: u64, idx: u64) -> u64 {
@@ -292,7 +292,7 @@ pub(crate) extern "C" fn jit_store_upvalue_stub(ctx: *mut JitCtx, src: u64, idx:
     }
 }
 
-/// Bridge stub: allocate an ordinary object for `NewObject` from compiled code.
+/// Runtime stub: allocate an ordinary object for `NewObject` from compiled code.
 /// Uses the VM's stack-rooted allocator so moving young-GC semantics match the
 /// interpreter path.
 pub(crate) extern "C" fn jit_new_object_stub(ctx: *mut JitCtx, dst: u64) -> u64 {
@@ -341,42 +341,7 @@ pub(crate) extern "C" fn otter_jit_math_random() -> u64 {
     Value::number(otter_vm::math::random_number()).to_bits()
 }
 
-/// Narrow collection-IC method bridge.
-///
-/// Return status: `0` = IC hit and `dst` written, `1` = throw parked in ctx,
-/// `2` = miss, continue to the generic method path.
-#[allow(clippy::too_many_arguments)]
-pub(crate) extern "C" fn jit_call_collection_method_ic_stub(
-    ctx: *mut JitCtx,
-    dst: u64,
-    recv: u64,
-    site: u64,
-    argc: u64,
-    packed_args: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let mut runtime = match ctx.runtime_call() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            return 1;
-        }
-    };
-    let mut inline_args = [0u16; crate::entry::MAX_METHOD_ARGS];
-    let args = crate::entry::decode_packed_arg_regs(argc as usize, packed_args, &mut inline_args);
-    let result = runtime.try_collection_method(dst as u16, recv as u16, site as usize, args);
-    match result {
-        Ok(Some(true)) => 0,
-        Ok(Some(false) | None) => 2,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            1
-        }
-    }
-}
-
-/// Bridge stub: perform a computed `StoreElement` (`recv[idx] = src`) from
+/// Runtime stub: perform a computed `StoreElement` (`recv[idx] = src`) from
 /// compiled code, delegating to the safe
 /// [`Interpreter::jit_runtime_store_element`]. Returns `0` on success, `1` when
 /// the write threw (error parked in `ctx`).

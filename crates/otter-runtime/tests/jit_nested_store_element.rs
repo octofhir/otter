@@ -15,7 +15,7 @@ use otter_runtime::{JitSelection, Runtime, SourceInput};
 
 struct FinalStats {
     osr_attempts: u64,
-    direct_calls: u64,
+    generated_calls: u64,
     property_stubs: u64,
     optimized_deopts: u64,
 }
@@ -164,7 +164,7 @@ fn run(selection: JitSelection) -> (String, FinalStats) {
         completion,
         FinalStats {
             osr_attempts: after.jit_osr_attempts - before.jit_osr_attempts,
-            direct_calls: after.jit_direct_calls - before.jit_direct_calls,
+            generated_calls: after.jit_generated_calls - before.jit_generated_calls,
             property_stubs: after.jit_runtime_property_stubs - before.jit_runtime_property_stubs,
             optimized_deopts: after.jit_optimized_deopts - before.jit_optimized_deopts,
         },
@@ -183,7 +183,7 @@ fn frameless_store_element_completes_object_array_and_typed_array_set() {
     );
     assert_eq!(stats.osr_attempts, 0);
     assert!(
-        stats.direct_calls > 0,
+        stats.generated_calls > 0,
         "final stores must cross a compiled caller-to-callee boundary"
     );
     assert!(

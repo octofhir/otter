@@ -8,6 +8,8 @@
 //! - Cooperative back-edge polling with loop-header bail writeback.
 //! - Precise live-tagged GC safepoints around element, property, global,
 //!   comparison, and method-call transitions.
+//! - Baked stable-entry plain and method calls with stack-owned rooted callee
+//!   frames.
 //! - Guarded numeric fast paths for source-lowered coercion scaffolding.
 //! - Tagged-number guards, mixed-representation arithmetic, spills, boxing,
 //!   and bail exits backed by exact deopt frame states.
@@ -50,6 +52,10 @@
 //!   bitmap names every tagged input and live-across value; moving-GC reloads
 //!   restore live values and load results while numeric machine locations
 //!   remain untouched.
+//! - A non-spliced call enters only its VM-baked native generation. Method
+//!   edges additionally prove receiver/prototype/slot identity in generated
+//!   code. Missing targets and every pre-entry guard or lease failure take the
+//!   caller's exact deopt exit.
 //!   Poll slow paths still bail so the interpreter owns interrupt/budget handling.
 //!
 //! # See also
@@ -62,19 +68,16 @@
 #![allow(clippy::useless_conversion)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_bytecode::{Op, Operand};
 use otter_vm::deopt::{DeoptExitId, DeoptFrame, DeoptLocation, DeoptRepr, DeoptTable};
 use otter_vm::native_abi::{
-    FrameMap, NO_FRAME_STATE, RuntimeStubDescriptor, STUB_JIT_BACKEDGE_POLL, STUB_JIT_CALL_GENERIC,
-    STUB_JIT_CALL_METHOD_GENERIC, STUB_JIT_CONSTRUCT, STUB_JIT_DEOPT_REIFY_FRAME,
-    STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROPERTY, STUB_JIT_LOAD_UPVALUE,
-    STUB_JIT_LOOSE_EQ, STUB_JIT_MATH_CALL, STUB_JIT_PREPARE_DIRECT_CALL,
-    STUB_JIT_PREPARE_DIRECT_METHOD_CALL, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY,
-    STUB_JIT_STORE_UPVALUE, STUB_JIT_STORE_UPVALUE_CHECKED, STUB_JIT_WRITE_BARRIER, SafepointId,
-    SafepointRecord,
+    FrameMap, NO_FRAME_STATE, RuntimeStubDescriptor, STUB_JIT_BACKEDGE_POLL, STUB_JIT_CONSTRUCT,
+    STUB_JIT_DEOPT_REIFY_FRAME, STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_LOAD_ELEMENT,
+    STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROPERTY, STUB_JIT_LOAD_UPVALUE, STUB_JIT_LOOSE_EQ,
+    STUB_JIT_MATH_CALL, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY, STUB_JIT_STORE_UPVALUE,
+    STUB_JIT_STORE_UPVALUE_CHECKED, STUB_JIT_WRITE_BARRIER, SafepointId, SafepointRecord,
 };
 use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG};
 
@@ -87,7 +90,11 @@ use super::{
 };
 use crate::{
     CompiledCode,
-    arm64::CallTrampoline,
+    arm64::{
+        DirectCallForm, DirectCallSite, MethodGuardSite, StaticNativeCallSite,
+        direct_call_artifact, direct_call_target_is_supported, emit_direct_call, emit_method_guard,
+        emit_static_native_call, static_native_target_is_supported,
+    },
     artifact::{
         ArtifactRequest, CodeMapCapture, CodeRegion, NativeCompileOutput, build_bundle,
         relocation::{PropertyIcAccess, RelocationCapture, RelocationTarget},
@@ -228,7 +235,6 @@ struct EmissionPlan<'a> {
     store_property_entry: ResolvedRuntimeEntry,
     load_global_entry: ResolvedRuntimeEntry,
     loose_eq_entry: ResolvedRuntimeEntry,
-    call_method_entry: ResolvedRuntimeEntry,
     construct_entry: ResolvedRuntimeEntry,
     /// Rebuilds a spliced callee's interpreter frame at a deopt exit.
     reify_frame_entry: ResolvedRuntimeEntry,
@@ -236,12 +242,8 @@ struct EmissionPlan<'a> {
     math_call_entry: ResolvedRuntimeEntry,
     /// Refills the back-edge budget and reports raised interrupts.
     poll_entry: ResolvedRuntimeEntry,
-    /// Resolves a method through its IC and stages a compiled-to-compiled call.
-    prepare_direct_method_entry: ResolvedRuntimeEntry,
-    /// Resolves a plain callee and stages a compiled-to-compiled call.
-    prepare_direct_call_entry: ResolvedRuntimeEntry,
-    /// Completes an ineligible plain call in place.
-    call_generic_entry: ResolvedRuntimeEntry,
+    /// Resumes an already-entered generated stack callee after native bailout.
+    deopt_stack_call_entry: ResolvedRuntimeEntry,
     /// Reads one captured binding into a window slot; TDZ reads throw.
     load_upvalue_entry: ResolvedRuntimeEntry,
     /// Writes one captured binding with the generational barrier.
@@ -254,8 +256,6 @@ struct EmissionPlan<'a> {
     to_boolean_entry: ResolvedRuntimeEntry,
     /// Exact non-allocating IEEE-754 remainder probe.
     number_rem_entry: ResolvedRuntimeEntry,
-    /// Hook/code-object-owned compiled-to-compiled call lifecycle.
-    call_trampoline: &'a CallTrampoline,
     /// Owning function id, baked into property/global transitions so the stub
     /// resolves the name constant against this function's constant pool.
     function_id: u64,
@@ -264,6 +264,8 @@ struct EmissionPlan<'a> {
 struct OptimizedEmission {
     code: CompiledCode,
     osr_entries: BTreeMap<u32, usize>,
+    dependencies: BTreeMap<u32, u64>,
+    direct_call_events: Option<BTreeMap<u32, otter_vm::JitCompilerDiagnostic>>,
     code_map: Option<CodeMapCapture>,
     relocations: RelocationCapture,
 }
@@ -280,27 +282,15 @@ pub(super) fn compile_with_transitions(
     code_object_id: u64,
     transitions: &TransitionTable,
 ) -> Result<OptimizedCode, Unsupported> {
-    let call_trampoline = Arc::new(CallTrampoline::compile(transitions)?);
-    compile_with_trampoline(view, code_object_id, transitions, call_trampoline)
+    compile_with_artifacts(view, code_object_id, transitions, None, false).map(|output| output.code)
 }
 
-#[cfg(test)]
-pub(super) fn compile_with_trampoline(
+pub(super) fn compile_with_artifacts(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &TransitionTable,
-    call_trampoline: Arc<CallTrampoline>,
-) -> Result<OptimizedCode, Unsupported> {
-    compile_with_trampoline_artifacts(view, code_object_id, transitions, call_trampoline, None)
-        .map(|output| output.code)
-}
-
-pub(super) fn compile_with_trampoline_artifacts(
-    view: &JitCompileSnapshot,
-    code_object_id: u64,
-    transitions: &TransitionTable,
-    call_trampoline: Arc<CallTrampoline>,
     artifact_request: Option<ArtifactRequest>,
+    capture_events: bool,
 ) -> Result<NativeCompileOutput<OptimizedCode>, Unsupported> {
     // The unit is the root function plus every callee body the inline tree
     // splices into it, from the VM-baked monomorphic candidates. Only bodies
@@ -381,10 +371,6 @@ pub(super) fn compile_with_trampoline_artifacts(
                 STUB_JIT_LOOSE_EQ,
                 transitions.variadic_entry(STUB_JIT_LOOSE_EQ),
             ),
-            call_method_entry: ResolvedRuntimeEntry::new(
-                STUB_JIT_CALL_METHOD_GENERIC,
-                transitions.variadic_entry(STUB_JIT_CALL_METHOD_GENERIC),
-            ),
             construct_entry: ResolvedRuntimeEntry::new(
                 STUB_JIT_CONSTRUCT,
                 transitions.variadic_entry(STUB_JIT_CONSTRUCT),
@@ -401,17 +387,9 @@ pub(super) fn compile_with_trampoline_artifacts(
                 STUB_JIT_BACKEDGE_POLL,
                 transitions.entry(STUB_JIT_BACKEDGE_POLL),
             ),
-            prepare_direct_method_entry: ResolvedRuntimeEntry::new(
-                STUB_JIT_PREPARE_DIRECT_METHOD_CALL,
-                transitions.entry(STUB_JIT_PREPARE_DIRECT_METHOD_CALL),
-            ),
-            prepare_direct_call_entry: ResolvedRuntimeEntry::new(
-                STUB_JIT_PREPARE_DIRECT_CALL,
-                transitions.entry(STUB_JIT_PREPARE_DIRECT_CALL),
-            ),
-            call_generic_entry: ResolvedRuntimeEntry::new(
-                STUB_JIT_CALL_GENERIC,
-                transitions.entry(STUB_JIT_CALL_GENERIC),
+            deopt_stack_call_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_DEOPT_STACK_CALL,
+                transitions.entry(STUB_JIT_DEOPT_STACK_CALL),
             ),
             load_upvalue_entry: ResolvedRuntimeEntry::new(
                 STUB_JIT_LOAD_UPVALUE,
@@ -437,10 +415,10 @@ pub(super) fn compile_with_trampoline_artifacts(
                 otter_vm::runtime_stubs::NUMBER_REM_LEAF.descriptor,
                 otter_vm::runtime_stubs::NUMBER_REM_LEAF.entry_addr() as u64,
             ),
-            call_trampoline: call_trampoline.as_ref(),
             function_id: u64::from(view.code_block.id),
         },
         artifact_request.is_some(),
+        capture_events,
     )?;
     let frame_maps = eligibility
         .element_transitions
@@ -486,12 +464,20 @@ pub(super) fn compile_with_trampoline_artifacts(
     });
     let code = OptimizedCode::new(
         emission.code,
-        call_trampoline,
+        None,
         unit.deopt.table().clone(),
         safepoint_records,
         frame_maps,
         eligibility.element_transitions.bitmap_words,
         emission.osr_entries,
+        emission
+            .dependencies
+            .into_iter()
+            .map(|(function_id, code_object_id)| {
+                otter_vm::native_abi::CodeDependency::code_generation(function_id, code_object_id)
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
         eligibility.math_call_arguments,
         load_ic_cells,
         store_ic_cells,
@@ -512,7 +498,14 @@ pub(super) fn compile_with_trampoline_artifacts(
             spill_slot_count: unit.spill_slot_count,
         },
     );
-    Ok(NativeCompileOutput { code, artifact })
+    Ok(NativeCompileOutput {
+        code,
+        artifact,
+        diagnostics: emission
+            .direct_call_events
+            .map(|events| events.into_values().collect::<Vec<_>>().into_boxed_slice())
+            .unwrap_or_default(),
+    })
 }
 
 /// `true` when every instruction of `callee` lowers into machine registers.
@@ -1120,10 +1113,10 @@ fn check_eligibility(
                         return Err(Unsupported::Opcode(instruction.op));
                     }
                 }
-                // A plain call resolves through the direct-call prepare stub
-                // and runs compiled-to-compiled; an ineligible callee completes
-                // through the generic in-place transition. Every tagged operand
-                // is materialized in the precise frame window first.
+                // A plain call uses only a VM-baked monomorphic native target.
+                // Every tagged operand is materialized in the precise frame
+                // window first; absence or invalidation of that target takes
+                // the exact pre-effect deopt exit.
                 Op::Call if !is_spliced_call(cfg, block, instruction) => {
                     let result = instruction
                         .result
@@ -1131,17 +1124,26 @@ fn check_eligibility(
                     if reprs.representation(result) != Representation::Tagged
                         || instruction.result_register.is_none()
                         || instruction.input_registers.is_empty()
-                        || instruction.input_registers.len() > 1 + MAX_METHOD_ARGS
                         || instruction.inputs.len() != instruction.input_registers.len()
                     {
                         return Err(Unsupported::Opcode(instruction.op));
                     }
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
-                    element_transition_instructions.push((
-                        instruction.pc,
-                        block,
-                        instruction_index,
-                    ));
+                    let frame = &tree.frames[instruction.inline.0 as usize];
+                    let byte_pc = frame
+                        .instructions
+                        .get(instruction.pc as usize)
+                        .map(|metadata| metadata.byte_pc)
+                        .ok_or(Unsupported::OperandShape("optimizing call byte PC"))?;
+                    if instruction.inline != InlineId::ROOT
+                        || !view.static_native_calls.contains_key(&byte_pc)
+                    {
+                        element_transition_instructions.push((
+                            instruction.pc,
+                            block,
+                            instruction_index,
+                        ));
+                    }
                 }
                 // A spliced call is not lowered as a call: control enters the
                 // callee's body. Its operands stay inputs so the emitter can
@@ -1730,6 +1732,34 @@ fn deopt_exit_at(
     )
 }
 
+fn optimizing_direct_call_target_tier(
+    target: &otter_vm::JitDirectCallee,
+) -> otter_vm::JitDebugTier {
+    match target.plan.tier {
+        otter_vm::native_abi::NativeFrameKind::Baseline => otter_vm::JitDebugTier::Template,
+        otter_vm::native_abi::NativeFrameKind::Optimizing => otter_vm::JitDebugTier::Optimizing,
+        otter_vm::native_abi::NativeFrameKind::Interpreter => {
+            unreachable!("interpreter has no entry-capable code generation")
+        }
+    }
+}
+
+fn optimizing_direct_call_event(
+    call_kind: otter_vm::JitDirectCallKind,
+    instruction_pc: u32,
+    byte_pc: u32,
+    target: &otter_vm::JitDirectCallee,
+    outcome: otter_vm::JitDirectCallLoweringOutcome,
+) -> otter_vm::JitCompilerDiagnostic {
+    otter_vm::JitCompilerDiagnostic::DirectCallLowered {
+        call_kind,
+        instruction_pc,
+        byte_pc,
+        callee_function_id: target.plan.function_id,
+        outcome,
+    }
+}
+
 fn emit(
     view: &JitCompileSnapshot,
     cfg: &ControlFlowGraph,
@@ -1739,6 +1769,7 @@ fn emit(
     store_ic_cells: &mut [WhiskerIcCell],
     plan: EmissionPlan<'_>,
     capture_artifacts: bool,
+    capture_events: bool,
 ) -> Result<OptimizedEmission, Unsupported> {
     let EmissionPlan {
         reprs,
@@ -1753,26 +1784,93 @@ fn emit(
         store_property_entry,
         load_global_entry,
         loose_eq_entry,
-        call_method_entry,
         construct_entry,
         reify_frame_entry,
         math_call_entry,
         poll_entry,
-        prepare_direct_method_entry,
-        prepare_direct_call_entry,
-        call_generic_entry,
+        deopt_stack_call_entry,
         load_upvalue_entry,
         store_upvalue_entry,
         store_upvalue_checked_entry,
         write_barrier_entry,
         to_boolean_entry,
         number_rem_entry,
-        call_trampoline,
         function_id,
     } = plan;
     let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
     let mut code_map = capture_artifacts.then(CodeMapCapture::default);
     let mut relocations = RelocationCapture::new(capture_artifacts);
+    let mut code_dependencies = BTreeMap::<u32, u64>::new();
+    let mut direct_call_events = capture_events.then(|| {
+        let mut events = view
+            .direct_callees
+            .iter()
+            .filter_map(|(&byte_pc, target)| {
+                let instruction = view
+                    .instructions
+                    .iter()
+                    .find(|instruction| instruction.byte_pc == byte_pc)?;
+                let instruction_pc = instruction.instruction_pc(&view.code_block);
+                let outcome = otter_vm::JitDirectCallLoweringOutcome::Rejected {
+                    reason: otter_vm::JitDirectCallLoweringRejectionReason::Eliminated,
+                };
+                Some((
+                    byte_pc,
+                    optimizing_direct_call_event(
+                        otter_vm::JitDirectCallKind::Plain,
+                        instruction_pc,
+                        byte_pc,
+                        target,
+                        outcome,
+                    ),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (&byte_pc, method) in &view.direct_methods {
+            let Some(instruction) = view
+                .instructions
+                .iter()
+                .find(|instruction| instruction.byte_pc == byte_pc)
+            else {
+                continue;
+            };
+            let instruction_pc = instruction.instruction_pc(&view.code_block);
+            events.insert(
+                byte_pc,
+                optimizing_direct_call_event(
+                    otter_vm::JitDirectCallKind::Method,
+                    instruction_pc,
+                    byte_pc,
+                    &method.callee,
+                    otter_vm::JitDirectCallLoweringOutcome::Rejected {
+                        reason: otter_vm::JitDirectCallLoweringRejectionReason::Eliminated,
+                    },
+                ),
+            );
+        }
+        for (&byte_pc, target) in &view.static_native_calls {
+            let Some(instruction) = view
+                .instructions
+                .iter()
+                .find(|instruction| instruction.byte_pc == byte_pc)
+            else {
+                continue;
+            };
+            let instruction_pc = instruction.instruction_pc(&view.code_block);
+            events.insert(
+                byte_pc,
+                otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
+                    instruction_pc,
+                    byte_pc,
+                    target: target.kind,
+                    outcome: otter_vm::JitStaticNativeCallLoweringOutcome::Rejected {
+                        reason: otter_vm::JitStaticNativeCallLoweringRejectionReason::Eliminated,
+                    },
+                },
+            );
+        }
+        events
+    });
     let mut next_load_ic = 0usize;
     let mut next_store_ic = 0usize;
     let mut ops = Assembler::new()
@@ -2883,14 +2981,14 @@ fn emit(
                         .expect("eligibility checked method-call destination");
                     let receiver = instruction.input_registers[0];
                     let arg_regs = &instruction.input_registers[1..];
-                    let argc = arg_regs.len() as u32;
-                    let packed = pack_method_arg_regs(arg_regs);
-                    let name = view.instructions[instruction.pc as usize]
-                        .const_index(view.code_block.as_ref(), 2)
-                        .ok_or(Unsupported::OperandShape("method-call name constant"))?;
-                    let ic_site = view.instructions[instruction.pc as usize]
-                        .property_ic_site(view.code_block.as_ref())
-                        .unwrap_or(usize::MAX) as u64;
+                    let frame = &tree.frames[instruction.inline.0 as usize];
+                    let byte_pc = frame
+                        .instructions
+                        .get(instruction.pc as usize)
+                        .map(|metadata| metadata.byte_pc)
+                        .ok_or(Unsupported::OperandShape(
+                            "optimizing direct method byte PC",
+                        ))?;
                     let site = eligibility
                         .element_transitions
                         .sites
@@ -2913,68 +3011,112 @@ fn emit(
                         ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
                     );
 
-                    // Direct dispatch first: the prepare transition resolves the
-                    // method through its IC and stages the callee's entry, and
-                    // the shared trampoline calls it compiled-to-compiled — no
-                    // interpreter dispatch on the hot path. A bailed callee is
-                    // finished by the VM and this caller keeps running compiled;
-                    // only an abort report side-exits at this call.
                     let succeeded = ops.new_dynamic_label();
                     let bail = ops.new_dynamic_label();
-                    let generic = ops.new_dynamic_label();
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; mov x0, x20
-                        ; movz x1, receiver as u32
-                    );
-                    emit_load_u64(&mut ops, 2, u64::from(name));
-                    emit_load_u64(&mut ops, 3, ic_site);
-                    dynasm!(ops ; .arch aarch64 ; movz x4, argc);
-                    emit_load_u64(&mut ops, 5, packed);
-                    emit_runtime_entry(&mut ops, &mut relocations, 16, prepare_direct_method_entry);
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; blr x16
-                        ; cmp x0, #1
-                        ; b.eq =>threw
-                        ; cmp x0, #2
-                        ; b.eq =>generic
-                    );
-                    crate::arm64::emit_prepared_call(
-                        &mut ops,
-                        &mut relocations,
-                        call_trampoline,
-                        dst,
-                        bail,
-                        threw,
-                        succeeded,
-                    );
-
-                    // Ineligible resolution: the generic in-place transition
-                    // completes the whole opcode.
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; =>generic
-                        ; mov x0, x20
-                        ; movz x1, dst as u32
-                        ; movz x2, receiver as u32
-                    );
-                    emit_load_u64(&mut ops, 3, u64::from(name));
-                    emit_load_u64(&mut ops, 4, ic_site);
-                    dynasm!(ops ; .arch aarch64 ; movz x5, argc);
-                    emit_load_u64(&mut ops, 6, packed);
-                    emit_runtime_entry(&mut ops, &mut relocations, 16, call_method_entry);
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; blr x16
-                        ; cmp x0, #1
-                        ; b.eq =>threw
-                        ; cmp x0, #2
-                        ; b.eq =>bail
-                        ; cbz x0, =>succeeded
-                        ; b =>threw
-                        ; =>succeeded
-                    );
+                    let planned_method = (instruction.inline == InlineId::ROOT)
+                        .then(|| view.direct_methods.get(&byte_pc))
+                        .flatten();
+                    let direct_method = planned_method
+                        .filter(|method| direct_call_target_is_supported(&method.callee));
+                    if let Some(method) = direct_method {
+                        let direct_site = DirectCallSite {
+                            target: &method.callee,
+                            caller_function_id: frame.function_id,
+                            logical_pc: instruction.pc,
+                            byte_pc,
+                            dst,
+                            form: DirectCallForm::Method {
+                                callable: 17,
+                                receiver,
+                            },
+                            arguments: arg_regs,
+                        };
+                        let direct_call = direct_call_artifact(view, direct_site)?;
+                        let guard_start = ops.offset().0;
+                        emit_method_guard(
+                            &mut ops,
+                            &mut relocations,
+                            view,
+                            MethodGuardSite {
+                                guard: &method.guard,
+                                receiver,
+                            },
+                            17,
+                            None,
+                            bail,
+                        )?;
+                        if let Some(code_map) = code_map.as_mut() {
+                            code_map.record(CodeRegion::method_call_structural(
+                                "directMethodGuard",
+                                guard_start,
+                                ops.offset().0,
+                                direct_site.caller_function_id,
+                                direct_site.logical_pc,
+                                direct_site.byte_pc,
+                                direct_call,
+                                receiver,
+                                &method.guard,
+                            ));
+                        }
+                        emit_direct_call(
+                            &mut ops,
+                            &mut relocations,
+                            view,
+                            direct_site,
+                            deopt_stack_call_entry.address,
+                            code_map.as_mut(),
+                            bail,
+                            threw,
+                            succeeded,
+                        )?;
+                        let previous = code_dependencies.insert(
+                            method.callee.plan.function_id,
+                            method.callee.plan.code_object_id,
+                        );
+                        debug_assert!(
+                            previous.is_none_or(|code_object_id| {
+                                code_object_id == method.callee.plan.code_object_id
+                            }),
+                            "one compile snapshot cannot name two generations for one callee"
+                        );
+                        if let Some(events) = direct_call_events.as_mut() {
+                            events.insert(
+                                byte_pc,
+                                optimizing_direct_call_event(
+                                    otter_vm::JitDirectCallKind::Method,
+                                    instruction.pc,
+                                    byte_pc,
+                                    &method.callee,
+                                    otter_vm::JitDirectCallLoweringOutcome::Generated {
+                                        code_object_id: method.callee.plan.code_object_id,
+                                        target_tier: optimizing_direct_call_target_tier(
+                                            &method.callee,
+                                        ),
+                                        this_mode: otter_vm::JitDirectCallThisMode::MethodReceiver,
+                                    },
+                                ),
+                            );
+                        }
+                    } else {
+                        if let (Some(events), Some(method)) =
+                            (direct_call_events.as_mut(), planned_method)
+                        {
+                            events.insert(
+                                byte_pc,
+                                optimizing_direct_call_event(
+                                    otter_vm::JitDirectCallKind::Method,
+                                    instruction.pc,
+                                    byte_pc,
+                                    &method.callee,
+                                    otter_vm::JitDirectCallLoweringOutcome::Rejected {
+                                        reason: otter_vm::JitDirectCallLoweringRejectionReason::LayoutUnsupported,
+                                    },
+                                ),
+                            );
+                        }
+                        dynasm!(ops ; .arch aarch64 ; b =>bail);
+                    }
+                    dynasm!(ops ; .arch aarch64 ; =>succeeded);
                     emit_reload_element_transition(
                         &mut ops,
                         allocation,
@@ -2988,8 +3130,6 @@ fn emit(
                             ),
                         )),
                     )?;
-                    // An exotic-receiver report (`2`) side-exits before the opcode
-                    // takes effect: a full deopt re-runs it in the interpreter.
                     deopt_exits.push((
                         bail,
                         deopt_exit_at(frame_states, instruction)?,
@@ -3533,95 +3673,203 @@ fn emit(
                         taken,
                     )?;
                 }
-                // A plain call: prepare resolves the callee against installed
-                // code and the shared trampoline runs it compiled-to-compiled. An
-                // ineligible callee completes through the generic in-place
-                // transition; only a non-callable report side-exits.
+                // A plain call: generated code guards one VM-baked target,
+                // enters its stable code generation with a stack-owned rooted
+                // frame, and returns directly. Every pre-entry miss deopts at
+                // this exact Call; an entered callee bailout resumes through
+                // the cold stack-call deoptimizer and is never replayed.
                 Op::Call if !is_spliced_call(cfg, block_id, instruction) => {
                     let dst = instruction
                         .result_register
                         .expect("eligibility checked call destination");
                     let callee = instruction.input_registers[0];
                     let arg_regs = &instruction.input_registers[1..];
-                    let argc = arg_regs.len() as u32;
-                    let packed = pack_method_arg_regs(arg_regs);
-                    let site = eligibility
-                        .element_transitions
-                        .sites
-                        .get(&instruction.pc)
-                        .ok_or(Unsupported::OperandShape("optimizing call missing site"))?;
-                    debug_assert_eq!(site.safepoint_id, site.frame_map.id);
-                    emit_materialize_element_transition(
-                        &mut ops,
-                        reprs,
-                        allocation,
-                        instruction,
-                        site,
-                    )?;
-                    emit_load_u32(&mut ops, 9, instruction.pc);
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-                        ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
-                    );
-                    let succeeded = ops.new_dynamic_label();
                     let bail = ops.new_dynamic_label();
-                    let generic = ops.new_dynamic_label();
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; mov x0, x20
-                        ; movz x1, callee as u32
-                        ; movz x2, argc
-                    );
-                    emit_load_u64(&mut ops, 3, packed);
-                    emit_runtime_entry(&mut ops, &mut relocations, 16, prepare_direct_call_entry);
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; blr x16
-                        ; cmp x0, #1
-                        ; b.eq =>threw
-                        ; cmp x0, #2
-                        ; b.eq =>generic
-                    );
-                    crate::arm64::emit_prepared_call(
-                        &mut ops,
-                        &mut relocations,
-                        call_trampoline,
-                        dst,
-                        bail,
-                        threw,
-                        succeeded,
-                    );
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; =>generic
-                        ; mov x0, x20
-                        ; movz x1, dst as u32
-                        ; movz x2, callee as u32
-                        ; movz x3, argc
-                    );
-                    emit_load_u64(&mut ops, 4, packed);
-                    emit_runtime_entry(&mut ops, &mut relocations, 16, call_generic_entry);
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; blr x16
-                        ; cmp x0, #1
-                        ; b.eq =>threw
-                        ; cmp x0, #2
-                        ; b.eq =>bail
-                        ; =>succeeded
-                    );
-                    emit_reload_element_transition(
-                        &mut ops,
-                        allocation,
-                        site,
-                        Some((
-                            dst,
-                            allocation.location(
-                                instruction.result.expect("eligibility checked call result"),
-                            ),
-                        )),
-                    )?;
+                    let frame = &tree.frames[instruction.inline.0 as usize];
+                    let byte_pc = frame
+                        .instructions
+                        .get(instruction.pc as usize)
+                        .map(|metadata| metadata.byte_pc)
+                        .ok_or(Unsupported::OperandShape("optimizing direct call byte PC"))?;
+                    let static_target = (instruction.inline == InlineId::ROOT)
+                        .then(|| view.static_native_calls.get(&byte_pc))
+                        .flatten();
+                    if let Some(target) = static_target {
+                        let static_site = StaticNativeCallSite {
+                            target,
+                            caller_function_id: frame.function_id,
+                            logical_pc: instruction.pc,
+                            byte_pc,
+                            argc: arg_regs.len(),
+                        };
+                        if instruction.inputs.len() >= 2
+                            && static_native_target_is_supported(view, static_site)
+                        {
+                            emit_load_boxed_value(
+                                &mut ops,
+                                reprs,
+                                allocation,
+                                instruction.inputs[0],
+                                9,
+                            )?;
+                            emit_load_boxed_value(
+                                &mut ops,
+                                reprs,
+                                allocation,
+                                instruction.inputs[1],
+                                10,
+                            )?;
+                            emit_static_native_call(
+                                &mut ops,
+                                &mut relocations,
+                                view,
+                                static_site,
+                                9,
+                                10,
+                                code_map.as_mut(),
+                                bail,
+                            )?;
+                            emit_store_tagged_location(
+                                &mut ops,
+                                allocation.location(
+                                    instruction.result.expect("eligibility checked call result"),
+                                ),
+                                9,
+                            )?;
+                            if let Some(events) = direct_call_events.as_mut() {
+                                events.insert(
+                                    byte_pc,
+                                    otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
+                                        instruction_pc: instruction.pc,
+                                        byte_pc,
+                                        target: target.kind,
+                                        outcome:
+                                            otter_vm::JitStaticNativeCallLoweringOutcome::Generated,
+                                    },
+                                );
+                            }
+                        } else {
+                            if let Some(events) = direct_call_events.as_mut() {
+                                events.insert(
+                                    byte_pc,
+                                    otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
+                                        instruction_pc: instruction.pc,
+                                        byte_pc,
+                                        target: target.kind,
+                                        outcome: otter_vm::JitStaticNativeCallLoweringOutcome::Rejected {
+                                            reason: if instruction.inputs.len() < 2 {
+                                                otter_vm::JitStaticNativeCallLoweringRejectionReason::ArityUnsupported
+                                            } else {
+                                                otter_vm::JitStaticNativeCallLoweringRejectionReason::LayoutUnsupported
+                                            },
+                                        },
+                                    },
+                                );
+                            }
+                            dynasm!(ops ; .arch aarch64 ; b =>bail);
+                        }
+                    } else {
+                        let site = eligibility
+                            .element_transitions
+                            .sites
+                            .get(&instruction.pc)
+                            .ok_or(Unsupported::OperandShape("optimizing call missing site"))?;
+                        debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                        emit_materialize_element_transition(
+                            &mut ops,
+                            reprs,
+                            allocation,
+                            instruction,
+                            site,
+                        )?;
+                        emit_load_u32(&mut ops, 9, instruction.pc);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                            ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+                        );
+                        let succeeded = ops.new_dynamic_label();
+                        let direct_target = (instruction.inline == InlineId::ROOT)
+                            .then(|| view.direct_callees.get(&byte_pc))
+                            .flatten();
+                        if let Some(target) =
+                            direct_target.filter(|target| direct_call_target_is_supported(target))
+                        {
+                            emit_direct_call(
+                                &mut ops,
+                                &mut relocations,
+                                view,
+                                DirectCallSite {
+                                    target,
+                                    caller_function_id: frame.function_id,
+                                    logical_pc: instruction.pc,
+                                    byte_pc,
+                                    dst,
+                                    form: DirectCallForm::Plain { callable: callee },
+                                    arguments: arg_regs,
+                                },
+                                deopt_stack_call_entry.address,
+                                code_map.as_mut(),
+                                bail,
+                                threw,
+                                succeeded,
+                            )?;
+                            let previous = code_dependencies
+                                .insert(target.plan.function_id, target.plan.code_object_id);
+                            debug_assert!(
+                                previous.is_none_or(|code_object_id| {
+                                    code_object_id == target.plan.code_object_id
+                                }),
+                                "one compile snapshot cannot name two generations for one callee"
+                            );
+                            if let Some(events) = direct_call_events.as_mut() {
+                                events.insert(
+                                    byte_pc,
+                                    optimizing_direct_call_event(
+                                        otter_vm::JitDirectCallKind::Plain,
+                                        instruction.pc,
+                                        byte_pc,
+                                        target,
+                                        otter_vm::JitDirectCallLoweringOutcome::Generated {
+                                            code_object_id: target.plan.code_object_id,
+                                            target_tier: optimizing_direct_call_target_tier(target),
+                                            this_mode: target.plan.this_mode,
+                                        },
+                                    ),
+                                );
+                            }
+                        } else {
+                            if let (Some(events), Some(target)) =
+                                (direct_call_events.as_mut(), direct_target)
+                            {
+                                events.insert(
+                                    byte_pc,
+                                    optimizing_direct_call_event(
+                                        otter_vm::JitDirectCallKind::Plain,
+                                        instruction.pc,
+                                        byte_pc,
+                                        target,
+                                        otter_vm::JitDirectCallLoweringOutcome::Rejected {
+                                            reason: otter_vm::JitDirectCallLoweringRejectionReason::LayoutUnsupported,
+                                        },
+                                    ),
+                                );
+                            }
+                            dynasm!(ops ; .arch aarch64 ; b =>bail);
+                        }
+                        dynasm!(ops ; .arch aarch64 ; =>succeeded);
+                        emit_reload_element_transition(
+                            &mut ops,
+                            allocation,
+                            site,
+                            Some((
+                                dst,
+                                allocation.location(
+                                    instruction.result.expect("eligibility checked call result"),
+                                ),
+                            )),
+                        )?;
+                    }
                     deopt_exits.push((
                         bail,
                         deopt_exit_at(frame_states, instruction)?,
@@ -3681,6 +3929,29 @@ fn emit(
                         ; cmp w14, w15
                         ; b.ne =>deopt
                     );
+                    if instruction.inline == InlineId::ROOT {
+                        let caller = &tree.frames[instruction.inline.0 as usize];
+                        let byte_pc = caller
+                            .instructions
+                            .get(instruction.pc as usize)
+                            .map(|metadata| metadata.byte_pc)
+                            .ok_or(Unsupported::OperandShape("optimizing inlined call byte PC"))?;
+                        if let (Some(events), Some(target)) = (
+                            direct_call_events.as_mut(),
+                            view.direct_callees.get(&byte_pc),
+                        ) {
+                            events.insert(
+                                byte_pc,
+                                optimizing_direct_call_event(
+                                    otter_vm::JitDirectCallKind::Plain,
+                                    instruction.pc,
+                                    byte_pc,
+                                    target,
+                                    otter_vm::JitDirectCallLoweringOutcome::Inlined,
+                                ),
+                            );
+                        }
+                    }
                 }
                 // A spliced return hands its value to the continuation's merge
                 // through the edge; the block's terminator emits that edge.
@@ -3913,6 +4184,8 @@ fn emit(
     Ok(OptimizedEmission {
         code: CompiledCode::new(buffer, entry),
         osr_entries,
+        dependencies: code_dependencies,
+        direct_call_events,
         code_map,
         relocations,
     })
@@ -4469,7 +4742,8 @@ fn emit_load_boxed_value(
         }
         Representation::Int32 => {
             emit_load_location(ops, allocation.location(value), scratch)?;
-            emit_box_int32(ops, scratch, 10);
+            let tag_scratch = if scratch == 10 { 11 } else { 10 };
+            emit_box_int32(ops, scratch, tag_scratch);
             Ok(())
         }
         Representation::Float64 => {
@@ -5418,10 +5692,17 @@ mod tests {
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::addr_of_mut!(native_frame),
             error: &mut error,
-            direct_call: std::mem::MaybeUninit::uninit(),
             activation_base: std::ptr::null_mut(),
             activation_top_ptr: std::ptr::null_mut(),
             activation_limit: 0,
+            global_this_offset: std::ptr::null(),
+            sync_reentry_depth: std::ptr::null_mut(),
+            sync_reentry_limit: 0,
+            native_stack_bytes: std::ptr::null_mut(),
+            native_stack_bytes_limit: 0,
+            generated_call_depth: std::ptr::null_mut(),
+            generated_calls: 0,
+            generated_call_deopts: 0,
         };
         let result = entry(&mut ctx);
         (result, frame, native_frame.header.pc)

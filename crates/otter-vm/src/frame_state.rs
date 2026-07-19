@@ -93,12 +93,12 @@ impl OwnedRegisterSnapshot {
     }
 }
 
-/// Materialized compatibility/cold-sidecar frame.
+/// Materialized interpreter-owned frame.
 ///
 /// Existing ActivationStack dispatch paths still own this compact record. New
 /// tier-neutral execution uses [`crate::ActiveFrameMut`] over the canonical
 /// [`crate::NativeFrame`] and its register window, so interpreter/baseline/
-/// optimizer switches do not require constructing this Rust-owned adapter.
+/// optimizer switches do not require constructing another Rust-owned frame.
 #[repr(C, align(8))]
 #[derive(Debug)]
 pub struct Frame {
@@ -335,8 +335,8 @@ impl Frame {
     /// with `Value::Undefined`. Used for test-side construction
     /// of trivial functions.
     ///
-    /// **Precondition (since task 76):** `function.own_upvalue_count
-    /// == 0`. Functions with own upvalues route through
+    /// **Precondition:** `function.own_upvalue_count == 0`. Functions with own
+    /// upvalues route through
     /// [`Self::for_function_with_heap`] (production path) or
     /// [`Self::build_upvalues`] + [`Self::with_return_upvalues_and_this`].
     #[must_use]

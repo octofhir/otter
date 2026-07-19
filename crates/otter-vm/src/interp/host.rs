@@ -2,13 +2,21 @@
 //!
 //! # Contents
 //! Timer scheduler and dynamic-import loader wiring, console sink,
-//! microtask queue accessors, stack-depth limit, eval hook, tracer,
-//! CPU profiler, IC/shape/heap snapshots, interrupt handle, and
-//! `global_this`/`set_global`, plus rooted host-construction scopes.
+//! microtask queue accessors, logical/native stack-depth limits,
+//! machine-visible generated-call counters, eval hook, tracer, CPU profiler,
+//! IC/shape/heap snapshots, interrupt handle, and `global_this`/`set_global`,
+//! plus rooted host-construction scopes.
 //!
 //! # Invariants
 //! - Interpreter services here are isolate-owned and never discover the active
 //!   execution stack through TLS or raw pointers.
+//! - Generated code mutates recursion, logical-depth, and native-stack
+//!   counters only while its exclusive interpreter borrow is active and
+//!   restores each on every exit.
+//! - `jit_generated_call_depth` counts only frames still native. Cold
+//!   deoptimization transfers its current frame to `ActivationStack` for the
+//!   interpreter continuation, then restores native ownership before generated
+//!   cleanup releases the frame.
 //! - Live-frame diagnostics belong to [`NativeCtx`](crate::NativeCtx), whose
 //!   [`RuntimeTurn`](crate::runtime_cx::RuntimeTurn) carries the explicit
 //!   activation-stack borrow.
@@ -17,6 +25,8 @@
 //! - [`crate::runtime_cx`] — explicit runtime-turn and native binding context.
 #![allow(unused_imports)]
 use crate::*;
+
+const JIT_NATIVE_STACK_BYTES_LIMIT: usize = 512 * 1024;
 
 impl Interpreter {
     /// Run host/runtime construction work while the complete interpreter root
@@ -172,7 +182,7 @@ impl Interpreter {
     }
 
     pub(crate) fn enter_sync_reentry(&mut self) -> Result<(), VmError> {
-        let limit = self.max_stack_depth.min(DEFAULT_MAX_SYNC_REENTRY_DEPTH);
+        let limit = self.jit_sync_reentry_limit();
         if self.sync_reentry_depth >= limit {
             return Err(VmError::StackOverflow { limit });
         }
@@ -183,6 +193,86 @@ impl Interpreter {
     pub(crate) fn leave_sync_reentry(&mut self) {
         debug_assert!(self.sync_reentry_depth > 0);
         self.sync_reentry_depth = self.sync_reentry_depth.saturating_sub(1);
+    }
+
+    /// Address of the synchronous JavaScript re-entry depth counter.
+    ///
+    /// Compiler-generated call sequences compare/increment/decrement this
+    /// address directly. The interpreter is exclusively borrowed and cannot
+    /// move for the full generated-code dynamic extent.
+    pub fn jit_sync_reentry_depth_addr(&mut self) -> *mut u32 {
+        std::ptr::addr_of_mut!(self.sync_reentry_depth)
+    }
+
+    /// Address of the active generated-call logical-depth counter.
+    ///
+    /// Generated call sequences increment this after all pre-entry guards and
+    /// decrement it on every native cleanup or entry rollback.
+    pub fn jit_generated_call_depth_addr(&mut self) -> *mut u32 {
+        std::ptr::addr_of_mut!(self.jit_generated_call_depth)
+    }
+
+    /// Address of the active realm's rooted `globalThis` compressed offset.
+    ///
+    /// `JsObject` is a transparent four-byte `Gc<ObjectBody>`. The collector
+    /// and realm-switch machinery both rewrite this exact interpreter field,
+    /// so generated sloppy-call linkage always reads the current rooted handle
+    /// immediately before publishing the callee frame.
+    pub fn jit_global_this_offset_addr(&self) -> *const u32 {
+        const _: [(); std::mem::size_of::<u32>()] = [(); std::mem::size_of::<crate::JsObject>()];
+        const _: [(); std::mem::align_of::<u32>()] = [(); std::mem::align_of::<crate::JsObject>()];
+        std::ptr::from_ref(&self.global_this).cast()
+    }
+
+    /// Current logical JavaScript frame depth across materialized interpreter
+    /// frames and generated frames that still live only on the native stack.
+    ///
+    /// A stack-call cold deopt transfers its current generated frame out of
+    /// `jit_generated_call_depth` before publishing the materialized frame, so
+    /// this sum never counts that activation twice.
+    pub(crate) fn logical_call_depth(&self, stack: &ActivationStack) -> u32 {
+        u32::try_from(stack.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(self.jit_generated_call_depth)
+    }
+
+    /// Temporarily transfer the current generated frame into interpreter
+    /// ownership while `operation` runs.
+    ///
+    /// Generated cleanup still owns the final decrement, so native ownership
+    /// is restored before this helper returns.
+    pub(crate) fn with_materialized_generated_call_depth<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> Result<T, VmError> {
+        self.jit_generated_call_depth = self
+            .jit_generated_call_depth
+            .checked_sub(1)
+            .ok_or(VmError::InvalidOperand)?;
+        let result = operation(self);
+        self.jit_generated_call_depth += 1;
+        Ok(result)
+    }
+
+    /// Maximum synchronous JavaScript re-entry depth accepted by generated
+    /// calls and [`Self::enter_sync_reentry`].
+    #[must_use]
+    pub fn jit_sync_reentry_limit(&self) -> u32 {
+        self.max_stack_depth.min(DEFAULT_MAX_SYNC_REENTRY_DEPTH)
+    }
+
+    /// Address of active compiler-generated native-stack byte usage.
+    ///
+    /// A generated call reserves its complete aligned frame before publishing
+    /// tagged slots and restores the counter after unpublishing them.
+    pub fn jit_native_stack_bytes_addr(&mut self) -> *mut usize {
+        std::ptr::addr_of_mut!(self.jit_native_stack_bytes)
+    }
+
+    /// Conservative per-isolate budget for compiler-generated call frames.
+    #[must_use]
+    pub const fn jit_native_stack_bytes_limit(&self) -> usize {
+        JIT_NATIVE_STACK_BYTES_LIMIT
     }
 
     /// Install the parse + compile callback used by `Op::Eval` and

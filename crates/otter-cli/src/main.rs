@@ -100,7 +100,7 @@ struct Cli {
     )]
     trace: Option<String>,
 
-    /// Emit structured, schema-versioned JIT events to
+    /// Emit structured JIT events to
     /// `otter-jit-events.json` (or to the explicit path). `-` writes stderr.
     #[arg(
         long = "jit-events",
@@ -112,7 +112,7 @@ struct Cli {
     )]
     jit_events: Option<String>,
 
-    /// Persist one versioned directory per successful native compile under
+    /// Persist one directory per successful native compile under
     /// `otter-jit-artifacts` (or the explicit directory). Off when omitted.
     #[arg(
         long = "jit-artifacts",
@@ -991,7 +991,6 @@ fn emit_otter_stats_if_requested(result: &otter_runtime::ExecutionResult) {
         return;
     }
     let payload = serde_json::json!({
-        "schema": "otter.stats.v1",
         "durationMs": result.duration.as_secs_f64() * 1000.0,
         "exitCode": result.exit_code(),
         "stats": result.stats(),
@@ -2016,8 +2015,6 @@ fn compiled_dump_json(
 ) -> Result<String, serde_json::Error> {
     #[derive(serde::Serialize)]
     struct Dump<'a> {
-        #[serde(rename = "otterBytecodeDumpVersion")]
-        version: u32,
         #[serde(flatten)]
         bytecode: &'a otter_bytecode::BytecodeModule,
         metadata: &'a [otter_runtime::CompiledModuleMetadata],
@@ -2025,7 +2022,6 @@ fn compiled_dump_json(
     }
 
     let dump = Dump {
-        version: otter_bytecode::dump::DUMP_SCHEMA_VERSION,
         bytecode: &compiled.bytecode,
         metadata: &compiled.metadata,
         entry_url: compiled.entry_url.as_deref(),

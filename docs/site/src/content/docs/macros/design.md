@@ -5,9 +5,8 @@ title: "Otter Macros — Design Note"
 This is the design note behind the otter-themed macro surface
 (`holt!` / `couch!` / `raft!` / `burrow!` / `lodge!` / `#[dive]` /
 `#[derive(Pelt)]` / `#[derive(Groom)]`). It captures the naming
-rationale, the migration story away from the legacy
-`#[js_namespace]` / `#[js_class]` macros, and the open questions
-that remain.
+rationale, the canonical surface replacing
+`#[js_namespace]` / `#[js_class]`, and the open questions that remain.
 
 The brief was generic `otter_intrinsic`, `otter_class`,
 `otter_module`, `dive`, plus trace/finalize derives. This note
@@ -20,13 +19,13 @@ as Otter, not as "yet-another-engine".
 
 - Single canonical macro path per JS surface role; no parallel
   hand-written + macro-generated coexistence in `main`.
-- Generated code lands on the Phase 2.5 native ABI verbatim — no
-  ABI shim, no new runtime path.
+- Generated code lands on the current native ABI verbatim — no
+  shim and no parallel runtime path.
 - Span-correct diagnostics with `trybuild` regression tests for
   every invalid input shape we want to reject.
 - `forbid(unsafe_code)` stays load-bearing in `otter-vm`; macro
   expansion must compile under that gate.
-- Each macro generates the same `BuiltinIntrinsic` adapter shape
+- Each macro generates the same `BuiltinIntrinsic` declaration shape
   the hand-written installers already produce so the bootstrap
   registry walks identical entries.
 
@@ -353,11 +352,9 @@ depends on (see `crates/otter-runtime/tests/compile_fail/`).
    errors at the wrong line. Mitigation: every emitted token gets
    an explicit `quote_spanned!` against the source ident; trybuild
    assertions pin the expected `^^^^^` underline range.
-2. **ABI drift.** Generated code embeds the v1 ABI signature; an
-   ABI v2 (if and when it ships) breaks every macro expansion at
-once. Document this in `docs/site/src/content/docs/engine/native-call-abi.md` as a hard
-   versioning rule: macros target the current ABI verbatim, no
-   shim layer.
+2. **ABI drift.** Generated code embeds the current ABI signature.
+   Change the ABI, macro output, compile-time fixtures, and every consumer in
+   one cut-over. Internal ABI versions and shim layers are forbidden.
 3. **`forbid(unsafe_code)`.** None of the planned expansions need
    unsafe — they wrap existing helpers from
    `intrinsics/shared.rs`. Guard with a `compile_fail!` test that

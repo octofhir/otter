@@ -197,6 +197,8 @@ impl Interpreter {
             simple_constructor_shape_cache: rustc_hash::FxHashMap::default(),
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
             sync_reentry_depth: 0,
+            jit_generated_call_depth: 0,
+            jit_native_stack_bytes: 0,
             allow_blocking_atomics_wait: false,
             microtasks: MicrotaskQueue::new(),
             module_environments: std::collections::HashMap::new(),
@@ -226,17 +228,15 @@ impl Interpreter {
             jit_code: rustc_hash::FxHashMap::default(),
             jit_optimized_code: rustc_hash::FxHashMap::default(),
             jit_optimized_code_cache: None,
-            jit_direct_call_cache: None,
             jit_optimized_declined_epoch: rustc_hash::FxHashMap::default(),
             jit_osr_code: rustc_hash::FxHashMap::default(),
             jit_code_cache: None,
             jit_entry_osr_only: rustc_hash::FxHashSet::default(),
-            jit_direct_method_cache: Vec::new(),
             jit_runtime_stats: JitRuntimeStats::default(),
             jit_code_registry: crate::jit_registry::JitCodeRegistry::new_boxed(),
+            jit_generated_feedback_pending: false,
             jit_next_code_object_id: 1,
             register_stack: register_stack::RegisterStack::new(),
-            native_call_owners: native_call_owners::NativeCallOwnerStack::new(),
             jit_native_activations: vec![
                 jit::JitNativeActivation::EMPTY;
                 DEFAULT_MAX_STACK_DEPTH as usize
@@ -986,6 +986,21 @@ impl Interpreter {
     #[must_use]
     pub fn jit_runtime_stats(&self) -> JitRuntimeStats {
         self.jit_runtime_stats
+    }
+
+    /// Merge counters accumulated inline by compiler-generated call sites.
+    ///
+    /// Generated code batches these monotonically increasing values in its
+    /// call context so successful hot calls need no VM transition solely for
+    /// instrumentation.
+    pub fn jit_note_generated_calls(&mut self, calls: u64, deopts: u64) {
+        self.jit_runtime_stats.generated_calls =
+            self.jit_runtime_stats.generated_calls.saturating_add(calls);
+        self.jit_runtime_stats.generated_call_deopts = self
+            .jit_runtime_stats
+            .generated_call_deopts
+            .saturating_add(deopts);
+        self.jit_generated_feedback_pending |= calls != 0 || deopts != 0;
     }
 
     /// Return the current collection method IC summary.

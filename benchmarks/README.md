@@ -18,6 +18,10 @@ is one live format: changes are intentionally breaking and land together with
 the runner, fixtures, tests, and this documentation. There is no compatibility
 reader or legacy output mode.
 
+Primary and secondary metric sample arrays match `sampling.sampleCount`.
+Run-level diagnostics instead use one raw value with the `single` statistic;
+they are never ranking inputs and need not fabricate one copy per timed sample.
+
 A record is scoreable only when the workload completes successfully, its
 semantic result is validated, and it contains a primary metric. Baseline
 eligibility is stricter: provenance must report a clean worktree and the
@@ -76,6 +80,14 @@ Run one fixture per isolate. Warmups and measured samples reuse that isolate
 and the same precompiled invocation stub, but every invocation must return the
 same exact result. The fixtures contain no timers or validation output; the
 harness owns timing, tier selection, sampling, and checksum validation.
+
+Each kernel record also emits the complete `JitRuntimeStats` delta from after
+fixture setup through the last measured sample as informational `jit-*`
+diagnostic counters. The before/after snapshots are outside timed samples,
+include warmup tiering, and retain explicit zeroes so interpreter runs prove
+that no native work occurred. Generated template and optimizing entries,
+returns, throws, and cold deopts remain separate from VM-entered optimizer
+activity.
 
 ```bash
 cargo run --release -p otter-benchmark --features engine \

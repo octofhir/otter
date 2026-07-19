@@ -48,7 +48,7 @@ use smallvec::SmallVec;
 use crate::cache_ir::CacheStub;
 use crate::jit::JitElementLoadKind;
 use crate::property_ic::{PropertyIcEntry, PropertyIcKind};
-use crate::{CallTargetFeedback, Value};
+use crate::{Value, jit::JitStaticNativeCallKind};
 
 /// At least one operand was an `int32` fast-path number.
 pub const ARITH_INT32: u8 = 1 << 0;
@@ -75,27 +75,21 @@ const ELEMENT_INT32: u8 = 2;
 const ELEMENT_GENERIC: u8 = 3;
 const ELEMENT_MASK: u8 = 0b0000_0011;
 
-const CALL_UNSEEN: u8 = 0;
-const CALL_MONO: u8 = 1;
-const CALL_POLY: u8 = 2;
-const CALL_SHIFT: u8 = 2;
-const CALL_MASK: u8 = 0b0000_1100;
 const BRANCH_TAKEN_SEEN: u8 = 1 << 4;
 const BRANCH_NOT_TAKEN_SEEN: u8 = 1 << 5;
 
-/// Material transition made while recording an ordinary bytecode call target.
+/// Material transition made while recording an ordinary call target.
 ///
-/// The existing baseline invalidation policy only reacts to
-/// [`Self::BecameMonomorphic`]. Keeping that decision distinct from the broader
-/// state-change signal lets the feedback epoch also observe mono-to-poly without
-/// changing baseline recompilation behavior.
+/// Baseline invalidation reacts only to [`Self::BecameMonomorphic`]. Keeping
+/// that decision distinct from later target-set changes lets the feedback epoch
+/// invalidate optimized assumptions without recompiling on every new target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CallTargetTransition {
-    /// The observation was already represented by the dense cell.
+    /// The observation was already represented by the typed call slot.
     Unchanged,
-    /// The previously unseen site recorded its first bytecode callee.
+    /// The previously unseen site recorded its first target.
     BecameMonomorphic,
-    /// A monomorphic site observed a different bytecode callee.
+    /// A populated site gained a target or saturated its bounded population.
     BecamePolymorphic,
 }
 
@@ -113,13 +107,22 @@ impl CallTargetTransition {
     }
 }
 
-/// Maximum distinct bytecode callees retained at one ordinary-call site.
+/// Maximum distinct targets retained at one ordinary-call site.
 pub(crate) const MAX_CALL_TARGETS: usize = 8;
 
-/// One observed bytecode callee and its saturating execution count.
+/// Stable non-GC identity observed at an ordinary `Op::Call`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrdinaryCallTarget {
+    /// Plain bytecode function body.
+    Bytecode(u32),
+    /// Original bootstrap static native supported by direct leaf codegen.
+    StaticNative(JitStaticNativeCallKind),
+}
+
+/// One observed call target and its saturating execution count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CallTargetCount {
-    pub(crate) fid: u32,
+    pub(crate) target: OrdinaryCallTarget,
     pub(crate) hits: u32,
 }
 
@@ -129,15 +132,6 @@ pub(crate) enum CallSiteDistribution {
     Mono(CallTargetCount),
     Poly(Box<SmallVec<[CallTargetCount; MAX_CALL_TARGETS]>>),
     Megamorphic,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DistributionTransition {
-    Unchanged,
-    /// The dense unseen/mono/poly state already accounts for this transition.
-    MirroredByDenseCell,
-    /// The bounded target set gained information beyond dense mono/poly state.
-    Extended,
 }
 
 /// Stable tier-facing summary of an isolate-owned property IC.
@@ -241,26 +235,52 @@ const CALL_DISTRIBUTION_EMPTY: u8 = 0;
 const CALL_DISTRIBUTION_MONO: u8 = 1;
 const CALL_DISTRIBUTION_POLY: u8 = 2;
 const CALL_DISTRIBUTION_MEGAMORPHIC: u8 = 3;
+const CALL_TARGET_BYTECODE: u8 = 0;
+const CALL_TARGET_STATIC_NATIVE: u8 = 1;
 
-const fn pack_call_target(target: CallTargetCount) -> u64 {
-    (target.fid as u64) << 32 | target.hits as u64
+const fn call_target_kind(target: OrdinaryCallTarget) -> u8 {
+    match target {
+        OrdinaryCallTarget::Bytecode(_) => CALL_TARGET_BYTECODE,
+        OrdinaryCallTarget::StaticNative(_) => CALL_TARGET_STATIC_NATIVE,
+    }
 }
 
-const fn unpack_call_target(packed: u64) -> CallTargetCount {
+const fn call_target_payload(target: OrdinaryCallTarget) -> u32 {
+    match target {
+        OrdinaryCallTarget::Bytecode(fid) => fid,
+        OrdinaryCallTarget::StaticNative(kind) => kind as u32,
+    }
+}
+
+const fn pack_call_target(target: CallTargetCount) -> u64 {
+    (call_target_payload(target.target) as u64) << 32 | target.hits as u64
+}
+
+fn unpack_call_target(packed: u64, kind: u8) -> CallTargetCount {
+    let payload = (packed >> 32) as u32;
+    let target = match kind {
+        CALL_TARGET_BYTECODE => OrdinaryCallTarget::Bytecode(payload),
+        CALL_TARGET_STATIC_NATIVE => OrdinaryCallTarget::StaticNative(
+            JitStaticNativeCallKind::from_u32(payload)
+                .expect("static-native call feedback contains a valid kind"),
+        ),
+        _ => unreachable!("invalid atomic call target kind"),
+    };
     CallTargetCount {
-        fid: (packed >> 32) as u32,
+        target,
         hits: packed as u32,
     }
 }
 
 /// Fixed-capacity ordinary-call distribution. Target records are packed as
-/// `(function id, hits)` in one atomic word and never allocate after slot
-/// construction.
+/// `(identity payload, hits)` with a parallel one-byte identity class and
+/// never allocate after slot construction.
 #[derive(Debug)]
 struct AtomicCallFeedback {
     sequence: AtomicU32,
     state: AtomicU8,
     count: AtomicU8,
+    kinds: [AtomicU8; MAX_CALL_TARGETS],
     targets: [AtomicU64; MAX_CALL_TARGETS],
 }
 
@@ -270,38 +290,50 @@ impl Default for AtomicCallFeedback {
             sequence: AtomicU32::new(0),
             state: AtomicU8::new(CALL_DISTRIBUTION_EMPTY),
             count: AtomicU8::new(0),
+            kinds: std::array::from_fn(|_| AtomicU8::new(CALL_TARGET_BYTECODE)),
             targets: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
 
 impl AtomicCallFeedback {
-    fn record(&self, callee_fid: u32) -> DistributionTransition {
+    fn record(&self, observed: OrdinaryCallTarget) -> CallTargetTransition {
         let sequence = self.sequence.fetch_add(1, Ordering::AcqRel);
         debug_assert_eq!(sequence & 1, 0, "call feedback has one writer");
 
         let state = self.state.load(Ordering::Relaxed);
         let count = usize::from(self.count.load(Ordering::Relaxed));
-        let mut transition = DistributionTransition::Unchanged;
+        let observed_kind = call_target_kind(observed);
+        let mut transition = CallTargetTransition::Unchanged;
         match state {
             CALL_DISTRIBUTION_EMPTY => {
+                self.kinds[0].store(observed_kind, Ordering::Relaxed);
                 self.targets[0].store(
                     pack_call_target(CallTargetCount {
-                        fid: callee_fid,
+                        target: observed,
                         hits: 1,
                     }),
                     Ordering::Relaxed,
                 );
                 self.count.store(1, Ordering::Relaxed);
                 self.state.store(CALL_DISTRIBUTION_MONO, Ordering::Relaxed);
-                transition = DistributionTransition::MirroredByDenseCell;
+                transition = CallTargetTransition::BecameMonomorphic;
             }
             CALL_DISTRIBUTION_MONO | CALL_DISTRIBUTION_POLY => {
-                let existing = self.targets[..count].iter().position(|target| {
-                    unpack_call_target(target.load(Ordering::Relaxed)).fid == callee_fid
+                let existing = (0..count).position(|index| {
+                    self.kinds[index].load(Ordering::Relaxed) == observed_kind
+                        && unpack_call_target(
+                            self.targets[index].load(Ordering::Relaxed),
+                            observed_kind,
+                        )
+                        .target
+                            == observed
                 });
                 if let Some(index) = existing {
-                    let target = unpack_call_target(self.targets[index].load(Ordering::Relaxed));
+                    let target = unpack_call_target(
+                        self.targets[index].load(Ordering::Relaxed),
+                        observed_kind,
+                    );
                     self.targets[index].store(
                         pack_call_target(CallTargetCount {
                             hits: target.hits.saturating_add(1),
@@ -310,24 +342,21 @@ impl AtomicCallFeedback {
                         Ordering::Relaxed,
                     );
                 } else if count < MAX_CALL_TARGETS {
+                    self.kinds[count].store(observed_kind, Ordering::Relaxed);
                     self.targets[count].store(
                         pack_call_target(CallTargetCount {
-                            fid: callee_fid,
+                            target: observed,
                             hits: 1,
                         }),
                         Ordering::Relaxed,
                     );
                     self.count.store((count + 1) as u8, Ordering::Relaxed);
                     self.state.store(CALL_DISTRIBUTION_POLY, Ordering::Relaxed);
-                    transition = if count == 1 {
-                        DistributionTransition::MirroredByDenseCell
-                    } else {
-                        DistributionTransition::Extended
-                    };
+                    transition = CallTargetTransition::BecamePolymorphic;
                 } else {
                     self.state
                         .store(CALL_DISTRIBUTION_MEGAMORPHIC, Ordering::Relaxed);
-                    transition = DistributionTransition::Extended;
+                    transition = CallTargetTransition::BecamePolymorphic;
                 }
             }
             CALL_DISTRIBUTION_MEGAMORPHIC => {}
@@ -349,8 +378,11 @@ impl AtomicCallFeedback {
             let state = self.state.load(Ordering::Relaxed);
             let count = usize::from(self.count.load(Ordering::Relaxed));
             let mut targets: SmallVec<[CallTargetCount; MAX_CALL_TARGETS]> = SmallVec::new();
-            for target in self.targets.iter().take(count.min(MAX_CALL_TARGETS)) {
-                targets.push(unpack_call_target(target.load(Ordering::Relaxed)));
+            for index in 0..count.min(MAX_CALL_TARGETS) {
+                targets.push(unpack_call_target(
+                    self.targets[index].load(Ordering::Relaxed),
+                    self.kinds[index].load(Ordering::Relaxed),
+                ));
             }
             fence(Ordering::Acquire);
             let end = self.sequence.load(Ordering::Relaxed);
@@ -377,6 +409,7 @@ impl Clone for AtomicCallFeedback {
         };
         match snapshot {
             CallSiteDistribution::Mono(target) => {
+                cloned.kinds[0].store(call_target_kind(target.target), Ordering::Relaxed);
                 cloned.targets[0].store(pack_call_target(target), Ordering::Relaxed);
                 cloned.count.store(1, Ordering::Relaxed);
                 cloned
@@ -385,6 +418,7 @@ impl Clone for AtomicCallFeedback {
             }
             CallSiteDistribution::Poly(targets) => {
                 for (index, target) in targets.iter().copied().enumerate() {
+                    cloned.kinds[index].store(call_target_kind(target.target), Ordering::Relaxed);
                     cloned.targets[index].store(pack_call_target(target), Ordering::Relaxed);
                 }
                 cloned.count.store(targets.len() as u8, Ordering::Relaxed);
@@ -477,12 +511,11 @@ pub(crate) struct CallFeedbackSlot<'a> {
 }
 
 impl CallFeedbackSlot<'_> {
-    fn record(self, callee_fid: u32) -> DistributionTransition {
-        self.feedback.record(callee_fid)
+    fn record(self, target: OrdinaryCallTarget) -> CallTargetTransition {
+        self.feedback.record(target)
     }
 
     #[must_use]
-    #[allow(dead_code)]
     pub(crate) fn distribution(self) -> Option<CallSiteDistribution> {
         self.feedback.snapshot()
     }
@@ -571,7 +604,6 @@ pub struct InstructionFeedback {
     states: AtomicU8,
     branch_taken: AtomicU8,
     branch_total: AtomicU8,
-    call_target: AtomicU32,
 }
 
 impl Clone for InstructionFeedback {
@@ -581,7 +613,6 @@ impl Clone for InstructionFeedback {
             states: AtomicU8::new(self.states.load(Ordering::Acquire)),
             branch_taken: AtomicU8::new(self.branch_taken.load(Ordering::Relaxed)),
             branch_total: AtomicU8::new(self.branch_total.load(Ordering::Relaxed)),
-            call_target: AtomicU32::new(self.call_target.load(Ordering::Relaxed)),
         }
     }
 }
@@ -708,50 +739,15 @@ impl InstructionFeedback {
             _ => JitElementLoadKind::Any,
         }
     }
-
-    /// Record one bytecode callee at an ordinary `Call` instruction.
-    pub(crate) fn record_call_target(&self, callee_fid: u32) -> CallTargetTransition {
-        match (self.states.load(Ordering::Acquire) & CALL_MASK) >> CALL_SHIFT {
-            CALL_UNSEEN => {
-                self.call_target.store(callee_fid, Ordering::Relaxed);
-                self.states
-                    .fetch_update(Ordering::Release, Ordering::Acquire, |states| {
-                        Some((states & !CALL_MASK) | (CALL_MONO << CALL_SHIFT))
-                    })
-                    .ok();
-                CallTargetTransition::BecameMonomorphic
-            }
-            CALL_MONO if self.call_target.load(Ordering::Relaxed) != callee_fid => {
-                self.states
-                    .fetch_update(Ordering::Release, Ordering::Acquire, |states| {
-                        Some((states & !CALL_MASK) | (CALL_POLY << CALL_SHIFT))
-                    })
-                    .ok();
-                CallTargetTransition::BecamePolymorphic
-            }
-            _ => CallTargetTransition::Unchanged,
-        }
-    }
-
-    /// Monomorphic/polymorphic call target observed at this instruction.
-    #[must_use]
-    pub(crate) fn call_target(&self) -> Option<CallTargetFeedback> {
-        match (self.states.load(Ordering::Acquire) & CALL_MASK) >> CALL_SHIFT {
-            CALL_UNSEEN => None,
-            CALL_MONO => Some(CallTargetFeedback::Mono(
-                self.call_target.load(Ordering::Relaxed),
-            )),
-            _ => Some(CallTargetFeedback::Poly),
-        }
-    }
 }
 
 /// Dense feedback cells and their single material-transition epoch.
 ///
-/// Keeping versioning beside the cells makes feedback one owned runtime
-/// artifact instead of a `CodeBlock` field plus a separately coordinated epoch.
-/// Property, call, and arithmetic feedback can migrate behind this boundary
-/// without teaching executable code how each slot family publishes changes.
+/// Keeping the transition epoch beside the cells makes feedback one owned
+/// runtime artifact instead of a `CodeBlock` field plus a separately
+/// coordinated counter. Property, call, and arithmetic feedback can evolve
+/// behind this boundary without teaching executable code how each slot family
+/// publishes changes.
 #[derive(Debug)]
 pub struct FeedbackVector {
     cells: Box<[InstructionFeedback]>,
@@ -846,26 +842,24 @@ impl FeedbackVector {
         Some(CallFeedbackSlot { feedback })
     }
 
-    /// Record compact and bounded ordinary-call state through one intent-level
-    /// operation. Call sites never coordinate the dense cell, payload, or epoch.
-    pub(crate) fn record_call(&self, index: usize, callee_fid: u32) -> CallTargetTransition {
-        let Some(cell) = self.cell(index) else {
+    /// Record bounded ordinary-call state through one intent-level operation.
+    /// Call sites never coordinate the payload and epoch independently.
+    pub(crate) fn record_call(
+        &self,
+        index: usize,
+        target: OrdinaryCallTarget,
+    ) -> CallTargetTransition {
+        let Some(slot) = self.call_slot(index) else {
             return CallTargetTransition::Unchanged;
         };
-        let transition = cell.record_call_target(callee_fid);
+        let transition = slot.record(target);
         if transition.state_changed() {
-            self.bump_epoch();
-        }
-        if self
-            .call_slot(index)
-            .is_some_and(|slot| slot.record(callee_fid) == DistributionTransition::Extended)
-        {
             self.bump_epoch();
         }
         transition
     }
 
-    /// Current monotonic version of material feedback transitions.
+    /// Current monotonic epoch of material feedback transitions.
     #[must_use]
     pub fn epoch(&self) -> u32 {
         self.epoch.load(Ordering::Acquire)
@@ -998,7 +992,7 @@ mod tests {
 
     #[test]
     fn dense_cell_layout_stays_compact() {
-        assert_eq!(std::mem::size_of::<InstructionFeedback>(), 8);
+        assert_eq!(std::mem::size_of::<InstructionFeedback>(), 4);
     }
 
     #[test]
@@ -1012,36 +1006,8 @@ mod tests {
     }
 
     #[test]
-    fn call_target_tracks_mono_then_poly_without_truncating_ids() {
-        let max_id = InstructionFeedback::default();
-        assert_eq!(
-            max_id.record_call_target(u32::MAX),
-            CallTargetTransition::BecameMonomorphic
-        );
-        assert_eq!(
-            max_id.call_target(),
-            Some(CallTargetFeedback::Mono(u32::MAX))
-        );
-
-        let cell = InstructionFeedback::default();
-        assert_eq!(
-            cell.record_call_target(7),
-            CallTargetTransition::BecameMonomorphic
-        );
-        assert_eq!(cell.record_call_target(7), CallTargetTransition::Unchanged);
-        assert_eq!(cell.call_target(), Some(CallTargetFeedback::Mono(7)));
-        assert_eq!(
-            cell.record_call_target(9),
-            CallTargetTransition::BecamePolymorphic
-        );
-        assert_eq!(cell.call_target(), Some(CallTargetFeedback::Poly));
-        assert_eq!(cell.record_call_target(7), CallTargetTransition::Unchanged);
-        assert_eq!(cell.call_target(), Some(CallTargetFeedback::Poly));
-    }
-
-    #[test]
     fn vector_epoch_advances_once_per_material_transition() {
-        let vector = FeedbackVector::with_instruction_count(1);
+        let vector = FeedbackVector::for_instruction_ops([Op::Call]);
         let feedback = vector.recorder(0).unwrap();
         assert_eq!(vector.epoch(), 0);
 
@@ -1069,14 +1035,17 @@ mod tests {
         assert_eq!(vector.epoch(), 6);
 
         assert_eq!(
-            vector.record_call(0, 7),
+            vector.record_call(0, OrdinaryCallTarget::Bytecode(7)),
             CallTargetTransition::BecameMonomorphic
         );
         assert_eq!(vector.epoch(), 7);
-        assert_eq!(vector.record_call(0, 7), CallTargetTransition::Unchanged);
+        assert_eq!(
+            vector.record_call(0, OrdinaryCallTarget::Bytecode(7)),
+            CallTargetTransition::Unchanged
+        );
         assert_eq!(vector.epoch(), 7);
         assert_eq!(
-            vector.record_call(0, 8),
+            vector.record_call(0, OrdinaryCallTarget::Bytecode(8)),
             CallTargetTransition::BecamePolymorphic
         );
         assert_eq!(vector.epoch(), 8);
@@ -1085,7 +1054,7 @@ mod tests {
         assert_eq!(vector.epoch(), 9);
         assert!(!feedback.widen_arith_to_float());
         assert_eq!(vector.epoch(), 9);
-        assert_eq!(std::mem::size_of::<InstructionFeedback>(), 8);
+        assert_eq!(std::mem::size_of::<InstructionFeedback>(), 4);
     }
 
     #[test]
@@ -1175,9 +1144,10 @@ mod tests {
     #[test]
     fn atomic_call_hits_saturate_and_snapshot_without_heap_mutation() {
         let feedback = AtomicCallFeedback::default();
+        feedback.kinds[0].store(CALL_TARGET_BYTECODE, Ordering::Relaxed);
         feedback.targets[0].store(
             pack_call_target(CallTargetCount {
-                fid: u32::MAX,
+                target: OrdinaryCallTarget::Bytecode(u32::MAX),
                 hits: u32::MAX,
             }),
             Ordering::Relaxed,
@@ -1187,11 +1157,14 @@ mod tests {
             .state
             .store(CALL_DISTRIBUTION_MONO, Ordering::Relaxed);
 
-        assert_eq!(feedback.record(u32::MAX), DistributionTransition::Unchanged);
+        assert_eq!(
+            feedback.record(OrdinaryCallTarget::Bytecode(u32::MAX)),
+            CallTargetTransition::Unchanged
+        );
         assert_eq!(
             feedback.snapshot(),
             Some(CallSiteDistribution::Mono(CallTargetCount {
-                fid: u32::MAX,
+                target: OrdinaryCallTarget::Bytecode(u32::MAX),
                 hits: u32::MAX,
             }))
         );

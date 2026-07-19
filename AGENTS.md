@@ -30,6 +30,25 @@ Repository rules:
 - Prefer vertical slices and small ports over large framework rewrites.
 - Keep parked compatibility shims out of the active workspace build graph.
 
+## Pre-Release Architecture Policy
+
+Otter is currently pre-user and pre-stability. Improve the architecture
+directly, even when that breaks an internal API, ABI, diagnostic schema,
+artifact format, or test fixture.
+
+- Do not version internal contracts: do not add or bump format/schema
+  versions, migrations, compatibility readers, dual writers, deprecated
+  aliases, or legacy modes for in-repository contracts. Change the one current
+  format in place and update every producer, consumer, fixture, test, and
+  document in the same patch.
+- Do not add bridges, adapter layers, generic-call detours, or replay paths to
+  connect old and new engine designs. Refactor both sides onto the intended
+  final boundary.
+- Prefer a clean breaking change when it removes debt or improves correctness,
+  introspection, code generation, or runtime performance.
+- Versioning or compatibility work requires an explicitly declared external
+  consumer contract and explicit task approval; never infer that requirement.
+
 ## Module Size And Boundary Hygiene
 
 Do not grow kilometer-long `lib.rs` files. New non-trivial runtime,
@@ -51,13 +70,14 @@ detail; do not expand it or copy the pattern into runtime/session APIs.
 
 1. **Confirm intent + constraints**: Web API compatibility? sandbox/permissions? performance target? platform?
 2. **Check ES conformance status**: Before working on feature implementation or bug fixes, consult `ES_CONFORMANCE.md` to understand the current pass rate for the affected area.
-3. **Search before adding**: prefer `rg` to find similar code and reuse existing patterns.
+3. **Search before adding**: use `fff` in this git-indexed repository; fall
+   back to `rg` only when the `fff` service is unavailable.
 4. **Keep patches surgical**: avoid refactors unless requested; keep public APIs stable.
 5. **Respect safety boundaries**: follow the `unsafe` rules and GC invariants below.
 6. **Update the "triangle" when needed**: runtime behavior ↔ TypeScript `.d.ts` ↔ docs/examples/tests.
 7. **Parse JS/TS with ASTs**: use `oxc`/SWC; never regex-parse JS/TS.
 8. **Protect the runtime boundary**: do not add dependencies from active crates into parked compatibility shims.
-9. **Prefer build-graph cleanup**: when a slice lands, check whether temporary shims, adapters, or parked code can be simplified immediately.
+9. **Prefer build-graph cleanup**: when a slice lands, remove temporary shims and parked code from the active path immediately.
 10. **Use porting markers for uncertain migrations**: for substantial ports from parked shims or reference implementations, follow `docs/site/src/content/docs/contributing/porting.md` (`TODO(port)`, `PERF(port)`, `PORT NOTE`, optional `PORT STATUS`).
 
 ## Repository Map (where to change what)
@@ -169,7 +189,7 @@ Keep code manual when:
 - Promise settlement for async native APIs must go through the target VM/runtime job queue.
 - Worker tasks may execute plain Rust async work, but VM/JS interaction must hop back onto the runtime scheduling boundary.
 - For stream/iterator-like async APIs, use explicit pending queues and deterministic delivery semantics.
-- When reviving parked async APIs, move semantics first and adapter glue second; do not preserve old abstractions just for compatibility.
+- When reviving parked async APIs, move semantics first and wire the final runtime boundary second; do not preserve old abstractions just for compatibility.
 
 ## Common Pitfalls to Avoid
 
@@ -327,7 +347,7 @@ Pure Rust implementation - no external JavaScript engine dependencies.
 - VM step trace for a script:
   - Stderr: `cargo run -p otter-cli -- --trace=- run <file>`
   - File: `cargo run -p otter-cli -- --trace=otter-trace.txt run <file>`
-  - The shipped step trace is versioned text and records
+  - The shipped step trace uses one current text format and records
     interpreter-dispatched opcodes only. A `.json` extension does not change
     its format, and native JIT bodies do not currently emit step events.
 - Structured JIT events:
@@ -337,10 +357,12 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     `cargo run -p otter-cli -- --jit-events=/tmp/otter-jit-events.json --jit-tier=production-tiered run <file>`
   - `--jit-events=-` writes the JSON report to stderr. Prefer a file when the
     program itself uses stderr or when `--json` is active.
-  - The `otterJitDebugSchemaVersion: 1` report contains typed compile,
-    inlining, bail, and inline-deopt events. Capture is default-off and bounded
-    to 16,384 events per top-level run; `truncated` and `droppedEvents` report
-    overflow without constructing further payloads.
+  - The current report contains typed compile,
+    inlining, direct-call plan/final-lowering, bail, generated-call-deopt, and
+    inline-deopt events. `compilePrepared` reports exact generated-link and
+    body-inline candidate counts separately. Capture
+    is default-off and bounded to 16,384 events per top-level run; `truncated`
+    and `droppedEvents` report overflow without constructing further payloads.
   - Abrupt VM completion (for example, a thrown exception after tier-up) still
     writes the partial report. The original execution error remains primary if
     writing that report also fails. A host command timeout can precede isolate
@@ -368,7 +390,7 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     Compare `code-normalized.bin` across processes; its relocation tokens and
     branch targets are symbolic, and it is not executable. `relocations.json`
     uses exact `code.bin` offsets but never serializes resolved addresses.
-  - `asm.txt` starts with `; otter jit aarch64 assembly v1` and
+  - `asm.txt` starts with `; otter jit aarch64 assembly` and
     `; offset-basis=code.bin`. Native locations use `+0x<8-hex>:` offsets,
     local branch targets use `L<8-hex-offset>` labels, and baked address sites
     replace the address-bearing sequence with a symbolic `relocation …` line
@@ -377,19 +399,31 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     fallback. Join assembly ranges to bytecode/tier operations through
     `code-map.json`, then inspect `deopt.json` or `safepoints.json` as
     applicable; safepoint `nativeReturnOffset` is currently explicitly `null`.
-  - Template method inlines expose `inlineMethodGuard`,
-    `inlineScratchSetup`, per-op `inlineInstruction`, aggregate body, hit
-    epilogue, miss teardown, and common miss replay regions. `inlineSite`
-    identifies the caller PC while top-level `functionId` identifies the
-    callee. Inspect `inlineScratchLayout` for compact register/receiver slots
-    and ordered argument/receiver/`undefined` entry values. A zero-width
+  - Template plain-call and method inlines expose `inlineCall*` /
+    `inlineMethod*` guard, body, hit-epilogue, and deopt-teardown regions plus
+    shared `inlineScratchSetup` and per-op `inlineInstruction` regions.
+    `inlineSite` identifies the caller PC while top-level `functionId`
+    identifies the callee. Inspect `inlineScratchLayout` for compact
+    register/receiver slots and ordered argument/receiver/`undefined` entry
+    values. A zero-width
     `inlineInstruction` is an intentionally coalesced operation, not missing
-    capture. Code-map schema v1 readers must ignore unknown additive fields and
-    region kinds while still validating offsets.
+    capture.
+  - Compiler-generated plain and method calls expose `directCallGuard`,
+    `directCallFrameSetup`, `directCallNativeEntry`, `directCallReturn`,
+    `directCallCleanup`, and `directCallEntryReject`; methods additionally
+    expose `directMethodGuard`. `functionId` is the caller. Typed `directCall`
+    metadata names call kind, target function, exact `targetCodeObjectId`,
+    tier, `thisMode`, callee-native-frame bytes, caller linkage bytes, total
+    reserved stack bytes, and register count. `methodGuard` names the receiver
+    register, receiver/prototype shapes, method function, and slot byte.
+    Portable normalized code excludes only generation-local
+    `targetCodeObjectId`; call kind, target tier, `thisMode`, and layout
+    semantics remain portable. Pre-entry misses deopt at the original opcode;
+    started callees are never replayed.
   - Assembly decoding and formatting run only when `--jit-artifacts` is
     requested. The disabled path does not clone code, disassemble it, or build
     artifact text.
-  - Full workflow and schema notes:
+  - Full workflow and output-shape notes:
     `docs/site/src/content/docs/engine/jit-debugging.md`.
 - CPU profile + folded flamegraph stacks:
   - `cargo run -p otter-cli -- run <file> --cpu-prof --cpu-prof-dir /tmp/otter-prof`
@@ -482,15 +516,18 @@ Practical rules when adding/altering APIs:
 - Test262 conformance: `cargo test -p otter-test262`
 - Focused engine harness:
   `cargo run --release -p otter-benchmark --features engine --bin otter-engine-benchmark -- <subcommand>`
-  - Current subcommands are `call`, `idle-memory`, `jit-compile`, `memory`,
-    and `module`.
-  - `call` and `module` require `--jit-tier=interpreter`,
+  - Current subcommands are `call`, `idle-memory`, `jit-compile`, `kernel`,
+    `memory`, and `module`.
+  - `call`, `kernel`, and `module` require `--jit-tier=interpreter`,
     `--jit-tier=template`, or `--jit-tier=production-tiered`. `jit-compile`
     requires `--compile-tier=template` or `--compile-tier=optimizing` plus
     explicit numeric `--argument` values. `memory` is intrinsically
     interpreter/full-GC; `idle-memory` aggregates fresh release
     process/runtime samples across a controlled post-full-GC idle window. Do
     not infer a benchmark tier from legacy JIT environment variables.
+  - `kernel` snapshots every `JitRuntimeStats` counter outside timed samples
+    and emits its warmup-plus-measurement delta as an informational `jit-*`
+    metric, including zeroes.
   - `module --runtime-reuse=fresh-per-sample` uses a new runtime for every
     warmup and measured execution, discarding warmup runtimes;
     `reused-across-samples` reuses one validated runtime. Runtime reuse is not

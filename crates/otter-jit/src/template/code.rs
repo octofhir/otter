@@ -17,20 +17,13 @@
 //!   status contract.
 
 use crate::CompiledCode;
-#[cfg(target_arch = "aarch64")]
-use crate::arm64::CallTrampoline;
 use crate::entry::enter_compiled;
-use otter_vm::native_abi::CodeObjectMetadata;
+use otter_vm::native_abi::{CodeDependency, CodeObjectMetadata};
 use otter_vm::{JitExecOutcome, JitFunctionCode, SafepointRecord, VmRuntimeActivation};
 
 /// Finalized template machine code for one function.
 pub struct TemplateCode {
     code: CompiledCode,
-    /// Shared executable call lifecycle whose entry address is baked into this
-    /// mapping. Installed code can outlive the compiler hook, so ownership is
-    /// retained here as well as by [`crate::OtterJitCompiler`].
-    #[cfg(target_arch = "aarch64")]
-    _call_trampoline: std::sync::Arc<CallTrampoline>,
     /// Frozen VM-owned metadata validated before every entry selection.
     metadata: CodeObjectMetadata,
     /// Installed code-object identity published in native frames.
@@ -39,6 +32,8 @@ pub struct TemplateCode {
     function_id: u32,
     /// Tagged register-window width published in the native frame.
     register_count: u16,
+    /// Exact installed callee generations entered by emitted direct edges.
+    dependencies: Box<[CodeDependency]>,
     /// Stable decoded register buffer shared by variadic operation sites.
     /// Emitted code passes pointers into this boxed slice to runtime
     /// transitions, so the allocation must live exactly as long as the code.
@@ -68,10 +63,10 @@ impl TemplateCode {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn from_emission(
         code: CompiledCode,
-        #[cfg(target_arch = "aarch64")] call_trampoline: std::sync::Arc<CallTrampoline>,
         code_object_id: u64,
         function_id: u32,
         register_count: u16,
+        dependencies: Box<[CodeDependency]>,
         register_operands: Box<[u16]>,
         index_operands: Box<[u32]>,
         load_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
@@ -88,16 +83,15 @@ impl TemplateCode {
             safepoint_count: safepoint_records.len() as u32,
             frame_map_count: safepoint_records.len() as u32,
             spill_map_count: 0,
-            dependency_count: 0,
+            dependency_count: dependencies.len() as u32,
         };
         Self {
             code,
-            #[cfg(target_arch = "aarch64")]
-            _call_trampoline: call_trampoline,
             metadata,
             code_object_id,
             function_id,
             register_count,
+            dependencies,
             register_operands,
             index_operands,
             load_ic_cells,
@@ -143,14 +137,29 @@ impl JitFunctionCode for TemplateCode {
         self.code.len()
     }
 
+    fn generated_stack_frame_bytes(&self) -> Option<u32> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            Some(super::arm64::NATIVE_FRAME_BYTES)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            None
+        }
+    }
+
+    fn dependencies(&self) -> &[CodeDependency] {
+        &self.dependencies
+    }
+
     fn osr_only(&self) -> bool {
         self.osr_only
     }
 
     fn entry_addr(&self) -> Option<usize> {
         // SAFETY: the mapping is live for `self`; callers must keep the owning
-        // code object installed while using this address (the direct-call
-        // prepare path anchors it through the code registry).
+        // code object installed while using this address. Generated call edges
+        // acquire an exact entry-cell lease before branching here.
         Some(unsafe { self.code.entry_ptr() as usize })
     }
 

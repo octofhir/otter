@@ -1508,8 +1508,8 @@ impl Interpreter {
             // Proxy and any other receiver not special-cased above resolve
             // through the generic, proxy-aware value-level `[[Get]]` funnel.
             // The interpreter opcode reaches this via `drive_load_property`'s
-            // proxy pre-handling; the JIT bridge calls here directly, so this
-            // fallback must cover proxies too.
+            // proxy pre-handling; compiled runtime operations call here
+            // directly, so this fallback must cover proxies too.
             let key = VmPropertyKey::String(name);
             match self.ordinary_get_value(stack, context, receiver, receiver, &key, 0)? {
                 VmGetOutcome::Value(v) => v,
@@ -3110,12 +3110,10 @@ impl Interpreter {
             .whisker_load_cell_fill(site, obj, &self.gc_heap, atomized_key)
     }
 
-    /// JIT bridge for a computed `LoadElement` (`recv[idx]`) from compiled code.
-    /// Delegates to the full interpreter element read
-    /// ([`Self::run_load_element_regs`]), which covers dense / sparse array
-    /// elements, typed arrays, string indices, and the ordinary `[[Get]]`
-    /// fallback for object receivers. The frame PC is saved and restored so a
-    /// later guard bail still re-runs the compiled frame from PC 0.
+    /// Complete one computed `LoadElement` (`recv[idx]`) from a compiled
+    /// activation. The value-level operation covers dense/sparse arrays, typed
+    /// arrays, string indices, and the ordinary `[[Get]]` fallback without
+    /// mutating the caller's PC.
     ///
     /// # Errors
     /// Propagates a throwing getter, a `null`/`undefined` receiver `TypeError`,
@@ -3136,11 +3134,9 @@ impl Interpreter {
         frame.write(dst, value)
     }
 
-    /// JIT bridge for `LoadGlobalOrThrow` from compiled code, delegating to the
-    /// full interpreter global read ([`Self::run_load_global_or_throw_reg`]):
-    /// resolves a free identifier through the global object, throwing a
-    /// `ReferenceError` when unbound. Frame PC is saved/restored so a later
-    /// guard bail re-runs the compiled frame from PC 0.
+    /// Complete `LoadGlobalOrThrow` from a compiled activation. Resolves a free
+    /// identifier through the global object and throws `ReferenceError` when
+    /// unbound without mutating the caller's PC.
     ///
     /// # Errors
     /// Propagates the `ReferenceError` for an unbound identifier (and any
@@ -3160,8 +3156,8 @@ impl Interpreter {
     }
 
     /// `Op::DefineDataProperty obj, key, value` — construction-time data-property
-    /// definition for object literals. Shared by the dispatch loop and the JIT
-    /// delegate bridge; does **not** advance the PC (the caller does).
+    /// definition for object literals. Shared by the dispatch loop and compiled
+    /// runtime operation; does **not** advance the PC (the caller does).
     ///
     /// # Errors
     /// Propagates a `TypeError` when the target rejects the definition, plus any
@@ -3288,7 +3284,7 @@ impl Interpreter {
         frame.write(dst, value)
     }
 
-    /// Representation-neutral JIT bridge for computed stores.
+    /// Representation-neutral compiled operation for computed stores.
     ///
     /// The published activation is only an operand source. Once the operands
     /// are rooted, the value-level `[[Set]]` funnel owns every receiver shape:

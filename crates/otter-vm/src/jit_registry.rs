@@ -37,7 +37,9 @@
 //! - [`crate::native_abi::CodeRegistryView`] — the published lookup surface.
 //! - `JIT_REFACTOR_PLAN.md` Phase 4 for the lifetime states this backs.
 
-use crate::jit::{JitDirectCallPlan, JitFunctionCode};
+use crate::jit::{
+    JitCodeGenerationSnapshot, JitDirectCallPlan, JitDirectCallThisMode, JitFunctionCode,
+};
 use crate::native_abi::{
     CODE_ENTRY_HAS_SAFEPOINTS, CODE_ENTRY_OPTIMIZING_TIER, CodeDependency, CodeDependencyKind,
     CodeEntryCell, CodeLifetimeState, CodeRegistryView, NativeFrameKind, SafepointId,
@@ -52,6 +54,26 @@ struct RegisteredCode {
     state: CodeLifetimeState,
 }
 
+/// New generated-call observations since the previous cold reconciliation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GeneratedCallFeedback {
+    pub(crate) function_id: u32,
+    pub(crate) code_object_id: u64,
+    pub(crate) tier: NativeFrameKind,
+    pub(crate) entries: u64,
+    pub(crate) returns: u64,
+    pub(crate) deopts: u64,
+    pub(crate) throws: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct GeneratedFeedbackSeen {
+    entries: u64,
+    returns: u64,
+    deopts: u64,
+    throws: u64,
+}
+
 /// Isolate-owned installed-code registry behind a stable published view.
 pub struct JitCodeRegistry {
     /// Published C-layout lookup surface; `context` names this registry.
@@ -62,14 +84,10 @@ pub struct JitCodeRegistry {
     /// invalidation and intentionally survive executable retirement so a baked
     /// pointer can never observe freed or repurposed metadata.
     entry_cells: rustc_hash::FxHashMap<u64, Box<CodeEntryCell>>,
+    /// Last cumulative generated-call counters merged into VM tier policy.
+    generated_feedback_seen: rustc_hash::FxHashMap<u64, GeneratedFeedbackSeen>,
     /// Latest isolate-local epoch by dependency family and stable identity.
     epochs: rustc_hash::FxHashMap<(CodeDependencyKind, u32), u64>,
-    /// Monotonic counter bumped whenever any installed code can become
-    /// invalid (function invalidation or dependency-epoch publication).
-    /// Cached per-call-site entry plans snapshot it; an equal snapshot proves
-    /// the cached plan's compatibility check is still current without
-    /// re-walking the registry.
-    invalidation_epoch: u64,
 }
 
 impl JitCodeRegistry {
@@ -83,8 +101,8 @@ impl JitCodeRegistry {
             },
             codes: rustc_hash::FxHashMap::default(),
             entry_cells: rustc_hash::FxHashMap::default(),
+            generated_feedback_seen: rustc_hash::FxHashMap::default(),
             epochs: rustc_hash::FxHashMap::default(),
-            invalidation_epoch: 0,
         });
         registry.view.context = std::ptr::addr_of!(*registry) as u64;
         registry
@@ -231,7 +249,15 @@ impl JitCodeRegistry {
     ) -> Option<JitDirectCallPlan> {
         Some(JitDirectCallPlan {
             function_id: function.id,
+            code_object_id: code.metadata().id,
             entry_cell: self.entry_cell_addr_for_entry(code)?,
+            tier: code.native_frame_kind(),
+            this_mode: if function.is_strict || function.is_arrow {
+                JitDirectCallThisMode::StrictOrLexical
+            } else {
+                JitDirectCallThisMode::SloppyGlobal
+            },
+            generated_stack_frame_bytes: code.generated_stack_frame_bytes(),
             param_count: function.param_count,
             register_count: function.register_count,
         })
@@ -256,18 +282,17 @@ impl JitCodeRegistry {
     /// Unlink every installed body compiled from `function_id`: the code takes
     /// no new entries, while active entry-cell leases keep its mapping alive
     /// until their compiled frames return.
-    pub(crate) fn invalidate_function(&mut self, function_id: u32) {
-        self.invalidation_epoch += 1;
-        for (code_object_id, registered) in &mut self.codes {
-            if registered.state == CodeLifetimeState::Installed
-                && registered.code.metadata().code_block_id == function_id
-            {
-                registered.state = CodeLifetimeState::Invalid;
-                if let Some(cell) = self.entry_cells.get(code_object_id) {
-                    cell.unlink();
-                }
-            }
-        }
+    pub(crate) fn invalidate_function(&mut self, function_id: u32) -> Vec<u32> {
+        let seeds = self
+            .codes
+            .iter()
+            .filter_map(|(&code_object_id, registered)| {
+                (registered.state == CodeLifetimeState::Installed
+                    && registered.code.metadata().code_block_id == function_id)
+                    .then_some(code_object_id)
+            })
+            .collect::<Vec<_>>();
+        self.invalidate_code_objects(seeds)
     }
 
     /// Publish `current_epoch` and invalidate Installed code whose matching
@@ -283,31 +308,38 @@ impl JitCodeRegistry {
         kind: CodeDependencyKind,
         identity: u32,
         current_epoch: u64,
-    ) {
+    ) -> Vec<u32> {
+        debug_assert_ne!(
+            kind,
+            CodeDependencyKind::CodeGeneration,
+            "code generations invalidate through lifecycle worklists"
+        );
+        if kind == CodeDependencyKind::CodeGeneration {
+            return Vec::new();
+        }
         let published = self.epochs.entry((kind, identity)).or_insert(0);
         debug_assert!(
             current_epoch >= *published,
             "dependency epochs must not move backwards"
         );
         if current_epoch <= *published {
-            return;
+            return Vec::new();
         }
         *published = current_epoch;
-        self.invalidation_epoch += 1;
-        for (code_object_id, registered) in &mut self.codes {
-            if registered.state == CodeLifetimeState::Installed
-                && registered.dependencies.iter().any(|dependency| {
-                    dependency.kind == kind
-                        && dependency.identity == identity
-                        && dependency.expected < current_epoch
-                })
-            {
-                registered.state = CodeLifetimeState::Invalid;
-                if let Some(cell) = self.entry_cells.get(code_object_id) {
-                    cell.unlink();
-                }
-            }
-        }
+        let seeds = self
+            .codes
+            .iter()
+            .filter_map(|(&code_object_id, registered)| {
+                (registered.state == CodeLifetimeState::Installed
+                    && registered.dependencies.iter().any(|dependency| {
+                        dependency.kind == kind
+                            && dependency.identity == identity
+                            && dependency.expected < current_epoch
+                    }))
+                .then_some(code_object_id)
+            })
+            .collect::<Vec<_>>();
+        self.invalidate_code_objects(seeds)
     }
 
     /// Retire invalid code whose last `Arc` owner is the registry and whose
@@ -335,10 +367,117 @@ impl JitCodeRegistry {
             .map(|cell| std::ptr::from_ref(cell.as_ref()) as u64)
     }
 
-    /// Current invalidation-epoch snapshot for cached per-site entry plans.
+    /// Snapshot every permanent entry-cell generation in deterministic
+    /// code-object order.
+    ///
+    /// Registered executable metadata contributes lifecycle and dependencies.
+    /// Once retired, the retained cell remains observable as a dependency-free
+    /// tombstone with its final counters.
     #[must_use]
-    pub(crate) fn invalidation_epoch(&self) -> u64 {
-        self.invalidation_epoch
+    pub(crate) fn generation_snapshot(&self) -> Vec<JitCodeGenerationSnapshot> {
+        let mut generations = Vec::with_capacity(self.entry_cells.len());
+        for (&code_object_id, cell) in &self.entry_cells {
+            debug_assert_eq!(cell.code_object_id, code_object_id);
+            let registered = self.codes.get(&code_object_id);
+            let (entries, returns, deopts, throws, streak) = cell.generated_feedback();
+            generations.push(JitCodeGenerationSnapshot {
+                code_object_id,
+                function_id: cell.function_id,
+                tier: if cell.flags & CODE_ENTRY_OPTIMIZING_TIER == 0 {
+                    NativeFrameKind::Baseline
+                } else {
+                    NativeFrameKind::Optimizing
+                },
+                lifecycle: registered
+                    .map_or(CodeLifetimeState::Retired, |registered| registered.state),
+                linked: cell.entry_addr.load(std::sync::atomic::Ordering::Acquire) != 0,
+                active_count: cell.active_count(),
+                param_count: cell.param_count,
+                register_count: cell.register_count,
+                generated_entries: u64::from(entries),
+                generated_returns: u64::from(returns),
+                generated_deopts: u64::from(deopts),
+                generated_throws: u64::from(throws),
+                generated_bail_streak: streak,
+                dependencies: registered.map(|registered| {
+                    let mut dependencies = registered.dependencies.to_vec();
+                    dependencies.sort_unstable_by_key(|dependency| {
+                        (
+                            dependency.kind as u16,
+                            dependency.identity,
+                            dependency.expected,
+                        )
+                    });
+                    dependencies
+                }),
+            });
+        }
+        generations.sort_unstable_by_key(|generation| generation.code_object_id);
+        generations
+    }
+
+    /// Drain exact-generation generated-call deltas for cold tier-policy and
+    /// budget reconciliation. Entry cells are retained tombstones, so feedback
+    /// remains available after invalidation and executable retirement.
+    pub(crate) fn take_generated_feedback(&mut self) -> Vec<GeneratedCallFeedback> {
+        let mut feedback = Vec::new();
+        for (&code_object_id, cell) in &self.entry_cells {
+            let (entries, returns, deopts, throws, _) = cell.generated_feedback();
+            let entries = u64::from(entries);
+            let returns = u64::from(returns);
+            let deopts = u64::from(deopts);
+            let throws = u64::from(throws);
+            let seen = self
+                .generated_feedback_seen
+                .entry(code_object_id)
+                .or_default();
+            let delta = GeneratedCallFeedback {
+                function_id: cell.function_id,
+                code_object_id,
+                tier: if cell.flags & CODE_ENTRY_OPTIMIZING_TIER == 0 {
+                    NativeFrameKind::Baseline
+                } else {
+                    NativeFrameKind::Optimizing
+                },
+                entries: entries.saturating_sub(seen.entries),
+                returns: returns.saturating_sub(seen.returns),
+                deopts: deopts.saturating_sub(seen.deopts),
+                throws: throws.saturating_sub(seen.throws),
+            };
+            *seen = GeneratedFeedbackSeen {
+                entries,
+                returns,
+                deopts,
+                throws,
+            };
+            if delta.entries != 0 || delta.returns != 0 || delta.deopts != 0 || delta.throws != 0 {
+                feedback.push(delta);
+            }
+        }
+        feedback.sort_unstable_by_key(|entry| entry.code_object_id);
+        feedback
+    }
+
+    /// Current consecutive generated bailout streak for one exact generation.
+    pub(crate) fn generated_bail_streak(
+        &self,
+        code_object_id: u64,
+    ) -> Option<(u32, NativeFrameKind, u32)> {
+        let cell = self.entry_cells.get(&code_object_id)?;
+        let (_, _, _, _, streak) = cell.generated_feedback();
+        let tier = if cell.flags & CODE_ENTRY_OPTIMIZING_TIER == 0 {
+            NativeFrameKind::Baseline
+        } else {
+            NativeFrameKind::Optimizing
+        };
+        Some((cell.function_id, tier, streak))
+    }
+
+    /// Function identity retained for one exact generated-code generation.
+    pub(crate) fn generation_function_id(&self, code_object_id: u64) -> Option<u32> {
+        self.entry_cells
+            .get(&code_object_id)
+            .map(|cell| cell.function_id)
     }
 
     /// Address of the published view for [`crate::native_abi::VmThread`].
@@ -349,6 +488,21 @@ impl JitCodeRegistry {
 
     fn dependencies_are_current(&self, dependencies: &[CodeDependency]) -> bool {
         dependencies.iter().all(|dependency| {
+            if dependency.kind == CodeDependencyKind::CodeGeneration {
+                return self
+                    .codes
+                    .get(&dependency.expected)
+                    .is_some_and(|registered| {
+                        registered.state == CodeLifetimeState::Installed
+                            && registered.code.metadata().code_block_id == dependency.identity
+                            && self
+                                .entry_cells
+                                .get(&dependency.expected)
+                                .is_some_and(|cell| {
+                                    cell.entry_addr.load(std::sync::atomic::Ordering::Acquire) != 0
+                                })
+                    });
+            }
             dependency.expected
                 == self
                     .epochs
@@ -356,6 +510,48 @@ impl JitCodeRegistry {
                     .copied()
                     .unwrap_or(0)
         })
+    }
+
+    /// Invalidate exact generations and every installed caller that embeds a
+    /// direct edge to them. The local reverse graph and iterative worklist make
+    /// cycles finite and keep invalidation off native execution paths.
+    fn invalidate_code_objects(&mut self, seeds: impl IntoIterator<Item = u64>) -> Vec<u32> {
+        let mut reverse = rustc_hash::FxHashMap::<u64, Vec<u64>>::default();
+        for (&caller_code_object_id, registered) in &self.codes {
+            if registered.state != CodeLifetimeState::Installed {
+                continue;
+            }
+            for dependency in &registered.dependencies {
+                if dependency.kind == CodeDependencyKind::CodeGeneration {
+                    reverse
+                        .entry(dependency.expected)
+                        .or_default()
+                        .push(caller_code_object_id);
+                }
+            }
+        }
+
+        let mut queue = std::collections::VecDeque::from_iter(seeds);
+        let mut visited = rustc_hash::FxHashSet::default();
+        let mut affected = std::collections::BTreeSet::new();
+        while let Some(code_object_id) = queue.pop_front() {
+            if !visited.insert(code_object_id) {
+                continue;
+            }
+            if let Some(registered) = self.codes.get_mut(&code_object_id)
+                && registered.state == CodeLifetimeState::Installed
+            {
+                registered.state = CodeLifetimeState::Invalid;
+                affected.insert(registered.code.metadata().code_block_id);
+                if let Some(cell) = self.entry_cells.get(&code_object_id) {
+                    cell.unlink();
+                }
+            }
+            if let Some(dependents) = reverse.get(&code_object_id) {
+                queue.extend(dependents.iter().copied());
+            }
+        }
+        affected.into_iter().collect()
     }
 
     fn resolve(&self, code_object_id: u64, safepoint_id: SafepointId) -> *const SafepointRecord {

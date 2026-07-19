@@ -14,6 +14,8 @@
 //! - Parsing and bytecode lowering are outside call and kernel execution samples.
 //! - Kernel fixture setup runs once before warmup; samples run a precompiled call stub.
 //! - One interpreter owns all warmup and measured kernel executions.
+//! - Kernel JIT counter snapshots bracket warmup plus measurement and never
+//!   execute inside a timed sample.
 //! - Feedback seeding, JIT snapshot construction, and compiler-hook
 //!   construction are outside native-emitter samples.
 //! - Every idle-memory sample owns a fresh release process and runtime.
@@ -49,7 +51,7 @@ use otter_syntax::SourceKind;
 use otter_vm::{
     ExecutionContext, Interpreter, JitArtifactFileName, JitArtifactIdentity, JitCompileError,
     JitCompileRequest, JitCompileStatus, JitCompilerHook, JitDebugRequest, JitExecOutcome,
-    JitFunctionCode, JitRuntimeStubBinding, VmRuntimeActivation,
+    JitFunctionCode, JitRuntimeStats, JitRuntimeStubBinding, VmRuntimeActivation,
 };
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -285,6 +287,7 @@ struct Measurements {
     off_heap_reserved_bytes: Vec<u64>,
     full_gc_cycles: Vec<u64>,
     release_binary_bytes: Vec<u64>,
+    jit_counters: Vec<(&'static str, u64)>,
 }
 
 #[derive(Debug)]
@@ -412,6 +415,63 @@ fn metric_role(name: &str, primary_metric: &str) -> MetricRole {
     } else {
         MetricRole::Secondary
     }
+}
+
+fn jit_counter_deltas(before: JitRuntimeStats, after: JitRuntimeStats) -> Vec<(&'static str, u64)> {
+    macro_rules! counters {
+        ($(($name:literal, $field:ident)),+ $(,)?) => {
+            vec![
+                $((
+                    $name,
+                    after.$field.saturating_sub(before.$field),
+                )),+
+            ]
+        };
+    }
+
+    counters![
+        ("jit-optimized-entries", optimized_entries),
+        ("jit-optimized-osr-entries", optimized_osr_entries),
+        ("jit-optimized-deopts", optimized_deopts),
+        ("jit-runtime-calls", runtime_calls),
+        ("jit-runtime-constructs", runtime_constructs),
+        ("jit-generated-calls", generated_calls),
+        ("jit-generated-call-deopts", generated_call_deopts),
+        ("jit-generated-template-entries", generated_template_entries),
+        ("jit-generated-template-returns", generated_template_returns),
+        ("jit-generated-template-deopts", generated_template_deopts),
+        ("jit-generated-template-throws", generated_template_throws),
+        (
+            "jit-generated-optimizing-entries",
+            generated_optimizing_entries
+        ),
+        (
+            "jit-generated-optimizing-returns",
+            generated_optimizing_returns
+        ),
+        (
+            "jit-generated-optimizing-deopts",
+            generated_optimizing_deopts
+        ),
+        (
+            "jit-generated-optimizing-throws",
+            generated_optimizing_throws
+        ),
+        ("jit-compile-attempts", compile_attempts),
+        ("jit-osr-attempts", osr_attempts),
+        ("jit-runtime-property-stubs", runtime_property_stubs),
+        ("jit-runtime-stub-transitions", runtime_stub_transitions),
+        ("jit-leaf-stub-transitions", leaf_stub_transitions),
+        ("jit-alloc-stub-transitions", alloc_stub_transitions),
+        ("jit-reentrant-stub-transitions", reentrant_stub_transitions),
+        ("jit-alloc-value-stub-ok", alloc_value_stub_ok),
+        ("jit-alloc-value-stub-miss", alloc_value_stub_miss),
+        (
+            "jit-alloc-value-stub-out-of-memory",
+            alloc_value_stub_out_of_memory
+        ),
+        ("jit-alloc-value-stub-other", alloc_value_stub_other),
+    ]
 }
 
 fn benchmark_result(record: RunRecord) -> BenchmarkResult {
@@ -554,6 +614,19 @@ fn benchmark_result(record: RunRecord) -> BenchmarkResult {
         MetricDirection::LowerIsBetter,
         &record.measurements.release_binary_bytes,
     );
+    for &(name, value) in &record.measurements.jit_counters {
+        metrics.push(
+            Metric::from_u64_samples(
+                name,
+                MetricUnit::Count,
+                MetricDirection::Informational,
+                MetricRole::Diagnostic,
+                vec![value],
+                Statistic::Single,
+            )
+            .expect("one JIT counter always admits a single-value aggregate"),
+        );
+    }
 
     let status = if record.failure.is_some() {
         OutcomeStatus::Failed
@@ -967,6 +1040,7 @@ fn run_kernel(
             format!("fixture setup failed: {error}"),
         );
     }
+    let jit_before = interpreter.jit_runtime_stats();
     for index in 0..warmup {
         let value = match run_kernel_invocation(&mut interpreter, &context, invocation_id) {
             Ok(value) => value,
@@ -1026,6 +1100,7 @@ fn run_kernel(
         measurements.wall_time_ns.push(elapsed);
         measurements.execution_time_ns.push(elapsed);
     }
+    measurements.jit_counters = jit_counter_deltas(jit_before, interpreter.jit_runtime_stats());
 
     RunRecord {
         name,
@@ -1089,7 +1164,7 @@ fn compile_once(
     }
     .map_err(|error| error.to_string())?;
     match status {
-        JitCompileStatus::Compiled { code, artifact } => Ok((code, artifact)),
+        JitCompileStatus::Compiled { code, artifact, .. } => Ok((code, artifact)),
         JitCompileStatus::Unavailable => Err(format!("{} compiler unavailable", tier.cli())),
         JitCompileStatus::Unsupported { reason } => {
             Err(format!("{} compiler declined: {reason}", tier.cli()))
@@ -1279,6 +1354,7 @@ impl ExactArtifactCompiler {
         Ok(JitCompileStatus::Compiled {
             code: Arc::clone(&self.code),
             artifact: None,
+            diagnostics: Box::default(),
         })
     }
 }

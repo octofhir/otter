@@ -36,7 +36,7 @@ pub(crate) fn instruction_byte_pc(unit: &OptimizedUnit, instruction: &SsaInstr) 
 
 /// Render the already-owned optimizing analysis product.
 pub(crate) fn render_optimized_unit(unit: &OptimizedUnit) -> String {
-    let mut out = String::from("; otter optimized unit v1\n");
+    let mut out = String::from("; otter optimized unit\n");
     writeln!(
         out,
         "; frames={} blocks={} values={} linear-scan-spills={} final-spills={}",

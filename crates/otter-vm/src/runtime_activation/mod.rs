@@ -3,7 +3,7 @@
 //! # Contents
 //! - [`RuntimeCall`] is the short-lived JIT-to-VM semantic boundary.
 //! - A private frame identity distinguishes an interpreter-owned root from a
-//!   frameless native-call owner without exposing either container.
+//!   generated stack-owned activation.
 //! - Focused `control` and `value_ops` implementations expose typed
 //!   operations instead of raw interpreter, stack, context, or frame handles.
 //!
@@ -17,9 +17,10 @@
 //! - A semantic operation may open the VM/context reference required by the
 //!   existing exclusive-mutator contract. Native-frame and stack slot views
 //!   remain operation-scoped and are not retained across that call.
-//! - A native frame's activation word is decoded once. The few genuinely
-//!   materialized-only cold operations reject a native owner before mutating
-//!   state; total value-level operations never side-exit for representation.
+//! - A native frame's ownership flags are decoded once. The few genuinely
+//!   materialized-only cold operations reject non-materialized frames before
+//!   mutating state; total value-level operations never side-exit for
+//!   representation.
 //! - Register/upvalue windows stay published across allocating operations;
 //!   slot access remains checked and scoped through [`ActiveFrameMut`].
 //! - The boundary allocates no wrapper, lock, side table, or thread-local state.
@@ -44,8 +45,8 @@ use crate::{
 pub(crate) enum RuntimeFrameIdentity {
     /// Compiled view of an existing interpreter activation.
     Materialized(u32),
-    /// VM-owned resources of a frameless compiled callee.
-    NativeOwner(u32),
+    /// Generated-code stack window rooted by the published native frame.
+    StackOwned,
 }
 
 /// Exclusive, short-lived semantic view of one compiled activation.
@@ -118,8 +119,14 @@ impl<'a> RuntimeCall<'a> {
                 return Err(VmError::InvalidOperand);
             }
             RuntimeFrameIdentity::Materialized(frame_snapshot.activation_id)
+        } else if frame_snapshot
+            .header
+            .flags
+            .contains(NativeFrameFlags::STACK_REGISTERS)
+        {
+            RuntimeFrameIdentity::StackOwned
         } else {
-            RuntimeFrameIdentity::NativeOwner(frame_snapshot.activation_id)
+            return Err(VmError::InvalidOperand);
         };
         Ok(Self {
             vm,
@@ -171,13 +178,6 @@ impl<'a> RuntimeCall<'a> {
         unsafe { self.frame.as_mut().header.pc = pc };
     }
 
-    pub(super) fn materialized_index(&self) -> Option<usize> {
-        match self.identity {
-            RuntimeFrameIdentity::Materialized(index) => Some(index as usize),
-            RuntimeFrameIdentity::NativeOwner(_) => None,
-        }
-    }
-
     pub(super) fn with_frame<T>(
         &mut self,
         operation: impl FnOnce(&mut ActiveFrameMut<'_>) -> Result<T, VmError>,
@@ -222,14 +222,14 @@ mod tests {
             Value::function(7),
             Value::undefined(),
         );
-        frame.set_native_owner(41);
+        frame.set_stack_registers();
 
         // SAFETY: the local activation, frame, and register array stay live and
         // exclusively owned for the RuntimeCall scope.
         let mut call =
             unsafe { RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame)) }
                 .unwrap();
-        assert_eq!(call.identity(), RuntimeFrameIdentity::NativeOwner(41));
+        assert_eq!(call.identity(), RuntimeFrameIdentity::StackOwned);
         assert_eq!(call.read(0).unwrap(), Value::number_i32(3));
         call.write(1, Value::boolean(true)).unwrap();
         assert!(matches!(call.read(2), Err(VmError::InvalidOperand)));

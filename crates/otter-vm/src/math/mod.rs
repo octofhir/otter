@@ -15,6 +15,12 @@
 //! - [`call`] — used by `Op::MathCall` and native wrappers.
 //! - [`MathError`] — failure modes the dispatcher converts to
 //!   `VmError`.
+//! - Static-native identity selection for extracted-method JIT leaves.
+//!
+//! # Invariants
+//! - Extracted methods remain ordinary callable objects. Native leaf codegen is
+//!   selected only after exact bootstrap function identity feedback and keeps
+//!   a pre-effect side exit for every identity or numeric guard miss.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-math-object>
@@ -249,6 +255,34 @@ fn original_native_fn(method: otter_bytecode::method_id::MathMethod) -> NativeFa
         M::Tan => native_tan,
         M::Tanh => native_tanh,
         M::Trunc => native_trunc,
+    }
+}
+
+/// Classify an exact bootstrap native supported by ordinary-call leaf codegen.
+pub(crate) fn jit_static_call_kind(
+    native: crate::NativeFunction,
+    heap: &otter_gc::GcHeap,
+) -> Option<crate::jit::JitStaticNativeCallKind> {
+    let kind = native
+        .is_static_fn(
+            heap,
+            original_native_fn(otter_bytecode::method_id::MathMethod::Abs),
+        )
+        .then_some(crate::jit::JitStaticNativeCallKind::MathAbs)?;
+    debug_assert_eq!(
+        native.jit_static_fn_addr(heap),
+        Some(jit_static_call_address(kind)),
+        "static-native classifier and JIT identity field must agree"
+    );
+    Some(kind)
+}
+
+/// Exact bootstrap function address guarded by generated static-native leaves.
+pub(crate) fn jit_static_call_address(kind: crate::jit::JitStaticNativeCallKind) -> usize {
+    match kind {
+        crate::jit::JitStaticNativeCallKind::MathAbs => {
+            original_native_fn(otter_bytecode::method_id::MathMethod::Abs) as *const () as usize
+        }
     }
 }
 

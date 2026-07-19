@@ -223,15 +223,23 @@ impl Interpreter {
             jit::JitNativeActivation::EMPTY;
     }
 
-    /// Trace the non-register roots of every canonical native activation
-    /// currently capable of crossing a safepoint. Register windows are traced
-    /// once by [`Self::trace_reg_stack`].
+    /// Trace every canonical native activation currently capable of crossing a
+    /// safepoint. Register-arena windows are traced once by
+    /// [`Self::trace_reg_stack`]; generated-code stack windows are absent from
+    /// that arena and are traced through their published frame here.
     pub(crate) fn trace_native_jit_activations(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
         for activation in &self.jit_native_activations[..self.jit_native_activation_top] {
             // SAFETY: `jit_push_native_frame`/the equivalent generated fast
             // publication keep the frame and its windows live until pop.
             let frame = unsafe { crate::ActiveFrameRef::from_native_ptr(activation.frame) }
                 .expect("published native activation must remain valid");
+            if frame
+                .header()
+                .flags
+                .contains(NativeFrameFlags::STACK_REGISTERS)
+            {
+                frame.trace_stack_register_slots(visitor);
+            }
             frame.trace_non_register_slots(visitor);
         }
     }

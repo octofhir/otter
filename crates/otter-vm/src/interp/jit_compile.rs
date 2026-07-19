@@ -1,7 +1,8 @@
 //! JIT compile requests and cold profile-feedback baking.
 //!
 //! # Contents
-//! - `jit_code_residency` — opt-in whole-isolate executable-code snapshot.
+//! - `jit_code_residency` and `jit_code_generation_snapshot` — opt-in
+//!   whole-isolate executable ownership and generation snapshots.
 //! - `compile_jit_function` and cold feedback baking into the instruction view
 //!   (property/object-literal/inline-callee tables).
 //! - Call/method target profiling and reoptimization eviction.
@@ -16,6 +17,15 @@
 use crate::*;
 
 impl Interpreter {
+    /// Snapshot installed, invalid, and retired-tombstone JIT generations.
+    ///
+    /// This explicit diagnostics call walks cold registry metadata and performs
+    /// no work during ordinary compilation or execution.
+    #[must_use]
+    pub fn jit_code_generation_snapshot(&self) -> Vec<jit::JitCodeGenerationSnapshot> {
+        self.jit_code_registry.generation_snapshot()
+    }
+
     /// Snapshot all executable code objects currently retained by this isolate.
     ///
     /// This walks cold JIT ownership/cache tables only when explicitly called;
@@ -48,12 +58,6 @@ impl Interpreter {
         if let Some((_, code)) = &self.jit_optimized_code_cache {
             record(code);
         }
-        for cache_set in &self.jit_direct_method_cache {
-            for entry in cache_set {
-                record(entry.code());
-            }
-        }
-
         jit::JitCodeResidency {
             installed_optimized_bodies: self.jit_optimized_code.values().flatten().count() as u64,
             installed_entry_bodies: self.jit_code.values().flatten().count() as u64,
@@ -92,8 +96,8 @@ impl Interpreter {
             .iter()
             .filter(|instr| {
                 view.code_block
-                    .feedback_at(instr.instruction_pc(&view.code_block) as usize)
-                    .is_some_and(|cell| cell.call_target().is_some())
+                    .call_distribution_at(instr.instruction_pc(&view.code_block) as usize)
+                    .is_some()
             })
             .count();
         let event = jit_debug::JitDebugEvent::CompilePrepared {
@@ -105,6 +109,9 @@ impl Interpreter {
             parameter_count: u32::try_from(view.code_block.param_count).unwrap_or(u32::MAX),
             call_feedback_sites: u32::try_from(call_feedback_sites).unwrap_or(u32::MAX),
             method_feedback_sites: u32::try_from(method_feedback_sites).unwrap_or(u32::MAX),
+            direct_callees: u32::try_from(view.direct_callees.len()).unwrap_or(u32::MAX),
+            direct_methods: u32::try_from(view.direct_methods.len()).unwrap_or(u32::MAX),
+            static_native_calls: u32::try_from(view.static_native_calls.len()).unwrap_or(u32::MAX),
             inline_callees: u32::try_from(view.inline_callees.len()).unwrap_or(u32::MAX),
             inline_methods: u32::try_from(view.inline_methods.len()).unwrap_or(u32::MAX),
         };
@@ -147,6 +154,47 @@ impl Interpreter {
             target,
             outcome,
         });
+        let Ok(jit::JitCompileStatus::Compiled { diagnostics, .. }) = status else {
+            return;
+        };
+        for diagnostic in diagnostics {
+            if !self.reserve_jit_debug_event() {
+                break;
+            }
+            let event = match *diagnostic {
+                jit_debug::JitCompilerDiagnostic::DirectCallLowered {
+                    call_kind,
+                    instruction_pc,
+                    byte_pc,
+                    callee_function_id,
+                    outcome,
+                } => jit_debug::JitDebugEvent::DirectCallLowered {
+                    call_kind,
+                    caller_function_id: fid,
+                    caller_code_object_id: code_object_id,
+                    instruction_pc,
+                    byte_pc,
+                    tier,
+                    callee_function_id,
+                    outcome,
+                },
+                jit_debug::JitCompilerDiagnostic::StaticNativeCallLowered {
+                    instruction_pc,
+                    byte_pc,
+                    target,
+                    outcome,
+                } => jit_debug::JitDebugEvent::StaticNativeCallLowered {
+                    caller_function_id: fid,
+                    caller_code_object_id: code_object_id,
+                    instruction_pc,
+                    byte_pc,
+                    tier,
+                    target,
+                    outcome,
+                },
+            };
+            self.push_reserved_jit_debug_event(event);
+        }
     }
 
     fn record_jit_inline_candidate(
@@ -166,9 +214,53 @@ impl Interpreter {
         });
     }
 
-    /// Compile and register one optimizing-tier leaf from the current feedback
-    /// snapshot. Unsupported functions return `None` and keep using the
-    /// template/interpreter path.
+    fn record_jit_direct_call_plan(
+        &mut self,
+        call_kind: jit::JitDirectCallKind,
+        caller_function_id: u32,
+        instruction_pc: u32,
+        tier: jit_debug::JitDebugTier,
+        callee_function_id: u32,
+        outcome: jit_debug::JitDirectCallPlanOutcome,
+    ) {
+        self.record_jit_debug_event(|| jit_debug::JitDebugEvent::DirectCallPlan {
+            call_kind,
+            caller_function_id,
+            instruction_pc,
+            tier,
+            callee_function_id,
+            outcome,
+        });
+    }
+
+    fn record_jit_static_native_call_plan(
+        &mut self,
+        caller_function_id: u32,
+        instruction_pc: u32,
+        tier: jit_debug::JitDebugTier,
+        target: jit::JitStaticNativeCallKind,
+    ) {
+        self.record_jit_debug_event(|| jit_debug::JitDebugEvent::StaticNativeCallPlan {
+            caller_function_id,
+            instruction_pc,
+            tier,
+            target,
+        });
+    }
+
+    /// Replace `fid`'s current native generation with one optimizing-tier body
+    /// compiled from the latest feedback snapshot.
+    ///
+    /// Promotion first unlinks every current generation for `fid` and every
+    /// generated caller that embeds an exact edge to it. This keeps one
+    /// authoritative entry generation: a caller recompiled after promotion
+    /// binds the optimizer directly instead of continuing through a stale
+    /// baseline cell. Unlinking before snapshotting also prevents a newly
+    /// compiled body from retaining a transitive dependency cycle through the
+    /// generation being replaced.
+    ///
+    /// Unsupported functions return `None`; hotness survives invalidation, so
+    /// the normal resolver can immediately rebuild a baseline body.
     pub(crate) fn compile_optimized_jit_function(
         &mut self,
         context: &ExecutionContext,
@@ -182,6 +274,7 @@ impl Interpreter {
         {
             return None;
         }
+        self.invalidate_jit_function(fid);
         let mut snapshot = context.jit_compile_snapshot(fid)?;
         self.publish_property_feedback_for_view(&snapshot);
         // The optimizing tier consumes the same baked compile inputs as the
@@ -235,7 +328,7 @@ impl Interpreter {
             &status,
         );
         match status {
-            Ok(jit::JitCompileStatus::Compiled { code, artifact }) => {
+            Ok(jit::JitCompileStatus::Compiled { code, artifact, .. }) => {
                 if let Some(artifact) = artifact {
                     self.record_jit_artifact(*artifact);
                 }
@@ -360,7 +453,7 @@ impl Interpreter {
             &status,
         );
         match status {
-            Ok(jit::JitCompileStatus::Compiled { code, artifact }) => {
+            Ok(jit::JitCompileStatus::Compiled { code, artifact, .. }) => {
                 if let Some(artifact) = artifact {
                     self.record_jit_artifact(*artifact);
                 }
@@ -475,7 +568,7 @@ impl Interpreter {
             });
         }
         // Walk the prototype chain, recording each hopped object's shape; the
-        // baked guard replays exactly this walk (flat-prototype chase + shape
+        // baked guard checks exactly this chain (flat-prototype chase + shape
         // compare per hop) before trusting the holder's slot offset.
         let mut proto_chain = crate::MethodProtoChain::own();
         let mut cur = recv;
@@ -503,26 +596,49 @@ impl Interpreter {
     /// lets those sites inline. The currently-running body, if any, stays alive
     /// through its `Arc` until the frame returns.
     pub(crate) fn evict_compiled_for_reopt(&mut self, fid: u32) {
-        self.jit_code.remove(&fid);
-        self.jit_entry_osr_only.remove(&fid);
-        self.jit_code_cache = None;
-        self.jit_direct_call_cache = None;
-        self.clear_jit_direct_method_cache_for_fid(fid);
-        self.jit_code_registry.invalidate_function(fid);
-        self.jit_osr_code.retain(|&(f, _), _| f != fid);
-        self.jit_osr_disabled.retain(|&(f, _)| f != fid);
-        self.jit_osr_counts.retain(|&(f, _), _| f != fid);
+        self.invalidate_jit_function(fid);
     }
 
-    /// Bake inline-candidate callee bodies for `fid`'s monomorphic `Op::Call`
-    /// sites into `view`, so the baseline can splice a tiny leaf callee under an
-    /// identity guard instead of emitting the per-call bridge.
+    /// Resolve the best current entry-capable code generation for one baked
+    /// compiler-native plain call.
+    ///
+    /// Optimizing code wins only when it advertises safe stack-owned cold
+    /// deoptimization; otherwise the current baseline entry is used. OSR-only
+    /// bodies are never valid function entries, and registry validation must
+    /// return a stable entry-cell plan for the exact generation.
+    fn current_direct_callee_plan(&self, function: &CodeBlock) -> Option<jit::JitDirectCallPlan> {
+        let candidates = [
+            self.jit_optimized_code
+                .get(&function.id)
+                .and_then(Option::as_ref),
+            self.jit_code.get(&function.id).and_then(Option::as_ref),
+        ];
+        for code in candidates.into_iter().flatten() {
+            if code.osr_only() {
+                continue;
+            }
+            if let Some(plan) = self
+                .jit_code_registry
+                .direct_call_plan(function, code.as_ref())
+                .filter(|plan| plan.generated_stack_frame_bytes.is_some())
+            {
+                return Some(plan);
+            }
+        }
+        None
+    }
+
+    /// Bake compiler-native direct-call plans and inline-candidate bodies for
+    /// `fid`'s monomorphic `Op::Call` sites.
     ///
     /// A site is a candidate only when (a) it observed a single callee (`Mono`),
     /// and (b) that callee is a plain synchronous bytecode function — the same
-    /// shape the direct-call bridge accepts. The emitter applies the final
-    /// pure-leaf / size / arity test; `Poly`, unobserved, and disqualified-shape
-    /// sites are left out and emit the normal bridge.
+    /// static shape accepted by native entry. The direct-call table is narrower:
+    /// its first slice requires no callee-owned upvalue cells and one current
+    /// non-OSR installed entry. Generated linkage binds both strict/lexical and
+    /// unbound sloppy-global `this`; an explicitly bound sloppy closure misses
+    /// before entry. The emitter applies the final pure-leaf / size / arity test
+    /// to the separate inline table.
     pub(crate) fn bake_inline_callees(
         &mut self,
         view: &mut jit::JitCompileSnapshot,
@@ -537,13 +653,12 @@ impl Interpreter {
                 let instruction_pc = instr.instruction_pc(&view.code_block);
                 let state = view
                     .code_block
-                    .feedback_at(instruction_pc as usize)?
-                    .call_target()?;
+                    .call_distribution_at(instruction_pc as usize)?;
                 Some((instruction_pc, instr.byte_pc, state))
             })
             .collect();
         for (instruction_pc, call_byte_pc, state) in call_sites {
-            let CallTargetFeedback::Mono(callee_fid) = state else {
+            let feedback::CallSiteDistribution::Mono(target) = state else {
                 self.record_jit_inline_candidate(
                     fid,
                     instruction_pc,
@@ -553,6 +668,27 @@ impl Interpreter {
                 );
                 continue;
             };
+            let callee_fid = match target.target {
+                feedback::OrdinaryCallTarget::Bytecode(callee_fid) => callee_fid,
+                feedback::OrdinaryCallTarget::StaticNative(kind) => {
+                    view.static_native_calls.insert(
+                        call_byte_pc,
+                        jit::JitStaticNativeCall {
+                            kind,
+                            builtin_fn_addr: crate::math::jit_static_call_address(kind),
+                        },
+                    );
+                    self.record_jit_inline_candidate(
+                        fid,
+                        instruction_pc,
+                        tier,
+                        None,
+                        Some(jit_debug::JitInlineRejectionReason::StaticNative { target: kind }),
+                    );
+                    self.record_jit_static_native_call_plan(fid, instruction_pc, tier, kind);
+                    continue;
+                }
+            };
             let Some(callee) = context.exec_function(callee_fid) else {
                 self.record_jit_inline_candidate(
                     fid,
@@ -560,6 +696,16 @@ impl Interpreter {
                     tier,
                     Some(callee_fid),
                     Some(jit_debug::JitInlineRejectionReason::MissingCallee),
+                );
+                self.record_jit_direct_call_plan(
+                    jit::JitDirectCallKind::Plain,
+                    fid,
+                    instruction_pc,
+                    tier,
+                    callee_fid,
+                    jit_debug::JitDirectCallPlanOutcome::Rejected {
+                        reason: jit_debug::JitDirectCallRejectionReason::MissingCallee,
+                    },
                 );
                 continue;
             };
@@ -587,8 +733,58 @@ impl Interpreter {
                         makes_function: callee.makes_function,
                     }),
                 );
+                self.record_jit_direct_call_plan(
+                    jit::JitDirectCallKind::Plain,
+                    fid,
+                    instruction_pc,
+                    tier,
+                    callee_fid,
+                    jit_debug::JitDirectCallPlanOutcome::Rejected {
+                        reason: jit_debug::JitDirectCallRejectionReason::IneligibleFunction,
+                    },
+                );
                 continue;
             }
+            let direct_call_outcome = if callee_fid == fid {
+                jit_debug::JitDirectCallPlanOutcome::Rejected {
+                    reason: jit_debug::JitDirectCallRejectionReason::SelfRecursive,
+                }
+            } else if callee.own_upvalue_count != 0 {
+                jit_debug::JitDirectCallPlanOutcome::Rejected {
+                    reason: jit_debug::JitDirectCallRejectionReason::OwnUpvalues {
+                        count: callee.own_upvalue_count,
+                    },
+                }
+            } else if let Some(plan) = self.current_direct_callee_plan(callee) {
+                debug_assert_eq!(plan.function_id, callee_fid);
+                view.direct_callees
+                    .insert(call_byte_pc, jit::JitDirectCallee { plan });
+                jit_debug::JitDirectCallPlanOutcome::Available {
+                    code_object_id: plan.code_object_id,
+                    target_tier: match plan.tier {
+                        native_abi::NativeFrameKind::Baseline => jit_debug::JitDebugTier::Template,
+                        native_abi::NativeFrameKind::Optimizing => {
+                            jit_debug::JitDebugTier::Optimizing
+                        }
+                        native_abi::NativeFrameKind::Interpreter => {
+                            unreachable!("interpreter has no entry-capable code generation")
+                        }
+                    },
+                    this_mode: plan.this_mode,
+                }
+            } else {
+                jit_debug::JitDirectCallPlanOutcome::Rejected {
+                    reason: jit_debug::JitDirectCallRejectionReason::NoEntryGeneration,
+                }
+            };
+            self.record_jit_direct_call_plan(
+                jit::JitDirectCallKind::Plain,
+                fid,
+                instruction_pc,
+                tier,
+                callee_fid,
+                direct_call_outcome,
+            );
             let Some(callee_view) = context.jit_compile_snapshot(callee_fid) else {
                 self.record_jit_inline_candidate(
                     fid,
@@ -617,16 +813,17 @@ impl Interpreter {
         // `&mut self`) does not alias the feedback map borrow. Each snapshot is a
         // list of candidate targets — one for `Mono`, up to
         // `MAX_POLY_METHOD_TARGETS` (most-frequent first) for `Poly`.
-        // `Megamorphic` sites are skipped and take the in-place method bridge.
+        // `Megamorphic` sites are skipped and side-exit before method lookup.
         struct PolySnapshot {
             instruction_pc: u32,
+            call_byte_pc: u32,
+            direct_target: Option<PolyMethodTarget>,
             targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]>,
         }
         let method_sites: Vec<PolySnapshot> = view
             .instructions
             .iter()
             .filter_map(|instr| {
-                let instruction_pc = instr.instruction_pc(&view.code_block);
                 let site = instr.property_ic_site(&view.code_block)?;
                 let state = self.method_target_feedback(site)?;
                 match state {
@@ -645,8 +842,11 @@ impl Interpreter {
                             method_value_byte,
                             hits: 1,
                         });
+                        let direct_target = targets.first().copied();
                         Some(PolySnapshot {
-                            instruction_pc,
+                            instruction_pc: instr.instruction_pc(&view.code_block),
+                            call_byte_pc: instr.byte_pc,
+                            direct_target,
                             targets,
                         })
                     }
@@ -656,7 +856,9 @@ impl Interpreter {
                         // then hits the shortest guard chain.
                         targets.sort_by_key(|t| std::cmp::Reverse(t.hits));
                         Some(PolySnapshot {
-                            instruction_pc,
+                            instruction_pc: instr.instruction_pc(&view.code_block),
+                            call_byte_pc: instr.byte_pc,
+                            direct_target: None,
                             targets,
                         })
                     }
@@ -665,14 +867,47 @@ impl Interpreter {
             })
             .collect();
         for snap in method_sites {
-            let Some(call_byte_pc) = view
-                .instructions
-                .iter()
-                .find(|instr| instr.instruction_pc(&view.code_block) == snap.instruction_pc)
-                .map(|instr| instr.byte_pc)
-            else {
-                continue;
-            };
+            if let Some(target) = snap.direct_target {
+                let (callee_function_id, outcome) =
+                    match self.bake_one_direct_method(context, fid, &target) {
+                        Ok(method) => {
+                            let plan = method.callee.plan;
+                            view.direct_methods.insert(snap.call_byte_pc, method);
+                            (
+                                plan.function_id,
+                                jit_debug::JitDirectCallPlanOutcome::Available {
+                                    code_object_id: plan.code_object_id,
+                                    target_tier: match plan.tier {
+                                        native_abi::NativeFrameKind::Baseline => {
+                                            jit_debug::JitDebugTier::Template
+                                        }
+                                        native_abi::NativeFrameKind::Optimizing => {
+                                            jit_debug::JitDebugTier::Optimizing
+                                        }
+                                        native_abi::NativeFrameKind::Interpreter => {
+                                            unreachable!(
+                                                "interpreter has no entry-capable code generation"
+                                            )
+                                        }
+                                    },
+                                    this_mode: jit::JitDirectCallThisMode::MethodReceiver,
+                                },
+                            )
+                        }
+                        Err(reason) => (
+                            target.method_fid,
+                            jit_debug::JitDirectCallPlanOutcome::Rejected { reason },
+                        ),
+                    };
+                self.record_jit_direct_call_plan(
+                    jit::JitDirectCallKind::Method,
+                    fid,
+                    snap.instruction_pc,
+                    tier,
+                    callee_function_id,
+                    outcome,
+                );
+            }
             let mut baked: Vec<jit::JitInlineMethod> = Vec::new();
             for target in &snap.targets {
                 if let Some(method) = self.bake_one_inline_method(context, target) {
@@ -681,19 +916,90 @@ impl Interpreter {
             }
             match baked.len() {
                 0 => {}
-                // A single inlinable target is the monomorphic fast path, even if
-                // the site observed several shapes: the others miss its guard and
-                // take the bridge, which is strictly better than no inline.
+                // A single inlinable target remains useful even when the site
+                // observed several shapes: other shapes miss its guard and
+                // side-exit before method lookup.
                 1 => {
                     view.inline_methods
-                        .insert(call_byte_pc, baked.pop().unwrap());
+                        .insert(snap.call_byte_pc, baked.pop().unwrap());
                 }
                 // Two or more: emit the guarded inline chain.
                 _ => {
-                    view.inline_poly_methods.insert(call_byte_pc, baked);
+                    view.inline_poly_methods.insert(snap.call_byte_pc, baked);
                 }
             }
         }
+    }
+
+    /// Materialize one exact receiver/prototype/method-slot identity guard.
+    ///
+    /// Feedback keeps stable shape ids; generated code consumes compressed
+    /// shape-handle offsets. Resolving every hop here keeps heap/runtime layout
+    /// knowledge on the VM side.
+    fn bake_method_guard(&self, target: &PolyMethodTarget) -> Option<jit::JitMethodGuard> {
+        let recv_shape = self.shape_runtime.handle_for_id(target.recv_shape)?;
+        let proto_chain = target
+            .proto_chain
+            .as_slice()
+            .iter()
+            .map(|shape_id| {
+                self.shape_runtime
+                    .handle_for_id(*shape_id)
+                    .map(|shape| shape.offset())
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(jit::JitMethodGuard {
+            method_fid: target.method_fid,
+            recv_shape: recv_shape.offset(),
+            proto_chain,
+            method_value_byte: target.method_value_byte,
+        })
+    }
+
+    /// Bake one compiler-generated method call independently of leaf inlining.
+    ///
+    /// Only a monomorphic feedback target reaches this helper. The target must
+    /// be an ordinary synchronous function, differ from the caller, require no
+    /// fresh capture-cell allocation, and already have one entry-capable native
+    /// generation. Inherited closure captures are consumed directly.
+    fn bake_one_direct_method(
+        &self,
+        context: &ExecutionContext,
+        caller_fid: u32,
+        target: &PolyMethodTarget,
+    ) -> Result<jit::JitDirectMethod, jit_debug::JitDirectCallRejectionReason> {
+        let method = context
+            .exec_function(target.method_fid)
+            .ok_or(jit_debug::JitDirectCallRejectionReason::MissingCallee)?;
+        if method.is_generator
+            || method.is_async
+            || method.is_async_generator
+            || method.needs_arguments
+            || method.has_rest
+            || method.contains_direct_eval
+            || method.is_derived_constructor
+        {
+            return Err(jit_debug::JitDirectCallRejectionReason::IneligibleFunction);
+        }
+        if target.method_fid == caller_fid {
+            return Err(jit_debug::JitDirectCallRejectionReason::SelfRecursive);
+        }
+        if method.own_upvalue_count != 0 {
+            return Err(jit_debug::JitDirectCallRejectionReason::OwnUpvalues {
+                count: method.own_upvalue_count,
+            });
+        }
+        let guard = self
+            .bake_method_guard(target)
+            .ok_or(jit_debug::JitDirectCallRejectionReason::MethodGuardUnavailable)?;
+        let plan = self
+            .current_direct_callee_plan(method)
+            .ok_or(jit_debug::JitDirectCallRejectionReason::NoEntryGeneration)?;
+        debug_assert_eq!(plan.function_id, target.method_fid);
+        Ok(jit::JitDirectMethod {
+            guard,
+            callee: jit::JitDirectCallee { plan },
+        })
     }
 
     /// Bake one inline-method candidate body for a `(method, receiver shape)`
@@ -713,7 +1019,7 @@ impl Interpreter {
     /// Recursion bound for nested method-body inlining. A method whose tail is a
     /// call splices that callee's body; the callee may in turn call, so the bake
     /// recurses down the monomorphic call chain to this depth (richards is
-    /// `run → task.run → scheduler.X`), then leaves deeper calls bridged.
+    /// `run → task.run → scheduler.X`). Deeper calls side-exit if reached.
     const MAX_INLINE_METHOD_DEPTH: u32 = 3;
 
     pub(crate) fn bake_inline_method_rec(
@@ -773,8 +1079,8 @@ impl Interpreter {
             prop_shapes.insert(instr.byte_pc, shape_off);
         }
         // Recursively bake the body's monomorphic nested method calls so the
-        // inliner can splice their bodies rather than bridge them. Only `Mono`
-        // sites recurse; polymorphic/megamorphic internal calls stay bridged.
+        // inliner can splice their bodies. Only `Mono` sites recurse;
+        // polymorphic/megamorphic internal calls stay uninlined.
         // Collect targets first — the recursion needs `&mut self`, which cannot
         // overlap the feedback-map borrow.
         let mut nested_targets: Vec<(u32, PolyMethodTarget)> = Vec::new();
@@ -813,23 +1119,10 @@ impl Interpreter {
                 nested_methods.insert(pc, nested);
             }
         }
-        let recv_shape = self.shape_runtime.handle_for_id(target.recv_shape)?;
-        let proto_chain = target
-            .proto_chain
-            .as_slice()
-            .iter()
-            .map(|shape_id| {
-                self.shape_runtime
-                    .handle_for_id(*shape_id)
-                    .map(|shape| shape.offset())
-            })
-            .collect::<Option<Vec<_>>>()?;
+        let guard = self.bake_method_guard(target)?;
         Some(jit::JitInlineMethod {
             code_block: std::sync::Arc::clone(&method_view.code_block),
-            method_fid: target.method_fid,
-            recv_shape: recv_shape.offset(),
-            proto_chain,
-            method_value_byte: target.method_value_byte,
+            guard,
             param_count: method_view.code_block.param_count,
             register_count: method_view.code_block.register_count,
             instructions: method_view.instructions,
@@ -846,8 +1139,8 @@ impl Interpreter {
     /// slot. Baking only makes those fields machine-readable so the hot path no
     /// longer crosses into Rust just to resolve a `RuntimeStubId`.
     /// Bake dense-array `push` / `pop` method-call guard metadata so the
-    /// baseline can splice an inline fast path for the site. The runtime method
-    /// bridge re-validates the receiver/prototype/builtin on every miss.
+    /// baseline can splice an inline fast path for the site. Guard misses
+    /// side-exit before method effects.
     pub(crate) fn bake_array_methods(&self, view: &mut jit::JitCompileSnapshot) {
         for instr in &view.instructions {
             if instr.op(&view.code_block) != Op::CallMethodValue {

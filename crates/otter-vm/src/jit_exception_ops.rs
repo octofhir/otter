@@ -74,9 +74,9 @@ impl Interpreter {
     /// Deliver a propagated compiled-callee throw into `frame_index` when that
     /// caller still owns an active structured-exception handler.
     ///
-    /// Compiled call bridges use this before taking their shared throw
-    /// epilogue. A successful unwind updates the caller's canonical frame PC;
-    /// the bridge publishes that PC and bails so interpreter dispatch resumes
+    /// Compiler-generated call linkage uses this before taking the shared
+    /// throw epilogue. A successful unwind updates the caller's canonical frame
+    /// PC; native code publishes that PC and bails so interpreter dispatch resumes
     /// at the selected catch/finally continuation without replaying the call.
     pub fn jit_resume_caller_throw(
         &mut self,

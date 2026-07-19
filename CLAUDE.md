@@ -47,6 +47,15 @@ Compatibility rules:
 - New runtime/VM/API work belongs on the active `crates/*` stack.
 - Do not add new dependencies from active crates into parked compatibility shims.
 - Keep `otter-nodejs` and `otter-node-compat` compileable, but treat them as parked surfaces rather than active implementation homes.
+- Otter is pre-user and pre-stability: make clean breaking changes to internal
+  APIs, ABIs, diagnostics, artifacts, and fixtures when architecture improves.
+- Do not version internal contracts: do not add or bump schema/format versions,
+  migrations, compatibility readers/writers, legacy modes, deprecated aliases,
+  bridges, adapters, generic-call detours, or replay paths. Change the one
+  current contract in place and update all in-repository producers and
+  consumers together.
+- Compatibility/versioning work requires an explicitly declared external
+  contract and explicit task approval.
 
 ### Crate Layering (bottom-up)
 

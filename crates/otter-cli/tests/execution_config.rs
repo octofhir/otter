@@ -4,7 +4,7 @@
 //! - Explicit execution-tier selection through the public CLI.
 //! - Shared trace and CPU-profiler configuration on the synchronous runtime path.
 //! - Structured JIT event capture through an explicit default-off target.
-//! - Atomic, versioned JIT artifact bundle persistence.
+//! - Atomic current-format JIT artifact bundle persistence.
 //!
 //! # Invariants
 //! - Tests invoke the built binary instead of private configuration helpers.
@@ -34,8 +34,8 @@ fn assert_persisted_assembly(path: &std::path::Path) {
     let mut lines = assembly.lines();
     assert_eq!(
         lines.next(),
-        Some("; otter jit aarch64 assembly v1"),
-        "versioned assembly header"
+        Some("; otter jit aarch64 assembly"),
+        "current assembly header"
     );
     assert_eq!(
         lines.next(),
@@ -119,7 +119,7 @@ fn explicit_jit_tier_modes_are_accepted() {
 }
 
 #[test]
-fn structured_jit_events_are_versioned_and_typed() {
+fn structured_jit_events_are_typed() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let events_path = tmp.path().join("otter-jit-events.json");
     let output = otter_command(tmp.path())
@@ -139,7 +139,6 @@ fn structured_jit_events_are_versioned_and_typed() {
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(events_path).expect("read JIT events"))
             .expect("valid JIT events JSON");
-    assert_eq!(report["otterJitDebugSchemaVersion"], 1);
     let events = report["events"].as_array().expect("events array");
     assert_eq!(report["droppedEvents"], 0);
     assert_eq!(report["truncated"], false);
@@ -174,7 +173,6 @@ fn abrupt_failure_still_writes_partial_jit_events() {
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(events_path).expect("read partial JIT events"))
             .expect("valid partial JIT events JSON");
-    assert_eq!(report["otterJitDebugSchemaVersion"], 1);
     assert!(
         report["events"].as_array().is_some_and(|events| events
             .iter()
@@ -278,7 +276,7 @@ fn late_input_error_preserves_earlier_file_jit_events() {
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn jit_artifacts_are_versioned_complete_and_offset_consistent() {
+fn jit_artifacts_are_complete_and_offset_consistent() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let artifacts_path = tmp.path().join("artifacts");
     let output = otter_command(tmp.path())
@@ -299,7 +297,6 @@ fn jit_artifacts_are_versioned_complete_and_offset_consistent() {
         &std::fs::read(artifacts_path.join("index.json")).expect("read artifact index"),
     )
     .expect("valid artifact index");
-    assert_eq!(index["otterJitArtifactIndexSchemaVersion"], 1);
     assert_eq!(index["droppedBundles"], 0);
     assert_eq!(index["droppedBytes"], 0);
     assert_eq!(index["truncated"], false);
@@ -319,7 +316,6 @@ fn jit_artifacts_are_versioned_complete_and_offset_consistent() {
         &std::fs::read(directory.join("manifest.json")).expect("read artifact manifest"),
     )
     .expect("valid artifact manifest");
-    assert_eq!(manifest["otterJitArtifactSchemaVersion"], 1);
     assert_eq!(manifest["tier"], "template");
     assert_eq!(manifest["entry"]["kind"], "osr");
     assert_eq!(manifest["module"], "<eval>");
@@ -371,7 +367,6 @@ fn jit_artifacts_are_versioned_complete_and_offset_consistent() {
         std::fs::read(directory.join("relocations.json")).expect("read relocations");
     let relocations: serde_json::Value =
         serde_json::from_slice(&relocations_bytes).expect("valid relocations");
-    assert_eq!(relocations["otterJitRelocationSchemaVersion"], 1);
     assert_eq!(relocations["offsetBasis"], "code.bin");
     assert!(relocations["relocations"].is_array());
     assert!(
@@ -381,19 +376,18 @@ fn jit_artifacts_are_versioned_complete_and_offset_consistent() {
     assert!(
         std::fs::read_to_string(directory.join("bytecode.txt"))
             .expect("read bytecode")
-            .starts_with("; otter bytecode v1\n")
+            .starts_with("; otter bytecode\n")
     );
     assert!(
         std::fs::read_to_string(directory.join("template-plan.txt"))
             .expect("read template plan")
-            .starts_with("; otter template plan v1\n")
+            .starts_with("; otter template plan\n")
     );
 
     let code_map: serde_json::Value = serde_json::from_slice(
         &std::fs::read(directory.join("code-map.json")).expect("read code map"),
     )
     .expect("valid code map");
-    assert_eq!(code_map["otterJitCodeMapSchemaVersion"], 1);
     let regions = code_map["regions"].as_array().expect("code-map regions");
     assert!(!regions.is_empty());
     for region in regions {
@@ -415,7 +409,6 @@ fn jit_artifacts_are_versioned_complete_and_offset_consistent() {
         &std::fs::read(directory.join("safepoints.json")).expect("read safepoints"),
     )
     .expect("valid safepoints");
-    assert_eq!(safepoints["otterJitSafepointSchemaVersion"], 1);
     assert!(safepoints["safepoints"].is_array());
 }
 
@@ -628,7 +621,7 @@ if (total !== 19900) throw new Error("bad total");
     assert_success(&output);
 
     let trace_text = std::fs::read_to_string(&trace).expect("read trace");
-    assert!(trace_text.starts_with("; otter step trace v1\n"));
+    assert!(trace_text.starts_with("; otter step trace\n"));
     assert!(trace_text.lines().count() > 1, "trace contains VM steps");
 
     let cpuprofile = profile_dir.join("owned-config.cpuprofile");

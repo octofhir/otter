@@ -1,38 +1,44 @@
 //! AArch64 call emitters for the template compiler.
 //!
 //! # Contents
-//! - Plain-call, method-call, and construct lowering through prepare and
-//!   generic transitions.
-//! - Guarded read-only numeric method splicing from VM-baked inline metadata.
-//! - Guarded collection-method dispatch before ordinary method resolution.
+//! - Compiler-generated monomorphic plain and method calls with exact
+//!   pre-effect deopt.
+//! - Construct lowering through the current runtime transition.
+//! - Guarded read-only numeric call/method splicing from VM-baked metadata.
+//! - Guarded collection-method leaves before generated method linkage.
 //!
 //! # Invariants
-//! - The caller's canonical PC is stamped before the prepare transition; a
-//!   bailed callee reifies at its exact PC through the finish helpers and the
-//!   caller's published frame survives untouched.
+//! - Call guard/setup failure is effect-free and deoptimizes at the original
+//!   opcode; accepted inline misses never replay it.
+//! - A generated call owns a rooted stack register window and enters the baked
+//!   stable code-entry generation directly.
 //! - A callee throw caught by the compiled caller publishes the selected
 //!   catch/finally PC and exits through the shared bailout epilogue.
-//! - Prepared callees enter through the common owned AArch64 call trampoline,
-//!   which owns frame publication and cleanup for every native tier.
-//! - Inlined method bodies contain no call, allocation, branch, or mutation;
-//!   every guard failure balances compact scratch storage and completes the
-//!   original method call through the ordinary bridge.
+//! - A generated method call re-reads receiver/prototype/slot identity, then
+//!   carries the proven callable and exact receiver into the shared linkage.
+//! - Inlined call and method bodies contain no call, allocation, branch, or
+//!   mutation; every guard failure balances compact scratch storage and
+//!   deoptimizes the original opcode before observable effects.
 //! - `x19` remains the caller register base throughout an inline body. Callee
 //!   virtual registers use explicit `sp`-relative compact slots initialized
 //!   only for live entry values.
 //! - A raw receiver pointer retained in `x17` is live only between the entry
 //!   identity guard and the end of a call-free, safepoint-free inline body.
-//! - Ineligible call resolutions complete through the descriptor-classified
-//!   generic in-place transitions; only receivers whose opcode semantics the
-//!   interpreter dispatches through bespoke branches take an exact side exit.
+//! - A method site that cannot prove one current native generation takes an
+//!   exact pre-effect side exit.
 //!
 //! # See also
-//! - [`crate::arm64::calls`] — shared compiled-to-compiled call emission.
+//! - [`crate::arm64`] — shared generated call and method-guard emission.
 //! - [`super::transitions`] — descriptor-resolved entries used here.
+
+use std::collections::BTreeMap;
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::native_abi as abi;
-use otter_vm::{JitCompileSnapshot, JitInlineMethod, closure::JS_CLOSURE_BODY_TYPE_TAG};
+use otter_vm::{
+    JitCompileSnapshot, JitInlineCallee, JitInlineMethod, closure::JS_CLOSURE_BODY_TYPE_TAG,
+    value::tag as value_tag,
+};
 
 use super::collections::{
     MethodSite, emit_alloc_method_guarded_call, emit_leaf_method_guarded_call,
@@ -42,7 +48,11 @@ use super::values::{
     emit_box_double, emit_box_int32, emit_decompress_slot, emit_load_reg, emit_load_runtime_stub,
     emit_load_symbol_u64, emit_load_u64, emit_num_to_double, emit_slab_base, emit_store_reg,
 };
-use crate::arm64::{CallTrampoline, emit_prepared_call};
+use crate::arm64::{
+    DirectCallForm, DirectCallSite, MethodGuardSite, StaticNativeCallSite, direct_call_artifact,
+    direct_call_target_is_supported, emit_direct_call, emit_method_guard, emit_static_native_call,
+    static_native_target_is_supported,
+};
 use crate::artifact::relocation::{
     RelocationCapture, RelocationTarget, TemplateOperandArena, TemplateOperandRole,
 };
@@ -50,24 +60,18 @@ use crate::artifact::{
     CodeMapCapture, CodeRegion, InlineScratchEntryArtifact, InlineScratchLayoutArtifact,
     InlineSiteArtifact,
 };
-use crate::entry::{NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, Unsupported, VALUE_UNDEFINED};
+use crate::entry::{NUMBER_TAG_HI16, Unsupported, VALUE_UNDEFINED};
 use crate::template::{
-    ArithKind, InlineEntryValue, InlineMethodPlan, InlineScratchSlot, TemplateOp, TemplatePlan,
+    ArithKind, InlineEntryValue, InlineLeafPlan, InlineScratchSlot, TemplateOp, TemplatePlan,
     TemplateTail,
 };
 
-#[derive(Debug, Clone, Copy)]
-struct InlineMethodEmission {
-    miss_replay_start: usize,
-    inline_site: InlineSiteArtifact,
-    function_id: u32,
-}
-
 fn inline_scratch_artifact(
-    method: &JitInlineMethod,
-    plan: &InlineMethodPlan<'_>,
+    parameter_count: u16,
+    register_count: u16,
+    plan: &InlineLeafPlan<'_>,
 ) -> InlineScratchLayoutArtifact {
-    let register_slots = (0..method.register_count)
+    let register_slots = (0..register_count)
         .map(|register| plan.register_slot(register).map(InlineScratchSlot::index))
         .collect();
     let entry_values = plan
@@ -95,8 +99,8 @@ fn inline_scratch_artifact(
         })
         .collect();
     InlineScratchLayoutArtifact {
-        parameter_count: method.param_count,
-        virtual_register_count: method.register_count,
+        parameter_count,
+        virtual_register_count: register_count,
         scratch_slot_count: plan.slot_count(),
         slot_bytes: 8,
         stack_alignment_bytes: 16,
@@ -108,26 +112,42 @@ fn inline_scratch_artifact(
     }
 }
 
-/// Build the current template plan for one baked method body.
+/// Build the current template plan for one baked leaf body.
 ///
 /// PORT NOTE: the deleted legacy baseline emitter decoded the method body a
 /// second time. This port deliberately reuses the current typed TemplatePlan,
 /// keeping operand validation and opcode shapes in one backend-neutral path.
+fn inline_leaf_template_plan(
+    view: &JitCompileSnapshot,
+    code_block: &std::sync::Arc<otter_vm::CodeBlock>,
+    instructions: &[otter_vm::JitInstructionMetadata],
+) -> Result<TemplatePlan, Unsupported> {
+    let mut leaf_view = view.clone();
+    leaf_view.code_block = code_block.clone();
+    leaf_view.instructions = instructions.to_vec();
+    leaf_view.inline_callees.clear();
+    leaf_view.direct_callees.clear();
+    leaf_view.inline_methods.clear();
+    leaf_view.inline_poly_methods.clear();
+    leaf_view.collection_leaf_methods.clear();
+    leaf_view.collection_alloc_methods.clear();
+    leaf_view.array_methods.clear();
+    leaf_view.primitive_method_guards.clear();
+    TemplatePlan::build(&leaf_view)
+}
+
 fn inline_method_template_plan(
     view: &JitCompileSnapshot,
     method: &JitInlineMethod,
 ) -> Result<TemplatePlan, Unsupported> {
-    let mut method_view = view.clone();
-    method_view.code_block = method.code_block.clone();
-    method_view.instructions = method.instructions.clone();
-    method_view.inline_callees.clear();
-    method_view.inline_methods.clear();
-    method_view.inline_poly_methods.clear();
-    method_view.collection_leaf_methods.clear();
-    method_view.collection_alloc_methods.clear();
-    method_view.array_methods.clear();
-    method_view.primitive_method_guards.clear();
-    TemplatePlan::build(&method_view)
+    inline_leaf_template_plan(view, &method.code_block, &method.instructions)
+}
+
+fn inline_callee_template_plan(
+    view: &JitCompileSnapshot,
+    callee: &JitInlineCallee,
+) -> Result<TemplatePlan, Unsupported> {
+    inline_leaf_template_plan(view, &callee.code_block, &callee.instructions)
 }
 
 pub(super) fn has_emit_eligible_inline_method(view: &JitCompileSnapshot) -> bool {
@@ -146,7 +166,7 @@ pub(super) fn has_emit_eligible_inline_method(view: &JitCompileSnapshot) -> bool
         };
         inline_method_template_plan(view, method).is_ok_and(|method_plan| {
             view.cage_base != 0
-                && InlineMethodPlan::build(method, &method_plan, usize::from(argc)).is_some()
+                && InlineLeafPlan::build_method(method, &method_plan, usize::from(argc)).is_some()
         })
     })
 }
@@ -261,225 +281,40 @@ fn emit_inline_receiver_property(
     Ok(())
 }
 
-/// Emit one exact receiver/method guard plus a replay-safe scratch body.
+#[derive(Debug, Clone, Copy)]
+struct InlineBodySpec<'a> {
+    function_id: u32,
+    parameter_count: u16,
+    register_count: u16,
+    arguments: [Option<u16>; 2],
+    receiver: Option<u16>,
+    method: Option<&'a JitInlineMethod>,
+    inline_site: InlineSiteArtifact,
+    body_region: &'static str,
+    hit_epilogue_region: &'static str,
+    deopt_teardown_region: &'static str,
+}
+
+/// Emit one already-guarded leaf body over compact scratch storage.
 ///
-/// A miss label is bound at the end so the caller can append the existing
-/// collection/direct/generic method dispatch without duplicating it.
+/// `body_deopt` balances scratch allocated after the identity guard, then
+/// branches to the caller's exact pre-effect deopt exit. Keeping teardown in
+/// one emitter prevents call and method splices from drifting in stack
+/// discipline or code-map coverage.
 #[allow(clippy::too_many_arguments)]
-fn try_emit_inline_numeric_method(
+fn emit_inline_leaf_body(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
-    method: &JitInlineMethod,
+    plan: &InlineLeafPlan<'_>,
+    spec: InlineBodySpec<'_>,
     dst: u16,
-    receiver: u16,
-    argc: u16,
-    arg0: Option<u16>,
-    arg1: Option<u16>,
-    call_logical_pc: u32,
-    call_byte_pc: u32,
     mut code_map: Option<&mut CodeMapCapture>,
     done: DynamicLabel,
-) -> Result<Option<InlineMethodEmission>, Unsupported> {
-    let template_plan = inline_method_template_plan(view, method)?;
-    let Some(plan) = (view.cage_base != 0)
-        .then(|| InlineMethodPlan::build(method, &template_plan, usize::from(argc)))
-        .flatten()
-    else {
-        if std::env::var_os("OTTER_JIT_TRACE").is_some() {
-            eprintln!(
-                "[otter-jit] template inline method skip fid={} argc={} params={} regs={} ops={:?}",
-                method.method_fid,
-                argc,
-                method.param_count,
-                method.register_count,
-                template_plan
-                    .instructions
-                    .iter()
-                    .map(|instruction| instruction.op)
-                    .collect::<Vec<_>>(),
-            );
-        }
-        return Ok(None);
-    };
-    if std::env::var_os("OTTER_JIT_TRACE").is_some() {
-        eprintln!(
-            "[otter-jit] template inline method emit fid={} argc={} regs={} scratch_slots={} scratch_bytes={}",
-            method.method_fid,
-            argc,
-            method.register_count,
-            plan.slot_count(),
-            plan.aligned_scratch_bytes(),
-        );
-    }
-    let inline_site = InlineSiteArtifact {
-        caller_function_id: view.code_block.id,
-        logical_pc: call_logical_pc,
-        byte_pc: call_byte_pc,
-        has_receiver_property: plan.has_receiver_property(),
-    };
-    let arguments = match (argc, arg0, arg1) {
-        (0, _, _) => [None, None],
-        (1, Some(first), _) => [Some(first), None],
-        (2, Some(first), Some(second)) => [Some(first), Some(second)],
-        _ => return Ok(None),
-    };
-    let miss = ops.new_dynamic_label();
-    let body_miss = ops.new_dynamic_label();
+    deopt: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let body_deopt = ops.new_dynamic_label();
     let inline_done = ops.new_dynamic_label();
-    let method_closure = ops.new_dynamic_label();
-    let method_guarded = ops.new_dynamic_label();
-    let guard_start = ops.offset().0;
-
-    // Receiver tag/type/shape guard.
-    emit_load_reg(ops, 9, receiver)?;
-    dynasm!(ops
-        ; .arch aarch64
-        ; movz x11, NUMBER_TAG_HI16, lsl #48
-        ; orr x11, x11, #0x2
-        ; tst x9, x11
-        ; b.ne =>miss
-        ; mov w12, w9
-    );
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        13,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; add x13, x13, x12
-        ; ldrb w14, [x13]
-        ; cmp w14, OBJECT_BODY_TYPE_TAG
-        ; b.ne =>miss
-        ; ldr w14, [x13, view.object_shape_byte]
-    );
-    emit_load_u64(ops, 15, u64::from(method.recv_shape));
-    dynasm!(ops ; .arch aarch64 ; cmp w14, w15 ; b.ne =>miss);
-    if plan.has_receiver_property() {
-        // Preserve the exact shape-guarded receiver body while `x13` chases
-        // the possibly distinct prototype holder of the method slot.
-        dynasm!(ops ; .arch aarch64 ; mov x17, x13);
-    }
-
-    // Chase the baked direct prototype chain, guarding each holder shape.
-    for &hop_shape in &method.proto_chain {
-        dynasm!(ops
-            ; .arch aarch64
-            ; ldr w9, [x13, view.jit_proto_byte]
-            ; cbz w9, =>miss
-        );
-        emit_load_symbol_u64(
-            ops,
-            relocations,
-            12,
-            view.cage_base as u64,
-            RelocationTarget::GcCageBase,
-        );
-        dynasm!(ops
-            ; .arch aarch64
-            ; add x13, x12, x9
-            ; ldrb w14, [x13]
-            ; cmp w14, OBJECT_BODY_TYPE_TAG
-            ; b.ne =>miss
-            ; ldr w14, [x13, view.object_shape_byte]
-        );
-        emit_load_u64(ops, 15, u64::from(hop_shape));
-        dynasm!(ops ; .arch aarch64 ; cmp w14, w15 ; b.ne =>miss);
-    }
-
-    // Re-read the method slot. A closure is accepted only when its function id
-    // matches and no bound/runtime-setup state can alter ordinary method-call
-    // receiver semantics.
-    emit_slab_base(ops, view, 13, 14);
-    dynasm!(ops
-        ; .arch aarch64
-        ; cbz x13, =>miss
-        ; ldr w9, [x13, method.method_value_byte]
-    );
-    use otter_vm::value::compressed as cslot;
-    debug_assert_eq!(cslot::TAG_MASK, 0b111);
-    debug_assert_eq!(cslot::TAG_FUNCTION_ID, 0b110);
-    dynasm!(ops
-        ; .arch aarch64
-        ; and w10, w9, cslot::TAG_MASK
-        ; cbz w10, =>method_closure
-    );
-    if let Some(compressed_fid) = (method.method_fid <= u32::MAX >> 3)
-        .then_some((method.method_fid << 3) | cslot::TAG_FUNCTION_ID)
-    {
-        emit_load_u64(ops, 10, u64::from(compressed_fid));
-        dynasm!(ops
-            ; .arch aarch64
-            ; cmp w9, w10
-            ; b.eq =>method_guarded
-        );
-    }
-    dynasm!(ops
-        ; .arch aarch64
-        ; b =>miss
-        ; =>method_closure
-        ; cbz w9, =>miss
-        ; mov w12, w9
-    );
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        11,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
-    let closure_fid_byte = view.closure_call_layout.function_id_byte;
-    let closure_flags_byte = view.closure_call_layout.flags_byte;
-    let incompatible_call_flags =
-        view.closure_call_layout.runtime_setup_flags | view.closure_call_layout.bound_this_flag;
-    dynasm!(ops
-        ; .arch aarch64
-        ; add x11, x11, x12
-        ; ldrb w14, [x11]
-        ; cmp w14, JS_CLOSURE_BODY_TYPE_TAG as u32
-        ; b.ne =>miss
-        ; ldr w14, [x11, closure_flags_byte]
-    );
-    emit_load_u64(ops, 15, u64::from(incompatible_call_flags));
-    dynasm!(ops
-        ; .arch aarch64
-        ; tst w14, w15
-        ; b.ne =>miss
-        ; ldr w14, [x11, closure_fid_byte]
-    );
-    emit_load_u64(ops, 15, u64::from(method.method_fid));
-    dynasm!(ops
-        ; .arch aarch64
-        ; cmp w14, w15
-        ; b.ne =>miss
-        ; =>method_guarded
-    );
-    if plan.has_receiver_property() {
-        // Receiver-property offsets were baked from `recv_shape`, whose guard
-        // already succeeded above. Materialize its slab once for every sealed
-        // receiver-property load in the straight-line inline body.
-        dynasm!(ops ; .arch aarch64 ; mov x13, x17);
-        emit_slab_base(ops, view, 13, 14);
-        dynasm!(ops
-            ; .arch aarch64
-            ; cbz x13, =>miss
-            ; mov x17, x13
-        );
-    }
-
-    let guard_end = ops.offset().0;
-    if let Some(code_map) = code_map.as_deref_mut() {
-        code_map.record(CodeRegion::inline_structural(
-            "inlineMethodGuard",
-            guard_start,
-            guard_end,
-            inline_site,
-            method.method_fid,
-        ));
-    }
 
     // Compact scratch is unobservable and contains no safepoint. `x19` stays
     // on the published caller window; only explicit `sp`-relative helpers may
@@ -493,15 +328,19 @@ fn try_emit_inline_numeric_method(
     for &entry in plan.entry_values() {
         match entry {
             InlineEntryValue::Argument { argument, slot, .. } => {
-                let caller_register = arguments
+                let caller_register = spec
+                    .arguments
                     .get(usize::from(argument))
                     .copied()
                     .flatten()
-                    .expect("validated inline method argument");
+                    .ok_or(Unsupported::OperandShape("inline leaf argument"))?;
                 emit_load_reg(ops, 9, caller_register)?;
                 emit_store_inline_slot(ops, 9, slot);
             }
             InlineEntryValue::Receiver { slot } => {
+                let receiver = spec
+                    .receiver
+                    .ok_or(Unsupported::OperandShape("inline leaf receiver"))?;
                 emit_load_reg(ops, 9, receiver)?;
                 emit_store_inline_slot(ops, 9, slot);
             }
@@ -520,9 +359,9 @@ fn try_emit_inline_numeric_method(
         code_map.record(CodeRegion::inline_scratch(
             scratch_start,
             scratch_end,
-            inline_site,
-            method.method_fid,
-            inline_scratch_artifact(method, &plan),
+            spec.inline_site,
+            spec.function_id,
+            inline_scratch_artifact(spec.parameter_count, spec.register_count, plan),
         ));
     }
 
@@ -562,6 +401,9 @@ fn try_emit_inline_numeric_method(
                 }
             }
             TemplateOp::LoadProperty { dst, .. } => {
+                let method = spec
+                    .method
+                    .ok_or(Unsupported::OperandShape("inline callee property load"))?;
                 let dst = plan
                     .register_slot(dst)
                     .ok_or(Unsupported::OperandShape("inline scratch destination"))?;
@@ -569,7 +411,7 @@ fn try_emit_inline_numeric_method(
                     .prop_offsets
                     .get(&instruction.byte_pc)
                     .ok_or(Unsupported::OperandShape("inline method property offset"))?;
-                emit_inline_receiver_property(ops, relocations, view, dst, value_byte, body_miss)?;
+                emit_inline_receiver_property(ops, relocations, view, dst, value_byte, body_deopt)?;
             }
             TemplateOp::ToPrimitive { dst, src, .. } | TemplateOp::ToNumeric { dst, src } => {
                 let dst = plan
@@ -578,7 +420,7 @@ fn try_emit_inline_numeric_method(
                 let src = plan
                     .register_slot(src)
                     .ok_or(Unsupported::OperandShape("inline scratch source"))?;
-                emit_inline_number_identity(ops, dst, src, body_miss);
+                emit_inline_number_identity(ops, dst, src, body_deopt);
             }
             TemplateOp::AddGeneric { dst, lhs, rhs, .. } => {
                 let dst = plan
@@ -590,7 +432,7 @@ fn try_emit_inline_numeric_method(
                 let rhs = plan
                     .register_slot(rhs)
                     .ok_or(Unsupported::OperandShape("inline scratch rhs"))?;
-                emit_inline_numeric_add(ops, dst, lhs, rhs, body_miss);
+                emit_inline_numeric_add(ops, dst, lhs, rhs, body_deopt);
             }
             TemplateOp::BinaryArith {
                 dst,
@@ -607,7 +449,7 @@ fn try_emit_inline_numeric_method(
                 let rhs = plan
                     .register_slot(rhs)
                     .ok_or(Unsupported::OperandShape("inline scratch rhs"))?;
-                emit_inline_numeric_binary(ops, dst, lhs, rhs, kind, body_miss)?;
+                emit_inline_numeric_binary(ops, dst, lhs, rhs, kind, body_deopt)?;
             }
             TemplateOp::Return { src } => {
                 let src = plan
@@ -626,8 +468,8 @@ fn try_emit_inline_numeric_method(
             code_map.record(CodeRegion::inline_instruction(
                 instruction_start,
                 ops.offset().0,
-                inline_site,
-                method.method_fid,
+                spec.inline_site,
+                spec.function_id,
                 instruction.pc,
                 instruction.byte_pc,
                 u32::try_from(operation_index).unwrap_or(u32::MAX),
@@ -638,11 +480,11 @@ fn try_emit_inline_numeric_method(
     let body_end = ops.offset().0;
     if let Some(code_map) = code_map.as_deref_mut() {
         code_map.record(CodeRegion::inline_structural(
-            "inlineMethodBody",
+            spec.body_region,
             body_start,
             body_end,
-            inline_site,
-            method.method_fid,
+            spec.inline_site,
+            spec.function_id,
         ));
     }
 
@@ -652,37 +494,316 @@ fn try_emit_inline_numeric_method(
         dynasm!(ops ; .arch aarch64 ; add sp, sp, scratch_bytes);
     }
     emit_store_reg(ops, 9, dst)?;
-    dynasm!(ops ; .arch aarch64 ; b =>done ; =>body_miss);
+    dynasm!(ops ; .arch aarch64 ; b =>done);
     let hit_epilogue_end = ops.offset().0;
     if let Some(code_map) = code_map.as_deref_mut() {
         code_map.record(CodeRegion::inline_structural(
-            "inlineMethodHitEpilogue",
+            spec.hit_epilogue_region,
             hit_epilogue_start,
             hit_epilogue_end,
-            inline_site,
-            method.method_fid,
+            spec.inline_site,
+            spec.function_id,
         ));
     }
-    let miss_replay_start = ops.offset().0;
+
+    dynasm!(ops ; .arch aarch64 ; =>body_deopt);
+    let deopt_teardown_start = ops.offset().0;
     if scratch_bytes != 0 {
         dynasm!(ops ; .arch aarch64 ; add sp, sp, scratch_bytes);
     }
-    dynasm!(ops ; .arch aarch64 ; =>miss);
-    let miss_entry = ops.offset().0;
+    dynasm!(ops ; .arch aarch64 ; b =>deopt);
+    let deopt_teardown_end = ops.offset().0;
     if let Some(code_map) = code_map {
         code_map.record(CodeRegion::inline_structural(
-            "inlineMethodMissTeardown",
-            miss_replay_start,
-            miss_entry,
-            inline_site,
-            method.method_fid,
+            spec.deopt_teardown_region,
+            deopt_teardown_start,
+            deopt_teardown_end,
+            spec.inline_site,
+            spec.function_id,
         ));
     }
-    Ok(Some(InlineMethodEmission {
-        miss_replay_start: miss_entry,
-        inline_site,
-        function_id: method.method_fid,
-    }))
+    Ok(())
+}
+
+/// Emit one exact receiver/method guard plus a deopt-safe scratch body.
+#[allow(clippy::too_many_arguments)]
+fn try_emit_inline_numeric_method(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    method: &JitInlineMethod,
+    dst: u16,
+    receiver: u16,
+    argc: u16,
+    arg0: Option<u16>,
+    arg1: Option<u16>,
+    call_logical_pc: u32,
+    call_byte_pc: u32,
+    mut code_map: Option<&mut CodeMapCapture>,
+    done: DynamicLabel,
+    bail: DynamicLabel,
+) -> Result<bool, Unsupported> {
+    let template_plan = inline_method_template_plan(view, method)?;
+    let Some(plan) = (view.cage_base != 0)
+        .then(|| InlineLeafPlan::build_method(method, &template_plan, usize::from(argc)))
+        .flatten()
+    else {
+        if std::env::var_os("OTTER_JIT_TRACE").is_some() {
+            eprintln!(
+                "[otter-jit] template inline method skip fid={} argc={} params={} regs={} ops={:?}",
+                method.guard.method_fid,
+                argc,
+                method.param_count,
+                method.register_count,
+                template_plan
+                    .instructions
+                    .iter()
+                    .map(|instruction| instruction.op)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        return Ok(false);
+    };
+    if std::env::var_os("OTTER_JIT_TRACE").is_some() {
+        eprintln!(
+            "[otter-jit] template inline method emit fid={} argc={} regs={} scratch_slots={} scratch_bytes={}",
+            method.guard.method_fid,
+            argc,
+            method.register_count,
+            plan.slot_count(),
+            plan.aligned_scratch_bytes(),
+        );
+    }
+    let inline_site = InlineSiteArtifact {
+        caller_function_id: view.code_block.id,
+        logical_pc: call_logical_pc,
+        byte_pc: call_byte_pc,
+        has_receiver_property: plan.has_receiver_property(),
+    };
+    let arguments = match (argc, arg0, arg1) {
+        (0, _, _) => [None, None],
+        (1, Some(first), _) => [Some(first), None],
+        (2, Some(first), Some(second)) => [Some(first), Some(second)],
+        _ => return Ok(false),
+    };
+    let guard_start = ops.offset().0;
+    emit_method_guard(
+        ops,
+        relocations,
+        view,
+        MethodGuardSite {
+            guard: &method.guard,
+            receiver,
+        },
+        17,
+        plan.has_receiver_property().then_some(16),
+        bail,
+    )?;
+    if plan.has_receiver_property() {
+        // Receiver-property offsets were baked from `recv_shape`, whose guard
+        // already succeeded above. Materialize its slab once for every sealed
+        // receiver-property load in the straight-line inline body.
+        dynasm!(ops ; .arch aarch64 ; mov x13, x16);
+        emit_slab_base(ops, view, 13, 14);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cbz x13, =>bail
+            ; mov x17, x13
+        );
+    }
+
+    let guard_end = ops.offset().0;
+    if let Some(code_map) = code_map.as_deref_mut() {
+        code_map.record(CodeRegion::inline_structural(
+            "inlineMethodGuard",
+            guard_start,
+            guard_end,
+            inline_site,
+            method.guard.method_fid,
+        ));
+    }
+
+    emit_inline_leaf_body(
+        ops,
+        relocations,
+        view,
+        &plan,
+        InlineBodySpec {
+            function_id: method.guard.method_fid,
+            parameter_count: method.param_count,
+            register_count: method.register_count,
+            arguments,
+            receiver: Some(receiver),
+            method: Some(method),
+            inline_site,
+            body_region: "inlineMethodBody",
+            hit_epilogue_region: "inlineMethodHitEpilogue",
+            deopt_teardown_region: "inlineMethodDeoptTeardown",
+        },
+        dst,
+        code_map,
+        done,
+        bail,
+    )?;
+    Ok(true)
+}
+
+fn inline_argument_registers(argc: u16, argument_registers: &[u16]) -> Option<[Option<u16>; 2]> {
+    if argument_registers.len() != usize::from(argc) {
+        return None;
+    }
+    match argc {
+        0 => Some([None, None]),
+        1 => Some([Some(argument_registers[0]), None]),
+        2 => Some([Some(argument_registers[0]), Some(argument_registers[1])]),
+        _ => None,
+    }
+}
+
+/// Emit one exact plain-callee identity guard plus deopt-safe leaf body.
+///
+/// Function-id immediates and closure cells share the same body identity. A
+/// closure additionally must not require runtime call setup; bound lexical
+/// `this` remains eligible because the plain-callee planner rejects
+/// `LoadThis`. Every guard failure deoptimizes the original `Call` before
+/// effects.
+#[allow(clippy::too_many_arguments)]
+fn try_emit_inline_numeric_callee(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    callee: &JitInlineCallee,
+    dst: u16,
+    callee_register: u16,
+    argc: u16,
+    argument_registers: &[u16],
+    call_logical_pc: u32,
+    call_byte_pc: u32,
+    mut code_map: Option<&mut CodeMapCapture>,
+    done: DynamicLabel,
+    bail: DynamicLabel,
+) -> Result<bool, Unsupported> {
+    let template_plan = inline_callee_template_plan(view, callee)?;
+    let Some(plan) = InlineLeafPlan::build_callee(callee, &template_plan, usize::from(argc)) else {
+        if std::env::var_os("OTTER_JIT_TRACE").is_some() {
+            eprintln!(
+                "[otter-jit] template inline call skip fid={} argc={} params={} regs={} ops={:?}",
+                callee.function_id,
+                argc,
+                callee.param_count,
+                callee.register_count,
+                template_plan
+                    .instructions
+                    .iter()
+                    .map(|instruction| instruction.op)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        return Ok(false);
+    };
+    let Some(arguments) = inline_argument_registers(argc, argument_registers) else {
+        return Ok(false);
+    };
+    if std::env::var_os("OTTER_JIT_TRACE").is_some() {
+        eprintln!(
+            "[otter-jit] template inline call emit fid={} argc={} regs={} scratch_slots={} scratch_bytes={}",
+            callee.function_id,
+            argc,
+            callee.register_count,
+            plan.slot_count(),
+            plan.aligned_scratch_bytes(),
+        );
+    }
+
+    let inline_site = InlineSiteArtifact {
+        caller_function_id: view.code_block.id,
+        logical_pc: call_logical_pc,
+        byte_pc: call_byte_pc,
+        has_receiver_property: false,
+    };
+    let closure = ops.new_dynamic_label();
+    let guarded = ops.new_dynamic_label();
+    let guard_start = ops.offset().0;
+
+    emit_load_reg(ops, 9, callee_register)?;
+    emit_load_u64(ops, 10, value_tag::box_function_id(callee.function_id));
+    dynasm!(ops
+        ; .arch aarch64
+        ; cmp x9, x10
+        ; b.eq =>guarded
+        ; cbz x9, =>bail
+    );
+    emit_load_u64(ops, 10, value_tag::NOT_CELL_MASK);
+    dynasm!(ops
+        ; .arch aarch64
+        ; tst x9, x10
+        ; b.eq =>closure
+        ; b =>bail
+        ; =>closure
+        // Heap-cell Values already carry the full pointer. No cage relocation
+        // belongs on this path.
+        ; ldrb w11, [x9]
+        ; cmp w11, JS_CLOSURE_BODY_TYPE_TAG as u32
+        ; b.ne =>bail
+    );
+    let closure_flags_byte = view.closure_call_layout.flags_byte;
+    let closure_fid_byte = view.closure_call_layout.function_id_byte;
+    if view.closure_call_layout.runtime_setup_flags != 0 {
+        dynasm!(ops ; .arch aarch64 ; ldr w11, [x9, closure_flags_byte]);
+        emit_load_u64(
+            ops,
+            12,
+            u64::from(view.closure_call_layout.runtime_setup_flags),
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; tst w11, w12
+            ; b.ne =>bail
+        );
+    }
+    dynasm!(ops ; .arch aarch64 ; ldr w11, [x9, closure_fid_byte]);
+    emit_load_u64(ops, 12, u64::from(callee.function_id));
+    dynasm!(ops
+        ; .arch aarch64
+        ; cmp w11, w12
+        ; b.ne =>bail
+        ; =>guarded
+    );
+
+    let guard_end = ops.offset().0;
+    if let Some(code_map) = code_map.as_deref_mut() {
+        code_map.record(CodeRegion::inline_structural(
+            "inlineCallGuard",
+            guard_start,
+            guard_end,
+            inline_site,
+            callee.function_id,
+        ));
+    }
+
+    emit_inline_leaf_body(
+        ops,
+        relocations,
+        view,
+        &plan,
+        InlineBodySpec {
+            function_id: callee.function_id,
+            parameter_count: callee.param_count,
+            register_count: callee.register_count,
+            arguments,
+            receiver: None,
+            method: None,
+            inline_site,
+            body_region: "inlineCallBody",
+            hit_epilogue_region: "inlineCallHitEpilogue",
+            deopt_teardown_region: "inlineCallDeoptTeardown",
+        },
+        dst,
+        code_map,
+        done,
+        bail,
+    )?;
+    Ok(true)
 }
 
 fn emit_packed_args(
@@ -713,94 +834,211 @@ fn emit_packed_args(
 
 /// Emit `dst = callee(args…)` (plain `Op::Call`).
 ///
-/// The prepare transition resolves the callee against installed code and
-/// stages the callee window/identity in the entry context (`0`), throws
-/// (`1`), or reports an ineligible callee (`2`), which then completes
-/// through the generic in-place call transition — the compiled caller keeps
-/// running for every callable. Only a non-callable value takes the exact
-/// side exit so the interpreter owns the thrown error.
+/// A baked monomorphic pure leaf gets an exact guarded splice. Otherwise a
+/// baked stable code-entry plan emits the complete rooted native call in
+/// machine code. Missing plans and all pre-effect guard/setup failures
+/// deoptimize the original opcode; plain calls never prepare, replay, or enter
+/// a generic call transition.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
-    call_trampoline: &CallTrampoline,
+    view: &JitCompileSnapshot,
+    code_dependencies: &mut BTreeMap<u32, u64>,
+    mut direct_call_events: Option<&mut BTreeMap<u32, otter_vm::JitCompilerDiagnostic>>,
+    mut code_map: Option<&mut CodeMapCapture>,
     dst: u16,
     callee: u16,
     argc: u16,
-    packed_args: u64,
-    packed_args_tail: Option<TemplateTail>,
+    argument_registers: &[u16],
+    logical_pc: u32,
+    byte_pc: u32,
     bail: DynamicLabel,
     threw: DynamicLabel,
-) {
+) -> Result<(), Unsupported> {
     let done = ops.new_dynamic_label();
-    let generic = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch aarch64
-        ; mov x0, x20
-        ; movz x1, callee as u32
-        ; movz x2, argc as u32
-    );
-    emit_packed_args(
-        ops,
-        relocations,
-        3,
-        packed_args,
-        packed_args_tail,
-        TemplateOperandRole::CallArguments,
-    );
-    emit_load_runtime_stub(
-        ops,
-        relocations,
-        16,
-        table.entry(abi::STUB_JIT_PREPARE_DIRECT_CALL),
-        abi::STUB_JIT_PREPARE_DIRECT_CALL,
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; cmp x0, #1
-        ; b.eq =>threw
-        ; cmp x0, #2
-        ; b.eq =>generic
-    );
-    emit_prepared_call(ops, relocations, call_trampoline, dst, bail, threw, done);
+    if let Some(target) = view.static_native_calls.get(&byte_pc) {
+        let site = StaticNativeCallSite {
+            target,
+            caller_function_id: view.code_block.id,
+            logical_pc,
+            byte_pc,
+            argc: usize::from(argc),
+        };
+        if let Some(&argument) = argument_registers.first()
+            && static_native_target_is_supported(view, site)
+        {
+            emit_load_reg(ops, 9, callee)?;
+            emit_load_reg(ops, 10, argument)?;
+            emit_static_native_call(
+                ops,
+                relocations,
+                view,
+                site,
+                9,
+                10,
+                code_map.as_deref_mut(),
+                bail,
+            )?;
+            emit_store_reg(ops, 9, dst)?;
+            if let Some(events) = direct_call_events.as_deref_mut() {
+                events.insert(
+                    byte_pc,
+                    otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
+                        instruction_pc: logical_pc,
+                        byte_pc,
+                        target: target.kind,
+                        outcome: otter_vm::JitStaticNativeCallLoweringOutcome::Generated,
+                    },
+                );
+            }
+            dynasm!(ops ; .arch aarch64 ; b =>done ; =>done);
+            return Ok(());
+        }
+        if let Some(events) = direct_call_events.as_deref_mut() {
+            events.insert(
+                byte_pc,
+                otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
+                    instruction_pc: logical_pc,
+                    byte_pc,
+                    target: target.kind,
+                    outcome: otter_vm::JitStaticNativeCallLoweringOutcome::Rejected {
+                        reason: if argument_registers.is_empty() {
+                            otter_vm::JitStaticNativeCallLoweringRejectionReason::ArityUnsupported
+                        } else {
+                            otter_vm::JitStaticNativeCallLoweringRejectionReason::LayoutUnsupported
+                        },
+                    },
+                },
+            );
+        }
+        dynasm!(ops ; .arch aarch64 ; b =>bail);
+        return Ok(());
+    }
+    let direct_target = view.direct_callees.get(&byte_pc);
+    if let Some(candidate) = view.inline_callees.get(&byte_pc) {
+        if try_emit_inline_numeric_callee(
+            ops,
+            relocations,
+            view,
+            candidate,
+            dst,
+            callee,
+            argc,
+            argument_registers,
+            logical_pc,
+            byte_pc,
+            code_map.as_deref_mut(),
+            done,
+            bail,
+        )? {
+            if let (Some(events), Some(target)) = (direct_call_events.as_deref_mut(), direct_target)
+            {
+                events.insert(
+                    byte_pc,
+                    direct_call_lowering_event(
+                        otter_vm::JitDirectCallKind::Plain,
+                        logical_pc,
+                        byte_pc,
+                        target,
+                        otter_vm::JitDirectCallLoweringOutcome::Inlined,
+                    ),
+                );
+            }
+            dynasm!(ops ; .arch aarch64 ; =>done);
+            return Ok(());
+        }
+    }
 
-    // Ineligible callee: complete the whole opcode through the generic
-    // in-place call transition; only its non-callable report (`2`)
-    // side-exits to normal dispatch.
-    dynasm!(ops
-        ; .arch aarch64
-        ; =>generic
-        ; mov x0, x20
-        ; movz x1, dst as u32
-        ; movz x2, callee as u32
-        ; movz x3, argc as u32
-    );
-    emit_packed_args(
-        ops,
-        relocations,
-        4,
-        packed_args,
-        packed_args_tail,
-        TemplateOperandRole::CallArguments,
-    );
-    emit_load_runtime_stub(
-        ops,
-        relocations,
-        16,
-        table.entry(abi::STUB_JIT_CALL_GENERIC),
-        abi::STUB_JIT_CALL_GENERIC,
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; cmp x0, #1
-        ; b.eq =>threw
-        ; cmp x0, #2
-        ; b.eq =>bail
-        ; =>done
-    );
+    if let Some(target) = direct_target.filter(|target| direct_call_target_is_supported(target)) {
+        emit_direct_call(
+            ops,
+            relocations,
+            view,
+            DirectCallSite {
+                target,
+                caller_function_id: view.code_block.id,
+                logical_pc,
+                byte_pc,
+                dst,
+                form: DirectCallForm::Plain { callable: callee },
+                arguments: argument_registers,
+            },
+            table.entry(abi::STUB_JIT_DEOPT_STACK_CALL),
+            code_map,
+            bail,
+            threw,
+            done,
+        )?;
+        let previous =
+            code_dependencies.insert(target.plan.function_id, target.plan.code_object_id);
+        debug_assert!(
+            previous.is_none_or(|code_object_id| code_object_id == target.plan.code_object_id),
+            "one compile snapshot cannot name two generations for one callee"
+        );
+        if let Some(events) = direct_call_events.as_deref_mut() {
+            events.insert(
+                byte_pc,
+                direct_call_lowering_event(
+                    otter_vm::JitDirectCallKind::Plain,
+                    logical_pc,
+                    byte_pc,
+                    target,
+                    otter_vm::JitDirectCallLoweringOutcome::Generated {
+                        code_object_id: target.plan.code_object_id,
+                        target_tier: direct_call_target_tier(target),
+                        this_mode: target.plan.this_mode,
+                    },
+                ),
+            );
+        }
+        dynasm!(ops ; .arch aarch64 ; =>done);
+        return Ok(());
+    }
+
+    if let (Some(events), Some(target)) = (direct_call_events.as_deref_mut(), direct_target) {
+        events.insert(
+            byte_pc,
+            direct_call_lowering_event(
+                otter_vm::JitDirectCallKind::Plain,
+                logical_pc,
+                byte_pc,
+                target,
+                otter_vm::JitDirectCallLoweringOutcome::Rejected {
+                    reason: otter_vm::JitDirectCallLoweringRejectionReason::LayoutUnsupported,
+                },
+            ),
+        );
+    }
+    dynasm!(ops ; .arch aarch64 ; b =>bail);
+    Ok(())
+}
+
+fn direct_call_target_tier(target: &otter_vm::JitDirectCallee) -> otter_vm::JitDebugTier {
+    match target.plan.tier {
+        abi::NativeFrameKind::Baseline => otter_vm::JitDebugTier::Template,
+        abi::NativeFrameKind::Optimizing => otter_vm::JitDebugTier::Optimizing,
+        abi::NativeFrameKind::Interpreter => {
+            unreachable!("interpreter has no entry-capable code generation")
+        }
+    }
+}
+
+fn direct_call_lowering_event(
+    call_kind: otter_vm::JitDirectCallKind,
+    logical_pc: u32,
+    byte_pc: u32,
+    target: &otter_vm::JitDirectCallee,
+    outcome: otter_vm::JitDirectCallLoweringOutcome,
+) -> otter_vm::JitCompilerDiagnostic {
+    otter_vm::JitCompilerDiagnostic::DirectCallLowered {
+        call_kind,
+        instruction_pc: logical_pc,
+        byte_pc,
+        callee_function_id: target.plan.function_id,
+        outcome,
+    }
 }
 
 /// Emit `dst = new callee(args…)` (`Op::New`).
@@ -857,31 +1095,24 @@ pub(super) fn emit_construct(
 
 /// Emit `dst = recv.name(args…)` (`Op::CallMethodValue`).
 ///
-/// Layered dispatch: the collection-method IC transition completes hot
-/// collection methods in place (`0`), throws (`1`), or misses (`2`); a miss
-/// falls through to the direct-method prepare; an ineligible resolution
-/// (polymorphic, native, accessor, or cold method) then completes through
-/// the generic in-place method transition, so the compiled caller keeps
-/// running for every ordinary receiver, including missing/non-callable
-/// resolutions after an observable getter or proxy trap. Only receivers the
-/// interpreter dispatches through bespoke opcode branches (generators,
-/// iterators, pending bind continuations) take the exact side exit before
-/// resolution begins.
+/// Leaf/inlined collection layers run first. Otherwise only a VM-baked
+/// monomorphic method generation remains native: generated code re-reads the
+/// receiver/prototype/method slot, proves the exact callable, then builds the
+/// rooted callee frame directly. Missing plans and guard misses deoptimize the
+/// original opcode before method lookup effects.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_method_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
-    call_trampoline: &CallTrampoline,
     view: &JitCompileSnapshot,
+    code_dependencies: &mut BTreeMap<u32, u64>,
+    mut direct_call_events: Option<&mut BTreeMap<u32, otter_vm::JitCompilerDiagnostic>>,
     mut code_map: Option<&mut CodeMapCapture>,
     dst: u16,
     receiver: u16,
-    name: u32,
-    site: u64,
     argc: u16,
-    packed_args: u64,
-    packed_args_tail: Option<TemplateTail>,
+    argument_registers: &[u16],
     logical_pc: u32,
     byte_pc: u32,
     arg0: Option<u16>,
@@ -897,9 +1128,8 @@ pub(super) fn emit_method_call(
         arg0,
         arg1,
     };
-    let mut inline_emission = None;
     if let Some(method) = view.inline_methods.get(&byte_pc) {
-        inline_emission = try_emit_inline_numeric_method(
+        if try_emit_inline_numeric_method(
             ops,
             relocations,
             view,
@@ -913,9 +1143,28 @@ pub(super) fn emit_method_call(
             byte_pc,
             code_map.as_deref_mut(),
             done,
-        )?;
+            bail,
+        )? {
+            if let (Some(events), Some(target)) = (
+                direct_call_events.as_deref_mut(),
+                view.direct_methods.get(&byte_pc),
+            ) {
+                events.insert(
+                    byte_pc,
+                    direct_call_lowering_event(
+                        otter_vm::JitDirectCallKind::Method,
+                        logical_pc,
+                        byte_pc,
+                        &target.callee,
+                        otter_vm::JitDirectCallLoweringOutcome::Inlined,
+                    ),
+                );
+            }
+            dynasm!(ops ; .arch aarch64 ; =>done);
+            return Ok(());
+        }
     }
-    // Guarded monomorphic collection fast paths precede the shared bridge;
+    // Guarded monomorphic collection fast paths precede existing dispatch;
     // every guard miss lands on the next layer.
     if let Some(leaf) = view.collection_leaf_methods.get(&byte_pc) {
         let after_leaf = ops.new_dynamic_label();
@@ -947,116 +1196,103 @@ pub(super) fn emit_method_call(
             dynasm!(ops ; .arch aarch64 ; =>after_alloc);
         }
     }
-    dynasm!(ops
-        ; .arch aarch64
-        ; mov x0, x20
-        ; movz x1, dst as u32
-        ; movz x2, receiver as u32
-    );
-    emit_load_u64(ops, 3, site);
-    dynasm!(ops ; .arch aarch64 ; movz x4, argc as u32);
-    emit_packed_args(
-        ops,
-        relocations,
-        5,
-        packed_args,
-        packed_args_tail,
-        TemplateOperandRole::MethodArguments,
-    );
-    emit_load_runtime_stub(
-        ops,
-        relocations,
-        16,
-        table.entry(abi::STUB_JIT_COLLECTION_METHOD_IC),
-        abi::STUB_JIT_COLLECTION_METHOD_IC,
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; cmp x0, #1
-        ; b.eq =>threw
-        ; cbz x0, =>done
-    );
-
-    let generic = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch aarch64
-        ; mov x0, x20
-        ; movz x1, receiver as u32
-    );
-    emit_load_u64(ops, 2, u64::from(name));
-    emit_load_u64(ops, 3, site);
-    dynasm!(ops ; .arch aarch64 ; movz x4, argc as u32);
-    emit_packed_args(
-        ops,
-        relocations,
-        5,
-        packed_args,
-        packed_args_tail,
-        TemplateOperandRole::MethodArguments,
-    );
-    emit_load_runtime_stub(
-        ops,
-        relocations,
-        16,
-        table.entry(abi::STUB_JIT_PREPARE_DIRECT_METHOD_CALL),
-        abi::STUB_JIT_PREPARE_DIRECT_METHOD_CALL,
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; cmp x0, #1
-        ; b.eq =>threw
-        ; cmp x0, #2
-        ; b.eq =>generic
-    );
-    emit_prepared_call(ops, relocations, call_trampoline, dst, bail, threw, done);
-
-    // Ineligible direct resolution: complete the whole opcode through the
-    // generic in-place method transition; only its exotic-receiver report
-    // (`2`) side-exits to normal dispatch.
-    dynasm!(ops
-        ; .arch aarch64
-        ; =>generic
-        ; mov x0, x20
-        ; movz x1, dst as u32
-        ; movz x2, receiver as u32
-    );
-    emit_load_u64(ops, 3, u64::from(name));
-    emit_load_u64(ops, 4, site);
-    dynasm!(ops ; .arch aarch64 ; movz x5, argc as u32);
-    emit_packed_args(
-        ops,
-        relocations,
-        6,
-        packed_args,
-        packed_args_tail,
-        TemplateOperandRole::MethodArguments,
-    );
-    emit_load_runtime_stub(
-        ops,
-        relocations,
-        16,
-        table.entry(abi::STUB_JIT_CALL_METHOD_GENERIC),
-        abi::STUB_JIT_CALL_METHOD_GENERIC,
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; cmp x0, #1
-        ; b.eq =>threw
-        ; cmp x0, #2
-        ; b.eq =>bail
-        ; =>done
-    );
-    if let (Some(emission), Some(code_map)) = (inline_emission, code_map) {
-        code_map.record(CodeRegion::inline_structural(
-            "inlineMethodMissReplay",
-            emission.miss_replay_start,
-            ops.offset().0,
-            emission.inline_site,
-            emission.function_id,
-        ));
+    let planned_method = view.direct_methods.get(&byte_pc);
+    let direct_method =
+        planned_method.filter(|method| direct_call_target_is_supported(&method.callee));
+    if let Some(method) = direct_method {
+        let direct_site = DirectCallSite {
+            target: &method.callee,
+            caller_function_id: view.code_block.id,
+            logical_pc,
+            byte_pc,
+            dst,
+            form: DirectCallForm::Method {
+                callable: 17,
+                receiver,
+            },
+            arguments: argument_registers,
+        };
+        let direct_call = direct_call_artifact(view, direct_site)?;
+        let guard_start = ops.offset().0;
+        emit_method_guard(
+            ops,
+            relocations,
+            view,
+            MethodGuardSite {
+                guard: &method.guard,
+                receiver,
+            },
+            17,
+            None,
+            bail,
+        )?;
+        if let Some(code_map) = code_map.as_deref_mut() {
+            code_map.record(CodeRegion::method_call_structural(
+                "directMethodGuard",
+                guard_start,
+                ops.offset().0,
+                direct_site.caller_function_id,
+                direct_site.logical_pc,
+                direct_site.byte_pc,
+                direct_call,
+                receiver,
+                &method.guard,
+            ));
+        }
+        emit_direct_call(
+            ops,
+            relocations,
+            view,
+            direct_site,
+            table.entry(abi::STUB_JIT_DEOPT_STACK_CALL),
+            code_map,
+            bail,
+            threw,
+            done,
+        )?;
+        let previous = code_dependencies.insert(
+            method.callee.plan.function_id,
+            method.callee.plan.code_object_id,
+        );
+        debug_assert!(
+            previous.is_none_or(|code_object_id| {
+                code_object_id == method.callee.plan.code_object_id
+            }),
+            "one compile snapshot cannot name two generations for one callee"
+        );
+        if let Some(events) = direct_call_events.as_deref_mut() {
+            events.insert(
+                byte_pc,
+                direct_call_lowering_event(
+                    otter_vm::JitDirectCallKind::Method,
+                    logical_pc,
+                    byte_pc,
+                    &method.callee,
+                    otter_vm::JitDirectCallLoweringOutcome::Generated {
+                        code_object_id: method.callee.plan.code_object_id,
+                        target_tier: direct_call_target_tier(&method.callee),
+                        this_mode: otter_vm::JitDirectCallThisMode::MethodReceiver,
+                    },
+                ),
+            );
+        }
+    } else {
+        if let (Some(events), Some(method)) = (direct_call_events.as_deref_mut(), planned_method) {
+            events.insert(
+                byte_pc,
+                direct_call_lowering_event(
+                    otter_vm::JitDirectCallKind::Method,
+                    logical_pc,
+                    byte_pc,
+                    &method.callee,
+                    otter_vm::JitDirectCallLoweringOutcome::Rejected {
+                        reason: otter_vm::JitDirectCallLoweringRejectionReason::LayoutUnsupported,
+                    },
+                ),
+            );
+        }
+        dynasm!(ops ; .arch aarch64 ; b =>bail);
     }
+    dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
 }

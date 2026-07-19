@@ -23,7 +23,7 @@ needed to optimize the VM and JIT safely.
 - Standard formats are the primary interchange when one exists:
   Chrome Trace Event, Chrome/V8 CPU profiles and heap snapshots, standard
   folded stacks, raw machine-code bytes, and ordinary annotated assembly text.
-- Every versioned JSON artifact has schema tests. Absolute code addresses are
+- Every current-format JSON artifact has shape tests. Absolute code addresses are
   runtime-local metadata and must not appear in annotated assembly or be
   required for portable comparisons.
 - Debugging must not create a second compiler traversal, GC traversal, or
@@ -34,7 +34,7 @@ needed to optimize the VM and JIT safely.
 
 - [x] Bytecode disassembly through `--dump-bytecode` (text) and
   `--dump-bytecode=json` (compile and exit).
-- [x] Versioned text step trace through `--trace` or `--trace=<path>`.
+- [x] Current text step trace through `--trace` or `--trace=<path>`.
   It records interpreter-dispatched bytecode only.
 - [x] Opt-in VM stack sampling through `--cpu-prof`, producing Chrome/V8
   `.cpuprofile` and standard `.folded` outputs. Sampling is driven by bytecode
@@ -43,21 +43,47 @@ needed to optimize the VM and JIT safely.
   summaries, and Chrome `.heapsnapshot` output.
 - [x] Explicit runtime tier selection (`ProductionTiered`, `Template`, or
   `InterpreterOnly`); template-only runs do not execute optimizer policy.
-- [x] Owned, schema-versioned JIT events through
+- [x] Owned current-format JIT events through
   `--jit-events[=<path>]`: compile preparation/results, inline candidates,
   side exits, and inline-frame materialization. Capture is bounded, survives
   abrupt completion, and includes JIT work performed by event-loop callbacks.
-- [x] Owned, schema-versioned JIT compile bundles through
+- [x] Owned current-format JIT compile bundles through
   `--jit-artifacts[=<directory>]`: exact runtime-local code, bytecode,
   template plan or the selected optimizing backend input (Otter unit or CLIF),
   typed symbolic relocations, portable normalized code, annotated ARM64
   assembly, native offset maps, deopt metadata, and safepoints. The CLI writes
   a new root atomically under a cooperative single-writer contract and never
   intentionally merges with an existing target.
-- [x] Template method-inline artifacts expose caller/callee identity, exact
-  guard/setup/body/hit/miss-replay native ranges, per-callee-operation ranges,
-  and the compact live virtual-register/receiver scratch assignment. Coalesced
-  operations remain visible as zero-width source regions.
+- [x] Template plain-call and method-inline artifacts expose caller/callee
+  identity, exact guard/setup/body/hit/deopt-teardown native ranges,
+  per-callee-operation ranges, and compact live virtual-register/receiver
+  scratch assignment. Coalesced operations remain visible as zero-width
+  source regions.
+- [x] Compiler-generated plain and method calls expose typed method/call
+  guards, frame setup, native entry, return, cleanup, and entry-reject regions
+  plus a symbolic
+  stable-entry-cell relocation. Exact artifacts expose caller/callee identity,
+  target generation/tier, call kind, receiver binding, method
+  receiver/prototype/slot facts, call PC, frame/linkage/total stack bytes, and
+  register count; portable normalized code excludes only the
+  generation-local code-object id.
+- [x] Compiler-generated callee deopts emit an exact-generation structured
+  event with baked call kind, exact caller/callee code-object ids, caller
+  call-site PC, callee resume PC, tier, and consecutive deopt streak; baseline
+  streaks feed the existing cold eviction policy.
+- [x] Compiler-generated call plan events distinguish plain/method edges and
+  expose an exact available generation/tier/`this` mode or a typed planning
+  rejection (`missing callee`, ineligible, self-recursive, own-upvalue
+  allocation, unavailable method guard, or no entry generation).
+  Successful compiles then report the actual backend lowering (`generated`,
+  `inlined`, layout rejection, or elimination), while compile preparation
+  separates generated-link counts from leaf-inline candidates.
+- [x] Ordinary-call feedback identifies bytecode callees and static-native
+  operations in one typed target population. Monomorphic original `Math.abs`
+  sites expose separate static-native plan and actual-lowering events, typed
+  guard/body code-map regions, and an address-free bootstrap-function
+  relocation. Disabled artifact capture builds neither code-map nor relocation
+  DTOs.
 - [x] Capture Cranelift numeric leaves through the existing optimizing bundle:
   backend-marked CLIF, the exact installed code object, one structural code-map
   region, and empty relocation/safepoint/deopt inventories.
@@ -66,6 +92,9 @@ needed to optimize the VM and JIT safely.
   off-heap accounting, controlled idle RSS, and release binary size. The
   normal runtime path enables no sampler; its public snapshots copy existing
   counters only.
+- [x] Kernel benchmark records expose every `JitRuntimeStats` field as an
+  informational delta spanning warmup plus measurement. Snapshots execute
+  outside timed samples and explicit zeroes keep tier inactivity visible.
 
 The text step trace is not a Chrome/Perfetto trace. Async/op tracing, timeout
 ring-buffer dumps, and Test262 failure traces are not shipped yet. Structured
@@ -93,7 +122,8 @@ replacements for the planned Chrome/Perfetto timeline.
   can be correlated. Safepoint-to-native-return offsets remain open and stay
   explicit `null` in `safepoints.json`.
 - Successful JIT compile events join to artifact manifests by `codeObjectId`.
-  Native entry, side-exit, and deopt execution counters remain open.
+  Generated-call deopts now carry that exact id; general native-entry and
+  side-exit execution events remain open.
 
 ## Ordered Implementation Slices
 
@@ -110,12 +140,12 @@ replacements for the planned Chrome/Perfetto timeline.
 - [x] Prove the disabled path produces no artifact payloads and performs no
   filesystem work.
 
-### 2. Versioned JIT artifact bundle
+### 2. Current JIT artifact bundle
 
 - [x] Return an optional owned bundle with each successful template or
   optimizing compile.
 - [x] Let the CLI/embedder persist bundles into one directory per compile.
-- [x] Publish a versioned `manifest.json` containing target, architecture,
+- [x] Publish the current `manifest.json` containing target, architecture,
   tier, function identity, module, entry kind, bytecode/code sizes, and the
   files present.
 - [x] Emit exact runtime-local `code.bin`, deterministic `code-map.json`, and
@@ -124,9 +154,9 @@ replacements for the planned Chrome/Perfetto timeline.
 - [x] Emit tier input from the already-owned compiler representation:
   template plan for the template tier and optimized unit/IR for the optimizing
   tier.
-- [x] Expose replay-safe template method inlining as typed additive code-map
-  regions, including compact scratch slots, deterministic entry values, and
-  the common post-teardown replay boundary.
+- [x] Expose deopt-safe template plain-call and method inlining as typed
+  code-map regions, including identity guards, compact scratch slots,
+  deterministic entry values, and exact post-teardown deopt boundaries.
 - [ ] Cover multiple functions, recompilation, OSR entry, abrupt compile
   failure, nested JIT re-entry, and full-GC relocation.
 
@@ -162,8 +192,8 @@ manifest rather than emitted as placeholders.
   OSR entry, and deopt/side-exit id when known. Safepoints are included as an
   explicit summary with unavailable native offsets rather than attached to a
   fabricated instruction.
-- [x] Annotate template method-inline caller/callee identity, compact scratch
-  layout, callee operation index, and distinct hit, teardown, and replay
+- [x] Annotate template call/method-inline caller/callee identity, compact
+  scratch layout, callee operation index, and distinct hit/deopt-teardown
   regions without inferring runtime execution.
 - [x] Use code offsets in annotations and render baked address sites as
   symbolic relocations. Never print absolute executable addresses in ASM;
@@ -199,13 +229,13 @@ return offset and a test can cover that exact native range without inference.
 - [ ] Let Test262 retain diagnostics only for failures and timeouts.
 - [ ] Keep large values preview-capped and make all buffers explicitly bounded.
 
-### 6. Documentation and compatibility
+### 6. Documentation and validation
 
 - [x] Add a docs-site JIT debugging guide once the artifact CLI is real.
-- [x] Document bundle schemas, annotated assembly, source correlation, and
+- [x] Document bundle shapes, annotated assembly, source correlation, and
   before/after optimization workflow.
-- [ ] Add compatibility tests that load every machine-readable output in its
-  target tool or validate the corresponding published schema.
+- [ ] Add current-shape tests that load every machine-readable output in its
+  target tool or validate the complete emitted structure.
 
 ## Required Verification
 

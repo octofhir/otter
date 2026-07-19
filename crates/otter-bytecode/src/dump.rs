@@ -1,30 +1,10 @@
 //! JSON dump for [`crate::BytecodeModule`].
 //!
-//! Top-level wrapper carries `otterBytecodeDumpVersion: 1`.
-//!
 //! # Contents
-//! - [`DUMP_SCHEMA_VERSION`] — pinned at `1`.
 //! - [`to_json_pretty`] — serialize a module to pretty JSON suitable
 //!   for golden files.
-//! - [`Dump`] — wrapper struct that adds the version banner.
-
-use serde::Serialize;
 
 use crate::BytecodeModule;
-
-/// Current dump schema version.
-pub const DUMP_SCHEMA_VERSION: u32 = 1;
-
-/// Top-level wrapper that prepends the schema-version field.
-#[derive(Debug, Serialize)]
-pub struct Dump<'a> {
-    /// Pinned at [`DUMP_SCHEMA_VERSION`].
-    #[serde(rename = "otterBytecodeDumpVersion")]
-    pub version: u32,
-    /// The module being dumped.
-    #[serde(flatten)]
-    pub module: &'a BytecodeModule,
-}
 
 /// Serialize `module` as pretty JSON (2-space indent, trailing
 /// newline). Used for `--dump-bytecode=json` and golden files.
@@ -34,11 +14,7 @@ pub struct Dump<'a> {
 /// failure; the foundation types implement infallible
 /// [`serde::Serialize`].
 pub fn to_json_pretty(module: &BytecodeModule) -> Result<String, serde_json::Error> {
-    let dump = Dump {
-        version: DUMP_SCHEMA_VERSION,
-        module,
-    };
-    let mut s = serde_json::to_string_pretty(&dump)?;
+    let mut s = serde_json::to_string_pretty(module)?;
     s.push('\n');
     Ok(s)
 }
@@ -49,7 +25,7 @@ mod tests {
     use crate::{Function, Instruction, Op, Operand, SourceKind, SpanEntry};
 
     #[test]
-    fn dump_carries_schema_version() {
+    fn dump_carries_bytecode_module() {
         let module = BytecodeModule {
             module: "x.ts".to_string(),
             template_sites: Vec::new(),
@@ -75,7 +51,7 @@ mod tests {
             module_inits: Vec::new(),
         };
         let json = to_json_pretty(&module).unwrap();
-        assert!(json.contains("\"otterBytecodeDumpVersion\": 1"));
+        assert!(json.contains("\"module\": \"x.ts\""));
         assert!(json.contains("\"source_kind\": \"typescript\""));
     }
 }

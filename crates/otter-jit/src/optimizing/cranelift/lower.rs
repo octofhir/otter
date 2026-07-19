@@ -29,7 +29,7 @@ use cranelift_codegen::{
         condcodes::{FloatCC, IntCC},
         types,
     },
-    isa::TargetIsa,
+    isa::{TargetIsa, unwind::UnwindInst},
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
@@ -48,6 +48,7 @@ pub(super) struct NumericSourceRange {
 
 pub(super) struct LoweredNumericLeaf {
     pub(super) bytes: Vec<u8>,
+    pub(super) generated_stack_frame_bytes: u32,
     pub(super) tier_input: Option<String>,
     pub(super) source_ranges: Vec<NumericSourceRange>,
 }
@@ -95,6 +96,30 @@ pub(super) fn lower(
     {
         return None;
     }
+    // Finalized frame metadata reports every byte below FP, including spills
+    // and saved callee registers. The unwind stream independently publishes
+    // the exact FP/LR setup reservation above it. Reject anything except one
+    // proven frame setup rather than assuming a backend prologue shape.
+    let mut setup_bytes = None;
+    for (_, instruction) in &compiled.buffer.unwind_info {
+        if let UnwindInst::PushFrameRegs {
+            offset_upward_to_caller_sp,
+        } = instruction
+        {
+            if setup_bytes.replace(*offset_upward_to_caller_sp).is_some() {
+                return None;
+            }
+        }
+    }
+    let setup_bytes = setup_bytes?;
+    let generated_stack_frame_bytes = compiled
+        .buffer
+        .frame_layout()?
+        .frame_to_fp_offset
+        .checked_add(setup_bytes)?;
+    if setup_bytes == 0 || !generated_stack_frame_bytes.is_multiple_of(16) {
+        return None;
+    }
     let bytes = compiled.code_buffer().to_vec();
     if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
         return None;
@@ -128,6 +153,7 @@ pub(super) fn lower(
     }
     Some(LoweredNumericLeaf {
         bytes,
+        generated_stack_frame_bytes,
         tier_input,
         source_ranges,
     })

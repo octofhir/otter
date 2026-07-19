@@ -68,7 +68,7 @@ const BASELINE_DIR: &str = "tests/test262-baseline";
     name = "otter-test262",
     about = "Test262 conformance runner for the new-engine Otter stack.",
     long_about = "Drives the tc39/test262 corpus through the active otter-runtime / \
-                  otter-vm stack and publishes a versioned baseline."
+                  otter-vm stack and publishes the current baseline."
 )]
 struct Cli {
     /// Path to the repository root. Defaults to the current

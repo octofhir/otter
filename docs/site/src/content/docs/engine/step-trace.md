@@ -40,16 +40,14 @@ frame=<depth> fn=<function-name> pc=<6-digit byte pc> op=<MNEMONIC>  <operand li
   registers, `k[<N>]` for constant-pool indices, `i32:<N>` for
   signed immediates.
 
-The very first line of every trace is the version banner so
-downstream consumers can hard-fail on format drift:
+The very first line of every trace is the canonical header:
 
 ```text
-; otter step trace v1
+; otter step trace
 ```
 
-Bump [`otter_vm::inspect::TRACE_FORMAT_VERSION`][trace-version] on
-any incompatible format change. Golden tests under
-`crates/otter-runtime/tests/golden/` re-bless via the
+The trace has one current format. Change it in place and re-bless golden tests
+under `crates/otter-runtime/tests/golden/` with the
 `OTTER_BLESS_TRACES=1` environment variable.
 
 ## Embedding
@@ -159,6 +157,5 @@ schema tests in `crates/otter-vm/src/inspect.rs`:
 
 [op-mnemonic]: https://docs.rs/otter-bytecode/latest/otter_bytecode/enum.Op.html#method.mnemonic
 [op-byte-table]: https://docs.rs/otter-bytecode/latest/otter_bytecode/encoding/constant.OP_BYTE_TABLE.html
-[trace-version]: https://docs.rs/otter-vm/latest/otter_vm/inspect/constant.TRACE_FORMAT_VERSION.html
 [step-tracer]: https://docs.rs/otter-vm/latest/otter_vm/inspect/trait.StepTracer.html
 [writer-tracer]: https://docs.rs/otter-vm/latest/otter_vm/inspect/struct.WriterTracer.html

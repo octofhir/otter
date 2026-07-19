@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - Template and optimizing OSR bundle contents.
-//! - Template method-inline guard/body/replay subregions and compact scratch
+//! - Template method-inline guard/body/deopt subregions and compact scratch
 //!   layout metadata.
 //! - Abrupt completion followed by explicit bundle draining.
 //! - Bundle ownership across full GC, later allocation, and nested JIT entry.
@@ -17,7 +17,7 @@
 //!   process-local relocation values.
 //!
 //! # See also
-//! - `otter_vm::jit_artifact` for the versioned manifest and bounded batch.
+//! - `otter_vm::jit_artifact` for the current manifest and bounded batch.
 
 #![cfg(target_arch = "aarch64")]
 
@@ -125,8 +125,8 @@ fn assert_assembly_is_symbolic(bundle: &JitArtifactBundle) {
     let mut lines = assembly.lines();
     assert_eq!(
         lines.next(),
-        Some("; otter jit aarch64 assembly v1"),
-        "versioned assembly header"
+        Some("; otter jit aarch64 assembly"),
+        "current assembly header"
     );
     assert_eq!(
         lines.next(),
@@ -194,7 +194,7 @@ fn assert_bundle_is_self_consistent(bundle: &JitArtifactBundle) {
     assert_eq!(code.contents().len() as u64, manifest.code_bytes());
     assert!(
         normalized.contents().starts_with(b"OTJNCODE"),
-        "normalized code must carry its binary schema marker"
+        "normalized code must carry its binary type marker"
     );
     assert!(manifest.bytecode_bytes() > 0);
     assert!(!manifest.function_name().is_empty());
@@ -205,7 +205,6 @@ fn assert_bundle_is_self_consistent(bundle: &JitArtifactBundle) {
 
     let relocations: serde_json::Value =
         serde_json::from_slice(relocations_file.contents()).expect("valid relocation JSON");
-    assert_eq!(relocations["otterJitRelocationSchemaVersion"], 1);
     assert_eq!(relocations["offsetBasis"], "code.bin");
     assert!(
         !String::from_utf8_lossy(relocations_file.contents()).contains("resolvedValue"),
@@ -233,7 +232,6 @@ fn assert_bundle_is_self_consistent(bundle: &JitArtifactBundle) {
     }
 
     let map = code_map(bundle);
-    assert_eq!(map["otterJitCodeMapSchemaVersion"], 1);
     let code_len = manifest.code_bytes();
     assert!(
         map["entryOffset"]
@@ -293,7 +291,7 @@ fn relocation_target_kinds(batch: &JitArtifactBatch) -> BTreeSet<String> {
 }
 
 #[test]
-fn template_osr_returns_a_versioned_owned_bundle_without_events() {
+fn template_osr_returns_a_current_owned_bundle_without_events() {
     let mut runtime = runtime_with_artifacts(JitSelection::Template, 1);
     let result = runtime
         .run_script(
@@ -306,7 +304,6 @@ fn template_osr_returns_a_versioned_owned_bundle_without_events() {
 
     assert_eq!(result.completion_string(), "4560");
     assert!(result.jit_debug_report().is_none());
-    assert_eq!(bundle.manifest().schema_version(), 1);
     assert_eq!(bundle.manifest().module(), "jit-artifact-template.js");
     assert!(matches!(
         bundle.manifest().entry(),
@@ -323,7 +320,7 @@ fn template_osr_returns_a_versioned_owned_bundle_without_events() {
 }
 
 #[test]
-fn template_method_inline_artifact_exposes_compact_scratch_and_replay_ranges() {
+fn template_method_inline_artifact_exposes_compact_scratch_and_deopt_ranges() {
     let mut runtime = runtime_with_artifacts(JitSelection::ProductionTiered, u32::MAX);
     let result = runtime
         .run_script(
@@ -361,8 +358,7 @@ fn template_method_inline_artifact_exposes_compact_scratch_and_replay_ranges() {
         "inlineInstruction",
         "inlineMethodBody",
         "inlineMethodHitEpilogue",
-        "inlineMethodMissTeardown",
-        "inlineMethodMissReplay",
+        "inlineMethodDeoptTeardown",
     ] {
         assert!(
             kinds.contains(expected),
@@ -491,13 +487,11 @@ fn template_method_inline_artifact_exposes_compact_scratch_and_replay_ranges() {
     let scratch_range = native_range(scratch);
     let body_range = native_range(find_region("inlineMethodBody"));
     let hit_range = native_range(find_region("inlineMethodHitEpilogue"));
-    let teardown_range = native_range(find_region("inlineMethodMissTeardown"));
-    let replay_range = native_range(find_region("inlineMethodMissReplay"));
+    let teardown_range = native_range(find_region("inlineMethodDeoptTeardown"));
     assert!(guard_range.1 <= scratch_range.0);
     assert!(scratch_range.1 <= body_range.0);
     assert_eq!(body_range.1, hit_range.0);
     assert_eq!(hit_range.1, teardown_range.0);
-    assert_eq!(teardown_range.1, replay_range.0);
     for instruction in &inline_instructions {
         let instruction_range = native_range(instruction);
         assert!(
@@ -523,7 +517,7 @@ fn template_method_inline_artifact_exposes_compact_scratch_and_replay_ranges() {
         "inline site must identify caller code map"
     );
     assert!(
-        method_call_range.0 <= guard_range.0 && replay_range.1 <= method_call_range.1,
+        method_call_range.0 <= guard_range.0 && teardown_range.1 <= method_call_range.1,
         "inline ranges must stay inside caller MethodCall: {method_call}"
     );
 
@@ -535,7 +529,8 @@ fn template_method_inline_artifact_exposes_compact_scratch_and_replay_ranges() {
     )
     .expect("annotated assembly is UTF-8");
     assert!(assembly.contains("kind=inlineMethodGuard"));
-    assert!(assembly.contains("kind=inlineMethodMissReplay"));
+    assert!(assembly.contains("kind=inlineMethodDeoptTeardown"));
+    assert!(!assembly.contains("inlineMethodMissReplay"));
     assert!(assembly.contains("inline-site=caller:"));
     assert!(assembly.contains("receiver-property=true"));
     assert!(assembly.contains(
@@ -576,7 +571,6 @@ fn optimizing_osr_returns_ir_deopt_and_safepoint_payloads() {
             .contents(),
     )
     .expect("valid deopt JSON");
-    assert_eq!(deopt["otterJitDeoptSchemaVersion"], 1);
     assert!(deopt["exits"].is_array());
     let optimized_ir = std::str::from_utf8(
         bundle
@@ -649,6 +643,10 @@ function sumMany(a, b, c, d, e, f, g) {
   return a + b + c + d + e + f + g;
 }
 
+for (let warm = 0; warm < 64; warm++) {
+  sumMany(1, 2, 3, 4, 5, 6, 7);
+}
+
 function hot(limit) {
   const bias = 2;
   const addBias = value => value + bias;
@@ -675,7 +673,7 @@ String(hot(48));
 
     for expected in [
         "runtimeStub",
-        "callTrampoline",
+        "directCallEntryCell",
         "gcCageBase",
         "propertyIcCell",
         "templateOperandSlice",

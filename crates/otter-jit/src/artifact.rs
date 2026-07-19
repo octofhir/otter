@@ -5,8 +5,8 @@
 //!   VM-owned diagnostics request.
 //! - [`NativeCompileOutput`] — finalized code plus an optional sidecar.
 //! - [`CodeMapCapture`] and [`CodeRegion`] — emission-order native offset
-//!   correlation, including template inline-method subregions and compact
-//!   scratch layouts.
+//!   correlation, including template inline subregions, generated direct-call
+//!   targets, and compact scratch layouts.
 //! - [`relocation`] — typed address sites and portable semantic code.
 //! - [`assembly`] — deterministic annotated AArch64 disassembly.
 //! - Deterministic bytecode, safepoint, deopt, and bundle renderers.
@@ -62,6 +62,7 @@ pub(crate) struct ArtifactRequest {
 pub(crate) struct NativeCompileOutput<T> {
     pub(crate) code: T,
     pub(crate) artifact: Option<Box<JitArtifactBundle>>,
+    pub(crate) diagnostics: Box<[otter_vm::JitCompilerDiagnostic]>,
 }
 
 /// Machine-readable compact scratch assignment attached to an inline setup
@@ -81,7 +82,7 @@ pub(crate) struct InlineScratchLayoutArtifact {
     pub(crate) entry_values: Vec<InlineScratchEntryArtifact>,
 }
 
-/// Caller site that owns one template-spliced method body.
+/// Caller site that owns one template-spliced plain-call or method body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct InlineSiteArtifact {
@@ -89,6 +90,89 @@ pub(crate) struct InlineSiteArtifact {
     pub(crate) logical_pc: u32,
     pub(crate) byte_pc: u32,
     pub(crate) has_receiver_property: bool,
+}
+
+/// Native tier of one exact generated direct-call target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum DirectCallTierArtifact {
+    Template,
+    Optimizing,
+}
+
+impl DirectCallTierArtifact {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Template => "template",
+            Self::Optimizing => "optimizing",
+        }
+    }
+}
+
+/// Source opcode represented by one generated call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum DirectCallKindArtifact {
+    Plain,
+    Method,
+}
+
+impl DirectCallKindArtifact {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Method => "method",
+        }
+    }
+}
+
+/// ECMAScript receiver source used by one generated call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum DirectCallThisModeArtifact {
+    StrictOrLexical,
+    SloppyGlobal,
+    MethodReceiver,
+}
+
+impl DirectCallThisModeArtifact {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::StrictOrLexical => "strictOrLexical",
+            Self::SloppyGlobal => "sloppyGlobal",
+            Self::MethodReceiver => "methodReceiver",
+        }
+    }
+}
+
+/// Exact target generation and stack contract baked into one direct-call site.
+///
+/// `target_code_object_id` is diagnostic identity for exact artifacts. Portable
+/// normalized code deliberately excludes it while retaining the semantic
+/// receiver mode, tier, and every layout field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DirectCallArtifact {
+    pub(crate) call_kind: DirectCallKindArtifact,
+    pub(crate) target_function_id: u32,
+    pub(crate) target_code_object_id: u64,
+    pub(crate) target_tier: DirectCallTierArtifact,
+    pub(crate) this_mode: DirectCallThisModeArtifact,
+    pub(crate) callee_native_frame_bytes: u32,
+    pub(crate) linkage_bytes: u32,
+    pub(crate) reserved_stack_bytes: u32,
+    pub(crate) callee_register_count: u16,
+}
+
+/// Exact heap facts re-read by one guarded monomorphic method edge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MethodGuardArtifact {
+    pub(crate) receiver_register: u16,
+    pub(crate) method_function_id: u32,
+    pub(crate) receiver_shape: u32,
+    pub(crate) prototype_shapes: Vec<u32>,
+    pub(crate) method_value_byte: u32,
 }
 
 /// One live-in value materialized by an inline scratch setup.
@@ -125,6 +209,12 @@ pub(crate) struct CodeRegion {
     #[serde(skip_serializing_if = "Option::is_none")]
     function_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    direct_call: Option<DirectCallArtifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method_guard: Option<MethodGuardArtifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    static_native_call: Option<otter_vm::JitStaticNativeCallKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     logical_pc: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     byte_pc: Option<u32>,
@@ -150,6 +240,9 @@ impl CodeRegion {
             target_block: None,
             inline_frame: None,
             function_id: None,
+            direct_call: None,
+            method_guard: None,
+            static_native_call: None,
             logical_pc: None,
             byte_pc: None,
             operation_index: None,
@@ -180,6 +273,9 @@ impl CodeRegion {
             target_block: None,
             inline_frame,
             function_id: Some(function_id),
+            direct_call: None,
+            method_guard: None,
+            static_native_call: None,
             logical_pc: Some(logical_pc),
             byte_pc: Some(byte_pc),
             operation_index,
@@ -200,6 +296,79 @@ impl CodeRegion {
         let mut region = Self::structural(kind, start, end);
         region.function_id = Some(function_id);
         region.inline_site = Some(inline_site);
+        region
+    }
+
+    /// One compiler-generated call phase.
+    ///
+    /// `function_id` remains the caller owning this code object. `direct_call`
+    /// carries the exact target generation and stack contract separately.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn call_structural(
+        kind: &'static str,
+        start: usize,
+        end: usize,
+        caller_function_id: u32,
+        logical_pc: u32,
+        byte_pc: u32,
+        direct_call: DirectCallArtifact,
+    ) -> Self {
+        let mut region = Self::structural(kind, start, end);
+        region.function_id = Some(caller_function_id);
+        region.direct_call = Some(direct_call);
+        region.logical_pc = Some(logical_pc);
+        region.byte_pc = Some(byte_pc);
+        region
+    }
+
+    /// Heap identity guard immediately preceding a generated method call.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn method_call_structural(
+        kind: &'static str,
+        start: usize,
+        end: usize,
+        caller_function_id: u32,
+        logical_pc: u32,
+        byte_pc: u32,
+        direct_call: DirectCallArtifact,
+        receiver_register: u16,
+        guard: &otter_vm::jit::JitMethodGuard,
+    ) -> Self {
+        let mut region = Self::call_structural(
+            kind,
+            start,
+            end,
+            caller_function_id,
+            logical_pc,
+            byte_pc,
+            direct_call,
+        );
+        region.method_guard = Some(MethodGuardArtifact {
+            receiver_register,
+            method_function_id: guard.method_fid,
+            receiver_shape: guard.recv_shape,
+            prototype_shapes: guard.proto_chain.clone(),
+            method_value_byte: guard.method_value_byte,
+        });
+        region
+    }
+
+    /// One guarded static-native ordinary-call phase.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn static_native_structural(
+        kind: &'static str,
+        start: usize,
+        end: usize,
+        caller_function_id: u32,
+        logical_pc: u32,
+        byte_pc: u32,
+        target: otter_vm::JitStaticNativeCallKind,
+    ) -> Self {
+        let mut region = Self::structural(kind, start, end);
+        region.function_id = Some(caller_function_id);
+        region.static_native_call = Some(target);
+        region.logical_pc = Some(logical_pc);
+        region.byte_pc = Some(byte_pc);
         region
     }
 
@@ -295,15 +464,12 @@ impl CodeMapCapture {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Document {
-            #[serde(rename = "otterJitCodeMapSchemaVersion")]
-            schema_version: u32,
             entry_offset: u64,
             regions: Vec<CodeRegion>,
             osr_entries: Vec<OsrCodeEntry>,
         }
 
         let document = Document {
-            schema_version: 1,
             entry_offset: entry_offset as u64,
             regions: self.regions,
             osr_entries: self.osr_entries,
@@ -391,7 +557,7 @@ pub(crate) fn build_bundle(
 }
 
 fn render_bytecode(view: &JitCompileSnapshot) -> String {
-    let mut out = String::from("; otter bytecode v1\n");
+    let mut out = String::from("; otter bytecode\n");
     writeln!(
         out,
         "; function={} registers={} parameters={} bytes={}",
@@ -435,8 +601,6 @@ fn render_safepoints(records: &[SafepointRecord]) -> String {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct Document {
-        #[serde(rename = "otterJitSafepointSchemaVersion")]
-        schema_version: u32,
         safepoints: Vec<Point>,
     }
 
@@ -462,11 +626,8 @@ fn render_safepoints(records: &[SafepointRecord]) -> String {
                 .collect(),
         })
         .collect();
-    let mut rendered = serde_json::to_string_pretty(&Document {
-        schema_version: 1,
-        safepoints,
-    })
-    .expect("safepoint DTO always serializes");
+    let mut rendered = serde_json::to_string_pretty(&Document { safepoints })
+        .expect("safepoint DTO always serializes");
     rendered.push('\n');
     rendered
 }
@@ -498,8 +659,6 @@ fn render_deopt(table: &DeoptTable) -> String {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct Document {
-        #[serde(rename = "otterJitDeoptSchemaVersion")]
-        schema_version: u32,
         exits: Vec<Exit>,
     }
 
@@ -543,11 +702,8 @@ fn render_deopt(table: &DeoptTable) -> String {
                 .collect(),
         })
         .collect();
-    let mut rendered = serde_json::to_string_pretty(&Document {
-        schema_version: 1,
-        exits,
-    })
-    .expect("deopt DTO always serializes");
+    let mut rendered =
+        serde_json::to_string_pretty(&Document { exits }).expect("deopt DTO always serializes");
     rendered.push('\n');
     rendered
 }
@@ -578,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn code_map_schema_is_versioned_and_offset_based() {
+    fn code_map_format_is_typed_and_offset_based() {
         let mut map = CodeMapCapture::default();
         map.record(CodeRegion::instruction(
             4,
@@ -594,7 +750,6 @@ mod tests {
         map.record_osr(2, 20, 32);
         let value: serde_json::Value =
             serde_json::from_str(&map.render(4)).expect("valid code-map JSON");
-        assert_eq!(value["otterJitCodeMapSchemaVersion"], 1);
         assert_eq!(value["entryOffset"], 4);
         assert_eq!(value["regions"][0]["startOffset"], 4);
         assert_eq!(value["regions"][0]["bytePc"], 19);
@@ -602,7 +757,47 @@ mod tests {
     }
 
     #[test]
-    fn code_map_inline_scratch_schema_is_typed_and_additive() {
+    fn code_map_direct_call_shape_names_exact_generation_and_stack_contract() {
+        let mut map = CodeMapCapture::default();
+        map.record(CodeRegion::call_structural(
+            "directCallNativeEntry",
+            20,
+            28,
+            7,
+            2,
+            19,
+            DirectCallArtifact {
+                call_kind: DirectCallKindArtifact::Plain,
+                target_function_id: 11,
+                target_code_object_id: 29,
+                target_tier: DirectCallTierArtifact::Optimizing,
+                this_mode: DirectCallThisModeArtifact::SloppyGlobal,
+                callee_native_frame_bytes: 160,
+                linkage_bytes: 112,
+                reserved_stack_bytes: 272,
+                callee_register_count: 6,
+            },
+        ));
+
+        let value: serde_json::Value =
+            serde_json::from_str(&map.render(0)).expect("valid code-map JSON");
+        let region = &value["regions"][0];
+        assert_eq!(region["functionId"], 7);
+        assert_eq!(region["logicalPc"], 2);
+        assert_eq!(region["bytePc"], 19);
+        assert_eq!(region["directCall"]["callKind"], "plain");
+        assert_eq!(region["directCall"]["targetFunctionId"], 11);
+        assert_eq!(region["directCall"]["targetCodeObjectId"], 29);
+        assert_eq!(region["directCall"]["targetTier"], "optimizing");
+        assert_eq!(region["directCall"]["thisMode"], "sloppyGlobal");
+        assert_eq!(region["directCall"]["calleeNativeFrameBytes"], 160);
+        assert_eq!(region["directCall"]["linkageBytes"], 112);
+        assert_eq!(region["directCall"]["reservedStackBytes"], 272);
+        assert_eq!(region["directCall"]["calleeRegisterCount"], 6);
+    }
+
+    #[test]
+    fn code_map_inline_scratch_layout_is_typed_and_offset_safe() {
         let inline_site = InlineSiteArtifact {
             caller_function_id: 7,
             logical_pc: 2,

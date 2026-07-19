@@ -1,12 +1,13 @@
-//! Cold materialization for legacy and inlined JIT side exits.
+//! Cold materialization for JIT side exits.
 //!
-//! Native interpreter entry normally keeps the canonical [`crate::NativeFrame`] and
-//! its register window intact. This module is the narrow exception: legacy
-//! frameless self-call exits and nested inlined deopts that still require a
-//! `ActivationStack` adapter materialize one only after the side exit has fired.
+//! Native execution normally keeps the canonical [`crate::NativeFrame`] and its
+//! register window intact. This module is the narrow exception: a generated
+//! stack-owned call or nested inline exit copies/materializes an
+//! [`crate::ActivationStack`] frame only after the side exit has fired.
 //!
 //! # Contents
-//! - [`Interpreter::jit_deopt_materialize_self_call`] — legacy self-call bail.
+//! - [`Interpreter::jit_deopt_materialize_stack_call`] — standard generated
+//!   stack-call deopt, including exact-generation diagnostics and policy.
 //! - [`Interpreter::jit_deopt_materialize_inline_frames`] — nested inline deopt.
 //!
 //! # Invariants
@@ -17,66 +18,118 @@
 //!   returning to compiled code.
 //! - Nested dispatch stops at the caller's activation floor and reuses the
 //!   already-published runtime-turn root provider.
+//! - A stack-owned frame stays published while copying and dispatching, so its
+//!   machine-stack values remain precise roots until generated code unpublishes
+//!   the activation after this API returns.
+//! - Generated code owns synchronous-depth and native-stack-byte counters.
+//!   Stack-call deopt neither enters nor leaves synchronous re-entry. Its
+//!   logical-depth slot is transferred temporarily to the materialized frame
+//!   so interpreter stack checks count native outer frames exactly once.
 //! - New interpreter/baseline/optimizer transitions must use
 //!   [`crate::ActiveFrameMut`] over the existing [`NativeFrame`] instead.
 //!
 //! # See also
 //! - [`crate::active_frame`] — canonical tier-neutral activation access.
 //! - [`crate::jit::JitDeoptFrame`] — owned inline-deopt reconstruction input.
-//! - [`crate::NativeFrame`] — canonical activation that these cold adapters replace
-//!   only for legacy/deopt compatibility.
+//! - [`crate::NativeFrame`] — canonical activation reconstructed only after a
+//!   cold side exit.
 
-use crate::{ActivationStack, ExecutionContext, Frame, Interpreter, Value, VmError, jit};
+use crate::{
+    ActivationStack, ActiveFrameRef, ExecutionContext, Frame, Interpreter, NativeFrame,
+    NativeFrameFlags, Value, VmError, jit,
+};
 
 impl Interpreter {
-    /// Materialize and finish a legacy frameless self-call after a compiled
-    /// side exit.
+    /// Copy one generated stack-owned activation into cold interpreter storage
+    /// and run it from its exact published resume PC.
     ///
-    /// This is not the interpreter tier-entry path. It exists only for the old
-    /// inline self-call sequence whose callee window has no canonical native
-    /// frame to resume. The live top register window is attached to a cold
-    /// `ActivationStack` adapter, dispatched to completion, then removed.
-    pub fn jit_deopt_materialize_self_call(
+    /// `native` is a scalar snapshot of the still-published stack frame.
+    /// Generated code retains ownership of its synchronous-depth and
+    /// native-stack-byte reservations across this call and releases them only
+    /// after the interpreter continuation returns.
+    pub fn jit_deopt_materialize_stack_call(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
-        caller_frame_index: usize,
-        bail_pc: u32,
-        register_count: usize,
+        native: NativeFrame,
+        caller_function_id: u32,
+        caller_call_pc: u32,
+        callee_code_object_id: u64,
+        caller_code_object_id: u64,
+        call_kind: jit::JitDirectCallKind,
     ) -> Result<Value, VmError> {
-        let window = self.register_stack.top_window(register_count)?;
-        let caller = stack
-            .get(caller_frame_index)
-            .ok_or(VmError::InvalidOperand)?;
-        let function_id = caller.function_id;
-        let upvalues = caller.upvalues.clone();
-        let self_value = caller.self_value;
+        if !native
+            .header
+            .flags
+            .contains(NativeFrameFlags::STACK_REGISTERS)
+            || native.header.flags.contains(NativeFrameFlags::MATERIALIZED)
+        {
+            return Err(VmError::InvalidOperand);
+        }
+        self.note_generated_call_deopt(
+            caller_function_id,
+            caller_call_pc,
+            caller_code_object_id,
+            callee_code_object_id,
+            call_kind,
+            native,
+        )?;
 
-        self.note_jit_entry_bail(function_id);
+        // SAFETY: generated code keeps the original NativeFrame and both
+        // windows initialized, published, and stable across this cold call.
+        // The copied descriptor retains the exact same raw window addresses.
+        let active = unsafe { ActiveFrameRef::from_native_ptr(&native) }
+            .map_err(|_| VmError::InvalidOperand)?;
         let function = context
-            .exec_function(function_id)
+            .exec_function(native.header.function_id)
             .ok_or(VmError::InvalidOperand)?;
+        let register_count = active.register_count();
+        if register_count != usize::from(function.register_count)
+            || active.upvalue_count() < usize::from(function.own_upvalue_count)
+        {
+            return Err(VmError::InvalidOperand);
+        }
+
+        // Copy all scalar and tagged inputs before building the materialized
+        // frame. Host Vec/register-arena growth cannot collect; once pushed,
+        // ordinary runtime-turn tracing owns the new interpreter storage.
+        let self_value = active.self_value();
+        let this_value = active.this_value();
+        let mut upvalues = Vec::with_capacity(active.upvalue_count());
+        for index in 0..active.upvalue_count() {
+            let index = u32::try_from(index).map_err(|_| VmError::InvalidOperand)?;
+            upvalues.push(active.upvalue(index)?);
+        }
+
+        let _window_rollback = self.register_window_rollback();
+        let mut window = self.alloc_reg_window(register_count)?;
+        for index in 0..register_count {
+            let register = u16::try_from(index).map_err(|_| VmError::InvalidOperand)?;
+            window[index] = active.read(register)?;
+        }
         let mut frame = Frame::with_exec_return_upvalues_and_this(
             function,
             None,
-            upvalues,
-            Value::undefined(),
+            upvalues.into_boxed_slice(),
+            this_value,
             window,
         );
         frame.self_value = self_value;
-        frame.pc = bail_pc;
+        frame.pc = native.header.pc;
 
-        let floor = stack.floor();
-        stack.push(frame);
-        let result = self.dispatch_loop_above_rooted(context, stack, floor);
-        self.release_frames_above(stack, floor);
-        result
+        self.with_materialized_generated_call_depth(|interp| {
+            let floor = stack.floor();
+            stack.push(frame);
+            let result = interp.dispatch_loop_above_rooted(context, stack, floor);
+            interp.release_frames_above(stack, floor);
+            result
+        })?
     }
 
     /// Materialize a nested inline deopt chain and run it to completion.
     ///
     /// `frames` is ordered outermost first. The outermost completion returns to
-    /// compiled code; every younger adapter returns through its recorded parent
+    /// compiled code; every younger frame returns through its recorded parent
     /// destination. This owned reconstruction is reserved for inlined
     /// optimized exits that cannot resume one canonical native activation.
     pub fn jit_deopt_materialize_inline_frames(

@@ -858,7 +858,7 @@ impl Interpreter {
         dst: u16,
     ) -> Result<(), VmError> {
         self.record_runtime_bytecode_call();
-        if stack.len() as u32 >= self.max_stack_depth {
+        if self.logical_call_depth(stack) >= self.max_stack_depth {
             return Err(VmError::StackOverflow {
                 limit: self.max_stack_depth,
             });
@@ -1165,7 +1165,7 @@ impl Interpreter {
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
         self.record_runtime_bytecode_call();
-        if stack.len() as u32 >= self.max_stack_depth {
+        if self.logical_call_depth(stack) >= self.max_stack_depth {
             return Err(VmError::StackOverflow {
                 limit: self.max_stack_depth,
             });

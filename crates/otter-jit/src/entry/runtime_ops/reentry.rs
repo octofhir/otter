@@ -16,7 +16,7 @@
 //!
 //! # See also
 //! - `super::super::abi` — machine-visible entry context.
-//! - `super::calls` — plain/method-call adapters and direct-call lifecycle.
+//! - `super::calls` — native activation and generated-call deoptimization.
 
 use otter_vm::{JitExceptionOutcome, NumericRuntimeOp, UnaryCoercionOp, VmError};
 
@@ -34,7 +34,7 @@ pub(crate) fn park_jit_error(ctx: &mut JitCtx, err: VmError) {
 
 /// Try to deliver an uncaught compiled-callee throw to the current compiled
 /// caller. On success, publish the catch/finally PC so status `2` from a call
-/// bridge becomes a committed bailout rather than a replay of the call site.
+/// boundary becomes a committed bailout rather than a replay of the call site.
 pub(super) fn try_resume_caller_throw(
     ctx: &mut JitCtx,
     is_uncaught: bool,
@@ -1010,8 +1010,8 @@ fn complete_numeric_op(
 }
 
 /// Complete one numeric-family opcode in the VM. `0` means the destination
-/// was committed and `1` means decoding or execution threw. Unlike the former
-/// adapter, this path has no isolate-less/ActivationStack bailout mode: a published
+/// was committed and `1` means decoding or execution threw. This path has no
+/// isolate-less/ActivationStack bailout mode: a published
 /// [`NativeFrame`](otter_vm::native_abi::NativeFrame) and VM activation are
 /// part of the runtime-op contract.
 pub(crate) extern "C" fn jit_numeric_op_stub(
@@ -1046,7 +1046,7 @@ pub(crate) extern "C" fn jit_numeric_op_stub(
     }
 }
 
-/// Bridge stub: build a `MakeFunction` closure from compiled code. Returns `0`
+/// Runtime stub: build a `MakeFunction` closure from compiled code. Returns `0`
 /// on success, `1` when construction threw (error parked in `ctx`).
 pub(crate) extern "C" fn jit_make_fn_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
@@ -1111,7 +1111,7 @@ mod tests {
             Value::function(7),
             Value::undefined(),
         );
-        frame.set_native_owner(41);
+        frame.set_stack_registers();
         let mut thread = VmThread::empty();
         thread.current_frame = std::ptr::addr_of_mut!(frame) as u64;
         let mut error = None;
@@ -1119,10 +1119,17 @@ mod tests {
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::addr_of_mut!(frame),
             error: std::ptr::addr_of_mut!(error),
-            direct_call: std::mem::MaybeUninit::uninit(),
             activation_base: std::ptr::null_mut(),
             activation_top_ptr: std::ptr::null_mut(),
             activation_limit: 0,
+            global_this_offset: std::ptr::null(),
+            sync_reentry_depth: std::ptr::null_mut(),
+            sync_reentry_limit: 0,
+            native_stack_bytes: std::ptr::null_mut(),
+            native_stack_bytes_limit: 0,
+            generated_call_depth: std::ptr::null_mut(),
+            generated_calls: 0,
+            generated_call_deopts: 0,
         };
         test(&mut ctx, &mut error);
     }
@@ -1133,7 +1140,10 @@ mod tests {
             let status = jit_iterator_op_stub(ctx, 0, 0, 0, 0);
             assert_eq!(status, STATUS_BAILED);
             assert!(error.is_none());
-            assert_eq!(ctx.native_owner_id(), Ok(41));
+            assert!(matches!(
+                ctx.materialized_frame_index(),
+                Err(VmError::InvalidOperand)
+            ));
         });
     }
 

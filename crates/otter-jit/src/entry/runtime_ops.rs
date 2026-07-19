@@ -1,10 +1,10 @@
 //! Typed C ABI entries for baseline JIT runtime slow paths.
 //!
 //! # Contents
-//! - Fixed-operand descriptor operations and compile-owned variadic adapters.
-//! - [`calls`] — plain/method-call ABI adapters and direct-call lifecycle.
+//! - Fixed-operand descriptor operations and compile-owned variadic entries.
+//! - [`calls`] — native activation and generated-call deoptimization.
 //! - [`reentry`] — exception, coercion, and non-call reentrant completion.
-//! - [`vm_ops`] — typed VM operation bridges.
+//! - [`vm_ops`] — typed VM operations.
 //!
 //! # Invariants
 //! - Operands are decoded during compilation. No entry accepts a byte PC or

@@ -27,7 +27,7 @@
 mod lower;
 mod plan;
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
 use cranelift_codegen::{
     isa::OwnedTargetIsa,
@@ -37,7 +37,6 @@ use otter_vm::{JitArtifactFileName, JitCompileSnapshot, deopt::DeoptTable};
 
 use crate::{
     CompiledCode, Unsupported,
-    arm64::CallTrampoline,
     artifact::{
         ArtifactRequest, CodeMapCapture, CodeRegion, NativeCompileOutput, build_bundle,
         relocation::RelocationCapture,
@@ -60,6 +59,7 @@ impl NumericLeafBackend {
         flags.set("preserve_frame_pointers", "true").ok()?;
         flags.set("enable_probestack", "false").ok()?;
         flags.set("enable_verifier", "true").ok()?;
+        flags.set("unwind_info", "true").ok()?;
         let isa = cranelift_native::builder()
             .ok()?
             .finish(settings::Flags::new(flags))
@@ -71,7 +71,6 @@ impl NumericLeafBackend {
         &self,
         view: &JitCompileSnapshot,
         code_object_id: u64,
-        call_trampoline: Arc<CallTrampoline>,
         osr_pc: Option<u32>,
         artifact_request: Option<ArtifactRequest>,
     ) -> Result<Option<NativeCompileOutput<OptimizedCode>>, Unsupported> {
@@ -149,12 +148,13 @@ impl NumericLeafBackend {
 
         let code = OptimizedCode::new(
             code,
-            call_trampoline,
+            Some(lowered.generated_stack_frame_bytes),
             deopt_table,
             safepoints,
             frame_maps,
             frame_map_bitmap_words,
             BTreeMap::new(),
+            Box::default(),
             BTreeMap::new(),
             Box::default(),
             Box::default(),
@@ -170,14 +170,16 @@ impl NumericLeafBackend {
                 spill_slot_count: 0,
             },
         );
-        Ok(Some(NativeCompileOutput { code, artifact }))
+        Ok(Some(NativeCompileOutput {
+            code,
+            artifact,
+            diagnostics: Box::default(),
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use otter_bytecode::{Op, Operand};
     use otter_vm::{
         JitArtifactFileName, JitArtifactIdentity, JitCompileSnapshot, JitDebugTarget, JitDebugTier,
@@ -190,7 +192,6 @@ mod tests {
 
     use super::*;
     use crate::{
-        TransitionTable,
         artifact::relocation::RelocationCapture,
         entry::{JitCtx, JitEntry, JitRet, STATUS_BAILED, STATUS_RETURNED},
     };
@@ -402,14 +403,9 @@ mod tests {
         view: &JitCompileSnapshot,
         artifact_request: Option<ArtifactRequest>,
     ) -> NativeCompileOutput<OptimizedCode> {
-        let transitions = TransitionTable::resolve();
-        let call_trampoline = Arc::new(
-            CallTrampoline::compile(&transitions)
-                .expect("test host can allocate the shared call trampoline"),
-        );
         NumericLeafBackend::for_host()
             .expect("AArch64 host ISA")
-            .try_compile(view, 7001, call_trampoline, None, artifact_request)
+            .try_compile(view, 7001, None, artifact_request)
             .expect("numeric-leaf code generation")
             .expect("eligible numeric leaf")
     }
@@ -447,10 +443,17 @@ mod tests {
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::addr_of_mut!(native_frame),
             error: &mut error,
-            direct_call: std::mem::MaybeUninit::uninit(),
             activation_base: std::ptr::null_mut(),
             activation_top_ptr: std::ptr::null_mut(),
             activation_limit: 0,
+            global_this_offset: std::ptr::null(),
+            sync_reentry_depth: std::ptr::null_mut(),
+            sync_reentry_limit: 0,
+            native_stack_bytes: std::ptr::null_mut(),
+            native_stack_bytes_limit: 0,
+            generated_call_depth: std::ptr::null_mut(),
+            generated_calls: 0,
+            generated_call_deopts: 0,
         };
         let result = entry(&mut ctx);
         assert_eq!(frame, original_frame, "leaf code must not mutate VM slots");
@@ -524,14 +527,9 @@ mod tests {
 
     #[test]
     fn osr_target_falls_through_to_the_general_backend() {
-        let transitions = TransitionTable::resolve();
-        let call_trampoline = Arc::new(
-            CallTrampoline::compile(&transitions)
-                .expect("test host can allocate the shared call trampoline"),
-        );
         let output = NumericLeafBackend::for_host()
             .expect("AArch64 host ISA")
-            .try_compile(&arithmetic_view(), 7002, call_trampoline, Some(3), None)
+            .try_compile(&arithmetic_view(), 7002, Some(3), None)
             .expect("OSR gate");
 
         assert!(

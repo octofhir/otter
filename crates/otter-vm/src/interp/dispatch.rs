@@ -142,7 +142,9 @@ impl Interpreter {
                     // pushed → a miss). Sampling the max here instead of on every
                     // instruction keeps `maxStackDepthObserved` exact while taking
                     // the comparison off the straight-line hot path.
-                    let depth32 = u32::try_from(depth).unwrap_or(u32::MAX);
+                    let depth32 = u32::try_from(depth)
+                        .unwrap_or(u32::MAX)
+                        .saturating_add(self.jit_generated_call_depth);
                     if depth32 > self.runtime_budget_stats.max_stack_depth_observed {
                         self.runtime_budget_stats.max_stack_depth_observed = depth32;
                     }
@@ -229,22 +231,50 @@ impl Interpreter {
                 Op::Call => {
                     let operands = function.operand_view(instr);
                     let depth_before = stack.len();
+                    let static_native_target = if jit_installed {
+                        register_operand(function.operand(instr, 1))
+                            .ok()
+                            .and_then(|register| {
+                                stack
+                                    .get(top_idx)
+                                    .and_then(|frame| frame.registers.get(register as usize))
+                                    .copied()
+                            })
+                            .and_then(Value::as_native_function)
+                            .and_then(|native| {
+                                crate::math::jit_static_call_kind(native, &self.gc_heap)
+                            })
+                    } else {
+                        None
+                    };
                     self.do_call(stack, context, operands)?;
-                    // Tier-up hook: only when a bytecode callee frame was just
-                    // pushed and a JIT is installed. Cheap (one bool) when off.
-                    if jit_installed && stack.len() > depth_before {
-                        // Record the observed callee for leaf-inlining feedback
-                        // before the tier-up hook may consume the freshly pushed
-                        // frame.
-                        let callee_fid = stack[stack.len() - 1].function_id;
+                    // Record the resolved typed target before a tier-up hook
+                    // consumes a newly pushed bytecode frame. Static natives
+                    // complete synchronously and therefore leave stack depth
+                    // unchanged.
+                    let bytecode_pushed = stack.len() > depth_before;
+                    if jit_installed
+                        && let Some(target) = if bytecode_pushed {
+                            Some(crate::feedback::OrdinaryCallTarget::Bytecode(
+                                stack[stack.len() - 1].function_id,
+                            ))
+                        } else {
+                            static_native_target
+                                .map(crate::feedback::OrdinaryCallTarget::StaticNative)
+                        }
+                    {
                         let transition = self.record_ordinary_call_feedback(
                             function,
                             instr.instruction_pc,
-                            callee_fid,
+                            target,
                         );
                         if transition.evict_for_reopt() {
                             self.evict_compiled_for_reopt(function_id);
                         }
+                    }
+                    // Tier-up hook: only when a bytecode callee frame was just
+                    // pushed and a JIT is installed. Cheap (one bool) when off.
+                    if jit_installed && bytecode_pushed {
                         if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)? {
                             return Ok(value);
                         }

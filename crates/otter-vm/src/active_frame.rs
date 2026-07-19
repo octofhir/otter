@@ -3,9 +3,9 @@
 //! [`NativeFrame`] plus its published register/upvalue windows is the canonical
 //! activation shared by interpreter, baseline, and optimizing tiers. Tier
 //! switches mutate only execution metadata and preserve those windows. A
-//! materialized [`Frame`] is supported as a legacy/cold-sidecar adapter for
-//! paths that have not moved to the canonical activation yet. Runtime semantics
-//! should not otherwise know which representation they received.
+//! materialized [`Frame`] remains the cold interpreter-owned representation.
+//! Runtime semantics should not otherwise know which representation they
+//! received.
 //!
 //! # Contents
 //! - [`ActiveFrameRef`] — shared access to common frame state.
@@ -366,12 +366,33 @@ impl<'a> ActiveFrameRef<'a> {
         }
     }
 
+    /// Trace and rewrite a native-stack register window.
+    ///
+    /// Register-arena windows are traced by
+    /// [`crate::register_stack::RegisterStack`] and must not call this method.
+    /// Callers gate it with
+    /// [`crate::NativeFrameFlags::STACK_REGISTERS`] so each tagged register is
+    /// visited exactly once.
+    pub(crate) fn trace_stack_register_slots(&self, visitor: &mut SlotVisitor<'_>) {
+        let ActiveFrameRefInner::Native(native) = &self.inner else {
+            return;
+        };
+        for index in 0..native.registers.len {
+            // SAFETY: the validated published window remains live until native
+            // activation pop. Stop-the-world tracing owns this short in-place
+            // relocation update and retains no reference afterward.
+            let slot = unsafe { native.registers.base.as_ptr().add(index) };
+            unsafe { (&mut *slot).trace_value_slot_mut(visitor) };
+        }
+    }
+
     /// Trace non-register GC slots owned by this activation.
     ///
-    /// Register windows are traced once through the published register-stack
-    /// prefix. This method owns SELF, `this`, `new.target`, and upvalue handles
-    /// for a native activation; a legacy materialized adapter delegates to its
-    /// established frame tracer.
+    /// Register-arena windows are traced once through their published prefix;
+    /// generated stack windows are handled separately by
+    /// [`Self::trace_stack_register_slots`]. This method owns SELF, `this`,
+    /// `new.target`, and upvalue handles for a native activation; an interpreter
+    /// frame delegates to its established frame tracer.
     pub(crate) fn trace_non_register_slots(&self, visitor: &mut SlotVisitor<'_>) {
         match &self.inner {
             ActiveFrameRefInner::Materialized { frame, .. } => frame.trace_frame_slots(visitor),
@@ -711,7 +732,7 @@ impl<'a> ActiveFrameMut<'a> {
     /// Enter a compiled tier over this same canonical native activation.
     ///
     /// Materialized interpreter activations enter compiled code through the
-    /// JIT entry adapter, which constructs and publishes a native frame. This
+    /// JIT entry path, which constructs and publishes a native frame. This
     /// borrowed materialized view cannot perform that ownership transition.
     pub fn enter_compiled(&mut self, kind: NativeFrameKind) -> Result<(), VmError> {
         match &mut self.inner {

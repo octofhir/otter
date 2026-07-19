@@ -1,4 +1,4 @@
-; otter step trace v1
+; otter step trace
 frame=1 fn=<main> pc=000000 op=VALIDATE_GLOBAL_DECL  k[0] i32:0
 frame=1 fn=<main> pc=000012 op=DECLARE_GLOBAL_LEX  k[0] i32:1
 frame=1 fn=<main> pc=000024 op=LOAD_UNDEFINED  r0

@@ -5,8 +5,11 @@
 //!   listing with code-relative offsets and stable branch labels.
 //! - Relocation, code-map, deopt, and safepoint annotations are rendered from
 //!   the already-built artifact DTOs.
-//! - Template inline-method annotations expose guard/body/replay ranges and
-//!   compact virtual-register-to-scratch assignments.
+//! - Template inline annotations expose guard/body/deopt ranges and compact
+//!   virtual-register-to-scratch assignments.
+//! - Generated direct-call annotations expose exact target generation, tier,
+//!   receiver mode, register shape, and stack reservations without exposing
+//!   its entry-cell address.
 //!
 //! # Invariants
 //! - Every native location is an offset relative to the matching `code.bin`.
@@ -42,7 +45,7 @@ use super::{
     OsrCodeEntry,
 };
 
-const HEADER: &str = "; otter jit aarch64 assembly v1\n";
+const HEADER: &str = "; otter jit aarch64 assembly\n";
 
 /// Render one finalized AArch64 code object and its existing metadata.
 pub(super) fn render(
@@ -309,6 +312,34 @@ fn render_region_annotation(
     if let Some(function_id) = region.function_id {
         write!(output, " function={function_id}").expect("writing to String cannot fail");
     }
+    if let Some(direct_call) = region.direct_call {
+        write!(
+            output,
+            " call-kind={} call-target-function={} call-target-code-object-id={} call-target-tier={} call-this-mode={} call-callee-native-frame-bytes={} call-linkage-bytes={} call-reserved-stack-bytes={} call-callee-register-count={}",
+            direct_call.call_kind.name(),
+            direct_call.target_function_id,
+            direct_call.target_code_object_id,
+            direct_call.target_tier.name(),
+            direct_call.this_mode.name(),
+            direct_call.callee_native_frame_bytes,
+            direct_call.linkage_bytes,
+            direct_call.reserved_stack_bytes,
+            direct_call.callee_register_count,
+        )
+        .expect("writing to String cannot fail");
+    }
+    if let Some(method_guard) = &region.method_guard {
+        write!(
+            output,
+            " method-guard-receiver-register={} method-guard-function={} method-guard-receiver-shape={} method-guard-prototype-shapes={:?} method-guard-value-byte={}",
+            method_guard.receiver_register,
+            method_guard.method_function_id,
+            method_guard.receiver_shape,
+            method_guard.prototype_shapes,
+            method_guard.method_value_byte,
+        )
+        .expect("writing to String cannot fail");
+    }
     if let Some(logical_pc) = region.logical_pc {
         write!(output, " pc={logical_pc}").expect("writing to String cannot fail");
     }
@@ -453,7 +484,6 @@ fn symbolic_target(target: &RelocationTarget) -> String {
             name,
             signature,
         } => format!("runtimeStub(id={id},name={name:?},signature={signature:?})"),
-        RelocationTarget::CallTrampoline => "callTrampoline".to_string(),
         RelocationTarget::GcCageBase => "gcCageBase".to_string(),
         RelocationTarget::PropertyIcCell { access, ordinal } => format!(
             "propertyIcCell(access={},ordinal={ordinal})",
@@ -497,6 +527,24 @@ fn symbolic_target(target: &RelocationTarget) -> String {
             "collectionBuiltinFunction(feedback={},bytePc={byte_pc},runtimeStubId={runtime_stub_id})",
             feedback_kind_name(*feedback_kind)
         ),
+        RelocationTarget::StaticNativeBuiltinFunction { target, byte_pc } => {
+            format!("staticNativeBuiltinFunction(target={target:?},bytePc={byte_pc})")
+        }
+        RelocationTarget::DirectCallEntryCell {
+            byte_pc,
+            direct_call,
+        } => format!(
+            "directCallEntryCell(callerBytePc={byte_pc},callKind={},targetFunction={},targetCodeObjectId={},targetTier={},thisMode={},calleeNativeFrameBytes={},linkageBytes={},reservedStackBytes={},calleeRegisterCount={})",
+            direct_call.call_kind.name(),
+            direct_call.target_function_id,
+            direct_call.target_code_object_id,
+            direct_call.target_tier.name(),
+            direct_call.this_mode.name(),
+            direct_call.callee_native_frame_bytes,
+            direct_call.linkage_bytes,
+            direct_call.reserved_stack_bytes,
+            direct_call.callee_register_count,
+        ),
     }
 }
 
@@ -512,9 +560,7 @@ fn operand_role_name(role: TemplateOperandRole) -> &'static str {
         TemplateOperandRole::ClosureParents => "closureParents",
         TemplateOperandRole::NewArrayElements => "newArrayElements",
         TemplateOperandRole::MathArguments => "mathArguments",
-        TemplateOperandRole::CallArguments => "callArguments",
         TemplateOperandRole::ConstructArguments => "constructArguments",
-        TemplateOperandRole::MethodArguments => "methodArguments",
     }
 }
 
@@ -606,7 +652,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::artifact::relocation::RelocationCapture;
+    use crate::artifact::{
+        DirectCallArtifact, DirectCallKindArtifact, DirectCallThisModeArtifact,
+        DirectCallTierArtifact, relocation::RelocationCapture,
+    };
 
     const NOP: u32 = 0xd503_201f;
     const RET: u32 = 0xd65f_03c0;
@@ -739,6 +788,38 @@ mod tests {
     }
 
     #[test]
+    fn direct_call_region_names_caller_and_target() {
+        let mut output = String::new();
+        render_region_annotation(
+            &mut output,
+            &CodeRegion::call_structural(
+                "directCallGuard",
+                4,
+                12,
+                7,
+                2,
+                19,
+                DirectCallArtifact {
+                    call_kind: DirectCallKindArtifact::Plain,
+                    target_function_id: 11,
+                    target_code_object_id: 29,
+                    target_tier: DirectCallTierArtifact::Optimizing,
+                    this_mode: DirectCallThisModeArtifact::SloppyGlobal,
+                    callee_native_frame_bytes: 160,
+                    linkage_bytes: 112,
+                    reserved_stack_bytes: 272,
+                    callee_register_count: 6,
+                },
+            ),
+            None,
+        );
+        assert_eq!(
+            output,
+            "  ; region kind=directCallGuard range=+0x00000004..+0x0000000c function=7 call-kind=plain call-target-function=11 call-target-code-object-id=29 call-target-tier=optimizing call-this-mode=sloppyGlobal call-callee-native-frame-bytes=160 call-linkage-bytes=112 call-reserved-stack-bytes=272 call-callee-register-count=6 pc=2 byte-pc=19\n"
+        );
+    }
+
+    #[test]
     fn relocation_lines_are_symbolic_and_redact_address_chunks() {
         let code = words(&[movz(16, 0xdead, 0), movk(16, 0xbeef, 16), RET]);
         let mut capture = RelocationCapture::new(true);
@@ -774,6 +855,45 @@ mod tests {
         assert!(!assembly.contains("movz"));
         assert!(!assembly.contains("movk"));
         assert!(line.contains("runtimeStub(id=1"));
+    }
+
+    #[test]
+    fn direct_call_relocation_names_exact_generation_and_stack_contract() {
+        let code = words(&[movz(16, 0xdead, 0), RET]);
+        let mut capture = RelocationCapture::new(true);
+        capture.record_mov_wide(
+            0,
+            4,
+            16,
+            RelocationTarget::DirectCallEntryCell {
+                byte_pc: 19,
+                direct_call: DirectCallArtifact {
+                    call_kind: DirectCallKindArtifact::Plain,
+                    target_function_id: 11,
+                    target_code_object_id: 29,
+                    target_tier: DirectCallTierArtifact::Optimizing,
+                    this_mode: DirectCallThisModeArtifact::SloppyGlobal,
+                    callee_native_frame_bytes: 160,
+                    linkage_bytes: 112,
+                    reserved_stack_bytes: 272,
+                    callee_register_count: 6,
+                },
+            },
+        );
+        let relocations = capture.render(&code).unwrap();
+        let assembly = render(
+            &metadata(),
+            &code,
+            0,
+            &CodeMapCapture::default(),
+            &relocations.validated,
+            None,
+            &[],
+        );
+        assert!(assembly.starts_with("; otter jit aarch64 assembly\n"));
+        assert!(assembly.contains(
+            "directCallEntryCell(callerBytePc=19,callKind=plain,targetFunction=11,targetCodeObjectId=29,targetTier=optimizing,thisMode=sloppyGlobal,calleeNativeFrameBytes=160,linkageBytes=112,reservedStackBytes=272,calleeRegisterCount=6)"
+        ));
     }
 
     #[test]

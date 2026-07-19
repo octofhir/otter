@@ -250,8 +250,6 @@ impl CliExecutionConfig {
             #[derive(serde::Serialize)]
             #[serde(rename_all = "camelCase")]
             struct Index<'a> {
-                #[serde(rename = "otterJitArtifactIndexSchemaVersion")]
-                schema_version: u32,
                 bundles: &'a [String],
                 retained_bytes: u64,
                 dropped_bundles: u64,
@@ -262,7 +260,6 @@ impl CliExecutionConfig {
             write_json_file(
                 &temp.join("index.json"),
                 &Index {
-                    schema_version: 1,
                     bundles: &directory_names,
                     retained_bytes: u64::try_from(batch.retained_bytes()).unwrap_or(u64::MAX),
                     dropped_bundles: batch.dropped_bundles(),

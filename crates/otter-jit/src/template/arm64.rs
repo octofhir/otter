@@ -33,6 +33,9 @@
 //! - A branch may skip general tagged truthiness only when its condition's
 //!   nearest write in the same straight-line basic block is a canonical
 //!   boolean producer. Any explicit control-flow target breaks that proof.
+//! - `LoadThis` checks the TDZ hole only for a snapshot explicitly marked as a
+//!   derived constructor; every other entry binding is initialized by frame
+//!   setup.
 //!
 //! # See also
 //! - [`super::plan`] — the validated operation stream consumed here.
@@ -433,10 +436,12 @@ pub(super) fn compile(
             }
             TemplateOp::LoadThis { dst } => {
                 dynasm!(ops ; .arch aarch64 ; ldr x9, [x21, NATIVE_FRAME_THIS_OFFSET]);
-                emit_load_u64(&mut ops, 12, VALUE_HOLE);
-                // A derived-ctor `this`-before-`super` hole resolves in the
-                // interpreter.
-                dynasm!(ops ; .arch aarch64 ; cmp x9, x12 ; b.eq =>bail);
+                if view.derived_constructor {
+                    emit_load_u64(&mut ops, 12, VALUE_HOLE);
+                    // A derived-ctor `this`-before-`super` hole resolves in the
+                    // interpreter.
+                    dynasm!(ops ; .arch aarch64 ; cmp x9, x12 ; b.eq =>bail);
+                }
                 emit_store_reg(&mut ops, 9, dst)?;
             }
             TemplateOp::LoadSelfClosure { dst } => {

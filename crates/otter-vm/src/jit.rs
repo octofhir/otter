@@ -143,6 +143,12 @@ pub struct JitCompileSnapshot {
     /// function-mode flags are owned solely by this `CodeBlock`. The JIT must
     /// not keep a second scalar representation of executable state.
     pub code_block: Arc<CodeBlock>,
+    /// Whether entry starts with the `this` binding in the derived-constructor
+    /// TDZ until `super()` commits `BindThisValue`.
+    ///
+    /// Every other function receives an initialized `this` value, allowing a
+    /// backend to omit the per-`LoadThis` hole guard.
+    pub derived_constructor: bool,
     /// GC cage base address (`otter_gc::cage_base()`), baked at compile time.
     /// Stable for the isolate's life, so emitted inline property loads add it
     /// to a compressed `Gc` offset to decompress an object pointer without a
@@ -807,6 +813,7 @@ impl JitCompileSnapshot {
             .collect();
         Self {
             code_block,
+            derived_constructor: false,
             cage_base: 0,
             array_layout: JitArrayLayout::default(),
             string_layout: JitStringLayout::default(),

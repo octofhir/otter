@@ -205,7 +205,9 @@ impl Interpreter {
             host_module_env_cache: std::collections::HashMap::new(),
             module_init_upvalues: std::collections::HashMap::new(),
             global_lexicals: rustc_hash::FxHashMap::default(),
+            global_lexical_epoch: 0,
             global_lexical_load_ic: rustc_hash::FxHashMap::default(),
+            global_object_load_ic: rustc_hash::FxHashMap::default(),
             module_hoisted: std::collections::HashSet::new(),
             module_evaluation_depth: 0,
             module_resolution_cache: std::collections::HashMap::new(),
@@ -222,6 +224,8 @@ impl Interpreter {
             optimizing_tier_policy: tier_policy::TierPolicy::default(),
             jit_entry_bail_counts: rustc_hash::FxHashMap::default(),
             jit_entry_reopt_counts: rustc_hash::FxHashMap::default(),
+            jit_feedback_refresh_attempted: rustc_hash::FxHashSet::default(),
+            jit_pending_direct_targets: rustc_hash::FxHashMap::default(),
             jit_osr_disabled: rustc_hash::FxHashSet::default(),
             jit_osr_counts: rustc_hash::FxHashMap::default(),
             jit_osr_threshold: Self::JIT_OSR_THRESHOLD,
@@ -1014,12 +1018,29 @@ impl Interpreter {
     /// calls never pay compile latency.
     pub(crate) const JIT_TIER_UP_THRESHOLD: u32 = 50;
 
+    /// Shared entry hotness at which a successful baseline generation gets one
+    /// feedback-driven rebuild. Target readiness is checked separately before
+    /// invalidation, so this window only needs to amortize one extra compile;
+    /// keeping it close to initial tier-up avoids hundreds of generic calls
+    /// after every observed callee already has a stable native entry.
+    pub(crate) const JIT_FEEDBACK_REFRESH_THRESHOLD: u32 = 128;
+
     /// Entry-bail count at which an installed body is evicted and recompiled
     /// against current feedback (see [`Self::note_jit_entry_bail`]). Low enough
     /// that a body bailing on every call stops wasting entries quickly, high
     /// enough that a handful of cold-path bails (a rare branch hitting an
     /// unsupported region) never evicts a body that is fine on its hot path.
     pub(crate) const JIT_ENTRY_BAIL_REOPT_THRESHOLD: u32 = 8;
+
+    /// Minimum generated entries before aggregate deopt pressure can evict an
+    /// exact code generation. This keeps small/cold samples from influencing
+    /// tier policy while bounding deopt-dominated hot generations quickly.
+    pub(crate) const JIT_GENERATED_DEOPT_MIN_ENTRIES: u64 = 64;
+
+    /// A generated code object is unhealthy when at least this fraction of its
+    /// entries deopt. Expressed as a denominator to keep the cold check integer
+    /// only: `deopts * DENOMINATOR >= entries`.
+    pub(crate) const JIT_GENERATED_DEOPT_RATE_DENOMINATOR: u64 = 4;
 
     /// Recompile budget per function for entry-bail eviction. A body still
     /// bail-looping after this many fresh-feedback recompiles is stuck on

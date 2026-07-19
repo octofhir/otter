@@ -362,10 +362,11 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     inline-deopt events. Bounded method chains expose `targetIndex` /
     `targetCount`; `compilePrepared` reports `directMethodSites` and
     `directMethodTargets` separately from body-inline candidate counts, while
-    `globalLexicalLoads` counts permanent global-declarative cells available
-    for direct reads. Capture is default-off and bounded to 16,384 events per
-    top-level run; `truncated` and `droppedEvents` report overflow without
-    constructing further payloads.
+    `globalLoadSites` counts analyzed global reads, `globalLexicalLoads`
+    counts permanent global-declarative cells, and `globalObjectLoads` counts
+    guarded global-object slots available for direct reads. Capture is
+    default-off and bounded to 16,384 events per top-level run; `truncated`
+    and `droppedEvents` report overflow without constructing further payloads.
   - Abrupt VM completion (for example, a thrown exception after tier-up) still
     writes the partial report. The original execution error remains primary if
     writing that report also fails. A host command timeout can precede isolate
@@ -388,6 +389,8 @@ Pure Rust implementation - no external JavaScript engine dependencies.
   - Direct global-lexical reads expose `globalLexicalCell` relocations keyed by
     byte PC. Exact addresses are redacted; the generated hit reads the live
     permanent cell and a TDZ hole retains the canonical throwing transition.
+    Guarded global-object reads prove the realm epoch, dictionary shape, and
+    property slot before reading the live value.
   - Inspect the first line of `optimized-ir.txt` before reading it: the general
     backend emits the Otter optimized unit, while a Cranelift numeric leaf
     starts with `; backend=cranelift numeric-leaf` and then contains CLIF. Its
@@ -402,8 +405,10 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     replace the address-bearing sequence with a symbolic `relocation …` line
     rather than printing its resolved value or immediate chunks.
     Words the decoder does not recognize remain visible through a `.word`
-    fallback. Join assembly ranges to bytecode/tier operations through
-    `code-map.json`, then inspect `deopt.json` or `safepoints.json` as
+    fallback. Join a process-local profiler PC to `runtimeAddressRange`, then
+    use assembly offsets and `code-map.json` to reach bytecode/tier operations.
+    The hexadecimal range exists only under explicit artifact capture and is
+    not portable or callable. Inspect `deopt.json` or `safepoints.json` as
     applicable; safepoint `nativeReturnOffset` is currently explicitly `null`.
   - Template plain-call and method inlines expose `inlineCall*` /
     `inlineMethod*` guard, body, hit-epilogue, and deopt-teardown regions plus
@@ -418,14 +423,17 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     `directCallFrameSetup`, `directCallNativeEntry`, `directCallReturn`,
     `directCallCleanup`, and `directCallEntryReject`; methods additionally
     expose `directMethodGuard`. `functionId` is the caller. Typed `directCall`
-    metadata names call kind, target function, exact `targetCodeObjectId`,
-    tier, `thisMode`, callee-native-frame bytes, caller linkage bytes, total
-    reserved stack bytes, and register count. `methodGuard` names the receiver
-    register, receiver/prototype shapes, method function, and slot byte.
-    Portable normalized code excludes only generation-local
-    `targetCodeObjectId`; call kind, target tier, `thisMode`, and layout
-    semantics remain portable. Pre-entry misses deopt at the original opcode;
-    started callees are never replayed.
+    metadata names call kind, target function, planning-time
+    `targetCodeObjectId`, tier, `thisMode`, captured callee-native-frame bytes,
+    caller linkage bytes, captured total reservation, and register count.
+    Generated code links through the permanent function cell and reads the
+    selected generation's actual code-object id, tier, and frame reservation
+    before entry; tier publication does not recompile callers. `methodGuard`
+    names the receiver register, receiver/prototype shapes, method function,
+    and slot byte. Portable normalized code excludes generation-local
+    `targetCodeObjectId`; call kind, captured target tier, `thisMode`, and
+    layout semantics remain portable. Pre-entry misses deopt at the original
+    opcode; started callees are never replayed.
   - Assembly decoding and formatting run only when `--jit-artifacts` is
     requested. The disabled path does not clone code, disassemble it, or build
     artifact text.

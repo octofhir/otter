@@ -224,6 +224,15 @@ impl Interpreter {
         std::ptr::from_ref(&self.global_this).cast()
     }
 
+    /// Address of the global declarative record's monotonic name-set epoch.
+    ///
+    /// Generated object-record global loads read this cell immediately before
+    /// their shape guard. The interpreter is exclusively borrowed and cannot
+    /// move for the complete compiled activation.
+    pub fn jit_global_lexical_epoch_addr(&self) -> *const u64 {
+        std::ptr::addr_of!(self.global_lexical_epoch)
+    }
+
     /// Current logical JavaScript frame depth across materialized interpreter
     /// frames and generated frames that still live only on the native stack.
     ///

@@ -975,10 +975,11 @@ pub const STUB_JIT_CONTROL_OP: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
 );
 
-/// Completes spread calls/constructions, explicit-receiver calls, and
-/// `CollectArguments` through the VM's synchronous call helpers. `TailCall`
-/// is excluded: its interpreter path reuses the caller frame for true tail
-/// recursion, so it stays an exact side exit rather than a nested call.
+/// Completes spread calls/constructions, explicit-receiver calls, generic
+/// method-call misses, and `CollectArguments` through the VM's synchronous
+/// call helpers. `TailCall` is excluded: its interpreter path reuses the
+/// caller frame for true tail recursion, so it stays an exact side exit rather
+/// than a nested call.
 pub const STUB_JIT_SPREAD_CALL_OP: RuntimeStubDescriptor = descriptor(
     63,
     RuntimeStubClass::Reentrant,
@@ -1070,6 +1071,22 @@ pub const STUB_JIT_DEOPT_STACK_CALL: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusPair,
 );
 
+/// Cold no-allocation repair for a stable generated-call function entry.
+///
+/// The normal path reads the published generation cell entirely in machine
+/// code. A zero target calls this resolver once to republish any already
+/// installed fallback generation, returning its generation-cell address or
+/// zero when the caller must take an exact pre-effect side exit.
+pub const STUB_JIT_RESOLVE_DIRECT_ENTRY: RuntimeStubDescriptor = descriptor(
+    69,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::ValueWord,
+);
+
 /// Human-readable symbol for a runtime-stub id in the current contract.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -1142,6 +1159,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         66 => "jit_resolve_threw",
         67 => "jit_deopt_reify_frame",
         68 => "jit_deopt_stack_call",
+        69 => "jit_resolve_direct_entry",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1216,6 +1234,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_RESOLVE_THREW,
     STUB_JIT_DEOPT_REIFY_FRAME,
     STUB_JIT_DEOPT_STACK_CALL,
+    STUB_JIT_RESOLVE_DIRECT_ENTRY,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

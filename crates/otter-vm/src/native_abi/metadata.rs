@@ -59,12 +59,6 @@ pub enum CodeDependencyKind {
     BuiltinIdentity = 2,
     /// Shape/prototype epoch.
     ShapeEpoch = 3,
-    /// Exact installed callee code generation used by a generated direct edge.
-    ///
-    /// `identity` is the bytecode function id and `expected` is the immutable
-    /// code-object id. Unlike epoch families, registry validation resolves
-    /// this directly against installed-code lifecycle state.
-    CodeGeneration = 4,
 }
 
 /// Explicit validity dependency owned by a code object.
@@ -87,17 +81,6 @@ impl CodeDependency {
             kind,
             identity,
             expected,
-        }
-    }
-
-    /// Construct an exact generated-call dependency on one installed code
-    /// object.
-    #[must_use]
-    pub const fn code_generation(function_id: u32, code_object_id: u64) -> Self {
-        Self {
-            kind: CodeDependencyKind::CodeGeneration,
-            identity: function_id,
-            expected: code_object_id,
         }
     }
 }

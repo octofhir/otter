@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - Compiler-generated monomorphic plain calls and bounded polymorphic method
-//!   chains with exact pre-effect deopt.
+//!   chains with a canonical generic-call continuation.
 //! - Construct lowering through the current runtime transition.
 //! - Guarded read-only numeric call/method splicing from VM-baked metadata.
 //! - Guarded collection-method leaves before generated method linkage.
@@ -26,7 +26,8 @@
 //! - A raw receiver pointer retained in `x17` is live only between the entry
 //!   identity guard and the end of a call-free, safepoint-free inline body.
 //! - A method target without one current native generation is omitted; a site
-//!   matching no generated target takes an exact pre-effect side exit.
+//!   matching no generated target completes through the VM's canonical
+//!   `GetMethod + Call` transition without replaying the caller.
 //!
 //! # See also
 //! - [`crate::arm64`] — shared generated call and method-guard emission.
@@ -35,6 +36,7 @@
 use std::collections::BTreeMap;
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
+use otter_bytecode::Op;
 use otter_vm::native_abi as abi;
 use otter_vm::{
     JitCompileSnapshot, JitInlineCallee, JitInlineMethod, closure::JS_CLOSURE_BODY_TYPE_TAG,
@@ -61,7 +63,9 @@ use crate::artifact::{
     CodeMapCapture, CodeRegion, InlineScratchEntryArtifact, InlineScratchLayoutArtifact,
     InlineSiteArtifact,
 };
-use crate::entry::{NUMBER_TAG_HI16, Unsupported, VALUE_UNDEFINED};
+use crate::entry::{
+    MAX_METHOD_ARGS, NUMBER_TAG_HI16, Unsupported, VALUE_UNDEFINED, pack_method_arg_regs,
+};
 use crate::template::{
     ArithKind, InlineEntryValue, InlineLeafPlan, InlineScratchSlot, TemplateOp, TemplatePlan,
     TemplateTail,
@@ -847,7 +851,6 @@ pub(super) fn emit_call(
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
     view: &JitCompileSnapshot,
-    code_dependencies: &mut BTreeMap<u32, u64>,
     mut direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
     mut code_map: Option<&mut CodeMapCapture>,
     dst: u16,
@@ -970,17 +973,12 @@ pub(super) fn emit_call(
                 arguments: argument_registers,
             },
             table.entry(abi::STUB_JIT_DEOPT_STACK_CALL),
+            table.entry(abi::STUB_JIT_RESOLVE_DIRECT_ENTRY),
             code_map,
             bail,
             threw,
             done,
         )?;
-        let previous =
-            code_dependencies.insert(target.plan.function_id, target.plan.code_object_id);
-        debug_assert!(
-            previous.is_none_or(|code_object_id| code_object_id == target.plan.code_object_id),
-            "one compile snapshot cannot name two generations for one callee"
-        );
         if let Some(events) = direct_call_events.as_deref_mut() {
             events.insert(
                 (byte_pc, 0),
@@ -1118,11 +1116,11 @@ pub(super) fn emit_method_call(
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
     view: &JitCompileSnapshot,
-    code_dependencies: &mut BTreeMap<u32, u64>,
     mut direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
     mut code_map: Option<&mut CodeMapCapture>,
     dst: u16,
     receiver: u16,
+    name: u32,
     argc: u16,
     argument_registers: &[u16],
     logical_pc: u32,
@@ -1280,21 +1278,12 @@ pub(super) fn emit_method_call(
             view,
             direct_site,
             table.entry(abi::STUB_JIT_DEOPT_STACK_CALL),
+            table.entry(abi::STUB_JIT_RESOLVE_DIRECT_ENTRY),
             code_map.as_deref_mut(),
             bail,
             threw,
             done,
         )?;
-        let previous = code_dependencies.insert(
-            method.callee.plan.function_id,
-            method.callee.plan.code_object_id,
-        );
-        debug_assert!(
-            previous.is_none_or(|code_object_id| {
-                code_object_id == method.callee.plan.code_object_id
-            }),
-            "one compile snapshot cannot name two generations for one callee"
-        );
         if let Some(events) = direct_call_events.as_deref_mut() {
             events.insert(
                 (byte_pc, method.target_index),
@@ -1315,6 +1304,23 @@ pub(super) fn emit_method_call(
         }
         dynasm!(ops ; .arch aarch64 ; =>next_target);
     }
-    dynasm!(ops ; .arch aarch64 ; b =>bail ; =>done);
+    if argument_registers.len() <= MAX_METHOD_ARGS {
+        let packed_meta = u64::from(dst) | (u64::from(receiver) << 16) | (u64::from(argc) << 32);
+        super::spread_call::emit_spread_call_op(
+            ops,
+            relocations,
+            table,
+            Op::CallMethodValue as u8,
+            packed_meta,
+            pack_method_arg_regs(argument_registers),
+            u64::from(name),
+            bail,
+            threw,
+        );
+        dynasm!(ops ; .arch aarch64 ; b =>done);
+    } else {
+        dynasm!(ops ; .arch aarch64 ; b =>bail);
+    }
+    dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
 }

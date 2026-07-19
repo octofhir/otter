@@ -115,7 +115,6 @@ pub(super) fn compile(
     let plan = TemplatePlan::build(view)?;
     let mut code_map = artifact_request.as_ref().map(|_| CodeMapCapture::default());
     let mut relocations = RelocationCapture::new(artifact_request.is_some());
-    let mut code_dependencies = BTreeMap::<u32, u64>::new();
     let mut direct_call_events = capture_events.then(|| {
         let mut events = view
             .direct_callees
@@ -688,7 +687,6 @@ pub(super) fn compile(
                     &mut relocations,
                     transitions,
                     view,
-                    &mut code_dependencies,
                     direct_call_events.as_mut(),
                     code_map.as_mut(),
                     dst,
@@ -724,7 +722,7 @@ pub(super) fn compile(
             TemplateOp::MethodCall {
                 dst,
                 receiver,
-                name: _,
+                name,
                 site: _,
                 argc,
                 packed_args,
@@ -738,11 +736,11 @@ pub(super) fn compile(
                     &mut relocations,
                     transitions,
                     view,
-                    &mut code_dependencies,
                     direct_call_events.as_mut(),
                     code_map.as_mut(),
                     dst,
                     receiver,
+                    name,
                     argc,
                     &argument_registers,
                     instr.pc,
@@ -1434,13 +1432,7 @@ pub(super) fn compile(
         code_object_id,
         view.code_block.id,
         register_count,
-        code_dependencies
-            .into_iter()
-            .map(|(function_id, code_object_id)| {
-                otter_vm::native_abi::CodeDependency::code_generation(function_id, code_object_id)
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
+        Box::new([]),
         register_operands,
         index_operands,
         load_ic_cells,

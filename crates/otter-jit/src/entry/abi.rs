@@ -16,7 +16,9 @@
 use otter_vm::{
     ActiveFrameMut, ActiveFrameRef, RuntimeCall, RuntimeStubAllocContext, Value, VmError,
     VmRuntimeActivation,
-    native_abi::{CodeEntryCell, NativeFrame, NativeFrameFlags, VmFrameHeader, VmThread},
+    native_abi::{
+        CodeEntryCell, FunctionEntryCell, NativeFrame, NativeFrameFlags, VmFrameHeader, VmThread,
+    },
 };
 /// Machine-visible context shared by every compiled tier.
 ///
@@ -196,6 +198,8 @@ pub(crate) const VM_THREAD_INTERRUPT_CELL_OFFSET: u32 =
     std::mem::offset_of!(VmThread, interrupt_cell) as u32;
 pub(crate) const VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET: u32 =
     std::mem::offset_of!(VmThread, backedge_fuel_cell) as u32;
+pub(crate) const VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET: u32 =
+    std::mem::offset_of!(VmThread, global_lexical_epoch_cell) as u32;
 pub(crate) const VM_THREAD_GC_HEAP_OFFSET: u32 = std::mem::offset_of!(VmThread, gc_heap) as u32;
 pub(crate) const VM_THREAD_CODE_OBJECT_ID_OFFSET: u32 =
     std::mem::offset_of!(VmThread, current_code_object_id) as u32;
@@ -233,8 +237,11 @@ pub(crate) const ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET: u32 =
     std::mem::offset_of!(RuntimeStubAllocContext, spill_slot_count) as u32;
 pub(crate) const ALLOC_CTX_STACK_SIZE: u32 =
     ((std::mem::size_of::<RuntimeStubAllocContext>() + 15) & !15) as u32;
-/// Fixed-layout fields consumed by native call linkage. Entry cells are boxed
-/// by the isolate registry and never reused for another code generation.
+/// Fixed-layout stable function dispatch selected by generated call linkage.
+pub(crate) const FUNCTION_ENTRY_GENERATION_CELL_OFFSET: u32 =
+    std::mem::offset_of!(FunctionEntryCell, generation_cell) as u32;
+/// Fixed-layout fields consumed by native call linkage. Generation cells are
+/// boxed by the isolate registry and never reused.
 pub(crate) const CODE_ENTRY_ACTIVE_COUNT_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, active_count) as u32;
 pub(crate) const CODE_ENTRY_GENERATED_ENTRIES_OFFSET: u32 =
@@ -254,6 +261,8 @@ pub(crate) const CODE_ENTRY_FUNCTION_ID_OFFSET: u32 =
 pub(crate) const CODE_ENTRY_REGISTER_COUNT_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, register_count) as u32;
 pub(crate) const CODE_ENTRY_FLAGS_OFFSET: u32 = std::mem::offset_of!(CodeEntryCell, flags) as u32;
+pub(crate) const CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET: u32 =
+    std::mem::offset_of!(CodeEntryCell, generated_stack_frame_bytes) as u32;
 /// 16-aligned machine-stack reservation for a nested callee's compact frame.
 pub(crate) const NATIVE_FRAME_STACK_SIZE: u32 =
     ((std::mem::size_of::<NativeFrame>() + 15) & !15) as u32;

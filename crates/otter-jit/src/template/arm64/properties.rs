@@ -145,8 +145,6 @@ pub(super) fn emit_load_property(
                 ordinal: cell_ordinal,
             },
         );
-        // Walk the IC ways: a hit loads that way's value byte into w17 and
-        // shares the slab read.
         let do_load = ops.new_dynamic_label();
         for way in 0..IC_WAYS as u32 {
             let shape_off = way * 8;

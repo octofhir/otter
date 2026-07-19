@@ -437,6 +437,9 @@ fn jit_counter_deltas(before: JitRuntimeStats, after: JitRuntimeStats) -> Vec<(&
         ("jit-runtime-constructs", runtime_constructs),
         ("jit-generated-calls", generated_calls),
         ("jit-generated-call-deopts", generated_call_deopts),
+        ("jit-caller-invalidations", caller_invalidations),
+        ("jit-cold-entry-resolver-misses", cold_entry_resolver_misses),
+        ("jit-to-rust-call-transitions", jit_to_rust_call_transitions),
         ("jit-generated-template-entries", generated_template_entries),
         ("jit-generated-template-returns", generated_template_returns),
         ("jit-generated-template-deopts", generated_template_deopts),
@@ -458,6 +461,8 @@ fn jit_counter_deltas(before: JitRuntimeStats, after: JitRuntimeStats) -> Vec<(&
             generated_optimizing_throws
         ),
         ("jit-compile-attempts", compile_attempts),
+        ("jit-code-generations", code_generations),
+        ("jit-feedback-refreshes", feedback_refreshes),
         ("jit-osr-attempts", osr_attempts),
         ("jit-runtime-property-stubs", runtime_property_stubs),
         ("jit-runtime-stub-transitions", runtime_stub_transitions),

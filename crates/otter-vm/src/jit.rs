@@ -164,6 +164,9 @@ pub struct JitCompileSnapshot {
     /// emitter reads `[obj_ptr + object_shape_byte]` for the WhiskerIC
     /// `LoadProperty` cell guard, staying layout-agnostic.
     pub object_shape_byte: u32,
+    /// Byte offset from a decompressed object pointer to its dictionary-mode
+    /// structural identity. Read only after the ordinary shape handle is null.
+    pub object_dictionary_shape_id_byte: u32,
     /// Byte offset from a decompressed object pointer to its cached
     /// string-keyed value slab pointer (`HEADER_SIZE +
     /// OBJECT_BODY_VALUES_PTR_OFFSET`). The emitter reads this pointer after a
@@ -222,6 +225,11 @@ pub struct JitCompileSnapshot {
     /// each non-moving cell; generated code reads its current value and takes
     /// the semantic stub only for a TDZ hole.
     pub global_lexical_loads: rustc_hash::FxHashMap<u32, JitGlobalLexicalLoad>,
+    /// Guarded own-data reads from the global object record keyed by the
+    /// `Op::LoadGlobalOrThrow` byte-PC. Generated code validates both the live
+    /// global-declarative epoch and the global object's hidden class before
+    /// reading the current compressed slot value.
+    pub global_object_loads: rustc_hash::FxHashMap<u32, JitGlobalObjectLoad>,
     /// Guarded static-native leaf calls keyed by the caller's `Op::Call`
     /// byte-PC. Each plan names one exact bootstrap function identity and one
     /// machine-code operation; misses side-exit before effects.
@@ -544,13 +552,14 @@ pub struct JitStaticNativeCall {
 pub struct JitDirectCallPlan {
     /// Callee function id in the executable module.
     pub function_id: u32,
-    /// Exact installed code-object generation named by [`Self::entry_cell`].
+    /// Generation current when this cold compile plan was captured. Generated
+    /// code uses it only for diagnostics; dispatch follows [`Self::entry_cell`].
     pub code_object_id: u64,
-    /// Stable address of the exact generation's
-    /// [`crate::native_abi::CodeEntryCell`]. The cell is registry-owned and is
-    /// never reused, even after its executable mapping retires.
+    /// Stable address of the function's
+    /// [`crate::native_abi::FunctionEntryCell`]. The cell is registry-owned,
+    /// never reused, and atomically selects the current generation.
     pub entry_cell: u64,
-    /// Native tier published by the exact target generation.
+    /// Native tier current when this cold compile plan was captured.
     pub tier: NativeFrameKind,
     /// Exact plain-call `this` binding the generated linkage must perform.
     pub this_mode: JitDirectCallThisMode,
@@ -570,13 +579,13 @@ pub struct JitDirectCallPlan {
 /// One baked compiler-native target for a monomorphic plain-call site.
 ///
 /// Presence in [`JitCompileSnapshot::direct_callees`] proves the callee is an
-/// ordinary synchronous body, owns no fresh upvalue cells, and has a current
-/// entry-capable code generation. Dynamic callable identity, supported `this`
-/// binding, and entry-cell liveness remain machine-code guards, so invalidation
-/// safely side-exits.
+/// ordinary synchronous body, owns no fresh upvalue cells, and has a stable
+/// entry cell with one current entry-capable generation. Dynamic callable
+/// identity, supported `this` binding, and target liveness remain machine-code
+/// guards; tier promotion patches the cell without invalidating this caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JitDirectCallee {
-    /// Exact function identity, entry cell, and callee register-window shape.
+    /// Function identity, stable entry cell, and callee register-window shape.
     pub plan: JitDirectCallPlan,
 }
 
@@ -585,6 +594,21 @@ pub struct JitDirectCallee {
 pub struct JitGlobalLexicalLoad {
     /// Compressed GC-cage offset of the rooted, non-moving upvalue cell.
     pub cell_offset: u32,
+}
+
+/// One guarded own-data load from the global object record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitGlobalObjectLoad {
+    /// Expected ordinary shape-handle offset or dictionary structural id.
+    pub shape: u64,
+    /// Whether [`Self::shape`] names the dictionary structural id rather than
+    /// an ordinary compressed shape handle.
+    pub dictionary: bool,
+    /// Byte offset of the property inside the object's value slab.
+    pub value_byte: u32,
+    /// Global declarative-record epoch captured with the slot lookup. A
+    /// mismatch means a later lexical declaration may shadow this property.
+    pub global_lexical_epoch: u64,
 }
 
 /// One guarded method target with an exact generated callee plan.
@@ -787,6 +811,7 @@ impl JitCompileSnapshot {
             array_layout: JitArrayLayout::default(),
             string_layout: JitStringLayout::default(),
             object_shape_byte: 0,
+            object_dictionary_shape_id_byte: 0,
             object_values_ptr_byte: 0,
             object_inline_values_byte: 0,
             object_slab_len_byte: 0,
@@ -801,6 +826,7 @@ impl JitCompileSnapshot {
             native_static_fn_byte: 0,
             instructions,
             global_lexical_loads: rustc_hash::FxHashMap::default(),
+            global_object_loads: rustc_hash::FxHashMap::default(),
             static_native_calls: rustc_hash::FxHashMap::default(),
             direct_callees: rustc_hash::FxHashMap::default(),
             direct_methods: rustc_hash::FxHashMap::default(),
@@ -1318,21 +1344,6 @@ pub trait JitCompilerHook: Send + Sync {
     /// running promotion policy. Hooks overriding
     /// [`Self::compile_optimized_function`] must also return `true` here.
     fn optimizing_tier_enabled(&self) -> bool {
-        false
-    }
-
-    /// Whether optimizing this exact snapshot can publish an entry generation
-    /// safe for existing compiler-generated callers.
-    ///
-    /// This is a conservative pre-invalidation capability query. Returning
-    /// `false` keeps a depended-on entry-capable generation installed. Hooks
-    /// should return `true` only for a backend whose stack reservation and
-    /// every cold-deopt path are already proven under stack-owned entry.
-    fn optimizing_generated_entry_supported(
-        &self,
-        _snapshot: &JitCompileSnapshot,
-        _osr_pc: Option<u32>,
-    ) -> bool {
         false
     }
 

@@ -16,8 +16,11 @@
 //!   safepoint. Moving GC therefore rewrites them in place.
 //! - A callee bailout is not replayed. The live published frame enters the
 //!   cold stack-call deoptimizer, which resumes the already-started callee.
-//! - The exact `CodeEntryCell` generation is acquired and rechecked before
-//!   entry, then released only after return, throw, or cold deopt completes.
+//! - Callers load the current generation through a stable per-function cell.
+//!   The selected `CodeEntryCell` is acquired and rechecked before entry, then
+//!   released only after return, throw, or cold deopt completes.
+//! - Tier publication patches the function cell; a missing target enters one
+//!   no-allocation cold resolver and never invalidates the generated caller.
 //! - Generated recursion, logical-call-depth, and native-stack reservations
 //!   are committed together and released on both normal cleanup and rejected
 //!   entry. Cold deopt temporarily transfers the current logical frame to the
@@ -44,8 +47,9 @@ use crate::{
         CODE_ENTRY_ACTIVE_COUNT_OFFSET, CODE_ENTRY_CODE_OBJECT_ID_OFFSET, CODE_ENTRY_FLAGS_OFFSET,
         CODE_ENTRY_FUNCTION_ID_OFFSET, CODE_ENTRY_GENERATED_BAIL_STREAK_OFFSET,
         CODE_ENTRY_GENERATED_DEOPTS_OFFSET, CODE_ENTRY_GENERATED_ENTRIES_OFFSET,
-        CODE_ENTRY_GENERATED_RETURNS_OFFSET, CODE_ENTRY_GENERATED_THROWS_OFFSET,
-        CODE_ENTRY_REGISTER_COUNT_OFFSET, GENERATED_CALL_DEOPTS_OFFSET,
+        CODE_ENTRY_GENERATED_RETURNS_OFFSET, CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET,
+        CODE_ENTRY_GENERATED_THROWS_OFFSET, CODE_ENTRY_REGISTER_COUNT_OFFSET,
+        FUNCTION_ENTRY_GENERATION_CELL_OFFSET, GENERATED_CALL_DEOPTS_OFFSET,
         GENERATED_CALL_DEPTH_PTR_OFFSET, GENERATED_CALLS_OFFSET, GLOBAL_THIS_OFFSET_PTR_OFFSET,
         NATIVE_FRAME_ACTIVATION_ID_OFFSET, NATIVE_FRAME_CODE_BLOCK_ID_OFFSET,
         NATIVE_FRAME_FLAGS_OFFSET, NATIVE_FRAME_FUNCTION_ID_OFFSET, NATIVE_FRAME_KIND_OFFSET,
@@ -96,26 +100,28 @@ struct StackLayout {
     entry_addr: u32,
     caller_frame: u32,
     caller_code_object_id: u32,
-    callee_native_frame_bytes: u32,
-    frame_bytes: u32,
+    target_cell: u32,
     reserved_bytes: u32,
+    frame_bytes: u32,
 }
 
 impl StackLayout {
     fn for_target(target: &JitDirectCallee) -> Option<Self> {
         let register_bytes = u32::from(target.plan.register_count).checked_mul(8)?;
         let spill = NATIVE_FRAME_STACK_SIZE.checked_add(register_bytes)?;
-        let frame_bytes = spill.checked_add(32)?.checked_add(15)? & !15;
-        let callee_native_frame_bytes = target.plan.generated_stack_frame_bytes?;
-        let reserved_bytes = frame_bytes.checked_add(callee_native_frame_bytes)?;
+        target
+            .plan
+            .generated_stack_frame_bytes
+            .filter(|bytes| *bytes != 0)?;
+        let frame_bytes = spill.checked_add(48)?.checked_add(15)? & !15;
         (frame_bytes <= MAX_DIRECT_CALL_FRAME_BYTES).then_some(Self {
             saved_x25: spill,
             entry_addr: spill + 8,
             caller_frame: spill + 16,
             caller_code_object_id: spill + 24,
-            callee_native_frame_bytes,
+            target_cell: spill + 32,
+            reserved_bytes: spill + 40,
             frame_bytes,
-            reserved_bytes,
         })
     }
 }
@@ -273,6 +279,15 @@ fn layout_and_artifact(
     {
         return Err(Unsupported::OperandShape("plain call receiver binding"));
     }
+    let callee_native_frame_bytes = site
+        .target
+        .plan
+        .generated_stack_frame_bytes
+        .ok_or(Unsupported::OperandShape("direct call target native frame"))?;
+    let reserved_stack_bytes = layout
+        .frame_bytes
+        .checked_add(callee_native_frame_bytes)
+        .ok_or(Unsupported::OperandShape("direct call stack reservation"))?;
     let direct_call = DirectCallArtifact {
         call_kind: match site.form {
             DirectCallForm::Plain { .. } => DirectCallKindArtifact::Plain,
@@ -299,9 +314,9 @@ fn layout_and_artifact(
                 }
             },
         },
-        callee_native_frame_bytes: layout.callee_native_frame_bytes,
+        callee_native_frame_bytes,
         linkage_bytes: layout.frame_bytes,
-        reserved_stack_bytes: layout.reserved_bytes,
+        reserved_stack_bytes,
         callee_register_count: site.target.plan.register_count,
     };
     Ok((layout, direct_call))
@@ -326,6 +341,7 @@ pub(crate) fn emit_direct_call(
     view: &JitCompileSnapshot,
     site: DirectCallSite<'_>,
     deopt_entry: u64,
+    resolve_direct_entry: u64,
     mut code_map: Option<&mut CodeMapCapture>,
     bail: DynamicLabel,
     threw: DynamicLabel,
@@ -336,6 +352,8 @@ pub(crate) fn emit_direct_call(
     let direct_function = ops.new_dynamic_label();
     let closure = ops.new_dynamic_label();
     let callable_ready = ops.new_dynamic_label();
+    let generation_ready = ops.new_dynamic_label();
+    let uncommitted_rejected = ops.new_dynamic_label();
     let entry_acquire_retry = ops.new_dynamic_label();
     let entry_acquire_saturated = ops.new_dynamic_label();
     let entry_acquire_rollback = ops.new_dynamic_label();
@@ -350,8 +368,9 @@ pub(crate) fn emit_direct_call(
     let cleanup_threw = ops.new_dynamic_label();
 
     let guard_start = ops.offset().0;
-    // All capacity checks are pre-effect. Commit happens only after callable
-    // identity and closure semantics have also been proven.
+    // Activation and recursion capacity checks are pre-effect. Native-stack
+    // capacity depends on the generation selected through the stable function
+    // cell and is checked after the callable guard.
     dynasm!(ops
         ; .arch aarch64
         ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
@@ -364,17 +383,6 @@ pub(crate) fn emit_direct_call(
         ; ldr w11, [x20, SYNC_REENTRY_LIMIT_OFFSET]
         ; cmp w10, w11
         ; b.hs =>bail
-        ; ldr x9, [x20, NATIVE_STACK_BYTES_PTR_OFFSET]
-        ; ldr x10, [x9]
-        ; ldr x11, [x20, NATIVE_STACK_BYTES_LIMIT_OFFSET]
-    );
-    emit_load_u64(ops, 12, u64::from(layout.reserved_bytes));
-    dynasm!(ops
-        ; .arch aarch64
-        ; adds x12, x10, x12
-        ; b.cs =>bail
-        ; cmp x12, x11
-        ; b.hi =>bail
     );
 
     match site.form {
@@ -498,23 +506,12 @@ pub(crate) fn emit_direct_call(
     );
 
     let setup_start = ops.offset().0;
-    // Commit shared recursion and native-stack accounting, then reserve this
-    // frame. x9/x10/x11/x12 still carry SELF/upvalues/this.
-    emit_load_u64(ops, 15, u64::from(layout.reserved_bytes));
+    // Reserve the fixed caller-owned linkage frame and root the callable
+    // state before the cold resolver can clobber caller-saved registers. The
+    // frame is not published and no shared resource accounting is committed
+    // until the selected generation's dynamic stack contract is validated.
     dynasm!(ops
         ; .arch aarch64
-        ; ldr x13, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
-        ; ldr w14, [x13]
-        ; add w14, w14, #1
-        ; str w14, [x13]
-        ; ldr x13, [x20, GENERATED_CALL_DEPTH_PTR_OFFSET]
-        ; ldr w14, [x13]
-        ; add w14, w14, #1
-        ; str w14, [x13]
-        ; ldr x13, [x20, NATIVE_STACK_BYTES_PTR_OFFSET]
-        ; ldr x14, [x13]
-        ; add x14, x14, x15
-        ; str x14, [x13]
         ; sub sp, sp, layout.frame_bytes
         ; str x25, [sp, layout.saved_x25]
         ; str x9, [sp, NATIVE_FRAME_SELF_OFFSET]
@@ -529,10 +526,13 @@ pub(crate) fn emit_direct_call(
         ; str wzr, [sp, NATIVE_FRAME_ACTIVATION_ID_OFFSET]
     );
 
+    // Generated callers bake the permanent function-cell address. The hot
+    // load selects its current generation; only an empty publication enters
+    // the single no-allocation cold resolver.
     emit_symbol(
         ops,
         relocations,
-        25,
+        1,
         site.target.plan.entry_cell,
         RelocationTarget::DirectCallEntryCell {
             byte_pc: site.byte_pc,
@@ -541,6 +541,52 @@ pub(crate) fn emit_direct_call(
     );
     dynasm!(ops
         ; .arch aarch64
+        ; add x2, x1, FUNCTION_ENTRY_GENERATION_CELL_OFFSET
+        ; ldar x25, [x2]
+        ; cbnz x25, =>generation_ready
+        ; mov x0, x20
+    );
+    emit_runtime_stub(
+        ops,
+        relocations,
+        16,
+        resolve_direct_entry,
+        abi::STUB_JIT_RESOLVE_DIRECT_ENTRY,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; mov x25, x0
+        ; cbz x25, =>uncommitted_rejected
+        ; =>generation_ready
+        ; str x25, [sp, layout.target_cell]
+        ; ldr w15, [x25, CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET]
+        ; cbz w15, =>uncommitted_rejected
+    );
+    emit_load_u64(ops, 14, u64::from(layout.frame_bytes));
+    dynasm!(ops
+        ; .arch aarch64
+        ; adds x15, x15, x14
+        ; b.cs =>uncommitted_rejected
+        ; ldr x9, [x20, NATIVE_STACK_BYTES_PTR_OFFSET]
+        ; ldr x10, [x9]
+        ; adds x12, x10, x15
+        ; b.cs =>uncommitted_rejected
+        ; ldr x11, [x20, NATIVE_STACK_BYTES_LIMIT_OFFSET]
+        ; cmp x12, x11
+        ; b.hi =>uncommitted_rejected
+        ; str x15, [sp, layout.reserved_bytes]
+        // Commit recursion and native-stack accounting only after every
+        // pre-entry capacity and target contract has succeeded.
+        ; ldr x13, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
+        ; ldr w14, [x13]
+        ; add w14, w14, #1
+        ; str w14, [x13]
+        ; ldr x13, [x20, GENERATED_CALL_DEPTH_PTR_OFFSET]
+        ; ldr w14, [x13]
+        ; add w14, w14, #1
+        ; str w14, [x13]
+        ; str x12, [x9]
         ; ldar x16, [x25]
         ; cbz x16, =>entry_rejected
         ; add x15, x25, CODE_ENTRY_ACTIVE_COUNT_OFFSET
@@ -574,22 +620,45 @@ pub(crate) fn emit_direct_call(
         ; str x14, [sp, NATIVE_FRAME_REGISTER_BASE_OFFSET]
     );
 
-    if site.target.plan.register_count != 0 {
-        let init_loop = ops.new_dynamic_label();
+    let copied_argument_count = site
+        .arguments
+        .len()
+        .min(usize::from(site.target.plan.param_count));
+    let initialized_register_count =
+        usize::from(site.target.plan.register_count).saturating_sub(copied_argument_count);
+    if initialized_register_count != 0 {
+        let init_pair_count = initialized_register_count / 2;
+        let init_offset = NATIVE_FRAME_STACK_SIZE
+            + u32::try_from(copied_argument_count)
+                .map_err(|_| Unsupported::OperandShape("direct call argument count"))?
+                * 8;
         emit_load_u64(ops, 15, VALUE_UNDEFINED);
         dynasm!(ops
             ; .arch aarch64
-            ; movz w13, site.target.plan.register_count as u32
-            ; =>init_loop
-            ; str x15, [x14], #8
-            ; subs w13, w13, #1
-            ; b.ne =>init_loop
+            ; add x14, sp, init_offset
         );
+        if init_pair_count != 0 {
+            let init_loop = ops.new_dynamic_label();
+            dynasm!(ops
+                ; .arch aarch64
+                ; movz w13, init_pair_count as u32
+                ; =>init_loop
+                ; stp x15, x15, [x14], #16
+                ; subs w13, w13, #1
+                ; b.ne =>init_loop
+            );
+        }
+        if initialized_register_count & 1 != 0 {
+            dynasm!(ops
+                ; .arch aarch64
+                ; str x15, [x14]
+            );
+        }
     }
     for (argument, &source) in site
         .arguments
         .iter()
-        .take(usize::from(site.target.plan.param_count))
+        .take(copied_argument_count)
         .enumerate()
     {
         let source_offset = reg_offset(source)?;
@@ -752,9 +821,9 @@ pub(crate) fn emit_direct_call(
         ; stlxr w11, w10, [x15]
         ; cbnz w11, =>release_retry
     );
-    emit_load_u64(ops, 11, u64::from(layout.reserved_bytes));
     dynasm!(ops
         ; .arch aarch64
+        ; ldr x11, [sp, layout.reserved_bytes]
         ; ldr x9, [x20, NATIVE_STACK_BYTES_PTR_OFFSET]
         ; ldr x10, [x9]
         ; sub x10, x10, x11
@@ -802,10 +871,7 @@ pub(crate) fn emit_direct_call(
         ; stlxr w10, w14, [x15]
         ; cbnz w10, =>entry_rollback_retry
         ; =>entry_rejected
-    );
-    emit_load_u64(ops, 11, u64::from(layout.reserved_bytes));
-    dynasm!(ops
-        ; .arch aarch64
+        ; ldr x11, [sp, layout.reserved_bytes]
         ; ldr x9, [x20, NATIVE_STACK_BYTES_PTR_OFFSET]
         ; ldr x10, [x9]
         ; sub x10, x10, x11
@@ -818,6 +884,10 @@ pub(crate) fn emit_direct_call(
         ; ldr w10, [x9]
         ; sub w10, w10, #1
         ; str w10, [x9]
+        ; ldr x25, [sp, layout.saved_x25]
+        ; add sp, sp, layout.frame_bytes
+        ; b =>bail
+        ; =>uncommitted_rejected
         ; ldr x25, [sp, layout.saved_x25]
         ; add sp, sp, layout.frame_bytes
         ; b =>bail

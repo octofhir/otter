@@ -9,11 +9,15 @@
 //! - Synchronous `in` / `HasProperty` checks through the shared object resolver.
 //! - Synchronous property and element load/store tails, including the shared
 //!   named-value `[[Set]]` entry used by JIT miss transitions.
+//! - Allocation-free completion for plain dense-array slots after a generated
+//!   element guard rejects a hole or pointer-valued store.
 //!
 //! # Invariants
 //! - Stack-modifying proxy and `@@hasInstance` cases are handled before these
 //!   helpers are called.
 //! - Inputs are already decoded from the executable instruction format.
+//! - A dense hole bypasses prototype lookup only while the one-shot indexed
+//!   accessor protector remains intact; arrays with sidecars stay generic.
 //!
 //! # See also
 //! - [`crate::executable`]
@@ -2229,6 +2233,20 @@ impl Interpreter {
         mut recv: Value,
         mut idx_value_raw: Value,
     ) -> Result<Value, VmError> {
+        // Generated dense loads enter this Rust completion only for a failed
+        // guard. The common miss is an in-bounds hole. When the one-shot
+        // indexed-accessor protector is still intact and the receiver has no
+        // exotic sidecar, the prototype chain cannot turn that hole into a
+        // getter result, so avoid `ToPropertyKey` and the full descriptor walk.
+        if !self.array_index_accessor_protector
+            && let Some(arr) = recv.as_array()
+            && let Some(index) = idx_value_raw
+                .as_i32()
+                .and_then(|index| usize::try_from(index).ok())
+            && crate::array::is_plain_dense_hole(arr, &self.gc_heap, index)
+        {
+            return Ok(Value::undefined());
+        }
         let mut idx_value = Value::undefined();
         let mut result = Value::undefined();
         let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
@@ -3322,6 +3340,25 @@ impl Interpreter {
         mut key_value: Value,
         mut value: Value,
     ) -> Result<(), VmError> {
+        // Complete the dense-array miss without allocating a property key.
+        // Existing slots need only the write barrier; plain holes are also
+        // safe while no indexed accessor has ever polluted the prototype
+        // universe. Sidecars retain the descriptor-aware authority below.
+        let allow_plain_hole = !self.array_index_accessor_protector;
+        if let Some(arr) = receiver.as_array()
+            && let Some(index) = key_value
+                .as_i32()
+                .and_then(|index| usize::try_from(index).ok())
+            && crate::array::set_plain_dense_slot(
+                arr,
+                &mut self.gc_heap,
+                index,
+                value,
+                allow_plain_hole,
+            )
+        {
+            return Ok(());
+        }
         let mut property_key = Value::undefined();
         let strict = context.function_is_strict(function_id);
 

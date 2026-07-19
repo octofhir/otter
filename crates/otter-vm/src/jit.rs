@@ -217,6 +217,11 @@ pub struct JitCompileSnapshot {
     pub native_static_fn_byte: u32,
     /// Instruction overlays in canonical logical-PC order.
     pub instructions: Vec<JitInstructionMetadata>,
+    /// Direct reads of permanent global-lexical cells keyed by the
+    /// `Op::LoadGlobalOrThrow` byte-PC. The global declarative record roots
+    /// each non-moving cell; generated code reads its current value and takes
+    /// the semantic stub only for a TDZ hole.
+    pub global_lexical_loads: rustc_hash::FxHashMap<u32, JitGlobalLexicalLoad>,
     /// Guarded static-native leaf calls keyed by the caller's `Op::Call`
     /// byte-PC. Each plan names one exact bootstrap function identity and one
     /// machine-code operation; misses side-exit before effects.
@@ -575,6 +580,13 @@ pub struct JitDirectCallee {
     pub plan: JitDirectCallPlan,
 }
 
+/// One permanent global-declarative binding available to generated code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitGlobalLexicalLoad {
+    /// Compressed GC-cage offset of the rooted, non-moving upvalue cell.
+    pub cell_offset: u32,
+}
+
 /// One guarded method target with an exact generated callee plan.
 #[derive(Debug, Clone)]
 pub struct JitDirectMethod {
@@ -788,6 +800,7 @@ impl JitCompileSnapshot {
             collection_layout: JitCollectionLayout::default(),
             native_static_fn_byte: 0,
             instructions,
+            global_lexical_loads: rustc_hash::FxHashMap::default(),
             static_native_calls: rustc_hash::FxHashMap::default(),
             direct_callees: rustc_hash::FxHashMap::default(),
             direct_methods: rustc_hash::FxHashMap::default(),

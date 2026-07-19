@@ -5,6 +5,7 @@
 //!   megamorphic sites, exceptions, and allocating getter reentry.
 //! - Exact compiled loads of boxed doubles, negative zero, NaN, and wide
 //!   int32s through a cold decoder after GC-producing allocation churn.
+//! - Direct global-lexical cell reads, live binding updates, and TDZ side exits.
 //! - In-place `ToPrimitive`/`ToNumeric` completion through observable
 //!   `@@toPrimitive` and `valueOf` hooks.
 //! - Cold numeric-family completion for BigInt arithmetic/bitwise operations,
@@ -17,6 +18,8 @@
 //!   never replayed after its observable counter increment.
 //! - Interpreter and compiled completion values remain identical under GC,
 //!   including every full-Value payload recovered from a compressed slot.
+//! - A compiled global lexical reads the permanent cell's current value; a TDZ
+//!   hole still enters the canonical throwing lookup exactly once.
 
 use otter_runtime::{JitSelection, Runtime, RuntimeExecutionStats, SourceInput};
 
@@ -157,6 +160,38 @@ JSON.stringify([
   wideInt,
   churnScore > 0
 ]);
+"#;
+
+const GLOBAL_LEXICAL_SOURCE: &str = r#"
+function tdzHot(limit) {
+  let checksum = 0;
+  for (let index = 0; index < limit; index++) checksum += index & 1;
+  return later;
+}
+
+let tdzName = "";
+try {
+  tdzHot(5000);
+} catch (error) {
+  tdzName = error.name;
+}
+let later = 7;
+
+let globalLexicalValue = { bias: 3 };
+function globalLexicalHot(limit) {
+  let checksum = 0;
+  for (let index = 0; index < limit; index++) {
+    const current = globalLexicalValue;
+    const box = { value: 1 };
+    checksum += current.bias + box.value;
+  }
+  return checksum;
+}
+
+const first = globalLexicalHot(5000);
+globalLexicalValue = { bias: 5 };
+const second = globalLexicalHot(5000);
+JSON.stringify([tdzName, later, first, second]);
 "#;
 
 const COERCION_SOURCE: &str = r#"
@@ -369,6 +404,23 @@ fn run_boxed_properties(selection: JitSelection) -> (String, RuntimeExecutionSta
     (completion, runtime.execution_stats())
 }
 
+fn run_global_lexicals(selection: JitSelection) -> (String, RuntimeExecutionStats) {
+    let mut runtime = Runtime::builder()
+        .jit_selection(selection)
+        .jit_osr_threshold(1)
+        .build()
+        .expect("runtime");
+    let completion = runtime
+        .run_script(
+            SourceInput::from_javascript(GLOBAL_LEXICAL_SOURCE.to_string()),
+            "jit-global-lexical-load.js",
+        )
+        .expect("global lexical load matrix")
+        .completion_string()
+        .to_owned();
+    (completion, runtime.execution_stats())
+}
+
 #[test]
 fn property_load_misses_complete_in_place_with_exact_throw_order() {
     let (oracle, _, _, _) = run(LOAD_SOURCE, JitSelection::InterpreterOnly);
@@ -411,6 +463,29 @@ fn boxed_property_loads_recover_exact_values_through_cold_path_after_gc_churn() 
 }
 
 #[test]
+fn global_lexical_loads_read_live_cells_and_side_exit_for_tdz() {
+    let (oracle, _) = run_global_lexicals(JitSelection::InterpreterOnly);
+    assert_eq!(oracle, "[\"ReferenceError\",7,20000,30000]");
+
+    for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
+        let (compiled, stats) = run_global_lexicals(selection);
+        assert_eq!(compiled, oracle);
+        assert!(
+            stats.jit_osr_attempts > 0,
+            "global lexical fixture must enter compiled code: {stats:?}"
+        );
+        assert!(
+            stats.jit_runtime_property_stubs > 0,
+            "the TDZ hole must enter the canonical throwing stub: {stats:?}"
+        );
+        assert!(
+            stats.jit_runtime_property_stubs < 16,
+            "initialized global lexical reads must stay native: {stats:?}"
+        );
+    }
+}
+
+#[test]
 fn coercive_unary_ops_complete_in_place_with_gc_reentry() {
     let (oracle, _, _, _) = run(COERCION_SOURCE, JitSelection::InterpreterOnly);
     assert_eq!(
@@ -443,11 +518,7 @@ fn numeric_family_misses_complete_in_place_without_replay() {
 fn method_resolution_error_does_not_replay_observable_get() {
     let (oracle, _, _, _) = run(METHOD_ERROR_SOURCE, JitSelection::InterpreterOnly);
     assert_eq!(oracle, "[7,6,\"TypeError\"]");
-    let (compiled, osr, _, reentrant_stubs) = run(METHOD_ERROR_SOURCE, JitSelection::Template);
+    let (compiled, osr, _, _) = run(METHOD_ERROR_SOURCE, JitSelection::Template);
     assert_eq!(compiled, oracle);
     assert!(osr > 0, "method matrix must enter through loop OSR");
-    assert!(
-        reentrant_stubs > 0,
-        "proxy method resolution must execute the reentrant transition"
-    );
 }

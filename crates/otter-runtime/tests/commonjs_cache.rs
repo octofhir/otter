@@ -7,15 +7,16 @@
 //! - Circular file loads observe the current replacement `module.exports`.
 //! - Canonical file aliases preserve module and export singleton identity.
 //! - A retained require closure, cache record, and export survive full GC.
-//! - An uncached nested require entered from template-JIT code matches the
-//!   interpreter.
+//! - An uncached nested require reached after a template-JIT side exit matches
+//!   the interpreter.
 //!
 //! # Invariants
 //! - Cache values are module records, never snapshots of `module.exports`.
 //! - Every abrupt exit removes the record inserted by that load attempt.
 //! - Resolver aliases converge before cache lookup.
 //! - The shared cache is rooted solely by ordinary reachable JS values.
-//! - Compiled-to-native-to-CommonJS re-entry uses the active runtime turn.
+//! - A compiled caller side-exits before unsupported native CommonJS work and
+//!   resumes that call exactly once on the active runtime turn.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -418,19 +419,21 @@ fn run_nested_jit_require(selection: JitSelection) -> JitRequireResult {
         dir.path(),
         "entry.cjs",
         r#"
-        function loadFromHotFunction(specifier) {
+        function loadFromHotFunction(specifier, probe) {
+            const marker = probe.value;
             if (specifier === null) {
-                return 1;
+                return marker;
             }
             return require(specifier);
         }
 
+        const probe = { value: 1 };
         let checksum = 0;
         for (let i = 0; i < 512; i++) {
-            checksum += loadFromHotFunction(null);
+            checksum += loadFromHotFunction(null, probe);
         }
 
-        const outer = loadFromHotFunction("./outer.cjs");
+        const outer = loadFromHotFunction("./outer.cjs", probe);
         globalThis.__nestedJitRequireResult = JSON.stringify([
             checksum,
             outer.value,
@@ -457,7 +460,7 @@ fn run_nested_jit_require(selection: JitSelection) -> JitRequireResult {
 }
 
 #[test]
-fn nested_require_from_template_jit_matches_the_interpreter() {
+fn nested_require_after_template_jit_side_exit_matches_the_interpreter() {
     let oracle = run_nested_jit_require(JitSelection::InterpreterOnly);
     let compiled = run_nested_jit_require(JitSelection::Template);
 
@@ -472,7 +475,7 @@ fn nested_require_from_template_jit_matches_the_interpreter() {
         "fixture must exercise whole-function JIT entry"
     );
     assert!(
-        compiled.stats.jit_reentrant_stub_transitions > 0,
-        "uncached nested require must cross the JIT re-entry boundary"
+        compiled.stats.jit_runtime_property_stubs > 0,
+        "fixture must execute the compiled require caller before the exact side exit"
     );
 }

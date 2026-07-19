@@ -67,6 +67,10 @@ needed to optimize the VM and JIT safely.
   receiver/prototype/slot facts, call PC, frame/linkage/total stack bytes, and
   register count; portable normalized code excludes only the
   generation-local code-object id.
+- [x] Direct global-lexical reads expose a `globalLexicalLoads` compile count
+  and one address-free `globalLexicalCell` relocation per baked site. Exact
+  generated code reads the permanent cell's live value; TDZ holes retain the
+  canonical throwing transition.
 - [x] Compiler-generated callee deopts emit an exact-generation structured
   event with baked call kind, exact caller/callee code-object ids, caller
   call-site PC, callee resume PC, tier, and consecutive deopt streak; baseline

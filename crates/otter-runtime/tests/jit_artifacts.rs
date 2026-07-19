@@ -675,6 +675,7 @@ String(hot(48));
         "runtimeStub",
         "directCallEntryCell",
         "gcCageBase",
+        "globalLexicalCell",
         "propertyIcCell",
         "templateOperandSlice",
         "collectionHeapReference",

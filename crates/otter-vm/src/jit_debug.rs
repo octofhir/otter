@@ -385,6 +385,8 @@ pub enum JitDebugEvent {
         call_feedback_sites: u32,
         /// Method sites carrying target feedback.
         method_feedback_sites: u32,
+        /// Global lexical reads carrying one permanent direct-cell target.
+        global_lexical_loads: u32,
         /// Exact installed generations available for generated native linkage.
         direct_callees: u32,
         /// Method sites carrying at least one guarded generated-link plan.
@@ -854,6 +856,7 @@ mod tests {
             parameter_count: 1,
             call_feedback_sites: 2,
             method_feedback_sites: 3,
+            global_lexical_loads: 4,
             direct_callees: 1,
             direct_method_sites: 2,
             direct_method_targets: 5,
@@ -878,6 +881,7 @@ mod tests {
                     "parameterCount": 1,
                     "callFeedbackSites": 2,
                     "methodFeedbackSites": 3,
+                    "globalLexicalLoads": 4,
                     "directCallees": 1,
                     "directMethodSites": 2,
                     "directMethodTargets": 5,

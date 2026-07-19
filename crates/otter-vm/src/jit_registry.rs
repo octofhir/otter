@@ -12,6 +12,8 @@
 //!   unlinking, and tombstone retention.
 //! - Dependency registration, exact-epoch entry consistency, and monotonic
 //!   dependent invalidation.
+//! - Cold reverse-dependency queries used to keep an entry-capable generation
+//!   installed when its proposed replacement cannot serve generated callers.
 //! - `resolve_jit_registry_safepoint` — the machine-visible resolver behind
 //!   the published view.
 //!
@@ -261,6 +263,33 @@ impl JitCodeRegistry {
             param_count: function.param_count,
             register_count: function.register_count,
         })
+    }
+
+    /// Whether an installed generation for `function_id` is the exact target
+    /// of any installed generated caller.
+    ///
+    /// Promotion uses this cold reverse-edge query before unlinking the current
+    /// generation. A replacement that cannot publish stack-owned generated
+    /// entry must not evict a target still serving native callers.
+    #[must_use]
+    pub(crate) fn has_installed_generation_dependents(&self, function_id: u32) -> bool {
+        let targets = self
+            .codes
+            .iter()
+            .filter_map(|(&code_object_id, registered)| {
+                (registered.state == CodeLifetimeState::Installed
+                    && registered.code.metadata().code_block_id == function_id)
+                    .then_some(code_object_id)
+            })
+            .collect::<rustc_hash::FxHashSet<_>>();
+        !targets.is_empty()
+            && self.codes.values().any(|registered| {
+                registered.state == CodeLifetimeState::Installed
+                    && registered.dependencies.iter().any(|dependency| {
+                        dependency.kind == CodeDependencyKind::CodeGeneration
+                            && targets.contains(&dependency.expected)
+                    })
+            })
     }
 
     /// Stable machine-visible cell for the exact installed code generation.

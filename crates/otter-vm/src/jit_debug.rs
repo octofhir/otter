@@ -199,7 +199,7 @@ pub enum JitInlineRejectionReason {
     MissingSnapshot,
 }
 
-/// Why a monomorphic call site could not bake compiler-generated native
+/// Why one observed call target could not bake compiler-generated native
 /// linkage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(
@@ -229,7 +229,7 @@ pub enum JitDirectCallRejectionReason {
     NoEntryGeneration,
 }
 
-/// VM planning result for one monomorphic compiler-generated call.
+/// VM planning result for one compiler-generated call target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(
     tag = "kind",
@@ -334,8 +334,12 @@ pub enum JitCompilerDiagnostic {
         instruction_pc: u32,
         /// Encoded byte PC used by the compile snapshot's call tables.
         byte_pc: u32,
-        /// Monomorphic callee function id.
+        /// Exact callee function id for this guarded target.
         callee_function_id: u32,
+        /// Zero-based position in the call site's bounded target chain.
+        target_index: u32,
+        /// Total observed targets represented by the chain.
+        target_count: u32,
         /// Actual lowering emitted by the backend.
         outcome: JitDirectCallLoweringOutcome,
     },
@@ -383,8 +387,10 @@ pub enum JitDebugEvent {
         method_feedback_sites: u32,
         /// Exact installed generations available for generated native linkage.
         direct_callees: u32,
-        /// Monomorphic method sites carrying guarded generated-link plans.
-        direct_methods: u32,
+        /// Method sites carrying at least one guarded generated-link plan.
+        direct_method_sites: u32,
+        /// Total guarded method targets across those sites.
+        direct_method_targets: u32,
         /// Monomorphic static-native targets available for guarded leaf codegen.
         static_native_calls: u32,
         /// Plain-call callee bodies made available to the body inliner.
@@ -408,8 +414,8 @@ pub enum JitDebugEvent {
         /// size, arity, or tier-specific eligibility constraints.
         bake_rejection: Option<JitInlineRejectionReason>,
     },
-    /// One monomorphic call target was made available to the backend or
-    /// rejected during VM planning.
+    /// One observed call target was made available to the backend or rejected
+    /// during VM planning.
     DirectCallPlan {
         /// Source opcode represented by this generated linkage.
         call_kind: crate::jit::JitDirectCallKind,
@@ -419,8 +425,12 @@ pub enum JitDebugEvent {
         instruction_pc: u32,
         /// Tier for which the target was inspected.
         tier: JitDebugTier,
-        /// Monomorphic callee function id.
+        /// Exact callee function id for this guarded target.
         callee_function_id: u32,
+        /// Zero-based position in the call site's bounded target chain.
+        target_index: u32,
+        /// Total observed targets represented by the chain.
+        target_count: u32,
         /// Exact generated-link planning result.
         outcome: JitDirectCallPlanOutcome,
     },
@@ -438,8 +448,12 @@ pub enum JitDebugEvent {
         byte_pc: u32,
         /// Tier that compiled the caller.
         tier: JitDebugTier,
-        /// Monomorphic callee function id.
+        /// Exact callee function id for this guarded target.
         callee_function_id: u32,
+        /// Zero-based position in the call site's bounded target chain.
+        target_index: u32,
+        /// Total observed targets represented by the chain.
+        target_count: u32,
         /// Actual lowering emitted by the backend.
         outcome: JitDirectCallLoweringOutcome,
     },
@@ -841,7 +855,8 @@ mod tests {
             call_feedback_sites: 2,
             method_feedback_sites: 3,
             direct_callees: 1,
-            direct_methods: 2,
+            direct_method_sites: 2,
+            direct_method_targets: 5,
             static_native_calls: 1,
             inline_callees: 1,
             inline_methods: 0,
@@ -864,7 +879,8 @@ mod tests {
                     "callFeedbackSites": 2,
                     "methodFeedbackSites": 3,
                     "directCallees": 1,
-                    "directMethods": 2,
+                    "directMethodSites": 2,
+                    "directMethodTargets": 5,
                     "staticNativeCalls": 1,
                     "inlineCallees": 1,
                     "inlineMethods": 0

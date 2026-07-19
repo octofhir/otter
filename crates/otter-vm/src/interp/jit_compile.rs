@@ -110,7 +110,11 @@ impl Interpreter {
             call_feedback_sites: u32::try_from(call_feedback_sites).unwrap_or(u32::MAX),
             method_feedback_sites: u32::try_from(method_feedback_sites).unwrap_or(u32::MAX),
             direct_callees: u32::try_from(view.direct_callees.len()).unwrap_or(u32::MAX),
-            direct_methods: u32::try_from(view.direct_methods.len()).unwrap_or(u32::MAX),
+            direct_method_sites: u32::try_from(view.direct_methods.len()).unwrap_or(u32::MAX),
+            direct_method_targets: u32::try_from(
+                view.direct_methods.values().map(Vec::len).sum::<usize>(),
+            )
+            .unwrap_or(u32::MAX),
             static_native_calls: u32::try_from(view.static_native_calls.len()).unwrap_or(u32::MAX),
             inline_callees: u32::try_from(view.inline_callees.len()).unwrap_or(u32::MAX),
             inline_methods: u32::try_from(view.inline_methods.len()).unwrap_or(u32::MAX),
@@ -167,6 +171,8 @@ impl Interpreter {
                     instruction_pc,
                     byte_pc,
                     callee_function_id,
+                    target_index,
+                    target_count,
                     outcome,
                 } => jit_debug::JitDebugEvent::DirectCallLowered {
                     call_kind,
@@ -176,6 +182,8 @@ impl Interpreter {
                     byte_pc,
                     tier,
                     callee_function_id,
+                    target_index,
+                    target_count,
                     outcome,
                 },
                 jit_debug::JitCompilerDiagnostic::StaticNativeCallLowered {
@@ -221,6 +229,8 @@ impl Interpreter {
         instruction_pc: u32,
         tier: jit_debug::JitDebugTier,
         callee_function_id: u32,
+        target_index: u32,
+        target_count: u32,
         outcome: jit_debug::JitDirectCallPlanOutcome,
     ) {
         self.record_jit_debug_event(|| jit_debug::JitDebugEvent::DirectCallPlan {
@@ -229,6 +239,8 @@ impl Interpreter {
             instruction_pc,
             tier,
             callee_function_id,
+            target_index,
+            target_count,
             outcome,
         });
     }
@@ -267,12 +279,18 @@ impl Interpreter {
         fid: u32,
         osr_pc: Option<u32>,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
-        if !self
-            .jit_hook
-            .as_ref()
-            .is_some_and(|hook| hook.optimizing_tier_enabled())
-        {
+        let hook = self.jit_hook.as_ref()?.clone();
+        if !hook.optimizing_tier_enabled() {
             return None;
+        }
+        if self
+            .jit_code_registry
+            .has_installed_generation_dependents(fid)
+        {
+            let eligibility_snapshot = context.jit_compile_snapshot(fid)?;
+            if !hook.optimizing_generated_entry_supported(&eligibility_snapshot, osr_pc) {
+                return None;
+            }
         }
         self.invalidate_jit_function(fid);
         let mut snapshot = context.jit_compile_snapshot(fid)?;
@@ -311,7 +329,6 @@ impl Interpreter {
                     module: snapshot.code_block.module_url().to_string(),
                 });
         let function = snapshot.code_block.clone();
-        let hook = self.jit_hook.as_ref()?.clone();
         let code_object_id = self.jit_next_code_object_id;
         let status = hook.compile_optimized_function(jit::JitCompileRequest {
             snapshot,
@@ -629,16 +646,15 @@ impl Interpreter {
     }
 
     /// Bake compiler-native direct-call plans and inline-candidate bodies for
-    /// `fid`'s monomorphic `Op::Call` sites.
+    /// `fid`'s call sites.
     ///
-    /// A site is a candidate only when (a) it observed a single callee (`Mono`),
-    /// and (b) that callee is a plain synchronous bytecode function — the same
-    /// static shape accepted by native entry. The direct-call table is narrower:
-    /// its first slice requires no callee-owned upvalue cells and one current
-    /// non-OSR installed entry. Generated linkage binds both strict/lexical and
-    /// unbound sloppy-global `this`; an explicitly bound sloppy closure misses
-    /// before entry. The emitter applies the final pure-leaf / size / arity test
-    /// to the separate inline table.
+    /// Plain-call candidates remain monomorphic. Method-call candidates may
+    /// contain a bounded, most-frequent-first polymorphic chain. Every generated
+    /// target is a synchronous bytecode function without callee-owned upvalue
+    /// cells and has one current non-OSR installed entry. Generated linkage binds
+    /// both strict/lexical and unbound sloppy-global `this`; an explicitly bound
+    /// sloppy closure misses before entry. The emitter applies the final
+    /// pure-leaf / size / arity test to the separate monomorphic inline tables.
     pub(crate) fn bake_inline_callees(
         &mut self,
         view: &mut jit::JitCompileSnapshot,
@@ -703,6 +719,8 @@ impl Interpreter {
                     instruction_pc,
                     tier,
                     callee_fid,
+                    0,
+                    1,
                     jit_debug::JitDirectCallPlanOutcome::Rejected {
                         reason: jit_debug::JitDirectCallRejectionReason::MissingCallee,
                     },
@@ -739,6 +757,8 @@ impl Interpreter {
                     instruction_pc,
                     tier,
                     callee_fid,
+                    0,
+                    1,
                     jit_debug::JitDirectCallPlanOutcome::Rejected {
                         reason: jit_debug::JitDirectCallRejectionReason::IneligibleFunction,
                     },
@@ -783,6 +803,8 @@ impl Interpreter {
                 instruction_pc,
                 tier,
                 callee_fid,
+                0,
+                1,
                 direct_call_outcome,
             );
             let Some(callee_view) = context.jit_compile_snapshot(callee_fid) else {
@@ -817,7 +839,6 @@ impl Interpreter {
         struct PolySnapshot {
             instruction_pc: u32,
             call_byte_pc: u32,
-            direct_target: Option<PolyMethodTarget>,
             targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]>,
         }
         let method_sites: Vec<PolySnapshot> = view
@@ -842,11 +863,9 @@ impl Interpreter {
                             method_value_byte,
                             hits: 1,
                         });
-                        let direct_target = targets.first().copied();
                         Some(PolySnapshot {
                             instruction_pc: instr.instruction_pc(&view.code_block),
                             call_byte_pc: instr.byte_pc,
-                            direct_target,
                             targets,
                         })
                     }
@@ -858,7 +877,6 @@ impl Interpreter {
                         Some(PolySnapshot {
                             instruction_pc: instr.instruction_pc(&view.code_block),
                             call_byte_pc: instr.byte_pc,
-                            direct_target: None,
                             targets,
                         })
                     }
@@ -867,46 +885,59 @@ impl Interpreter {
             })
             .collect();
         for snap in method_sites {
-            if let Some(target) = snap.direct_target {
-                let (callee_function_id, outcome) =
-                    match self.bake_one_direct_method(context, fid, &target) {
-                        Ok(method) => {
-                            let plan = method.callee.plan;
-                            view.direct_methods.insert(snap.call_byte_pc, method);
-                            (
-                                plan.function_id,
-                                jit_debug::JitDirectCallPlanOutcome::Available {
-                                    code_object_id: plan.code_object_id,
-                                    target_tier: match plan.tier {
-                                        native_abi::NativeFrameKind::Baseline => {
-                                            jit_debug::JitDebugTier::Template
-                                        }
-                                        native_abi::NativeFrameKind::Optimizing => {
-                                            jit_debug::JitDebugTier::Optimizing
-                                        }
-                                        native_abi::NativeFrameKind::Interpreter => {
-                                            unreachable!(
-                                                "interpreter has no entry-capable code generation"
-                                            )
-                                        }
-                                    },
-                                    this_mode: jit::JitDirectCallThisMode::MethodReceiver,
+            let mut direct_methods = Vec::with_capacity(snap.targets.len());
+            let target_count = u32::try_from(snap.targets.len()).unwrap_or(u32::MAX);
+            for (target_index, target) in snap.targets.iter().enumerate() {
+                let (callee_function_id, outcome) = match self.bake_one_direct_method(
+                    context,
+                    fid,
+                    target,
+                    u32::try_from(target_index).unwrap_or(u32::MAX),
+                    target_count,
+                ) {
+                    Ok(method) => {
+                        let plan = method.callee.plan;
+                        direct_methods.push(method);
+                        (
+                            plan.function_id,
+                            jit_debug::JitDirectCallPlanOutcome::Available {
+                                code_object_id: plan.code_object_id,
+                                target_tier: match plan.tier {
+                                    native_abi::NativeFrameKind::Baseline => {
+                                        jit_debug::JitDebugTier::Template
+                                    }
+                                    native_abi::NativeFrameKind::Optimizing => {
+                                        jit_debug::JitDebugTier::Optimizing
+                                    }
+                                    native_abi::NativeFrameKind::Interpreter => {
+                                        unreachable!(
+                                            "interpreter has no entry-capable code generation"
+                                        )
+                                    }
                                 },
-                            )
-                        }
-                        Err(reason) => (
-                            target.method_fid,
-                            jit_debug::JitDirectCallPlanOutcome::Rejected { reason },
-                        ),
-                    };
+                                this_mode: jit::JitDirectCallThisMode::MethodReceiver,
+                            },
+                        )
+                    }
+                    Err(reason) => (
+                        target.method_fid,
+                        jit_debug::JitDirectCallPlanOutcome::Rejected { reason },
+                    ),
+                };
                 self.record_jit_direct_call_plan(
                     jit::JitDirectCallKind::Method,
                     fid,
                     snap.instruction_pc,
                     tier,
                     callee_function_id,
+                    u32::try_from(target_index).unwrap_or(u32::MAX),
+                    target_count,
                     outcome,
                 );
+            }
+            if !direct_methods.is_empty() {
+                view.direct_methods
+                    .insert(snap.call_byte_pc, direct_methods);
             }
             let mut baked: Vec<jit::JitInlineMethod> = Vec::new();
             for target in &snap.targets {
@@ -967,6 +998,8 @@ impl Interpreter {
         context: &ExecutionContext,
         caller_fid: u32,
         target: &PolyMethodTarget,
+        target_index: u32,
+        target_count: u32,
     ) -> Result<jit::JitDirectMethod, jit_debug::JitDirectCallRejectionReason> {
         let method = context
             .exec_function(target.method_fid)
@@ -997,6 +1030,8 @@ impl Interpreter {
             .ok_or(jit_debug::JitDirectCallRejectionReason::NoEntryGeneration)?;
         debug_assert_eq!(plan.function_id, target.method_fid);
         Ok(jit::JitDirectMethod {
+            target_index,
+            target_count,
             guard,
             callee: jit::JitDirectCallee { plan },
         })

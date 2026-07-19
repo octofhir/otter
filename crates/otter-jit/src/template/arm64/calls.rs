@@ -1,8 +1,8 @@
 //! AArch64 call emitters for the template compiler.
 //!
 //! # Contents
-//! - Compiler-generated monomorphic plain and method calls with exact
-//!   pre-effect deopt.
+//! - Compiler-generated monomorphic plain calls and bounded polymorphic method
+//!   chains with exact pre-effect deopt.
 //! - Construct lowering through the current runtime transition.
 //! - Guarded read-only numeric call/method splicing from VM-baked metadata.
 //! - Guarded collection-method leaves before generated method linkage.
@@ -14,8 +14,9 @@
 //!   stable code-entry generation directly.
 //! - A callee throw caught by the compiled caller publishes the selected
 //!   catch/finally PC and exits through the shared bailout epilogue.
-//! - A generated method call re-reads receiver/prototype/slot identity, then
-//!   carries the proven callable and exact receiver into the shared linkage.
+//! - A generated method chain re-reads each receiver/prototype/slot identity in
+//!   feedback order, then carries the proven callable and exact receiver into
+//!   the selected linkage.
 //! - Inlined call and method bodies contain no call, allocation, branch, or
 //!   mutation; every guard failure balances compact scratch storage and
 //!   deoptimizes the original opcode before observable effects.
@@ -24,8 +25,8 @@
 //!   only for live entry values.
 //! - A raw receiver pointer retained in `x17` is live only between the entry
 //!   identity guard and the end of a call-free, safepoint-free inline body.
-//! - A method site that cannot prove one current native generation takes an
-//!   exact pre-effect side exit.
+//! - A method target without one current native generation is omitted; a site
+//!   matching no generated target takes an exact pre-effect side exit.
 //!
 //! # See also
 //! - [`crate::arm64`] — shared generated call and method-guard emission.
@@ -127,6 +128,7 @@ fn inline_leaf_template_plan(
     leaf_view.instructions = instructions.to_vec();
     leaf_view.inline_callees.clear();
     leaf_view.direct_callees.clear();
+    leaf_view.direct_methods.clear();
     leaf_view.inline_methods.clear();
     leaf_view.inline_poly_methods.clear();
     leaf_view.collection_leaf_methods.clear();
@@ -846,7 +848,7 @@ pub(super) fn emit_call(
     table: &TransitionTable,
     view: &JitCompileSnapshot,
     code_dependencies: &mut BTreeMap<u32, u64>,
-    mut direct_call_events: Option<&mut BTreeMap<u32, otter_vm::JitCompilerDiagnostic>>,
+    mut direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
     mut code_map: Option<&mut CodeMapCapture>,
     dst: u16,
     callee: u16,
@@ -884,7 +886,7 @@ pub(super) fn emit_call(
             emit_store_reg(ops, 9, dst)?;
             if let Some(events) = direct_call_events.as_deref_mut() {
                 events.insert(
-                    byte_pc,
+                    (byte_pc, 0),
                     otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
                         instruction_pc: logical_pc,
                         byte_pc,
@@ -898,7 +900,7 @@ pub(super) fn emit_call(
         }
         if let Some(events) = direct_call_events.as_deref_mut() {
             events.insert(
-                byte_pc,
+                (byte_pc, 0),
                 otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
                     instruction_pc: logical_pc,
                     byte_pc,
@@ -936,12 +938,14 @@ pub(super) fn emit_call(
             if let (Some(events), Some(target)) = (direct_call_events.as_deref_mut(), direct_target)
             {
                 events.insert(
-                    byte_pc,
+                    (byte_pc, 0),
                     direct_call_lowering_event(
                         otter_vm::JitDirectCallKind::Plain,
                         logical_pc,
                         byte_pc,
                         target,
+                        0,
+                        1,
                         otter_vm::JitDirectCallLoweringOutcome::Inlined,
                     ),
                 );
@@ -979,12 +983,14 @@ pub(super) fn emit_call(
         );
         if let Some(events) = direct_call_events.as_deref_mut() {
             events.insert(
-                byte_pc,
+                (byte_pc, 0),
                 direct_call_lowering_event(
                     otter_vm::JitDirectCallKind::Plain,
                     logical_pc,
                     byte_pc,
                     target,
+                    0,
+                    1,
                     otter_vm::JitDirectCallLoweringOutcome::Generated {
                         code_object_id: target.plan.code_object_id,
                         target_tier: direct_call_target_tier(target),
@@ -999,12 +1005,14 @@ pub(super) fn emit_call(
 
     if let (Some(events), Some(target)) = (direct_call_events.as_deref_mut(), direct_target) {
         events.insert(
-            byte_pc,
+            (byte_pc, 0),
             direct_call_lowering_event(
                 otter_vm::JitDirectCallKind::Plain,
                 logical_pc,
                 byte_pc,
                 target,
+                0,
+                1,
                 otter_vm::JitDirectCallLoweringOutcome::Rejected {
                     reason: otter_vm::JitDirectCallLoweringRejectionReason::LayoutUnsupported,
                 },
@@ -1030,6 +1038,8 @@ fn direct_call_lowering_event(
     logical_pc: u32,
     byte_pc: u32,
     target: &otter_vm::JitDirectCallee,
+    target_index: u32,
+    target_count: u32,
     outcome: otter_vm::JitDirectCallLoweringOutcome,
 ) -> otter_vm::JitCompilerDiagnostic {
     otter_vm::JitCompilerDiagnostic::DirectCallLowered {
@@ -1037,6 +1047,8 @@ fn direct_call_lowering_event(
         instruction_pc: logical_pc,
         byte_pc,
         callee_function_id: target.plan.function_id,
+        target_index,
+        target_count,
         outcome,
     }
 }
@@ -1095,11 +1107,11 @@ pub(super) fn emit_construct(
 
 /// Emit `dst = recv.name(args…)` (`Op::CallMethodValue`).
 ///
-/// Leaf/inlined collection layers run first. Otherwise only a VM-baked
-/// monomorphic method generation remains native: generated code re-reads the
-/// receiver/prototype/method slot, proves the exact callable, then builds the
-/// rooted callee frame directly. Missing plans and guard misses deoptimize the
-/// original opcode before method lookup effects.
+/// Leaf/inlined collection layers run first. Otherwise a VM-baked bounded
+/// method-target chain remains native: generated code walks exact
+/// receiver/prototype/method-slot guards in feedback order, then builds the
+/// selected rooted callee frame directly. Missing plans and guard-chain misses
+/// deoptimize the original opcode before method lookup effects.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_method_call(
     ops: &mut Assembler,
@@ -1107,7 +1119,7 @@ pub(super) fn emit_method_call(
     table: &TransitionTable,
     view: &JitCompileSnapshot,
     code_dependencies: &mut BTreeMap<u32, u64>,
-    mut direct_call_events: Option<&mut BTreeMap<u32, otter_vm::JitCompilerDiagnostic>>,
+    mut direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
     mut code_map: Option<&mut CodeMapCapture>,
     dst: u16,
     receiver: u16,
@@ -1128,7 +1140,10 @@ pub(super) fn emit_method_call(
         arg0,
         arg1,
     };
-    if let Some(method) = view.inline_methods.get(&byte_pc) {
+    let planned_methods = view.direct_methods.get(&byte_pc);
+    if planned_methods.is_none_or(|methods| methods.len() == 1 && methods[0].target_count == 1)
+        && let Some(method) = view.inline_methods.get(&byte_pc)
+    {
         if try_emit_inline_numeric_method(
             ops,
             relocations,
@@ -1147,15 +1162,17 @@ pub(super) fn emit_method_call(
         )? {
             if let (Some(events), Some(target)) = (
                 direct_call_events.as_deref_mut(),
-                view.direct_methods.get(&byte_pc),
+                planned_methods.and_then(|methods| methods.first()),
             ) {
                 events.insert(
-                    byte_pc,
+                    (byte_pc, target.target_index),
                     direct_call_lowering_event(
                         otter_vm::JitDirectCallKind::Method,
                         logical_pc,
                         byte_pc,
                         &target.callee,
+                        target.target_index,
+                        target.target_count,
                         otter_vm::JitDirectCallLoweringOutcome::Inlined,
                     ),
                 );
@@ -1196,10 +1213,28 @@ pub(super) fn emit_method_call(
             dynasm!(ops ; .arch aarch64 ; =>after_alloc);
         }
     }
-    let planned_method = view.direct_methods.get(&byte_pc);
-    let direct_method =
-        planned_method.filter(|method| direct_call_target_is_supported(&method.callee));
-    if let Some(method) = direct_method {
+    for method in planned_methods.into_iter().flatten() {
+        if !direct_call_target_is_supported(&method.callee) {
+            if let Some(events) = direct_call_events.as_deref_mut() {
+                events.insert(
+                    (byte_pc, method.target_index),
+                    direct_call_lowering_event(
+                        otter_vm::JitDirectCallKind::Method,
+                        logical_pc,
+                        byte_pc,
+                        &method.callee,
+                        method.target_index,
+                        method.target_count,
+                        otter_vm::JitDirectCallLoweringOutcome::Rejected {
+                            reason:
+                                otter_vm::JitDirectCallLoweringRejectionReason::LayoutUnsupported,
+                        },
+                    ),
+                );
+            }
+            continue;
+        }
+        let next_target = ops.new_dynamic_label();
         let direct_site = DirectCallSite {
             target: &method.callee,
             caller_function_id: view.code_block.id,
@@ -1224,7 +1259,7 @@ pub(super) fn emit_method_call(
             },
             17,
             None,
-            bail,
+            next_target,
         )?;
         if let Some(code_map) = code_map.as_deref_mut() {
             code_map.record(CodeRegion::method_call_structural(
@@ -1245,7 +1280,7 @@ pub(super) fn emit_method_call(
             view,
             direct_site,
             table.entry(abi::STUB_JIT_DEOPT_STACK_CALL),
-            code_map,
+            code_map.as_deref_mut(),
             bail,
             threw,
             done,
@@ -1262,12 +1297,14 @@ pub(super) fn emit_method_call(
         );
         if let Some(events) = direct_call_events.as_deref_mut() {
             events.insert(
-                byte_pc,
+                (byte_pc, method.target_index),
                 direct_call_lowering_event(
                     otter_vm::JitDirectCallKind::Method,
                     logical_pc,
                     byte_pc,
                     &method.callee,
+                    method.target_index,
+                    method.target_count,
                     otter_vm::JitDirectCallLoweringOutcome::Generated {
                         code_object_id: method.callee.plan.code_object_id,
                         target_tier: direct_call_target_tier(&method.callee),
@@ -1276,23 +1313,8 @@ pub(super) fn emit_method_call(
                 ),
             );
         }
-    } else {
-        if let (Some(events), Some(method)) = (direct_call_events.as_deref_mut(), planned_method) {
-            events.insert(
-                byte_pc,
-                direct_call_lowering_event(
-                    otter_vm::JitDirectCallKind::Method,
-                    logical_pc,
-                    byte_pc,
-                    &method.callee,
-                    otter_vm::JitDirectCallLoweringOutcome::Rejected {
-                        reason: otter_vm::JitDirectCallLoweringRejectionReason::LayoutUnsupported,
-                    },
-                ),
-            );
-        }
-        dynasm!(ops ; .arch aarch64 ; b =>bail);
+        dynasm!(ops ; .arch aarch64 ; =>next_target);
     }
-    dynasm!(ops ; .arch aarch64 ; =>done);
+    dynasm!(ops ; .arch aarch64 ; b =>bail ; =>done);
     Ok(())
 }

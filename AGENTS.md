@@ -359,8 +359,9 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     program itself uses stderr or when `--json` is active.
   - The current report contains typed compile,
     inlining, direct-call plan/final-lowering, bail, generated-call-deopt, and
-    inline-deopt events. `compilePrepared` reports exact generated-link and
-    body-inline candidate counts separately. Capture
+    inline-deopt events. Bounded method chains expose `targetIndex` /
+    `targetCount`; `compilePrepared` reports `directMethodSites` and
+    `directMethodTargets` separately from body-inline candidate counts. Capture
     is default-off and bounded to 16,384 events per top-level run; `truncated`
     and `droppedEvents` report overflow without constructing further payloads.
   - Abrupt VM completion (for example, a thrown exception after tier-up) still

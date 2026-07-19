@@ -3,8 +3,8 @@
 //! # Contents
 //! - Alternating closure instances from one function literal through one
 //!   compiled plain-call site.
-//! - Polymorphic receiver shapes and method identities through one compiled
-//!   caller's semantic fallback.
+//! - Polymorphic receiver shapes and method identities through one bounded
+//!   generated-method guard chain.
 //! - A monomorphic production-tier method site whose guarded splice removes
 //!   the compiled-call boundary entirely.
 //! - A prototype-held method whose inline body reads an own receiver property.
@@ -24,6 +24,8 @@
 //!   SELF and upvalues are selected from the current callee on every call.
 //! - Method dispatch selects both the current function and current receiver;
 //!   neither method identity nor `this` leaks between polymorphic calls.
+//! - A bounded polymorphic method site enters exact native generations without
+//!   a runtime resolver or replaying the method call.
 //! - A production-tier inline candidate eliminates the generated call boundary
 //!   while preserving the same result as the interpreter.
 //! - A template-spliced method body runs only for the exact baked receiver and
@@ -211,7 +213,8 @@ fn same_function_id_closures_keep_current_capture_state() {
 
 const POLYMORPHIC_METHODS: &str = r#"
 function add(value) {
-  return this.base + value;
+  const result = { value: this.base + value };
+  return result.value;
 }
 function multiply(value) {
   return this.base * value;
@@ -234,9 +237,17 @@ const receivers = [
   subtractSecond
 ];
 
+// Install entry-capable generations before the polymorphic caller snapshots
+// its target chain.
+for (let i = 0; i < 320; i++) {
+  add(i);
+  multiply(i);
+  subtract(i);
+}
+
 // One source call site sees different shapes, different methods, and two
 // instances sharing one method implementation but requiring different this.
-for (let i = 0; i < 320; i++) {
+for (let i = 0; i < 5000; i++) {
   callMethod(receivers[i & 3], i);
 }
 
@@ -254,18 +265,19 @@ fn polymorphic_method_site_keeps_current_method_and_this() {
         "jit-call-polymorphic-methods.js",
         JitSelection::InterpreterOnly,
     );
-    let compiled = run(
-        POLYMORPHIC_METHODS,
-        "jit-call-polymorphic-methods.js",
-        JitSelection::Template,
-    );
-
-    assert_eq!(compiled.completion, oracle.completion);
-    assert_eq!(
-        compiled.completion,
-        "[100,7,498,797,104,35,494,793,108,63,490,789]"
-    );
-    assert_whole_function_compiled(&compiled);
+    for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
+        let compiled = run(
+            POLYMORPHIC_METHODS,
+            "jit-call-polymorphic-methods.js",
+            selection,
+        );
+        assert_eq!(compiled.completion, oracle.completion);
+        assert_eq!(
+            compiled.completion,
+            "[100,7,498,797,104,35,494,793,108,63,490,789]"
+        );
+        assert_whole_function_direct_calls(&compiled);
+    }
 }
 
 const OPTIMIZING_METHOD_CACHE: &str = r#"

@@ -2,13 +2,14 @@
 //!
 //! # Contents
 //! - Extracted single-implementation register helpers for `ToObject`,
-//!   `ToPropertyKey`, `IsArray`, `ArrayLength`, and `LoadLength`, shared by the
-//!   interpreter dispatch and the compiled transition.
+//!   `ToPropertyKey`, `IsArray`, `ArrayLength`, and `LoadLength`, shared by
+//!   interpreter dispatch and compiled slow paths.
 //! - The reentrant scalar transition dispatching those plus `TypeOf`,
 //!   `LoadNewTarget`, and `SameValue`.
 //!
 //! # Invariants
-//! - No scalar semantics are duplicated in JIT code; each opcode calls the same
+//! - JIT code may commit pure tag/layout-guarded scalar hits; every proxy,
+//!   realm-identity, wrong-type, or otherwise ambiguous case reaches the same
 //!   VM register helper the interpreter dispatches.
 //! - `ToPropertyKey` coercion (`@@toPrimitive`/`valueOf`/`toString`) reenters JS
 //!   through the shared path; a committed coercion is never replayed by an exact

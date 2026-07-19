@@ -911,13 +911,14 @@ pub(super) fn compile(
                     &mut ops,
                     &mut relocations,
                     transitions,
+                    view,
                     opcode,
                     arg0,
                     arg1,
                     arg2,
                     bail,
                     threw,
-                );
+                )?;
             }
             TemplateOp::SuperOp {
                 opcode,

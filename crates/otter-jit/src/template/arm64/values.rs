@@ -38,7 +38,7 @@ const VALUE_FALSE_IMM: u32 = VALUE_FALSE as u32;
 const VALUE_HOLE_IMM: u32 = VALUE_HOLE as u32;
 
 /// `ldr X(t), [x19, #idx*8]`.
-pub(super) fn emit_load_reg(ops: &mut Assembler, t: u8, idx: u16) -> Result<(), Unsupported> {
+pub(crate) fn emit_load_reg(ops: &mut Assembler, t: u8, idx: u16) -> Result<(), Unsupported> {
     let off = reg_offset(idx)?;
     dynasm!(ops ; .arch aarch64 ; ldr X(t), [x19, off]);
     Ok(())
@@ -52,7 +52,7 @@ pub(super) fn emit_store_reg(ops: &mut Assembler, t: u8, idx: u16) -> Result<(),
 }
 
 /// Materialize a 64-bit constant into x-register `t` via movz/movk.
-pub(super) fn emit_load_u64(ops: &mut Assembler, t: u8, v: u64) {
+pub(crate) fn emit_load_u64(ops: &mut Assembler, t: u8, v: u64) {
     dynasm!(ops ; .arch aarch64 ; movz X(t), (v & 0xFFFF) as u32);
     if (v >> 16) & 0xFFFF != 0 {
         dynasm!(ops ; .arch aarch64 ; movk X(t), ((v >> 16) & 0xFFFF) as u32, lsl #16);
@@ -67,7 +67,7 @@ pub(super) fn emit_load_u64(ops: &mut Assembler, t: u8, v: u64) {
 
 /// Materialize one process-local symbolic value without changing the
 /// variable-width `movz`/`movk` sequence used by the normal code path.
-pub(super) fn emit_load_symbol_u64(
+pub(crate) fn emit_load_symbol_u64(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     t: u8,
@@ -99,7 +99,7 @@ pub(super) fn emit_load_runtime_stub(
 /// Box the int32 payload in the low 32 bits of `X(t)` by setting the number
 /// tag. The producing op wrote `X(t)` through its `W` view, which zeroes bits
 /// [63:32], so a single `orr` completes the box. Clobbers `X(scratch)`.
-pub(super) fn emit_box_int32(ops: &mut Assembler, t: u8, scratch: u8) {
+pub(crate) fn emit_box_int32(ops: &mut Assembler, t: u8, scratch: u8) {
     dynasm!(ops
         ; .arch aarch64
         ; movz X(scratch), NUMBER_TAG_HI16, lsl #48
@@ -163,7 +163,7 @@ pub(crate) fn emit_num_to_double(ops: &mut Assembler, src_x: u8, dst_d: u8, bail
 /// A NaN result is first canonicalised to the single quiet-NaN pattern;
 /// then the encode offset is added so the bits land in the number space.
 /// Uses scratch GPR x14 in addition to `dst_x`.
-pub(super) fn emit_box_double(ops: &mut Assembler, src_d: u8, dst_x: u8) {
+pub(crate) fn emit_box_double(ops: &mut Assembler, src_d: u8, dst_x: u8) {
     let ready = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64

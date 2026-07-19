@@ -1,19 +1,23 @@
 //! Ordinary-call recording into CodeBlock-owned typed feedback slots.
 //!
 //! # Contents
-//! - [`Interpreter::record_ordinary_call_feedback`] — additive recording keyed
-//!   by the canonical instruction index in the supplied CodeBlock.
+//! - [`Interpreter::record_ordinary_call_feedback`] — typed recording keyed by
+//!   the canonical instruction index in the supplied CodeBlock.
 //!
 //! # Invariants
 //! - The typed `Op::Call` payload owns the bounded target population; no
 //!   interpreter-side `(function_id, pc)` map mirrors it.
-//! - Existing baseline decisions continue to read the compact dense cell.
+//! - Bytecode and supported static-native identities share one coherent target
+//!   population and one transition epoch.
 //!
 //! # See also
 //! - [`crate::feedback`] — compact per-instruction feedback and epochs.
 //! - [`crate::feedback::CallSiteDistribution`] — bounded typed payload.
 
-use crate::{CodeBlock, Interpreter, feedback::CallTargetTransition};
+use crate::{
+    CodeBlock, Interpreter,
+    feedback::{CallTargetTransition, OrdinaryCallTarget},
+};
 
 impl Interpreter {
     /// Record both compact and bounded ordinary-call feedback for one site.
@@ -25,9 +29,9 @@ impl Interpreter {
         &mut self,
         code_block: &CodeBlock,
         instruction_pc: u32,
-        callee_fid: u32,
+        target: OrdinaryCallTarget,
     ) -> CallTargetTransition {
-        code_block.record_call_feedback(instruction_pc as usize, callee_fid)
+        code_block.record_call_target_feedback(instruction_pc as usize, target)
     }
 }
 
@@ -73,13 +77,25 @@ mod tests {
         let Some(CallSiteDistribution::Poly(targets)) = code_block.call_distribution_at(0) else {
             panic!("second distinct target must make the site polymorphic");
         };
-        assert_eq!(targets.as_slice()[0], CallTargetCount { fid: 10, hits: 2 });
-        assert_eq!(targets.as_slice()[1], CallTargetCount { fid: 11, hits: 1 });
+        assert_eq!(
+            targets.as_slice()[0],
+            CallTargetCount {
+                target: OrdinaryCallTarget::Bytecode(10),
+                hits: 2,
+            }
+        );
+        assert_eq!(
+            targets.as_slice()[1],
+            CallTargetCount {
+                target: OrdinaryCallTarget::Bytecode(11),
+                hits: 1,
+            }
+        );
 
         for fid in 12..(10 + MAX_CALL_TARGETS as u32) {
             assert_eq!(
                 code_block.record_call_feedback(0, fid),
-                CallTargetTransition::Unchanged
+                CallTargetTransition::BecamePolymorphic
             );
         }
         let Some(CallSiteDistribution::Poly(targets)) = code_block.call_distribution_at(0) else {
@@ -97,7 +113,7 @@ mod tests {
 
         assert_eq!(
             code_block.record_call_feedback(0, 10 + MAX_CALL_TARGETS as u32),
-            CallTargetTransition::Unchanged
+            CallTargetTransition::BecamePolymorphic
         );
         assert_eq!(
             code_block.call_distribution_at(0),
@@ -115,25 +131,36 @@ mod tests {
         let mut interpreter = Interpreter::new();
 
         for fid in 0..MAX_CALL_TARGETS as u32 {
-            let transition = interpreter.record_ordinary_call_feedback(&code_block, 0, fid);
+            let transition = interpreter.record_ordinary_call_feedback(
+                &code_block,
+                0,
+                OrdinaryCallTarget::Bytecode(fid),
+            );
             let expected = match fid {
                 0 => CallTargetTransition::BecameMonomorphic,
-                1 => CallTargetTransition::BecamePolymorphic,
-                _ => CallTargetTransition::Unchanged,
+                _ => CallTargetTransition::BecamePolymorphic,
             };
             assert_eq!(transition, expected);
             assert_eq!(code_block.feedback_epoch(), fid + 1);
         }
 
         assert_eq!(
-            interpreter.record_ordinary_call_feedback(&code_block, 0, 0),
+            interpreter.record_ordinary_call_feedback(
+                &code_block,
+                0,
+                OrdinaryCallTarget::Bytecode(0),
+            ),
             CallTargetTransition::Unchanged
         );
         assert_eq!(code_block.feedback_epoch(), MAX_CALL_TARGETS as u32);
 
         assert_eq!(
-            interpreter.record_ordinary_call_feedback(&code_block, 0, MAX_CALL_TARGETS as u32),
-            CallTargetTransition::Unchanged
+            interpreter.record_ordinary_call_feedback(
+                &code_block,
+                0,
+                OrdinaryCallTarget::Bytecode(MAX_CALL_TARGETS as u32),
+            ),
+            CallTargetTransition::BecamePolymorphic
         );
         assert_eq!(code_block.feedback_epoch(), MAX_CALL_TARGETS as u32 + 1);
         assert!(matches!(
@@ -141,7 +168,11 @@ mod tests {
             Some(CallSiteDistribution::Megamorphic)
         ));
 
-        interpreter.record_ordinary_call_feedback(&code_block, 0, u32::MAX);
+        interpreter.record_ordinary_call_feedback(
+            &code_block,
+            0,
+            OrdinaryCallTarget::Bytecode(u32::MAX),
+        );
         assert_eq!(code_block.feedback_epoch(), MAX_CALL_TARGETS as u32 + 1);
     }
 }

@@ -90,8 +90,9 @@ impl RuntimeCall<'_> {
 
     /// Allocate a closure from the current activation's captured-cell window.
     ///
-    /// Materialized entries retain their cold lexical sidecar. Frameless direct
-    /// callees use the canonical native window and never synthesize a [`crate::Frame`].
+    /// Materialized entries retain their cold lexical sidecar. Generated
+    /// stack-owned callees use the canonical native window and never synthesize
+    /// a [`crate::Frame`].
     pub fn make_closure(
         &mut self,
         function_id: u32,
@@ -111,7 +112,7 @@ impl RuntimeCall<'_> {
                 function_index,
                 parent_indices,
             ),
-            RuntimeFrameIdentity::NativeOwner(_) => {
+            RuntimeFrameIdentity::StackOwned => {
                 let frame = self.frame.as_ptr();
                 // SAFETY: RuntimeCall validated and exclusively owns this
                 // descriptor for the duration of the semantic operation.
@@ -147,7 +148,7 @@ impl RuntimeCall<'_> {
                 dst,
                 function_index,
             ),
-            RuntimeFrameIdentity::NativeOwner(_) => {
+            RuntimeFrameIdentity::StackOwned => {
                 let frame = self.frame.as_ptr();
                 // SAFETY: RuntimeCall exclusively owns the validated published
                 // descriptor for this semantic operation.
@@ -405,31 +406,6 @@ impl RuntimeCall<'_> {
             source,
             site,
         )
-    }
-
-    /// Try one collection-method inline cache on a materialized activation.
-    pub fn try_collection_method(
-        &mut self,
-        dst: u16,
-        recv: u16,
-        site: usize,
-        arguments: &[u16],
-    ) -> Result<Option<bool>, VmError> {
-        let Some(frame_index) = self.materialized_index() else {
-            return Ok(None);
-        };
-        // SAFETY: short VM/stack references for this exact materialized-only
-        // operation; RuntimeCall retains only their raw descriptors.
-        unsafe { &mut *self.vm.as_ptr() }
-            .jit_runtime_try_collection_method_ic(
-                unsafe { &mut *self.stack.as_ptr() },
-                frame_index,
-                dst,
-                recv,
-                site,
-                arguments,
-            )
-            .map(Some)
     }
 
     /// Store one computed element through the representation-neutral frame.

@@ -121,11 +121,11 @@ allocation deltas, duplicate-name validation, and per-entry timing.
 The shipped engine diagnostics are deliberately default-off:
 
 - text or JSON bytecode disassembly for compiler output;
-- a versioned text [step trace](/otter/engine/step-trace/) for
+- the current text [step trace](/otter/engine/step-trace/) for
   interpreter-dispatched bytecode;
 - Chrome/V8 `.cpuprofile` plus folded stacks from the bytecode-dispatch
   sampler;
-- versioned [JIT events and compile artifacts](/otter/engine/jit-debugging/)
+- current [JIT events and compile artifacts](/otter/engine/jit-debugging/)
   for bytecode, tier input, exact native bytes, native offset maps,
   safepoints, and deopt metadata;
 - embedder snapshots for inline caches, shapes, frames, heap summaries, and

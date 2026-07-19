@@ -60,7 +60,6 @@ readFileSync({path:?}, "utf8");
         String::from_utf8_lossy(&output.stderr)
     );
     let envelope: Value = serde_json::from_slice(&output.stderr).expect("json diagnostic");
-    assert_eq!(envelope["error_schema_version"], 1);
     assert_eq!(envelope["error"]["kind"], "runtime");
     assert_eq!(envelope["error"]["diagnostic"]["code"], "UNCAUGHT");
 }

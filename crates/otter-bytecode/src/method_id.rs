@@ -12,8 +12,8 @@
 //!
 //! # Invariants
 //! - Enum discriminants are written explicitly; never reorder
-//!   variants without also bumping any persistent bytecode
-//!   serialisation format.
+//!   variants without updating every producer and consumer of the
+//!   one current bytecode contract in the same change.
 //! - Every enum exposes
 //!   [`from_str`](`JsonMethod::from_str`) (compile-time mapping)
 //!   and [`from_u32`](`JsonMethod::from_u32`) (runtime decode).

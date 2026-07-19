@@ -234,7 +234,7 @@ fn heap_snapshot_summary_reports_live_buckets() {
     );
 
     let rendered = summary.render_text();
-    assert!(rendered.starts_with("; otter heap snapshot summary v1"));
+    assert!(rendered.starts_with("; otter heap snapshot summary —"));
     assert!(rendered.contains("type_tag"));
 }
 

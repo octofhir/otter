@@ -1,4 +1,4 @@
-; otter step trace v1
+; otter step trace
 frame=1 fn=<main> pc=000000 op=VALIDATE_GLOBAL_DECL  k[0] i32:2
 frame=1 fn=<main> pc=000012 op=VALIDATE_GLOBAL_DECL  k[1] i32:2
 frame=1 fn=<main> pc=000024 op=MAKE_FUNCTION  r0 k[3]

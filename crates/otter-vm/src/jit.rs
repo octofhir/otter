@@ -16,8 +16,11 @@
 //! - [`JitFunctionCode`] and [`JitCompileStatus`] — type-erased compiled-code
 //!   result handles and validity dependencies that keep executable memory
 //!   ownership outside this crate.
-//! - [`JitDirectCallPlan`] and the isolate-local direct-call cache record used
-//!   to reuse an already-validated optimizing entry.
+//! - [`JitDirectCallPlan`], [`JitDirectCallee`], guarded static-native call
+//!   plans, and the isolate-local direct-call cache record used to reuse an
+//!   already-validated native entry.
+//! - [`JitCodeGenerationSnapshot`] — explicit cold introspection over live
+//!   generations and retained entry-cell tombstones.
 //!
 //! # Invariants
 //! - DTOs are owned and borrow-free. JIT compilation must not hold references
@@ -42,11 +45,14 @@
 use std::sync::Arc;
 
 use otter_bytecode::{Op, Operand};
+use serde::Serialize;
 
 use crate::{
     CodeBlock, CodeBlockInstruction,
     feedback::ArithFeedback,
-    native_abi::{NativeFrameKind, SafepointId, SafepointRecord},
+    native_abi::{
+        CodeDependency, CodeLifetimeState, NativeFrameKind, SafepointId, SafepointRecord,
+    },
 };
 
 /// Canonical handlers owned by one compiled `EnterTry` instruction.
@@ -191,7 +197,7 @@ pub struct JitCompileSnapshot {
     /// `[[Prototype]]` mirror (`HEADER_SIZE + OBJECT_BODY_JIT_PROTO_OFFSET`). A
     /// `#[repr(C)]` constant; the method-inline guard reads
     /// `[recv_ptr + jit_proto_byte]` to chase the receiver's prototype chain
-    /// in machine code without a resolve bridge.
+    /// in machine code without runtime resolution.
     pub jit_proto_byte: u32,
     /// `GcHeader::type_tag` for heap-number boxes referenced by compressed
     /// object slots.
@@ -211,14 +217,31 @@ pub struct JitCompileSnapshot {
     pub native_static_fn_byte: u32,
     /// Instruction overlays in canonical logical-PC order.
     pub instructions: Vec<JitInstructionMetadata>,
+    /// Guarded static-native leaf calls keyed by the caller's `Op::Call`
+    /// byte-PC. Each plan names one exact bootstrap function identity and one
+    /// machine-code operation; misses side-exit before effects.
+    pub static_native_calls: rustc_hash::FxHashMap<u32, JitStaticNativeCall>,
+    /// Compiler-native direct callees keyed by the caller's `Op::Call`
+    /// byte-PC. Each entry names one monomorphic, ordinary synchronous callee
+    /// with no callee-owned upvalue cells and a current non-OSR native entry.
+    /// The emitter guards the dynamic callable against
+    /// [`JitDirectCallPlan::function_id`] and side-exits if the identity or
+    /// entry-cell lease no longer matches; no runtime resolver is part of the
+    /// compiled hit path.
+    pub direct_callees: rustc_hash::FxHashMap<u32, JitDirectCallee>,
+    /// Compiler-native direct methods keyed by the caller's
+    /// `Op::CallMethodValue` byte-PC. Presence proves monomorphic receiver and
+    /// method feedback plus one current entry-capable callee generation.
+    /// Generated code re-reads the receiver/prototype chain and exact method
+    /// slot before constructing the callee frame.
+    pub direct_methods: rustc_hash::FxHashMap<u32, JitDirectMethod>,
     /// Inline-candidate callees for baseline leaf-inlining, keyed by the
     /// caller's `Op::Call` byte-PC. Populated only for sites the interpreter
     /// observed resolving to a single plain synchronous bytecode callee; baked
-    /// by `Interpreter::bake_inline_callees`. Empty in the raw compile snapshot
-    /// snapshot. The emitter applies the final pure-leaf / size / arity test and
-    /// either splices the body under an identity guard or — for a site absent
-    /// here, or one whose candidate fails the test — emits the normal
-    /// direct-call bridge.
+    /// by `Interpreter::bake_inline_callees`. Empty in the raw compile
+    /// snapshot. The emitter applies the final pure-leaf / size / arity test
+    /// and splices accepted bodies under an identity guard; a failed guard
+    /// side-exits at the exact caller PC.
     pub inline_callees: rustc_hash::FxHashMap<u32, JitInlineCallee>,
     /// Inline-candidate methods for `Op::CallMethodValue` sites, keyed by the
     /// caller's call byte-PC. Populated for monomorphic method sites whose method
@@ -230,14 +253,14 @@ pub struct JitCompileSnapshot {
     /// most-frequent-first list (length ≥ 2) of per-receiver-shape inline
     /// methods the baseline emits as a guard chain: each entry guards its own
     /// receiver shape + prototype-method identity and, on a miss, falls through
-    /// to the next entry; a receiver matching none of them takes the in-place
-    /// method bridge. Baked by `Interpreter::bake_inline_callees`. The optimizing
-    /// tier ignores this map and bridges polymorphic method sites.
+    /// to the next entry; a receiver matching none of them side-exits before
+    /// method lookup. Baked by `Interpreter::bake_inline_callees`. The optimizing
+    /// tier ignores polymorphic inline bodies.
     pub inline_poly_methods: rustc_hash::FxHashMap<u32, Vec<JitInlineMethod>>,
     /// Leaf collection method-call feedback keyed by the caller's
     /// `Op::CallMethodValue` byte-PC. These entries are fully JIT-readable:
     /// generated code can validate the receiver/prototype/builtin guards and
-    /// call the VM-native leaf stub without a Rust resolver bridge.
+    /// call the VM-native leaf stub without runtime method resolution.
     pub collection_leaf_methods: rustc_hash::FxHashMap<u32, JitCollectionLeafMethod>,
     /// Allocating collection method-call feedback keyed by the caller's
     /// `Op::CallMethodValue` byte-PC. These entries carry the same
@@ -248,8 +271,8 @@ pub struct JitCompileSnapshot {
     /// Dense-array `push` / `pop` method-call feedback keyed by the caller's
     /// `Op::CallMethodValue` byte-PC. Each entry carries the receiver guard's
     /// prototype/shape/builtin metadata so the baseline can splice an inline
-    /// fast path (length bump + element move) under a guard, with the runtime
-    /// method bridge as the miss fallback.
+    /// fast path (length bump + element move) under a guard; misses side-exit
+    /// before method lookup.
     pub array_methods: rustc_hash::FxHashMap<u32, JitArrayMethod>,
     /// Primitive builtin method guard metadata keyed by the caller's
     /// `Op::CallMethodValue` byte-PC. Each entry validates the realm prototype
@@ -331,7 +354,7 @@ pub enum JitArrayMethodKind {
 /// the builtin is checked against a stable native `fn` address. The inline fast
 /// path validates the receiver is an ordinary dense array (no exotic sidecar)
 /// and the prototype still carries the original builtin at the cached slot;
-/// any miss falls through to the rooted runtime method bridge.
+/// any miss side-exits before method effects.
 #[derive(Debug, Clone, Copy)]
 pub struct JitArrayMethod {
     /// Compressed offset of the realm `%Array.prototype%` object.
@@ -363,10 +386,11 @@ pub struct JitPrimitiveMethodGuard {
     pub builtin_fn_addr: usize,
 }
 
-/// A callee the baseline may splice into a caller's `Op::Call` site instead of
-/// emitting the per-call bridge. Carries the callee's own bytecode (the body to
-/// inline) plus the identity it is guarded against: a runtime closure whose bits
-/// do not match this `function_id` makes the guard bail to the interpreter.
+/// A callee the baseline may splice into a caller's `Op::Call` site.
+///
+/// Carries the callee's own bytecode plus the identity guard. A runtime
+/// callable whose function id does not match [`Self::function_id`] side-exits
+/// at the caller's canonical call PC.
 #[derive(Debug, Clone)]
 pub struct JitInlineCallee {
     /// Authoritative callee execution body owning operand side tables.
@@ -383,35 +407,44 @@ pub struct JitInlineCallee {
     pub instructions: Vec<JitInstructionMetadata>,
 }
 
+/// Exact receiver/prototype/method-slot identity for one monomorphic method
+/// target.
+///
+/// This guard is shared by leaf inlining and compiler-generated method calls:
+/// both must re-read the current slot and prove the same callable before any
+/// effect.
+#[derive(Debug, Clone)]
+pub struct JitMethodGuard {
+    /// Method function id the slot identity check is keyed on.
+    pub method_fid: u32,
+    /// Receiver shape-handle compressed offset.
+    pub recv_shape: u32,
+    /// Shape-handle compressed offsets of each prototype hopped from the
+    /// receiver to the method holder, in hop order.
+    pub proto_chain: Vec<u32>,
+    /// Byte offset inside the holder object's value slab for the method slot.
+    pub method_value_byte: u32,
+}
+
 /// A method the baseline may splice into a caller's `Op::CallMethodValue` site.
-/// Carries the method's body plus the data to guard it: the receiver shape the
-/// body's sealed property loads/stores are baked against, and, per body
+/// Carries the method's body plus the shared identity guard. Per body
 /// `LoadProperty`/`StoreProperty` byte-PC, the value byte offset within the
 /// decompressed receiver.
 /// Method identity is verified inline every call: the emitter chases the
-/// flat prototype handle once per [`proto_chain`](Self::proto_chain) entry,
+/// flat prototype handle once per
+/// [`JitMethodGuard::proto_chain`] entry,
 /// guards each hopped object's shape, reads the method slot at
-/// [`method_value_byte`](Self::method_value_byte) from the final holder, and
+/// [`JitMethodGuard::method_value_byte`] from the final holder, and
 /// compares the resolved closure's `function_id` to
-/// [`method_fid`](Self::method_fid). A prototype-method reassignment or any
-/// shape change along the chain falls back to the in-place method call — no
-/// per-call resolve bridge.
+/// [`JitMethodGuard::method_fid`]. A prototype-method reassignment or any
+/// shape change along the chain side-exits at the original method call before
+/// effects.
 #[derive(Debug, Clone)]
 pub struct JitInlineMethod {
     /// Authoritative method execution body owning operand side tables.
     pub code_block: Arc<CodeBlock>,
-    /// Method function id the call-site identity check is keyed on.
-    pub method_fid: u32,
-    /// Receiver shape-handle compressed offset the sealed loads are baked for.
-    pub recv_shape: u32,
-    /// Shape-handle compressed offsets of each prototype hopped from the
-    /// receiver to the object holding the method slot, in hop order (the last
-    /// entry is the holder). Empty when the method slot is an own property on
-    /// the receiver.
-    pub proto_chain: Vec<u32>,
-    /// Byte offset inside the holder object's value slab for the method
-    /// slot, baked from the holder's shape.
-    pub method_value_byte: u32,
+    /// Exact receiver/prototype/method-slot guard shared with generated calls.
+    pub guard: JitMethodGuard,
     /// Method formal parameter count (excluding `this`); must equal argc.
     pub param_count: u16,
     /// Method virtual-register-window length. A backend may compact the live
@@ -432,8 +465,68 @@ pub struct JitInlineMethod {
     pub prop_shapes: rustc_hash::FxHashMap<u32, u32>,
     /// Body `CallMethodValue` byte-PC → the monomorphic method it resolves to,
     /// baked recursively. Lets the inliner splice a nested call's body inline
-    /// (bounded recursion) instead of leaving it a bridged call.
+    /// with bounded recursion.
     pub nested_methods: rustc_hash::FxHashMap<u32, JitInlineMethod>,
+}
+
+/// Source opcode represented by compiler-generated call linkage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JitDirectCallKind {
+    /// Ordinary `Op::Call`.
+    Plain,
+    /// Guarded `Op::CallMethodValue`.
+    Method,
+}
+
+/// `this` binding performed by compiler-generated call linkage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JitDirectCallThisMode {
+    /// Strict functions receive `undefined`; arrows retain their lexical
+    /// binding from the guarded closure metadata.
+    StrictOrLexical,
+    /// An ordinary sloppy `Op::Call` receives the active realm's rooted global
+    /// object. Closures carrying an explicit bound receiver side-exit before
+    /// entry because primitive `ToObject` remains an interpreter operation.
+    SloppyGlobal,
+    /// A guarded method call passes its exact object receiver.
+    MethodReceiver,
+}
+
+/// Static native operation that a backend may lower without entering Rust.
+///
+/// Variants are semantic operations rather than raw function addresses. The
+/// address travels separately as an identity guard, while the variant selects
+/// exact machine code and makes diagnostics process-independent.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JitStaticNativeCallKind {
+    /// Numeric fast path for the original realm `Math.abs`.
+    MathAbs = 0,
+}
+
+impl JitStaticNativeCallKind {
+    /// Decode the compact call-feedback payload.
+    #[must_use]
+    pub(crate) const fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::MathAbs),
+            _ => None,
+        }
+    }
+}
+
+/// One monomorphic static-native call selected from ordinary-call feedback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitStaticNativeCall {
+    /// Semantic leaf operation emitted by the backend.
+    pub kind: JitStaticNativeCallKind,
+    /// Exact process-local bootstrap function address checked before the leaf
+    /// executes. This address is never serialized into diagnostics or
+    /// normalized artifacts.
+    pub builtin_fn_addr: usize,
 }
 
 /// VM-resolved direct-call target for one eligible compiled callee.
@@ -445,33 +538,49 @@ pub struct JitInlineMethod {
 pub struct JitDirectCallPlan {
     /// Callee function id in the executable module.
     pub function_id: u32,
+    /// Exact installed code-object generation named by [`Self::entry_cell`].
+    pub code_object_id: u64,
     /// Stable address of the exact generation's
     /// [`crate::native_abi::CodeEntryCell`]. The cell is registry-owned and is
     /// never reused, even after its executable mapping retires.
     pub entry_cell: u64,
+    /// Native tier published by the exact target generation.
+    pub tier: NativeFrameKind,
+    /// Exact plain-call `this` binding the generated linkage must perform.
+    pub this_mode: JitDirectCallThisMode,
+    /// Persistent machine-stack bytes reserved by the target after native
+    /// entry, when that tier can safely cold-deopt from a stack-owned caller.
+    ///
+    /// `None` rejects compiler-generated stack linkage for this generation.
+    /// Existing VM-owned call paths may still enter it through their own
+    /// materialized-frame contract.
+    pub generated_stack_frame_bytes: Option<u32>,
     /// Number of formal parameter registers.
     pub param_count: u16,
     /// Total callee register-window length.
     pub register_count: u16,
 }
 
-/// One isolate-local monomorphic optimizing entry selected for direct calls.
+/// One baked compiler-native target for a monomorphic plain-call site.
 ///
-/// The strong owner pins the exact code generation named by `plan`; the
-/// registry epoch proves its entry/dependency checks have not changed. Call
-/// resolution still decodes the current function or closure before consulting
-/// this record, so upvalues, SELF, and `this` never come from the cache.
-pub(crate) struct JitDirectCallCache {
-    /// Function identity checked after fresh callable decoding.
-    pub(crate) function_id: u32,
-    /// Exact scalar entry plan selected from the registry.
-    pub(crate) plan: JitDirectCallPlan,
-    /// Strong owner for the code generation named by `plan`.
-    pub(crate) code: Arc<dyn JitFunctionCode>,
-    /// Native frame kind copied once from the selected code object.
-    pub(crate) tier: NativeFrameKind,
-    /// Registry invalidation epoch at plan selection.
-    pub(crate) plan_epoch: u64,
+/// Presence in [`JitCompileSnapshot::direct_callees`] proves the callee is an
+/// ordinary synchronous body, owns no fresh upvalue cells, and has a current
+/// entry-capable code generation. Dynamic callable identity, supported `this`
+/// binding, and entry-cell liveness remain machine-code guards, so invalidation
+/// safely side-exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitDirectCallee {
+    /// Exact function identity, entry cell, and callee register-window shape.
+    pub plan: JitDirectCallPlan,
+}
+
+/// One monomorphic method target with an exact generated callee plan.
+#[derive(Debug, Clone)]
+pub struct JitDirectMethod {
+    /// Receiver/prototype/method-slot identity checked immediately before call.
+    pub guard: JitMethodGuard,
+    /// Exact entry generation and callee frame shape.
+    pub callee: JitDirectCallee,
 }
 
 /// VM-owned root descriptor for one native JIT activation.
@@ -498,50 +607,6 @@ impl JitNativeActivation {
 const _: [(); 8] = [(); std::mem::size_of::<JitNativeActivation>()];
 const _: [(); 8] = [(); std::mem::align_of::<JitNativeActivation>()];
 const _: [(); 0] = [(); std::mem::offset_of!(JitNativeActivation, frame)];
-
-/// Receiver shapes cached per direct-method call site, and the number of flat
-/// inline-link ways the optimizing tier walks. Shared with the VM so the flat
-/// table stride and the emitted walk agree.
-pub const JIT_DIRECT_METHOD_WAYS: usize = 4;
-
-/// Prepared direct-call entry state returned by the VM to emitted code.
-///
-/// The VM has reserved one native-call owner and one register window, but has
-/// not materialized an interpreter [`crate::Frame`]. Emitted code publishes a
-/// stack-local [`crate::native_abi::NativeFrame`] and branches through the
-/// entry cell without the generic call bridge. It acquires `entry_cell` before
-/// native entry, so an invalidated generation rejects the call without
-/// branching through a stale raw address. The record is staged as one compact
-/// C-layout unit and consumed only after prepare reports success.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct JitPreparedDirectCall {
-    /// Address-stable [`crate::native_abi::CodeEntryCell`] for this exact code
-    /// generation. Native linkage must acquire/recheck it before entry and
-    /// release its active count after the compiled callee returns.
-    pub entry_cell: u64,
-    /// Callee register-window base.
-    pub regs: *mut u64,
-    /// Boxed SELF closure bits for the callee context.
-    pub self_closure: u64,
-    /// Boxed `this` bits for the callee context.
-    pub this_value: u64,
-    /// Base of the callee frame's stable upvalue source, or `0` when it captures
-    /// nothing. Inherited-only calls borrow the exact closure's immutable
-    /// allocation; calls with fresh own cells publish owner-allocated storage.
-    pub upvalues_ptr: usize,
-    /// VM-owned frameless-call resources released or materialized exactly once
-    /// when native execution completes.
-    pub owner_id: u32,
-    /// Number of initialized handles at [`Self::upvalues_ptr`].
-    pub upvalue_count: u32,
-}
-
-const _: [(); 48] = [(); std::mem::size_of::<JitPreparedDirectCall>()];
-const _: [(); 8] = [(); std::mem::align_of::<JitPreparedDirectCall>()];
-const _: [(); 32] = [(); std::mem::offset_of!(JitPreparedDirectCall, upvalues_ptr)];
-const _: [(); 40] = [(); std::mem::offset_of!(JitPreparedDirectCall, owner_id)];
-const _: [(); 44] = [(); std::mem::offset_of!(JitPreparedDirectCall, upvalue_count)];
 
 /// Current static offsets needed by native Array guards.
 ///
@@ -718,6 +783,9 @@ impl JitCompileSnapshot {
             collection_layout: JitCollectionLayout::default(),
             native_static_fn_byte: 0,
             instructions,
+            static_native_calls: rustc_hash::FxHashMap::default(),
+            direct_callees: rustc_hash::FxHashMap::default(),
+            direct_methods: rustc_hash::FxHashMap::default(),
             inline_callees: rustc_hash::FxHashMap::default(),
             inline_methods: rustc_hash::FxHashMap::default(),
             inline_poly_methods: rustc_hash::FxHashMap::default(),
@@ -885,10 +953,8 @@ pub struct JitDeoptFrame {
 }
 
 /// VM-owned runtime state retained behind [`crate::native_abi::VmThread`]
-/// while compiled code can re-enter
-/// the VM (recursive calls, closure allocation) through the safe bridge methods
-/// ([`crate::Interpreter::jit_runtime_call`],
-/// [`crate::Interpreter::jit_runtime_make_function`]).
+/// while compiled code can re-enter the VM for typed runtime operations such
+/// as closure allocation.
 ///
 /// # Invariants
 /// - Pointers are valid only for the duration of one
@@ -991,8 +1057,8 @@ pub enum JitExecOutcome {
 ///
 /// The JIT implementation owns executable memory and the unsafe ABI calls. The
 /// VM still needs raw entry metadata for compiled-to-compiled direct branches:
-/// emitted callers can branch to an already-installed callee without routing
-/// through the generic runtime call bridge.
+/// emitted callers branch to an already-installed callee through its guarded
+/// entry cell.
 pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// Immutable metadata for this installed code object.
     fn metadata(&self) -> crate::native_abi::CodeObjectMetadata;
@@ -1000,6 +1066,18 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// Native activation kind published for this tier.
     fn native_frame_kind(&self) -> NativeFrameKind {
         NativeFrameKind::Baseline
+    }
+
+    /// Exact persistent native-frame reservation for stack-owned generated
+    /// calls, or `None` when this code generation cannot safely cold-deopt
+    /// through that entry contract.
+    ///
+    /// The value excludes the caller-owned [`crate::native_abi::NativeFrame`]
+    /// and tagged register window: the shared emitter accounts those
+    /// separately. A tier must return `None` unless all of its bailout paths
+    /// can resume from a stack-owned activation.
+    fn generated_stack_frame_bytes(&self) -> Option<u32> {
+        None
     }
 
     /// Immutable isolate-state dependencies declared by this code object.
@@ -1050,8 +1128,8 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// `activation.frame_index`.
     ///
     /// Compiled code reads/writes that frame's register window in place and,
-    /// for `Call`/`MakeFunction`, re-enters the VM through the safe bridge
-    /// methods reached through the activation published by [`crate::native_abi::VmThread`].
+    /// for typed runtime operations, re-enters the VM through entries reached
+    /// through the activation published by [`crate::native_abi::VmThread`].
     /// The window stays rooted on the VM frame
     /// stack throughout, so allocation/calls in the body are GC-safe.
     fn run_entry(&self, activation: VmRuntimeActivation) -> JitExecOutcome;
@@ -1114,6 +1192,45 @@ pub struct JitCodeResidency {
     pub code_bytes: u64,
 }
 
+/// Owned cold snapshot of one isolate-local JIT code generation.
+///
+/// A retired generation remains visible as long as its permanent entry-cell
+/// tombstone exists. `dependencies` is `None` only after executable metadata
+/// has retired; a registered generation with no dependencies reports
+/// `Some(Vec::new())`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JitCodeGenerationSnapshot {
+    /// Immutable isolate-local code-object identity.
+    pub code_object_id: u64,
+    /// Bytecode function implemented by this generation.
+    pub function_id: u32,
+    /// Native tier that emitted the generation.
+    pub tier: NativeFrameKind,
+    /// Current executable lifecycle, including retained retired tombstones.
+    pub lifecycle: CodeLifetimeState,
+    /// Whether the stable entry cell still accepts new leases.
+    pub linked: bool,
+    /// Native activations currently holding an entry lease.
+    pub active_count: u32,
+    /// Formal parameter count frozen into the entry cell.
+    pub param_count: u16,
+    /// Initialized tagged register-window length.
+    pub register_count: u16,
+    /// Generated native entries observed for this exact generation.
+    pub generated_entries: u64,
+    /// Generated entries that returned normally.
+    pub generated_returns: u64,
+    /// Generated entries that cold-deoptimized.
+    pub generated_deopts: u64,
+    /// Generated entries that propagated a throw.
+    pub generated_throws: u64,
+    /// Consecutive generated deopts since the last return or throw.
+    pub generated_bail_streak: u32,
+    /// Exact validity dependencies while executable metadata remains
+    /// registered; `None` denotes a retired tombstone.
+    pub dependencies: Option<Vec<CodeDependency>>,
+}
+
 /// Result of a JIT compile attempt.
 #[derive(Debug, Clone)]
 pub enum JitCompileStatus {
@@ -1132,6 +1249,8 @@ pub enum JitCompileStatus {
         /// Optional owned debug sidecar returned independently of installed
         /// executable code.
         artifact: Option<Box<crate::jit_artifact::JitArtifactBundle>>,
+        /// Opt-in compiler-emitted events describing actual backend choices.
+        diagnostics: Box<[crate::jit_debug::JitCompilerDiagnostic]>,
     },
 }
 

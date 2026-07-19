@@ -21,5 +21,4 @@ mod stats;
 mod tests;
 mod trace_roots;
 
-pub(crate) use feedback::{FeedbackDirectory, MethodLoadHit};
-pub(crate) use jit_call::cache::JitDirectMethodCache;
+pub(crate) use feedback::FeedbackDirectory;

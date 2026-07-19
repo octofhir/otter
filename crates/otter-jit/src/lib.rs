@@ -78,11 +78,6 @@ pub struct OtterJitCompiler {
     /// Hook-lifetime resolution of the transition inventory; every compile
     /// bakes entry addresses through this table.
     transitions: TransitionTable,
-    /// One fallibly assembled call lifecycle shared by every produced code
-    /// object. The code objects retain their own `Arc`, so installed code can
-    /// safely outlive this compiler hook.
-    #[cfg(target_arch = "aarch64")]
-    call_trampoline: Result<std::sync::Arc<arm64::CallTrampoline>, Unsupported>,
     /// Immutable host ISA used only by the profitable numeric-leaf backend.
     #[cfg(target_arch = "aarch64")]
     numeric_leaf_backend: Option<optimizing::NumericLeafBackend>,
@@ -118,16 +113,12 @@ impl OtterJitCompiler {
     fn with_policy(policy: JitTierPolicy) -> Self {
         let transitions = TransitionTable::resolve();
         #[cfg(target_arch = "aarch64")]
-        let call_trampoline = arm64::CallTrampoline::compile(&transitions).map(std::sync::Arc::new);
-        #[cfg(target_arch = "aarch64")]
         let numeric_leaf_backend = (policy == JitTierPolicy::ProductionTiered)
             .then(optimizing::NumericLeafBackend::for_host)
             .flatten();
         Self {
             policy,
             transitions,
-            #[cfg(target_arch = "aarch64")]
-            call_trampoline,
             #[cfg(target_arch = "aarch64")]
             numeric_leaf_backend,
         }
@@ -152,6 +143,7 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
         request: otter_vm::JitCompileRequest,
     ) -> Result<otter_vm::JitCompileStatus, otter_vm::JitCompileError> {
         let fid = request.snapshot.code_block.id;
+        let capture_events = request.debug.events_enabled();
         let artifact_request = request
             .debug
             .artifacts_enabled()
@@ -167,19 +159,13 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
                     }),
             });
         #[cfg(target_arch = "aarch64")]
-        let compiled = self
-            .call_trampoline
-            .as_ref()
-            .map_err(Clone::clone)
-            .and_then(|call_trampoline| {
-                template::compile_with_trampoline_artifacts(
-                    &request.snapshot,
-                    request.code_object_id,
-                    &self.transitions,
-                    std::sync::Arc::clone(call_trampoline),
-                    artifact_request,
-                )
-            });
+        let compiled = template::compile_with_artifacts(
+            &request.snapshot,
+            request.code_object_id,
+            &self.transitions,
+            artifact_request,
+            capture_events,
+        );
         #[cfg(not(target_arch = "aarch64"))]
         let compiled = {
             let _ = artifact_request;
@@ -187,6 +173,7 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
                 |code| artifact::NativeCompileOutput {
                     code,
                     artifact: None,
+                    diagnostics: Box::default(),
                 },
             )
         };
@@ -194,6 +181,7 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
             Ok(output) => Ok(otter_vm::JitCompileStatus::Compiled {
                 code: std::sync::Arc::new(output.code),
                 artifact: output.artifact,
+                diagnostics: output.diagnostics,
             }),
             Err(reason) => Ok(otter_vm::JitCompileStatus::Unsupported {
                 reason: format!("function {fid} not in template subset: {reason:?}"),
@@ -209,6 +197,7 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
             return Ok(otter_vm::JitCompileStatus::Unavailable);
         }
         let fid = request.snapshot.code_block.id;
+        let capture_events = request.debug.events_enabled();
         #[cfg(target_arch = "aarch64")]
         if template::has_emit_eligible_inline_method(&request.snapshot) {
             return Ok(otter_vm::JitCompileStatus::Unsupported {
@@ -230,21 +219,15 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
                     }),
             });
         #[cfg(target_arch = "aarch64")]
-        let compiled = self
-            .call_trampoline
-            .as_ref()
-            .map_err(Clone::clone)
-            .and_then(|call_trampoline| {
-                optimizing::compile_optimized_with_artifacts(
-                    &request.snapshot,
-                    request.code_object_id,
-                    &self.transitions,
-                    std::sync::Arc::clone(call_trampoline),
-                    self.numeric_leaf_backend.as_ref(),
-                    request.osr_pc,
-                    artifact_request,
-                )
-            });
+        let compiled = optimizing::compile_optimized_with_artifacts(
+            &request.snapshot,
+            request.code_object_id,
+            &self.transitions,
+            self.numeric_leaf_backend.as_ref(),
+            request.osr_pc,
+            artifact_request,
+            capture_events,
+        );
         #[cfg(not(target_arch = "aarch64"))]
         let compiled = {
             let _ = artifact_request;
@@ -256,12 +239,14 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
             .map(|code| artifact::NativeCompileOutput {
                 code,
                 artifact: None,
+                diagnostics: Box::default(),
             })
         };
         match compiled {
             Ok(output) => Ok(otter_vm::JitCompileStatus::Compiled {
                 code: std::sync::Arc::new(output.code),
                 artifact: output.artifact,
+                diagnostics: output.diagnostics,
             }),
             Err(reason) => Ok(otter_vm::JitCompileStatus::Unsupported {
                 reason: format!("function {fid} not in optimizing subset: {reason:?}"),

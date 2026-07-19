@@ -67,7 +67,6 @@ struct CaseResult {
 
 #[derive(Debug, Serialize)]
 struct Report {
-    schema_version: u32,
     seed: u64,
     otter: PathBuf,
     cases: Vec<CaseResult>,
@@ -199,7 +198,6 @@ fn main() {
     let passed = cases.iter().filter(|case| case.passed).count();
     let failed = cases.len() - passed;
     let report = Report {
-        schema_version: 1,
         seed: 0x004f_5454_4552,
         otter,
         cases,

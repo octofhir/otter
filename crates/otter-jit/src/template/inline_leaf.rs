@@ -1,7 +1,8 @@
-//! Backend-neutral planning for straight-line template method inlining.
+//! Backend-neutral leaf-inlining plans for straight-line template bodies.
 //!
 //! # Contents
-//! - [`InlineMethodPlan`] validates the small replay-safe numeric method subset.
+//! - [`InlineLeafPlan`] validates the small deopt-safe numeric subset shared by
+//!   plain calls and method calls.
 //! - [`InlineScratchLayout`] maps sparse callee virtual registers onto a compact
 //!   deterministic stack-slot set.
 //! - [`InlineEntryValue`] describes the exact argument, receiver, and
@@ -9,8 +10,8 @@
 //!
 //! # Invariants
 //! - Accepted bodies are straight-line, read-only, and end in exactly one final
-//!   return. An emitter may guard and replay them only before any observable
-//!   effect.
+//!   return. Every failed identity or value guard deoptimizes the original call
+//!   before any observable effect.
 //! - Liveness models every instruction as source reads followed by its
 //!   destination write. Distinct virtual registers may therefore share a slot
 //!   at that boundary only when the emitter loads every source before storing
@@ -21,8 +22,9 @@
 //! - Scratch values are not published through the active VM frame. Backends
 //!   consuming this plan must keep the inline body call-free, allocation-free,
 //!   and safepoint-free.
-//! - The receiver entry value is the boxed call receiver. Prototype holders
-//!   used by method-identity guards never replace it as the `this` value.
+//! - Method plans retain the boxed call receiver. Prototype holders used by
+//!   method-identity guards never replace it as the `this` value. Plain-call
+//!   plans reject both `LoadThis` and `LoadProperty`.
 //!
 //! # See also
 //! - [`super::TemplatePlan`] — validated typed operations analyzed here.
@@ -30,19 +32,19 @@
 
 use std::cmp::Reverse;
 
-use otter_vm::JitInlineMethod;
+use otter_vm::{JitInlineCallee, JitInlineMethod};
 
 use super::plan::TemplateInstr;
 use super::{ArithKind, TemplateOp, TemplatePlan};
 
-pub(crate) const INLINE_METHOD_MAX_REGISTERS: u16 = 24;
-pub(crate) const INLINE_METHOD_MAX_INSTRUCTIONS: usize = 48;
-pub(crate) const INLINE_METHOD_MAX_ARGUMENTS: usize = 2;
+pub(crate) const INLINE_LEAF_MAX_REGISTERS: u16 = 24;
+pub(crate) const INLINE_LEAF_MAX_INSTRUCTIONS: usize = 48;
+pub(crate) const INLINE_LEAF_MAX_ARGUMENTS: usize = 2;
 
 const INLINE_SCRATCH_SLOT_BYTES: u32 = 8;
 const INLINE_STACK_ALIGNMENT: u32 = 16;
 
-/// One compact stack slot used by an inline method body.
+/// One compact stack slot used by an inline leaf body.
 ///
 /// This type intentionally differs from the callee's virtual-register index:
 /// passing an untranslated virtual register to a scratch load/store should be
@@ -129,39 +131,74 @@ impl InlineScratchLayout {
     }
 }
 
-/// Validated straight-line method body plus its compact scratch layout.
-pub(crate) struct InlineMethodPlan<'a> {
+/// Validated straight-line leaf body plus its compact scratch layout.
+pub(crate) struct InlineLeafPlan<'a> {
     template: &'a TemplatePlan,
     scratch: InlineScratchLayout,
     has_receiver_property: bool,
 }
 
-impl<'a> InlineMethodPlan<'a> {
+impl<'a> InlineLeafPlan<'a> {
     /// Validate one baked method and derive its compact static scratch layout.
     ///
-    /// `None` means the body or call shape is outside the replay-safe inline
+    /// `None` means the body or call shape is outside the deopt-safe inline
     /// subset. The supplied [`TemplatePlan`] remains authoritative for typed
     /// operands and instruction order.
     #[must_use]
-    pub(crate) fn build(
+    pub(crate) fn build_method(
         method: &JitInlineMethod,
         template: &'a TemplatePlan,
         argc: usize,
     ) -> Option<Self> {
-        if argc != usize::from(method.param_count)
-            || argc > INLINE_METHOD_MAX_ARGUMENTS
-            || argc > usize::from(method.register_count)
-            || method.register_count > INLINE_METHOD_MAX_REGISTERS
-            || template.instructions.len() > INLINE_METHOD_MAX_INSTRUCTIONS
-            || template.register_count != method.register_count
+        Self::build_leaf(
+            method.param_count,
+            method.register_count,
+            Some(method),
+            template,
+            argc,
+        )
+    }
+
+    /// Validate one baked plain callee and derive compact static scratch.
+    ///
+    /// Plain-call plans accept the same pure numeric subset as method plans,
+    /// excluding receiver-dependent `LoadThis` and `LoadProperty`.
+    #[must_use]
+    pub(crate) fn build_callee(
+        callee: &JitInlineCallee,
+        template: &'a TemplatePlan,
+        argc: usize,
+    ) -> Option<Self> {
+        Self::build_leaf(
+            callee.param_count,
+            callee.register_count,
+            None,
+            template,
+            argc,
+        )
+    }
+
+    fn build_leaf(
+        param_count: u16,
+        register_count: u16,
+        method: Option<&JitInlineMethod>,
+        template: &'a TemplatePlan,
+        argc: usize,
+    ) -> Option<Self> {
+        if argc != usize::from(param_count)
+            || argc > INLINE_LEAF_MAX_ARGUMENTS
+            || argc > usize::from(register_count)
+            || register_count > INLINE_LEAF_MAX_REGISTERS
+            || template.instructions.len() > INLINE_LEAF_MAX_INSTRUCTIONS
+            || template.register_count != register_count
         {
             return None;
         }
 
-        let register_count = usize::from(method.register_count);
-        let receiver_node = register_count;
+        let register_count_usize = usize::from(register_count);
+        let receiver_node = register_count_usize;
         let receiver_read = node_bit(receiver_node)?;
-        let mut kinds = vec![InlineValueKind::Unknown; register_count];
+        let mut kinds = vec![InlineValueKind::Unknown; register_count_usize];
         let mut accesses = Vec::with_capacity(template.instructions.len());
         let mut has_receiver_property = false;
         let mut saw_return = false;
@@ -173,14 +210,15 @@ impl<'a> InlineMethodPlan<'a> {
             let access = match instruction.op {
                 TemplateOp::LoadImmediate { dst, .. } => {
                     write_kind(&mut kinds, dst, InlineValueKind::Unknown)?;
-                    InlineAccess::write(dst, method.register_count)?
+                    InlineAccess::write(dst, register_count)?
                 }
                 TemplateOp::Move { dst, src } => {
                     let kind = read_kind(&kinds, src)?;
                     write_kind(&mut kinds, dst, kind)?;
-                    InlineAccess::read_write(&[src], dst, method.register_count)?
+                    InlineAccess::read_write(&[src], dst, register_count)?
                 }
                 TemplateOp::LoadThis { dst } => {
+                    method?;
                     write_kind(&mut kinds, dst, InlineValueKind::Receiver)?;
                     InlineAccess {
                         reads: receiver_read,
@@ -188,6 +226,7 @@ impl<'a> InlineMethodPlan<'a> {
                     }
                 }
                 TemplateOp::LoadProperty { dst, object, .. } => {
+                    let method = method?;
                     if read_kind(&kinds, object)? != InlineValueKind::Receiver
                         || !method.prop_offsets.contains_key(&instruction.byte_pc)
                         || method.prop_shapes.contains_key(&instruction.byte_pc)
@@ -196,18 +235,18 @@ impl<'a> InlineMethodPlan<'a> {
                     }
                     write_kind(&mut kinds, dst, InlineValueKind::Unknown)?;
                     has_receiver_property = true;
-                    InlineAccess::read_write(&[object], dst, method.register_count)?
+                    InlineAccess::read_write(&[object], dst, register_count)?
                 }
                 TemplateOp::ToPrimitive { dst, src, .. } | TemplateOp::ToNumeric { dst, src } => {
                     read_kind(&kinds, src)?;
                     write_kind(&mut kinds, dst, InlineValueKind::Unknown)?;
-                    InlineAccess::read_write(&[src], dst, method.register_count)?
+                    InlineAccess::read_write(&[src], dst, register_count)?
                 }
                 TemplateOp::AddGeneric { dst, lhs, rhs, .. } => {
                     read_kind(&kinds, lhs)?;
                     read_kind(&kinds, rhs)?;
                     write_kind(&mut kinds, dst, InlineValueKind::Unknown)?;
-                    InlineAccess::read_write(&[lhs, rhs], dst, method.register_count)?
+                    InlineAccess::read_write(&[lhs, rhs], dst, register_count)?
                 }
                 TemplateOp::BinaryArith {
                     dst,
@@ -221,7 +260,7 @@ impl<'a> InlineMethodPlan<'a> {
                     read_kind(&kinds, lhs)?;
                     read_kind(&kinds, rhs)?;
                     write_kind(&mut kinds, dst, InlineValueKind::Unknown)?;
-                    InlineAccess::read_write(&[lhs, rhs], dst, method.register_count)?
+                    InlineAccess::read_write(&[lhs, rhs], dst, register_count)?
                 }
                 TemplateOp::Return { src } => {
                     read_kind(&kinds, src)?;
@@ -229,7 +268,7 @@ impl<'a> InlineMethodPlan<'a> {
                     if index + 1 != template.instructions.len() {
                         return None;
                     }
-                    InlineAccess::read(&[src], method.register_count)?
+                    InlineAccess::read(&[src], register_count)?
                 }
                 TemplateOp::ReturnUndefined => {
                     saw_return = true;
@@ -246,7 +285,7 @@ impl<'a> InlineMethodPlan<'a> {
         if !saw_return {
             return None;
         }
-        let scratch = build_scratch_layout(method.register_count, argc, &accesses)?;
+        let scratch = build_scratch_layout(register_count, argc, &accesses)?;
         Some(Self {
             template,
             scratch,
@@ -370,7 +409,7 @@ fn build_scratch_layout(
     argc: usize,
     accesses: &[InlineAccess],
 ) -> Option<InlineScratchLayout> {
-    if register_count > INLINE_METHOD_MAX_REGISTERS || argc > usize::from(register_count) {
+    if register_count > INLINE_LEAF_MAX_REGISTERS || argc > usize::from(register_count) {
         return None;
     }
     let register_count_usize = usize::from(register_count);

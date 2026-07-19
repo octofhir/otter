@@ -506,7 +506,8 @@ pub(crate) fn is_vm_owned_runtime_stub(id: RuntimeStubId) -> bool {
 ///
 /// Runtime calls use their statically typed VM/JIT entrypoints directly; this
 /// check exists only to prove that the installed compiler's transition table
-/// covers every non-VM descriptor exactly once with the declared signature.
+/// covers every active non-VM descriptor exactly once with the declared
+/// signature.
 pub(crate) fn validate_jit_runtime_stub_bindings(bindings: &[crate::jit::JitRuntimeStubBinding]) {
     let mut seen = [false; crate::native_abi::RUNTIME_STUB_DESCRIPTORS.len()];
 

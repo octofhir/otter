@@ -103,7 +103,7 @@ fn simple_script_trace_matches_golden() {
     let source = "const x = 1 + 2;\n";
     let actual = capture_typescript(source);
     assert!(
-        actual.contains("; otter step trace v1"),
+        actual.contains("; otter step trace\n"),
         "header banner missing"
     );
     assert!(actual.contains("op=ADD"), "expected ADD opcode in trace");

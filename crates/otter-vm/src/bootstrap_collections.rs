@@ -488,7 +488,7 @@ fn apply_collection_new_target_prototype(
     // identical to leaving it implicit (both resolve methods through the same
     // object) but it sets `COLLECTION_JIT_FLAG_PROTO_OVERRIDE`, which the
     // machine-code method guard reads as "not a pristine ordinary collection"
-    // and falls back to the runtime bridge. Keeping the flag clear for ordinary
+    // and falls back to the runtime semantic path. Keeping the flag clear for ordinary
     // `new Map()` / `new Set()` lets the direct VM-native method path fire.
     let canonical_override = |canonical: Option<crate::object::JsObject>| {
         if canonical.is_some() && proto.as_object() == canonical {

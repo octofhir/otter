@@ -33,7 +33,6 @@ fn dump_bytecode_json_includes_module_metadata_for_development_loop_fixture() {
     );
 
     let dump: Value = serde_json::from_slice(&output.stdout).expect("valid dump json");
-    assert_eq!(dump["otterBytecodeDumpVersion"], 1);
     assert!(
         dump["module"]
             .as_str()

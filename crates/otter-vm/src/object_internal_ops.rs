@@ -1275,11 +1275,12 @@ impl Interpreter {
             .array_index_accessor_protector_epoch
             .checked_add(1)
             .expect("array-index accessor protector epoch exhausted");
-        self.jit_code_registry.invalidate_dependents(
+        let affected = self.jit_code_registry.invalidate_dependents(
             crate::native_abi::CodeDependencyKind::Protector,
             crate::native_abi::ARRAY_INDEX_ACCESSOR_PROTECTOR_IDENTITY,
             self.array_index_accessor_protector_epoch,
         );
+        self.discard_invalidated_jit_state(&affected);
     }
 
     /// Publish one successful ordinary-object prototype mutation.
@@ -1288,11 +1289,12 @@ impl Interpreter {
             .shape_epoch
             .checked_add(1)
             .expect("ordinary-object prototype shape epoch exhausted");
-        self.jit_code_registry.invalidate_dependents(
+        let affected = self.jit_code_registry.invalidate_dependents(
             crate::native_abi::CodeDependencyKind::ShapeEpoch,
             crate::native_abi::ORDINARY_OBJECT_PROTOTYPE_SHAPE_IDENTITY,
             self.shape_epoch,
         );
+        self.discard_invalidated_jit_state(&affected);
     }
 
     pub(crate) fn define_own_property_value(

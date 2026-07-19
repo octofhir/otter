@@ -1,4 +1,4 @@
-//! Owned, versioned JIT artifact bundles.
+//! Owned JIT artifact bundles.
 //!
 //! # Contents
 //! - [`JitArtifactMetadata`] and [`JitArtifactManifest`] — stable identity and
@@ -29,9 +29,6 @@
 use serde::Serialize;
 
 use crate::jit_debug::{JitDebugRequest, JitDebugTarget, JitDebugTier};
-
-/// Wire-schema version for [`JitArtifactManifest`].
-pub const JIT_ARTIFACT_SCHEMA_VERSION: u32 = 1;
 
 /// Maximum successful compile bundles retained by one top-level capture.
 pub const JIT_ARTIFACT_BUNDLE_LIMIT: usize = 1_024;
@@ -132,12 +129,10 @@ pub struct JitArtifactMetadata {
     pub code_bytes: u64,
 }
 
-/// Versioned file inventory for one successful native compile.
+/// File inventory for one successful native compile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JitArtifactManifest {
-    #[serde(rename = "otterJitArtifactSchemaVersion")]
-    schema_version: u32,
     target: String,
     architecture: String,
     operating_system: String,
@@ -155,12 +150,6 @@ pub struct JitArtifactManifest {
 }
 
 impl JitArtifactManifest {
-    /// Artifact manifest wire-schema version.
-    #[must_use]
-    pub const fn schema_version(&self) -> u32 {
-        self.schema_version
-    }
-
     /// Stable description of the native target.
     #[must_use]
     pub fn target(&self) -> &str {
@@ -283,7 +272,7 @@ pub enum JitArtifactBuildError {
     DuplicateFile(JitArtifactFileName),
     /// Exact `code.bin` is required for every successful native compile.
     MissingCode,
-    /// A versioned bundle is missing another required compiler payload.
+    /// A bundle is missing another required compiler payload.
     MissingRequiredFile(JitArtifactFileName),
     /// `code.bin` length disagrees with the compiler's finalized mapping.
     CodeSizeMismatch {
@@ -376,7 +365,6 @@ impl JitArtifactBundle {
             total.saturating_add(file.contents.len())
         });
         let manifest = JitArtifactManifest {
-            schema_version: JIT_ARTIFACT_SCHEMA_VERSION,
             target: metadata.target,
             architecture: metadata.architecture,
             operating_system: metadata.operating_system,
@@ -399,7 +387,7 @@ impl JitArtifactBundle {
         })
     }
 
-    /// Borrow the versioned manifest.
+    /// Borrow the manifest.
     #[must_use]
     pub const fn manifest(&self) -> &JitArtifactManifest {
         &self.manifest
@@ -620,13 +608,12 @@ mod tests {
     }
 
     #[test]
-    fn manifest_is_versioned_and_inventory_is_explicit() {
+    fn manifest_inventory_is_explicit() {
         let bundle = bundle();
         let value = serde_json::to_value(bundle.manifest()).expect("serialize manifest");
         assert_eq!(
             value,
             json!({
-                "otterJitArtifactSchemaVersion": 1,
                 "target": "aarch64-macos",
                 "architecture": "aarch64",
                 "operatingSystem": "macos",

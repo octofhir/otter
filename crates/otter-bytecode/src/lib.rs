@@ -15,8 +15,7 @@
 //! - [`BytecodeModule`] — top-level container the compiler emits and
 //!   the VM consumes.
 //! - [`disasm`] — text disassembler for CLI/debug output.
-//! - [`dump`] — JSON dump for tooling and tests
-//!   (`otterBytecodeDumpVersion: 1`).
+//! - [`dump`] — JSON dump for tooling and tests.
 //! - [`opcode_schema`] — declarative opcode identity, wire-format, conservative
 //!   effects, and tier-policy metadata.
 //!

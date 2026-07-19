@@ -14,7 +14,7 @@
 //!   only. GC-bearing executable recipes never cross that boundary.
 //! - A site id maps to exactly one canonical instruction for the lifetime of
 //!   the isolate.
-//! - Direct-call linkage caches remain separate from observational feedback.
+//! - Generated-call plans remain separate from observational feedback.
 //!
 //! # See also
 //! - [`crate::feedback::FeedbackVector`]
@@ -31,51 +31,6 @@ use crate::{
 use smallvec::SmallVec;
 
 type ExecutablePropertyIc = PropertyIcEntry<crate::cache_ir::CacheStub>;
-
-/// Stable property-load recipe retained by a compiled direct-method cache.
-/// The recipe carries shape/slot identity only and reloads the callable from
-/// the current receiver on every invocation.
-#[derive(Clone)]
-pub(crate) enum MethodLoadHit {
-    Own(crate::object::AtomOwnPropertyHit),
-    DirectPrototype {
-        receiver_shape_id: crate::object::ShapeId,
-        prototype_hit: crate::object::AtomOwnPropertyHit,
-    },
-}
-
-impl MethodLoadHit {
-    #[must_use]
-    pub(crate) fn receiver_shape_id(&self) -> crate::object::ShapeId {
-        match self {
-            Self::Own(hit) => hit.shape_id,
-            Self::DirectPrototype {
-                receiver_shape_id, ..
-            } => *receiver_shape_id,
-        }
-    }
-
-    /// Re-read the current callable under the cached receiver/prototype guards.
-    pub(crate) fn reload(
-        &self,
-        recv: crate::object::JsObject,
-        heap: &otter_gc::GcHeap,
-    ) -> Option<crate::Value> {
-        match *self {
-            Self::Own(slot) => crate::object::load_plain_shaped_own_data_slot_hit(recv, heap, slot),
-            Self::DirectPrototype {
-                receiver_shape_id,
-                prototype_hit,
-            } => {
-                if crate::object::shape_id(recv, heap) != receiver_shape_id {
-                    return None;
-                }
-                let prototype = crate::object::prototype(recv, heap)?;
-                crate::object::load_plain_shaped_own_data_slot_hit(prototype, heap, prototype_hit)
-            }
-        }
-    }
-}
 
 /// Isolate-local facade mapping global executable site ids to canonical typed
 /// feedback slots and executable IC state. Atomic publication, GC-bearing
@@ -199,44 +154,6 @@ impl FeedbackDirectory {
                     .iter()
                     .any(|stub| stub.run_has(obj, heap, key).is_some())
             })
-    }
-
-    /// Resolve a load recipe suitable for a compiled direct-method cache.
-    /// Only own-data and direct-prototype data slots qualify.
-    pub(crate) fn method_load_hit(
-        &self,
-        site: usize,
-        obj: crate::object::JsObject,
-        heap: &otter_gc::GcHeap,
-        key: crate::property_atom::AtomizedPropertyKey<'_>,
-        method: crate::Value,
-    ) -> Option<MethodLoadHit> {
-        for stub in self.property_stubs(site, PropertyIcKind::Load)? {
-            if let Some(hit) = stub.own_data_hit()
-                && crate::object::load_own_data_slot_atom(obj, heap, key, hit) == Some(method)
-                && crate::object::load_plain_shaped_own_data_slot_hit(obj, heap, hit)
-                    == Some(method)
-            {
-                return Some(MethodLoadHit::Own(hit));
-            }
-            if let Some((receiver_shape_id, prototype_hit)) = stub.direct_prototype_load()
-                && crate::object::shape_id(obj, heap) == receiver_shape_id
-                && let Some(prototype) = crate::object::prototype(obj, heap)
-                && crate::object::load_own_data_slot_atom(prototype, heap, key, prototype_hit)
-                    == Some(method)
-                && crate::object::load_plain_shaped_own_data_slot_hit(
-                    prototype,
-                    heap,
-                    prototype_hit,
-                ) == Some(method)
-            {
-                return Some(MethodLoadHit::DirectPrototype {
-                    receiver_shape_id,
-                    prototype_hit,
-                });
-            }
-        }
-        None
     }
 
     /// Encode one monomorphic own-data load recipe for the WhiskerIC cell.
@@ -371,11 +288,6 @@ impl FeedbackDirectory {
     #[must_use]
     pub(crate) fn method_ic(&self, site: usize) -> Option<MethodCallIc> {
         self.method_ics.get(site).copied().flatten()
-    }
-
-    #[must_use]
-    pub(crate) fn has_method_ic(&self, site: usize) -> bool {
-        self.method_ic(site).is_some()
     }
 
     pub(crate) fn install_method_ic(&mut self, site: usize, ic: MethodCallIc) -> bool {
@@ -551,12 +463,7 @@ fn record_method_distribution(
 
 impl Interpreter {
     pub(crate) fn ensure_property_ic_capacity(&mut self, context: &ExecutionContext) {
-        let site_count = context.property_ic_site_end();
         self.feedback_directory.install_context(context);
-        if self.jit_direct_method_cache.len() < site_count {
-            self.jit_direct_method_cache
-                .resize_with(site_count, Vec::new);
-        }
     }
 
     /// Publish a stable compile/profile summary after mutating a runtime IC.

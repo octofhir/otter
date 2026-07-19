@@ -59,7 +59,6 @@ pub(crate) mod values;
 mod variadic;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_bytecode::Op;
@@ -100,16 +99,89 @@ const VALUE_FALSE_IMM: u32 = VALUE_FALSE as u32;
 const VALUE_NULL_IMM: u32 = VALUE_NULL as u32;
 const VALUE_UNDEFINED_IMM: u32 = VALUE_UNDEFINED as u32;
 
+/// Persistent machine-stack reservation held by [`emit_prologue`].
+pub(super) const NATIVE_FRAME_BYTES: u32 = 32;
+
 pub(super) fn compile(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &crate::entry::TransitionTable,
-    call_trampoline: Arc<crate::arm64::CallTrampoline>,
     artifact_request: Option<ArtifactRequest>,
+    capture_events: bool,
 ) -> Result<NativeCompileOutput<TemplateCode>, Unsupported> {
     let plan = TemplatePlan::build(view)?;
     let mut code_map = artifact_request.as_ref().map(|_| CodeMapCapture::default());
     let mut relocations = RelocationCapture::new(artifact_request.is_some());
+    let mut code_dependencies = BTreeMap::<u32, u64>::new();
+    let mut direct_call_events = capture_events.then(|| {
+        let mut events = view
+            .direct_callees
+            .iter()
+            .filter_map(|(&byte_pc, target)| {
+                let instruction = view
+                    .instructions
+                    .iter()
+                    .find(|instruction| instruction.byte_pc == byte_pc)?;
+                let instruction_pc = instruction.instruction_pc(&view.code_block);
+                Some((
+                    byte_pc,
+                    otter_vm::JitCompilerDiagnostic::DirectCallLowered {
+                        call_kind: otter_vm::JitDirectCallKind::Plain,
+                        instruction_pc,
+                        byte_pc,
+                        callee_function_id: target.plan.function_id,
+                        outcome: otter_vm::JitDirectCallLoweringOutcome::Rejected {
+                            reason: otter_vm::JitDirectCallLoweringRejectionReason::Eliminated,
+                        },
+                    },
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (&byte_pc, method) in &view.direct_methods {
+            let Some(instruction) = view
+                .instructions
+                .iter()
+                .find(|instruction| instruction.byte_pc == byte_pc)
+            else {
+                continue;
+            };
+            let instruction_pc = instruction.instruction_pc(&view.code_block);
+            events.insert(
+                byte_pc,
+                otter_vm::JitCompilerDiagnostic::DirectCallLowered {
+                    call_kind: otter_vm::JitDirectCallKind::Method,
+                    instruction_pc,
+                    byte_pc,
+                    callee_function_id: method.callee.plan.function_id,
+                    outcome: otter_vm::JitDirectCallLoweringOutcome::Rejected {
+                        reason: otter_vm::JitDirectCallLoweringRejectionReason::Eliminated,
+                    },
+                },
+            );
+        }
+        for (&byte_pc, target) in &view.static_native_calls {
+            let Some(instruction) = view
+                .instructions
+                .iter()
+                .find(|instruction| instruction.byte_pc == byte_pc)
+            else {
+                continue;
+            };
+            let instruction_pc = instruction.instruction_pc(&view.code_block);
+            events.insert(
+                byte_pc,
+                otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
+                    instruction_pc,
+                    byte_pc,
+                    target: target.kind,
+                    outcome: otter_vm::JitStaticNativeCallLoweringOutcome::Rejected {
+                        reason: otter_vm::JitStaticNativeCallLoweringRejectionReason::Eliminated,
+                    },
+                },
+            );
+        }
+        events
+    });
     let poll_entry = transitions.entry(abi::STUB_JIT_BACKEDGE_POLL);
     let code_block_id = view.code_block.id;
     // Self-patching property IC cells: allocated address-stable before any
@@ -597,22 +669,26 @@ pub(super) fn compile(
                 callee,
                 argc,
                 packed_args,
-                byte_pc: _,
+                byte_pc,
             } => {
-                let (packed_args, packed_args_tail) = plan.resolve_packed_args(argc, packed_args);
+                let argument_registers = plan.call_argument_registers(argc, packed_args);
                 calls::emit_call(
                     &mut ops,
                     &mut relocations,
                     transitions,
-                    call_trampoline.as_ref(),
+                    view,
+                    &mut code_dependencies,
+                    direct_call_events.as_mut(),
+                    code_map.as_mut(),
                     dst,
                     callee,
                     argc,
-                    packed_args,
-                    packed_args_tail,
+                    &argument_registers,
+                    instr.pc,
+                    byte_pc,
                     bail,
                     threw,
-                );
+                )?;
             }
             TemplateOp::Construct {
                 dst,
@@ -637,29 +713,27 @@ pub(super) fn compile(
             TemplateOp::MethodCall {
                 dst,
                 receiver,
-                name,
-                site,
+                name: _,
+                site: _,
                 argc,
                 packed_args,
                 byte_pc,
                 arg0,
                 arg1,
             } => {
-                let (packed_args, packed_args_tail) = plan.resolve_packed_args(argc, packed_args);
+                let argument_registers = plan.call_argument_registers(argc, packed_args);
                 calls::emit_method_call(
                     &mut ops,
                     &mut relocations,
                     transitions,
-                    call_trampoline.as_ref(),
                     view,
+                    &mut code_dependencies,
+                    direct_call_events.as_mut(),
                     code_map.as_mut(),
                     dst,
                     receiver,
-                    name,
-                    site,
                     argc,
-                    packed_args,
-                    packed_args_tail,
+                    &argument_registers,
                     instr.pc,
                     byte_pc,
                     arg0,
@@ -1346,10 +1420,16 @@ pub(super) fn compile(
     });
     let code = TemplateCode::from_emission(
         compiled_code,
-        call_trampoline,
         code_object_id,
         view.code_block.id,
         register_count,
+        code_dependencies
+            .into_iter()
+            .map(|(function_id, code_object_id)| {
+                otter_vm::native_abi::CodeDependency::code_generation(function_id, code_object_id)
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
         register_operands,
         index_operands,
         load_ic_cells,
@@ -1358,7 +1438,13 @@ pub(super) fn compile(
         osr_entries,
         osr_only,
     );
-    Ok(NativeCompileOutput { code, artifact })
+    Ok(NativeCompileOutput {
+        code,
+        artifact,
+        diagnostics: direct_call_events
+            .map(|events| events.into_values().collect::<Vec<_>>().into_boxed_slice())
+            .unwrap_or_default(),
+    })
 }
 
 /// Emit the function prologue: save fp/lr + callee-saved bases, then set

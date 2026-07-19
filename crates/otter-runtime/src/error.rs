@@ -3,19 +3,18 @@
 //! [`OtterError`] is the **only** error type the public API
 //! surfaces. It is `#[non_exhaustive]`, derives
 //! [`thiserror::Error`] + [`serde::Serialize`] /
-//! [`serde::Deserialize`], and serializes to a stable JSON wire
+//! [`serde::Deserialize`], and serializes to the current JSON wire
 //! format.
 //!
 //! # Contents
 //! - [`OtterError`] — top-level error enum.
 //! - [`ConfigError`] — companion enum for `OtterError::Config`.
 //! - [`IoErrorKind`] — small mapped subset of [`std::io::ErrorKind`].
-//! - [`error_schema_version`] — pinned `1` for the foundation phase.
 //! - [`OtterError::to_json`] — convenience for CLI `--json` output.
 //!
 //! # Invariants
-//! - Renaming or removing serialized fields requires an
-//!   `error_schema_version` bump.
+//! - Format changes update every producer, consumer, fixture, and document in
+//!   the same patch.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -24,12 +23,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::Diagnostic;
-
-/// Current JSON wire format version for [`OtterError`].
-#[must_use]
-pub const fn error_schema_version() -> u32 {
-    1
-}
 
 /// Public error enum.
 #[derive(Debug, Clone, Error, Serialize, Deserialize)]
@@ -146,10 +139,7 @@ impl OtterError {
     /// the variants can fail under normal conditions; the result is
     /// `Result` so callers can propagate cleanly).
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
-        let envelope = ErrorEnvelope {
-            error_schema_version: error_schema_version(),
-            error: self,
-        };
+        let envelope = ErrorEnvelope { error: self };
         serde_json::to_string(&envelope)
     }
 
@@ -158,10 +148,7 @@ impl OtterError {
     /// # Errors
     /// See [`Self::to_json`].
     pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
-        let envelope = ErrorEnvelope {
-            error_schema_version: error_schema_version(),
-            error: self,
-        };
+        let envelope = ErrorEnvelope { error: self };
         let mut s = serde_json::to_string_pretty(&envelope)?;
         s.push('\n');
         Ok(s)
@@ -193,7 +180,6 @@ impl From<otter_gc::OutOfMemory> for OtterError {
 
 #[derive(Debug, Serialize)]
 struct ErrorEnvelope<'a> {
-    error_schema_version: u32,
     error: &'a OtterError,
 }
 
@@ -276,13 +262,11 @@ mod tests {
         };
         let json = err.to_json().unwrap();
         let de: ErrorEnvelopeOwned = serde_json::from_str(&json).unwrap();
-        assert_eq!(de.error_schema_version, 1);
         assert!(matches!(de.error, OtterError::Config { .. }));
     }
 
     #[derive(Debug, Deserialize)]
     struct ErrorEnvelopeOwned {
-        error_schema_version: u32,
         error: OtterError,
     }
 

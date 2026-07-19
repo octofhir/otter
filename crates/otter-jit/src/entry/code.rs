@@ -50,7 +50,7 @@ pub(crate) unsafe fn enter_compiled(
     {
         let stack = activation.stack_ptr().cast::<ActivationStack>();
         let vm = activation.vm_ptr().cast::<Interpreter>();
-        // This is the remaining interpreter-to-native entry adapter. It reads
+        // This interpreter-to-native entry boundary reads
         // the materialized activation once through the tier-neutral API; the
         // resulting NativeFrame is the sole machine-visible state thereafter.
         let (regs, self_value, this_value, upvalue_base, upvalue_count) = {
@@ -81,6 +81,12 @@ pub(crate) unsafe fn enter_compiled(
         let gc_heap = unsafe { (*vm).jit_gc_heap_ptr() };
         let interrupt_flag = unsafe { (*vm).jit_interrupt_flag_ptr() };
         let backedge_fuel = unsafe { (*vm).jit_backedge_fuel_ptr() };
+        let global_this_offset = unsafe { (*vm).jit_global_this_offset_addr() };
+        let sync_reentry_depth = unsafe { (*vm).jit_sync_reentry_depth_addr() };
+        let sync_reentry_limit = unsafe { (*vm).jit_sync_reentry_limit() };
+        let native_stack_bytes = unsafe { (*vm).jit_native_stack_bytes_addr() };
+        let native_stack_bytes_limit = unsafe { (*vm).jit_native_stack_bytes_limit() };
+        let generated_call_depth = unsafe { (*vm).jit_generated_call_depth_addr() };
         let flags = if has_safepoints {
             NativeFrameFlags::from_bits(NativeFrameFlags::HAS_SAFEPOINTS)
         } else {
@@ -117,10 +123,17 @@ pub(crate) unsafe fn enter_compiled(
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::addr_of_mut!(native_frame),
             error: &mut error,
-            direct_call: std::mem::MaybeUninit::uninit(),
             activation_base: activation_base.cast(),
             activation_top_ptr,
             activation_limit,
+            global_this_offset,
+            sync_reentry_depth,
+            sync_reentry_limit,
+            native_stack_bytes,
+            native_stack_bytes_limit,
+            generated_call_depth,
+            generated_calls: 0,
+            generated_call_deopts: 0,
         };
         // SAFETY: the mapping is live and `entry` was emitted with the
         // `JitEntry` ABI.
@@ -131,6 +144,10 @@ pub(crate) unsafe fn enter_compiled(
         }
         let ret = entry(&mut ctx);
         let _ = jit_pop_native_activation_stub(&mut ctx);
+        unsafe {
+            (*vm).jit_note_generated_calls(ctx.generated_calls, ctx.generated_call_deopts);
+            (*vm).jit_reconcile_generated_feedback(&*activation.context_ptr());
+        }
         match ret.status {
             STATUS_RETURNED => JitExecOutcome::Returned(Value::from_bits(ret.value)),
             STATUS_BAILED => JitExecOutcome::Bailed(native_frame.header.pc),

@@ -13,6 +13,9 @@
 //!   contiguous AArch64 `MOVZ` followed by zero to three `MOVK` instructions.
 //! - Captured targets contain semantic identities only. Raw target addresses
 //!   never enter this module's state or either rendered artifact.
+//! - Exact relocation JSON may name an isolate-local target code generation.
+//!   Portable normalized code excludes that generation id while retaining the
+//!   target function, tier, and complete stack-layout contract.
 //! - The normalized stream collapses every variable-length materialization to
 //!   one logical item. Direct branch destinations are encoded as logical-item
 //!   ordinals, so address-dependent MOV-wide lengths cannot perturb them.
@@ -27,9 +30,11 @@ use std::fmt;
 use otter_vm::native_abi::{RuntimeStubDescriptor, RuntimeStubSignature, runtime_stub_name};
 use serde::Serialize;
 
-const RELOCATION_SCHEMA_VERSION: u32 = 1;
+use super::{
+    DirectCallArtifact, DirectCallKindArtifact, DirectCallThisModeArtifact, DirectCallTierArtifact,
+};
+
 const NORMALIZED_MAGIC: &[u8; 8] = b"OTJNCODE";
-const NORMALIZED_VERSION: u16 = 1;
 const NORMALIZED_ARCH_AARCH64: u16 = 1;
 
 const ITEM_RAW_INSTRUCTION: u8 = 0;
@@ -37,13 +42,14 @@ const ITEM_RELOCATION: u8 = 1;
 const ITEM_DIRECT_BRANCH: u8 = 2;
 
 const TARGET_RUNTIME_STUB: u8 = 1;
-const TARGET_CALL_TRAMPOLINE: u8 = 2;
-const TARGET_GC_CAGE_BASE: u8 = 3;
-const TARGET_PROPERTY_IC_CELL: u8 = 4;
-const TARGET_TEMPLATE_OPERAND_SLICE: u8 = 5;
-const TARGET_OPTIMIZED_MATH_ARGUMENTS: u8 = 6;
-const TARGET_COLLECTION_HEAP_REFERENCE: u8 = 7;
-const TARGET_COLLECTION_BUILTIN_FUNCTION: u8 = 8;
+const TARGET_GC_CAGE_BASE: u8 = 2;
+const TARGET_PROPERTY_IC_CELL: u8 = 3;
+const TARGET_TEMPLATE_OPERAND_SLICE: u8 = 4;
+const TARGET_OPTIMIZED_MATH_ARGUMENTS: u8 = 5;
+const TARGET_COLLECTION_HEAP_REFERENCE: u8 = 6;
+const TARGET_COLLECTION_BUILTIN_FUNCTION: u8 = 7;
+const TARGET_DIRECT_CALL_ENTRY_CELL: u8 = 8;
+const TARGET_STATIC_NATIVE_BUILTIN_FUNCTION: u8 = 9;
 
 /// Whether a property inline-cache cell serves a load or a store site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -68,9 +74,7 @@ pub(crate) enum TemplateOperandRole {
     ClosureParents,
     NewArrayElements,
     MathArguments,
-    CallArguments,
     ConstructArguments,
-    MethodArguments,
 }
 
 /// Address-stable heap component used by a collection fast path.
@@ -95,14 +99,17 @@ pub(crate) enum CollectionFeedbackKind {
 /// compiler/runtime concepts and are length-framed in the normalized binary,
 /// making their encoding deterministic and unambiguous.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub(crate) enum RelocationTarget {
     RuntimeStub {
         id: u32,
         name: &'static str,
         signature: &'static str,
     },
-    CallTrampoline,
     GcCageBase,
     PropertyIcCell {
         access: PropertyIcAccess,
@@ -129,6 +136,21 @@ pub(crate) enum RelocationTarget {
         feedback_kind: CollectionFeedbackKind,
         byte_pc: u32,
         runtime_stub_id: u32,
+    },
+    /// Exact bootstrap function identity guarded by an ordinary-call native
+    /// leaf. The process address is deliberately absent.
+    StaticNativeBuiltinFunction {
+        target: otter_vm::JitStaticNativeCallKind,
+        byte_pc: u32,
+    },
+    /// Stable registry cell guarded by one generated direct-call site.
+    ///
+    /// The process address is intentionally absent. Exact JSON retains the
+    /// target generation id; normalized code omits that id and retains the
+    /// portable target/layout contract.
+    DirectCallEntryCell {
+        byte_pc: u32,
+        direct_call: DirectCallArtifact,
     },
 }
 
@@ -719,15 +741,12 @@ fn render_json(relocations: &[ValidatedRelocation]) -> String {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct Document<'a> {
-        #[serde(rename = "otterJitRelocationSchemaVersion")]
-        schema_version: u32,
         offset_basis: &'static str,
         address_encoding: &'static str,
         relocations: &'a [ValidatedRelocation],
     }
 
     let document = Document {
-        schema_version: RELOCATION_SCHEMA_VERSION,
         offset_basis: "code.bin",
         address_encoding: "symbolicOnly",
         relocations,
@@ -752,9 +771,8 @@ fn render_normalized(
             LogicalItem::Relocation { index } => relocations[*index].start(),
         });
     }
-    let mut output = Vec::with_capacity(16 + items.len() * 8);
+    let mut output = Vec::with_capacity(14 + items.len() * 8);
     output.extend_from_slice(NORMALIZED_MAGIC);
-    put_u16(&mut output, NORMALIZED_VERSION);
     put_u16(&mut output, NORMALIZED_ARCH_AARCH64);
     put_u32(&mut output, item_count);
 
@@ -974,7 +992,6 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             put_text(output, "runtimeStub.name", name)?;
             put_text(output, "runtimeStub.signature", signature)?;
         }
-        RelocationTarget::CallTrampoline => output.push(TARGET_CALL_TRAMPOLINE),
         RelocationTarget::GcCageBase => output.push(TARGET_GC_CAGE_BASE),
         RelocationTarget::PropertyIcCell { access, ordinal } => {
             output.push(TARGET_PROPERTY_IC_CELL);
@@ -999,9 +1016,7 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
                 TemplateOperandRole::ClosureParents => 0,
                 TemplateOperandRole::NewArrayElements => 1,
                 TemplateOperandRole::MathArguments => 2,
-                TemplateOperandRole::CallArguments => 3,
-                TemplateOperandRole::ConstructArguments => 4,
-                TemplateOperandRole::MethodArguments => 5,
+                TemplateOperandRole::ConstructArguments => 3,
             });
             put_u32(output, *start);
             put_u32(output, *len);
@@ -1046,6 +1061,36 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             });
             put_u32(output, *byte_pc);
             put_u32(output, *runtime_stub_id);
+        }
+        RelocationTarget::StaticNativeBuiltinFunction { target, byte_pc } => {
+            output.push(TARGET_STATIC_NATIVE_BUILTIN_FUNCTION);
+            put_u32(output, *target as u32);
+            put_u32(output, *byte_pc);
+        }
+        RelocationTarget::DirectCallEntryCell {
+            byte_pc,
+            direct_call,
+        } => {
+            output.push(TARGET_DIRECT_CALL_ENTRY_CELL);
+            put_u32(output, direct_call.target_function_id);
+            put_u32(output, *byte_pc);
+            output.push(match direct_call.call_kind {
+                DirectCallKindArtifact::Plain => 0,
+                DirectCallKindArtifact::Method => 1,
+            });
+            output.push(match direct_call.target_tier {
+                DirectCallTierArtifact::Template => 0,
+                DirectCallTierArtifact::Optimizing => 1,
+            });
+            output.push(match direct_call.this_mode {
+                DirectCallThisModeArtifact::StrictOrLexical => 0,
+                DirectCallThisModeArtifact::SloppyGlobal => 1,
+                DirectCallThisModeArtifact::MethodReceiver => 2,
+            });
+            put_u32(output, direct_call.callee_native_frame_bytes);
+            put_u32(output, direct_call.linkage_bytes);
+            put_u32(output, direct_call.reserved_stack_bytes);
+            put_u16(output, direct_call.callee_register_count);
         }
     }
     Ok(())
@@ -1095,6 +1140,27 @@ mod tests {
 
     fn runtime_stub() -> RelocationTarget {
         RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_JIT_BACKEDGE_POLL)
+    }
+
+    fn direct_call_target(
+        target_code_object_id: u64,
+        target_tier: DirectCallTierArtifact,
+        this_mode: DirectCallThisModeArtifact,
+    ) -> RelocationTarget {
+        RelocationTarget::DirectCallEntryCell {
+            byte_pc: 13,
+            direct_call: DirectCallArtifact {
+                call_kind: DirectCallKindArtifact::Plain,
+                target_function_id: 12,
+                target_code_object_id,
+                target_tier,
+                this_mode,
+                callee_native_frame_bytes: 160,
+                linkage_bytes: 112,
+                reserved_stack_bytes: 272,
+                callee_register_count: 6,
+            },
+        }
     }
 
     fn instructions(words: &[u32]) -> Vec<u8> {
@@ -1193,10 +1259,9 @@ mod tests {
         let code = instructions(&[movz(3, 0xdead, 0, true), NOP, movz(5, 0xbeef, 0, true)]);
         let mut capture = RelocationCapture::new(true);
         capture.record_mov_wide(8, 12, 5, RelocationTarget::GcCageBase);
-        capture.record_mov_wide(0, 4, 3, RelocationTarget::CallTrampoline);
+        capture.record_mov_wide(0, 4, 3, runtime_stub());
         let rendered = capture.render(&code).unwrap();
         let document: Value = serde_json::from_str(&rendered.json).unwrap();
-        assert_eq!(document["otterJitRelocationSchemaVersion"], 1);
         assert_eq!(document["offsetBasis"], "code.bin");
         assert_eq!(document["addressEncoding"], "symbolicOnly");
         assert_eq!(document["relocations"][0]["startOffset"], 0);
@@ -1215,11 +1280,11 @@ mod tests {
     fn record_order_does_not_change_artifacts() {
         let code = instructions(&[movz(3, 1, 0, true), NOP, movz(5, 2, 0, true)]);
         let mut forward = RelocationCapture::new(true);
-        forward.record_mov_wide(0, 4, 3, RelocationTarget::CallTrampoline);
+        forward.record_mov_wide(0, 4, 3, runtime_stub());
         forward.record_mov_wide(8, 12, 5, RelocationTarget::GcCageBase);
         let mut reverse = RelocationCapture::new(true);
         reverse.record_mov_wide(8, 12, 5, RelocationTarget::GcCageBase);
-        reverse.record_mov_wide(0, 4, 3, RelocationTarget::CallTrampoline);
+        reverse.record_mov_wide(0, 4, 3, runtime_stub());
         assert_eq!(forward.render(&code), reverse.render(&code));
     }
 
@@ -1237,6 +1302,10 @@ mod tests {
         let document: Value = serde_json::from_str(&rendered.json).unwrap();
         assert_eq!(document["relocations"].as_array().unwrap().len(), 0);
         assert!(rendered.normalized_code.starts_with(NORMALIZED_MAGIC));
+        assert_eq!(
+            &rendered.normalized_code[NORMALIZED_MAGIC.len()..NORMALIZED_MAGIC.len() + 2],
+            &NORMALIZED_ARCH_AARCH64.to_le_bytes()
+        );
         assert!(rendered.normalized_code.ends_with(&NOP.to_le_bytes()));
     }
 
@@ -1293,9 +1362,9 @@ mod tests {
             movk(16, 0xdddd, 48, true),
         ]);
         let mut short_capture = RelocationCapture::new(true);
-        short_capture.record_mov_wide(short_start, short_end, 16, RelocationTarget::CallTrampoline);
+        short_capture.record_mov_wide(short_start, short_end, 16, RelocationTarget::GcCageBase);
         let mut long_capture = RelocationCapture::new(true);
-        long_capture.record_mov_wide(long_start, long_end, 16, RelocationTarget::CallTrampoline);
+        long_capture.record_mov_wide(long_start, long_end, 16, RelocationTarget::GcCageBase);
 
         assert_eq!(
             short_capture.render(&short_code).unwrap().normalized_code,
@@ -1312,7 +1381,6 @@ mod tests {
                 name: "one",
                 signature: "poll1",
             },
-            RelocationTarget::CallTrampoline,
             RelocationTarget::GcCageBase,
             RelocationTarget::PropertyIcCell {
                 access: PropertyIcAccess::Load,
@@ -1320,7 +1388,7 @@ mod tests {
             },
             RelocationTarget::TemplateOperandSlice {
                 arena: TemplateOperandArena::Registers,
-                role: TemplateOperandRole::CallArguments,
+                role: TemplateOperandRole::ConstructArguments,
                 start: 3,
                 len: 4,
             },
@@ -1340,12 +1408,21 @@ mod tests {
                 byte_pc: 10,
                 runtime_stub_id: 11,
             },
+            RelocationTarget::StaticNativeBuiltinFunction {
+                target: otter_vm::JitStaticNativeCallKind::MathAbs,
+                byte_pc: 12,
+            },
+            direct_call_target(
+                29,
+                DirectCallTierArtifact::Optimizing,
+                DirectCallThisModeArtifact::SloppyGlobal,
+            ),
         ];
         let normalized: BTreeSet<_> = targets
             .into_iter()
             .map(|target| render_single(&code, 4, target).normalized_code)
             .collect();
-        assert_eq!(normalized.len(), 8);
+        assert_eq!(normalized.len(), 9);
 
         let first = render_single(
             &code,
@@ -1367,6 +1444,66 @@ mod tests {
         );
         assert_ne!(first.normalized_code, second.normalized_code);
         assert!(first.normalized_code.starts_with(NORMALIZED_MAGIC));
+    }
+
+    #[test]
+    fn direct_call_exact_generation_is_not_portable_normalized_identity() {
+        let code = instructions(&[movz(16, 0x1234, 0, true)]);
+        let first = render_single(
+            &code,
+            4,
+            direct_call_target(
+                29,
+                DirectCallTierArtifact::Optimizing,
+                DirectCallThisModeArtifact::SloppyGlobal,
+            ),
+        );
+        let second = render_single(
+            &code,
+            4,
+            direct_call_target(
+                30,
+                DirectCallTierArtifact::Optimizing,
+                DirectCallThisModeArtifact::SloppyGlobal,
+            ),
+        );
+        assert_eq!(first.normalized_code, second.normalized_code);
+        assert_ne!(first.json, second.json);
+
+        let document: Value = serde_json::from_str(&first.json).unwrap();
+        let target = &document["relocations"][0]["target"];
+        assert_eq!(target["kind"], "directCallEntryCell");
+        assert_eq!(target["bytePc"], 13);
+        assert_eq!(target["directCall"]["targetFunctionId"], 12);
+        assert_eq!(target["directCall"]["targetCodeObjectId"], 29);
+        assert_eq!(target["directCall"]["targetTier"], "optimizing");
+        assert_eq!(target["directCall"]["thisMode"], "sloppyGlobal");
+        assert_eq!(target["directCall"]["calleeNativeFrameBytes"], 160);
+        assert_eq!(target["directCall"]["linkageBytes"], 112);
+        assert_eq!(target["directCall"]["reservedStackBytes"], 272);
+        assert_eq!(target["directCall"]["calleeRegisterCount"], 6);
+
+        let template = render_single(
+            &code,
+            4,
+            direct_call_target(
+                29,
+                DirectCallTierArtifact::Template,
+                DirectCallThisModeArtifact::SloppyGlobal,
+            ),
+        );
+        assert_ne!(first.normalized_code, template.normalized_code);
+
+        let strict_or_lexical = render_single(
+            &code,
+            4,
+            direct_call_target(
+                29,
+                DirectCallTierArtifact::Optimizing,
+                DirectCallThisModeArtifact::StrictOrLexical,
+            ),
+        );
+        assert_ne!(first.normalized_code, strict_or_lexical.normalized_code);
     }
 
     #[test]
@@ -1476,7 +1613,7 @@ mod tests {
     fn rejects_overlap_before_decoding_ranges() {
         let code = instructions(&[movz(16, 1, 0, true), movk(16, 2, 16, true)]);
         let mut capture = RelocationCapture::new(true);
-        capture.record_mov_wide(0, 8, 16, RelocationTarget::CallTrampoline);
+        capture.record_mov_wide(0, 8, 16, runtime_stub());
         capture.record_mov_wide(4, 8, 16, RelocationTarget::GcCageBase);
         assert_eq!(
             capture.render(&code).unwrap_err(),

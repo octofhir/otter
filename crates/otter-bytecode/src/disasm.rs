@@ -28,7 +28,7 @@ pub fn disassemble(module: &BytecodeModule) -> String {
     };
     let _ = writeln!(
         out,
-        "; otter bytecode dump v1 — module={} source_kind={}",
+        "; otter bytecode dump — module={} source_kind={}",
         module.module, kind
     );
     for f in &module.functions {
@@ -107,7 +107,7 @@ mod tests {
             module_inits: Vec::new(),
         };
         let text = disassemble(&module);
-        assert!(text.contains("; otter bytecode dump v1"));
+        assert!(text.contains("; otter bytecode dump —"));
         assert!(text.contains("RETURN  r0"));
     }
 

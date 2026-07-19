@@ -31,9 +31,9 @@ otter --dump-bytecode=json path/to/script.ts
 The text dump starts with:
 
 ```text
-; otter bytecode dump v1 - module=<specifier> source_kind=<javascript|typescript>
+; otter bytecode dump — module=<specifier> source_kind=<javascript|typescript>
 ```
 
-The JSON dump is intended for tools and tests. Keep it stable when possible; when
-the schema must change, update tests, docs, and any downstream consumers in the
-same patch.
+The JSON dump is intended for tools and tests. It has one current shape: change
+the format in place and update tests, docs, and downstream consumers in the same
+patch.

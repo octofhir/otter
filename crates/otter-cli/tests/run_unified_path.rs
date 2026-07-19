@@ -163,7 +163,6 @@ fn failing_run_script_emits_stable_json_diagnostic() {
     );
     let envelope: Value =
         serde_json::from_slice(&output.stderr).expect("stderr is JSON diagnostic envelope");
-    assert_eq!(envelope["error_schema_version"], 1);
     assert_eq!(envelope["error"]["kind"], "runtime");
     assert_eq!(envelope["error"]["diagnostic"]["code"], "UNCAUGHT");
 }

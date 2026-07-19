@@ -3,8 +3,8 @@
 //! # Contents
 //! - [`FrameMap`] and [`SpillMap`] index immutable code-object side tables.
 //! - [`SafepointEntry`] maps a native return PC to logical state and a stub id.
-//! - [`SafepointRecord`] is the VM-owned expanded root map used during the
-//!   current baseline migration.
+//! - [`SafepointRecord`] is the VM-owned expanded root map consumed by current
+//!   native frames.
 //!
 //! # Invariants
 //! - Machine code publishes only `(code_object_id, safepoint_id)`; it never

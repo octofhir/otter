@@ -99,7 +99,7 @@ fn prototype_override_is(override_value: Option<Value>, expected: crate::object:
 }
 
 mod ic;
-mod jit_bridge;
+mod jit_snapshot;
 pub(crate) use ic::{
     ArrayMethodCallIc, CollectionFastOp, CollectionFastTarget, CollectionMethodCallIc, MethodCallIc,
 };
@@ -394,7 +394,7 @@ impl Interpreter {
     /// TypeError at the right slot and user `@@toPrimitive` / `valueOf`
     /// fire), and string operands run `ToPrimitive(String)`. Shared by
     /// the primitive-string fast path in `do_call_method_value` and the
-    /// `.call` / property bridge so both invocation styles coerce
+    /// ordinary property-call path so both invocation styles coerce
     /// identically. A `RegExp` argument to `match` / `matchAll` /
     /// `search` / `normalize` passes through unchanged for its
     /// `@@`-method.
@@ -606,7 +606,7 @@ impl Interpreter {
         }
         // Ordinary Map/Set whose realm prototype slot is the untouched builtin —
         // dispatch the collection primitive directly, skipping both the
-        // method-resolution walk and the native call bridge.
+        // method-resolution walk and generic native-call machinery.
         if let Some(result) = self.try_fast_collection_proto_method(
             method_site,
             recv_value,
@@ -954,11 +954,11 @@ impl Interpreter {
         // the interpreter to invoke the callback. The intrinsic
         // table can't run callbacks (it lacks an
         // `ExecutionContext`), so intercept here before the table
-        // lookup and route through the dedicated bridge.
+        // lookup and run the callback-capable semantic implementation.
         //
         // Wrapper objects (`new String("…")`) also reach this arm —
         // unwrap their `[[StringData]]` so the receiver flows in as
-        // a primitive string for the callable-replace bridge.
+        // a primitive string for the callback-capable implementation.
         let string_recv: Option<Value> = if recv_value.is_string() {
             Some(recv_value)
         } else if let Some(obj) = recv_value.as_object() {
@@ -988,7 +988,7 @@ impl Interpreter {
             // §22.1.3.18 step 7 — `searchString = ? ToString(searchValue)`.
             // Coerce non-String searchValues (null, undefined, numbers,
             // objects with `toString`) before handing the args to the
-            // callable-replace bridge.
+            // callback-capable implementation.
             let mut coerced_args = arg_values.clone();
             let needs_coerce = !coerced_args.first().is_some_and(|v| v.is_string());
             if needs_coerce {
@@ -1280,8 +1280,8 @@ impl Interpreter {
 
     /// Fast `arr.method(args)` dispatch for an ordinary dense array whose
     /// `%Array.prototype%` slot for `method` is still the original builtin,
-    /// skipping the per-call `[[Get]]` method-resolution walk and the native
-    /// call bridge entirely.
+    /// skipping the per-call `[[Get]]` method-resolution walk and generic
+    /// native-call machinery entirely.
     ///
     /// Returns `None` (caller falls back to the full path) unless every
     /// condition that makes the direct dispatch observably identical holds:
@@ -1452,7 +1452,7 @@ impl Interpreter {
     /// ordinary Map/Set whose realm prototype slot still holds the original
     /// builtin — skipping the per-call method-resolution walk
     /// (`get_method_value_for_call` → `ordinary_get_value` → constructor →
-    /// prototype) **and** the native call bridge (`invoke` →
+    /// prototype) **and** generic native-call machinery (`invoke` →
     /// `invoke_native_call_with_roots` → `NativeCtx`) entirely, calling the
     /// `collections::*` primitive straight through.
     ///
@@ -1923,11 +1923,10 @@ impl Interpreter {
         }
     }
 
-    /// Stage-4 `GetMethod` bridge for the slow `CallMethodValue`
-    /// fallback. Builtin fast arms still live above this helper; this
-    /// routine centralizes the ordinary property/getter path so the call
-    /// opcode can be collapsed behind one `GetMethod + Call` boundary in
-    /// smaller, reviewable steps.
+    /// Canonical `GetMethod` operation for the slow `CallMethodValue`
+    /// path. Builtin fast arms live above this helper; this routine owns the
+    /// ordinary property/getter semantics behind one `GetMethod + Call`
+    /// boundary.
     pub(crate) fn get_method_value_for_call(
         &mut self,
         context: &ExecutionContext,

@@ -125,7 +125,7 @@ fn run(selection: JitSelection) -> (String, u64, u64, u64, u64) {
         stats.jit_compile_attempts,
         stats.jit_osr_attempts,
         stats.jit_reentrant_stub_transitions,
-        stats.jit_direct_calls,
+        stats.jit_generated_calls,
     )
 }
 

@@ -98,7 +98,7 @@ use serde::{Deserialize, Serialize};
 
 pub use compiled_program::CompiledProgram;
 pub use diagnostics::{Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticKind, StackFrame};
-pub use error::{ConfigError, IoErrorKind, OtterError, error_schema_version};
+pub use error::{ConfigError, IoErrorKind, OtterError};
 pub use event_loop::RuntimeLiveness;
 pub use handle::{RuntimeActivityStats, RuntimeHandle};
 pub use hooks::{
@@ -115,10 +115,10 @@ pub use otter_gc;
 pub use otter_vm::CpuProfile;
 pub use otter_vm::{
     AccessorSpec, Attr, ConstSpec, ConstValue, ConstructorSpec, JIT_ARTIFACT_BUNDLE_LIMIT,
-    JIT_ARTIFACT_BYTE_LIMIT, JIT_ARTIFACT_SCHEMA_VERSION, JIT_DEBUG_EVENT_LIMIT, JitArtifactBatch,
-    JitArtifactBundle, JitArtifactFile, JitArtifactFileName, JitArtifactManifest,
-    JitDebugCompileOutcome, JitDebugEvent, JitDebugReport, JitDebugRequest, JitDebugTarget,
-    JitDebugTier, JitInlineRejectionReason, JsObject, JsSurfaceError, MethodSpec, NativeCall,
+    JIT_ARTIFACT_BYTE_LIMIT, JIT_DEBUG_EVENT_LIMIT, JitArtifactBatch, JitArtifactBundle,
+    JitArtifactFile, JitArtifactFileName, JitArtifactManifest, JitDebugCompileOutcome,
+    JitDebugEvent, JitDebugReport, JitDebugRequest, JitDebugTarget, JitDebugTier,
+    JitDirectCallKind, JitInlineRejectionReason, JsObject, JsSurfaceError, MethodSpec, NativeCall,
     ObjectBuilder, Value, array, bootstrap, intrinsic_install, object, rooting,
 };
 // Unrenamed re-exports consumed by `#[js_class]`- and `couch!`-generated
@@ -802,12 +802,28 @@ pub struct RuntimeExecutionStats {
     pub max_turn_allocated_bytes: u64,
     /// Longest observed root turn, in nanoseconds.
     pub max_turn_nanos: u64,
-    /// Compiled `Op::Call` bridge invocations.
+    /// Compiled closure-inline validation transitions.
     pub jit_runtime_calls: u64,
-    /// Compiled-to-compiled fast-call hits.
-    pub jit_direct_calls: u64,
-    /// Compiled calls that fell back to the Rust callable path.
-    pub jit_rust_call_fallbacks: u64,
+    /// Compiler-generated stack-frame calls that entered native callee code.
+    pub jit_generated_calls: u64,
+    /// Compiler-generated calls resumed through cold callee deoptimization.
+    pub jit_generated_call_deopts: u64,
+    /// Generated template-tier callee entries.
+    pub jit_generated_template_entries: u64,
+    /// Generated template-tier callees that returned normally.
+    pub jit_generated_template_returns: u64,
+    /// Generated template-tier callees that cold-deoptimized.
+    pub jit_generated_template_deopts: u64,
+    /// Generated template-tier callees that propagated a throw.
+    pub jit_generated_template_throws: u64,
+    /// Generated optimizing-tier callee entries.
+    pub jit_generated_optimizing_entries: u64,
+    /// Generated optimizing-tier callees that returned normally.
+    pub jit_generated_optimizing_returns: u64,
+    /// Generated optimizing-tier callees that cold-deoptimized.
+    pub jit_generated_optimizing_deopts: u64,
+    /// Generated optimizing-tier callees that propagated a throw.
+    pub jit_generated_optimizing_throws: u64,
     /// Optimizing-tier function and OSR entries.
     pub jit_optimized_entries: u64,
     /// Optimizing-tier entries materialized at a hot loop header.
@@ -820,14 +836,6 @@ pub struct RuntimeExecutionStats {
     pub jit_osr_attempts: u64,
     /// JIT property/method/element/global/upvalue runtime stub calls.
     pub jit_runtime_property_stubs: u64,
-    /// JIT method-call runtime stub calls.
-    pub jit_runtime_method_stubs: u64,
-    /// JIT method-call runtime stubs reached from baseline dynasm.
-    pub jit_runtime_method_baseline_stubs: u64,
-    /// JIT method-call runtime stubs reached from optimizing dynasm.
-    pub jit_runtime_method_optimizing_stubs: u64,
-    /// Narrow collection-IC method bridge calls from compiled code.
-    pub jit_runtime_collection_method_ic_stubs: u64,
     /// ABI-classified runtime stub transitions from compiled code.
     pub jit_runtime_stub_transitions: u64,
     /// ABI-classified leaf runtime stubs.
@@ -844,18 +852,6 @@ pub struct RuntimeExecutionStats {
     pub jit_alloc_value_stub_out_of_memory: u64,
     /// Executed `AllocValueStub` entries that returned another non-`Ok` status.
     pub jit_alloc_value_stub_other: u64,
-    /// JIT method bridge calls served by a live collection method IC.
-    pub jit_method_collection_ic_hits: u64,
-    /// JIT method bridge calls served by collection prototype fast paths.
-    pub jit_method_fast_collection_hits: u64,
-    /// JIT method bridge calls served by array fast paths.
-    pub jit_method_array_fast_hits: u64,
-    /// JIT method bridge calls served by primitive string fast paths.
-    pub jit_method_string_fast_hits: u64,
-    /// JIT method bridge calls served by primitive number fast paths.
-    pub jit_method_number_fast_hits: u64,
-    /// JIT method bridge calls that reached generic callable dispatch.
-    pub jit_method_generic_calls: u64,
     /// VM-published collection method IC mirror slots.
     pub jit_collection_method_ic_slots: u64,
     /// Empty collection method IC mirror slots.
@@ -1963,9 +1959,8 @@ impl Runtime {
         let module_loader = RuntimeModuleLoaderState::new(config.loader.clone());
         let package_manager =
             RuntimePackageManagerHandle::from_loader_config(config.loader.as_ref());
-        // The interpreter owns the per-isolate GC heap (since
-        // task 76); both the string heap and the GC heap honour
-        // the configured cap.
+        // The interpreter owns both per-isolate heaps; the string and GC
+        // allocators honor the configured cap.
         let mut interp = Interpreter::with_string_heap_cap(config.max_heap_bytes);
         interp.set_max_stack_depth(config.max_stack_depth);
         interp.set_allow_blocking_atomics_wait(config.allow_blocking_atomics_wait);
@@ -3175,13 +3170,9 @@ impl Runtime {
 
     /// Configured heap cap in bytes (`0` = disabled).
     ///
-    /// The cap is **load-bearing** as of task 73:
-    /// allocations against the [`otter_gc::GcHeap`] and string
-    /// allocations against the interpreter's string heap that
-    /// would overshoot the cap surface as
-    /// [`OtterError::OutOfMemory`]. Per-type GC migrations
-    /// (tasks 76–83) progressively widen the set of script
-    /// allocations subject to the cap.
+    /// Allocations against the [`otter_gc::GcHeap`] and string allocations
+    /// against the interpreter's string heap that would overshoot the cap
+    /// surface as [`OtterError::OutOfMemory`].
     #[must_use]
     pub fn max_heap_bytes(&self) -> u64 {
         self.config.max_heap_bytes
@@ -3193,10 +3184,7 @@ impl Runtime {
     /// Takes `&mut self` because the aggregate `live_objects` /
     /// `live_bytes` fields are derived lazily from the per-tag
     /// rows (the alloc fast path only updates the per-tag
-    /// counters, see [`otter_gc::GcHeap::gc_stats`]). Per-type
-    /// GC migrations (tasks 76–83) widen the surface populated
-    /// under `by_type` — Phase 1 only sees host-side
-    /// allocations through [`Self::gc_heap_mut`].
+    /// counters, see [`otter_gc::GcHeap::gc_stats`]).
     pub fn heap_stats(&mut self) -> &GcStats {
         self.interp.gc_heap_mut().gc_stats()
     }
@@ -3259,18 +3247,22 @@ impl Runtime {
             max_turn_allocated_bytes: budget.max_turn_allocated_bytes,
             max_turn_nanos: budget.max_turn_nanos,
             jit_runtime_calls: jit.runtime_calls,
-            jit_direct_calls: jit.direct_calls,
-            jit_rust_call_fallbacks: jit.rust_call_fallbacks,
+            jit_generated_calls: jit.generated_calls,
+            jit_generated_call_deopts: jit.generated_call_deopts,
+            jit_generated_template_entries: jit.generated_template_entries,
+            jit_generated_template_returns: jit.generated_template_returns,
+            jit_generated_template_deopts: jit.generated_template_deopts,
+            jit_generated_template_throws: jit.generated_template_throws,
+            jit_generated_optimizing_entries: jit.generated_optimizing_entries,
+            jit_generated_optimizing_returns: jit.generated_optimizing_returns,
+            jit_generated_optimizing_deopts: jit.generated_optimizing_deopts,
+            jit_generated_optimizing_throws: jit.generated_optimizing_throws,
             jit_optimized_entries: jit.optimized_entries,
             jit_optimized_osr_entries: jit.optimized_osr_entries,
             jit_optimized_deopts: jit.optimized_deopts,
             jit_compile_attempts: jit.compile_attempts,
             jit_osr_attempts: jit.osr_attempts,
             jit_runtime_property_stubs: jit.runtime_property_stubs,
-            jit_runtime_method_stubs: jit.runtime_method_stubs,
-            jit_runtime_method_baseline_stubs: jit.runtime_method_baseline_stubs,
-            jit_runtime_method_optimizing_stubs: jit.runtime_method_optimizing_stubs,
-            jit_runtime_collection_method_ic_stubs: jit.runtime_collection_method_ic_stubs,
             jit_runtime_stub_transitions: jit.runtime_stub_transitions,
             jit_leaf_stub_transitions: jit.leaf_stub_transitions,
             jit_alloc_stub_transitions: jit.alloc_stub_transitions,
@@ -3279,12 +3271,6 @@ impl Runtime {
             jit_alloc_value_stub_miss: jit.alloc_value_stub_miss,
             jit_alloc_value_stub_out_of_memory: jit.alloc_value_stub_out_of_memory,
             jit_alloc_value_stub_other: jit.alloc_value_stub_other,
-            jit_method_collection_ic_hits: jit.method_collection_ic_hits,
-            jit_method_fast_collection_hits: jit.method_fast_collection_hits,
-            jit_method_array_fast_hits: jit.method_array_fast_hits,
-            jit_method_string_fast_hits: jit.method_string_fast_hits,
-            jit_method_number_fast_hits: jit.method_number_fast_hits,
-            jit_method_generic_calls: jit.method_generic_calls,
             jit_collection_method_ic_slots: collection_method_ics.slots,
             jit_collection_method_ic_empty_slots: collection_method_ics.empty_slots,
             jit_collection_method_ic_collection_slots: collection_method_ics.collection_slots,
@@ -3312,6 +3298,16 @@ impl Runtime {
     #[must_use]
     pub fn jit_code_residency(&self) -> otter_vm::JitCodeResidency {
         self.interp.jit_code_residency()
+    }
+
+    /// Snapshot every JIT code generation retained by this isolate.
+    ///
+    /// The owned result includes installed/invalid executable metadata and
+    /// retired entry-cell tombstones. Calling it is explicit and does not add
+    /// ordinary execution-path accounting.
+    #[must_use]
+    pub fn jit_code_generation_snapshot(&self) -> Vec<otter_vm::JitCodeGenerationSnapshot> {
+        self.interp.jit_code_generation_snapshot()
     }
 
     fn attach_execution_stats(&mut self, result: ExecutionResult) -> ExecutionResult {
@@ -3440,7 +3436,7 @@ impl Runtime {
     ///
     /// The walker delegates to
     /// [`otter_vm::runtime_state::RuntimeState::trace_roots`]
-    /// (task 75) via [`otter_vm::Interpreter::force_gc`], which
+    /// via [`otter_vm::Interpreter::force_gc`], which
     /// owns the heap and does the split-borrow internally.
     pub fn force_gc(&mut self) -> Result<(), OtterError> {
         self.interp.force_gc().map_err(Into::into)
@@ -6376,13 +6372,12 @@ mod tests {
     }
 
     #[test]
-    fn json_error_carries_schema_version() {
+    fn json_error_carries_error_payload() {
         let err = OtterError::SourceKind {
             path: PathBuf::from("nope.foo"),
             extension: "foo".to_string(),
         };
         let json = err.to_json().unwrap();
-        assert!(json.contains("\"error_schema_version\":1"));
         assert!(json.contains("\"kind\":\"source_kind\""));
     }
 }

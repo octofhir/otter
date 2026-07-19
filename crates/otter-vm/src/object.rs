@@ -2042,31 +2042,6 @@ pub(crate) fn load_own_data_slot_atom(
     })
 }
 
-/// Load a cached shaped own data slot when the caller does not need dictionary,
-/// exotic, mapped-arguments, or attribute-overridden cases.
-#[must_use]
-pub(crate) fn load_plain_shaped_own_data_slot_hit(
-    obj: JsObject,
-    heap: &otter_gc::GcHeap,
-    hit: AtomOwnPropertyHit,
-) -> Option<Value> {
-    heap.read_payload(obj, |body| {
-        if body.shape.is_null()
-            || body.shape != hit.shape
-            || !hit.is_data
-            || body.slot_attrs_overridden
-            || body.exotic.is_some()
-        {
-            return None;
-        }
-        let offset = hit.slot as usize;
-        if offset >= body_property_count(heap, body) {
-            return None;
-        }
-        Some(body.data_value(heap, offset))
-    })
-}
-
 /// Store through a cached own data slot after validating shape and atom guards.
 ///
 /// Returns `Some(())` only when the write was completed. `None` means the

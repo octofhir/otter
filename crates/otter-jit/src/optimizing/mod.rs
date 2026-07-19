@@ -51,11 +51,9 @@ use std::collections::BTreeMap;
 use otter_vm::{
     JitCompileSnapshot, JitExecOutcome, JitFunctionCode, VmRuntimeActivation,
     deopt::DeoptTable,
-    native_abi::{CodeObjectMetadata, FrameMap, SafepointRecord},
+    native_abi::{CodeDependency, CodeObjectMetadata, FrameMap, SafepointRecord},
 };
 
-#[cfg(target_arch = "aarch64")]
-use crate::arm64::CallTrampoline;
 use crate::{
     CompiledCode, Unsupported,
     entry::{TransitionTable, enter_compiled},
@@ -95,16 +93,17 @@ pub struct OptimizedMetadata {
 /// Finalized optimizing code and its exact-PC deoptimization metadata.
 pub struct OptimizedCode {
     code: CompiledCode,
-    /// Shared executable call lifecycle whose address is baked into this code.
-    /// Installed optimized code can outlive the compiler hook.
-    #[cfg(target_arch = "aarch64")]
-    _call_trampoline: std::sync::Arc<CallTrampoline>,
+    /// Exact persistent native-stack reservation for generated entry, or
+    /// `None` when this backend has not proven stack-owned cold deoptimization.
+    generated_stack_frame_bytes: Option<u32>,
     deopt_table: DeoptTable,
     safepoint_records: Box<[SafepointRecord]>,
     frame_maps: Box<[FrameMap]>,
     frame_map_bitmap_words: Box<[u64]>,
     /// Loop-header logical PC → assembler offset of its OSR trampoline.
     osr_entries: BTreeMap<u32, usize>,
+    /// Exact installed callee generations entered by emitted direct edges.
+    dependencies: Box<[CodeDependency]>,
     /// Per-`MathCall`-site argument window registers. The emitted calls carry
     /// interior pointers into these boxed slices, so they must live exactly as
     /// long as the code.
@@ -123,12 +122,13 @@ impl OptimizedCode {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         code: CompiledCode,
-        #[cfg(target_arch = "aarch64")] call_trampoline: std::sync::Arc<CallTrampoline>,
+        generated_stack_frame_bytes: Option<u32>,
         deopt_table: DeoptTable,
         safepoint_records: Box<[SafepointRecord]>,
         frame_maps: Box<[FrameMap]>,
         frame_map_bitmap_words: Box<[u64]>,
         osr_entries: BTreeMap<u32, usize>,
+        dependencies: Box<[CodeDependency]>,
         math_call_arguments: BTreeMap<u32, Box<[u16]>>,
         load_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
         store_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
@@ -142,17 +142,17 @@ impl OptimizedCode {
             safepoint_count: safepoint_records.len() as u32,
             frame_map_count: frame_maps.len() as u32,
             spill_map_count: 0,
-            dependency_count: 0,
+            dependency_count: dependencies.len() as u32,
         };
         Self {
             code,
-            #[cfg(target_arch = "aarch64")]
-            _call_trampoline: call_trampoline,
+            generated_stack_frame_bytes,
             deopt_table,
             safepoint_records,
             frame_maps,
             frame_map_bitmap_words,
             osr_entries,
+            dependencies,
             _math_call_arguments: math_call_arguments,
             _load_ic_cells: load_ic_cells,
             _store_ic_cells: store_ic_cells,
@@ -204,6 +204,10 @@ impl std::fmt::Debug for OptimizedCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OptimizedCode")
             .field("code_len", &self.code.len())
+            .field(
+                "generated_stack_frame_bytes",
+                &self.generated_stack_frame_bytes,
+            )
             .field("deopt_points", &self.deopt_table.len())
             .field("safepoints", &self.safepoint_records.len())
             .field("frame_maps", &self.frame_maps.len())
@@ -221,6 +225,14 @@ impl JitFunctionCode for OptimizedCode {
 
     fn native_frame_kind(&self) -> otter_vm::native_abi::NativeFrameKind {
         otter_vm::native_abi::NativeFrameKind::Optimizing
+    }
+
+    fn generated_stack_frame_bytes(&self) -> Option<u32> {
+        self.generated_stack_frame_bytes
+    }
+
+    fn dependencies(&self) -> &[CodeDependency] {
+        &self.dependencies
     }
 
     fn code_len(&self) -> usize {
@@ -298,16 +310,15 @@ pub fn compile_optimized(
     code_object_id: u64,
 ) -> Result<OptimizedCode, Unsupported> {
     let transitions = TransitionTable::resolve();
-    let call_trampoline = std::sync::Arc::new(CallTrampoline::compile(&transitions)?);
     let numeric_leaf = NumericLeafBackend::for_host();
     compile_optimized_with_artifacts(
         view,
         code_object_id,
         &transitions,
-        call_trampoline,
         numeric_leaf.as_ref(),
         None,
         None,
+        false,
     )
     .map(|output| output.code)
 }
@@ -317,28 +328,23 @@ pub(crate) fn compile_optimized_with_artifacts(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &TransitionTable,
-    call_trampoline: std::sync::Arc<CallTrampoline>,
     numeric_leaf: Option<&NumericLeafBackend>,
     osr_pc: Option<u32>,
     artifact_request: Option<crate::artifact::ArtifactRequest>,
+    capture_events: bool,
 ) -> Result<crate::artifact::NativeCompileOutput<OptimizedCode>, Unsupported> {
     if let Some(numeric_leaf) = numeric_leaf
-        && let Some(output) = numeric_leaf.try_compile(
-            view,
-            code_object_id,
-            std::sync::Arc::clone(&call_trampoline),
-            osr_pc,
-            artifact_request.clone(),
-        )?
+        && let Some(output) =
+            numeric_leaf.try_compile(view, code_object_id, osr_pc, artifact_request.clone())?
     {
         return Ok(output);
     }
-    arm64::compile_with_trampoline_artifacts(
+    arm64::compile_with_artifacts(
         view,
         code_object_id,
         transitions,
-        call_trampoline,
         artifact_request,
+        capture_events,
     )
 }
 

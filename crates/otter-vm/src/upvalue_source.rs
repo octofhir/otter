@@ -16,8 +16,7 @@
 //!
 //! # See also
 //! - [`crate::closure::ClosureCallHeader`] publishes the stable closure spine.
-//! - [`crate::native_call_owners`] owns borrowed or allocated native-call
-//!   spines until return, abort, or cold materialization.
+//! - [`crate::native_abi::NativeFrame`] publishes the active upvalue window.
 
 use std::ptr::NonNull;
 
@@ -80,13 +79,6 @@ impl UpvalueSource {
         self.len as usize
     }
 
-    /// ABI-sized cell count.
-    #[inline]
-    #[must_use]
-    pub(crate) const fn len_u32(self) -> u32 {
-        self.len
-    }
-
     /// Whether the source is empty.
     #[inline]
     #[must_use]
@@ -94,7 +86,8 @@ impl UpvalueSource {
         self.len == 0
     }
 
-    /// Native ABI base, null for an empty source.
+    /// Stable base pointer, null for an empty source.
+    #[cfg(test)]
     #[inline]
     #[must_use]
     pub(crate) const fn base_ptr_or_null(self) -> *mut UpvalueCell {

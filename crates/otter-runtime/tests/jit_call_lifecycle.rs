@@ -4,27 +4,27 @@
 //! - Alternating closure instances from one function literal through one
 //!   compiled plain-call site.
 //! - Polymorphic receiver shapes and method identities through one compiled
-//!   method-call site.
+//!   caller's semantic fallback.
 //! - A monomorphic production-tier method site whose guarded splice removes
 //!   the compiled-call boundary entirely.
 //! - A prototype-held method whose inline body reads an own receiver property.
 //! - An inline method whose hoisted local observes function-entry `undefined`.
 //! - Compact scratch reuse across two arguments, assigned locals, and an
 //!   overlapping parameter-assignment snapshot.
-//! - Guarded numeric method splicing plus replay through the ordinary method
-//!   bridge after receiver, callee, bound-state, or late operand guards miss.
-//! - Direct callees that allocate their own captured cells while retaining the
-//!   current receiver across moving-GC safepoints.
+//! - Guarded numeric method splicing plus exact pre-effect side exits after
+//!   receiver, callee, bound-state, or late operand guards miss.
+//! - Callees that allocate their own captured cells while retaining the current
+//!   receiver across moving-GC safepoints.
 //! - Frameless direct callees that mint distinct capture-free function values.
-//! - Recursive compiled calls that catch or propagate throws before the same
-//!   runtime successfully enters another compiled call.
+//! - Recursive calls that catch or propagate throws before the same runtime
+//!   successfully enters an independent compiler-generated native call.
 //!
 //! # Invariants
 //! - A resolved compiled target never retains closure-owned capture state;
 //!   SELF and upvalues are selected from the current callee on every call.
 //! - Method dispatch selects both the current function and current receiver;
 //!   neither method identity nor `this` leaks between polymorphic calls.
-//! - A production-tier inline candidate bypasses the prepared-call lifecycle
+//! - A production-tier inline candidate eliminates the generated call boundary
 //!   while preserving the same result as the interpreter.
 //! - A template-spliced method body runs only for the exact baked receiver and
 //!   method identity; every rejected guard preserves full method-call semantics.
@@ -32,8 +32,8 @@
 //!   local that the accepted inline body can read before writing.
 //! - Compact slots never alias simultaneously live values; parameter
 //!   reassignment cannot overwrite an earlier expression snapshot.
-//! - Upvalue-spine construction roots inherited cells and dynamic call state
-//!   until the new frame is published.
+//! - Cold upvalue-spine construction roots inherited cells and dynamic call
+//!   state until the new frame is published.
 //! - Capture-free function construction uses the published SELF/register
 //!   window and never requires a materialized interpreter frame.
 //! - Return, caught-throw, and escaping-throw completion release every nested
@@ -52,7 +52,7 @@ struct RunResult {
     compile_attempts: u64,
     osr_attempts: u64,
     reentrant_transitions: u64,
-    direct_calls: u64,
+    generated_calls: u64,
 }
 
 struct SplitRunResult {
@@ -78,7 +78,7 @@ fn run(source: &str, name: &str, selection: JitSelection) -> RunResult {
         compile_attempts: stats.jit_compile_attempts,
         osr_attempts: stats.jit_osr_attempts,
         reentrant_transitions: stats.jit_reentrant_stub_transitions,
-        direct_calls: stats.jit_direct_calls,
+        generated_calls: stats.jit_generated_calls,
     }
 }
 
@@ -135,15 +135,18 @@ fn assert_inline_method_probe(
             compiled.runtime_stub_delta, 0,
             "{name} must complete through the spliced method body"
         );
-    } else {
-        assert!(
-            compiled.runtime_stub_delta > 0,
-            "{name} must replay through the ordinary method bridge"
-        );
     }
 }
 
 fn assert_whole_function_direct_calls(result: &RunResult) {
+    assert_whole_function_compiled(result);
+    assert!(
+        result.generated_calls > 0,
+        "fixture must cross a native compiled-call boundary"
+    );
+}
+
+fn assert_whole_function_compiled(result: &RunResult) {
     assert!(
         result.compile_attempts > 0,
         "fixture must compile whole-function entries"
@@ -151,10 +154,6 @@ fn assert_whole_function_direct_calls(result: &RunResult) {
     assert_eq!(
         result.osr_attempts, 0,
         "fixture must not tier through loop OSR"
-    );
-    assert!(
-        result.direct_calls > 0,
-        "fixture must cross a compiled direct-call boundary"
     );
 }
 
@@ -266,7 +265,7 @@ fn polymorphic_method_site_keeps_current_method_and_this() {
         compiled.completion,
         "[100,7,498,797,104,35,494,793,108,63,490,789]"
     );
-    assert_whole_function_direct_calls(&compiled);
+    assert_whole_function_compiled(&compiled);
 }
 
 const OPTIMIZING_METHOD_CACHE: &str = r#"
@@ -308,8 +307,8 @@ fn production_method_inline_eliminates_compiled_call_boundary() {
     assert!(compiled.compile_attempts > 0, "fixture must compile");
     assert_eq!(compiled.osr_attempts, 0, "fixture must not use loop OSR");
     assert_eq!(
-        compiled.direct_calls, 0,
-        "spliced method calls must bypass the prepared-call trampoline"
+        compiled.generated_calls, 0,
+        "spliced method calls must eliminate the generated call boundary"
     );
 }
 
@@ -332,7 +331,7 @@ globalThis.__jitInlineMethodFixture = (() => {
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn numeric_method_inline_hit_avoids_method_bridge() {
+fn numeric_method_inline_hit_avoids_runtime_transition() {
     assert_inline_method_probe(
         INLINE_METHOD_SETUP,
         r#"
@@ -492,8 +491,8 @@ JSON.stringify([
     );
 }
 
-const LATE_REPLAY_INLINE_METHOD_SETUP: &str = r#"
-globalThis.__jitLateReplayInlineMethodFixture = (() => {
+const LATE_DEOPT_INLINE_METHOD_SETUP: &str = r#"
+globalThis.__jitLateDeoptInlineMethodFixture = (() => {
   function apply(value, suffix) {
     const numeric = value + this.bias;
     return numeric + suffix;
@@ -512,11 +511,11 @@ globalThis.__jitLateReplayInlineMethodFixture = (() => {
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn method_inline_replays_after_late_guard_overwrites_scratch() {
+fn method_inline_side_exits_after_late_guard_overwrites_scratch() {
     assert_inline_method_probe(
-        LATE_REPLAY_INLINE_METHOD_SETUP,
+        LATE_DEOPT_INLINE_METHOD_SETUP,
         r#"
-const fixture = globalThis.__jitLateReplayInlineMethodFixture;
+const fixture = globalThis.__jitLateDeoptInlineMethodFixture;
 JSON.stringify(fixture.callMethod(fixture.receiver, 3, "!"));
 "#,
         "jit-inline-late-operand-miss",
@@ -527,7 +526,7 @@ JSON.stringify(fixture.callMethod(fixture.receiver, 3, "!"));
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn numeric_method_inline_replays_after_receiver_shape_change() {
+fn numeric_method_inline_side_exits_after_receiver_shape_change() {
     assert_inline_method_probe(
         INLINE_METHOD_SETUP,
         r#"
@@ -543,7 +542,7 @@ JSON.stringify(fixture.callMethod(fixture.receiver, 11));
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn numeric_method_inline_replays_after_method_replacement() {
+fn numeric_method_inline_side_exits_after_method_replacement() {
     assert_inline_method_probe(
         INLINE_METHOD_SETUP,
         r#"
@@ -577,7 +576,7 @@ JSON.stringify(fixture.callMethod(fixture.receiver, 6));
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn numeric_method_inline_replays_nonnumeric_operands() {
+fn numeric_method_inline_side_exits_nonnumeric_operands() {
     assert_inline_method_probe(
         INLINE_METHOD_SETUP,
         r#"
@@ -619,7 +618,7 @@ JSON.stringify([checksum, trace]);
 "#;
 
 #[test]
-fn direct_frame_build_roots_receiver_and_new_upvalue_cells() {
+fn own_upvalue_fallback_roots_receiver_and_new_cells() {
     let oracle = run(
         UPVALUE_FRAME_BUILD,
         "jit-call-upvalue-frame-build.js",
@@ -636,7 +635,7 @@ fn direct_frame_build_roots_receiver_and_new_upvalue_cells() {
         compiled.completion,
         "[72768,[10,1001,12,1003,14,1005,16,1007]]"
     );
-    assert_whole_function_direct_calls(&compiled);
+    assert_whole_function_compiled(&compiled);
 }
 
 const FRAMELESS_MAKE_FUNCTION: &str = r#"
@@ -713,8 +712,13 @@ function letEscape(depth, state) {
   return recursive(depth, 2, state);
 }
 
+function stableAdd(value) {
+  if (value < 0) return value - 1;
+  return value + 1;
+}
+
 function succeed(depth, state) {
-  return recursive(depth, 0, state);
+  return stableAdd(depth);
 }
 
 const warm = { entries: 0, throws: 0, caught: 0 };
@@ -726,6 +730,7 @@ for (let i = 0; i < 96; i++) {
     // The fixture intentionally lets the throw escape every compiled frame.
   }
 }
+for (let i = 0; i < 96; i++) stableAdd(i);
 for (let i = 0; i < 96; i++) succeed(9, warm);
 
 const state = { entries: 0, throws: 0, caught: 0, escaped: 0 };
@@ -769,7 +774,7 @@ fn recursive_throw_cleanup_leaves_compiled_state_reusable() {
     );
 
     assert_eq!(compiled.completion, oracle.completion);
-    assert_eq!(compiled.completion, "[128128,256,1280,3456,256,128,128]");
+    assert_eq!(compiled.completion, "[128128,256,1280,2176,256,128,128]");
     assert_whole_function_direct_calls(&compiled);
     assert!(
         compiled.reentrant_transitions > 0,

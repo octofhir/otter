@@ -1,8 +1,8 @@
 //! Shared AArch64 emission primitives used by every native JIT tier.
 //!
 //! # Contents
-//! - [`CallTrampoline`] — the owned compiled-to-compiled call lifecycle.
-//! - [`emit_prepared_call`] — the tier-neutral call-site bridge.
+//! - [`emit_direct_call`] — compiler-generated monomorphic plain-call linkage.
+//! - Guarded static-native leaves for extracted builtins.
 //!
 //! # Invariants
 //! - Common emitters depend only on the crate-wide entry ABI and VM runtime
@@ -20,6 +20,16 @@
 // conversion is intentionally redundant.
 #![allow(clippy::useless_conversion)]
 
-mod calls;
+mod direct_call;
+mod method_guard;
+mod static_native;
 
-pub(crate) use calls::{CallTrampoline, emit_prepared_call};
+pub(crate) use direct_call::{
+    DirectCallForm, DirectCallSite, direct_call_artifact, emit_direct_call,
+    target_is_supported as direct_call_target_is_supported,
+};
+pub(crate) use method_guard::{MethodGuardSite, emit_method_guard};
+pub(crate) use static_native::{
+    StaticNativeCallSite, emit_static_native_call,
+    target_is_supported as static_native_target_is_supported,
+};

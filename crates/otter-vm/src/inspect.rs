@@ -11,8 +11,6 @@
 //! - [`StepEvent`] — per-instruction event payload.
 //! - [`format_event`] / [`format_header`] — canonical text writers.
 //! - [`WriterTracer`] — flushes one line per event to a `Write` sink.
-//! - [`TRACE_FORMAT_VERSION`] — banner emitted ahead of every trace
-//!   stream; bumped on incompatible format changes.
 //!
 //! # Invariants
 //! - Mnemonics come from [`otter_bytecode::Op::mnemonic`]; renaming an
@@ -50,10 +48,6 @@ use std::io::Write;
 use otter_bytecode::{Op, Operand};
 
 use crate::{Value, executable::OperandView};
-
-/// Canonical version banner. Bump on any format change that breaks
-/// existing golden traces.
-pub const TRACE_FORMAT_VERSION: &str = "otter step trace v1";
 
 /// Per-instruction trace payload. Borrowed from the dispatch loop;
 /// implementations must not retain references past
@@ -146,8 +140,7 @@ impl<W: Write> StepTracer for WriterTracer<W> {
 
 /// Write the canonical banner.
 pub fn format_header(out: &mut String) {
-    out.push_str("; ");
-    out.push_str(TRACE_FORMAT_VERSION);
+    out.push_str("; otter step trace");
 }
 
 /// Append the canonical text form of one [`StepEvent`].
@@ -672,7 +665,7 @@ impl HeapSnapshotSummary {
         let mut out = String::with_capacity(64 + self.buckets.len() * 32);
         let _ = writeln!(
             out,
-            "; otter heap snapshot summary v1 — objects={} total_bytes={}",
+            "; otter heap snapshot summary — objects={} total_bytes={}",
             self.object_count, self.total_bytes,
         );
         let _ = writeln!(out, "  type_tag  object_count  bytes");
@@ -712,10 +705,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn header_text_is_versioned() {
+    fn header_text_is_canonical() {
         let mut out = String::new();
         format_header(&mut out);
-        assert_eq!(out, "; otter step trace v1");
+        assert_eq!(out, "; otter step trace");
     }
 
     #[test]
@@ -761,7 +754,7 @@ mod tests {
         }
         let text = String::from_utf8(buf).expect("utf-8");
         let mut lines = text.lines();
-        assert_eq!(lines.next(), Some("; otter step trace v1"));
+        assert_eq!(lines.next(), Some("; otter step trace"));
         assert_eq!(
             lines.next(),
             Some("frame=1 fn=<main> pc=000000 op=LOAD_INT32  r0 i32:7")

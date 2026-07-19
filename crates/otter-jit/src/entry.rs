@@ -12,7 +12,8 @@
 //! - [`lowering`] — [`BaselinePlan`] typed instruction stream over bytecode.
 //! - [`runtime_ops`] — typed C ABI runtime transition entries.
 //! - [`code`] — [`enter_compiled`], the shared activation-to-entry invocation.
-//! - [`runtime_stub_bindings`] — the complete JIT-owned transition inventory.
+//! - [`runtime_stub_bindings`] — the complete active JIT-owned transition
+//!   inventory.
 //! - [`TransitionTable`] — hook-lifetime descriptor-id-indexed resolution of
 //!   that inventory for O(1) compile-time address baking.
 //!
@@ -24,9 +25,9 @@
 //! - Interpreter-visible registers remain in the published frame window at
 //!   every side exit and allocating/reentrant call; no movable JS pointer is
 //!   kept only in a machine register across a safepoint.
-//! - Runtime entries install through validated descriptor bindings; no slot
-//!   may stay vacant with a hook present, so the emitted and audited stub
-//!   sets cannot drift.
+//! - Runtime entries install through validated descriptor bindings; every
+//!   active JIT-owned slot is filled, so emitted and audited stub sets cannot
+//!   drift.
 //!
 //! # See also
 //! - [`crate::template`] — the baseline compiler consuming this module.
@@ -43,6 +44,7 @@ pub(crate) use code::enter_compiled;
 pub use lowering::{BackendFailure, Unsupported};
 pub(crate) use lowering::{
     BaselinePlan, MAX_METHOD_ARGS, decode_packed_arg_regs, pack_method_arg_regs, reg_offset,
+    unpack_method_arg_regs,
 };
 use runtime_ops::*;
 pub(crate) use runtime_ops::{IC_WAYS, WhiskerIcCell, jit_backedge_poll_stub};
@@ -61,8 +63,8 @@ pub(crate) const OBJECT_BODY_TYPE_TAG: u32 = 0x11;
 /// the descriptor's signature family, so a compile bakes addresses through
 /// one O(1) lookup instead of re-resolving the binding inventory.
 pub struct TransitionTable {
-    /// `(entry_addr, signature)` indexed by `descriptor.id - 1`; VM-owned
-    /// slots (resolved through their own compile-time accessors) stay vacant.
+    /// `(entry_addr, signature)` indexed by `descriptor.id - 1`; VM-owned and
+    /// statically typed slots stay vacant.
     entries: Box<[(u64, Option<otter_vm::native_abi::RuntimeStubSignature>)]>,
 }
 
@@ -73,7 +75,7 @@ impl Default for TransitionTable {
 }
 
 impl TransitionTable {
-    /// Resolve and validate the complete JIT-owned binding inventory.
+    /// Resolve and validate the complete active JIT-owned binding inventory.
     #[must_use]
     pub fn resolve() -> Self {
         let descriptors = otter_vm::native_abi::RUNTIME_STUB_DESCRIPTORS;
@@ -157,8 +159,8 @@ impl TransitionTable {
 /// JIT-owned runtime transitions installed into the isolate entry table at
 /// compiler-hook install. Each binding names its VM descriptor id and
 /// signature family; the VM validates the pairing before installation and
-/// rejects an installation that leaves any inventory slot vacant, so this
-/// table is the complete machine inventory of transition entries.
+/// rejects an installation that leaves any active inventory slot vacant, so
+/// this table is the complete machine inventory of callable transition entries.
 pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
     use otter_vm::native_abi as abi;
     let binding = |descriptor: abi::RuntimeStubDescriptor,
@@ -198,16 +200,8 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_define_own_property_stub as *const () as usize,
         ),
         binding(
-            abi::STUB_JIT_COLLECTION_METHOD_IC,
-            jit_call_collection_method_ic_stub as *const () as usize,
-        ),
-        binding(
-            abi::STUB_JIT_FINISH_DIRECT_CALL_BAILED,
-            jit_finish_direct_call_bailed_stub as *const () as usize,
-        ),
-        binding(
-            abi::STUB_JIT_DEOPT_MATERIALIZE_SELF_CALL,
-            jit_deopt_materialize_self_call_stub as *const () as usize,
+            abi::STUB_JIT_DEOPT_STACK_CALL,
+            jit_deopt_stack_call_stub as *const () as usize,
         ),
         binding(
             abi::STUB_JIT_LOAD_PROPERTY,
@@ -250,28 +244,12 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_fresh_upvalue_stub as *const () as usize,
         ),
         binding(
-            abi::STUB_JIT_PREPARE_DIRECT_CALL,
-            jit_prepare_direct_call_stub as *const () as usize,
-        ),
-        binding(
-            abi::STUB_JIT_PREPARE_DIRECT_METHOD_CALL,
-            jit_prepare_direct_method_call_stub as *const () as usize,
-        ),
-        binding(
             abi::STUB_JIT_PUSH_NATIVE_ACTIVATION,
             jit_push_native_activation_stub as *const () as usize,
         ),
         binding(
             abi::STUB_JIT_POP_NATIVE_ACTIVATION,
             jit_pop_native_activation_stub as *const () as usize,
-        ),
-        binding(
-            abi::STUB_JIT_ABORT_DIRECT_CALL,
-            jit_abort_direct_call_stub as *const () as usize,
-        ),
-        binding(
-            abi::STUB_JIT_FINISH_DIRECT_CALL_RETURNED,
-            jit_finish_direct_call_returned_stub as *const () as usize,
         ),
         binding(
             abi::STUB_JIT_LOAD_UPVALUE,
@@ -300,14 +278,6 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
         binding(
             abi::STUB_JIT_MATH_RANDOM,
             otter_jit_math_random as *const () as usize,
-        ),
-        binding(
-            abi::STUB_JIT_CALL_METHOD_GENERIC,
-            jit_call_method_generic_stub as *const () as usize,
-        ),
-        binding(
-            abi::STUB_JIT_CALL_GENERIC,
-            jit_call_generic_stub as *const () as usize,
         ),
         binding(
             abi::STUB_JIT_LOOSE_EQ,
@@ -450,7 +420,7 @@ mod tests {
             assert_eq!(descriptor.signature, binding.signature);
             assert_ne!(binding.entry_addr, 0);
         }
-        // Exactly the JIT-owned slots (everything the VM phase leaves vacant).
+        // Exactly the active JIT-owned slots.
         let jit_owned = RUNTIME_STUB_DESCRIPTORS
             .iter()
             .filter(|descriptor| {

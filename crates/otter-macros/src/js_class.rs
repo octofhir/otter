@@ -1,6 +1,6 @@
 //! `#[js_class]` attribute macro — declarative host-class generator.
 //!
-//! The v2 class declaration form: an ordinary `impl` block whose
+//! The current class declaration form: an ordinary `impl` block whose
 //! signatures are the descriptor. Parameter types declare argument
 //! extraction (`FromJs`), return types declare result construction
 //! (`IntoJs`), receivers declare brand checks, and marker attributes

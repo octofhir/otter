@@ -240,7 +240,7 @@ pub fn couch(input: TokenStream) -> TokenStream {
     couch::expand(input)
 }
 
-/// Declarative host-class generator — the v2 class declaration form.
+/// Declarative host-class generator — the current class declaration form.
 ///
 /// Goes on an ordinary inherent `impl` block; the signatures are the
 /// descriptor. Parameter types declare argument extraction
@@ -321,7 +321,7 @@ pub fn romp(input: TokenStream) -> TokenStream {
     romp::expand(input)
 }
 
-/// Declarative namespace generator — the v2 form of `holt!`. Goes on
+/// Current declarative namespace generator. Goes on
 /// an inherent impl block of a marker type; members are static
 /// (`#[method(name = "…")]`, options `length`/`promise`/`raw`),
 /// `async fn` compiles to the promise protocol, and `js = "…"`
@@ -332,7 +332,7 @@ pub fn js_namespace(attr: TokenStream, item: TokenStream) -> TokenStream {
     js_namespace::expand(attr, item)
 }
 
-/// Declarative hosted-module generator — the v2 form of `lodge!`.
+/// Current declarative hosted-module generator.
 /// Goes on an inherent impl block of a marker type; exports are
 /// static (`#[export(name = "…")]`, options `length`/`promise`/`raw`),
 /// `async fn` compiles to the promise protocol, and with

@@ -5,7 +5,7 @@
 //! # Contents
 //! - A hot eight-operation Number leaf called through a compiled caller.
 //! - Full collections before and after speculative Number guard misses.
-//! - Successful and throwing `Symbol.toPrimitive` replay in the interpreter.
+//! - Successful and throwing `Symbol.toPrimitive` completion after cold deopt.
 //!
 //! # Invariants
 //! - Cranelift remains the internal backend of the existing optimizing tier.
@@ -173,17 +173,17 @@ fn production_full_gc_guard_miss_and_nested_abrupt_exit_stay_reusable() {
         "production tiering must route the hot leaf through Cranelift"
     );
     assert!(
-        compiled.stats.jit_optimized_entries > 0,
-        "numericLeaf must enter optimizing code: {:?}",
+        compiled.stats.jit_generated_optimizing_entries > 0,
+        "numericLeaf must enter optimizing code from its generated caller: {:?}",
         compiled.stats
     );
     assert!(
-        compiled.stats.jit_optimized_deopts >= 2,
-        "both non-Number parameters must restart in the interpreter: {:?}",
+        compiled.stats.jit_generated_optimizing_deopts >= 2,
+        "both non-Number parameters must cold-deopt the generated call: {:?}",
         compiled.stats
     );
     assert!(
-        compiled.stats.jit_direct_calls > 0,
+        compiled.stats.jit_generated_calls > 0,
         "the compiled caller must cross a direct native call boundary: {:?}",
         compiled.stats
     );

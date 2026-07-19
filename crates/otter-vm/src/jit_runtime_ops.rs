@@ -298,7 +298,7 @@ impl Interpreter {
         result
     }
 
-    /// Allocate a closure directly from a published frameless native owner.
+    /// Allocate a closure directly from a published stack-owned native frame.
     ///
     /// Direct-call eligibility excludes cold eval/constructor state, so the
     /// canonical native SELF/`this`/upvalue windows contain the complete source
@@ -334,7 +334,7 @@ impl Interpreter {
     }
 
     /// Allocate a distinct capture-free function value directly in a
-    /// published frameless native owner.
+    /// published stack-owned native frame.
     ///
     /// Direct-call eligibility excludes direct-eval cold state, while the
     /// native descriptor publishes the exact SELF value needed by named

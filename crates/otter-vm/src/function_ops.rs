@@ -2147,7 +2147,8 @@ impl Interpreter {
         // so the prototype keeps a fast shape: prototype-style method
         // definitions (`Foo.prototype.m = ...`) then land in shape slots and
         // instance method calls stay inline/direct-call guardable instead of
-        // forcing every dispatch through the generic method bridge. The define
+        // forcing every dispatch through generic method lookup and call
+        // machinery. The define
         // allocates a hidden-class child and can move the heap, so the bare
         // `proto` / `bag` locals may be stale afterward.
         if !context

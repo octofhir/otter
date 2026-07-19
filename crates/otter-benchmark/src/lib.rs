@@ -658,7 +658,12 @@ impl BenchmarkResult {
         let mut names = BTreeSet::new();
         let mut primary_count = 0usize;
         for metric in &self.metrics {
-            if metric.samples.len() != self.sampling.sample_count as usize {
+            let is_run_level_diagnostic = metric.role == MetricRole::Diagnostic
+                && metric.aggregate.statistic == Statistic::Single
+                && metric.samples.len() == 1;
+            if !is_run_level_diagnostic
+                && metric.samples.len() != self.sampling.sample_count as usize
+            {
                 return Some(format!(
                     "metric {:?} has {} samples, expected {}",
                     metric.name,
@@ -865,6 +870,19 @@ mod tests {
         let mut result = sample_result();
         result.metrics.push(result.metrics[0].clone());
         assert!(result.contract_error().unwrap().contains("duplicate"));
+        result.metrics.pop();
+        result.metrics.push(
+            Metric::from_u64_samples(
+                "run-level-counter",
+                MetricUnit::Count,
+                MetricDirection::Informational,
+                MetricRole::Diagnostic,
+                vec![7],
+                Statistic::Single,
+            )
+            .unwrap(),
+        );
+        assert_eq!(result.contract_error(), None);
         result.metrics.pop();
         result.metrics[0].samples.pop();
         assert!(result.contract_error().unwrap().contains("expected 3"));

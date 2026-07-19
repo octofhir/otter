@@ -13,8 +13,8 @@
 //!
 //! # Contents
 //! - [`plan`] — machine-independent operation stream over typed lowering.
-//! - [`inline_method`] — replay-safe method validation and compact scratch
-//!   planning.
+//! - [`inline_leaf`] — deopt-safe call/method leaf validation and compact
+//!   scratch planning.
 //! - [`arm64`] — the AArch64 dynasm backend (first machine target).
 //! - [`code`] — finalized [`TemplateCode`] objects and VM entry publication.
 //! - [`compile`] — the whole-function compile entry point.
@@ -38,19 +38,19 @@ use otter_vm::JitCompileSnapshot;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod arm64;
 mod code;
-mod inline_method;
+mod inline_leaf;
 mod plan;
 
 pub use code::TemplateCode;
-pub(crate) use inline_method::{InlineEntryValue, InlineMethodPlan, InlineScratchSlot};
+pub(crate) use inline_leaf::{InlineEntryValue, InlineLeafPlan, InlineScratchSlot};
 pub(crate) use plan::{
     ArithKind, BitwiseKind, CompareKind, TemplateOp, TemplatePlan, TemplateTail,
 };
 
 use crate::entry::{TransitionTable, Unsupported};
 
-/// Whether the current machine backend can replace at least one bridged
-/// method site with its guarded read-only numeric inline path.
+/// Whether the current machine backend can replace at least one method site
+/// with its guarded read-only numeric inline path.
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn has_emit_eligible_inline_method(view: &JitCompileSnapshot) -> bool {
     arm64::has_emit_eligible_inline_method(view)
@@ -66,39 +66,24 @@ pub fn compile(
     code_object_id: u64,
     transitions: &TransitionTable,
 ) -> Result<TemplateCode, Unsupported> {
-    let call_trampoline = std::sync::Arc::new(crate::arm64::CallTrampoline::compile(transitions)?);
-    compile_with_trampoline(view, code_object_id, transitions, call_trampoline)
-}
-
-/// Compile using the hook-owned call trampoline retained by the produced code
-/// object. This is the production path; [`compile`] remains a fallible
-/// convenience for standalone callers and tests.
-#[cfg(target_arch = "aarch64")]
-pub(crate) fn compile_with_trampoline(
-    view: &JitCompileSnapshot,
-    code_object_id: u64,
-    transitions: &TransitionTable,
-    call_trampoline: std::sync::Arc<crate::arm64::CallTrampoline>,
-) -> Result<TemplateCode, Unsupported> {
-    arm64::compile(view, code_object_id, transitions, call_trampoline, None)
-        .map(|output| output.code)
+    arm64::compile(view, code_object_id, transitions, None, false).map(|output| output.code)
 }
 
 /// Compile with an optional default-off artifact sidecar.
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn compile_with_trampoline_artifacts(
+pub(crate) fn compile_with_artifacts(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &TransitionTable,
-    call_trampoline: std::sync::Arc<crate::arm64::CallTrampoline>,
     artifact_request: Option<crate::artifact::ArtifactRequest>,
+    capture_events: bool,
 ) -> Result<crate::artifact::NativeCompileOutput<TemplateCode>, Unsupported> {
     arm64::compile(
         view,
         code_object_id,
         transitions,
-        call_trampoline,
         artifact_request,
+        capture_events,
     )
 }
 
@@ -191,10 +176,17 @@ mod tests {
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: &mut native_frame,
             error: &mut error,
-            direct_call: std::mem::MaybeUninit::uninit(),
             activation_base: activation_probe.as_mut_ptr().cast(),
             activation_top_ptr: std::ptr::addr_of_mut!(activation_top_probe),
             activation_limit: 16,
+            global_this_offset: std::ptr::null(),
+            sync_reentry_depth: std::ptr::null_mut(),
+            sync_reentry_limit: 0,
+            native_stack_bytes: std::ptr::null_mut(),
+            native_stack_bytes_limit: 0,
+            generated_call_depth: std::ptr::null_mut(),
+            generated_calls: 0,
+            generated_call_deopts: 0,
         };
         // SAFETY: subset code never re-enters the VM; the entry was emitted
         // with the shared compiled-entry ABI and its mapping outlives the call.
@@ -395,23 +387,12 @@ mod tests {
     fn artifact_capture_preserves_exact_code_and_layout() {
         let view = countdown_view();
         let transitions = crate::entry::TransitionTable::resolve();
-        let call_trampoline = std::sync::Arc::new(
-            crate::arm64::CallTrampoline::compile(&transitions)
-                .expect("shared call trampoline compiles"),
-        );
-        let without_capture = super::compile_with_trampoline_artifacts(
+        let without_capture = super::compile_with_artifacts(&view, 1, &transitions, None, false)
+            .expect("template compiles without artifact capture");
+        let with_capture = super::compile_with_artifacts(
             &view,
             1,
             &transitions,
-            std::sync::Arc::clone(&call_trampoline),
-            None,
-        )
-        .expect("template compiles without artifact capture");
-        let with_capture = super::compile_with_trampoline_artifacts(
-            &view,
-            1,
-            &transitions,
-            call_trampoline,
             Some(crate::artifact::ArtifactRequest {
                 identity: otter_vm::JitArtifactIdentity {
                     function_name: "countdown".to_string(),
@@ -420,6 +401,7 @@ mod tests {
                 tier: otter_vm::JitDebugTier::Template,
                 entry: otter_vm::JitDebugTarget::Entry,
             }),
+            false,
         )
         .expect("template compiles with artifact capture");
 

@@ -1,4 +1,4 @@
-//! Expose Cargo's exact native target triple to versioned JIT manifests.
+//! Expose Cargo's exact native target triple to JIT manifests.
 //!
 //! The build script performs no probing and emits no generated source. The
 //! ordinary compiler path reads the value only when artifact capture is

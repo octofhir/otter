@@ -203,8 +203,8 @@ impl RuntimeBudgetStats {
         self.current_turn_reductions = self.current_turn_reductions.saturating_add(units);
     }
 
-    pub(crate) fn record_bytecode_call(&mut self) {
-        self.bytecode_calls = self.bytecode_calls.saturating_add(1);
+    pub(crate) fn record_bytecode_calls(&mut self, calls: u64) {
+        self.bytecode_calls = self.bytecode_calls.saturating_add(calls);
     }
 
     pub(crate) fn record_native_call(&mut self) {

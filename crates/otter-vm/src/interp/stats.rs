@@ -91,7 +91,13 @@ impl Interpreter {
     }
 
     pub(crate) fn record_runtime_bytecode_call(&mut self) {
-        self.runtime_budget_stats.record_bytecode_call();
+        self.record_runtime_bytecode_calls(1);
+    }
+
+    /// Reconcile a cold batch of bytecode call entries without one VM
+    /// transition per generated call.
+    pub(crate) fn record_runtime_bytecode_calls(&mut self, calls: u64) {
+        self.runtime_budget_stats.record_bytecode_calls(calls);
     }
 
     pub(crate) fn record_runtime_native_call(&mut self) {
@@ -148,14 +154,6 @@ impl Interpreter {
         self.jit_runtime_stats.runtime_property_stubs = self
             .jit_runtime_stats
             .runtime_property_stubs
-            .saturating_add(1);
-    }
-
-    pub(crate) fn record_jit_runtime_collection_method_ic_stub(&mut self) {
-        self.record_jit_runtime_stub_class(native_abi::RuntimeStubClass::Reentrant);
-        self.jit_runtime_stats.runtime_collection_method_ic_stubs = self
-            .jit_runtime_stats
-            .runtime_collection_method_ic_stubs
             .saturating_add(1);
     }
 
@@ -216,27 +214,6 @@ impl Interpreter {
                     .saturating_add(1);
             }
         }
-    }
-
-    pub(crate) fn record_jit_method_collection_ic_hit(&mut self) {
-        self.jit_runtime_stats.method_collection_ic_hits = self
-            .jit_runtime_stats
-            .method_collection_ic_hits
-            .saturating_add(1);
-    }
-
-    pub(crate) fn record_jit_method_string_fast_hit(&mut self) {
-        self.jit_runtime_stats.method_string_fast_hits = self
-            .jit_runtime_stats
-            .method_string_fast_hits
-            .saturating_add(1);
-    }
-
-    pub(crate) fn record_jit_method_number_fast_hit(&mut self) {
-        self.jit_runtime_stats.method_number_fast_hits = self
-            .jit_runtime_stats
-            .method_number_fast_hits
-            .saturating_add(1);
     }
 
     pub(crate) fn record_runtime_microtask_drain_started(&mut self) {

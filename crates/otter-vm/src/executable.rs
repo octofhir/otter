@@ -289,9 +289,14 @@ impl CodeBlock {
                     ),
                 })
                 .collect(),
+            // Baked from the authoritative typed `Op::Call` distribution by
+            // `Interpreter::bake_inline_callees`.
+            static_native_calls: rustc_hash::FxHashMap::default(),
             // Baked by `Interpreter::bake_inline_callees` (it holds the live
             // per-site feedback and can resolve callee bodies); the raw snapshot
             // carries none.
+            direct_callees: rustc_hash::FxHashMap::default(),
+            direct_methods: rustc_hash::FxHashMap::default(),
             inline_callees: rustc_hash::FxHashMap::default(),
             inline_methods: rustc_hash::FxHashMap::default(),
             inline_poly_methods: rustc_hash::FxHashMap::default(),
@@ -412,7 +417,6 @@ impl CodeBlock {
     }
 
     /// Bounded ordinary-call distribution at one canonical instruction.
-    #[cfg(test)]
     #[must_use]
     pub(crate) fn call_distribution_at(
         &self,
@@ -422,12 +426,25 @@ impl CodeBlock {
     }
 
     /// Record one ordinary bytecode target through the feedback facade.
+    #[cfg(test)]
     pub(crate) fn record_call_feedback(
         &self,
         instruction_index: usize,
         callee_fid: u32,
     ) -> crate::feedback::CallTargetTransition {
-        self.feedback.record_call(instruction_index, callee_fid)
+        self.feedback.record_call(
+            instruction_index,
+            crate::feedback::OrdinaryCallTarget::Bytecode(callee_fid),
+        )
+    }
+
+    /// Record one typed ordinary-call target through the feedback facade.
+    pub(crate) fn record_call_target_feedback(
+        &self,
+        instruction_index: usize,
+        target: crate::feedback::OrdinaryCallTarget,
+    ) -> crate::feedback::CallTargetTransition {
+        self.feedback.record_call(instruction_index, target)
     }
 
     /// Cold serialized byte PC for one logical instruction index.

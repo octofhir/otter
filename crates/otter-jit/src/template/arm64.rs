@@ -4,6 +4,7 @@
 //! - Code-buffer ownership, per-PC labels, and branch fixups.
 //! - Prologue/epilogue establishing the shared compiled-entry ABI.
 //! - One emit dispatch per [`TemplateOp`], including inline tagged truthiness.
+//! - Direct live-value reads from baked global lexical cells.
 //! - Cooperative back-edge interrupt/fuel polling.
 //! - [`values`] — tagged encode/decode primitives.
 //! - [`arith`] — numeric, comparison, and bitwise emitters.
@@ -20,6 +21,8 @@
 //! - Process-local addresses are materialized through typed relocation
 //!   capture. Disabled capture allocates no record storage and emits the same
 //!   variable-width instruction sequences.
+//! - Global lexical addresses identify permanent cells only; their mutable
+//!   value is loaded at execution time and TDZ holes take the exact VM path.
 //! - Machine-visible offsets come only from the shared entry-ABI module and
 //!   frozen value-tag contracts; no Rust container layout is probed.
 //!
@@ -471,11 +474,13 @@ pub(super) fn compile(
                     &mut ops,
                     &mut relocations,
                     transitions,
+                    view,
                     dst,
                     name,
                     code_block_id,
+                    instr.byte_pc,
                     threw,
-                );
+                )?;
             }
             TemplateOp::LoadBuiltinError { dst, constant } => {
                 transitions::emit_load_builtin_error(

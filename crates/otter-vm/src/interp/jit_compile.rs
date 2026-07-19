@@ -4,7 +4,7 @@
 //! - `jit_code_residency` and `jit_code_generation_snapshot` — opt-in
 //!   whole-isolate executable ownership and generation snapshots.
 //! - `compile_jit_function` and cold feedback baking into the instruction view
-//!   (property/object-literal/inline-callee tables).
+//!   (property/object-literal/global-lexical/inline-callee tables).
 //! - Call/method target profiling and reoptimization eviction.
 //!
 //! # Invariants
@@ -109,6 +109,8 @@ impl Interpreter {
             parameter_count: u32::try_from(view.code_block.param_count).unwrap_or(u32::MAX),
             call_feedback_sites: u32::try_from(call_feedback_sites).unwrap_or(u32::MAX),
             method_feedback_sites: u32::try_from(method_feedback_sites).unwrap_or(u32::MAX),
+            global_lexical_loads: u32::try_from(view.global_lexical_loads.len())
+                .unwrap_or(u32::MAX),
             direct_callees: u32::try_from(view.direct_callees.len()).unwrap_or(u32::MAX),
             direct_method_sites: u32::try_from(view.direct_methods.len()).unwrap_or(u32::MAX),
             direct_method_targets: u32::try_from(
@@ -301,6 +303,7 @@ impl Interpreter {
         // there is nothing to inline.
         Self::bake_typed_array_layout(&mut snapshot);
         Self::bake_string_layout(&mut snapshot);
+        self.bake_global_lexical_loads(&mut snapshot, context, fid);
         self.bake_inline_callees(
             &mut snapshot,
             context,
@@ -426,6 +429,7 @@ impl Interpreter {
         self.publish_property_feedback_for_view(&view);
         Self::bake_typed_array_layout(&mut view);
         Self::bake_string_layout(&mut view);
+        self.bake_global_lexical_loads(&mut view, context, fid);
         self.bake_inline_callees(&mut view, context, fid, jit_debug::JitDebugTier::Template);
         self.bake_collection_leaf_methods(&mut view);
         self.bake_collection_alloc_methods(&mut view);
@@ -643,6 +647,42 @@ impl Interpreter {
             }
         }
         None
+    }
+
+    /// Bake direct reads for global-declarative bindings already owned by the
+    /// isolate's permanent lexical environment.
+    ///
+    /// Global lexical cells are old-space, non-moving GC objects rooted for the
+    /// lifetime of the binding. Their identity cannot be replaced by later
+    /// declarations, while their contained `Value` remains mutable. Generated
+    /// code may therefore read the live cell directly; a TDZ hole still enters
+    /// the canonical `LoadGlobalOrThrow` stub to construct the named error.
+    fn bake_global_lexical_loads(
+        &self,
+        view: &mut jit::JitCompileSnapshot,
+        context: &ExecutionContext,
+        fid: u32,
+    ) {
+        for instruction in &view.instructions {
+            if instruction.op(&view.code_block) != Op::LoadGlobalOrThrow {
+                continue;
+            }
+            let Some(name_index) = instruction.const_index(&view.code_block, 1) else {
+                continue;
+            };
+            let Some(name) = context.string_constant_str_for_function(fid, name_index) else {
+                continue;
+            };
+            let Some(&(cell, _)) = self.global_lexicals.get(name) else {
+                continue;
+            };
+            view.global_lexical_loads.insert(
+                instruction.byte_pc,
+                jit::JitGlobalLexicalLoad {
+                    cell_offset: cell.offset(),
+                },
+            );
+        }
     }
 
     /// Bake compiler-native direct-call plans and inline-candidate bodies for

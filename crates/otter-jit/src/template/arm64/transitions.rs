@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - Reentrant transition emitters completing whole opcodes in the VM.
+//! - Direct reads from baked, non-moving global lexical cells.
 //! - The allocating call-packet emitter publishing a concrete safepoint.
 //!
 //! # Invariants
@@ -15,6 +16,9 @@
 //!   reuse — operands re-load from the rooted frame window.
 //! - Runtime entries, cage bases, and plan-owned operand slices are recorded
 //!   with stable semantic identities during the existing emission pass.
+//! - Baked global lexical cells are permanent old-space objects; their live
+//!   value is read on every execution, while a TDZ hole uses the canonical
+//!   throwing transition.
 //!
 //! # See also
 //! - `crates/otter-vm/src/native_abi/runtime_stubs.rs` — the authoritative
@@ -187,11 +191,36 @@ pub(super) fn emit_load_global(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
+    view: &JitCompileSnapshot,
     dst: u16,
     name: u32,
     code_block_id: u32,
+    byte_pc: u32,
     threw: DynamicLabel,
-) {
+) -> Result<(), Unsupported> {
+    let miss = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    if let Some(target) = view.global_lexical_loads.get(&byte_pc)
+        && let Some(cell_addr) = view.cage_base.checked_add(target.cell_offset as usize)
+    {
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            13,
+            cell_addr as u64,
+            RelocationTarget::GlobalLexicalCell { byte_pc },
+        );
+        dynasm!(ops ; .arch aarch64 ; ldr x9, [x13, view.upvalue_value_byte]);
+        emit_load_u64(ops, 11, VALUE_HOLE);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp x9, x11
+            ; b.eq =>miss
+        );
+        emit_store_reg(ops, 9, dst)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done);
+    }
+    dynasm!(ops ; .arch aarch64 ; =>miss);
     emit_ctx_arg(ops);
     dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
     emit_load_u64(ops, 2, u64::from(name));
@@ -203,6 +232,8 @@ pub(super) fn emit_load_global(
         abi::STUB_JIT_LOAD_GLOBAL,
         threw,
     );
+    dynasm!(ops ; .arch aarch64 ; =>done);
+    Ok(())
 }
 
 pub(super) fn emit_load_builtin_error(

@@ -361,9 +361,11 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     inlining, direct-call plan/final-lowering, bail, generated-call-deopt, and
     inline-deopt events. Bounded method chains expose `targetIndex` /
     `targetCount`; `compilePrepared` reports `directMethodSites` and
-    `directMethodTargets` separately from body-inline candidate counts. Capture
-    is default-off and bounded to 16,384 events per top-level run; `truncated`
-    and `droppedEvents` report overflow without constructing further payloads.
+    `directMethodTargets` separately from body-inline candidate counts, while
+    `globalLexicalLoads` counts permanent global-declarative cells available
+    for direct reads. Capture is default-off and bounded to 16,384 events per
+    top-level run; `truncated` and `droppedEvents` report overflow without
+    constructing further payloads.
   - Abrupt VM completion (for example, a thrown exception after tier-up) still
     writes the partial report. The original execution error remains primary if
     writing that report also fails. A host command timeout can precede isolate
@@ -383,6 +385,9 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     portable semantic `code-normalized.bin`, typed `relocations.json`,
     annotated ARM64 `asm.txt`, `bytecode.txt`, tier input, `code-map.json`,
     `safepoints.json`, and optimizer `deopt.json` when applicable.
+  - Direct global-lexical reads expose `globalLexicalCell` relocations keyed by
+    byte PC. Exact addresses are redacted; the generated hit reads the live
+    permanent cell and a TDZ hole retains the canonical throwing transition.
   - Inspect the first line of `optimized-ir.txt` before reading it: the general
     backend emits the Otter optimized unit, while a Cranelift numeric leaf
     starts with `; backend=cranelift numeric-leaf` and then contains CLIF. Its

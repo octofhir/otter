@@ -289,6 +289,10 @@ impl CodeBlock {
                     ),
                 })
                 .collect(),
+            // Baked by `Interpreter::bake_global_lexical_loads`, which owns the
+            // live global declarative record. Raw snapshots carry no GC cell
+            // identity.
+            global_lexical_loads: rustc_hash::FxHashMap::default(),
             // Baked from the authoritative typed `Op::Call` distribution by
             // `Interpreter::bake_inline_callees`.
             static_native_calls: rustc_hash::FxHashMap::default(),

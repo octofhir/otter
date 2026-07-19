@@ -8,6 +8,7 @@
 //! - Cooperative back-edge polling with loop-header bail writeback.
 //! - Precise live-tagged GC safepoints around element, property, global,
 //!   comparison, and method-call transitions.
+//! - Direct live-value reads from baked global lexical cells.
 //! - Baked stable-entry plain and method calls with stack-owned rooted callee
 //!   frames.
 //! - Guarded numeric fast paths for source-lowered coercion scaffolding.
@@ -52,6 +53,9 @@
 //!   bitmap names every tagged input and live-across value; moving-GC reloads
 //!   restore live values and load results while numeric machine locations
 //!   remain untouched.
+//! - A baked global lexical address names a permanent old-space cell. Generated
+//!   code loads the cell's current value and uses the canonical transition for
+//!   TDZ holes.
 //! - A non-spliced call enters only its VM-baked native generation. Method
 //!   edges additionally prove receiver/prototype/slot identity in generated
 //!   code. Missing targets and every pre-entry guard or lease failure take the
@@ -2802,9 +2806,15 @@ fn emit(
                     let dst = instruction
                         .result_register
                         .expect("eligibility checked global-load destination");
-                    let name = view.instructions[instruction.pc as usize]
+                    let metadata = &view.instructions[instruction.pc as usize];
+                    let name = metadata
                         .const_index(view.code_block.as_ref(), 1)
                         .ok_or(Unsupported::OperandShape("global-load name constant"))?;
+                    let result_location = allocation.location(
+                        instruction
+                            .result
+                            .expect("eligibility checked global-load result"),
+                    );
                     let site = eligibility
                         .element_transitions
                         .sites
@@ -2813,6 +2823,35 @@ fn emit(
                             "optimizing global load missing site",
                         ))?;
                     debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                    let miss = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+                    if let Some(target) = view.global_lexical_loads.get(&metadata.byte_pc)
+                        && let Some(cell_addr) =
+                            view.cage_base.checked_add(target.cell_offset as usize)
+                    {
+                        emit_load_symbolic_u64(
+                            &mut ops,
+                            &mut relocations,
+                            13,
+                            cell_addr as u64,
+                            RelocationTarget::GlobalLexicalCell {
+                                byte_pc: metadata.byte_pc,
+                            },
+                        );
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr x9, [x13, view.upvalue_value_byte]
+                        );
+                        emit_load_u64(&mut ops, 11, VALUE_HOLE);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; cmp x9, x11
+                            ; b.eq =>miss
+                        );
+                        emit_store_tagged_location(&mut ops, result_location, 9)?;
+                        dynasm!(ops ; .arch aarch64 ; b =>done);
+                    }
+                    dynasm!(ops ; .arch aarch64 ; =>miss);
                     emit_materialize_element_transition(
                         &mut ops,
                         reprs,
@@ -2843,15 +2882,9 @@ fn emit(
                         &mut ops,
                         allocation,
                         site,
-                        Some((
-                            dst,
-                            allocation.location(
-                                instruction
-                                    .result
-                                    .expect("eligibility checked global-load result"),
-                            ),
-                        )),
+                        Some((dst, result_location)),
                     )?;
+                    dynasm!(ops ; .arch aarch64 ; =>done);
                 }
                 Op::LooseEqual | Op::LooseNotEqual => {
                     let dst = instruction

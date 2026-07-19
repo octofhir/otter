@@ -485,6 +485,9 @@ fn symbolic_target(target: &RelocationTarget) -> String {
             signature,
         } => format!("runtimeStub(id={id},name={name:?},signature={signature:?})"),
         RelocationTarget::GcCageBase => "gcCageBase".to_string(),
+        RelocationTarget::GlobalLexicalCell { byte_pc } => {
+            format!("globalLexicalCell(bytePc={byte_pc})")
+        }
         RelocationTarget::PropertyIcCell { access, ordinal } => format!(
             "propertyIcCell(access={},ordinal={ordinal})",
             match access {

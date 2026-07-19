@@ -45,7 +45,8 @@ that fires before the isolate replies may have no partial batch to write.
 
 ## Structured events
 
-`compilePrepared.directCallees`, `directMethodSites`, and
+`compilePrepared.globalLexicalLoads` counts permanent global-declarative cells
+available for direct generated reads. `directCallees`, `directMethodSites`, and
 `directMethodTargets` report exact generations available for generated plain
 and bounded polymorphic method linkage separately from `inlineCallees` /
 `inlineMethods`, which count bodies offered to the leaf inliner. A
@@ -65,6 +66,11 @@ generation, tier, and `thisMode`.
 `callerCodeObjectId` identifies the exact successful caller generation.
 Planning and lowering are separate events so diagnostics never claim a native
 call edge that the backend did not emit.
+
+Exact artifacts represent a baked global-declarative cell as a
+`globalLexicalCell` relocation keyed by byte PC. The raw pointer is redacted
+from assembly and normalized code. Generated code reads the live cell value;
+a TDZ hole still enters the canonical throwing global lookup.
 
 Ordinary `Op::Call` feedback uses one typed target population for bytecode
 callees and static-native operations. When that population is monomorphic for

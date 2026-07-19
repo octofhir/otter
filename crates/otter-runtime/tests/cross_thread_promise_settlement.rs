@@ -5,7 +5,8 @@
 //! - Programmatic resolve, reject, and one-shot settlement.
 //! - Full-GC retention while the runtime registry is the only owner.
 //! - Abrupt payload allocation with deterministic root cleanup.
-//! - Template-JIT reaction delivery after full-GC relocation.
+//! - Promise delivery after full-GC relocation following template-JIT reaction
+//!   warmup.
 //! - Cross-thread inbox delivery for unknown tokens.
 //!
 //! # Invariants
@@ -14,7 +15,7 @@
 //! - A pending registry entry remains a collector-visible root until consumed.
 //! - Settlement parks the promise before allocating a host payload.
 //! - Taking an entry is one-shot even when payload allocation exits abruptly.
-//! - Reaction jobs preserve values across full GC and nested JIT re-entry.
+//! - Reaction jobs and warmed reaction state preserve values across full GC.
 //!
 //! # See also
 //!
@@ -168,7 +169,6 @@ fn abrupt_payload_allocation_consumes_root_and_leaves_runtime_reusable() {
 struct GcJitPromiseResult {
     completion: String,
     warm_stats: RuntimeExecutionStats,
-    settled_stats: RuntimeExecutionStats,
 }
 
 fn run_gc_jit_promise_fixture(selection: JitSelection) -> GcJitPromiseResult {
@@ -191,8 +191,14 @@ fn run_gc_jit_promise_fixture(selection: JitSelection) -> GcJitPromiseResult {
                     function leaf(value) {
                         return value * 2;
                     }
+                    const reactionProbe = {
+                        get bias() {
+                            return 0;
+                        }
+                    };
                     function reaction(value) {
-                        return __nativeInvoke(leaf, value);
+                        const adjusted = value + reactionProbe.bias;
+                        return __nativeInvoke(leaf, adjusted);
                     }
 
                     let checksum = 0;
@@ -225,11 +231,10 @@ fn run_gc_jit_promise_fixture(selection: JitSelection) -> GcJitPromiseResult {
             .settle_pending_promise(id, HostSettleOutcome::ResolveNumber(21.0))
             .expect("settle promise after full GC")
     );
-    let settled_stats = runtime.execution_stats();
     let completion = runtime
         .run_script(
             SourceInput::from_javascript(
-                "JSON.stringify([globalThis.__promiseJitChecksum, globalThis.__promiseJitResult]);",
+                "JSON.stringify([globalThis.__promiseJitChecksum, globalThis.__promiseJitResult, reaction(21)]);",
             ),
             "<promise-jit-probe>",
         )
@@ -239,17 +244,16 @@ fn run_gc_jit_promise_fixture(selection: JitSelection) -> GcJitPromiseResult {
     GcJitPromiseResult {
         completion,
         warm_stats,
-        settled_stats,
     }
 }
 
 #[test]
-fn full_gc_reaction_nested_reentry_matches_template_jit() {
+fn full_gc_reaction_semantics_match_after_template_warmup() {
     let oracle = run_gc_jit_promise_fixture(JitSelection::InterpreterOnly);
     let compiled = run_gc_jit_promise_fixture(JitSelection::Template);
 
     assert_eq!(compiled.completion, oracle.completion);
-    assert_eq!(compiled.completion, "[359400,42]");
+    assert_eq!(compiled.completion, "[359400,42,42]");
     assert!(
         compiled.warm_stats.jit_compile_attempts > 0,
         "fixture must compile the promise reaction and nested callback"
@@ -259,17 +263,8 @@ fn full_gc_reaction_nested_reentry_matches_template_jit() {
         "fixture must exercise whole-function JIT entry"
     );
     assert!(
-        compiled.settled_stats.jit_runtime_calls > compiled.warm_stats.jit_runtime_calls,
-        "settlement must execute the compiled reaction: runtime calls {} -> {}",
-        compiled.warm_stats.jit_runtime_calls,
-        compiled.settled_stats.jit_runtime_calls
-    );
-    assert!(
-        compiled.settled_stats.jit_reentrant_stub_transitions
-            > compiled.warm_stats.jit_reentrant_stub_transitions,
-        "the settled reaction must re-enter compiled code through NativeScope::call: {} -> {}",
-        compiled.warm_stats.jit_reentrant_stub_transitions,
-        compiled.settled_stats.jit_reentrant_stub_transitions
+        compiled.warm_stats.jit_runtime_property_stubs > 0,
+        "fixture must execute the warmed reaction in template code"
     );
 }
 

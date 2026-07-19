@@ -50,6 +50,7 @@ const TARGET_COLLECTION_HEAP_REFERENCE: u8 = 6;
 const TARGET_COLLECTION_BUILTIN_FUNCTION: u8 = 7;
 const TARGET_DIRECT_CALL_ENTRY_CELL: u8 = 8;
 const TARGET_STATIC_NATIVE_BUILTIN_FUNCTION: u8 = 9;
+const TARGET_GLOBAL_LEXICAL_CELL: u8 = 10;
 
 /// Whether a property inline-cache cell serves a load or a store site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -111,6 +112,10 @@ pub(crate) enum RelocationTarget {
         signature: &'static str,
     },
     GcCageBase,
+    /// Permanent global-declarative cell read by one `LoadGlobalOrThrow`.
+    GlobalLexicalCell {
+        byte_pc: u32,
+    },
     PropertyIcCell {
         access: PropertyIcAccess,
         ordinal: u32,
@@ -993,6 +998,10 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             put_text(output, "runtimeStub.signature", signature)?;
         }
         RelocationTarget::GcCageBase => output.push(TARGET_GC_CAGE_BASE),
+        RelocationTarget::GlobalLexicalCell { byte_pc } => {
+            output.push(TARGET_GLOBAL_LEXICAL_CELL);
+            put_u32(output, *byte_pc);
+        }
         RelocationTarget::PropertyIcCell { access, ordinal } => {
             output.push(TARGET_PROPERTY_IC_CELL);
             output.push(match access {

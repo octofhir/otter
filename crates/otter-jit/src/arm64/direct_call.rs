@@ -51,9 +51,9 @@ use crate::{
         CODE_ENTRY_GENERATED_RETURNS_OFFSET, CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET,
         CODE_ENTRY_GENERATED_THROWS_OFFSET, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET,
         FUNCTION_ENTRY_GENERATION_CELL_OFFSET, GENERATED_CALL_DEOPTS_OFFSET,
-        GENERATED_CALL_DEPTH_PTR_OFFSET, GENERATED_CALLS_OFFSET, GLOBAL_THIS_OFFSET_PTR_OFFSET,
-        NATIVE_FRAME_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET,
-        NATIVE_FRAME_STACK_SIZE, NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
+        GENERATED_CALLS_OFFSET, GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_OFFSET,
+        NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE,
+        NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
         NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NATIVE_STACK_BYTES_LIMIT_OFFSET,
         NATIVE_STACK_BYTES_PTR_OFFSET, STATUS_BAILED, STATUS_RETURNED,
         SYNC_REENTRY_DEPTH_PTR_OFFSET, SYNC_REENTRY_LIMIT_OFFSET, THREAD_OFFSET, Unsupported,
@@ -564,12 +564,9 @@ pub(crate) fn emit_direct_call(
         ; b.hi =>uncommitted_rejected
         ; str x15, [sp, layout.reserved_bytes]
         // Commit recursion and native-stack accounting only after every
-        // pre-entry capacity and target contract has succeeded.
+        // pre-entry capacity and target contract has succeeded. Logical call
+        // depth is derived on cold paths from the published native frame.
         ; ldr x13, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
-        ; ldr w14, [x13]
-        ; add w14, w14, #1
-        ; str w14, [x13]
-        ; ldr x13, [x20, GENERATED_CALL_DEPTH_PTR_OFFSET]
         ; ldr w14, [x13]
         ; add w14, w14, #1
         ; str w14, [x13]
@@ -785,10 +782,6 @@ pub(crate) fn emit_direct_call(
         ; ldr x10, [x9]
         ; sub x10, x10, x11
         ; str x10, [x9]
-        ; ldr x9, [x20, GENERATED_CALL_DEPTH_PTR_OFFSET]
-        ; ldr w10, [x9]
-        ; sub w10, w10, #1
-        ; str w10, [x9]
         ; ldr x9, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
         ; ldr w10, [x9]
         ; sub w10, w10, #1
@@ -823,10 +816,6 @@ pub(crate) fn emit_direct_call(
         ; ldr x10, [x9]
         ; sub x10, x10, x11
         ; str x10, [x9]
-        ; ldr x9, [x20, GENERATED_CALL_DEPTH_PTR_OFFSET]
-        ; ldr w10, [x9]
-        ; sub w10, w10, #1
-        ; str w10, [x9]
         ; ldr x9, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
         ; ldr w10, [x9]
         ; sub w10, w10, #1

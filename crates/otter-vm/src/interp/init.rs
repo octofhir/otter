@@ -197,7 +197,7 @@ impl Interpreter {
             simple_constructor_shape_cache: rustc_hash::FxHashMap::default(),
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
             sync_reentry_depth: 0,
-            jit_generated_call_depth: 0,
+            jit_materialized_generated_call_depth: 0,
             jit_native_stack_bytes: 0,
             allow_blocking_atomics_wait: false,
             microtasks: MicrotaskQueue::new(),

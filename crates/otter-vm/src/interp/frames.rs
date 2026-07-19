@@ -3,8 +3,9 @@
 //! # Contents
 //! Register allocation/reclaim on the contiguous register stack, ActivationStack
 //! draw/return, cold-frame attach/detach, frame pop/unwind
-//! (`pop_frame`, `unwind_abrupt`, `return_running_finally`), and the
-//! raw pointers compiled code uses to address the reg window.
+//! (`pop_frame`, `unwind_abrupt`, `return_running_finally`), canonical native
+//! JIT activation publication, and the raw pointers compiled code uses to
+//! address the reg window.
 //!
 //! # Invariants
 //! The reg stack is a GC root region: windows must be zeroed on alloc
@@ -221,6 +222,32 @@ impl Interpreter {
         self.jit_native_activation_top -= 1;
         self.jit_native_activations[self.jit_native_activation_top] =
             jit::JitNativeActivation::EMPTY;
+    }
+
+    /// Logical depth owned by compiler-generated frames that remain native.
+    ///
+    /// The published activation array is the canonical frame inventory. Only
+    /// stack-register frames are generated callees; the outer compiled entry
+    /// keeps its registers in the interpreter arena. Cold deoptimization may
+    /// temporarily mirror one published frame in the materialized stack, which
+    /// the transfer count removes here.
+    pub(crate) fn jit_generated_call_depth(&self) -> u32 {
+        let published = self.jit_native_activations[..self.jit_native_activation_top]
+            .iter()
+            .filter(|activation| {
+                // SAFETY: generated publication keeps every frame and its
+                // windows live until the matching activation pop.
+                let frame = unsafe { crate::ActiveFrameRef::from_native_ptr(activation.frame) }
+                    .expect("published native activation must remain valid");
+                frame
+                    .header()
+                    .flags
+                    .contains(NativeFrameFlags::STACK_REGISTERS)
+            })
+            .count();
+        u32::try_from(published)
+            .unwrap_or(u32::MAX)
+            .saturating_sub(self.jit_materialized_generated_call_depth)
     }
 
     /// Trace every canonical native activation currently capable of crossing a

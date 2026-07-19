@@ -794,11 +794,11 @@ pub struct Interpreter {
     /// update this same counter inline through
     /// [`Self::jit_sync_reentry_depth_addr`].
     sync_reentry_depth: u32,
-    /// Active compiler-generated JavaScript call frames that still live only
-    /// on the native stack. Cold deoptimization temporarily transfers its
-    /// current frame out of this count while the interpreter owns a
-    /// materialized copy.
-    jit_generated_call_depth: u32,
+    /// Published compiler-generated frames temporarily mirrored by cold
+    /// interpreter materialization. Logical-depth reads subtract this transfer
+    /// count from the canonical native-activation scan so a deoptimized frame
+    /// is never counted twice.
+    jit_materialized_generated_call_depth: u32,
     /// Native-stack bytes reserved by active compiler-generated JS calls.
     /// Generated prologues update this inline and compare against
     /// [`Self::jit_native_stack_bytes_limit`].

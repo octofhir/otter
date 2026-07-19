@@ -144,7 +144,7 @@ impl Interpreter {
                     // the comparison off the straight-line hot path.
                     let depth32 = u32::try_from(depth)
                         .unwrap_or(u32::MAX)
-                        .saturating_add(self.jit_generated_call_depth);
+                        .saturating_add(self.jit_generated_call_depth());
                     if depth32 > self.runtime_budget_stats.max_stack_depth_observed {
                         self.runtime_budget_stats.max_stack_depth_observed = depth32;
                     }

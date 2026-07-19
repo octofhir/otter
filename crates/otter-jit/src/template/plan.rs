@@ -352,9 +352,10 @@ pub(crate) enum TemplateOp {
     },
     /// Complete one scalar value-query/coercion opcode (`ToObject`,
     /// `ToPropertyKey`, `TypeOf`, `LoadNewTarget`, `SameValue`, `IsArray`,
-    /// `ArrayLength`, `LoadLength`) through the shared reentrant scalar
-    /// transition. `arg0`/`arg1`/`arg2` name the destination and source (or
-    /// left/right) registers per opcode.
+    /// `ArrayLength`, `LoadLength`) through guarded native fast paths where
+    /// exact and the shared reentrant scalar fallback otherwise.
+    /// `arg0`/`arg1`/`arg2` name the destination and source (or left/right)
+    /// registers per opcode.
     ScalarOp {
         opcode: u8,
         arg0: u64,

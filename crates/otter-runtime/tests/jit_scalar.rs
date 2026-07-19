@@ -5,8 +5,8 @@
 //!   computed class field key from loop OSR.
 //!
 //! # Invariants
-//! - The exercised scalar opcodes complete in machine code through the shared
-//!   reentrant transition; the compiled body no longer side-exits at them.
+//! - Direct arrays and primitive `Array.isArray` inputs complete in native
+//!   code; ambiguous scalar cases retain the shared reentrant fallback.
 //! - Every result matches the interpreter oracle exactly.
 //!
 //! # See also
@@ -65,6 +65,6 @@ fn scalar_ops_complete_from_loop_osr() {
     assert!(osr_attempts > 0, "fixture must enter at a loop OSR header");
     assert!(
         reentrant > 0,
-        "scalar ops must use the shared reentrant transition"
+        "remaining scalar ops must use the shared reentrant fallback"
     );
 }

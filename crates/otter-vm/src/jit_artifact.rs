@@ -14,8 +14,10 @@
 //!   requested.
 //! - File names are a closed enum, so an artifact cannot escape the directory
 //!   selected by its host.
-//! - Every bundle owns all strings and bytes. It contains no GC handles,
-//!   executable pointers, isolate borrows, sinks, locks, or registries.
+//! - Every bundle owns all strings and bytes. It contains no live GC handles,
+//!   pointer-typed values, isolate borrows, sinks, locks, or registries.
+//!   Opt-in code maps may encode a process-local executable address range as
+//!   text for profiler joins; it is diagnostic data, never a callable pointer.
 //! - Exact [`JitArtifactFileName::Code`] bytes are runtime-local. Portable
 //!   comparisons use the required normalized and relocation files. The
 //!   normalized stream is semantic data and is never executable.

@@ -130,26 +130,6 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
         self.policy == JitTierPolicy::ProductionTiered
     }
 
-    fn optimizing_generated_entry_supported(
-        &self,
-        snapshot: &otter_vm::JitCompileSnapshot,
-        osr_pc: Option<u32>,
-    ) -> bool {
-        #[cfg(target_arch = "aarch64")]
-        {
-            self.policy == JitTierPolicy::ProductionTiered
-                && self
-                    .numeric_leaf_backend
-                    .as_ref()
-                    .is_some_and(|backend| backend.supports_generated_entry(snapshot, osr_pc))
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let _ = (snapshot, osr_pc);
-            false
-        }
-    }
-
     fn runtime_stub_bindings(&self) -> Vec<otter_vm::JitRuntimeStubBinding> {
         entry::runtime_stub_bindings()
     }

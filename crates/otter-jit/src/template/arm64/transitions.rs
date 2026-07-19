@@ -2,7 +2,8 @@
 //!
 //! # Contents
 //! - Reentrant transition emitters completing whole opcodes in the VM.
-//! - Direct reads from baked, non-moving global lexical cells.
+//! - Direct reads from baked, non-moving global lexical cells and guarded
+//!   global-object property records.
 //! - The allocating call-packet emitter publishing a concrete safepoint.
 //!
 //! # Invariants
@@ -19,6 +20,9 @@
 //! - Baked global lexical cells are permanent old-space objects; their live
 //!   value is read on every execution, while a TDZ hole uses the canonical
 //!   throwing transition.
+//! - A baked global-object load proves the realm epoch, dictionary shape, and
+//!   property slot before reading the current value; any mismatch re-enters
+//!   the canonical global lookup.
 //!
 //! # See also
 //! - `crates/otter-vm/src/native_abi/runtime_stubs.rs` — the authoritative
@@ -29,7 +33,8 @@ use otter_vm::native_abi::{self as abi};
 use otter_vm::runtime_stubs::alloc_value_stub_by_id;
 
 use super::values::{
-    emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64, emit_store_reg,
+    emit_decompress_slot, emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64,
+    emit_load_u64, emit_slab_base, emit_store_reg,
 };
 pub(super) use crate::entry::TransitionTable;
 use otter_vm::JitCompileSnapshot;
@@ -39,9 +44,9 @@ use crate::artifact::relocation::{
 };
 use crate::entry::{
     ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
-    ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, NATIVE_FRAME_OFFSET,
-    NATIVE_FRAME_UPVALUE_BASE_OFFSET, NUMBER_TAG_HI16, THREAD_OFFSET, Unsupported, VALUE_HOLE,
-    VALUE_UNDEFINED,
+    ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, GLOBAL_THIS_OFFSET_PTR_OFFSET,
+    NATIVE_FRAME_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET, NUMBER_TAG_HI16, THREAD_OFFSET,
+    Unsupported, VALUE_HOLE, VALUE_UNDEFINED, VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET,
 };
 use crate::template::TemplateTail;
 
@@ -217,6 +222,63 @@ pub(super) fn emit_load_global(
             ; cmp x9, x11
             ; b.eq =>miss
         );
+        emit_store_reg(ops, 9, dst)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done);
+    } else if let Some(target) = view.global_object_loads.get(&byte_pc) {
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x14, [x20, THREAD_OFFSET]
+            ; ldr x14, [x14, VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET]
+            ; cbz x14, =>miss
+            ; ldr x15, [x14]
+        );
+        emit_load_u64(ops, 11, target.global_lexical_epoch);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp x15, x11
+            ; b.ne =>miss
+            ; ldr x14, [x20, GLOBAL_THIS_OFFSET_PTR_OFFSET]
+            ; ldr w12, [x14]
+        );
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            14,
+            view.cage_base as u64,
+            RelocationTarget::GcCageBase,
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, x14, x12
+            ; ldr w14, [x13, view.object_shape_byte]
+        );
+        if target.dictionary {
+            dynasm!(ops
+                ; .arch aarch64
+                ; cbnz w14, =>miss
+                ; ldr x14, [x13, view.object_dictionary_shape_id_byte]
+            );
+            emit_load_u64(ops, 11, target.shape);
+            dynasm!(ops
+                ; .arch aarch64
+                ; cmp x14, x11
+                ; b.ne =>miss
+            );
+        } else {
+            emit_load_u64(ops, 11, target.shape);
+            dynasm!(ops
+                ; .arch aarch64
+                ; cmp w14, w11
+                ; b.ne =>miss
+            );
+        }
+        emit_slab_base(ops, view, 13, 14);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cbz x13, =>miss
+            ; ldr w9, [x13, target.value_byte]
+        );
+        emit_decompress_slot(ops, relocations, view.cage_base as u64, miss);
         emit_store_reg(ops, 9, dst)?;
         dynasm!(ops ; .arch aarch64 ; b =>done);
     }

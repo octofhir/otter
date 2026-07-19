@@ -1,10 +1,11 @@
-//! Compiled spread, explicit-receiver, arguments, and tail-call transitions.
+//! Compiled call-family, arguments, and tail-call transitions.
 //!
 //! # Contents
 //! - The shared `CollectArguments` register helper used by interpreter and JIT
 //!   dispatch.
 //! - Synchronous full-completion siblings for frame-pushing call/construct
 //!   helpers.
+//! - Canonical `GetMethod + Call` completion for compiled method-call misses.
 //! - Packed-operand dispatch for the template-tier reentrant stub.
 //!
 //! # Invariants
@@ -27,6 +28,58 @@ use crate::{
 };
 
 impl Interpreter {
+    pub(crate) fn jit_runtime_method_call_values(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        function_id: u32,
+        receiver: Value,
+        name_index: u32,
+        args: SmallVec<[Value; 8]>,
+    ) -> Result<Value, VmError> {
+        self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
+        self.jit_runtime_stats.jit_to_rust_call_transitions = self
+            .jit_runtime_stats
+            .jit_to_rust_call_transitions
+            .saturating_add(1);
+        let receiver_anchor = self.push_iteration_anchor(receiver) - 1;
+        let anchor_base = receiver_anchor;
+        let args_start = receiver_anchor + 1;
+        let args_len = args.len();
+        for value in args {
+            self.push_iteration_anchor(value);
+        }
+        let call = |interp: &mut Self, stack: &mut ActivationStack| {
+            let receiver = interp.iteration_anchor(receiver_anchor);
+            if receiver.is_nullish() {
+                let label = if receiver.is_null() {
+                    "null"
+                } else {
+                    "undefined"
+                };
+                return Err(interp.err_type((format!("Cannot read properties of {label}")).into()));
+            }
+            let name = context
+                .string_constant_str_for_function(function_id, name_index)
+                .ok_or(VmError::InvalidOperand)?;
+            let method = interp
+                .get_method_value_for_call(context, stack, receiver, name)?
+                .unwrap_or_else(Value::undefined);
+            if !interp.is_callable_runtime(&method) {
+                return Err(VmError::NotCallable);
+            }
+            let receiver = interp.iteration_anchor(receiver_anchor);
+            let mut rooted_args = SmallVec::with_capacity(args_len);
+            for index in args_start..args_start + args_len {
+                rooted_args.push(interp.iteration_anchor(index));
+            }
+            interp.run_callable_sync_rooted(stack, context, &method, receiver, rooted_args)
+        };
+        let result = call(self, stack);
+        self.pop_iteration_anchors_to(anchor_base);
+        result
+    }
+
     /// §10.4.4 Arguments exotic object construction shared by interpreter and
     /// compiled dispatch.
     pub(crate) fn run_collect_arguments_reg(
@@ -291,6 +344,35 @@ impl Interpreter {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn run_method_call_full_regs(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        frame_index: usize,
+        dst: u16,
+        receiver_reg: u16,
+        name_index: u32,
+        arg_regs: &[u16],
+    ) -> Result<(), VmError> {
+        let receiver = *read_register(&stack[frame_index], receiver_reg)?;
+        let function_id = stack[frame_index].function_id;
+        let mut args = SmallVec::with_capacity(arg_regs.len());
+        for &reg in arg_regs {
+            args.push(*read_register(&stack[frame_index], reg)?);
+        }
+        let result = self.jit_runtime_method_call_values(
+            context,
+            stack,
+            function_id,
+            receiver,
+            name_index,
+            args,
+        )?;
+        write_register(&mut stack[frame_index], dst, result)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn run_construct_spread_full_regs(
         &mut self,
         context: &ExecutionContext,
@@ -331,9 +413,24 @@ impl Interpreter {
         arg1: u64,
         arg2: u64,
     ) -> Result<(), VmError> {
-        self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         if frame_index + 1 != stack.len() {
             return Err(VmError::InvalidOperand);
+        }
+        if opcode != Op::CallMethodValue as u8 {
+            self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
+        }
+        if matches!(
+            opcode,
+            value
+                if value == Op::CallSpread as u8
+                    || value == Op::CallWithThis as u8
+                    || value == Op::NewSpread as u8
+                    || value == Op::SuperConstructSpread as u8
+        ) {
+            self.jit_runtime_stats.jit_to_rust_call_transitions = self
+                .jit_runtime_stats
+                .jit_to_rust_call_transitions
+                .saturating_add(1);
         }
         let saved_pc = stack[frame_index].pc;
         let lane = |packed: u64, index: usize| ((packed >> (index * 16)) & 0xffff) as u16;
@@ -365,6 +462,18 @@ impl Interpreter {
                     lane(arg0, 0),
                     lane(arg0, 1),
                     Some(lane(arg0, 2)),
+                    &regs,
+                )?;
+            }
+            value if value == Op::CallMethodValue as u8 => {
+                let regs = packed_regs(arg1, lane(arg0, 2) as usize);
+                self.run_method_call_full_regs(
+                    context,
+                    stack,
+                    frame_index,
+                    lane(arg0, 0),
+                    lane(arg0, 1),
+                    arg2 as u32,
                     &regs,
                 )?;
             }

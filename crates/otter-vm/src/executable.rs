@@ -218,6 +218,8 @@ impl CodeBlock {
             // pointer to its shape handle, for the WhiskerIC load-cell guard.
             object_shape_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_SHAPE_OFFSET as u32,
+            object_dictionary_shape_id_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::OBJECT_BODY_DICTIONARY_SHAPE_ID_OFFSET as u32,
             object_values_ptr_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_VALUES_PTR_OFFSET as u32,
             object_inline_values_byte: otter_gc::header::HEADER_SIZE as u32
@@ -293,6 +295,9 @@ impl CodeBlock {
             // live global declarative record. Raw snapshots carry no GC cell
             // identity.
             global_lexical_loads: rustc_hash::FxHashMap::default(),
+            // Baked by `Interpreter::bake_global_lexical_loads`, which owns
+            // the live global declarative record and global object.
+            global_object_loads: rustc_hash::FxHashMap::default(),
             // Baked from the authoritative typed `Op::Call` distribution by
             // `Interpreter::bake_inline_callees`.
             static_native_calls: rustc_hash::FxHashMap::default(),

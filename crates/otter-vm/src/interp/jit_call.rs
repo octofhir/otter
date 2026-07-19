@@ -417,6 +417,13 @@ impl Interpreter {
         if *bails < Self::JIT_ENTRY_BAIL_REOPT_THRESHOLD {
             return;
         }
+        self.reopt_or_pin_jit_function(fid);
+    }
+
+    /// Invalidate one unhealthy generation and consume its bounded recompile
+    /// budget, pinning the function to the interpreter when recompilation has
+    /// repeatedly failed to produce a stable body.
+    pub(crate) fn reopt_or_pin_jit_function(&mut self, fid: u32) {
         self.jit_entry_bail_counts.remove(&fid);
         let reopts = self.jit_entry_reopt_counts.entry(fid).or_insert(0);
         let exhausted = *reopts >= Self::JIT_MAX_ENTRY_BAIL_REOPTS;
@@ -439,7 +446,7 @@ impl Interpreter {
     }
 
     /// Remove cache/map ownership for every function whose installed code was
-    /// invalidated, including transitive callers with generated direct edges.
+    /// invalidated.
     ///
     /// Hotness and bounded reoptimization history survive so the next entry
     /// can compile immediately instead of warming from zero.
@@ -468,18 +475,40 @@ impl Interpreter {
         self.jit_optimized_code_cache = None;
     }
 
-    /// Unlink every current native generation for `fid` and all generated
-    /// callers that embed an exact edge to one of those generations.
+    /// Unlink every current native generation for `fid`.
     ///
-    /// Map/cache ownership is removed while hotness survives, so the next
-    /// entry rebuilds directly against the latest tier and feedback snapshot.
+    /// Stable generated callers are not invalidated: they observe a later
+    /// replacement through `fid`'s function entry cell. Map/cache ownership is
+    /// removed while hotness survives, so the next entry recompiles immediately.
     pub(crate) fn invalidate_jit_function(&mut self, fid: u32) {
         let mut affected = self.jit_code_registry.invalidate_function(fid);
+        self.jit_runtime_stats.caller_invalidations =
+            self.jit_runtime_stats.caller_invalidations.saturating_add(
+                affected
+                    .iter()
+                    .filter(|&&affected_fid| affected_fid != fid)
+                    .count() as u64,
+            );
         if affected.binary_search(&fid).is_err() {
             affected.push(fid);
             affected.sort_unstable();
         }
         self.discard_invalidated_jit_state(&affected);
+    }
+
+    /// Cold repair for one stable generated-call function cell.
+    ///
+    /// Publication normally keeps the cell hot and this is never called.
+    /// A zero target enters this single no-allocation resolver, which can
+    /// republish an already-installed fallback generation before the caller
+    /// takes its exact pre-effect side exit.
+    pub fn jit_resolve_direct_entry(&mut self, function_entry_addr: u64) -> u64 {
+        self.jit_runtime_stats.cold_entry_resolver_misses = self
+            .jit_runtime_stats
+            .cold_entry_resolver_misses
+            .saturating_add(1);
+        self.jit_code_registry
+            .resolve_function_entry(function_entry_addr)
     }
 
     /// Tier-up entry point for a synchronously-entered call frame (the
@@ -645,6 +674,7 @@ impl Interpreter {
         fid: u32,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         let count = self.note_jit_function_entry(fid);
+        self.maybe_refresh_successful_baseline(context, fid);
         // Single-entry compiled-code cache. A hot synchronous re-entry (Array
         // callbacks, comparators, `@@iterator` drives) resolves the SAME callee
         // every call; this skips the `jit_code` FxHashMap lookup + `Arc` clone
@@ -770,8 +800,18 @@ impl Interpreter {
         }
         // Compilation order determines code-object ids and artifact ordering.
         // Keep it stable even though the aggregation map is intentionally fast.
-        baseline_candidates.sort_unstable();
+        // Callees are commonly assigned after their callers by source
+        // lowering. Refresh higher ids first so their new entry generations
+        // are available when a lower-id caller rebuilds in this cold batch.
+        baseline_candidates.sort_unstable_by(|left, right| right.cmp(left));
         for fid in baseline_candidates {
+            // Generated calls never revisit the ordinary entry resolver while
+            // their caller stays native. Drive the same one-shot successful
+            // baseline refresh here, after entry-cell feedback has been
+            // reconciled and no native activation remains published.
+            if self.feedback_refresh_due(context, fid) {
+                let _ = self.resolve_jit_code_for_fid(context, fid);
+            }
             let _ = self.resolve_optimized_code_for_fid(context, fid);
         }
     }
@@ -789,6 +829,73 @@ impl Interpreter {
     #[inline]
     pub(crate) fn note_jit_function_entry(&mut self, fid: u32) -> u32 {
         self.note_jit_function_entries(fid, 1)
+    }
+
+    /// Whether `fid` has accumulated enough successful entry feedback for its
+    /// one-shot baseline rebuild.
+    #[inline]
+    fn feedback_refresh_due(&self, context: &ExecutionContext, fid: u32) -> bool {
+        let Some(pending_targets) = self.jit_pending_direct_targets.get(&fid) else {
+            return false;
+        };
+        !self.jit_feedback_refresh_attempted.contains(&fid)
+            && self.jit_call_counts.get(&fid).copied().unwrap_or(0)
+                >= Self::JIT_FEEDBACK_REFRESH_THRESHOLD
+            && matches!(self.jit_code.get(&fid), Some(Some(code))
+                if self.jit_code_registry.is_current_for_entry(code.as_ref())
+                    && !code.osr_only())
+            && pending_targets.iter().all(|target_fid| {
+                context
+                    .exec_function(*target_fid)
+                    .and_then(|target| self.current_direct_callee_plan(target))
+                    .is_some()
+            })
+    }
+
+    /// Rebuild one successful hot baseline generation against mature call
+    /// feedback. This policy is independent from bail/deopt recovery: it is
+    /// deliberately one-shot and never consumes the unhealthy-generation
+    /// budget.
+    fn maybe_refresh_successful_baseline(&mut self, context: &ExecutionContext, fid: u32) {
+        if !self.feedback_refresh_due(context, fid) {
+            return;
+        }
+        self.jit_feedback_refresh_attempted.insert(fid);
+        self.jit_pending_direct_targets.remove(&fid);
+        self.jit_runtime_stats.feedback_refreshes =
+            self.jit_runtime_stats.feedback_refreshes.saturating_add(1);
+        self.invalidate_jit_baseline_generation(fid);
+    }
+
+    /// Unlink only `fid`'s current template entry generation.
+    ///
+    /// Baseline feedback refresh is an entry-code replacement, not a function
+    /// invalidation. Optimizing entry/OSR objects have independent feedback and
+    /// remain installed so a hot loop does not fall back to template merely
+    /// because direct-call targets matured later.
+    fn invalidate_jit_baseline_generation(&mut self, fid: u32) {
+        let code = self.jit_code.remove(&fid).and_then(|slot| slot);
+        if let Some(code) = code {
+            let affected = self
+                .jit_code_registry
+                .invalidate_code_object(code.metadata().id);
+            self.jit_runtime_stats.caller_invalidations =
+                self.jit_runtime_stats.caller_invalidations.saturating_add(
+                    affected
+                        .iter()
+                        .filter(|&&affected_fid| affected_fid != fid)
+                        .count() as u64,
+                );
+        }
+        if self
+            .jit_code_cache
+            .as_ref()
+            .is_some_and(|(cached_fid, _)| *cached_fid == fid)
+        {
+            self.jit_code_cache = None;
+        }
+        self.jit_entry_osr_only.remove(&fid);
+        self.jit_entry_bail_counts.remove(&fid);
     }
 
     /// Run compiled `code` over the rooted register window of frame `top_idx`.

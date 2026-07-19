@@ -1,6 +1,7 @@
 //! VM re-entry stubs for exceptions and non-call runtime operations.
 //!
 //! # Contents
+//! - Cold stable function-entry repair for generated calls.
 //! - Propagated-throw resumption in live compiled callers.
 //! - Reentrant construction and closure/function creation.
 //! - Reentrant equality, typed numeric-family, and unary-coercion completion.
@@ -30,6 +31,26 @@ pub(crate) fn park_jit_error(ctx: &mut JitCtx, err: VmError) {
     unsafe {
         *ctx.error = Some(err);
     }
+}
+
+/// Repair one empty stable generated-call function cell.
+///
+/// This transition cannot compile, allocate, or reenter JavaScript. It only
+/// asks the isolate registry to republish an already-installed fallback
+/// generation and returns that generation-cell address.
+pub(crate) extern "C" fn jit_resolve_direct_entry_stub(
+    ctx: *mut JitCtx,
+    function_entry_addr: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let Some(activation) = ctx.checked_activation() else {
+        return 0;
+    };
+    // SAFETY: the compiled activation owns exclusive isolate execution for the
+    // dynamic extent of this no-allocation resolver call.
+    let vm = unsafe { &mut *activation.vm_ptr() };
+    vm.jit_resolve_direct_entry(function_entry_addr)
 }
 
 /// Try to deliver an uncaught compiled-callee throw to the current compiled
@@ -332,6 +353,32 @@ pub(crate) extern "C" fn jit_spread_call_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    if opcode as u8 == otter_bytecode::Op::CallMethodValue as u8 {
+        let lane = |packed: u64, index: usize| ((packed >> (index * 16)) & 0xffff) as u16;
+        let argc = lane(arg0, 2) as usize;
+        let mut argument_regs = smallvec::SmallVec::<[u16; 4]>::with_capacity(argc);
+        for index in 0..argc {
+            argument_regs.push(lane(arg1, index));
+        }
+        let result = (|| {
+            let mut call = ctx.runtime_call()?;
+            call.call_method(lane(arg0, 0), lane(arg0, 1), arg2 as u32, &argument_regs)
+        })();
+        return match result {
+            Ok(()) => 0,
+            Err(err) => match try_resume_caller_throw(ctx, matches!(err, VmError::Uncaught)) {
+                Ok(true) => STATUS_BAILED,
+                Ok(false) => {
+                    park_jit_error(ctx, err);
+                    STATUS_THREW
+                }
+                Err(unwind_err) => {
+                    park_jit_error(ctx, unwind_err);
+                    STATUS_THREW
+                }
+            },
+        };
+    }
     let frame_index = match ctx.materialized_frame_index() {
         Ok(index) => index,
         Err(_) => return STATUS_BAILED,

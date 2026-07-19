@@ -5,6 +5,12 @@
 //! explicit [`otter_gc::GcHeap`] reference so no thread-local heap
 //! lookup can hide a safepoint.
 //!
+//! # Contents
+//! - Dense and sparse indexed storage with array-exotic descriptor state.
+//! - GC-root-aware growth, mutation, bulk-fill, and structural helpers.
+//! - JIT-visible dense base/length caches plus allocation-free plain-slot
+//!   completion used after guarded native element misses.
+//!
 //! # Invariants
 //!
 //! - Low, contiguous indices live in `elements`.
@@ -17,6 +23,8 @@
 //!   descriptor flags, captured JSON source text, and per-instance
 //!   prototype overrides) lives behind one sidecar so plain dense
 //!   arrays keep a small hot body.
+//! - Plain-slot completion never grows storage; it may only replace an existing
+//!   dense slot and always records the generational write barrier.
 //!
 //! # See also
 //!
@@ -636,6 +644,50 @@ pub(crate) fn own_data_element_without_accessors(
         })?;
         if value.is_hole() { None } else { Some(value) }
     })
+}
+
+/// Whether `idx` is one plain dense hole with no receiver-local exotic state.
+///
+/// Prototype observability is deliberately not decided here: callers must
+/// separately prove that inherited indexed accessors cannot answer the hole.
+#[must_use]
+pub(crate) fn is_plain_dense_hole(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> bool {
+    heap.read_payload(arr, |body| {
+        body.exotic.is_none() && body.elements.get(idx).is_some_and(|value| value.is_hole())
+    })
+}
+
+/// Replace one slot in a plain dense array without allocation or key creation.
+///
+/// Existing data slots are always eligible. A hole is eligible only when the
+/// caller has proved that inherited indexed accessors cannot observe the
+/// assignment. `false` leaves the complete `OrdinarySet` path authoritative.
+pub(crate) fn set_plain_dense_slot(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    idx: usize,
+    value: Value,
+    allow_hole: bool,
+) -> bool {
+    let stored = heap.with_payload(arr, |body| {
+        if body.exotic.is_some() {
+            return false;
+        }
+        let Some(slot) = body.elements.get_mut(idx) else {
+            return false;
+        };
+        if slot.is_hole() && !allow_hole {
+            return false;
+        }
+        *slot = value;
+        body.length = body.length.max(idx.saturating_add(1));
+        body.mark_dirty();
+        true
+    });
+    if stored {
+        heap.record_write(arr, &value);
+    }
+    stored
 }
 
 /// Write element at `idx`, extending with the internal

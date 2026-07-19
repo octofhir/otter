@@ -4,11 +4,42 @@
 //! JIT supplies decoded operands and receives semantic results; no VM service
 //! or frame/window representation crosses the boundary.
 
+use smallvec::SmallVec;
+
 use crate::{NumericRuntimeOp, UnaryCoercionOp, UnaryPrimitiveHint, Value, VmError};
 
 use super::{RuntimeCall, RuntimeFrameIdentity};
 
 impl RuntimeCall<'_> {
+    /// Complete a generic method-call guard miss on either physical frame
+    /// representation and commit the result without materializing the caller.
+    pub fn call_method(
+        &mut self,
+        dst: u16,
+        receiver: u16,
+        name_index: u32,
+        argument_regs: &[u16],
+    ) -> Result<(), VmError> {
+        let receiver = self.read(receiver)?;
+        let mut args = SmallVec::with_capacity(argument_regs.len());
+        for &register in argument_regs {
+            args.push(self.read(register)?);
+        }
+        let function_id = self.function_id();
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        let stack = unsafe { &mut *self.stack.as_ptr() };
+        let context = unsafe { self.context.as_ref() };
+        let result = vm.jit_runtime_method_call_values(
+            context,
+            stack,
+            function_id,
+            receiver,
+            name_index,
+            args,
+        )?;
+        self.write(dst, result)
+    }
+
     /// Load one realm builtin error constructor.
     pub fn load_builtin_error(&mut self, dst: u16, kind_index: u32) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };

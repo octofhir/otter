@@ -457,6 +457,13 @@ pub struct JitRuntimeStats {
     /// Compiler-generated stack-frame calls that cold-deoptimized and resumed
     /// through the interpreter.
     pub generated_call_deopts: u64,
+    /// Generated callers invalidated because a callee generation changed.
+    /// Stable function entry cells keep this at zero for tier publication.
+    pub caller_invalidations: u64,
+    /// Stable function-entry probes that had to enter the cold resolver.
+    pub cold_entry_resolver_misses: u64,
+    /// Call-family transitions from generated code into Rust completion paths.
+    pub jit_to_rust_call_transitions: u64,
     /// Generated template-tier callee entries.
     pub generated_template_entries: u64,
     /// Generated template-tier callees that returned normally.
@@ -475,6 +482,11 @@ pub struct JitRuntimeStats {
     pub generated_optimizing_throws: u64,
     /// Function-entry compile attempts across native tiers.
     pub compile_attempts: u64,
+    /// Successfully installed native code generations across tiers.
+    pub code_generations: u64,
+    /// Successful hot baseline generations rebuilt once after call feedback and
+    /// callee entry generations have had time to mature.
+    pub feedback_refreshes: u64,
     /// Loop-OSR compile/entry attempts at threshold crossings.
     pub osr_attempts: u64,
     /// JIT property/method/element/global/upvalue runtime stub calls.
@@ -831,6 +843,12 @@ pub struct Interpreter {
     /// as global object properties. Cells start as the TDZ hole.
     pub(crate) global_lexicals:
         rustc_hash::FxHashMap<Box<str>, (crate::UpvalueCell, /* is_const */ bool)>,
+    /// Monotonic identity of the global declarative record's name set.
+    ///
+    /// Generated reads of object-record globals guard this live cell because a
+    /// later script/eval lexical declaration may shadow an otherwise
+    /// shape-stable global-object property.
+    pub(crate) global_lexical_epoch: u64,
     /// Per-load-site cache of resolved global declarative-record cells, keyed by
     /// `(function_id, name_constant_index)`. A global lexical binding's cell is
     /// stable for the realm's lifetime (lexical bindings are never deleted), so
@@ -840,6 +858,13 @@ pub struct Interpreter {
     /// roots traced alongside [`Self::global_lexicals`]; only lexical hits are
     /// cached, so object-record globals never produce a stale entry.
     pub(crate) global_lexical_load_ic: rustc_hash::FxHashMap<(u32, u32), crate::UpvalueCell>,
+    /// Per-load-site cache of own data slots on the global object. A matching
+    /// hidden-class identity proves the slot still names the same data
+    /// property; structural mutation changes the shape and global lexical
+    /// declaration clears the table because the declarative record then
+    /// shadows an existing object property.
+    pub(crate) global_object_load_ic:
+        rustc_hash::FxHashMap<(u32, u32), crate::global_ops::GlobalObjectLoadCache>,
     /// Depth of active §16.2.1.4 Evaluate calls. Dynamic imports that
     /// land while this is non-zero defer their target's evaluation to
     /// a host job so they cannot preempt the running DFS.
@@ -926,6 +951,16 @@ pub struct Interpreter {
     /// cannot express, and is pinned to the interpreter instead of thrashing
     /// the compiler.
     jit_entry_reopt_counts: rustc_hash::FxHashMap<u32, u32>,
+    /// Function ids whose one-shot successful-baseline refresh has been
+    /// attempted. Unlike bail-driven recompilation, this refresh waits for hot
+    /// call feedback and callee entry generations to mature, then rebuilds the
+    /// caller even when its original generation never failed.
+    jit_feedback_refresh_attempted: rustc_hash::FxHashSet<u32>,
+    /// Entry-generation targets that were semantically eligible but not yet
+    /// installed when a baseline caller last compiled. The successful refresh
+    /// waits until every recorded target is live instead of blindly rebuilding
+    /// leaf functions or publishing another partial caller.
+    jit_pending_direct_targets: rustc_hash::FxHashMap<u32, rustc_hash::FxHashSet<u32>>,
     /// OSR targets that bailed, had no trampoline, or whose function is
     /// uncompilable; OSR is not retried for them. Keyed by `(function_id,
     /// loop_header_pc)` so a bail in one loop disables only *that* loop header,

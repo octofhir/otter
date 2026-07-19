@@ -668,6 +668,12 @@ struct ExoticSlots {
 /// JIT reads the shape handle here for the monomorphic IC guard.
 pub(crate) const OBJECT_BODY_SHAPE_OFFSET: usize = std::mem::offset_of!(ObjectBody, shape);
 
+/// Byte offset of the structural identity used when [`ObjectBody::shape`] is
+/// null. Generated dictionary-mode guards compare this word after proving the
+/// ordinary shape handle is absent.
+pub(crate) const OBJECT_BODY_DICTIONARY_SHAPE_ID_OFFSET: usize =
+    std::mem::offset_of!(ObjectBody, dictionary_shape_id);
+
 /// Byte offset of the string-keyed value slab pointer within an [`ObjectBody`]
 /// payload. The JIT reads this pointer after its shape guard and then indexes
 /// the contiguous slab by `slot * size_of::<CompressedValue>()` (4 bytes),
@@ -697,6 +703,7 @@ pub(crate) const OBJECT_BODY_SLAB_LEN_OFFSET: usize = std::mem::offset_of!(Objec
 // these literals deliberately, in lockstep with the JIT, when the body changes.
 const _: () = assert!(OBJECT_BODY_SHAPE_OFFSET == 0);
 const _: () = assert!(OBJECT_BODY_VALUES_PTR_OFFSET == 8);
+const _: () = assert!(OBJECT_BODY_DICTIONARY_SHAPE_ID_OFFSET == 40);
 const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET == 52);
 const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET == 72);
 const _: () = assert!(OBJECT_BODY_SLAB_LEN_OFFSET == 80);

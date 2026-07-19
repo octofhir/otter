@@ -376,6 +376,10 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_module_op_stub as *const () as usize,
         ),
         binding(
+            abi::STUB_JIT_RESOLVE_DIRECT_ENTRY,
+            jit_resolve_direct_entry_stub as *const () as usize,
+        ),
+        binding(
             abi::STUB_JIT_RESOLVE_THREW,
             jit_resolve_threw_stub as *const () as usize,
         ),

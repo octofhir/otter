@@ -39,6 +39,10 @@ pub struct VmThread {
     /// Address of the back-edge fuel counter, decremented inline per
     /// back-edge; reaching zero re-enters the poll stub.
     pub backedge_fuel_cell: u64,
+    /// Address of the isolate's global-declarative-record epoch. Generated
+    /// global-object reads compare the live epoch with their compile snapshot
+    /// before trusting a shape-matched own-data slot.
+    pub global_lexical_epoch_cell: u64,
 }
 
 impl VmThread {
@@ -53,6 +57,7 @@ impl VmThread {
             interrupt_cell: 0,
             gc_heap: 0,
             backedge_fuel_cell: 0,
+            global_lexical_epoch_cell: 0,
         }
     }
 }
@@ -299,7 +304,7 @@ impl NativeFrame {
     }
 }
 
-const _: [(); 56] = [(); std::mem::size_of::<VmThread>()];
+const _: [(); 64] = [(); std::mem::size_of::<VmThread>()];
 const _: [(); 8] = [(); std::mem::align_of::<VmThread>()];
 const _: [(); 16] = [(); std::mem::size_of::<VmFrameHeader>()];
 const _: [(); 64] = [(); std::mem::size_of::<NativeFrame>()];
@@ -308,6 +313,7 @@ const _: [(); 0] = [(); std::mem::offset_of!(VmThread, current_frame)];
 const _: [(); 8] = [(); std::mem::offset_of!(VmThread, current_code_object_id)];
 const _: [(); 40] = [(); std::mem::offset_of!(VmThread, gc_heap)];
 const _: [(); 48] = [(); std::mem::offset_of!(VmThread, backedge_fuel_cell)];
+const _: [(); 56] = [(); std::mem::offset_of!(VmThread, global_lexical_epoch_cell)];
 const _: [(); 8] = [(); std::mem::offset_of!(VmFrameHeader, pc)];
 const _: [(); 12] = [(); std::mem::offset_of!(VmFrameHeader, register_count)];
 const _: [(); 15] = [(); std::mem::offset_of!(VmFrameHeader, flags)];

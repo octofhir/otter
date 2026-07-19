@@ -5,6 +5,8 @@
 //!   whole-isolate executable ownership and generation snapshots.
 //! - `compile_jit_function` and cold feedback baking into the instruction view
 //!   (property/object-literal/global-lexical/inline-callee tables).
+//! - One-level call-graph tiering for hot observed callees that need an entry
+//!   generation before the caller's stable direct-link snapshot is sealed.
 //! - Call/method target profiling and reoptimization eviction.
 //!
 //! # Invariants
@@ -13,6 +15,8 @@
 //! through a runtime stub instead.
 //! Compiled code is published only after the registry accepts its metadata and
 //! exact isolate-epoch dependency snapshot.
+//! Eager direct-target compilation is bounded to one edge level; recursively
+//! compiling an observed call graph is forbidden.
 #![allow(unused_imports)]
 use crate::*;
 
@@ -100,6 +104,11 @@ impl Interpreter {
                     .is_some()
             })
             .count();
+        let global_load_sites = view
+            .instructions
+            .iter()
+            .filter(|instruction| instruction.op(&view.code_block) == Op::LoadGlobalOrThrow)
+            .count();
         let event = jit_debug::JitDebugEvent::CompilePrepared {
             function_id: fid,
             function_name,
@@ -109,8 +118,10 @@ impl Interpreter {
             parameter_count: u32::try_from(view.code_block.param_count).unwrap_or(u32::MAX),
             call_feedback_sites: u32::try_from(call_feedback_sites).unwrap_or(u32::MAX),
             method_feedback_sites: u32::try_from(method_feedback_sites).unwrap_or(u32::MAX),
+            global_load_sites: u32::try_from(global_load_sites).unwrap_or(u32::MAX),
             global_lexical_loads: u32::try_from(view.global_lexical_loads.len())
                 .unwrap_or(u32::MAX),
+            global_object_loads: u32::try_from(view.global_object_loads.len()).unwrap_or(u32::MAX),
             direct_callees: u32::try_from(view.direct_callees.len()).unwrap_or(u32::MAX),
             direct_method_sites: u32::try_from(view.direct_methods.len()).unwrap_or(u32::MAX),
             direct_method_targets: u32::try_from(
@@ -265,13 +276,11 @@ impl Interpreter {
     /// Replace `fid`'s current native generation with one optimizing-tier body
     /// compiled from the latest feedback snapshot.
     ///
-    /// Promotion first unlinks every current generation for `fid` and every
-    /// generated caller that embeds an exact edge to it. This keeps one
-    /// authoritative entry generation: a caller recompiled after promotion
-    /// binds the optimizer directly instead of continuing through a stale
-    /// baseline cell. Unlinking before snapshotting also prevents a newly
-    /// compiled body from retaining a transitive dependency cycle through the
-    /// generation being replaced.
+    /// Compilation leaves the current baseline generation installed. A
+    /// successful entry-capable optimizer is published through the function's
+    /// stable entry cell; generated callers observe it on their next entry
+    /// without recompilation. A declined optimizer leaves the baseline target
+    /// untouched.
     ///
     /// Unsupported functions return `None`; hotness survives invalidation, so
     /// the normal resolver can immediately rebuild a baseline body.
@@ -285,16 +294,6 @@ impl Interpreter {
         if !hook.optimizing_tier_enabled() {
             return None;
         }
-        if self
-            .jit_code_registry
-            .has_installed_generation_dependents(fid)
-        {
-            let eligibility_snapshot = context.jit_compile_snapshot(fid)?;
-            if !hook.optimizing_generated_entry_supported(&eligibility_snapshot, osr_pc) {
-                return None;
-            }
-        }
-        self.invalidate_jit_function(fid);
         let mut snapshot = context.jit_compile_snapshot(fid)?;
         self.publish_property_feedback_for_view(&snapshot);
         // The optimizing tier consumes the same baked compile inputs as the
@@ -309,6 +308,7 @@ impl Interpreter {
             context,
             fid,
             jit_debug::JitDebugTier::Optimizing,
+            false,
         );
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
@@ -354,9 +354,16 @@ impl Interpreter {
                 }
                 self.jit_next_code_object_id += 1;
                 self.jit_code_registry.retire_unreferenced();
-                self.jit_code_registry
-                    .install_compiled(code_object_id, code.clone(), &function)
-                    .then_some(code)
+                let installed = self.jit_code_registry.install_compiled(
+                    code_object_id,
+                    code.clone(),
+                    &function,
+                );
+                if installed {
+                    self.jit_runtime_stats.code_generations =
+                        self.jit_runtime_stats.code_generations.saturating_add(1);
+                }
+                installed.then_some(code)
             }
             _ => None,
         }
@@ -425,12 +432,30 @@ impl Interpreter {
         fid: u32,
         osr_pc: Option<u32>,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+        self.compile_jit_function_with_direct_targets(context, fid, osr_pc, true)
+    }
+
+    /// Compile one template body, optionally materializing one level of hot
+    /// direct-target entry generations before the caller snapshot is sealed.
+    fn compile_jit_function_with_direct_targets(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+        osr_pc: Option<u32>,
+        eager_direct_targets: bool,
+    ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         let mut view = context.jit_compile_snapshot(fid)?;
         self.publish_property_feedback_for_view(&view);
         Self::bake_typed_array_layout(&mut view);
         Self::bake_string_layout(&mut view);
         self.bake_global_lexical_loads(&mut view, context, fid);
-        self.bake_inline_callees(&mut view, context, fid, jit_debug::JitDebugTier::Template);
+        self.bake_inline_callees(
+            &mut view,
+            context,
+            fid,
+            jit_debug::JitDebugTier::Template,
+            eager_direct_targets,
+        );
         self.bake_collection_leaf_methods(&mut view);
         self.bake_collection_alloc_methods(&mut view);
         self.bake_array_methods(&mut view);
@@ -483,9 +508,16 @@ impl Interpreter {
                 // `Arc`, while executing native generations hold an entry-cell
                 // lease. Only invalid code with neither kind of owner retires.
                 self.jit_code_registry.retire_unreferenced();
-                self.jit_code_registry
-                    .install_compiled(code_object_id, code.clone(), &function)
-                    .then_some(code)
+                let installed = self.jit_code_registry.install_compiled(
+                    code_object_id,
+                    code.clone(),
+                    &function,
+                );
+                if installed {
+                    self.jit_runtime_stats.code_generations =
+                        self.jit_runtime_stats.code_generations.saturating_add(1);
+                }
+                installed.then_some(code)
             }
             _ => None,
         }
@@ -620,43 +652,62 @@ impl Interpreter {
         self.invalidate_jit_function(fid);
     }
 
-    /// Resolve the best current entry-capable code generation for one baked
-    /// compiler-native plain call.
+    /// Resolve the stable entry cell for one compiler-native call.
     ///
-    /// Optimizing code wins only when it advertises safe stack-owned cold
-    /// deoptimization; otherwise the current baseline entry is used. OSR-only
-    /// bodies are never valid function entries, and registry validation must
-    /// return a stable entry-cell plan for the exact generation.
-    fn current_direct_callee_plan(&self, function: &CodeBlock) -> Option<jit::JitDirectCallPlan> {
-        let candidates = [
-            self.jit_optimized_code
-                .get(&function.id)
-                .and_then(Option::as_ref),
-            self.jit_code.get(&function.id).and_then(Option::as_ref),
-        ];
-        for code in candidates.into_iter().flatten() {
-            if code.osr_only() {
-                continue;
-            }
-            if let Some(plan) = self
-                .jit_code_registry
-                .direct_call_plan(function, code.as_ref())
-                .filter(|plan| plan.generated_stack_frame_bytes.is_some())
-            {
-                return Some(plan);
-            }
-        }
-        None
+    /// The registry publishes an optimizing generation only when it advertises
+    /// safe stack-owned cold deoptimization; otherwise the current baseline
+    /// remains selected. The returned function-cell address survives every
+    /// later generation replacement.
+    pub(crate) fn current_direct_callee_plan(
+        &self,
+        function: &CodeBlock,
+    ) -> Option<jit::JitDirectCallPlan> {
+        self.jit_code_registry.direct_call_plan(function)
     }
 
-    /// Bake direct reads for global-declarative bindings already owned by the
-    /// isolate's permanent lexical environment.
+    /// Ensure one hot feedback target has an entry-capable baseline generation.
+    ///
+    /// The caller compile may run before a loop-heavy callee reaches the
+    /// function-entry threshold: that callee can already own optimizing OSR
+    /// code while every call boundary still returns to Rust. Compile at most
+    /// this one target level, then seal the caller against its stable function
+    /// cell. Nested eager planning is disabled in the target compile to keep
+    /// compile work bounded by the caller's observed edge set.
+    fn ensure_direct_callee_plan(
+        &mut self,
+        context: &ExecutionContext,
+        function: &CodeBlock,
+        eager: bool,
+    ) -> Option<jit::JitDirectCallPlan> {
+        if let Some(plan) = self.current_direct_callee_plan(function) {
+            return Some(plan);
+        }
+        if !eager || self.jit_code.contains_key(&function.id) {
+            return None;
+        }
+        self.jit_runtime_stats.compile_attempts =
+            self.jit_runtime_stats.compile_attempts.saturating_add(1);
+        let compiled =
+            self.compile_jit_function_with_direct_targets(context, function.id, None, false);
+        self.jit_code.insert(function.id, compiled.clone());
+        self.jit_code_cache = None;
+        if compiled.is_some() {
+            self.jit_entry_osr_only.remove(&function.id);
+        }
+        self.current_direct_callee_plan(function)
+    }
+
+    /// Bake direct reads for global-declarative bindings and guarded own-data
+    /// slots already owned by the isolate's global object record.
     ///
     /// Global lexical cells are old-space, non-moving GC objects rooted for the
     /// lifetime of the binding. Their identity cannot be replaced by later
     /// declarations, while their contained `Value` remains mutable. Generated
     /// code may therefore read the live cell directly; a TDZ hole still enters
     /// the canonical `LoadGlobalOrThrow` stub to construct the named error.
+    /// Object-record reads additionally guard the live declarative-record epoch
+    /// and global-object shape, so later eval/script lexicals and structural
+    /// mutations miss before reading the baked slot.
     fn bake_global_lexical_loads(
         &self,
         view: &mut jit::JitCompileSnapshot,
@@ -673,13 +724,35 @@ impl Interpreter {
             let Some(name) = context.string_constant_str_for_function(fid, name_index) else {
                 continue;
             };
-            let Some(&(cell, _)) = self.global_lexicals.get(name) else {
+            if let Some(&(cell, _)) = self.global_lexicals.get(name) {
+                view.global_lexical_loads.insert(
+                    instruction.byte_pc,
+                    jit::JitGlobalLexicalLoad {
+                        cell_offset: cell.offset(),
+                    },
+                );
+                continue;
+            }
+            let (Some(hit), crate::object::PropertyLookup::Data { .. }) =
+                crate::object::lookup_own_slot(self.global_this, &self.gc_heap, name)
+            else {
                 continue;
             };
-            view.global_lexical_loads.insert(
+            let shape = crate::object::shape(self.global_this, &self.gc_heap);
+            let (shape, dictionary) = if shape.is_null() {
+                (hit.shape_id.raw(), true)
+            } else {
+                (u64::from(shape.offset()), false)
+            };
+            const SLOT_BYTES: u32 =
+                std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
+            view.global_object_loads.insert(
                 instruction.byte_pc,
-                jit::JitGlobalLexicalLoad {
-                    cell_offset: cell.offset(),
+                jit::JitGlobalObjectLoad {
+                    shape,
+                    dictionary,
+                    value_byte: u32::from(hit.slot) * SLOT_BYTES,
+                    global_lexical_epoch: self.global_lexical_epoch,
                 },
             );
         }
@@ -701,7 +774,9 @@ impl Interpreter {
         context: &ExecutionContext,
         fid: u32,
         tier: jit_debug::JitDebugTier,
+        eager_direct_targets: bool,
     ) {
+        let mut pending_direct_targets = rustc_hash::FxHashSet::default();
         let call_sites: Vec<_> = view
             .instructions
             .iter()
@@ -815,7 +890,9 @@ impl Interpreter {
                         count: callee.own_upvalue_count,
                     },
                 }
-            } else if let Some(plan) = self.current_direct_callee_plan(callee) {
+            } else if let Some(plan) =
+                self.ensure_direct_callee_plan(context, callee, eager_direct_targets)
+            {
                 debug_assert_eq!(plan.function_id, callee_fid);
                 view.direct_callees
                     .insert(call_byte_pc, jit::JitDirectCallee { plan });
@@ -833,6 +910,7 @@ impl Interpreter {
                     this_mode: plan.this_mode,
                 }
             } else {
+                pending_direct_targets.insert(callee_fid);
                 jit_debug::JitDirectCallPlanOutcome::Rejected {
                     reason: jit_debug::JitDirectCallRejectionReason::NoEntryGeneration,
                 }
@@ -934,6 +1012,7 @@ impl Interpreter {
                     target,
                     u32::try_from(target_index).unwrap_or(u32::MAX),
                     target_count,
+                    eager_direct_targets,
                 ) {
                     Ok(method) => {
                         let plan = method.callee.plan;
@@ -959,10 +1038,18 @@ impl Interpreter {
                             },
                         )
                     }
-                    Err(reason) => (
-                        target.method_fid,
-                        jit_debug::JitDirectCallPlanOutcome::Rejected { reason },
-                    ),
+                    Err(reason) => {
+                        if matches!(
+                            reason,
+                            jit_debug::JitDirectCallRejectionReason::NoEntryGeneration
+                        ) {
+                            pending_direct_targets.insert(target.method_fid);
+                        }
+                        (
+                            target.method_fid,
+                            jit_debug::JitDirectCallPlanOutcome::Rejected { reason },
+                        )
+                    }
                 };
                 self.record_jit_direct_call_plan(
                     jit::JitDirectCallKind::Method,
@@ -1000,6 +1087,16 @@ impl Interpreter {
                 }
             }
         }
+        if tier == jit_debug::JitDebugTier::Template
+            && !self.jit_feedback_refresh_attempted.contains(&fid)
+        {
+            if pending_direct_targets.is_empty() {
+                self.jit_pending_direct_targets.remove(&fid);
+            } else {
+                self.jit_pending_direct_targets
+                    .insert(fid, pending_direct_targets);
+            }
+        }
     }
 
     /// Materialize one exact receiver/prototype/method-slot identity guard.
@@ -1034,12 +1131,13 @@ impl Interpreter {
     /// fresh capture-cell allocation, and already have one entry-capable native
     /// generation. Inherited closure captures are consumed directly.
     fn bake_one_direct_method(
-        &self,
+        &mut self,
         context: &ExecutionContext,
         caller_fid: u32,
         target: &PolyMethodTarget,
         target_index: u32,
         target_count: u32,
+        eager_direct_targets: bool,
     ) -> Result<jit::JitDirectMethod, jit_debug::JitDirectCallRejectionReason> {
         let method = context
             .exec_function(target.method_fid)
@@ -1066,7 +1164,7 @@ impl Interpreter {
             .bake_method_guard(target)
             .ok_or(jit_debug::JitDirectCallRejectionReason::MethodGuardUnavailable)?;
         let plan = self
-            .current_direct_callee_plan(method)
+            .ensure_direct_callee_plan(context, method, eager_direct_targets)
             .ok_or(jit_debug::JitDirectCallRejectionReason::NoEntryGeneration)?;
         debug_assert_eq!(plan.function_id, target.method_fid);
         Ok(jit::JitDirectMethod {

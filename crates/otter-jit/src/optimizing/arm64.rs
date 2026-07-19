@@ -8,7 +8,8 @@
 //! - Cooperative back-edge polling with loop-header bail writeback.
 //! - Precise live-tagged GC safepoints around element, property, global,
 //!   comparison, and method-call transitions.
-//! - Direct live-value reads from baked global lexical cells.
+//! - Direct live-value reads from baked global lexical cells and guarded
+//!   global-object property records.
 //! - Baked stable-entry plain and method calls with stack-owned rooted callee
 //!   frames.
 //! - Guarded numeric fast paths for source-lowered coercion scaffolding.
@@ -56,10 +57,14 @@
 //! - A baked global lexical address names a permanent old-space cell. Generated
 //!   code loads the cell's current value and uses the canonical transition for
 //!   TDZ holes.
+//! - A baked global-object load proves the realm epoch, dictionary shape, and
+//!   property slot before reading its live value; structural drift uses the
+//!   canonical transition.
 //! - A non-spliced call enters only its VM-baked native generation. Method
 //!   edges additionally prove receiver/prototype/slot identity in generated
-//!   code. Missing targets and every pre-entry guard or lease failure take the
-//!   caller's exact deopt exit.
+//!   code. A method guard-chain miss completes through the canonical
+//!   `GetMethod + Call` transition; plain-call misses and native-entry lease
+//!   failures take the caller's exact deopt exit.
 //!   Poll slow paths still bail so the interpreter owns interrupt/budget handling.
 //!
 //! # See also
@@ -80,8 +85,9 @@ use otter_vm::native_abi::{
     FrameMap, NO_FRAME_STATE, RuntimeStubDescriptor, STUB_JIT_BACKEDGE_POLL, STUB_JIT_CONSTRUCT,
     STUB_JIT_DEOPT_REIFY_FRAME, STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_LOAD_ELEMENT,
     STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROPERTY, STUB_JIT_LOAD_UPVALUE, STUB_JIT_LOOSE_EQ,
-    STUB_JIT_MATH_CALL, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY, STUB_JIT_STORE_UPVALUE,
-    STUB_JIT_STORE_UPVALUE_CHECKED, STUB_JIT_WRITE_BARRIER, SafepointId, SafepointRecord,
+    STUB_JIT_MATH_CALL, STUB_JIT_SPREAD_CALL_OP, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY,
+    STUB_JIT_STORE_UPVALUE, STUB_JIT_STORE_UPVALUE_CHECKED, STUB_JIT_WRITE_BARRIER, SafepointId,
+    SafepointRecord,
 };
 use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG};
 
@@ -104,13 +110,15 @@ use crate::{
         relocation::{PropertyIcAccess, RelocationCapture, RelocationTarget},
     },
     entry::{
-        CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, IC_WAYS, MAX_METHOD_ARGS, NATIVE_FRAME_OFFSET,
-        NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_THIS_OFFSET,
+        CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, GLOBAL_THIS_OFFSET_PTR_OFFSET, IC_WAYS,
+        MAX_METHOD_ARGS, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
+        NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_THIS_OFFSET,
         NATIVE_FRAME_UPVALUE_BASE_OFFSET, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, STATUS_BAILED,
         STATUS_RETURNED, STATUS_THREW, THREAD_OFFSET, TransitionTable, Unsupported, VALUE_FALSE,
         VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED,
         VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
-        VM_THREAD_INTERRUPT_CELL_OFFSET, WhiskerIcCell, pack_method_arg_regs,
+        VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET, WhiskerIcCell,
+        pack_method_arg_regs,
     },
     ir::{
         cfg::{BlockId, ControlFlowGraph, Terminator},
@@ -240,6 +248,8 @@ struct EmissionPlan<'a> {
     load_global_entry: ResolvedRuntimeEntry,
     loose_eq_entry: ResolvedRuntimeEntry,
     construct_entry: ResolvedRuntimeEntry,
+    /// Completes a method-call guard miss through canonical `GetMethod + Call`.
+    method_call_entry: ResolvedRuntimeEntry,
     /// Rebuilds a spliced callee's interpreter frame at a deopt exit.
     reify_frame_entry: ResolvedRuntimeEntry,
     /// Dispatches a `Math.<method>` intrinsic through the window transition.
@@ -248,6 +258,8 @@ struct EmissionPlan<'a> {
     poll_entry: ResolvedRuntimeEntry,
     /// Resumes an already-entered generated stack callee after native bailout.
     deopt_stack_call_entry: ResolvedRuntimeEntry,
+    /// Repairs an empty stable function-entry cell from installed generations.
+    resolve_direct_entry: ResolvedRuntimeEntry,
     /// Reads one captured binding into a window slot; TDZ reads throw.
     load_upvalue_entry: ResolvedRuntimeEntry,
     /// Writes one captured binding with the generational barrier.
@@ -268,7 +280,6 @@ struct EmissionPlan<'a> {
 struct OptimizedEmission {
     code: CompiledCode,
     osr_entries: BTreeMap<u32, usize>,
-    dependencies: BTreeMap<u32, u64>,
     direct_call_events: Option<BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
     code_map: Option<CodeMapCapture>,
     relocations: RelocationCapture,
@@ -379,6 +390,10 @@ pub(super) fn compile_with_artifacts(
                 STUB_JIT_CONSTRUCT,
                 transitions.variadic_entry(STUB_JIT_CONSTRUCT),
             ),
+            method_call_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_SPREAD_CALL_OP,
+                transitions.variadic_entry(STUB_JIT_SPREAD_CALL_OP),
+            ),
             reify_frame_entry: ResolvedRuntimeEntry::new(
                 STUB_JIT_DEOPT_REIFY_FRAME,
                 transitions.variadic_entry(STUB_JIT_DEOPT_REIFY_FRAME),
@@ -394,6 +409,10 @@ pub(super) fn compile_with_artifacts(
             deopt_stack_call_entry: ResolvedRuntimeEntry::new(
                 STUB_JIT_DEOPT_STACK_CALL,
                 transitions.entry(STUB_JIT_DEOPT_STACK_CALL),
+            ),
+            resolve_direct_entry: ResolvedRuntimeEntry::new(
+                otter_vm::native_abi::STUB_JIT_RESOLVE_DIRECT_ENTRY,
+                transitions.entry(otter_vm::native_abi::STUB_JIT_RESOLVE_DIRECT_ENTRY),
             ),
             load_upvalue_entry: ResolvedRuntimeEntry::new(
                 STUB_JIT_LOAD_UPVALUE,
@@ -474,14 +493,7 @@ pub(super) fn compile_with_artifacts(
         frame_maps,
         eligibility.element_transitions.bitmap_words,
         emission.osr_entries,
-        emission
-            .dependencies
-            .into_iter()
-            .map(|(function_id, code_object_id)| {
-                otter_vm::native_abi::CodeDependency::code_generation(function_id, code_object_id)
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
+        Box::new([]),
         eligibility.math_call_arguments,
         load_ic_cells,
         store_ic_cells,
@@ -1793,10 +1805,12 @@ fn emit(
         load_global_entry,
         loose_eq_entry,
         construct_entry,
+        method_call_entry,
         reify_frame_entry,
         math_call_entry,
         poll_entry,
         deopt_stack_call_entry,
+        resolve_direct_entry,
         load_upvalue_entry,
         store_upvalue_entry,
         store_upvalue_checked_entry,
@@ -1808,7 +1822,6 @@ fn emit(
     let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
     let mut code_map = capture_artifacts.then(CodeMapCapture::default);
     let mut relocations = RelocationCapture::new(capture_artifacts);
-    let mut code_dependencies = BTreeMap::<u32, u64>::new();
     let mut direct_call_events = capture_events.then(|| {
         let mut events = view
             .direct_callees
@@ -2850,6 +2863,68 @@ fn emit(
                         );
                         emit_store_tagged_location(&mut ops, result_location, 9)?;
                         dynasm!(ops ; .arch aarch64 ; b =>done);
+                    } else if let Some(target) = view.global_object_loads.get(&metadata.byte_pc) {
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr x14, [x20, THREAD_OFFSET]
+                            ; ldr x14, [x14, VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET]
+                            ; cbz x14, =>miss
+                            ; ldr x15, [x14]
+                        );
+                        emit_load_u64(&mut ops, 11, target.global_lexical_epoch);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; cmp x15, x11
+                            ; b.ne =>miss
+                            ; ldr x14, [x20, GLOBAL_THIS_OFFSET_PTR_OFFSET]
+                            ; ldr w12, [x14]
+                        );
+                        emit_load_symbolic_u64(
+                            &mut ops,
+                            &mut relocations,
+                            14,
+                            view.cage_base as u64,
+                            RelocationTarget::GcCageBase,
+                        );
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; add x13, x14, x12
+                            ; ldr w14, [x13, view.object_shape_byte]
+                        );
+                        if target.dictionary {
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; cbnz w14, =>miss
+                                ; ldr x14, [x13, view.object_dictionary_shape_id_byte]
+                            );
+                            emit_load_u64(&mut ops, 11, target.shape);
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; cmp x14, x11
+                                ; b.ne =>miss
+                            );
+                        } else {
+                            emit_load_u64(&mut ops, 11, target.shape);
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; cmp w14, w11
+                                ; b.ne =>miss
+                            );
+                        }
+                        crate::template::arm64::values::emit_slab_base(&mut ops, view, 13, 14);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; cbz x13, =>miss
+                            ; ldr w9, [x13, target.value_byte]
+                        );
+                        crate::template::arm64::values::emit_decompress_slot(
+                            &mut ops,
+                            &mut relocations,
+                            view.cage_base as u64,
+                            miss,
+                        );
+                        emit_store_tagged_location(&mut ops, result_location, 9)?;
+                        dynasm!(ops ; .arch aarch64 ; b =>done);
                     }
                     dynasm!(ops ; .arch aarch64 ; =>miss);
                     emit_materialize_element_transition(
@@ -3024,6 +3099,9 @@ fn emit(
                         .expect("eligibility checked method-call destination");
                     let receiver = instruction.input_registers[0];
                     let arg_regs = &instruction.input_registers[1..];
+                    let name = view.instructions[instruction.pc as usize]
+                        .const_index(view.code_block.as_ref(), 2)
+                        .ok_or(Unsupported::OperandShape("optimizing method call name"))?;
                     let frame = &tree.frames[instruction.inline.0 as usize];
                     let byte_pc = frame
                         .instructions
@@ -3125,21 +3203,12 @@ fn emit(
                             view,
                             direct_site,
                             deopt_stack_call_entry.address,
+                            resolve_direct_entry.address,
                             code_map.as_mut(),
                             bail,
                             threw,
                             succeeded,
                         )?;
-                        let previous = code_dependencies.insert(
-                            method.callee.plan.function_id,
-                            method.callee.plan.code_object_id,
-                        );
-                        debug_assert!(
-                            previous.is_none_or(|code_object_id| {
-                                code_object_id == method.callee.plan.code_object_id
-                            }),
-                            "one compile snapshot cannot name two generations for one callee"
-                        );
                         if let Some(events) = direct_call_events.as_mut() {
                             events.insert(
                                 (byte_pc, method.target_index),
@@ -3162,7 +3231,27 @@ fn emit(
                         }
                         dynasm!(ops ; .arch aarch64 ; =>next_target);
                     }
-                    dynasm!(ops ; .arch aarch64 ; b =>bail ; =>succeeded);
+                    let packed_meta = u64::from(dst)
+                        | (u64::from(receiver) << 16)
+                        | ((arg_regs.len() as u64) << 32);
+                    let packed_args = pack_method_arg_regs(arg_regs);
+                    dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+                    emit_load_u64(&mut ops, 1, u64::from(Op::CallMethodValue as u8));
+                    emit_load_u64(&mut ops, 2, packed_meta);
+                    emit_load_u64(&mut ops, 3, packed_args);
+                    emit_load_u64(&mut ops, 4, u64::from(name));
+                    emit_runtime_entry(&mut ops, &mut relocations, 16, method_call_entry);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; cbz x0, =>succeeded
+                        ; cmp x0, STATUS_BAILED as u32
+                        ; b.eq =>bail
+                        ; cmp x0, STATUS_THREW as u32
+                        ; b.eq =>threw
+                        ; b =>threw
+                        ; =>succeeded
+                    );
                     emit_reload_element_transition(
                         &mut ops,
                         allocation,
@@ -3855,19 +3944,12 @@ fn emit(
                                     arguments: arg_regs,
                                 },
                                 deopt_stack_call_entry.address,
+                                resolve_direct_entry.address,
                                 code_map.as_mut(),
                                 bail,
                                 threw,
                                 succeeded,
                             )?;
-                            let previous = code_dependencies
-                                .insert(target.plan.function_id, target.plan.code_object_id);
-                            debug_assert!(
-                                previous.is_none_or(|code_object_id| {
-                                    code_object_id == target.plan.code_object_id
-                                }),
-                                "one compile snapshot cannot name two generations for one callee"
-                            );
                             if let Some(events) = direct_call_events.as_mut() {
                                 events.insert(
                                     (byte_pc, 0),
@@ -4236,7 +4318,6 @@ fn emit(
     Ok(OptimizedEmission {
         code: CompiledCode::new(buffer, entry),
         osr_entries,
-        dependencies: code_dependencies,
         direct_call_events,
         code_map,
         relocations,

@@ -1,16 +1,20 @@
-//! Stable machine-visible code-entry cells.
+//! Stable machine-visible function and generation entry cells.
 //!
-//! A cell separates the address selected by a new compiled call from ownership
-//! of the executable mapping. Invalidation unlinks the address first; active
-//! entrants keep the generation alive until their lease count reaches zero.
-//! The cell itself is never reused for another code generation.
+//! A function cell gives generated callers one permanent linkage address. It
+//! points at the best current generation cell, while each generation cell owns
+//! its exact entry address, frame contract, feedback, and activation lease.
+//! Promotion patches the function cell instead of recompiling dependent callers.
 //!
 //! # Contents
+//! - [`FunctionEntryCell`] — fixed-layout stable dispatch cell per function.
 //! - [`CodeEntryCell`] — fixed-layout per-generation entry and frame metadata.
 //! - [`CodeEntryLease`] — Rust-side implementation of the acquire/recheck/
 //!   release protocol native call trampolines must mirror.
 //!
 //! # Invariants
+//! - A function cell is allocated once and never reused for another function.
+//! - `FunctionEntryCell::generation_cell == 0` selects the cold resolver.
+//! - Publication switches the function cell before the old generation unlinks.
 //! - `entry_addr == 0` means unlinked and permanently rejects new entries.
 //! - An entrant loads the address, increments `active_count`, then rechecks the
 //!   address before branching. Invalidation stores zero before code retirement.
@@ -27,6 +31,51 @@ use std::{
     cell::Cell,
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
+
+/// Stable per-function dispatch cell consumed by generated call linkage.
+#[repr(C, align(8))]
+#[derive(Debug)]
+pub struct FunctionEntryCell {
+    /// Address of the current [`CodeEntryCell`], or zero for the cold resolver.
+    pub generation_cell: AtomicU64,
+    /// Immutable bytecode function identity.
+    pub function_id: u32,
+    /// Formal parameter count shared by every generation of this function.
+    pub param_count: u16,
+    /// Tagged register-window length shared by every generation.
+    pub register_count: u16,
+}
+
+impl FunctionEntryCell {
+    /// Construct one unresolved stable function entry.
+    #[must_use]
+    pub const fn new(function_id: u32, param_count: u16, register_count: u16) -> Self {
+        Self {
+            generation_cell: AtomicU64::new(0),
+            function_id,
+            param_count,
+            register_count,
+        }
+    }
+
+    /// Publish one current generation cell.
+    pub fn publish(&self, generation_cell: u64) {
+        debug_assert_ne!(generation_cell, 0);
+        self.generation_cell
+            .store(generation_cell, Ordering::Release);
+    }
+
+    /// Select the cold resolver until another generation is published.
+    pub fn clear(&self) {
+        self.generation_cell.store(0, Ordering::Release);
+    }
+
+    /// Current generation-cell address.
+    #[must_use]
+    pub fn current_generation(&self) -> u64 {
+        self.generation_cell.load(Ordering::Acquire)
+    }
+}
 
 /// The compiled generation owns precise safepoint metadata.
 pub const CODE_ENTRY_HAS_SAFEPOINTS: u32 = 1 << 0;
@@ -49,6 +98,9 @@ pub struct CodeEntryCell {
     pub register_count: u16,
     /// Static properties of this compiled generation.
     pub flags: u32,
+    /// Persistent native-stack bytes reserved by the target after entry, or
+    /// zero when this generation cannot accept stack-owned generated calls.
+    pub generated_stack_frame_bytes: u32,
     /// Native activations that acquired this generation and have not returned.
     pub active_count: AtomicU32,
     /// Generated native entries observed for tiering/introspection.
@@ -77,6 +129,7 @@ impl CodeEntryCell {
         param_count: u16,
         register_count: u16,
         flags: u32,
+        generated_stack_frame_bytes: u32,
     ) -> Self {
         debug_assert_ne!(entry_addr, 0);
         debug_assert_ne!(code_object_id, 0);
@@ -87,6 +140,7 @@ impl CodeEntryCell {
             param_count,
             register_count,
             flags,
+            generated_stack_frame_bytes,
             active_count: AtomicU32::new(0),
             generated_entries: Cell::new(0),
             generated_returns: Cell::new(0),
@@ -189,24 +243,30 @@ impl Drop for CodeEntryLease<'_> {
     }
 }
 
-const _: [(); 72] = [(); std::mem::size_of::<CodeEntryCell>()];
+const _: [(); 16] = [(); std::mem::size_of::<FunctionEntryCell>()];
+const _: [(); 8] = [(); std::mem::align_of::<FunctionEntryCell>()];
+const _: [(); 0] = [(); std::mem::offset_of!(FunctionEntryCell, generation_cell)];
+const _: [(); 8] = [(); std::mem::offset_of!(FunctionEntryCell, function_id)];
+
+const _: [(); 80] = [(); std::mem::size_of::<CodeEntryCell>()];
 const _: [(); 8] = [(); std::mem::align_of::<CodeEntryCell>()];
 const _: [(); 0] = [(); std::mem::offset_of!(CodeEntryCell, entry_addr)];
 const _: [(); 8] = [(); std::mem::offset_of!(CodeEntryCell, code_object_id)];
 const _: [(); 24] = [(); std::mem::offset_of!(CodeEntryCell, flags)];
-const _: [(); 28] = [(); std::mem::offset_of!(CodeEntryCell, active_count)];
-const _: [(); 32] = [(); std::mem::offset_of!(CodeEntryCell, generated_entries)];
-const _: [(); 40] = [(); std::mem::offset_of!(CodeEntryCell, generated_returns)];
-const _: [(); 48] = [(); std::mem::offset_of!(CodeEntryCell, generated_deopts)];
-const _: [(); 56] = [(); std::mem::offset_of!(CodeEntryCell, generated_throws)];
-const _: [(); 64] = [(); std::mem::offset_of!(CodeEntryCell, generated_bail_streak)];
+const _: [(); 28] = [(); std::mem::offset_of!(CodeEntryCell, generated_stack_frame_bytes)];
+const _: [(); 32] = [(); std::mem::offset_of!(CodeEntryCell, active_count)];
+const _: [(); 40] = [(); std::mem::offset_of!(CodeEntryCell, generated_entries)];
+const _: [(); 48] = [(); std::mem::offset_of!(CodeEntryCell, generated_returns)];
+const _: [(); 56] = [(); std::mem::offset_of!(CodeEntryCell, generated_deopts)];
+const _: [(); 64] = [(); std::mem::offset_of!(CodeEntryCell, generated_throws)];
+const _: [(); 72] = [(); std::mem::offset_of!(CodeEntryCell, generated_bail_streak)];
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn cell() -> CodeEntryCell {
-        CodeEntryCell::new(0x1234, 7, 9, 2, 12, CODE_ENTRY_HAS_SAFEPOINTS)
+        CodeEntryCell::new(0x1234, 7, 9, 2, 12, CODE_ENTRY_HAS_SAFEPOINTS, 64)
     }
 
     #[test]

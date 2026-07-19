@@ -87,7 +87,10 @@ diagnostic counters. The before/after snapshots are outside timed samples,
 include warmup tiering, and retain explicit zeroes so interpreter runs prove
 that no native work occurred. Generated template and optimizing entries,
 returns, throws, and cold deopts remain separate from VM-entered optimizer
-activity.
+activity. Stable-link health is explicit through
+`jit-caller-invalidations`, `jit-cold-entry-resolver-misses`,
+`jit-to-rust-call-transitions`, and `jit-code-generations`; compare those with
+`jit-generated-calls` to distinguish native residency from compile churn.
 
 ```bash
 cargo run --release -p otter-benchmark --features engine \

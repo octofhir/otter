@@ -82,6 +82,7 @@ pub(crate) unsafe fn enter_compiled(
         let interrupt_flag = unsafe { (*vm).jit_interrupt_flag_ptr() };
         let backedge_fuel = unsafe { (*vm).jit_backedge_fuel_ptr() };
         let global_this_offset = unsafe { (*vm).jit_global_this_offset_addr() };
+        let global_lexical_epoch = unsafe { (*vm).jit_global_lexical_epoch_addr() };
         let sync_reentry_depth = unsafe { (*vm).jit_sync_reentry_depth_addr() };
         let sync_reentry_limit = unsafe { (*vm).jit_sync_reentry_limit() };
         let native_stack_bytes = unsafe { (*vm).jit_native_stack_bytes_addr() };
@@ -118,6 +119,7 @@ pub(crate) unsafe fn enter_compiled(
         thread.interrupt_cell = interrupt_flag as u64;
         thread.gc_heap = gc_heap as u64;
         thread.backedge_fuel_cell = backedge_fuel as u64;
+        thread.global_lexical_epoch_cell = global_lexical_epoch as u64;
         let mut error = None;
         let mut ctx = JitCtx {
             thread: std::ptr::addr_of_mut!(thread),

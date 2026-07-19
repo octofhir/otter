@@ -55,6 +55,9 @@ struct RunResult {
     osr_attempts: u64,
     reentrant_transitions: u64,
     generated_calls: u64,
+    caller_invalidations: u64,
+    cold_entry_resolver_misses: u64,
+    code_generations: u64,
 }
 
 struct SplitRunResult {
@@ -81,6 +84,9 @@ fn run(source: &str, name: &str, selection: JitSelection) -> RunResult {
         osr_attempts: stats.jit_osr_attempts,
         reentrant_transitions: stats.jit_reentrant_stub_transitions,
         generated_calls: stats.jit_generated_calls,
+        caller_invalidations: stats.jit_caller_invalidations,
+        cold_entry_resolver_misses: stats.jit_cold_entry_resolver_misses,
+        code_generations: stats.jit_code_generations,
     }
 }
 
@@ -145,6 +151,18 @@ fn assert_whole_function_direct_calls(result: &RunResult) {
     assert!(
         result.generated_calls > 0,
         "fixture must cross a native compiled-call boundary"
+    );
+    assert_eq!(
+        result.caller_invalidations, 0,
+        "stable function entries must preserve generated callers"
+    );
+    assert_eq!(
+        result.cold_entry_resolver_misses, 0,
+        "ordinary tier publication must remain on the generated hot path"
+    );
+    assert!(
+        result.code_generations > 0,
+        "compiled entries must publish generation counters"
     );
 }
 

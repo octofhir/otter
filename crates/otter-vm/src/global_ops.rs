@@ -5,12 +5,15 @@
 //!
 //! # Contents
 //! - `globalThis` load.
-//! - Throwing global binding lookup for ordinary identifier reads.
+//! - Throwing global binding lookup with lexical-cell and guarded global-object
+//!   slot caches for ordinary identifier reads.
 //! - Undefined-returning global lookup for `typeof`.
 //! - Global declaration, initialization, assignment, and deletion helpers.
 //!
 //! # Invariants
 //! - Global properties live on the interpreter's `global_this` object.
+//! - A global-object slot cache is valid only while the object's hidden-class
+//!   identity matches and no later global lexical declaration shadows it.
 //! - Missing throwing lookups surface as `UndefinedIdentifier` so the normal
 //!   error path can synthesize a `ReferenceError`.
 //! - Identifier assignment routes through descriptor-aware object `[[Set]]`;
@@ -26,6 +29,13 @@ use crate::{
     ExecutionContext, Frame, Interpreter, Value, VmError, VmGetOutcome, VmPropertyKey,
     activation_stack::ActivationStack, object, write_register,
 };
+
+/// Guarded own-data slot for one global object-record load site.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GlobalObjectLoadCache {
+    shape_id: object::ShapeId,
+    slot: u16,
+}
 
 impl Interpreter {
     pub(crate) fn run_load_global_this_reg(
@@ -102,6 +112,22 @@ impl Interpreter {
                 (format!("Cannot access '{name}' before initialization")).into(),
             ));
         }
+        // Object-record globals such as constructors and benchmark fixtures
+        // dominate identifier reads in script code. A matching hidden class
+        // proves this own data slot still denotes the same property, so read
+        // its live value without repeating string lookup, `[[HasProperty]]`,
+        // deferred-namespace checks, and the second `[[Get]]` walk.
+        let site = (function_id, name_idx);
+        if let Some(cache) = self.global_object_load_ic.get(&site).copied() {
+            if object::shape_id(self.global_this, &self.gc_heap) == cache.shape_id {
+                return Ok(object::data_value_at(
+                    self.global_this,
+                    &self.gc_heap,
+                    cache.slot,
+                ));
+            }
+            self.global_object_load_ic.remove(&site);
+        }
         let name = context
             .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
@@ -117,6 +143,37 @@ impl Interpreter {
                 ));
             }
             return Ok(value);
+        }
+        let (own_hit, own_lookup) = object::lookup_own_slot(self.global_this, &self.gc_heap, name);
+        match own_lookup {
+            object::PropertyLookup::Data { value, .. } => {
+                if let Some(hit) = own_hit {
+                    self.global_object_load_ic.insert(
+                        site,
+                        GlobalObjectLoadCache {
+                            shape_id: hit.shape_id,
+                            slot: hit.slot,
+                        },
+                    );
+                }
+                return Ok(value);
+            }
+            object::PropertyLookup::Accessor { getter, .. } => {
+                return match getter {
+                    Some(getter) if crate::abstract_ops::is_callable(&getter) => {
+                        let receiver = Value::object(self.global_this);
+                        self.run_callable_sync_rooted(
+                            stack,
+                            context,
+                            &getter,
+                            receiver,
+                            SmallVec::new(),
+                        )
+                    }
+                    _ => Ok(Value::undefined()),
+                };
+            }
+            object::PropertyLookup::Absent => {}
         }
         let receiver = Value::object(self.global_this);
         let key = VmPropertyKey::String(name);
@@ -497,6 +554,8 @@ impl Interpreter {
         }
         let cell = crate::alloc_upvalue(&mut self.gc_heap, Value::hole())?;
         self.global_lexicals.insert(name.into(), (cell, is_const));
+        self.global_lexical_epoch = self.global_lexical_epoch.wrapping_add(1);
+        self.global_object_load_ic.clear();
         frame.advance_pc()?;
         Ok(())
     }

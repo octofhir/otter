@@ -19,7 +19,11 @@
 //!   never re-emits code or runs a second lowering/analysis traversal.
 //! - Relocation normalization scans finalized bytes only when capture is
 //!   enabled. It never changes installed code or serializes resolved
-//!   process-local addresses.
+//!   relocation targets.
+//! - `code-map.json` includes the opt-in capture process's executable mapping
+//!   range so native sampler PCs can be joined to `codeObjectId` and emitted
+//!   regions. The range is runtime-local diagnostic data, never a portable
+//!   identity or executable input.
 //! - A requested bundle is either returned complete or an internal compiler
 //!   invariant fails loudly; release builds never silently drop diagnostics.
 //! - Exact executable bytes remain runtime-local and are never retained by the
@@ -460,17 +464,34 @@ impl CodeMapCapture {
         });
     }
 
-    fn render(self, entry_offset: usize) -> String {
+    fn render(self, entry_offset: usize, runtime_range: Option<(usize, usize)>) -> String {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RuntimeAddressRange {
+            start: String,
+            end_exclusive: String,
+            entry: String,
+        }
+
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Document {
             entry_offset: u64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            runtime_address_range: Option<RuntimeAddressRange>,
             regions: Vec<CodeRegion>,
             osr_entries: Vec<OsrCodeEntry>,
         }
 
+        let runtime_address_range =
+            runtime_range.map(|(start, end_exclusive)| RuntimeAddressRange {
+                start: format!("0x{start:x}"),
+                end_exclusive: format!("0x{end_exclusive:x}"),
+                entry: format!("0x{:x}", start.saturating_add(entry_offset)),
+            });
         let document = Document {
             entry_offset: entry_offset as u64,
+            runtime_address_range,
             regions: self.regions,
             osr_entries: self.osr_entries,
         };
@@ -531,7 +552,13 @@ pub(crate) fn build_bundle(
         ),
         JitArtifactFile::text(
             JitArtifactFileName::CodeMap,
-            code_map.render(code.entry_offset()),
+            code_map.render(
+                code.entry_offset(),
+                Some((
+                    code.bytes().as_ptr() as usize,
+                    (code.bytes().as_ptr() as usize).saturating_add(code.len()),
+                )),
+            ),
         ),
         JitArtifactFile::text(JitArtifactFileName::Relocations, rendered_relocations.json),
         JitArtifactFile::text(
@@ -748,9 +775,12 @@ mod tests {
             "Move { dst: 1, src: 0 }".to_string(),
         ));
         map.record_osr(2, 20, 32);
-        let value: serde_json::Value =
-            serde_json::from_str(&map.render(4)).expect("valid code-map JSON");
+        let value: serde_json::Value = serde_json::from_str(&map.render(4, Some((0x1000, 0x1040))))
+            .expect("valid code-map JSON");
         assert_eq!(value["entryOffset"], 4);
+        assert_eq!(value["runtimeAddressRange"]["start"], "0x1000");
+        assert_eq!(value["runtimeAddressRange"]["endExclusive"], "0x1040");
+        assert_eq!(value["runtimeAddressRange"]["entry"], "0x1004");
         assert_eq!(value["regions"][0]["startOffset"], 4);
         assert_eq!(value["regions"][0]["bytePc"], 19);
         assert_eq!(value["osrEntries"][0]["logicalPc"], 2);
@@ -780,7 +810,7 @@ mod tests {
         ));
 
         let value: serde_json::Value =
-            serde_json::from_str(&map.render(0)).expect("valid code-map JSON");
+            serde_json::from_str(&map.render(0, None)).expect("valid code-map JSON");
         let region = &value["regions"][0];
         assert_eq!(region["functionId"], 7);
         assert_eq!(region["logicalPc"], 2);
@@ -832,7 +862,7 @@ mod tests {
         map.record(CodeRegion::inline_scratch(4, 20, inline_site, 11, layout));
 
         let value: serde_json::Value =
-            serde_json::from_str(&map.render(0)).expect("valid code-map JSON");
+            serde_json::from_str(&map.render(0, None)).expect("valid code-map JSON");
         let ordinary = &value["regions"][0];
         assert!(ordinary.get("inlineSite").is_none());
         assert!(ordinary.get("inlineScratchLayout").is_none());

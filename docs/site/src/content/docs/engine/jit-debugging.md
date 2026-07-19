@@ -45,15 +45,19 @@ that fires before the isolate replies may have no partial batch to write.
 
 ## Structured events
 
-`compilePrepared.globalLexicalLoads` counts permanent global-declarative cells
-available for direct generated reads. `directCallees`, `directMethodSites`, and
-`directMethodTargets` report exact generations available for generated plain
-and bounded polymorphic method linkage separately from `inlineCallees` /
+`compilePrepared.globalLoadSites` counts all analyzed global reads.
+`globalLexicalLoads` counts permanent global-declarative cells available for
+direct generated reads, while `globalObjectLoads` counts guarded
+global-object dictionary slots. `directCallees`, `directMethodSites`, and
+`directMethodTargets` report stable function links whose current generations
+were available for generated plain and bounded polymorphic method linkage,
+separately from `inlineCallees` /
 `inlineMethods`, which count bodies offered to the leaf inliner. A
 `directCallPlan` event records every observed call target inspected.
 `targetIndex` / `targetCount` identify its position in the bounded chain.
 `callKind` is `plain` or `method`. Its typed result is either
-`available`, with exact code-object id, target tier, and `thisMode`, or
+`available`, with the planning-time code-object id, target tier, and
+`thisMode`, or
 `rejected` with one of `missingCallee`, `ineligibleFunction`,
 `selfRecursive`, `ownUpvalues`, `methodGuardUnavailable`, or
 `noEntryGeneration`.
@@ -61,8 +65,10 @@ and bounded polymorphic method linkage separately from `inlineCallees` /
 For every available plan in a successful compile, `directCallLowered` records
 the backend's actual choice: `generated`, `inlined`, or `rejected` because the
 bounded stack layout is unsupported or the site was eliminated. It repeats
-`targetIndex` / `targetCount`; a generated outcome repeats exact target
-generation, tier, and `thisMode`.
+`targetIndex` / `targetCount`; a generated outcome repeats the target
+generation and tier current when the caller compiled plus `thisMode`.
+Generated code retains only the permanent function-cell link: later tier
+publication switches the selected generation without recompiling the caller.
 `callerCodeObjectId` identifies the exact successful caller generation.
 Planning and lowering are separate events so diagnostics never claim a native
 call edge that the backend did not emit.
@@ -71,6 +77,9 @@ Exact artifacts represent a baked global-declarative cell as a
 `globalLexicalCell` relocation keyed by byte PC. The raw pointer is redacted
 from assembly and normalized code. Generated code reads the live cell value;
 a TDZ hole still enters the canonical throwing global lookup.
+Global-object records similarly retain only structural identity and the
+property slot. Generated code proves the realm epoch and dictionary shape
+before reading the live value; a mismatch uses the canonical lookup.
 
 Ordinary `Op::Call` feedback uses one typed target population for bytecode
 callees and static-native operations. When that population is monomorphic for
@@ -285,14 +294,17 @@ and carries one typed `directCall` object:
 }
 ```
 
-`callKind` is `plain` or `method`. `targetCodeObjectId` names the exact
-installed generation. `targetTier` is `template` or `optimizing`. `thisMode`
-is `strictOrLexical`, `sloppyGlobal`, or `methodReceiver` and records the call
-binding emitted before frame publication.
-`calleeNativeFrameBytes` is the target's persistent native prologue
-reservation; `linkageBytes` is caller-owned `NativeFrame`, tagged register
-window, bookkeeping, and alignment; `reservedStackBytes` is their exact sum.
-The same object appears on the acquired entry-cell relocation in
+`callKind` is `plain` or `method`. `targetCodeObjectId`, `targetTier`, and
+`calleeNativeFrameBytes` describe the generation current when this caller
+compiled; they are planning diagnostics, not a permanently baked dispatch
+target. `thisMode` is `strictOrLexical`, `sloppyGlobal`, or `methodReceiver`
+and records the call binding emitted before frame publication.
+`linkageBytes` is the exact caller-owned `NativeFrame`, tagged register window,
+bookkeeping, and alignment. `reservedStackBytes` is the planning-time sum with
+the captured target prologue. At runtime the permanent function cell selects
+the current generation, and generated linkage reads that generation's actual
+code-object id, tier, and native-frame reservation before entry. The same
+planning object appears on the stable function-cell relocation in
 `relocations.json`. `asm.txt` renders all fields on region annotations and the
 `directCallEntryCell(...)` pseudo-line. No artifact serializes the cell's
 process-local address outside exact runtime-local `code.bin`; metadata and
@@ -377,7 +389,9 @@ portable cross-process comparisons.
 All joins use the same `code.bin` offset basis:
 
 - `code-map.json` maps assembly offsets and ranges back to bytecode and tier
-  operations;
+  operations. During explicit artifact capture it also records
+  `runtimeAddressRange` as hexadecimal text, allowing a process-local native
+  program counter to join the owning code object before applying offsets;
 - `relocations.json` describes the symbolic meaning of baked-address ranges;
 - `deopt.json` supplies frame reconstruction for a `deoptExitId` named by the
   code map or assembly annotation;
@@ -402,7 +416,8 @@ symbolic target such as a runtime-stub descriptor, call trampoline, GC cage
 base, property IC cell, or code-owned operand slice. Chunk immediates and
 resolved pointer values are deliberately absent. Typed targets use camel-case
 fields consistently. A direct-call entry-cell target additionally carries the
-exact `directCall` generation/layout object shown above.
+planning-time `directCall` generation/layout object shown above while the
+relocation itself denotes the permanent function cell.
 
 `code-normalized.bin` starts with the `OTJNCODE` marker, architecture id, and
 logical-item count. Its typed `directCallEntryCell` token
@@ -420,6 +435,8 @@ ARM64 executable code:
 Match bundles by module, function, tier, and entry, then compare their
 normalized streams. Continue to use `code.bin` offsets when joining the code
 map, relocation records, OSR entries, deopt exits, or safepoints.
+`runtimeAddressRange` is intentionally process-local profiler metadata and
+must not be used for cross-process comparison or as an executable pointer.
 
 ## Correlate an execution
 
@@ -440,9 +457,10 @@ fallback:
    `inlineSite`, then inspect its guard, compact scratch assignment,
    callee-local instructions, and separate hit/deopt-teardown ranges. For a
    generated plain call, join caller and callee through
-   `directCall.targetFunctionId`, confirm exact generation through
-   `directCall.targetCodeObjectId`, then inspect its guard, setup, native-entry,
-   return, cleanup, and entry-reject regions. For a static-native call, inspect
+   `directCall.targetFunctionId`, treat `directCall.targetCodeObjectId` as the
+   compile-time generation snapshot, then inspect its guard, stable-cell
+   selection, setup, native-entry, return, cleanup, and entry-reject regions.
+   For a static-native call, inspect
    `staticNativeCallGuard` and `staticNativeCallBody`, then join the guard's
    function identity through its `staticNativeBuiltinFunction` relocation.
 6. Open `asm.txt` at the matching `+0x<8-hex>:` offset to inspect the emitted

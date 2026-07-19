@@ -8,12 +8,11 @@
 //!
 //! # Contents
 //! - [`JitCodeRegistry`] — boxed, address-stable registry cell.
-//! - Stable per-generation [`crate::native_abi::CodeEntryCell`] installation,
-//!   unlinking, and tombstone retention.
+//! - Stable per-function entry dispatch plus per-generation
+//!   [`crate::native_abi::CodeEntryCell`] installation, unlinking, and
+//!   tombstone retention.
 //! - Dependency registration, exact-epoch entry consistency, and monotonic
-//!   dependent invalidation.
-//! - Cold reverse-dependency queries used to keep an entry-capable generation
-//!   installed when its proposed replacement cannot serve generated callers.
+//!   invalidation.
 //! - `resolve_jit_registry_safepoint` — the machine-visible resolver behind
 //!   the published view.
 //!
@@ -32,6 +31,8 @@
 //! - Invalid code remains available to safepoint resolution until its last
 //!   external anchor drops and [`JitCodeRegistry::retire_unreferenced`] removes
 //!   it. Safepoint resolution therefore does not apply the entry check.
+//! - Generated callers retain only stable function-cell addresses. Publishing a
+//!   new generation never invalidates or recompiles dependent callers.
 //! - Invalidating a generation unlinks its entry cell before executable
 //!   retirement. The cell address remains valid and is never reused.
 //!
@@ -44,8 +45,8 @@ use crate::jit::{
 };
 use crate::native_abi::{
     CODE_ENTRY_HAS_SAFEPOINTS, CODE_ENTRY_OPTIMIZING_TIER, CodeDependency, CodeDependencyKind,
-    CodeEntryCell, CodeLifetimeState, CodeRegistryView, NativeFrameKind, SafepointId,
-    SafepointRecord,
+    CodeEntryCell, CodeLifetimeState, CodeRegistryView, FunctionEntryCell, NativeFrameKind,
+    SafepointId, SafepointRecord,
 };
 use std::sync::Arc;
 
@@ -68,6 +69,17 @@ pub(crate) struct GeneratedCallFeedback {
     pub(crate) throws: u64,
 }
 
+/// Current direct-call health for one exact generated code object.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GeneratedDeoptState {
+    pub(crate) function_id: u32,
+    pub(crate) tier: NativeFrameKind,
+    pub(crate) entries: u64,
+    pub(crate) deopts: u64,
+    pub(crate) consecutive_deopts: u32,
+    pub(crate) linked: bool,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct GeneratedFeedbackSeen {
     entries: u64,
@@ -86,6 +98,10 @@ pub struct JitCodeRegistry {
     /// invalidation and intentionally survive executable retirement so a baked
     /// pointer can never observe freed or repurposed metadata.
     entry_cells: rustc_hash::FxHashMap<u64, Box<CodeEntryCell>>,
+    /// Permanent generated-call linkage cells by bytecode function. Callers
+    /// bake these addresses once; tier publication switches only the contained
+    /// generation-cell pointer.
+    function_entry_cells: rustc_hash::FxHashMap<u32, Box<FunctionEntryCell>>,
     /// Last cumulative generated-call counters merged into VM tier policy.
     generated_feedback_seen: rustc_hash::FxHashMap<u64, GeneratedFeedbackSeen>,
     /// Latest isolate-local epoch by dependency family and stable identity.
@@ -103,6 +119,7 @@ impl JitCodeRegistry {
             },
             codes: rustc_hash::FxHashMap::default(),
             entry_cells: rustc_hash::FxHashMap::default(),
+            function_entry_cells: rustc_hash::FxHashMap::default(),
             generated_feedback_seen: rustc_hash::FxHashMap::default(),
             epochs: rustc_hash::FxHashMap::default(),
         });
@@ -175,6 +192,7 @@ impl JitCodeRegistry {
             param_count,
             register_count,
             flags,
+            code.generated_stack_frame_bytes().unwrap_or(0),
         ));
         self.register_inner(code_object_id, code, Some(entry_cell))
     }
@@ -213,8 +231,32 @@ impl JitCodeRegistry {
         );
         debug_assert!(replaced.is_none(), "code-object ids are never reused");
         if let Some(entry_cell) = entry_cell {
+            let function_id = entry_cell.function_id;
+            let param_count = entry_cell.param_count;
+            let register_count = entry_cell.register_count;
+            let function_entry =
+                self.function_entry_cells
+                    .entry(function_id)
+                    .or_insert_with(|| {
+                        Box::new(FunctionEntryCell::new(
+                            function_id,
+                            param_count,
+                            register_count,
+                        ))
+                    });
+            if function_entry.param_count != param_count
+                || function_entry.register_count != register_count
+            {
+                debug_assert!(
+                    false,
+                    "function entry layout cannot change across generations"
+                );
+                self.codes.remove(&code_object_id);
+                return false;
+            }
             let replaced = self.entry_cells.insert(code_object_id, entry_cell);
             debug_assert!(replaced.is_none(), "entry-cell ids are never reused");
+            self.refresh_function_entry(function_id);
         }
         true
     }
@@ -237,59 +279,68 @@ impl JitCodeRegistry {
         })
     }
 
-    /// Resolve one exact installed generation into the complete tier-neutral
-    /// direct-call plan consumed by VM frame construction.
+    /// Resolve one stable function entry into the complete tier-neutral
+    /// direct-call plan consumed by generated frame construction.
     ///
-    /// Callers do not inspect registry states, entry-cell addresses, dependency
-    /// epochs, or safepoint flags individually. A failure at any gate returns
-    /// `None` and preserves the interpreter/generic-call fallback.
+    /// The plan snapshots current generation metadata for layout diagnostics,
+    /// but generated code bakes only the permanent function-cell address. A
+    /// later promotion changes the target generation without changing callers.
     #[must_use]
     pub(crate) fn direct_call_plan(
         &self,
         function: &crate::executable::CodeBlock,
-        code: &dyn JitFunctionCode,
     ) -> Option<JitDirectCallPlan> {
+        let function_entry = self.function_entry_cells.get(&function.id)?;
+        let generation_addr = function_entry.current_generation();
+        if generation_addr == 0 {
+            return None;
+        }
+        let generation = self
+            .entry_cells
+            .values()
+            .find(|cell| std::ptr::from_ref(cell.as_ref()) as u64 == generation_addr)?;
+        let registered = self.codes.get(&generation.code_object_id)?;
+        if registered.state != CodeLifetimeState::Installed
+            || !self.dependencies_are_current(&registered.dependencies)
+            || generation
+                .entry_addr
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+            || generation.generated_stack_frame_bytes == 0
+        {
+            return None;
+        }
         Some(JitDirectCallPlan {
             function_id: function.id,
-            code_object_id: code.metadata().id,
-            entry_cell: self.entry_cell_addr_for_entry(code)?,
-            tier: code.native_frame_kind(),
+            code_object_id: generation.code_object_id,
+            entry_cell: std::ptr::from_ref(function_entry.as_ref()) as u64,
+            tier: registered.code.native_frame_kind(),
             this_mode: if function.is_strict || function.is_arrow {
                 JitDirectCallThisMode::StrictOrLexical
             } else {
                 JitDirectCallThisMode::SloppyGlobal
             },
-            generated_stack_frame_bytes: code.generated_stack_frame_bytes(),
+            generated_stack_frame_bytes: Some(generation.generated_stack_frame_bytes),
             param_count: function.param_count,
             register_count: function.register_count,
         })
     }
 
-    /// Whether an installed generation for `function_id` is the exact target
-    /// of any installed generated caller.
-    ///
-    /// Promotion uses this cold reverse-edge query before unlinking the current
-    /// generation. A replacement that cannot publish stack-owned generated
-    /// entry must not evict a target still serving native callers.
+    /// Re-read one permanent function cell through the registry's cold
+    /// resolver. This path does not compile or allocate; it repairs publication
+    /// from already-installed generations and returns the selected generation
+    /// cell, or zero when generated calls must side-exit.
     #[must_use]
-    pub(crate) fn has_installed_generation_dependents(&self, function_id: u32) -> bool {
-        let targets = self
-            .codes
+    pub(crate) fn resolve_function_entry(&mut self, function_entry_addr: u64) -> u64 {
+        let Some((&function_id, _)) = self
+            .function_entry_cells
             .iter()
-            .filter_map(|(&code_object_id, registered)| {
-                (registered.state == CodeLifetimeState::Installed
-                    && registered.code.metadata().code_block_id == function_id)
-                    .then_some(code_object_id)
-            })
-            .collect::<rustc_hash::FxHashSet<_>>();
-        !targets.is_empty()
-            && self.codes.values().any(|registered| {
-                registered.state == CodeLifetimeState::Installed
-                    && registered.dependencies.iter().any(|dependency| {
-                        dependency.kind == CodeDependencyKind::CodeGeneration
-                            && targets.contains(&dependency.expected)
-                    })
-            })
+            .find(|(_, cell)| std::ptr::from_ref(cell.as_ref()) as u64 == function_entry_addr)
+        else {
+            return 0;
+        };
+        self.refresh_function_entry(function_id);
+        self.function_entry_cells[&function_id].current_generation()
     }
 
     /// Stable machine-visible cell for the exact installed code generation.
@@ -299,6 +350,7 @@ impl JitCodeRegistry {
     /// acquire/recheck the cell because an invalidated tombstone has a zero
     /// entry address.
     #[must_use]
+    #[cfg(test)]
     fn entry_cell_addr_for_entry(&self, code: &dyn JitFunctionCode) -> Option<u64> {
         if !self.is_current_for_entry(code) {
             return None;
@@ -324,6 +376,16 @@ impl JitCodeRegistry {
         self.invalidate_code_objects(seeds)
     }
 
+    /// Unlink one exact installed generation while preserving every other tier
+    /// and OSR body for the same function.
+    ///
+    /// Successful baseline feedback refresh uses this narrow operation: a new
+    /// entry generation must not discard an independently installed optimizing
+    /// loop body.
+    pub(crate) fn invalidate_code_object(&mut self, code_object_id: u64) -> Vec<u32> {
+        self.invalidate_code_objects([code_object_id])
+    }
+
     /// Publish `current_epoch` and invalidate Installed code whose matching
     /// dependency is stale.
     ///
@@ -338,14 +400,6 @@ impl JitCodeRegistry {
         identity: u32,
         current_epoch: u64,
     ) -> Vec<u32> {
-        debug_assert_ne!(
-            kind,
-            CodeDependencyKind::CodeGeneration,
-            "code generations invalidate through lifecycle worklists"
-        );
-        if kind == CodeDependencyKind::CodeGeneration {
-            return Vec::new();
-        }
         let published = self.epochs.entry((kind, identity)).or_insert(0);
         debug_assert!(
             current_epoch >= *published,
@@ -487,19 +541,23 @@ impl JitCodeRegistry {
         feedback
     }
 
-    /// Current consecutive generated bailout streak for one exact generation.
-    pub(crate) fn generated_bail_streak(
-        &self,
-        code_object_id: u64,
-    ) -> Option<(u32, NativeFrameKind, u32)> {
+    /// Current generated-call health for one exact generation.
+    pub(crate) fn generated_deopt_state(&self, code_object_id: u64) -> Option<GeneratedDeoptState> {
         let cell = self.entry_cells.get(&code_object_id)?;
-        let (_, _, _, _, streak) = cell.generated_feedback();
+        let (entries, _, deopts, _, consecutive_deopts) = cell.generated_feedback();
         let tier = if cell.flags & CODE_ENTRY_OPTIMIZING_TIER == 0 {
             NativeFrameKind::Baseline
         } else {
             NativeFrameKind::Optimizing
         };
-        Some((cell.function_id, tier, streak))
+        Some(GeneratedDeoptState {
+            function_id: cell.function_id,
+            tier,
+            entries,
+            deopts,
+            consecutive_deopts,
+            linked: cell.entry_addr.load(std::sync::atomic::Ordering::Acquire) != 0,
+        })
     }
 
     /// Function identity retained for one exact generated-code generation.
@@ -517,21 +575,6 @@ impl JitCodeRegistry {
 
     fn dependencies_are_current(&self, dependencies: &[CodeDependency]) -> bool {
         dependencies.iter().all(|dependency| {
-            if dependency.kind == CodeDependencyKind::CodeGeneration {
-                return self
-                    .codes
-                    .get(&dependency.expected)
-                    .is_some_and(|registered| {
-                        registered.state == CodeLifetimeState::Installed
-                            && registered.code.metadata().code_block_id == dependency.identity
-                            && self
-                                .entry_cells
-                                .get(&dependency.expected)
-                                .is_some_and(|cell| {
-                                    cell.entry_addr.load(std::sync::atomic::Ordering::Acquire) != 0
-                                })
-                    });
-            }
             dependency.expected
                 == self
                     .epochs
@@ -541,32 +584,51 @@ impl JitCodeRegistry {
         })
     }
 
-    /// Invalidate exact generations and every installed caller that embeds a
-    /// direct edge to them. The local reverse graph and iterative worklist make
-    /// cycles finite and keep invalidation off native execution paths.
-    fn invalidate_code_objects(&mut self, seeds: impl IntoIterator<Item = u64>) -> Vec<u32> {
-        let mut reverse = rustc_hash::FxHashMap::<u64, Vec<u64>>::default();
-        for (&caller_code_object_id, registered) in &self.codes {
-            if registered.state != CodeLifetimeState::Installed {
-                continue;
-            }
-            for dependency in &registered.dependencies {
-                if dependency.kind == CodeDependencyKind::CodeGeneration {
-                    reverse
-                        .entry(dependency.expected)
-                        .or_default()
-                        .push(caller_code_object_id);
+    /// Select the best entry-capable installed generation for one function and
+    /// publish it through the permanent function cell.
+    fn refresh_function_entry(&mut self, function_id: u32) {
+        let target = self
+            .codes
+            .iter()
+            .filter_map(|(&code_object_id, registered)| {
+                if registered.state != CodeLifetimeState::Installed
+                    || registered.code.metadata().code_block_id != function_id
+                    || registered.code.osr_only()
+                    || !self.dependencies_are_current(&registered.dependencies)
+                {
+                    return None;
                 }
-            }
+                let cell = self.entry_cells.get(&code_object_id)?;
+                if cell.entry_addr.load(std::sync::atomic::Ordering::Acquire) == 0
+                    || cell.generated_stack_frame_bytes == 0
+                {
+                    return None;
+                }
+                let tier_priority =
+                    u8::from(registered.code.native_frame_kind() == NativeFrameKind::Optimizing);
+                Some((
+                    (tier_priority, code_object_id),
+                    std::ptr::from_ref(cell.as_ref()) as u64,
+                ))
+            })
+            .max_by_key(|(priority, _)| *priority)
+            .map_or(0, |(_, cell)| cell);
+        let Some(function_entry) = self.function_entry_cells.get(&function_id) else {
+            return;
+        };
+        if target == 0 {
+            function_entry.clear();
+        } else {
+            function_entry.publish(target);
         }
+    }
 
-        let mut queue = std::collections::VecDeque::from_iter(seeds);
-        let mut visited = rustc_hash::FxHashSet::default();
+    /// Invalidate exact generations only. Stable function cells are refreshed
+    /// after unlinking, so a remaining entry-capable tier becomes visible
+    /// atomically without touching caller code.
+    fn invalidate_code_objects(&mut self, seeds: impl IntoIterator<Item = u64>) -> Vec<u32> {
         let mut affected = std::collections::BTreeSet::new();
-        while let Some(code_object_id) = queue.pop_front() {
-            if !visited.insert(code_object_id) {
-                continue;
-            }
+        for code_object_id in seeds {
             if let Some(registered) = self.codes.get_mut(&code_object_id)
                 && registered.state == CodeLifetimeState::Installed
             {
@@ -576,9 +638,9 @@ impl JitCodeRegistry {
                     cell.unlink();
                 }
             }
-            if let Some(dependents) = reverse.get(&code_object_id) {
-                queue.extend(dependents.iter().copied());
-            }
+        }
+        for &function_id in &affected {
+            self.refresh_function_entry(function_id);
         }
         affected.into_iter().collect()
     }
@@ -667,6 +729,49 @@ mod tests {
                 .binary_search_by_key(&safepoint_id, |record| record.id)
                 .ok()
                 .map(|index| &self.records[index])
+        }
+
+        fn run_entry(&self, _activation: crate::VmRuntimeActivation) -> crate::jit::JitExecOutcome {
+            unreachable!("fake code is never entered")
+        }
+    }
+
+    #[derive(Debug)]
+    struct GeneratedFakeCode {
+        id: u64,
+        function_id: u32,
+        tier: NativeFrameKind,
+        native_frame_bytes: u32,
+    }
+
+    impl JitFunctionCode for GeneratedFakeCode {
+        fn metadata(&self) -> CodeObjectMetadata {
+            CodeObjectMetadata {
+                id: self.id,
+                code_block_id: self.function_id,
+                entry_offset: 0,
+                code_size: 4,
+                safepoint_count: 0,
+                frame_map_count: 0,
+                spill_map_count: 0,
+                dependency_count: 0,
+            }
+        }
+
+        fn native_frame_kind(&self) -> NativeFrameKind {
+            self.tier
+        }
+
+        fn generated_stack_frame_bytes(&self) -> Option<u32> {
+            Some(self.native_frame_bytes)
+        }
+
+        fn code_len(&self) -> usize {
+            4
+        }
+
+        fn entry_addr(&self) -> Option<usize> {
+            Some(0x10_0000 + self.id as usize * 16)
         }
 
         fn run_entry(&self, _activation: crate::VmRuntimeActivation) -> crate::jit::JitExecOutcome {
@@ -764,6 +869,75 @@ mod tests {
                 .entry_addr
                 .load(std::sync::atomic::Ordering::Acquire),
             0
+        );
+    }
+
+    #[test]
+    fn stable_function_entry_switches_tiers_without_invalidating_callers() {
+        let mut registry = JitCodeRegistry::new_boxed();
+        let baseline: Arc<dyn JitFunctionCode> = Arc::new(GeneratedFakeCode {
+            id: 101,
+            function_id: 7,
+            tier: NativeFrameKind::Baseline,
+            native_frame_bytes: 64,
+        });
+        let optimizing: Arc<dyn JitFunctionCode> = Arc::new(GeneratedFakeCode {
+            id: 102,
+            function_id: 7,
+            tier: NativeFrameKind::Optimizing,
+            native_frame_bytes: 96,
+        });
+        let caller: Arc<dyn JitFunctionCode> = Arc::new(GeneratedFakeCode {
+            id: 201,
+            function_id: 8,
+            tier: NativeFrameKind::Baseline,
+            native_frame_bytes: 64,
+        });
+
+        assert!(registry.register_generation(101, baseline, 2, 9));
+        assert!(registry.register_generation(201, caller, 2, 12));
+        let stable_addr = std::ptr::from_ref(registry.function_entry_cells[&7].as_ref()) as u64;
+        assert_eq!(
+            registry.function_entry_cells[&7].current_generation(),
+            registry.entry_cell_addr(101).unwrap()
+        );
+
+        assert!(registry.register_generation(102, optimizing, 2, 9));
+        assert_eq!(
+            std::ptr::from_ref(registry.function_entry_cells[&7].as_ref()) as u64,
+            stable_addr,
+            "promotion must preserve the caller-baked function-cell address"
+        );
+        assert_eq!(
+            registry.function_entry_cells[&7].current_generation(),
+            registry.entry_cell_addr(102).unwrap(),
+            "optimizing tier becomes the published target"
+        );
+
+        assert_eq!(registry.invalidate_code_object(102), vec![7]);
+        assert_eq!(
+            registry.function_entry_cells[&7].current_generation(),
+            registry.entry_cell_addr(101).unwrap(),
+            "invalidating the optimizer republishes the installed baseline"
+        );
+        assert_eq!(
+            registry.codes[&201].state,
+            CodeLifetimeState::Installed,
+            "callee tier changes must not invalidate generated callers"
+        );
+
+        let optimizing_refresh: Arc<dyn JitFunctionCode> = Arc::new(GeneratedFakeCode {
+            id: 103,
+            function_id: 7,
+            tier: NativeFrameKind::Optimizing,
+            native_frame_bytes: 96,
+        });
+        assert!(registry.register_generation(103, optimizing_refresh, 2, 9));
+        assert_eq!(registry.invalidate_code_object(101), vec![7]);
+        assert_eq!(
+            registry.function_entry_cells[&7].current_generation(),
+            registry.entry_cell_addr(103).unwrap(),
+            "refreshing baseline must preserve the independent optimizing generation"
         );
     }
 

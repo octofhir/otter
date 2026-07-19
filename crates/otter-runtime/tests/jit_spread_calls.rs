@@ -6,13 +6,15 @@
 //!   fixture but completes through the interpreter (it is excluded from the
 //!   compiled set to preserve true tail-call stack reuse); the surrounding
 //!   loop still tiers up and reaches it through the reentrant path.
+//! - A megamorphic `CallMethodValue` site that exhausts its generated guard
+//!   chain and completes through canonical method lookup plus call.
 //! - An observable receiver getter proving explicit-`this` evaluation count.
-//! - Interpreter/template completion parity.
+//! - Interpreter/template/production-tiered completion parity.
 //!
 //! # Invariants
 //! - Every compiled call/construct completes through the VM's synchronous
 //!   helper and is never replayed after a committed side effect.
-//! - Template output is byte-identical to the interpreter oracle.
+//! - Compiled output is byte-identical to the interpreter oracle.
 //!
 //! # See also
 //! - `otter_vm::Interpreter::jit_runtime_spread_call_op`
@@ -94,6 +96,105 @@ fn spread_call_family_matches_oracle_with_single_getter_evaluation() {
         reentrant > 0,
         "spread/call opcodes must use the shared reentrant transition"
     );
+}
+
+const GENERIC_METHOD_FALLBACK: &str = r#"
+function one(value) { return this.base + value; }
+function two(value) { return this.base + value; }
+function three(value) { return this.base + value; }
+function four(value) { return this.base + value; }
+function five(value) { return this.base + value; }
+
+function invoke(receiver, value) {
+  return receiver.work(value);
+}
+function outer(receiver, value) {
+  return invoke(receiver, value);
+}
+
+const receivers = [
+  { base: 1, work: one },
+  { tag: "two", base: 20, work: two },
+  { base: 300, marker: true, work: three },
+  { work: four, base: 4000, extra: 0 },
+  { a: 1, b: 2, base: 50000, work: five }
+];
+
+// Make `invoke` entry-capable before `outer` snapshots its direct-call plan.
+for (let i = 0; i < 128; i++) {
+  invoke(receivers[i % receivers.length], i);
+}
+
+let sum = 0;
+for (let i = 0; i < 600; i++) {
+  sum += outer(receivers[i % receivers.length], i);
+}
+String(sum);
+"#;
+
+fn run_generic_method(selection: JitSelection) -> (String, u64, u64, u64, u64, u64) {
+    let mut runtime = Runtime::builder()
+        .jit_selection(selection)
+        .jit_osr_threshold(u32::MAX)
+        .build()
+        .expect("runtime");
+    let completion = runtime
+        .run_script(
+            SourceInput::from_javascript(GENERIC_METHOD_FALLBACK.to_string()),
+            "jit-generic-method-fallback.js",
+        )
+        .expect("generic method fallback")
+        .completion_string()
+        .to_owned();
+    let stats = runtime.execution_stats();
+    (
+        completion,
+        stats.jit_compile_attempts,
+        stats.jit_reentrant_stub_transitions,
+        stats.jit_generated_calls,
+        stats.jit_generated_template_deopts,
+        stats.jit_feedback_refreshes,
+    )
+}
+
+#[test]
+fn megamorphic_method_miss_completes_without_replaying_the_caller() {
+    let (oracle, _, _, _, _, _) = run_generic_method(JitSelection::InterpreterOnly);
+    assert_eq!(oracle, "6698220");
+
+    for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
+        let (
+            compiled,
+            compile_attempts,
+            reentrant,
+            generated_calls,
+            generated_deopts,
+            feedback_refreshes,
+        ) = run_generic_method(selection);
+        assert_eq!(compiled, oracle, "{selection:?}");
+        assert!(
+            compile_attempts > 0,
+            "{selection:?} must compile the hot method caller"
+        );
+        assert!(
+            reentrant > 0,
+            "{selection:?} must complete a guard miss through the shared reentrant transition"
+        );
+        assert!(
+            feedback_refreshes > 0,
+            "{selection:?} must rebuild the successful caller after callee generations mature"
+        );
+        if selection == JitSelection::Template {
+            assert!(
+                generated_calls > 0,
+                "template caller must enter a stack-owned generated callee"
+            );
+            assert_eq!(
+                generated_deopts, 0,
+                "the reentrant miss must return directly to its generated caller"
+            );
+        }
+    }
 }
 
 // Strict-mode proper tail calls run in O(1) call depth. The interpreter's

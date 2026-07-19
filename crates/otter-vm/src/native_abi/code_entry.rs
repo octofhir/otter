@@ -8,20 +8,22 @@
 //! # Contents
 //! - [`FunctionEntryCell`] — fixed-layout stable dispatch cell per function.
 //! - [`CodeEntryCell`] — fixed-layout per-generation entry and frame metadata.
-//! - [`CodeEntryLease`] — Rust-side implementation of the acquire/recheck/
-//!   release protocol native call trampolines must mirror.
+//! - [`CodeEntryLease`] — optional Rust-side ownership for users that outlive a
+//!   native-activation retirement epoch.
 //!
 //! # Invariants
 //! - A function cell is allocated once and never reused for another function.
 //! - `FunctionEntryCell::generation_cell == 0` selects the cold resolver.
 //! - Publication switches the function cell before the old generation unlinks.
 //! - `entry_addr == 0` means unlinked and permanently rejects new entries.
-//! - An entrant loads the address, increments `active_count`, then rechecks the
-//!   address before branching. Invalidation stores zero before code retirement.
+//! - Generated callers run on the isolate's single mutator and load the current
+//!   address before any possible VM transition. Their published outer native
+//!   activation defers executable retirement through reentrant invalidation.
+//!   Users that can outlive that epoch must instead acquire `active_count`.
 //! - A generation's cell address and immutable identity/layout fields never
 //!   change, and cells are never repurposed for newer native code.
-//! - Executable ownership may retire only after the cell is unlinked and
-//!   `active_count == 0` with acquire ordering.
+//! - At a native-activation epoch boundary, executable ownership may retire
+//!   only after the cell is unlinked and `active_count == 0`.
 //!
 //! # See also
 //! - [`super::CodeObjectMetadata`] — immutable compiled-object identity.
@@ -101,7 +103,7 @@ pub struct CodeEntryCell {
     /// Persistent native-stack bytes reserved by the target after entry, or
     /// zero when this generation cannot accept stack-owned generated calls.
     pub generated_stack_frame_bytes: u32,
-    /// Native activations that acquired this generation and have not returned.
+    /// Explicit leases that may outlive a native-activation retirement epoch.
     pub active_count: AtomicU32,
     /// Generated native entries observed for tiering/introspection.
     ///
@@ -152,10 +154,9 @@ impl CodeEntryCell {
 
     /// Try to acquire this exact generation for a new native activation.
     ///
-    /// Native code must implement the same load/increment/recheck order before
-    /// branching through [`Self::entry_addr`]. A concurrent unlink between the
-    /// first load and the recheck is observed and the provisional count is
-    /// released without entering code.
+    /// Use this only when ownership can outlive the isolate's published
+    /// native-activation retirement epoch. Generated callers execute on the
+    /// single mutator and are pinned by that epoch instead.
     #[must_use]
     pub fn try_acquire(&self) -> Option<CodeEntryLease<'_>> {
         let entry_addr = self.entry_addr.load(Ordering::Acquire);

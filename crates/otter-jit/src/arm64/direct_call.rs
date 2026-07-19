@@ -17,8 +17,10 @@
 //! - A callee bailout is not replayed. The live published frame enters the
 //!   cold stack-call deoptimizer, which resumes the already-started callee.
 //! - Callers load the current generation through a stable per-function cell.
-//!   The selected `CodeEntryCell` is acquired and rechecked before entry, then
-//!   released only after return, throw, or cold deopt completes.
+//!   Isolate execution is single-mutator: after selection no registry mutation
+//!   can occur before native entry, and executable retirement is deferred while
+//!   any native activation is published. Generated calls therefore need no
+//!   per-entry exclusive lease loop.
 //! - Tier publication patches the function cell; a missing target enters one
 //!   no-allocation cold resolver and never invalidates the generated caller.
 //! - Generated recursion, logical-call-depth, and native-stack reservations
@@ -44,23 +46,23 @@ use crate::{
     },
     entry::{
         ACTIVATION_BASE_OFFSET, ACTIVATION_LIMIT_OFFSET, ACTIVATION_TOP_PTR_OFFSET,
-        CODE_ENTRY_ACTIVE_COUNT_OFFSET, CODE_ENTRY_CODE_OBJECT_ID_OFFSET, CODE_ENTRY_FLAGS_OFFSET,
-        CODE_ENTRY_FUNCTION_ID_OFFSET, CODE_ENTRY_GENERATED_BAIL_STREAK_OFFSET,
-        CODE_ENTRY_GENERATED_DEOPTS_OFFSET, CODE_ENTRY_GENERATED_ENTRIES_OFFSET,
-        CODE_ENTRY_GENERATED_RETURNS_OFFSET, CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET,
-        CODE_ENTRY_GENERATED_THROWS_OFFSET, CODE_ENTRY_REGISTER_COUNT_OFFSET,
-        FUNCTION_ENTRY_GENERATION_CELL_OFFSET, GENERATED_CALL_DEOPTS_OFFSET,
-        GENERATED_CALL_DEPTH_PTR_OFFSET, GENERATED_CALLS_OFFSET, GLOBAL_THIS_OFFSET_PTR_OFFSET,
-        NATIVE_FRAME_ACTIVATION_ID_OFFSET, NATIVE_FRAME_CODE_BLOCK_ID_OFFSET,
-        NATIVE_FRAME_FLAGS_OFFSET, NATIVE_FRAME_FUNCTION_ID_OFFSET, NATIVE_FRAME_KIND_OFFSET,
-        NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
-        NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_REGISTER_COUNT_OFFSET,
-        NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE, NATIVE_FRAME_THIS_OFFSET,
-        NATIVE_FRAME_UPVALUE_BASE_OFFSET, NATIVE_FRAME_UPVALUE_COUNT_OFFSET,
-        NATIVE_STACK_BYTES_LIMIT_OFFSET, NATIVE_STACK_BYTES_PTR_OFFSET, STATUS_BAILED,
-        STATUS_RETURNED, SYNC_REENTRY_DEPTH_PTR_OFFSET, SYNC_REENTRY_LIMIT_OFFSET, THREAD_OFFSET,
-        Unsupported, VALUE_UNDEFINED, VM_THREAD_CODE_OBJECT_ID_OFFSET,
-        VM_THREAD_CURRENT_FRAME_OFFSET, reg_offset,
+        CODE_ENTRY_CODE_OBJECT_ID_OFFSET, CODE_ENTRY_FLAGS_OFFSET, CODE_ENTRY_FUNCTION_ID_OFFSET,
+        CODE_ENTRY_GENERATED_BAIL_STREAK_OFFSET, CODE_ENTRY_GENERATED_DEOPTS_OFFSET,
+        CODE_ENTRY_GENERATED_ENTRIES_OFFSET, CODE_ENTRY_GENERATED_RETURNS_OFFSET,
+        CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET, CODE_ENTRY_GENERATED_THROWS_OFFSET,
+        CODE_ENTRY_REGISTER_COUNT_OFFSET, FUNCTION_ENTRY_GENERATION_CELL_OFFSET,
+        GENERATED_CALL_DEOPTS_OFFSET, GENERATED_CALL_DEPTH_PTR_OFFSET, GENERATED_CALLS_OFFSET,
+        GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_ACTIVATION_ID_OFFSET,
+        NATIVE_FRAME_CODE_BLOCK_ID_OFFSET, NATIVE_FRAME_FLAGS_OFFSET,
+        NATIVE_FRAME_FUNCTION_ID_OFFSET, NATIVE_FRAME_KIND_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET,
+        NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
+        NATIVE_FRAME_REGISTER_COUNT_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE,
+        NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
+        NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NATIVE_STACK_BYTES_LIMIT_OFFSET,
+        NATIVE_STACK_BYTES_PTR_OFFSET, STATUS_BAILED, STATUS_RETURNED,
+        SYNC_REENTRY_DEPTH_PTR_OFFSET, SYNC_REENTRY_LIMIT_OFFSET, THREAD_OFFSET, Unsupported,
+        VALUE_UNDEFINED, VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_CURRENT_FRAME_OFFSET,
+        reg_offset,
     },
 };
 
@@ -354,16 +356,11 @@ pub(crate) fn emit_direct_call(
     let callable_ready = ops.new_dynamic_label();
     let generation_ready = ops.new_dynamic_label();
     let uncommitted_rejected = ops.new_dynamic_label();
-    let entry_acquire_retry = ops.new_dynamic_label();
-    let entry_acquire_saturated = ops.new_dynamic_label();
-    let entry_acquire_rollback = ops.new_dynamic_label();
-    let entry_rollback_retry = ops.new_dynamic_label();
     let entry_rejected = ops.new_dynamic_label();
     let callee_returned = ops.new_dynamic_label();
     let callee_bailed = ops.new_dynamic_label();
     let result_ready = ops.new_dynamic_label();
     let cleanup = ops.new_dynamic_label();
-    let release_retry = ops.new_dynamic_label();
     let returned = ops.new_dynamic_label();
     let cleanup_threw = ops.new_dynamic_label();
 
@@ -587,20 +584,12 @@ pub(crate) fn emit_direct_call(
         ; add w14, w14, #1
         ; str w14, [x13]
         ; str x12, [x9]
-        ; ldar x16, [x25]
+        // The isolate is single-mutator. No VM transition occurs between the
+        // stable generation load and this entry-address load, while the outer
+        // published activation defers executable retirement across any later
+        // reentry from the callee.
+        ; ldr x16, [x25]
         ; cbz x16, =>entry_rejected
-        ; add x15, x25, CODE_ENTRY_ACTIVE_COUNT_OFFSET
-        ; =>entry_acquire_retry
-        ; ldaxr w13, [x15]
-        ; cmn w13, #1
-        ; b.eq =>entry_acquire_saturated
-        ; add w14, w13, #1
-        ; stlxr w10, w14, [x15]
-        ; cbnz w10, =>entry_acquire_retry
-        ; ldar x13, [x25]
-        ; cbz x13, =>entry_acquire_rollback
-        ; cmp x13, x16
-        ; b.ne =>entry_acquire_rollback
         ; str x16, [sp, layout.entry_addr]
         ; ldr w13, [x25, CODE_ENTRY_FUNCTION_ID_OFFSET]
         ; str w13, [sp, NATIVE_FRAME_FUNCTION_ID_OFFSET]
@@ -814,12 +803,6 @@ pub(crate) fn emit_direct_call(
         ; ldr x11, [x20, ACTIVATION_BASE_OFFSET]
         ; add x12, x11, x10, lsl #3
         ; str xzr, [x12]
-        ; add x15, x25, CODE_ENTRY_ACTIVE_COUNT_OFFSET
-        ; =>release_retry
-        ; ldaxr w9, [x15]
-        ; sub w10, w9, #1
-        ; stlxr w11, w10, [x15]
-        ; cbnz w11, =>release_retry
     );
     dynasm!(ops
         ; .arch aarch64
@@ -855,21 +838,11 @@ pub(crate) fn emit_direct_call(
         direct_call,
     );
 
-    // Entry rejection owns no JS effects. Roll back a provisional lease when
-    // needed, then undo resource accounting and deopt the caller's Call.
+    // Entry rejection owns no JS effects. Undo committed resource accounting
+    // and deopt the caller's Call.
     let entry_reject_start = ops.offset().0;
     dynasm!(ops
         ; .arch aarch64
-        ; =>entry_acquire_saturated
-        ; clrex
-        ; b =>entry_rejected
-        ; =>entry_acquire_rollback
-        ; add x15, x25, CODE_ENTRY_ACTIVE_COUNT_OFFSET
-        ; =>entry_rollback_retry
-        ; ldaxr w13, [x15]
-        ; sub w14, w13, #1
-        ; stlxr w10, w14, [x15]
-        ; cbnz w10, =>entry_rollback_retry
         ; =>entry_rejected
         ; ldr x11, [sp, layout.reserved_bytes]
         ; ldr x9, [x20, NATIVE_STACK_BYTES_PTR_OFFSET]

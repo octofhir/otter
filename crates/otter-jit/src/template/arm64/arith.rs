@@ -4,6 +4,8 @@
 //! - Int32 fast paths with overflow promotion to the double path.
 //! - Full double arithmetic and NaN-correct comparisons.
 //! - Strict/loose equality over numbers and non-number immediates.
+//! - Early int32 equality before the complete nullish/double/coercive loose
+//!   comparison path.
 //! - Bitwise/shift lowering over the full finite-double `ToInt32`/`ToUint32`.
 //!
 //! # Invariants
@@ -606,8 +608,32 @@ pub(super) fn emit_loose_compare(
     let lhs_nullish = ops.new_dynamic_label();
     let rhs_nullish = ops.new_dynamic_label();
     let have_bool = ops.new_dynamic_label();
+    let generic = ops.new_dynamic_label();
     let slow = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
+    // Integer state/id comparisons dominate object-oriented dispatch loops.
+    // Prove both canonical int32 tags once, compare their payload words, and
+    // bypass nullish tests plus double conversion. Any other representation
+    // falls through to the complete existing loose-equality implementation.
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz x15, NUMBER_TAG_HI16, lsl #48
+        ; and x14, x9, x15
+        ; cmp x14, x15
+        ; b.ne =>generic
+        ; and x14, x10, x15
+        ; cmp x14, x15
+        ; b.ne =>generic
+        ; cmp w9, w10
+        ; cset w13, eq
+    );
+    if negate {
+        dynasm!(ops ; .arch aarch64 ; eor w13, w13, #1);
+    }
+    emit_box_bool(ops, 13, 12);
+    emit_store_reg(ops, 13, dst)?;
+    dynasm!(ops ; .arch aarch64 ; b =>done ; =>generic);
+
     emit_load_u64(ops, 11, VALUE_NULL);
     dynasm!(ops ; .arch aarch64 ; cmp x9, x11 ; b.eq =>lhs_nullish);
     emit_load_u64(ops, 11, VALUE_UNDEFINED);

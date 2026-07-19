@@ -16,9 +16,7 @@
 use otter_vm::{
     ActiveFrameMut, ActiveFrameRef, RuntimeCall, RuntimeStubAllocContext, Value, VmError,
     VmRuntimeActivation,
-    native_abi::{
-        CodeEntryCell, FunctionEntryCell, NativeFrame, NativeFrameFlags, VmFrameHeader, VmThread,
-    },
+    native_abi::{CodeEntryCell, FunctionEntryCell, NativeFrame, NativeFrameFlags, VmThread},
 };
 /// Machine-visible context shared by every compiled tier.
 ///
@@ -254,48 +252,24 @@ pub(crate) const CODE_ENTRY_GENERATED_BAIL_STREAK_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, generated_bail_streak) as u32;
 pub(crate) const CODE_ENTRY_CODE_OBJECT_ID_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, code_object_id) as u32;
-pub(crate) const CODE_ENTRY_FUNCTION_ID_OFFSET: u32 =
-    std::mem::offset_of!(CodeEntryCell, function_id) as u32;
-pub(crate) const CODE_ENTRY_REGISTER_COUNT_OFFSET: u32 =
-    std::mem::offset_of!(CodeEntryCell, register_count) as u32;
-pub(crate) const CODE_ENTRY_FLAGS_OFFSET: u32 = std::mem::offset_of!(CodeEntryCell, flags) as u32;
 pub(crate) const CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, generated_stack_frame_bytes) as u32;
+pub(crate) const CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET: u32 =
+    std::mem::offset_of!(CodeEntryCell, native_frame_header) as u32;
 /// 16-aligned machine-stack reservation for a nested callee's compact frame.
 pub(crate) const NATIVE_FRAME_STACK_SIZE: u32 =
     ((std::mem::size_of::<NativeFrame>() + 15) & !15) as u32;
 /// Byte offsets of the callee-frame fields emitted nested-call sequences fill.
 pub(crate) const NATIVE_FRAME_REGISTER_BASE_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, register_base) as u32;
-pub(crate) const NATIVE_FRAME_FUNCTION_ID_OFFSET: u32 = (std::mem::offset_of!(NativeFrame, header)
-    + std::mem::offset_of!(VmFrameHeader, function_id))
-    as u32;
-pub(crate) const NATIVE_FRAME_CODE_BLOCK_ID_OFFSET: u32 = (std::mem::offset_of!(
-    NativeFrame,
-    header
-) + std::mem::offset_of!(
-    VmFrameHeader,
-    code_block_id
-)) as u32;
-pub(crate) const NATIVE_FRAME_REGISTER_COUNT_OFFSET: u32 =
-    (std::mem::offset_of!(NativeFrame, header)
-        + std::mem::offset_of!(VmFrameHeader, register_count)) as u32;
-pub(crate) const NATIVE_FRAME_KIND_OFFSET: u32 =
-    (std::mem::offset_of!(NativeFrame, header) + std::mem::offset_of!(VmFrameHeader, kind)) as u32;
-pub(crate) const NATIVE_FRAME_FLAGS_OFFSET: u32 =
-    (std::mem::offset_of!(NativeFrame, header) + std::mem::offset_of!(VmFrameHeader, flags)) as u32;
 pub(crate) const NATIVE_FRAME_THIS_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, this_value_bits) as u32;
-pub(crate) const NATIVE_FRAME_NEW_TARGET_OFFSET: u32 =
-    std::mem::offset_of!(NativeFrame, new_target_bits) as u32;
 pub(crate) const NATIVE_FRAME_SELF_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, self_value_bits) as u32;
 pub(crate) const NATIVE_FRAME_UPVALUE_BASE_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, upvalue_base) as u32;
 pub(crate) const NATIVE_FRAME_UPVALUE_COUNT_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, upvalue_count) as u32;
-pub(crate) const NATIVE_FRAME_ACTIVATION_ID_OFFSET: u32 =
-    std::mem::offset_of!(NativeFrame, activation_id) as u32;
 
 // The native entry ABI targets 64-bit engines. These assertions describe the
 // one current VM/JIT layout generated code consumes directly.

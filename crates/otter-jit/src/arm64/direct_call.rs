@@ -46,18 +46,14 @@ use crate::{
     },
     entry::{
         ACTIVATION_BASE_OFFSET, ACTIVATION_LIMIT_OFFSET, ACTIVATION_TOP_PTR_OFFSET,
-        CODE_ENTRY_CODE_OBJECT_ID_OFFSET, CODE_ENTRY_FLAGS_OFFSET, CODE_ENTRY_FUNCTION_ID_OFFSET,
-        CODE_ENTRY_GENERATED_BAIL_STREAK_OFFSET, CODE_ENTRY_GENERATED_DEOPTS_OFFSET,
-        CODE_ENTRY_GENERATED_ENTRIES_OFFSET, CODE_ENTRY_GENERATED_RETURNS_OFFSET,
-        CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET, CODE_ENTRY_GENERATED_THROWS_OFFSET,
-        CODE_ENTRY_REGISTER_COUNT_OFFSET, FUNCTION_ENTRY_GENERATION_CELL_OFFSET,
-        GENERATED_CALL_DEOPTS_OFFSET, GENERATED_CALL_DEPTH_PTR_OFFSET, GENERATED_CALLS_OFFSET,
-        GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_ACTIVATION_ID_OFFSET,
-        NATIVE_FRAME_CODE_BLOCK_ID_OFFSET, NATIVE_FRAME_FLAGS_OFFSET,
-        NATIVE_FRAME_FUNCTION_ID_OFFSET, NATIVE_FRAME_KIND_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET,
-        NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
-        NATIVE_FRAME_REGISTER_COUNT_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE,
-        NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
+        CODE_ENTRY_CODE_OBJECT_ID_OFFSET, CODE_ENTRY_GENERATED_BAIL_STREAK_OFFSET,
+        CODE_ENTRY_GENERATED_DEOPTS_OFFSET, CODE_ENTRY_GENERATED_ENTRIES_OFFSET,
+        CODE_ENTRY_GENERATED_RETURNS_OFFSET, CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET,
+        CODE_ENTRY_GENERATED_THROWS_OFFSET, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET,
+        FUNCTION_ENTRY_GENERATION_CELL_OFFSET, GENERATED_CALL_DEOPTS_OFFSET,
+        GENERATED_CALL_DEPTH_PTR_OFFSET, GENERATED_CALLS_OFFSET, GLOBAL_THIS_OFFSET_PTR_OFFSET,
+        NATIVE_FRAME_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET,
+        NATIVE_FRAME_STACK_SIZE, NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
         NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NATIVE_STACK_BYTES_LIMIT_OFFSET,
         NATIVE_STACK_BYTES_PTR_OFFSET, STATUS_BAILED, STATUS_RETURNED,
         SYNC_REENTRY_DEPTH_PTR_OFFSET, SYNC_REENTRY_LIMIT_OFFSET, THREAD_OFFSET, Unsupported,
@@ -65,10 +61,6 @@ use crate::{
         reg_offset,
     },
 };
-
-const CODE_ENTRY_SAFEPOINT_FLAG: u32 = abi::CODE_ENTRY_HAS_SAFEPOINTS;
-const CODE_ENTRY_OPTIMIZING_TIER_FLAG: u32 = abi::CODE_ENTRY_OPTIMIZING_TIER;
-const STACK_REGISTER_FRAME_FLAG: u32 = abi::NativeFrameFlags::STACK_REGISTERS as u32;
 
 /// Maximum caller-owned linkage reservation accepted by one generated call.
 /// The target's exact persistent prologue reservation is accounted separately
@@ -513,14 +505,12 @@ pub(crate) fn emit_direct_call(
         ; str x25, [sp, layout.saved_x25]
         ; str x9, [sp, NATIVE_FRAME_SELF_OFFSET]
         ; str x10, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
-        ; str w11, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
-        ; str x12, [sp, NATIVE_FRAME_THIS_OFFSET]
     );
     emit_load_u64(ops, 13, VALUE_UNDEFINED);
     dynasm!(ops
         ; .arch aarch64
-        ; str x13, [sp, NATIVE_FRAME_NEW_TARGET_OFFSET]
-        ; str wzr, [sp, NATIVE_FRAME_ACTIVATION_ID_OFFSET]
+        ; stp x12, x13, [sp, NATIVE_FRAME_THIS_OFFSET as i32]
+        ; str x11, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
     );
 
     // Generated callers bake the permanent function-cell address. The hot
@@ -591,20 +581,8 @@ pub(crate) fn emit_direct_call(
         ; ldr x16, [x25]
         ; cbz x16, =>entry_rejected
         ; str x16, [sp, layout.entry_addr]
-        ; ldr w13, [x25, CODE_ENTRY_FUNCTION_ID_OFFSET]
-        ; str w13, [sp, NATIVE_FRAME_FUNCTION_ID_OFFSET]
-        ; str w13, [sp, NATIVE_FRAME_CODE_BLOCK_ID_OFFSET]
-        ; str wzr, [sp, NATIVE_FRAME_PC_OFFSET]
-        ; ldrh w13, [x25, CODE_ENTRY_REGISTER_COUNT_OFFSET]
-        ; strh w13, [sp, NATIVE_FRAME_REGISTER_COUNT_OFFSET]
-        ; ldr w14, [x25, CODE_ENTRY_FLAGS_OFFSET]
-        ; and w13, w14, #CODE_ENTRY_OPTIMIZING_TIER_FLAG
-        ; lsr w13, w13, #2
-        ; add w13, w13, #1
-        ; strb w13, [sp, NATIVE_FRAME_KIND_OFFSET]
-        ; and w13, w14, #CODE_ENTRY_SAFEPOINT_FLAG
-        ; orr w13, w13, #STACK_REGISTER_FRAME_FLAG
-        ; strb w13, [sp, NATIVE_FRAME_FLAGS_OFFSET]
+        ; ldp x13, x14, [x25, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET as i32]
+        ; stp x13, x14, [sp]
         ; add x14, sp, NATIVE_FRAME_STACK_SIZE
         ; str x14, [sp, NATIVE_FRAME_REGISTER_BASE_OFFSET]
     );
@@ -665,10 +643,9 @@ pub(crate) fn emit_direct_call(
     dynasm!(ops
         ; .arch aarch64
         ; ldr x13, [x20, NATIVE_FRAME_OFFSET]
-        ; str x13, [sp, layout.caller_frame]
         ; ldr x14, [x20, THREAD_OFFSET]
         ; ldr x15, [x14, VM_THREAD_CODE_OBJECT_ID_OFFSET]
-        ; str x15, [sp, layout.caller_code_object_id]
+        ; stp x13, x15, [sp, layout.caller_frame as i32]
         ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
         ; ldr x10, [x9]
         ; ldr x11, [x20, ACTIVATION_BASE_OFFSET]
@@ -678,9 +655,8 @@ pub(crate) fn emit_direct_call(
         ; add x10, x10, #1
         ; str x10, [x9]
         ; str x15, [x20, NATIVE_FRAME_OFFSET]
-        ; str x15, [x14, VM_THREAD_CURRENT_FRAME_OFFSET]
         ; ldr x13, [x25, CODE_ENTRY_CODE_OBJECT_ID_OFFSET]
-        ; str x13, [x14, VM_THREAD_CODE_OBJECT_ID_OFFSET]
+        ; stp x15, x13, [x14, VM_THREAD_CURRENT_FRAME_OFFSET as i32]
         ; ldr x16, [sp, layout.entry_addr]
     );
     record_region(
@@ -790,12 +766,10 @@ pub(crate) fn emit_direct_call(
         ; .arch aarch64
         ; =>cleanup
         // Restore caller publication before retiring the callee generation.
-        ; ldr x13, [sp, layout.caller_frame]
+        ; ldp x13, x15, [sp, layout.caller_frame as i32]
         ; str x13, [x20, NATIVE_FRAME_OFFSET]
         ; ldr x14, [x20, THREAD_OFFSET]
-        ; str x13, [x14, VM_THREAD_CURRENT_FRAME_OFFSET]
-        ; ldr x15, [sp, layout.caller_code_object_id]
-        ; str x15, [x14, VM_THREAD_CODE_OBJECT_ID_OFFSET]
+        ; stp x13, x15, [x14, VM_THREAD_CURRENT_FRAME_OFFSET as i32]
         ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
         ; ldr x10, [x9]
         ; sub x10, x10, #1

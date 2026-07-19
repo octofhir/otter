@@ -206,6 +206,7 @@ impl CodeBlock {
         let gc_header_bytes = otter_gc::header::HEADER_SIZE as u32;
         crate::jit::JitCompileSnapshot {
             code_block: Arc::clone(self),
+            derived_constructor: self.is_derived_constructor,
             // Baked by `Interpreter::compile_jit_function`, which holds the
             // cage base and the live property-IC tables.
             cage_base: 0,

@@ -1174,7 +1174,6 @@ mod tests {
             sync_reentry_limit: 0,
             native_stack_bytes: std::ptr::null_mut(),
             native_stack_bytes_limit: 0,
-            generated_call_depth: std::ptr::null_mut(),
             generated_calls: 0,
             generated_call_deopts: 0,
         };

@@ -53,9 +53,6 @@ pub(crate) struct JitCtx {
     pub(crate) native_stack_bytes: *mut usize,
     /// Conservative aggregate generated-call native-stack bound.
     pub(crate) native_stack_bytes_limit: usize,
-    /// Address of the logical depth owned by generated frames that remain
-    /// native-only.
-    pub(crate) generated_call_depth: *mut u32,
     /// Compiler-generated native calls entered during this outer activation.
     pub(crate) generated_calls: u64,
     /// Started generated callees resumed through cold deoptimization.
@@ -220,8 +217,6 @@ pub(crate) const NATIVE_STACK_BYTES_PTR_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, native_stack_bytes) as u32;
 pub(crate) const NATIVE_STACK_BYTES_LIMIT_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, native_stack_bytes_limit) as u32;
-pub(crate) const GENERATED_CALL_DEPTH_PTR_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, generated_call_depth) as u32;
 pub(crate) const GENERATED_CALLS_OFFSET: u32 = std::mem::offset_of!(JitCtx, generated_calls) as u32;
 pub(crate) const GENERATED_CALL_DEOPTS_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, generated_call_deopts) as u32;
@@ -274,7 +269,7 @@ pub(crate) const NATIVE_FRAME_UPVALUE_COUNT_OFFSET: u32 =
 // The native entry ABI targets 64-bit engines. These assertions describe the
 // one current VM/JIT layout generated code consumes directly.
 #[cfg(target_pointer_width = "64")]
-const _: [(); 112] = [(); std::mem::size_of::<JitCtx>()];
+const _: [(); 104] = [(); std::mem::size_of::<JitCtx>()];
 
 /// Compiled-code entry signature.
 pub(crate) type JitEntry = extern "C" fn(*mut JitCtx) -> JitRet;

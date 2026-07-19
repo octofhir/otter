@@ -3,20 +3,18 @@
 //! # Contents
 //! Timer scheduler and dynamic-import loader wiring, console sink,
 //! microtask queue accessors, logical/native stack-depth limits,
-//! machine-visible generated-call counters, eval hook, tracer, CPU profiler,
+//! machine-visible generated-call accounting, eval hook, tracer, CPU profiler,
 //! IC/shape/heap snapshots, interrupt handle, and `global_this`/`set_global`,
 //! plus rooted host-construction scopes.
 //!
 //! # Invariants
 //! - Interpreter services here are isolate-owned and never discover the active
 //!   execution stack through TLS or raw pointers.
-//! - Generated code mutates recursion, logical-depth, and native-stack
-//!   counters only while its exclusive interpreter borrow is active and
-//!   restores each on every exit.
-//! - `jit_generated_call_depth` counts only frames still native. Cold
-//!   deoptimization transfers its current frame to `ActivationStack` for the
-//!   interpreter continuation, then restores native ownership before generated
-//!   cleanup releases the frame.
+//! - Generated code mutates recursion and native-stack counters only while its
+//!   exclusive interpreter borrow is active and restores each on every exit.
+//! - Generated-call depth is derived from canonical native activations. Cold
+//!   deoptimization records a temporary materialization transfer so the same
+//!   activation is never counted twice.
 //! - Live-frame diagnostics belong to [`NativeCtx`](crate::NativeCtx), whose
 //!   [`RuntimeTurn`](crate::runtime_cx::RuntimeTurn) carries the explicit
 //!   activation-stack borrow.
@@ -204,14 +202,6 @@ impl Interpreter {
         std::ptr::addr_of_mut!(self.sync_reentry_depth)
     }
 
-    /// Address of the active generated-call logical-depth counter.
-    ///
-    /// Generated call sequences increment this after all pre-entry guards and
-    /// decrement it on every native cleanup or entry rollback.
-    pub fn jit_generated_call_depth_addr(&mut self) -> *mut u32 {
-        std::ptr::addr_of_mut!(self.jit_generated_call_depth)
-    }
-
     /// Address of the active realm's rooted `globalThis` compressed offset.
     ///
     /// `JsObject` is a transparent four-byte `Gc<ObjectBody>`. The collector
@@ -236,30 +226,29 @@ impl Interpreter {
     /// Current logical JavaScript frame depth across materialized interpreter
     /// frames and generated frames that still live only on the native stack.
     ///
-    /// A stack-call cold deopt transfers its current generated frame out of
-    /// `jit_generated_call_depth` before publishing the materialized frame, so
-    /// this sum never counts that activation twice.
+    /// A stack-call cold deopt temporarily marks its still-published native
+    /// frame as materialized, so this sum never counts that activation twice.
     pub(crate) fn logical_call_depth(&self, stack: &ActivationStack) -> u32 {
         u32::try_from(stack.len())
             .unwrap_or(u32::MAX)
-            .saturating_add(self.jit_generated_call_depth)
+            .saturating_add(self.jit_generated_call_depth())
     }
 
     /// Temporarily transfer the current generated frame into interpreter
     /// ownership while `operation` runs.
     ///
-    /// Generated cleanup still owns the final decrement, so native ownership
-    /// is restored before this helper returns.
+    /// Native publication remains intact for GC; only logical-depth ownership
+    /// is transferred and restored around the cold operation.
     pub(crate) fn with_materialized_generated_call_depth<T>(
         &mut self,
         operation: impl FnOnce(&mut Self) -> T,
     ) -> Result<T, VmError> {
-        self.jit_generated_call_depth = self
-            .jit_generated_call_depth
-            .checked_sub(1)
-            .ok_or(VmError::InvalidOperand)?;
+        if self.jit_generated_call_depth() == 0 {
+            return Err(VmError::InvalidOperand);
+        }
+        self.jit_materialized_generated_call_depth += 1;
         let result = operation(self);
-        self.jit_generated_call_depth += 1;
+        self.jit_materialized_generated_call_depth -= 1;
         Ok(result)
     }
 

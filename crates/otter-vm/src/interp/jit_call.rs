@@ -730,7 +730,14 @@ impl Interpreter {
     /// existing optimizing resolver sample hot baseline callees. Optimizing
     /// generations never become promotion candidates.
     pub fn jit_reconcile_generated_feedback(&mut self, context: &ExecutionContext) {
-        if !self.jit_generated_feedback_pending || self.jit_native_activation_top != 0 {
+        if self.jit_native_activation_top != 0 {
+            return;
+        }
+        // This is the generated-code retirement epoch boundary. No native
+        // frame can still hold an unleased entry address, so invalid mappings
+        // with no ordinary Arc owner may now be released.
+        self.jit_code_registry.retire_unreferenced();
+        if !self.jit_generated_feedback_pending {
             return;
         }
         self.jit_generated_feedback_pending = false;

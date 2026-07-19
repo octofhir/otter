@@ -10,9 +10,10 @@
 //! - [`arith`] — numeric, comparison, and bitwise emitters.
 //!
 //! # Invariants
-//! - Every instruction stamps its canonical resume PC into the published
-//!   native frame before any observable work; exact side exits, returns, and
-//!   the throw status are the only exits.
+//! - Every instruction that can side-exit, transition, or poll stamps its
+//!   canonical resume PC before observable work. Constants, moves, proven
+//!   boolean/nullish forward branches, plain forward jumps, and returns cannot
+//!   exit and therefore need no redundant publication.
 //! - Tagged truthiness decides immediate primitives inline and delegates heap
 //!   cells to the total leaf helper without allocating or re-entering JS.
 //! - Boxed-double falsiness is decided by exact bit patterns (`+0.0`, `-0.0`,
@@ -25,6 +26,13 @@
 //!   value is loaded at execution time and TDZ holes take the exact VM path.
 //! - Machine-visible offsets come only from the shared entry-ABI module and
 //!   frozen value-tag contracts; no Rust container layout is probed.
+//! - `x19` retains the tagged register-window base, `x20` retains `JitCtx`,
+//!   and `x21` retains the current `NativeFrame`. All three are callee-saved,
+//!   so exact-PC publication and frame-field reads never reload the frame
+//!   pointer from the context inside the instruction stream.
+//! - A branch may skip general tagged truthiness only when its condition's
+//!   nearest write in the same straight-line basic block is a canonical
+//!   boolean producer. Any explicit control-flow target breaks that proof.
 //!
 //! # See also
 //! - [`super::plan`] — the validated operation stream consumed here.
@@ -61,7 +69,7 @@ mod value_load;
 pub(crate) mod values;
 mod variadic;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_bytecode::Op;
@@ -103,7 +111,7 @@ const VALUE_NULL_IMM: u32 = VALUE_NULL as u32;
 const VALUE_UNDEFINED_IMM: u32 = VALUE_UNDEFINED as u32;
 
 /// Persistent machine-stack reservation held by [`emit_prologue`].
-pub(super) const NATIVE_FRAME_BYTES: u32 = 32;
+pub(super) const NATIVE_FRAME_BYTES: u32 = 48;
 
 pub(super) fn compile(
     view: &JitCompileSnapshot,
@@ -214,6 +222,16 @@ pub(super) fn compile(
         .iter()
         .map(|instr| (instr.pc, ops.new_dynamic_label()))
         .collect();
+    let explicit_targets = plan
+        .instructions
+        .iter()
+        .filter_map(|instruction| match instruction.op {
+            TemplateOp::Jump { target, .. }
+            | TemplateOp::Branch { target, .. }
+            | TemplateOp::BranchNullish { target, .. } => Some(target),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
 
     let entry = ops.offset();
     emit_prologue(&mut ops);
@@ -228,10 +246,21 @@ pub(super) fn compile(
         let instruction_start = ops.offset().0;
         let label = labels[&instr.pc];
         dynasm!(ops ; .arch aarch64 ; =>label);
-        // Publish this op's logical PC before any observable work; the
-        // published NativeFrame PC is the one canonical logical PC every bail
-        // path and diagnostic reads.
-        emit_stamp_pc(&mut ops, instr.pc);
+        let canonical_boolean_branch = match instr.op {
+            TemplateOp::Branch { condition, .. } => branch_condition_is_canonical_boolean(
+                &plan,
+                &explicit_targets,
+                operation_index,
+                condition,
+            ),
+            _ => false,
+        };
+        // Pure operations cannot leave native code. Every operation that can
+        // exit or cross a runtime boundary publishes its exact logical PC
+        // before observable work.
+        if operation_requires_pc_stamp(instr.op, canonical_boolean_branch) {
+            emit_stamp_pc(&mut ops, instr.pc);
+        }
         match instr.op {
             TemplateOp::LoadImmediate { dst, bits } => {
                 emit_load_u64(&mut ops, 9, bits);
@@ -256,7 +285,9 @@ pub(super) fn compile(
             } => {
                 let tgt = labels[&target];
                 emit_load_reg(&mut ops, 9, condition)?;
-                emit_truthiness_bool(&mut ops, &mut relocations, bail);
+                if !canonical_boolean_branch {
+                    emit_truthiness_bool(&mut ops, &mut relocations, bail);
+                }
                 dynasm!(ops ; .arch aarch64 ; cmp x9, VALUE_TRUE_IMM);
                 if back_edge {
                     let taken = ops.new_dynamic_label();
@@ -401,11 +432,7 @@ pub(super) fn compile(
                 )?;
             }
             TemplateOp::LoadThis { dst } => {
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-                    ; ldr x9, [x10, NATIVE_FRAME_THIS_OFFSET]
-                );
+                dynasm!(ops ; .arch aarch64 ; ldr x9, [x21, NATIVE_FRAME_THIS_OFFSET]);
                 emit_load_u64(&mut ops, 12, VALUE_HOLE);
                 // A derived-ctor `this`-before-`super` hole resolves in the
                 // interpreter.
@@ -413,11 +440,7 @@ pub(super) fn compile(
                 emit_store_reg(&mut ops, 9, dst)?;
             }
             TemplateOp::LoadSelfClosure { dst } => {
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-                    ; ldr x9, [x10, NATIVE_FRAME_SELF_OFFSET]
-                );
+                dynasm!(ops ; .arch aarch64 ; ldr x9, [x21, NATIVE_FRAME_SELF_OFFSET]);
                 emit_store_reg(&mut ops, 9, dst)?;
             }
             TemplateOp::MakeFunction { dst, constant } => {
@@ -1450,18 +1473,88 @@ pub(super) fn compile(
     })
 }
 
-/// Emit the function prologue: save fp/lr + callee-saved bases, then set
-/// `x20 = ctx` (arg in `x0`) and `x19 = NativeFrame.register_base` — the
-/// shared compiled-entry ABI. No register pointer is duplicated in `JitCtx`.
+/// Whether an operation can leave native code and therefore needs an exact
+/// resume PC published before it starts.
+fn operation_requires_pc_stamp(op: TemplateOp, canonical_boolean_branch: bool) -> bool {
+    match op {
+        TemplateOp::LoadImmediate { .. }
+        | TemplateOp::Move { .. }
+        | TemplateOp::LoadSelfClosure { .. }
+        | TemplateOp::Return { .. }
+        | TemplateOp::ReturnUndefined
+        | TemplateOp::Jump {
+            back_edge: false, ..
+        }
+        | TemplateOp::BranchNullish {
+            back_edge: false, ..
+        } => false,
+        TemplateOp::Branch {
+            back_edge: false, ..
+        } if canonical_boolean_branch => false,
+        _ => true,
+    }
+}
+
+/// Whether `condition` is still the canonical boolean produced in this basic
+/// block.
+///
+/// The narrow backward walk deliberately crosses only moves to other
+/// registers. This captures compare-result bookkeeping without becoming a
+/// second data-flow framework, while an explicit branch target prevents a
+/// fallthrough-only proof from leaking across CFG joins or OSR headers.
+fn branch_condition_is_canonical_boolean(
+    plan: &TemplatePlan,
+    explicit_targets: &BTreeSet<u32>,
+    operation_index: usize,
+    condition: u16,
+) -> bool {
+    if plan.instructions.iter().any(|instruction| {
+        matches!(
+            instruction.op,
+            TemplateOp::EnterTry { .. }
+                | TemplateOp::LeaveTry
+                | TemplateOp::Throw { .. }
+                | TemplateOp::TdzError { .. }
+                | TemplateOp::EndFinally
+                | TemplateOp::PopParkedFinally { .. }
+                | TemplateOp::JumpViaFinally { .. }
+        )
+    }) {
+        return false;
+    }
+    let mut index = operation_index;
+    while index != 0 {
+        if explicit_targets.contains(&plan.instructions[index].pc) {
+            return false;
+        }
+        index -= 1;
+        match plan.instructions[index].op {
+            TemplateOp::Compare { dst, .. }
+            | TemplateOp::LooseCompare { dst, .. }
+            | TemplateOp::Truthiness { dst, .. }
+                if dst == condition =>
+            {
+                return true;
+            }
+            TemplateOp::Move { dst, .. } if dst != condition => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Emit the function prologue: save fp/lr + callee-saved bases, then retain
+/// `JitCtx`, its current `NativeFrame`, and that frame's register window.
 fn emit_prologue(ops: &mut Assembler) {
     dynasm!(ops
         ; .arch aarch64
-        ; stp x29, x30, [sp, #-32]!
+        ; stp x29, x30, [sp, #-48]!
         ; stp x19, x20, [sp, #16]
+        ; str x21, [sp, #32]
         ; mov x29, sp
         ; mov x20, x0
-        ; ldr x9, [x20, NATIVE_FRAME_OFFSET]
-        ; ldr x19, [x9, NATIVE_FRAME_REGISTER_BASE_OFFSET]
+        ; ldr x21, [x20, NATIVE_FRAME_OFFSET]
+        ; ldr x19, [x21, NATIVE_FRAME_REGISTER_BASE_OFFSET]
     );
 }
 
@@ -1470,8 +1563,9 @@ fn emit_prologue(ops: &mut Assembler) {
 fn emit_epilogue(ops: &mut Assembler) {
     dynasm!(ops
         ; .arch aarch64
+        ; ldr x21, [sp, #32]
         ; ldp x19, x20, [sp, #16]
-        ; ldp x29, x30, [sp], #32
+        ; ldp x29, x30, [sp], #48
         ; ret
     );
 }
@@ -1479,11 +1573,7 @@ fn emit_epilogue(ops: &mut Assembler) {
 /// Publish the canonical instruction-index PC into the active native frame.
 fn emit_stamp_pc(ops: &mut Assembler, pc: u32) {
     emit_load_u64(ops, 9, u64::from(pc));
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-        ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
-    );
+    dynasm!(ops ; .arch aarch64 ; str w9, [x21, NATIVE_FRAME_PC_OFFSET]);
 }
 
 /// Reduce the tagged `Value` in `x9` to `VALUE_TRUE` / `VALUE_FALSE` in `x9`

@@ -11,6 +11,8 @@
 //! - Accepted closures have the expected function id and carry neither runtime
 //!   call setup nor bound-`this` state.
 //! - The returned callable is a full tagged `Value`, never a compressed slot.
+//! - One materialized cage base in `x12` serves the receiver and every
+//!   prototype hop; `x13` advances through the guarded object chain.
 //!
 //! # See also
 //! - [`otter_vm::JitMethodGuard`] — owned compile-time guard metadata.
@@ -63,18 +65,18 @@ pub(crate) fn emit_method_guard(
         ; orr x11, x11, #0x2
         ; tst x9, x11
         ; b.ne =>bail
-        ; mov w12, w9
+        ; mov w11, w9
     );
     emit_load_symbol_u64(
         ops,
         relocations,
-        13,
+        12,
         view.cage_base as u64,
         crate::artifact::relocation::RelocationTarget::GcCageBase,
     );
     dynasm!(ops
         ; .arch aarch64
-        ; add x13, x13, x12
+        ; add x13, x12, x11
         ; ldrb w14, [x13]
         ; cmp w14, OBJECT_BODY_TYPE_TAG
         ; b.ne =>bail
@@ -91,16 +93,6 @@ pub(crate) fn emit_method_guard(
             ; .arch aarch64
             ; ldr w9, [x13, view.jit_proto_byte]
             ; cbz w9, =>bail
-        );
-        emit_load_symbol_u64(
-            ops,
-            relocations,
-            12,
-            view.cage_base as u64,
-            crate::artifact::relocation::RelocationTarget::GcCageBase,
-        );
-        dynasm!(ops
-            ; .arch aarch64
             ; add x13, x12, x9
             ; ldrb w14, [x13]
             ; cmp w14, OBJECT_BODY_TYPE_TAG

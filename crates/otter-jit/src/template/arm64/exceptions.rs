@@ -20,9 +20,7 @@ use otter_vm::native_abi as abi;
 
 use super::values::{emit_load_runtime_stub, emit_load_u64};
 use crate::artifact::relocation::RelocationCapture;
-use crate::entry::{
-    NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET, STATUS_BAILED, STATUS_CONTINUE, STATUS_RETURNED,
-};
+use crate::entry::{NATIVE_FRAME_PC_OFFSET, STATUS_BAILED, STATUS_CONTINUE, STATUS_RETURNED};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_exception_op(
@@ -62,8 +60,7 @@ pub(super) fn emit_exception_op(
         ; b.eq =>resume
         ; b =>threw
         ; =>resume
-        ; ldr x9, [x20, NATIVE_FRAME_OFFSET]
-        ; str w0, [x9, NATIVE_FRAME_PC_OFFSET]
+        ; str w0, [x21, NATIVE_FRAME_PC_OFFSET]
         ; b =>bail
         ; =>done
     );

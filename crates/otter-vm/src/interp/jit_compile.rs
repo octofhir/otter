@@ -353,7 +353,12 @@ impl Interpreter {
                     self.record_jit_artifact(*artifact);
                 }
                 self.jit_next_code_object_id += 1;
-                self.jit_code_registry.retire_unreferenced();
+                // Generated callers do not take a per-call executable lease.
+                // Any published native activation pins the current retirement
+                // epoch, including across reentrant compilation/invalidation.
+                if self.jit_native_activation_top == 0 {
+                    self.jit_code_registry.retire_unreferenced();
+                }
                 let installed = self.jit_code_registry.install_compiled(
                     code_object_id,
                     code.clone(),
@@ -505,9 +510,11 @@ impl Interpreter {
                 }
                 self.jit_next_code_object_id += 1;
                 // Sweep before registering: cached/installed users hold an
-                // `Arc`, while executing native generations hold an entry-cell
-                // lease. Only invalid code with neither kind of owner retires.
-                self.jit_code_registry.retire_unreferenced();
+                // `Arc`; executing generated generations are protected by the
+                // isolate's published native-activation epoch.
+                if self.jit_native_activation_top == 0 {
+                    self.jit_code_registry.retire_unreferenced();
+                }
                 let installed = self.jit_code_registry.install_compiled(
                     code_object_id,
                     code.clone(),

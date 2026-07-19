@@ -242,8 +242,6 @@ pub(crate) const FUNCTION_ENTRY_GENERATION_CELL_OFFSET: u32 =
     std::mem::offset_of!(FunctionEntryCell, generation_cell) as u32;
 /// Fixed-layout fields consumed by native call linkage. Generation cells are
 /// boxed by the isolate registry and never reused.
-pub(crate) const CODE_ENTRY_ACTIVE_COUNT_OFFSET: u32 =
-    std::mem::offset_of!(CodeEntryCell, active_count) as u32;
 pub(crate) const CODE_ENTRY_GENERATED_ENTRIES_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, generated_entries) as u32;
 pub(crate) const CODE_ENTRY_GENERATED_RETURNS_OFFSET: u32 =

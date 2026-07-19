@@ -45,8 +45,8 @@ use crate::artifact::relocation::{
 use crate::entry::{
     ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
     ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, GLOBAL_THIS_OFFSET_PTR_OFFSET,
-    NATIVE_FRAME_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET, NUMBER_TAG_HI16, THREAD_OFFSET,
-    Unsupported, VALUE_HOLE, VALUE_UNDEFINED, VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET,
+    NATIVE_FRAME_UPVALUE_BASE_OFFSET, NUMBER_TAG_HI16, THREAD_OFFSET, Unsupported, VALUE_HOLE,
+    VALUE_UNDEFINED, VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET,
 };
 use crate::template::TemplateTail;
 
@@ -660,8 +660,7 @@ pub(super) fn emit_load_upvalue(
         let spine_offset = (index as u32) * 4;
         dynasm!(ops
             ; .arch aarch64
-            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-            ; ldr x9, [x10, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
+            ; ldr x9, [x21, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
             ; cbz x9, =>miss
             ; ldr w9, [x9, spine_offset]
         );

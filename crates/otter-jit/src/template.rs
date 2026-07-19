@@ -21,9 +21,10 @@
 //!
 //! # Invariants
 //! - Compiled code publishes the canonical instruction-index PC before every
-//!   opcode and exits only through pre-effect exact side exits, returns, or the
-//!   throw status; the interpreter resumes exactly there and never replays a
-//!   committed effect.
+//!   operation capable of a side exit, runtime transition, or back-edge poll.
+//!   Pure constants, moves, forward control flow, and returns cannot exit, so
+//!   they inherit the last publication. Every actual interpreter resume still
+//!   names the exact operation and never replays a committed effect.
 //! - The VM is reached only through `otter_vm::native_abi` records and the
 //!   shared runtime-stub inventory; no template-private frame or status shape
 //!   exists.

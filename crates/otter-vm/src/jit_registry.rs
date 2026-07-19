@@ -29,7 +29,8 @@
 //!   selection require `expected == current`; invalidation marks Installed
 //!   code only when `expected < current` for the same `(kind, identity)`.
 //! - Invalid code remains available to safepoint resolution until its last
-//!   external anchor drops and [`JitCodeRegistry::retire_unreferenced`] removes
+//!   external anchor drops and the interpreter reaches a native-activation
+//!   retirement epoch before [`JitCodeRegistry::retire_unreferenced`] removes
 //!   it. Safepoint resolution therefore does not apply the entry check.
 //! - Generated callers retain only stable function-cell addresses. Publishing a
 //!   new generation never invalidates or recompiles dependent callers.
@@ -426,8 +427,14 @@ impl JitCodeRegistry {
     }
 
     /// Retire invalid code whose last `Arc` owner is the registry and whose
-    /// unlinked entry cell has no active lease, so no new or executing native
-    /// frame can reach the mapping. Returns how many objects retired.
+    /// unlinked entry cell has no explicit active lease.
+    ///
+    /// The interpreter may call this only at a native-activation epoch
+    /// boundary. Generated calls deliberately avoid per-entry leases; their
+    /// published outer activation pins every entry address they can still be
+    /// executing until that boundary.
+    ///
+    /// Returns how many objects retired.
     pub(crate) fn retire_unreferenced(&mut self) -> usize {
         let before = self.codes.len();
         let entry_cells = &self.entry_cells;

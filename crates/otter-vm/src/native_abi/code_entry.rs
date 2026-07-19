@@ -34,6 +34,8 @@ use std::{
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
+use super::{NativeFrameFlags, NativeFrameKind, VmFrameHeader};
+
 /// Stable per-function dispatch cell consumed by generated call linkage.
 #[repr(C, align(8))]
 #[derive(Debug)]
@@ -103,6 +105,12 @@ pub struct CodeEntryCell {
     /// Persistent native-stack bytes reserved by the target after entry, or
     /// zero when this generation cannot accept stack-owned generated calls.
     pub generated_stack_frame_bytes: u32,
+    /// Ready-to-copy frame header for stack-owned generated calls.
+    ///
+    /// Function identity, register shape, tier, and safepoint capability are
+    /// immutable for this generation. Packing them once removes per-entry
+    /// metadata decoding from generated call linkage.
+    pub native_frame_header: VmFrameHeader,
     /// Explicit leases that may outlive a native-activation retirement epoch.
     pub active_count: AtomicU32,
     /// Generated native entries observed for tiering/introspection.
@@ -135,6 +143,16 @@ impl CodeEntryCell {
     ) -> Self {
         debug_assert_ne!(entry_addr, 0);
         debug_assert_ne!(code_object_id, 0);
+        let kind = if flags & CODE_ENTRY_OPTIMIZING_TIER != 0 {
+            NativeFrameKind::Optimizing
+        } else {
+            NativeFrameKind::Baseline
+        };
+        let mut frame_flag_bits = NativeFrameFlags::STACK_REGISTERS;
+        if flags & CODE_ENTRY_HAS_SAFEPOINTS != 0 {
+            frame_flag_bits |= NativeFrameFlags::HAS_SAFEPOINTS;
+        }
+        let frame_flags = NativeFrameFlags::from_bits(frame_flag_bits);
         Self {
             entry_addr: AtomicU64::new(entry_addr as u64),
             code_object_id,
@@ -143,6 +161,14 @@ impl CodeEntryCell {
             register_count,
             flags,
             generated_stack_frame_bytes,
+            native_frame_header: VmFrameHeader {
+                function_id,
+                code_block_id: function_id,
+                pc: 0,
+                register_count,
+                kind,
+                flags: frame_flags,
+            },
             active_count: AtomicU32::new(0),
             generated_entries: Cell::new(0),
             generated_returns: Cell::new(0),
@@ -249,18 +275,19 @@ const _: [(); 8] = [(); std::mem::align_of::<FunctionEntryCell>()];
 const _: [(); 0] = [(); std::mem::offset_of!(FunctionEntryCell, generation_cell)];
 const _: [(); 8] = [(); std::mem::offset_of!(FunctionEntryCell, function_id)];
 
-const _: [(); 80] = [(); std::mem::size_of::<CodeEntryCell>()];
+const _: [(); 96] = [(); std::mem::size_of::<CodeEntryCell>()];
 const _: [(); 8] = [(); std::mem::align_of::<CodeEntryCell>()];
 const _: [(); 0] = [(); std::mem::offset_of!(CodeEntryCell, entry_addr)];
 const _: [(); 8] = [(); std::mem::offset_of!(CodeEntryCell, code_object_id)];
 const _: [(); 24] = [(); std::mem::offset_of!(CodeEntryCell, flags)];
 const _: [(); 28] = [(); std::mem::offset_of!(CodeEntryCell, generated_stack_frame_bytes)];
-const _: [(); 32] = [(); std::mem::offset_of!(CodeEntryCell, active_count)];
-const _: [(); 40] = [(); std::mem::offset_of!(CodeEntryCell, generated_entries)];
-const _: [(); 48] = [(); std::mem::offset_of!(CodeEntryCell, generated_returns)];
-const _: [(); 56] = [(); std::mem::offset_of!(CodeEntryCell, generated_deopts)];
-const _: [(); 64] = [(); std::mem::offset_of!(CodeEntryCell, generated_throws)];
-const _: [(); 72] = [(); std::mem::offset_of!(CodeEntryCell, generated_bail_streak)];
+const _: [(); 32] = [(); std::mem::offset_of!(CodeEntryCell, native_frame_header)];
+const _: [(); 48] = [(); std::mem::offset_of!(CodeEntryCell, active_count)];
+const _: [(); 56] = [(); std::mem::offset_of!(CodeEntryCell, generated_entries)];
+const _: [(); 64] = [(); std::mem::offset_of!(CodeEntryCell, generated_returns)];
+const _: [(); 72] = [(); std::mem::offset_of!(CodeEntryCell, generated_deopts)];
+const _: [(); 80] = [(); std::mem::offset_of!(CodeEntryCell, generated_throws)];
+const _: [(); 88] = [(); std::mem::offset_of!(CodeEntryCell, generated_bail_streak)];
 
 #[cfg(test)]
 mod tests {

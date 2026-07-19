@@ -124,12 +124,14 @@ pub(super) fn compile(
                     .find(|instruction| instruction.byte_pc == byte_pc)?;
                 let instruction_pc = instruction.instruction_pc(&view.code_block);
                 Some((
-                    byte_pc,
+                    (byte_pc, 0),
                     otter_vm::JitCompilerDiagnostic::DirectCallLowered {
                         call_kind: otter_vm::JitDirectCallKind::Plain,
                         instruction_pc,
                         byte_pc,
                         callee_function_id: target.plan.function_id,
+                        target_index: 0,
+                        target_count: 1,
                         outcome: otter_vm::JitDirectCallLoweringOutcome::Rejected {
                             reason: otter_vm::JitDirectCallLoweringRejectionReason::Eliminated,
                         },
@@ -137,7 +139,7 @@ pub(super) fn compile(
                 ))
             })
             .collect::<BTreeMap<_, _>>();
-        for (&byte_pc, method) in &view.direct_methods {
+        for (&byte_pc, methods) in &view.direct_methods {
             let Some(instruction) = view
                 .instructions
                 .iter()
@@ -146,18 +148,22 @@ pub(super) fn compile(
                 continue;
             };
             let instruction_pc = instruction.instruction_pc(&view.code_block);
-            events.insert(
-                byte_pc,
-                otter_vm::JitCompilerDiagnostic::DirectCallLowered {
-                    call_kind: otter_vm::JitDirectCallKind::Method,
-                    instruction_pc,
-                    byte_pc,
-                    callee_function_id: method.callee.plan.function_id,
-                    outcome: otter_vm::JitDirectCallLoweringOutcome::Rejected {
-                        reason: otter_vm::JitDirectCallLoweringRejectionReason::Eliminated,
+            for method in methods {
+                events.insert(
+                    (byte_pc, method.target_index),
+                    otter_vm::JitCompilerDiagnostic::DirectCallLowered {
+                        call_kind: otter_vm::JitDirectCallKind::Method,
+                        instruction_pc,
+                        byte_pc,
+                        callee_function_id: method.callee.plan.function_id,
+                        target_index: method.target_index,
+                        target_count: method.target_count,
+                        outcome: otter_vm::JitDirectCallLoweringOutcome::Rejected {
+                            reason: otter_vm::JitDirectCallLoweringRejectionReason::Eliminated,
+                        },
                     },
-                },
-            );
+                );
+            }
         }
         for (&byte_pc, target) in &view.static_native_calls {
             let Some(instruction) = view
@@ -169,7 +175,7 @@ pub(super) fn compile(
             };
             let instruction_pc = instruction.instruction_pc(&view.code_block);
             events.insert(
-                byte_pc,
+                (byte_pc, 0),
                 otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
                     instruction_pc,
                     byte_pc,

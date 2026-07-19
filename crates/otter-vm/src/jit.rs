@@ -229,12 +229,13 @@ pub struct JitCompileSnapshot {
     /// entry-cell lease no longer matches; no runtime resolver is part of the
     /// compiled hit path.
     pub direct_callees: rustc_hash::FxHashMap<u32, JitDirectCallee>,
-    /// Compiler-native direct methods keyed by the caller's
-    /// `Op::CallMethodValue` byte-PC. Presence proves monomorphic receiver and
-    /// method feedback plus one current entry-capable callee generation.
-    /// Generated code re-reads the receiver/prototype chain and exact method
-    /// slot before constructing the callee frame.
-    pub direct_methods: rustc_hash::FxHashMap<u32, JitDirectMethod>,
+    /// Compiler-native direct-method chains keyed by the caller's
+    /// `Op::CallMethodValue` byte-PC. Each target carries one exact receiver /
+    /// prototype / method-slot guard and one current entry-capable callee
+    /// generation. Targets retain feedback order, so generated code emits one
+    /// bounded most-frequent-first guard chain and constructs a callee frame
+    /// only after one exact guard succeeds.
+    pub direct_methods: rustc_hash::FxHashMap<u32, Vec<JitDirectMethod>>,
     /// Inline-candidate callees for baseline leaf-inlining, keyed by the
     /// caller's `Op::Call` byte-PC. Populated only for sites the interpreter
     /// observed resolving to a single plain synchronous bytecode callee; baked
@@ -574,9 +575,13 @@ pub struct JitDirectCallee {
     pub plan: JitDirectCallPlan,
 }
 
-/// One monomorphic method target with an exact generated callee plan.
+/// One guarded method target with an exact generated callee plan.
 #[derive(Debug, Clone)]
 pub struct JitDirectMethod {
+    /// Zero-based position in the observed bounded method-target chain.
+    pub target_index: u32,
+    /// Total observed targets at this call site when the plan was baked.
+    pub target_count: u32,
     /// Receiver/prototype/method-slot identity checked immediately before call.
     pub guard: JitMethodGuard,
     /// Exact entry generation and callee frame shape.
@@ -1300,6 +1305,21 @@ pub trait JitCompilerHook: Send + Sync {
     /// running promotion policy. Hooks overriding
     /// [`Self::compile_optimized_function`] must also return `true` here.
     fn optimizing_tier_enabled(&self) -> bool {
+        false
+    }
+
+    /// Whether optimizing this exact snapshot can publish an entry generation
+    /// safe for existing compiler-generated callers.
+    ///
+    /// This is a conservative pre-invalidation capability query. Returning
+    /// `false` keeps a depended-on entry-capable generation installed. Hooks
+    /// should return `true` only for a backend whose stack reservation and
+    /// every cold-deopt path are already proven under stack-owned entry.
+    fn optimizing_generated_entry_supported(
+        &self,
+        _snapshot: &JitCompileSnapshot,
+        _osr_pc: Option<u32>,
+    ) -> bool {
         false
     }
 

@@ -59,11 +59,11 @@ needed to optimize the VM and JIT safely.
   per-callee-operation ranges, and compact live virtual-register/receiver
   scratch assignment. Coalesced operations remain visible as zero-width
   source regions.
-- [x] Compiler-generated plain and method calls expose typed method/call
-  guards, frame setup, native entry, return, cleanup, and entry-reject regions
-  plus a symbolic
-  stable-entry-cell relocation. Exact artifacts expose caller/callee identity,
-  target generation/tier, call kind, receiver binding, method
+- [x] Compiler-generated plain calls and bounded polymorphic method chains
+  expose typed method/call guards, frame setup, native entry, return, cleanup,
+  and entry-reject regions plus one symbolic stable-entry-cell relocation per
+  exact target. Exact artifacts expose caller/callee identity, target
+  generation/tier, call kind, receiver binding, method
   receiver/prototype/slot facts, call PC, frame/linkage/total stack bytes, and
   register count; portable normalized code excludes only the
   generation-local code-object id.
@@ -74,10 +74,13 @@ needed to optimize the VM and JIT safely.
 - [x] Compiler-generated call plan events distinguish plain/method edges and
   expose an exact available generation/tier/`this` mode or a typed planning
   rejection (`missing callee`, ineligible, self-recursive, own-upvalue
-  allocation, unavailable method guard, or no entry generation).
+  allocation, unavailable method guard, or no entry generation). Bounded
+  method chains carry `targetIndex` / `targetCount`, while compile preparation
+  separates direct-method site and target totals.
   Successful compiles then report the actual backend lowering (`generated`,
-  `inlined`, layout rejection, or elimination), while compile preparation
-  separates generated-link counts from leaf-inline candidates.
+  `inlined`, layout rejection, or elimination) separately for every target,
+  while compile preparation separates generated-link counts from leaf-inline
+  candidates.
 - [x] Ordinary-call feedback identifies bytecode callees and static-native
   operations in one typed target population. Monomorphic original `Math.abs`
   sites expose separate static-native plan and actual-lowering events, typed

@@ -67,6 +67,20 @@ impl NumericLeafBackend {
         Some(Self { isa })
     }
 
+    pub(crate) fn supports_generated_entry(
+        &self,
+        view: &JitCompileSnapshot,
+        osr_pc: Option<u32>,
+    ) -> bool {
+        if osr_pc.is_some() {
+            return false;
+        }
+        let Some(plan) = NumericLeafPlan::build(view) else {
+            return false;
+        };
+        lower::lower(&plan, view.code_block.id, self.isa.as_ref(), false).is_some()
+    }
+
     pub(crate) fn try_compile(
         &self,
         view: &JitCompileSnapshot,

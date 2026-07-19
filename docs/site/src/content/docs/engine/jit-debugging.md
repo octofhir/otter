@@ -45,11 +45,13 @@ that fires before the isolate replies may have no partial batch to write.
 
 ## Structured events
 
-`compilePrepared.directCallees` and `directMethods` report exact generations
-available for generated plain and method linkage separately from
-`inlineCallees` / `inlineMethods`, which count bodies offered to the leaf
-inliner. A `directCallPlan` event records every monomorphic call target
-inspected. `callKind` is `plain` or `method`. Its typed result is either
+`compilePrepared.directCallees`, `directMethodSites`, and
+`directMethodTargets` report exact generations available for generated plain
+and bounded polymorphic method linkage separately from `inlineCallees` /
+`inlineMethods`, which count bodies offered to the leaf inliner. A
+`directCallPlan` event records every observed call target inspected.
+`targetIndex` / `targetCount` identify its position in the bounded chain.
+`callKind` is `plain` or `method`. Its typed result is either
 `available`, with exact code-object id, target tier, and `thisMode`, or
 `rejected` with one of `missingCallee`, `ineligibleFunction`,
 `selfRecursive`, `ownUpvalues`, `methodGuardUnavailable`, or
@@ -57,8 +59,9 @@ inspected. `callKind` is `plain` or `method`. Its typed result is either
 
 For every available plan in a successful compile, `directCallLowered` records
 the backend's actual choice: `generated`, `inlined`, or `rejected` because the
-bounded stack layout is unsupported or the site was eliminated. A generated
-outcome repeats exact target generation, tier, and `thisMode`.
+bounded stack layout is unsupported or the site was eliminated. It repeats
+`targetIndex` / `targetCount`; a generated outcome repeats exact target
+generation, tier, and `thisMode`.
 `callerCodeObjectId` identifies the exact successful caller generation.
 Planning and lowering are separate events so diagnostics never claim a native
 call edge that the backend did not emit.

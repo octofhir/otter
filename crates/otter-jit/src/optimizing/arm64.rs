@@ -265,7 +265,7 @@ struct OptimizedEmission {
     code: CompiledCode,
     osr_entries: BTreeMap<u32, usize>,
     dependencies: BTreeMap<u32, u64>,
-    direct_call_events: Option<BTreeMap<u32, otter_vm::JitCompilerDiagnostic>>,
+    direct_call_events: Option<BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
     code_map: Option<CodeMapCapture>,
     relocations: RelocationCapture,
 }
@@ -1749,6 +1749,8 @@ fn optimizing_direct_call_event(
     instruction_pc: u32,
     byte_pc: u32,
     target: &otter_vm::JitDirectCallee,
+    target_index: u32,
+    target_count: u32,
     outcome: otter_vm::JitDirectCallLoweringOutcome,
 ) -> otter_vm::JitCompilerDiagnostic {
     otter_vm::JitCompilerDiagnostic::DirectCallLowered {
@@ -1756,6 +1758,8 @@ fn optimizing_direct_call_event(
         instruction_pc,
         byte_pc,
         callee_function_id: target.plan.function_id,
+        target_index,
+        target_count,
         outcome,
     }
 }
@@ -1815,18 +1819,20 @@ fn emit(
                     reason: otter_vm::JitDirectCallLoweringRejectionReason::Eliminated,
                 };
                 Some((
-                    byte_pc,
+                    (byte_pc, 0),
                     optimizing_direct_call_event(
                         otter_vm::JitDirectCallKind::Plain,
                         instruction_pc,
                         byte_pc,
                         target,
+                        0,
+                        1,
                         outcome,
                     ),
                 ))
             })
             .collect::<BTreeMap<_, _>>();
-        for (&byte_pc, method) in &view.direct_methods {
+        for (&byte_pc, methods) in &view.direct_methods {
             let Some(instruction) = view
                 .instructions
                 .iter()
@@ -1835,18 +1841,22 @@ fn emit(
                 continue;
             };
             let instruction_pc = instruction.instruction_pc(&view.code_block);
-            events.insert(
-                byte_pc,
-                optimizing_direct_call_event(
-                    otter_vm::JitDirectCallKind::Method,
-                    instruction_pc,
-                    byte_pc,
-                    &method.callee,
-                    otter_vm::JitDirectCallLoweringOutcome::Rejected {
-                        reason: otter_vm::JitDirectCallLoweringRejectionReason::Eliminated,
-                    },
-                ),
-            );
+            for method in methods {
+                events.insert(
+                    (byte_pc, method.target_index),
+                    optimizing_direct_call_event(
+                        otter_vm::JitDirectCallKind::Method,
+                        instruction_pc,
+                        byte_pc,
+                        &method.callee,
+                        method.target_index,
+                        method.target_count,
+                        otter_vm::JitDirectCallLoweringOutcome::Rejected {
+                            reason: otter_vm::JitDirectCallLoweringRejectionReason::Eliminated,
+                        },
+                    ),
+                );
+            }
         }
         for (&byte_pc, target) in &view.static_native_calls {
             let Some(instruction) = view
@@ -1858,7 +1868,7 @@ fn emit(
             };
             let instruction_pc = instruction.instruction_pc(&view.code_block);
             events.insert(
-                byte_pc,
+                (byte_pc, 0),
                 otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
                     instruction_pc,
                     byte_pc,
@@ -3013,12 +3023,30 @@ fn emit(
 
                     let succeeded = ops.new_dynamic_label();
                     let bail = ops.new_dynamic_label();
-                    let planned_method = (instruction.inline == InlineId::ROOT)
+                    let planned_methods = (instruction.inline == InlineId::ROOT)
                         .then(|| view.direct_methods.get(&byte_pc))
                         .flatten();
-                    let direct_method = planned_method
-                        .filter(|method| direct_call_target_is_supported(&method.callee));
-                    if let Some(method) = direct_method {
+                    for method in planned_methods.into_iter().flatten() {
+                        if !direct_call_target_is_supported(&method.callee) {
+                            if let Some(events) = direct_call_events.as_mut() {
+                                events.insert(
+                                    (byte_pc, method.target_index),
+                                    optimizing_direct_call_event(
+                                        otter_vm::JitDirectCallKind::Method,
+                                        instruction.pc,
+                                        byte_pc,
+                                        &method.callee,
+                                        method.target_index,
+                                        method.target_count,
+                                        otter_vm::JitDirectCallLoweringOutcome::Rejected {
+                                            reason: otter_vm::JitDirectCallLoweringRejectionReason::LayoutUnsupported,
+                                        },
+                                    ),
+                                );
+                            }
+                            continue;
+                        }
+                        let next_target = ops.new_dynamic_label();
                         let direct_site = DirectCallSite {
                             target: &method.callee,
                             caller_function_id: frame.function_id,
@@ -3043,7 +3071,7 @@ fn emit(
                             },
                             17,
                             None,
-                            bail,
+                            next_target,
                         )?;
                         if let Some(code_map) = code_map.as_mut() {
                             code_map.record(CodeRegion::method_call_structural(
@@ -3081,12 +3109,14 @@ fn emit(
                         );
                         if let Some(events) = direct_call_events.as_mut() {
                             events.insert(
-                                byte_pc,
+                                (byte_pc, method.target_index),
                                 optimizing_direct_call_event(
                                     otter_vm::JitDirectCallKind::Method,
                                     instruction.pc,
                                     byte_pc,
                                     &method.callee,
+                                    method.target_index,
+                                    method.target_count,
                                     otter_vm::JitDirectCallLoweringOutcome::Generated {
                                         code_object_id: method.callee.plan.code_object_id,
                                         target_tier: optimizing_direct_call_target_tier(
@@ -3097,26 +3127,9 @@ fn emit(
                                 ),
                             );
                         }
-                    } else {
-                        if let (Some(events), Some(method)) =
-                            (direct_call_events.as_mut(), planned_method)
-                        {
-                            events.insert(
-                                byte_pc,
-                                optimizing_direct_call_event(
-                                    otter_vm::JitDirectCallKind::Method,
-                                    instruction.pc,
-                                    byte_pc,
-                                    &method.callee,
-                                    otter_vm::JitDirectCallLoweringOutcome::Rejected {
-                                        reason: otter_vm::JitDirectCallLoweringRejectionReason::LayoutUnsupported,
-                                    },
-                                ),
-                            );
-                        }
-                        dynasm!(ops ; .arch aarch64 ; b =>bail);
+                        dynasm!(ops ; .arch aarch64 ; =>next_target);
                     }
-                    dynasm!(ops ; .arch aarch64 ; =>succeeded);
+                    dynasm!(ops ; .arch aarch64 ; b =>bail ; =>succeeded);
                     emit_reload_element_transition(
                         &mut ops,
                         allocation,
@@ -3738,7 +3751,7 @@ fn emit(
                             )?;
                             if let Some(events) = direct_call_events.as_mut() {
                                 events.insert(
-                                    byte_pc,
+                                    (byte_pc, 0),
                                     otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
                                         instruction_pc: instruction.pc,
                                         byte_pc,
@@ -3751,7 +3764,7 @@ fn emit(
                         } else {
                             if let Some(events) = direct_call_events.as_mut() {
                                 events.insert(
-                                    byte_pc,
+                                    (byte_pc, 0),
                                     otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
                                         instruction_pc: instruction.pc,
                                         byte_pc,
@@ -3824,12 +3837,14 @@ fn emit(
                             );
                             if let Some(events) = direct_call_events.as_mut() {
                                 events.insert(
-                                    byte_pc,
+                                    (byte_pc, 0),
                                     optimizing_direct_call_event(
                                         otter_vm::JitDirectCallKind::Plain,
                                         instruction.pc,
                                         byte_pc,
                                         target,
+                                        0,
+                                        1,
                                         otter_vm::JitDirectCallLoweringOutcome::Generated {
                                             code_object_id: target.plan.code_object_id,
                                             target_tier: optimizing_direct_call_target_tier(target),
@@ -3843,12 +3858,14 @@ fn emit(
                                 (direct_call_events.as_mut(), direct_target)
                             {
                                 events.insert(
-                                    byte_pc,
+                                    (byte_pc, 0),
                                     optimizing_direct_call_event(
                                         otter_vm::JitDirectCallKind::Plain,
                                         instruction.pc,
                                         byte_pc,
                                         target,
+                                        0,
+                                        1,
                                         otter_vm::JitDirectCallLoweringOutcome::Rejected {
                                             reason: otter_vm::JitDirectCallLoweringRejectionReason::LayoutUnsupported,
                                         },
@@ -3941,12 +3958,14 @@ fn emit(
                             view.direct_callees.get(&byte_pc),
                         ) {
                             events.insert(
-                                byte_pc,
+                                (byte_pc, 0),
                                 optimizing_direct_call_event(
                                     otter_vm::JitDirectCallKind::Plain,
                                     instruction.pc,
                                     byte_pc,
                                     target,
+                                    0,
+                                    1,
                                     otter_vm::JitDirectCallLoweringOutcome::Inlined,
                                 ),
                             );

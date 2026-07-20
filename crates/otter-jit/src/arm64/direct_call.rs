@@ -568,15 +568,25 @@ pub(crate) fn emit_direct_call(
             ; add x14, sp, init_offset
         );
         if init_pair_count != 0 {
-            let init_loop = ops.new_dynamic_label();
-            dynasm!(ops
-                ; .arch aarch64
-                ; movz w13, init_pair_count as u32
-                ; =>init_loop
-                ; stp x15, x15, [x14], #16
-                ; subs w13, w13, #1
-                ; b.ne =>init_loop
-            );
+            const MAX_UNROLLED_INIT_PAIRS: usize = 16;
+            if init_pair_count <= MAX_UNROLLED_INIT_PAIRS {
+                for _ in 0..init_pair_count {
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; stp x15, x15, [x14], #16
+                    );
+                }
+            } else {
+                let init_loop = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; movz w13, init_pair_count as u32
+                    ; =>init_loop
+                    ; stp x15, x15, [x14], #16
+                    ; subs w13, w13, #1
+                    ; b.ne =>init_loop
+                );
+            }
         }
         if initialized_register_count & 1 != 0 {
             dynasm!(ops

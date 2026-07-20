@@ -77,16 +77,16 @@ pub(crate) unsafe fn enter_compiled(
         // resized, and outlives every compiled activation.
         let activation_base = unsafe { (*vm).jit_native_activation_base() };
         let activation_top_ptr = unsafe { (*vm).jit_native_activation_top_addr() };
-        let activation_limit = unsafe { (*vm).jit_native_activation_limit() };
+        let activation_limit = unsafe { (*vm).jit_generated_activation_limit() };
         let gc_heap = unsafe { (*vm).jit_gc_heap_ptr() };
         let interrupt_flag = unsafe { (*vm).jit_interrupt_flag_ptr() };
         let backedge_fuel = unsafe { (*vm).jit_backedge_fuel_ptr() };
         let global_this_offset = unsafe { (*vm).jit_global_this_offset_addr() };
         let global_lexical_epoch = unsafe { (*vm).jit_global_lexical_epoch_addr() };
-        let sync_reentry_depth = unsafe { (*vm).jit_sync_reentry_depth_addr() };
-        let sync_reentry_limit = unsafe { (*vm).jit_sync_reentry_limit() };
-        let native_stack_bytes = unsafe { (*vm).jit_native_stack_bytes_addr() };
-        let native_stack_bytes_limit = unsafe { (*vm).jit_native_stack_bytes_limit() };
+        let native_stack_marker = 0_u8;
+        let native_stack_limit = unsafe {
+            (*vm).jit_native_stack_limit(std::ptr::from_ref(&native_stack_marker).addr())
+        };
         let flags = if has_safepoints {
             NativeFrameFlags::from_bits(NativeFrameFlags::HAS_SAFEPOINTS)
         } else {
@@ -128,10 +128,7 @@ pub(crate) unsafe fn enter_compiled(
             activation_top_ptr,
             activation_limit,
             global_this_offset,
-            sync_reentry_depth,
-            sync_reentry_limit,
-            native_stack_bytes,
-            native_stack_bytes_limit,
+            native_stack_limit,
             generated_calls: 0,
             generated_call_deopts: 0,
         };

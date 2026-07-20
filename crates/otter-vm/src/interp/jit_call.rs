@@ -825,6 +825,7 @@ impl Interpreter {
             // baseline refresh here, after entry-cell feedback has been
             // reconciled and no native activation remains published.
             if self.feedback_refresh_due(context, fid) {
+                self.maybe_refresh_successful_baseline(context, fid);
                 let _ = self.resolve_jit_code_for_fid(context, fid);
             }
             let _ = self.resolve_optimized_code_for_fid(context, fid);

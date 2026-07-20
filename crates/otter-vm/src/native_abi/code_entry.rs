@@ -113,14 +113,14 @@ pub struct CodeEntryCell {
     pub native_frame_header: VmFrameHeader,
     /// Explicit leases that may outlive a native-activation retirement epoch.
     pub active_count: AtomicU32,
-    /// Generated native entries observed for tiering/introspection.
+    /// Generated native entries observed for tiering/introspection. Normal
+    /// returns are derived as `entries - deopts - throws` during cold
+    /// reconciliation, so the hot path owns no redundant return counter.
     ///
     /// The isolate has one mutator and reconciles feedback only after native
     /// activation returns, so these counters deliberately use ordinary
     /// single-mutator cells instead of exclusive atomic loops on every call.
     pub generated_entries: Cell<u64>,
-    /// Generated entries that returned normally without native bailout.
-    pub generated_returns: Cell<u64>,
     /// Generated entries that bailed and resumed through cold deoptimization.
     pub generated_deopts: Cell<u64>,
     /// Generated entries that propagated a throw status.
@@ -171,7 +171,6 @@ impl CodeEntryCell {
             },
             active_count: AtomicU32::new(0),
             generated_entries: Cell::new(0),
-            generated_returns: Cell::new(0),
             generated_deopts: Cell::new(0),
             generated_throws: Cell::new(0),
             generated_bail_streak: Cell::new(0),
@@ -232,11 +231,15 @@ impl CodeEntryCell {
     /// Cumulative generated-call feedback for this exact code generation.
     #[must_use]
     pub fn generated_feedback(&self) -> (u64, u64, u64, u64, u32) {
+        let entries = self.generated_entries.get();
+        let deopts = self.generated_deopts.get();
+        let throws = self.generated_throws.get();
+        let returns = entries.saturating_sub(deopts.saturating_add(throws));
         (
-            self.generated_entries.get(),
-            self.generated_returns.get(),
-            self.generated_deopts.get(),
-            self.generated_throws.get(),
+            entries,
+            returns,
+            deopts,
+            throws,
             self.generated_bail_streak.get(),
         )
     }
@@ -275,7 +278,7 @@ const _: [(); 8] = [(); std::mem::align_of::<FunctionEntryCell>()];
 const _: [(); 0] = [(); std::mem::offset_of!(FunctionEntryCell, generation_cell)];
 const _: [(); 8] = [(); std::mem::offset_of!(FunctionEntryCell, function_id)];
 
-const _: [(); 96] = [(); std::mem::size_of::<CodeEntryCell>()];
+const _: [(); 88] = [(); std::mem::size_of::<CodeEntryCell>()];
 const _: [(); 8] = [(); std::mem::align_of::<CodeEntryCell>()];
 const _: [(); 0] = [(); std::mem::offset_of!(CodeEntryCell, entry_addr)];
 const _: [(); 8] = [(); std::mem::offset_of!(CodeEntryCell, code_object_id)];
@@ -284,10 +287,9 @@ const _: [(); 28] = [(); std::mem::offset_of!(CodeEntryCell, generated_stack_fra
 const _: [(); 32] = [(); std::mem::offset_of!(CodeEntryCell, native_frame_header)];
 const _: [(); 48] = [(); std::mem::offset_of!(CodeEntryCell, active_count)];
 const _: [(); 56] = [(); std::mem::offset_of!(CodeEntryCell, generated_entries)];
-const _: [(); 64] = [(); std::mem::offset_of!(CodeEntryCell, generated_returns)];
-const _: [(); 72] = [(); std::mem::offset_of!(CodeEntryCell, generated_deopts)];
-const _: [(); 80] = [(); std::mem::offset_of!(CodeEntryCell, generated_throws)];
-const _: [(); 88] = [(); std::mem::offset_of!(CodeEntryCell, generated_bail_streak)];
+const _: [(); 64] = [(); std::mem::offset_of!(CodeEntryCell, generated_deopts)];
+const _: [(); 72] = [(); std::mem::offset_of!(CodeEntryCell, generated_throws)];
+const _: [(); 80] = [(); std::mem::offset_of!(CodeEntryCell, generated_bail_streak)];
 
 #[cfg(test)]
 mod tests {

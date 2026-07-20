@@ -47,10 +47,10 @@ pub(crate) struct JitCtx {
     pub(crate) global_this_offset: *const u32,
     /// Lowest native-stack address generated callees may reserve.
     pub(crate) native_stack_limit: usize,
-    /// Compiler-generated native calls entered during this outer activation.
-    pub(crate) generated_calls: u64,
-    /// Started generated callees resumed through cold deoptimization.
-    pub(crate) generated_call_deopts: u64,
+    /// One while no generated entry has occurred in this outer activation;
+    /// generated linkage clears it with one idempotent store. Exact aggregate
+    /// counts come from per-generation feedback during cold reconciliation.
+    pub(crate) generated_feedback_clean: u64,
 }
 
 impl JitCtx {
@@ -205,9 +205,8 @@ pub(crate) const GLOBAL_THIS_OFFSET_PTR_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, global_this_offset) as u32;
 pub(crate) const NATIVE_STACK_LIMIT_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, native_stack_limit) as u32;
-pub(crate) const GENERATED_CALLS_OFFSET: u32 = std::mem::offset_of!(JitCtx, generated_calls) as u32;
-pub(crate) const GENERATED_CALL_DEOPTS_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, generated_call_deopts) as u32;
+pub(crate) const GENERATED_FEEDBACK_CLEAN_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, generated_feedback_clean) as u32;
 pub(crate) const ALLOC_CTX_THREAD_OFFSET: u32 =
     std::mem::offset_of!(RuntimeStubAllocContext, thread) as u32;
 pub(crate) const ALLOC_CTX_SAFEPOINT_ID_OFFSET: u32 =
@@ -225,8 +224,6 @@ pub(crate) const FUNCTION_ENTRY_GENERATION_CELL_OFFSET: u32 =
 /// boxed by the isolate registry and never reused.
 pub(crate) const CODE_ENTRY_GENERATED_ENTRIES_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, generated_entries) as u32;
-pub(crate) const CODE_ENTRY_GENERATED_RETURNS_OFFSET: u32 =
-    std::mem::offset_of!(CodeEntryCell, generated_returns) as u32;
 pub(crate) const CODE_ENTRY_GENERATED_DEOPTS_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, generated_deopts) as u32;
 pub(crate) const CODE_ENTRY_GENERATED_THROWS_OFFSET: u32 =
@@ -257,7 +254,7 @@ pub(crate) const NATIVE_FRAME_UPVALUE_COUNT_OFFSET: u32 =
 // The native entry ABI targets 64-bit engines. These assertions describe the
 // one current VM/JIT layout generated code consumes directly.
 #[cfg(target_pointer_width = "64")]
-const _: [(); 80] = [(); std::mem::size_of::<JitCtx>()];
+const _: [(); 72] = [(); std::mem::size_of::<JitCtx>()];
 
 /// Compiled-code entry signature.
 pub(crate) type JitEntry = extern "C" fn(*mut JitCtx) -> JitRet;

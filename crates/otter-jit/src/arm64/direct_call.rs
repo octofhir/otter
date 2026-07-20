@@ -48,10 +48,9 @@ use crate::{
         ACTIVATION_BASE_OFFSET, ACTIVATION_LIMIT_OFFSET, ACTIVATION_TOP_PTR_OFFSET,
         CODE_ENTRY_CODE_OBJECT_ID_OFFSET, CODE_ENTRY_GENERATED_BAIL_STREAK_OFFSET,
         CODE_ENTRY_GENERATED_DEOPTS_OFFSET, CODE_ENTRY_GENERATED_ENTRIES_OFFSET,
-        CODE_ENTRY_GENERATED_RETURNS_OFFSET, CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET,
-        CODE_ENTRY_GENERATED_THROWS_OFFSET, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET,
-        FUNCTION_ENTRY_GENERATION_CELL_OFFSET, GENERATED_CALL_DEOPTS_OFFSET,
-        GENERATED_CALLS_OFFSET, GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_OFFSET,
+        CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET, CODE_ENTRY_GENERATED_THROWS_OFFSET,
+        CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET, FUNCTION_ENTRY_GENERATION_CELL_OFFSET,
+        GENERATED_FEEDBACK_CLEAN_OFFSET, GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_OFFSET,
         NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE,
         NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
         NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NATIVE_STACK_LIMIT_OFFSET, STATUS_BAILED,
@@ -135,45 +134,33 @@ fn emit_load_u64(ops: &mut Assembler, register: u8, value: u64) {
     }
 }
 
-/// Saturating increment of one machine-visible `u64` feedback counter.
+/// Increment one isolate-serial machine-visible `u64` feedback counter.
 ///
-/// Native execution and cold reconciliation are isolate-serial. Ordinary
-/// loads/stores avoid exclusive-monitor traffic on every generated call while
-/// preserving exact counters at the outer activation boundary.
+/// These counters cannot practically wrap within one process lifetime. Direct
+/// addressing keeps exact call feedback to three straight-line instructions.
 fn emit_increment_feedback_u64(ops: &mut Assembler, offset: u32) {
-    let done = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
-        ; add x13, x25, offset
-        ; ldr x14, [x13]
-        ; cmn x14, #1
-        ; b.eq =>done
+        ; ldr x14, [x25, offset]
         ; add x14, x14, #1
-        ; str x14, [x13]
-        ; =>done
+        ; str x14, [x25, offset]
     );
 }
 
-/// Saturating increment of the `u32` consecutive-bail streak.
+/// Increment the cold `u32` consecutive-bail streak.
 fn emit_increment_feedback_u32(ops: &mut Assembler, offset: u32) {
-    let done = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
-        ; add x13, x25, offset
-        ; ldr w14, [x13]
-        ; cmn w14, #1
-        ; b.eq =>done
+        ; ldr w14, [x25, offset]
         ; add w14, w14, #1
-        ; str w14, [x13]
-        ; =>done
+        ; str w14, [x25, offset]
     );
 }
 
 fn emit_reset_generated_bail_streak(ops: &mut Assembler) {
     dynasm!(ops
         ; .arch aarch64
-        ; add x13, x25, CODE_ENTRY_GENERATED_BAIL_STREAK_OFFSET
-        ; str wzr, [x13]
+        ; str wzr, [x25, CODE_ENTRY_GENERATED_BAIL_STREAK_OFFSET]
     );
 }
 
@@ -648,6 +635,7 @@ pub(crate) fn emit_direct_call(
     emit_increment_feedback_u64(ops, CODE_ENTRY_GENERATED_ENTRIES_OFFSET);
     dynasm!(ops
         ; .arch aarch64
+        ; str xzr, [x20, GENERATED_FEEDBACK_CLEAN_OFFSET]
         ; mov x0, x20
         ; blr x16
     );
@@ -661,13 +649,8 @@ pub(crate) fn emit_direct_call(
     );
 
     let return_start = ops.offset().0;
-    // Runtime counters batch in the shared JitCtx and merge into isolate stats
-    // when the outer compiled activation returns.
     dynasm!(ops
         ; .arch aarch64
-        ; ldr x10, [x20, GENERATED_CALLS_OFFSET]
-        ; add x10, x10, #1
-        ; str x10, [x20, GENERATED_CALLS_OFFSET]
         ; cmp x1, STATUS_BAILED as u32
         ; b.eq =>callee_bailed
         ; cmp x1, STATUS_RETURNED as u32
@@ -676,7 +659,6 @@ pub(crate) fn emit_direct_call(
     emit_increment_feedback_u64(ops, CODE_ENTRY_GENERATED_THROWS_OFFSET);
     emit_reset_generated_bail_streak(ops);
     dynasm!(ops ; .arch aarch64 ; b =>result_ready ; =>callee_returned);
-    emit_increment_feedback_u64(ops, CODE_ENTRY_GENERATED_RETURNS_OFFSET);
     emit_reset_generated_bail_streak(ops);
     let destination_offset = reg_offset(site.dst)?;
     dynasm!(ops
@@ -691,9 +673,6 @@ pub(crate) fn emit_direct_call(
     emit_increment_feedback_u32(ops, CODE_ENTRY_GENERATED_BAIL_STREAK_OFFSET);
     dynasm!(ops
         ; .arch aarch64
-        ; ldr x10, [x20, GENERATED_CALL_DEOPTS_OFFSET]
-        ; add x10, x10, #1
-        ; str x10, [x20, GENERATED_CALL_DEOPTS_OFFSET]
         ; mov x0, x20
         ; mov x1, sp
     );

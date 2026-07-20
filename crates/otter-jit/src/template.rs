@@ -182,8 +182,7 @@ mod tests {
             activation_limit: 16,
             global_this_offset: std::ptr::null(),
             native_stack_limit: 0,
-            generated_calls: 0,
-            generated_call_deopts: 0,
+            generated_feedback_clean: 1,
         };
         // SAFETY: subset code never re-enters the VM; the entry was emitted
         // with the shared compiled-entry ABI and its mapping outlives the call.

@@ -448,8 +448,7 @@ mod tests {
             activation_limit: 0,
             global_this_offset: std::ptr::null(),
             native_stack_limit: 0,
-            generated_calls: 0,
-            generated_call_deopts: 0,
+            generated_feedback_clean: 1,
         };
         let result = entry(&mut ctx);
         assert_eq!(frame, original_frame, "leaf code must not mutate VM slots");

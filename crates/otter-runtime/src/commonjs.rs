@@ -361,13 +361,21 @@ fn load_resolved_scoped<'scope>(
                 Ok(exports)
             }
             CjsTarget::File(path) => {
-                if !cfg.capabilities.read.matches_path(path) {
-                    return Err(runtime_type_error(
+                // `read` gates filesystem access, so it is checked at each
+                // point that actually opens the file. The entry arrives with
+                // its source already in hand: that is code loading, not
+                // `fs_read`, and it is reached identically by the ESM path,
+                // which requires no capability either.
+                let denied = || {
+                    runtime_type_error(
                         "require",
                         format!("permission denied for '{}'", resolution.filename),
-                    ));
-                }
+                    )
+                };
                 if path.extension().is_some_and(|ext| ext == "node") {
+                    if !cfg.capabilities.read.matches_path(path) {
+                        return Err(denied());
+                    }
                     let loader = cfg.addon_loader.ok_or_else(|| {
                         runtime_type_error(
                             "require",
@@ -389,6 +397,9 @@ fn load_resolved_scoped<'scope>(
                 let source = if let Some(source) = entry_source {
                     source
                 } else {
+                    if !cfg.capabilities.read.matches_path(path) {
+                        return Err(denied());
+                    }
                     owned_source = std::fs::read_to_string(path).map_err(|err| {
                         runtime_type_error(
                             "require",

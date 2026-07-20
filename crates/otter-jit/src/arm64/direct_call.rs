@@ -23,10 +23,10 @@
 //!   per-entry exclusive lease loop.
 //! - Tier publication patches the function cell; a missing target enters one
 //!   no-allocation cold resolver and never invalidates the generated caller.
-//! - Generated recursion, logical-call-depth, and native-stack reservations
-//!   are committed together and released on both normal cleanup and rejected
-//!   entry. Cold deopt temporarily transfers the current logical frame to the
-//!   materialized interpreter stack.
+//! - The activation cursor is both the publication and generated-recursion
+//!   bound. Prospective callee `sp` is compared with one immutable native-stack
+//!   limit. Normal cleanup therefore restores frame publication only; it
+//!   mutates no duplicate resource counters.
 //!
 //! # See also
 //! - `otter-vm/src/native_abi/code_entry.rs` — stable generation leases.
@@ -54,11 +54,9 @@ use crate::{
         GENERATED_CALLS_OFFSET, GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_OFFSET,
         NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE,
         NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
-        NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NATIVE_STACK_BYTES_LIMIT_OFFSET,
-        NATIVE_STACK_BYTES_PTR_OFFSET, STATUS_BAILED, STATUS_RETURNED,
-        SYNC_REENTRY_DEPTH_PTR_OFFSET, SYNC_REENTRY_LIMIT_OFFSET, THREAD_OFFSET, Unsupported,
-        VALUE_UNDEFINED, VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_CURRENT_FRAME_OFFSET,
-        reg_offset,
+        NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NATIVE_STACK_LIMIT_OFFSET, STATUS_BAILED,
+        STATUS_RETURNED, THREAD_OFFSET, Unsupported, VALUE_UNDEFINED,
+        VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_CURRENT_FRAME_OFFSET, reg_offset,
     },
 };
 
@@ -95,7 +93,6 @@ struct StackLayout {
     caller_frame: u32,
     caller_code_object_id: u32,
     target_cell: u32,
-    reserved_bytes: u32,
     frame_bytes: u32,
 }
 
@@ -107,14 +104,13 @@ impl StackLayout {
             .plan
             .generated_stack_frame_bytes
             .filter(|bytes| *bytes != 0)?;
-        let frame_bytes = spill.checked_add(48)?.checked_add(15)? & !15;
+        let frame_bytes = spill.checked_add(40)?.checked_add(15)? & !15;
         (frame_bytes <= MAX_DIRECT_CALL_FRAME_BYTES).then_some(Self {
             saved_x25: spill,
             entry_addr: spill + 8,
             caller_frame: spill + 16,
             caller_code_object_id: spill + 24,
             target_cell: spill + 32,
-            reserved_bytes: spill + 40,
             frame_bytes,
         })
     }
@@ -357,20 +353,14 @@ pub(crate) fn emit_direct_call(
     let cleanup_threw = ops.new_dynamic_label();
 
     let guard_start = ops.offset().0;
-    // Activation and recursion capacity checks are pre-effect. Native-stack
-    // capacity depends on the generation selected through the stable function
-    // cell and is checked after the callable guard.
+    // The effective activation limit combines physical publication capacity
+    // with the outer entry's remaining recursion budget.
     dynasm!(ops
         ; .arch aarch64
         ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
         ; ldr x10, [x9]
         ; ldr x11, [x20, ACTIVATION_LIMIT_OFFSET]
         ; cmp x10, x11
-        ; b.hs =>bail
-        ; ldr x9, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
-        ; ldr w10, [x9]
-        ; ldr w11, [x20, SYNC_REENTRY_LIMIT_OFFSET]
-        ; cmp w10, w11
         ; b.hs =>bail
     );
 
@@ -550,27 +540,16 @@ pub(crate) fn emit_direct_call(
         ; ldr w15, [x25, CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET]
         ; cbz w15, =>uncommitted_rejected
     );
-    emit_load_u64(ops, 14, u64::from(layout.frame_bytes));
     dynasm!(ops
         ; .arch aarch64
-        ; adds x15, x15, x14
-        ; b.cs =>uncommitted_rejected
-        ; ldr x9, [x20, NATIVE_STACK_BYTES_PTR_OFFSET]
-        ; ldr x10, [x9]
-        ; adds x12, x10, x15
-        ; b.cs =>uncommitted_rejected
-        ; ldr x11, [x20, NATIVE_STACK_BYTES_LIMIT_OFFSET]
+        // `sp` already includes this caller's linkage frame. Subtracting the
+        // target's persistent prologue reservation yields its prospective
+        // deepest stack address without shared byte accounting.
+        ; subs x12, sp, x15
+        ; b.lo =>uncommitted_rejected
+        ; ldr x11, [x20, NATIVE_STACK_LIMIT_OFFSET]
         ; cmp x12, x11
-        ; b.hi =>uncommitted_rejected
-        ; str x15, [sp, layout.reserved_bytes]
-        // Commit recursion and native-stack accounting only after every
-        // pre-entry capacity and target contract has succeeded. Logical call
-        // depth is derived on cold paths from the published native frame.
-        ; ldr x13, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
-        ; ldr w14, [x13]
-        ; add w14, w14, #1
-        ; str w14, [x13]
-        ; str x12, [x9]
+        ; b.lo =>uncommitted_rejected
         // The isolate is single-mutator. No VM transition occurs between the
         // stable generation load and this entry-address load, while the outer
         // published activation defers executable retirement across any later
@@ -777,15 +756,6 @@ pub(crate) fn emit_direct_call(
     );
     dynasm!(ops
         ; .arch aarch64
-        ; ldr x11, [sp, layout.reserved_bytes]
-        ; ldr x9, [x20, NATIVE_STACK_BYTES_PTR_OFFSET]
-        ; ldr x10, [x9]
-        ; sub x10, x10, x11
-        ; str x10, [x9]
-        ; ldr x9, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
-        ; ldr w10, [x9]
-        ; sub w10, w10, #1
-        ; str w10, [x9]
         ; ldr x25, [sp, layout.saved_x25]
         ; add sp, sp, layout.frame_bytes
         ; cmp x1, STATUS_RETURNED as u32
@@ -805,21 +775,11 @@ pub(crate) fn emit_direct_call(
         direct_call,
     );
 
-    // Entry rejection owns no JS effects. Undo committed resource accounting
-    // and deopt the caller's Call.
+    // Entry rejection owns no JS effects or published callee frame.
     let entry_reject_start = ops.offset().0;
     dynasm!(ops
         ; .arch aarch64
         ; =>entry_rejected
-        ; ldr x11, [sp, layout.reserved_bytes]
-        ; ldr x9, [x20, NATIVE_STACK_BYTES_PTR_OFFSET]
-        ; ldr x10, [x9]
-        ; sub x10, x10, x11
-        ; str x10, [x9]
-        ; ldr x9, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
-        ; ldr w10, [x9]
-        ; sub w10, w10, #1
-        ; str w10, [x9]
         ; ldr x25, [sp, layout.saved_x25]
         ; add sp, sp, layout.frame_bytes
         ; b =>bail

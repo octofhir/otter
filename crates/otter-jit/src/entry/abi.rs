@@ -45,14 +45,8 @@ pub(crate) struct JitCtx {
     pub(crate) activation_limit: usize,
     /// Address of the active realm's GC-rooted `globalThis` compressed offset.
     pub(crate) global_this_offset: *const u32,
-    /// Address of the isolate's synchronous JavaScript re-entry depth.
-    pub(crate) sync_reentry_depth: *mut u32,
-    /// Shared interpreter/generated-code recursion bound.
-    pub(crate) sync_reentry_limit: u32,
-    /// Address of native-stack bytes reserved by generated JavaScript calls.
-    pub(crate) native_stack_bytes: *mut usize,
-    /// Conservative aggregate generated-call native-stack bound.
-    pub(crate) native_stack_bytes_limit: usize,
+    /// Lowest native-stack address generated callees may reserve.
+    pub(crate) native_stack_limit: usize,
     /// Compiler-generated native calls entered during this outer activation.
     pub(crate) generated_calls: u64,
     /// Started generated callees resumed through cold deoptimization.
@@ -209,14 +203,8 @@ pub(crate) const ACTIVATION_LIMIT_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, activation_limit) as u32;
 pub(crate) const GLOBAL_THIS_OFFSET_PTR_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, global_this_offset) as u32;
-pub(crate) const SYNC_REENTRY_DEPTH_PTR_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, sync_reentry_depth) as u32;
-pub(crate) const SYNC_REENTRY_LIMIT_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, sync_reentry_limit) as u32;
-pub(crate) const NATIVE_STACK_BYTES_PTR_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, native_stack_bytes) as u32;
-pub(crate) const NATIVE_STACK_BYTES_LIMIT_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, native_stack_bytes_limit) as u32;
+pub(crate) const NATIVE_STACK_LIMIT_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, native_stack_limit) as u32;
 pub(crate) const GENERATED_CALLS_OFFSET: u32 = std::mem::offset_of!(JitCtx, generated_calls) as u32;
 pub(crate) const GENERATED_CALL_DEOPTS_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, generated_call_deopts) as u32;
@@ -269,7 +257,7 @@ pub(crate) const NATIVE_FRAME_UPVALUE_COUNT_OFFSET: u32 =
 // The native entry ABI targets 64-bit engines. These assertions describe the
 // one current VM/JIT layout generated code consumes directly.
 #[cfg(target_pointer_width = "64")]
-const _: [(); 104] = [(); std::mem::size_of::<JitCtx>()];
+const _: [(); 80] = [(); std::mem::size_of::<JitCtx>()];
 
 /// Compiled-code entry signature.
 pub(crate) type JitEntry = extern "C" fn(*mut JitCtx) -> JitRet;

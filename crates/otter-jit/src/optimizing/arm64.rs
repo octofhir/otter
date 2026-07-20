@@ -5829,10 +5829,7 @@ mod tests {
             activation_top_ptr: std::ptr::null_mut(),
             activation_limit: 0,
             global_this_offset: std::ptr::null(),
-            sync_reentry_depth: std::ptr::null_mut(),
-            sync_reentry_limit: 0,
-            native_stack_bytes: std::ptr::null_mut(),
-            native_stack_bytes_limit: 0,
+            native_stack_limit: 0,
             generated_calls: 0,
             generated_call_deopts: 0,
         };

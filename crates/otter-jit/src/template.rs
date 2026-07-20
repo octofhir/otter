@@ -181,10 +181,7 @@ mod tests {
             activation_top_ptr: std::ptr::addr_of_mut!(activation_top_probe),
             activation_limit: 16,
             global_this_offset: std::ptr::null(),
-            sync_reentry_depth: std::ptr::null_mut(),
-            sync_reentry_limit: 0,
-            native_stack_bytes: std::ptr::null_mut(),
-            native_stack_bytes_limit: 0,
+            native_stack_limit: 0,
             generated_calls: 0,
             generated_call_deopts: 0,
         };

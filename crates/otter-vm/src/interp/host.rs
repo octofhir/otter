@@ -10,8 +10,9 @@
 //! # Invariants
 //! - Interpreter services here are isolate-owned and never discover the active
 //!   execution stack through TLS or raw pointers.
-//! - Generated code mutates recursion and native-stack counters only while its
-//!   exclusive interpreter borrow is active and restores each on every exit.
+//! - Generated code enforces recursion and native-stack limits through
+//!   immutable bounds captured by its outer compiled entry; only host-side
+//!   synchronous re-entry mutates `sync_reentry_depth`.
 //! - Generated-call depth is derived from canonical native activations. Cold
 //!   deoptimization records a temporary materialization transfer so the same
 //!   activation is never counted twice.
@@ -193,15 +194,6 @@ impl Interpreter {
         self.sync_reentry_depth = self.sync_reentry_depth.saturating_sub(1);
     }
 
-    /// Address of the synchronous JavaScript re-entry depth counter.
-    ///
-    /// Compiler-generated call sequences compare/increment/decrement this
-    /// address directly. The interpreter is exclusively borrowed and cannot
-    /// move for the full generated-code dynamic extent.
-    pub fn jit_sync_reentry_depth_addr(&mut self) -> *mut u32 {
-        std::ptr::addr_of_mut!(self.sync_reentry_depth)
-    }
-
     /// Address of the active realm's rooted `globalThis` compressed offset.
     ///
     /// `JsObject` is a transparent four-byte `Gc<ObjectBody>`. The collector
@@ -259,18 +251,15 @@ impl Interpreter {
         self.max_stack_depth.min(DEFAULT_MAX_SYNC_REENTRY_DEPTH)
     }
 
-    /// Address of active compiler-generated native-stack byte usage.
+    /// Lowest native-stack address generated code may reserve beneath the
+    /// outer compiled entry's stack marker.
     ///
-    /// A generated call reserves its complete aligned frame before publishing
-    /// tagged slots and restores the counter after unpublishing them.
-    pub fn jit_native_stack_bytes_addr(&mut self) -> *mut usize {
-        std::ptr::addr_of_mut!(self.jit_native_stack_bytes)
-    }
-
-    /// Conservative per-isolate budget for compiler-generated call frames.
+    /// AArch64 stacks grow downward. Comparing prospective callee `sp` against
+    /// this immutable address accounts for every caller linkage and compiled
+    /// prologue without shared mutable byte accounting.
     #[must_use]
-    pub const fn jit_native_stack_bytes_limit(&self) -> usize {
-        JIT_NATIVE_STACK_BYTES_LIMIT
+    pub const fn jit_native_stack_limit(&self, outer_stack_marker: usize) -> usize {
+        outer_stack_marker.saturating_sub(JIT_NATIVE_STACK_BYTES_LIMIT)
     }
 
     /// Install the parse + compile callback used by `Op::Eval` and

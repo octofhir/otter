@@ -790,19 +790,15 @@ pub struct Interpreter {
     /// cache slot, not only the owning `shape_runtime` transition table.
     simple_constructor_shape_cache: rustc_hash::FxHashMap<u32, object::ShapeHandle>,
     max_stack_depth: u32,
-    /// Active synchronous JavaScript re-entry depth. Generated call sequences
-    /// update this same counter inline through
-    /// [`Self::jit_sync_reentry_depth_addr`].
+    /// Active synchronous host/interpreter JavaScript re-entry depth. Generated
+    /// calls use the immutable effective activation limit computed when their
+    /// outer compiled entry begins.
     sync_reentry_depth: u32,
     /// Published compiler-generated frames temporarily mirrored by cold
     /// interpreter materialization. Logical-depth reads subtract this transfer
     /// count from the canonical native-activation scan so a deoptimized frame
     /// is never counted twice.
     jit_materialized_generated_call_depth: u32,
-    /// Native-stack bytes reserved by active compiler-generated JS calls.
-    /// Generated prologues update this inline and compare against
-    /// [`Self::jit_native_stack_bytes_limit`].
-    jit_native_stack_bytes: usize,
     allow_blocking_atomics_wait: bool,
     /// Per-interpreter microtask queue. Plain field — accessed
     /// only through `&mut self`. The dispatch loop threads

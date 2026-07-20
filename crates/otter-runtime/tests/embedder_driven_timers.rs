@@ -193,11 +193,9 @@ fn a_throwing_timer_callback_surfaces_as_an_error_without_poisoning_the_runtime(
     let error = runtime
         .fire_timer(token)
         .expect_err("an unhandled throw is reported to the embedder");
-    // The thrown value itself is not published at the synchronous-call
-    // boundary, so the embedder currently learns only that the task threw.
     assert!(
-        matches!(error, otter_runtime::OtterError::Runtime { .. }),
-        "an unhandled throw surfaces as a runtime diagnostic: {error:?}"
+        format!("{error:?}").contains("from timer"),
+        "the diagnostic names the failing callback's throw: {error:?}"
     );
 
     assert_eq!(

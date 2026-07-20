@@ -3212,10 +3212,15 @@ impl Runtime {
                 args,
             )
             .map_err(|error| {
+                // Pair the `Copy` discriminant with the in-flight detail the
+                // same way the top-level run does. Without it the embedder
+                // gets a bare "uncaught exception" and cannot tell which
+                // timer callback failed or why.
+                let detail = self.interp.take_error_detail();
                 map_vm_error(otter_vm::RunError {
                     error,
                     frames: Vec::new(),
-                    detail: None,
+                    detail,
                 })
             })?;
         let outcome = self.interp.drain_microtasks(&context);
@@ -3720,6 +3725,66 @@ impl Runtime {
     /// See [`OtterError`] variants.
     pub fn eval(&mut self, source: SourceInput) -> Result<ExecutionResult, OtterError> {
         self.run_script(source, "<eval>")
+    }
+
+    /// Run a classic script and hand its completion value to `with_value`.
+    ///
+    /// [`ExecutionResult`] renders the completion to a `String`, which is
+    /// enough for a CLI and useless to an embedder that wants the object
+    /// back. This runs the same path — same realm, same `globalThis`,
+    /// microtask checkpoint, dynamic-import pump — and then opens a native
+    /// context so the caller can read the value with the ordinary
+    /// [`otter_vm::NativeCtx`] API.
+    ///
+    /// The value is rooted across the checkpoint and the import pump, so it
+    /// survives the young-generation moves those cause. Inside `with_value`
+    /// the ordinary rule applies: it is a raw handle, valid only until the
+    /// first allocation. Park it with `ctx.scope` before allocating.
+    ///
+    /// # Errors
+    /// See [`OtterError`] variants.
+    pub fn eval_value<R>(
+        &mut self,
+        source: SourceInput,
+        specifier: &str,
+        with_value: impl FnOnce(&mut otter_vm::NativeCtx<'_>, otter_vm::Value) -> R,
+    ) -> Result<R, OtterError> {
+        let compiled = self.compile_source(&source, specifier)?;
+        let context = self.interp.link_module(compiled.bytecode);
+        let value = match self.interp.run(&context) {
+            Ok(value) => value,
+            Err(err) => {
+                let mapped = map_vm_error(err);
+                return Err(enrich_runtime_diagnostic_with_cause(&mut self.interp, mapped));
+            }
+        };
+        // Both the checkpoint and the import pump allocate, and the young
+        // generation is a moving collector, so the completion cannot stay in
+        // a plain local across them.
+        let root = self.interp.persistent_root_insert(value);
+        let settled = match self.interp.drain_microtasks(&context) {
+            Ok(()) => self.pump_layer_a_dynamic_imports(&context),
+            Err(err) => {
+                let mapped = map_vm_error(err);
+                Err(enrich_runtime_diagnostic_with_cause(&mut self.interp, mapped))
+            }
+        };
+        if let Err(err) = settled {
+            self.interp.persistent_root_remove(root);
+            return Err(err);
+        }
+        let global_value = otter_vm::Value::object(*self.interp.global_this());
+        Ok(otter_vm::NativeCtx::with_host_context(
+            &mut self.interp,
+            otter_vm::NativeCallInfo::call(global_value),
+            Some(&context),
+            |ctx| {
+                let value = ctx
+                    .persistent_root_remove(root)
+                    .expect("the completion root outlives the checkpoint");
+                with_value(ctx, value)
+            },
+        ))
     }
 
     /// Evaluate a snippet while retaining partial JIT diagnostics on failure.

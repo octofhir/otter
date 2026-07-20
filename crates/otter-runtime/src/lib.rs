@@ -135,6 +135,15 @@ pub use otter_vm::{
 pub use otter_vm::{
     NamespaceBuilder, NamespaceSpec, NativeCtx, NativeError, marshal, string, symbol,
 };
+// Embedder-driven event loop. `Runtime::install_timer_scheduler`,
+// `install_host_completion_sink`, and `install_dynamic_import_loader`
+// are public, so the types naming their arguments must be reachable
+// without a direct `otter-vm` dependency.
+pub use otter_vm::host_completion::{HostCompletionJob, HostCompletionSink, HostKeepAlive};
+pub use otter_vm::{
+    DynamicImportLoader, DynamicImportLoaderHandle, TimerEntry, TimerScheduler,
+    TimerSchedulerHandle,
+};
 pub use promise_registry::{HostSettleOutcome, PromiseId};
 pub use runtime_activity::{RuntimeKeepAlive, RuntimeTask, RuntimeTaskSpawner};
 pub use structured_clone::{
@@ -2278,10 +2287,27 @@ pub(crate) struct MicrotaskStats {
     pub(crate) generation: u64,
 }
 
+/// Result of [`Runtime::fire_timer`].
+///
+/// `Missing` means the token named no live entry — the timer was
+/// cancelled, or a one-shot entry already fired. A host scheduler must
+/// not decrement liveness for a `Missing` token, or a cancelled timer
+/// double-counts as a completed task.
+///
+/// `Fired { repeat }` reports whether the entry was repeating
+/// (`setInterval`). Repeating entries stay in the isolate timer table
+/// and the host scheduler re-arms them; one-shot entries are already
+/// removed by the time this returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TimerFireOutcome {
+pub enum TimerFireOutcome {
+    /// The token named no live entry: cancelled, or already fired.
     Missing,
-    Fired { repeat: bool },
+    /// The callback ran and its microtasks were drained.
+    Fired {
+        /// `true` for a repeating (`setInterval`) entry, which stays in
+        /// the timer table for the host scheduler to re-arm.
+        repeat: bool,
+    },
 }
 
 pub(crate) enum DynamicImportBegin {
@@ -3015,6 +3041,24 @@ impl Runtime {
         self.promise_registry.len()
     }
 
+    /// `true` when the isolate still owes observable work: queued
+    /// microtasks, live timer entries, or unsettled host promises.
+    ///
+    /// This is the idle predicate for an embedder that drives the
+    /// isolate from its own event loop. A `false` result means the
+    /// caller may block on its own wake sources without stranding JS
+    /// work; it does not mean the runtime may be dropped, since a host
+    /// operation in flight can still enqueue a settlement later.
+    ///
+    /// Cheap: three counter reads, no heap walk. Safe to call every
+    /// loop turn.
+    #[must_use]
+    pub fn has_pending_work(&self) -> bool {
+        self.microtask_stats().pending
+            || self.has_pending_timer_callbacks()
+            || self.pending_host_promise_count() > 0
+    }
+
     /// Register a fresh pending JS promise and return the
     /// `(PromiseId, Value::Promise)` pair. The caller — typically
     /// a native function exposed to JS — returns the
@@ -3142,7 +3186,12 @@ impl Runtime {
     /// from inside the callback observes the entry as gone.
     /// Repeating (`setInterval`) entries stay in the table; the
     /// host scheduler re-arms them on its own.
-    pub(crate) fn fire_timer(&mut self, token: u64) -> Result<TimerFireOutcome, OtterError> {
+    ///
+    /// Embedders that drive the isolate from their own event loop call
+    /// this when a deadline they scheduled from
+    /// [`TimerScheduler::schedule`](otter_vm::TimerScheduler::schedule)
+    /// elapses. The token is the one that `schedule` returned.
+    pub fn fire_timer(&mut self, token: u64) -> Result<TimerFireOutcome, OtterError> {
         let entry = match self.interp.timer_callbacks().get(token).cloned() {
             Some(entry) => entry,
             None => return Ok(TimerFireOutcome::Missing),

@@ -991,19 +991,12 @@ impl Interpreter {
         self.jit_runtime_stats
     }
 
-    /// Merge counters accumulated inline by compiler-generated call sites.
+    /// Mark exact per-generation feedback for cold reconciliation.
     ///
-    /// Generated code batches these monotonically increasing values in its
-    /// call context so successful hot calls need no VM transition solely for
-    /// instrumentation.
-    pub fn jit_note_generated_calls(&mut self, calls: u64, deopts: u64) {
-        self.jit_runtime_stats.generated_calls =
-            self.jit_runtime_stats.generated_calls.saturating_add(calls);
-        self.jit_runtime_stats.generated_call_deopts = self
-            .jit_runtime_stats
-            .generated_call_deopts
-            .saturating_add(deopts);
-        self.jit_generated_feedback_pending |= calls != 0 || deopts != 0;
+    /// Generated linkage clears one idempotent context marker instead of
+    /// maintaining duplicate aggregate counters on every call.
+    pub fn jit_note_generated_feedback(&mut self, dirty: bool) {
+        self.jit_generated_feedback_pending |= dirty;
     }
 
     /// Return the current collection method IC summary.

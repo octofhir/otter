@@ -129,8 +129,7 @@ pub(crate) unsafe fn enter_compiled(
             activation_limit,
             global_this_offset,
             native_stack_limit,
-            generated_calls: 0,
-            generated_call_deopts: 0,
+            generated_feedback_clean: 1,
         };
         // SAFETY: the mapping is live and `entry` was emitted with the
         // `JitEntry` ABI.
@@ -142,7 +141,7 @@ pub(crate) unsafe fn enter_compiled(
         let ret = entry(&mut ctx);
         let _ = jit_pop_native_activation_stub(&mut ctx);
         unsafe {
-            (*vm).jit_note_generated_calls(ctx.generated_calls, ctx.generated_call_deopts);
+            (*vm).jit_note_generated_feedback(ctx.generated_feedback_clean == 0);
             (*vm).jit_reconcile_generated_feedback(&*activation.context_ptr());
         }
         match ret.status {

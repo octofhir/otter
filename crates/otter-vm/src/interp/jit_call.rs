@@ -745,6 +745,14 @@ impl Interpreter {
         let feedback = self.jit_code_registry.take_generated_feedback();
         let mut functions = rustc_hash::FxHashMap::<u32, GeneratedFunctionFeedback>::default();
         for entry in feedback {
+            self.jit_runtime_stats.generated_calls = self
+                .jit_runtime_stats
+                .generated_calls
+                .saturating_add(entry.entries);
+            self.jit_runtime_stats.generated_call_deopts = self
+                .jit_runtime_stats
+                .generated_call_deopts
+                .saturating_add(entry.deopts);
             match entry.tier {
                 native_abi::NativeFrameKind::Baseline => {
                     self.jit_runtime_stats.generated_template_entries = self

@@ -1163,13 +1163,54 @@ impl Permission<PathBuf> {
                 allow_list,
                 deny_list,
             } => {
-                if deny_list.iter().any(|p| value.starts_with(p)) {
+                // A policy and the path it is checked against must be
+                // expressed in the same terms. Script-supplied paths arrive
+                // exactly as written while module resolution canonicalizes,
+                // and on macOS `/tmp` and `/var/folders/...` are symlinks
+                // into `/private`. Comparing raw would let a grant silently
+                // fail to match, and — worse — let a deny entry be stepped
+                // around by naming the other spelling of the same file.
+                let resolved = canonical_policy_path(value);
+                let value = resolved.as_deref().unwrap_or(value);
+                let covers = |entry: &PathBuf| {
+                    if value.starts_with(entry) {
+                        return true;
+                    }
+                    canonical_policy_path(entry).is_some_and(|entry| value.starts_with(entry))
+                };
+                if deny_list.iter().any(&covers) {
                     return false;
                 }
-                allow_list.iter().any(|p| value.starts_with(p))
+                allow_list.iter().any(covers)
             }
         }
     }
+}
+
+/// Resolve `value` to the form path policies are stored in.
+///
+/// Falls back to the longest existing ancestor with the remainder appended,
+/// so a path that does not exist yet — the target of a first write — still
+/// normalizes its existing prefix. Returns `None` when nothing resolves and
+/// the caller should compare the path as written.
+fn canonical_policy_path(value: &Path) -> Option<PathBuf> {
+    if let Ok(path) = std::fs::canonicalize(value) {
+        return Some(path);
+    }
+    let mut suffix = Vec::new();
+    let mut cursor = value;
+    while let Some(parent) = cursor.parent() {
+        let name = cursor.file_name()?;
+        suffix.push(name);
+        if let Ok(mut path) = std::fs::canonicalize(parent) {
+            for component in suffix.iter().rev() {
+                path.push(component);
+            }
+            return Some(path);
+        }
+        cursor = parent;
+    }
+    None
 }
 
 /// Glob-style match for permission patterns.

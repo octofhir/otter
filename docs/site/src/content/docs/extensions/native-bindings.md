@@ -39,12 +39,33 @@ in a low-level callback, `runtime_this_object(...)` plus
 `RuntimeCx`, `NativeCtx`, `Value`, `Gc<T>`, `Local<'gc, T>`, frames, or handle
 scopes.
 
+If host state contains JavaScript references, implement
+`RuntimeTracedHostObjectData` and allocate it with
+`RuntimeNativeScope::traced_host_object`. Untraced payload types explicitly
+implement `RuntimeHostObjectData`; this opt-in asserts that they contain no JS
+references. Store each traced reference in a
+`RuntimeHostValueSlot`; its only mutation path is
+`set_host_data_value`, which performs the normal generational write barrier.
+The tracer exposes only these opaque slots, so host code cannot trace arbitrary
+memory or manufacture raw GC pointers. Both payload kinds are finalized when
+their object dies or the runtime is disposed.
+
+Repeated property access should intern the name once with
+`HostAtomInterner::intern`, then use `RuntimeNativeScope::{get_atom,set_atom}`.
+`RuntimeHostAtom` is clone-cheap, stable, and `Send + Sync`; it stores no
+isolate pointer. For temporary string inspection use
+`RuntimeNativeScope::with_string_str`: Latin-1 ASCII is borrowed for the
+callback and other encodings use an owned fallback, while the callback lifetime
+prevents a heap borrow from escaping.
+
 Source/module loading is separate from filesystem I/O permissions. Following
 Deno's model, the entrypoint and statically analyzable local module graph are
 code loading, not `fs_read`. Runtime APIs that expose arbitrary file reads
-must still enforce `CapabilitySet::read`; future non-analyzable dynamic local
-imports and remote imports should use an explicit import policy rather than
-piggybacking on ordinary file I/O.
+must still enforce `CapabilitySet::read`. Dynamic local imports follow the
+same module-loader policy as static imports. Remote static and dynamic imports
+share the async provider pipeline and enforce the runtime's network capability
+before transport begins; embedders may add origin and CORS policy in their
+provider.
 
 ## Embedder Console Sink
 

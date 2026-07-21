@@ -10,6 +10,12 @@ crates should use the runtime-owned facade in `otter_runtime`; the VM keeps the
 static backend and centralized bootstrap internals. `Math`, `JSON`, `Atomics`,
 `console`, and active Web API classes are installed through this path.
 
+Procedural-macro expansions resolve backend details through the doc-hidden
+`otter_vm::__macro_support` module (binding crates alias `otter_runtime` as
+`otter_vm`). That path exists only for generated code. Contributor-written code
+uses the `Runtime*` aliases and helpers below; macro implementation details are
+not a second public builder API.
+
 The goal is high-level ergonomics without runtime overhead:
 
 - exported JavaScript names, arity, and attributes live in static specs;

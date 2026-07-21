@@ -28,8 +28,7 @@ otter-runtime = { version = "…" }
 One line of linking convention at your crate root:
 
 ```rust
-// Macro-generated glue resolves `::otter_vm::…` paths through this
-// alias in binding crates.
+// Macro-generated glue resolves its hidden support path through this alias.
 extern crate otter_runtime as otter_vm;
 ```
 
@@ -37,6 +36,11 @@ Everything you need is re-exported from `otter_runtime`: the
 `marshal` module (`JsError`, `USVString`, `BufferSource`,
 `Uint8Array`, …), `CapabilitySet`, `Extension`, `GlobalClass`,
 `HostedModule`, and the builders.
+
+Generated code refers only to `otter_vm::__macro_support`. That module is an
+opaque macro implementation contract, not an API to import by hand. Handwritten
+bindings use the named `Runtime*` types and helpers in `otter_runtime::surface`;
+they do not depend on raw descriptor/bootstrap re-exports at the crate root.
 
 ## Declare, bundle, register
 
@@ -131,7 +135,7 @@ stale/foreign ids return a typed `RealmError`.
 |---|---|---|
 | Classes, namespaces, sync methods | ✓ | ✓ |
 | `async fn` members | Only immediately-ready bodies (the poll-once fast path) | ✓ full protocol (Tokio + event loop) |
-| Hosted-module imports | — (needs the module runner) | ✓ |
+| Hosted-module imports | ✓ local/direct | ✓ local + async remote provider |
 | Timers, servers | — | ✓ |
 
 Async methods in direct mode reject with a `TypeError` if the future

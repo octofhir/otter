@@ -47,7 +47,9 @@ use std::sync::{Arc, LazyLock, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use otter_runtime::{InterruptHandle, OtterError, Runtime, RuntimeGlobalInstaller, SourceInput};
+use otter_runtime::{
+    InterruptHandle, OtterError, Runtime, RuntimeGlobalInstaller, RuntimeRealmContext, SourceInput,
+};
 use otter_vm::binary::array_buffer::SharedBody;
 use otter_vm::string::JsString;
 use otter_vm::{NativeCtx, NativeError, NativeFastFn, Value};
@@ -129,7 +131,7 @@ pub fn reset_for_next_test() {
 /// runtime. The runner calls this once per fresh runtime before
 /// the harness preamble runs so the JS-side `$262.agent` object
 /// in [`D262_HOST_PREAMBLE`] resolves to live bindings.
-pub fn install_natives(runtime: &mut Runtime) -> Result<(), OtterError> {
+pub fn install_natives(runtime: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
     for (name, length, call) in NATIVES {
         runtime.install_native_global(name, *length, *call)?;
     }

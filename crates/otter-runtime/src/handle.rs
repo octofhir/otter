@@ -61,6 +61,7 @@ const ISOLATE_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 type RunReply = oneshot::Sender<ExecutionAttempt>;
 type CheckReply = oneshot::Sender<Result<(), OtterError>>;
+type RealmReply = oneshot::Sender<Result<crate::RuntimeRealmId, OtterError>>;
 
 type CommandId = u64;
 
@@ -378,6 +379,17 @@ enum RuntimeCommand {
         specifier: String,
         reply: RunReply,
     },
+    CreateRealm {
+        id: CommandId,
+        reply: RealmReply,
+    },
+    RunScriptInRealm {
+        id: CommandId,
+        realm: crate::RuntimeRealmId,
+        source: SourceInput,
+        specifier: String,
+        reply: RunReply,
+    },
     RunModule {
         id: CommandId,
         linked: crate::module_graph::LinkedProgram,
@@ -657,6 +669,33 @@ impl RuntimeHandle {
             return ExecutionAttempt::from_result(Err(error), None, None);
         }
         self.await_run_reply(rx).await
+    }
+
+    /// Create and bootstrap an additional realm on this isolate.
+    pub async fn create_realm(&self) -> Result<crate::RuntimeRealmId, OtterError> {
+        let (reply, rx) = oneshot::channel();
+        let id = self.next_command_id();
+        self.submit(RuntimeCommand::CreateRealm { id, reply })?;
+        self.await_realm_reply(rx).await
+    }
+
+    /// Execute a classic script in an additional realm.
+    pub async fn run_script_in_realm(
+        &self,
+        realm: crate::RuntimeRealmId,
+        source: SourceInput,
+        specifier: impl Into<String>,
+    ) -> Result<ExecutionResult, OtterError> {
+        let (reply, rx) = oneshot::channel();
+        let id = self.next_command_id();
+        self.submit(RuntimeCommand::RunScriptInRealm {
+            id,
+            realm,
+            source,
+            specifier: specifier.into(),
+            reply,
+        })?;
+        self.await_run_reply(rx).await.into_result()
     }
 
     /// Request cooperative cancellation.
@@ -1157,6 +1196,52 @@ impl RuntimeHandle {
                     .failed_commands
                     .fetch_add(1, Ordering::Relaxed);
                 Err(err)
+            }
+            Err(_) => Err(OtterError::Internal {
+                code: DiagnosticCode::RuntimeReplyDropped.as_str().to_string(),
+                message: "runtime isolate dropped command reply".to_string(),
+            }),
+        }
+    }
+
+    async fn await_realm_reply(
+        &self,
+        rx: oneshot::Receiver<Result<crate::RuntimeRealmId, OtterError>>,
+    ) -> Result<crate::RuntimeRealmId, OtterError> {
+        let timeout = self.inner.command_timeout;
+        let outcome = if timeout == Duration::ZERO {
+            rx.await
+        } else {
+            match tokio::time::timeout(timeout, rx).await {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    self.inner
+                        .counters
+                        .timed_out_commands
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.inner
+                        .counters
+                        .failed_commands
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.interrupt();
+                    return Err(OtterError::timeout_after(timeout));
+                }
+            }
+        };
+        match outcome {
+            Ok(Ok(realm)) => {
+                self.inner
+                    .counters
+                    .completed_commands
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(realm)
+            }
+            Ok(Err(error)) => {
+                self.inner
+                    .counters
+                    .failed_commands
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(error)
             }
             Err(_) => Err(OtterError::Internal {
                 code: DiagnosticCode::RuntimeReplyDropped.as_str().to_string(),
@@ -1779,6 +1864,22 @@ impl IsolateRunner {
                 let attempt = self.runtime.finish_jit_debug_attempt(result);
                 send_run_reply(reply, attempt, &self.counters);
             }
+            RuntimeCommand::CreateRealm { reply, .. } => {
+                let result = self.runtime.create_realm();
+                send_realm_reply(reply, result, &self.counters);
+            }
+            RuntimeCommand::RunScriptInRealm {
+                realm,
+                source,
+                specifier,
+                reply,
+                ..
+            } => {
+                let result = self.runtime.run_script_in_realm(realm, source, &specifier);
+                let result = self.drive_event_loop_to_idle(result);
+                let attempt = self.runtime.finish_jit_debug_attempt(result);
+                send_run_reply(reply, attempt, &self.counters);
+            }
             RuntimeCommand::RunModule { linked, reply, .. } => {
                 let result = self.runtime.run_prepared_module(linked);
                 let result = self.drive_event_loop_to_idle(result);
@@ -1869,6 +1970,8 @@ impl RuntimeCommand {
             RuntimeCommand::CheckFile { id, .. }
             | RuntimeCommand::RunFile { id, .. }
             | RuntimeCommand::RunScript { id, .. }
+            | RuntimeCommand::CreateRealm { id, .. }
+            | RuntimeCommand::RunScriptInRealm { id, .. }
             | RuntimeCommand::RunModule { id, .. }
             | RuntimeCommand::RunModuleSource { id, .. }
             | RuntimeCommand::Eval { id, .. } => *id,
@@ -1883,6 +1986,16 @@ fn send_run_reply(reply: RunReply, result: ExecutionAttempt, counters: &RuntimeC
 }
 
 fn send_check_reply(reply: CheckReply, result: Result<(), OtterError>, counters: &RuntimeCounters) {
+    if reply.send(result).is_err() {
+        counters.cancelled_waiters.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn send_realm_reply(
+    reply: RealmReply,
+    result: Result<crate::RuntimeRealmId, OtterError>,
+    counters: &RuntimeCounters,
+) {
     if reply.send(result).is_err() {
         counters.cancelled_waiters.fetch_add(1, Ordering::Relaxed);
     }

@@ -16,7 +16,7 @@
 
 use otter_runtime::{
     JitSelection, OtterError, Runtime, RuntimeExecutionStats, RuntimeGlobalInstaller,
-    RuntimeNativeCtx, RuntimeNativeError, RuntimeValue, SourceInput,
+    RuntimeNativeCtx, RuntimeNativeError, RuntimeRealmContext, RuntimeValue, SourceInput,
 };
 
 fn structured_clone_native(
@@ -31,7 +31,7 @@ fn structured_clone_native(
     otter_runtime::web_structured_clone::structured_clone_with_options(ctx, value, options)
 }
 
-fn install_structured_clone(runtime: &mut Runtime) -> Result<(), OtterError> {
+fn install_structured_clone(runtime: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
     runtime.install_native_global("structuredClone", 1, structured_clone_native)
 }
 

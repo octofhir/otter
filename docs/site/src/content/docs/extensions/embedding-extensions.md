@@ -75,6 +75,44 @@ Adding another namespace later is one `#[js_namespace]` impl plus one
 `romp!` row. Adding a class is one struct + one impl + one row. That
 is the whole cost model.
 
+## High-level global installers and realms
+
+Public embedding code should not touch `Interpreter`, `Value`, `JsObject`,
+GC handles, or write barriers. A `RuntimeGlobalInstaller` receives a
+`RuntimeRealmContext`, whose deliberately small surface installs owned primitive
+configuration, registers extension natives, runs trusted bootstrap source,
+snapshots capabilities, and obtains owned task delivery:
+
+```rust
+fn install_acme(realm: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
+    realm.install_global("acmeVersion", env!("CARGO_PKG_VERSION"))?;
+    realm.install_script(SourceInput::from_javascript(
+        "Object.defineProperty(globalThis, 'acmeVersion', { writable: false });",
+    ))
+}
+
+let builder = Runtime::builder()
+    .global_installer(RuntimeGlobalInstaller::new(install_acme));
+```
+
+The same installer and configured `Extension` classes/JS run for the default
+realm and every additional realm. Realm identity is the opaque, owned,
+`Send + Sync` `RuntimeRealmId`; it contains no GC pointer:
+
+```rust
+let realm = otter.create_realm().await?;
+let result = otter.run_script_in_realm(
+    realm,
+    SourceInput::from_javascript("globalThis.frameState = 1"),
+    "frame:initial",
+).await?;
+```
+
+Globals are isolated and repeated turns retain state in their target realm.
+Classic-script execution is realm-aware today. Realm-targeted module graphs and
+explicit realm disposal are later high-level additions; embedders must not work
+around them by retaining raw globals.
+
 ## What works where
 
 | Surface | Direct mode (`RuntimeBuilder::build`) | Handle mode (`Otter::builder`) |

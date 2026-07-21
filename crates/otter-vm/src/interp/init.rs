@@ -549,32 +549,48 @@ impl Interpreter {
         function_prototype: JsObject,
         object_prototype: JsObject,
     ) -> Result<(), VmError> {
-        let registry = &self.extra_realms[state_index].error_classes;
-        let error_constructor = registry.constructor(ErrorKind::Error);
-        let error_prototype = registry.prototype(ErrorKind::Error);
-        object::set_prototype(
-            error_constructor,
-            &mut self.gc_heap,
-            Some(function_prototype),
-        );
-        object::set_prototype(error_prototype, &mut self.gc_heap, Some(object_prototype));
-        for kind in [
-            ErrorKind::TypeError,
-            ErrorKind::RangeError,
-            ErrorKind::SyntaxError,
-            ErrorKind::ReferenceError,
-            ErrorKind::URIError,
-            ErrorKind::EvalError,
-            ErrorKind::AggregateError,
-        ] {
-            let constructor = self.extra_realms[state_index]
-                .error_classes
-                .constructor(kind);
-            let error_constructor = self.extra_realms[state_index]
-                .error_classes
-                .constructor(ErrorKind::Error);
-            object::set_prototype(constructor, &mut self.gc_heap, Some(error_constructor));
-        }
+        self.with_handle_scope(|interp, scope| {
+            let function_prototype = interp.scoped_value(scope, Value::object(function_prototype));
+            let object_prototype = interp.scoped_value(scope, Value::object(object_prototype));
+            let error_constructor = interp.scoped_value(
+                scope,
+                Value::object(
+                    interp.extra_realms[state_index]
+                        .error_classes
+                        .constructor(ErrorKind::Error),
+                ),
+            );
+            let error_prototype = interp.scoped_value(
+                scope,
+                Value::object(
+                    interp.extra_realms[state_index]
+                        .error_classes
+                        .prototype(ErrorKind::Error),
+                ),
+            );
+            let _ = interp.scoped_set_prototype(scope, error_constructor, Some(function_prototype));
+            let _ = interp.scoped_set_prototype(scope, error_prototype, Some(object_prototype));
+            for kind in [
+                ErrorKind::TypeError,
+                ErrorKind::RangeError,
+                ErrorKind::SyntaxError,
+                ErrorKind::ReferenceError,
+                ErrorKind::URIError,
+                ErrorKind::EvalError,
+                ErrorKind::AggregateError,
+            ] {
+                let constructor = interp.scoped_value(
+                    scope,
+                    Value::object(
+                        interp.extra_realms[state_index]
+                            .error_classes
+                            .constructor(kind),
+                    ),
+                );
+                let _ = interp.scoped_set_prototype(scope, constructor, Some(error_constructor));
+            }
+            Ok::<(), VmError>(())
+        })?;
         for (name, kind) in [
             ("Error", ErrorKind::Error),
             ("TypeError", ErrorKind::TypeError),
@@ -799,13 +815,34 @@ impl Interpreter {
 
     /// Create an additional realm global object inside this interpreter.
     pub fn create_host_realm_global(&mut self) -> Result<JsObject, VmError> {
+        let id = self.create_host_realm()?;
+        self.extra_realms
+            .iter()
+            .find(|realm| realm.id == id.0)
+            .map(|realm| realm.global_this)
+            .ok_or(VmError::InvalidOperand)
+    }
+
+    /// Create an additional realm and return its stable, non-GC identity.
+    #[doc(hidden)]
+    pub fn create_host_realm(&mut self) -> Result<crate::HostRealmId, VmError> {
         let id = self.next_realm_id;
         self.next_realm_id = self
             .next_realm_id
             .checked_add(1)
             .ok_or(VmError::InvalidOperand)?;
-        let state_index = self.build_realm_state(id)?;
-        Ok(self.extra_realms[state_index].global_this)
+        self.build_realm_state(id)?;
+        Ok(crate::HostRealmId(id))
+    }
+
+    /// Run `body` with an opaque host realm active.
+    #[doc(hidden)]
+    pub fn with_host_realm<R>(
+        &mut self,
+        realm: crate::HostRealmId,
+        body: impl FnOnce(&mut Self) -> Result<R, VmError>,
+    ) -> Result<R, VmError> {
+        self.with_host_realm_id(realm.0, body)
     }
 
     /// Run `body` with the realm identified by `global` as the active realm.

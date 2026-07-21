@@ -62,9 +62,12 @@ broadcast delivery is one call to `Runtime::run_native_event(&context, ...)`;
 nested JavaScript dispatch remains synchronous and the method performs the
 single microtask checkpoint at the end of the outer host task.
 
-When a page closes, call `RuntimeHandle::shutdown` before removing it from the
-browser registry. Every clone observes the shutdown state and late task
-delivery fails. For async results that must become rich JavaScript objects,
+When a page closes, await `RuntimeHandle::shutdown_and_wait` before removing it
+from the browser registry. It signals shutdown without blocking the UI or a
+current-thread Tokio executor, then resolves after the isolate has released VM
+pages and traced host payloads. `RuntimeHandle::shutdown` is the fire-and-forget
+variant. Every clone observes the shutdown state and late task delivery fails.
+For async results that must become rich JavaScript objects,
 deliver an owned result DTO as a runtime task and call
 `Runtime::settle_pending_promise_with` inside that task; its materializer runs
 in a handle scope on the target isolate.
@@ -87,9 +90,9 @@ method receives an owned URL and `ModuleLoadCancellation`, and returns an owned
 future. Otter capability-checks each target, fetches at most eight remote graph
 nodes concurrently, caches requested and post-redirect canonical URLs, and
 moves AST/compile/link work to Tokio's blocking pool. Static graphs and dynamic
-imports use this same pipeline. Command timeout, dropped waiters, and
-`RuntimeHandle::shutdown` cancel in-flight provider work. Browser origin and
-CORS policy remain browser-owned and may be enforced by the provider.
+imports use this same pipeline. Command timeout, dropped waiters, and both
+runtime shutdown paths cancel in-flight provider work. Browser origin and CORS
+policy remain browser-owned and may be enforced by the provider.
 
 File-backed `RuntimeHandle::run_module(path)` shares that graph pipeline.
 Direct thread-pinned `Runtime` remains network-transport agnostic; use the

@@ -148,6 +148,22 @@ struct RuntimeHandleInner {
     command_timeout: Duration,
     command_capacity: usize,
     counters: Arc<RuntimeCounters>,
+    exit: Arc<IsolateExit>,
+}
+
+#[derive(Debug, Default)]
+struct IsolateExit {
+    stopped: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+struct IsolateExitGuard(Arc<IsolateExit>);
+
+impl Drop for IsolateExitGuard {
+    fn drop(&mut self) {
+        self.0.stopped.store(true, Ordering::Release);
+        self.0.notify.notify_waiters();
+    }
 }
 
 #[derive(Clone)]
@@ -782,10 +798,13 @@ impl RuntimeHandle {
         let scheduler_event_loop = event_loop.clone();
         let runner_module_preparation = module_preparation.clone();
         let runner_module_cancellation = module_cancellation.clone();
+        let exit = Arc::new(IsolateExit::default());
+        let runner_exit = exit.clone();
         let runner = std::thread::Builder::new()
             .name("otter-isolate".to_string())
             .stack_size(ISOLATE_THREAD_STACK_BYTES)
             .spawn(move || {
+                let _exit_guard = IsolateExitGuard(runner_exit);
                 run_isolate(
                     config,
                     rx,
@@ -815,6 +834,7 @@ impl RuntimeHandle {
             command_timeout,
             command_capacity: capacity,
             counters,
+            exit,
         });
         Ok(Self { inner })
     }
@@ -1095,6 +1115,23 @@ impl RuntimeHandle {
         // bounded isolate inbox. A full queue already guarantees the runner is
         // awake; it observes the atomic shutdown flag before its next tick.
         let _ = self.inner.tx.try_send(RuntimeMessage::Shutdown);
+    }
+
+    /// Shut the isolate down and asynchronously wait for complete teardown.
+    ///
+    /// This is the deterministic disposal path for latency-sensitive async
+    /// hosts. It never joins the isolate thread on the caller and remains safe
+    /// on a current-thread Tokio runtime. After it resolves, VM pages and
+    /// traced host payloads have been released.
+    pub async fn shutdown_and_wait(&self) {
+        self.shutdown();
+        loop {
+            let notified = self.inner.exit.notify.notified();
+            if self.inner.exit.stopped.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// `true` after explicit shutdown or isolate teardown has begun.

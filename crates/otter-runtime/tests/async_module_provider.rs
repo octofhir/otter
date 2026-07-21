@@ -246,14 +246,10 @@ async fn runtime_shutdown_cancels_inflight_remote_provider() {
     while state.calls.load(Ordering::Acquire) == 0 {
         state.started.notified().await;
     }
-    otter.handle().shutdown();
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while !state.cancelled.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("provider observes disposal");
+    tokio::time::timeout(Duration::from_secs(1), otter.handle().shutdown_and_wait())
+        .await
+        .expect("current-thread runtime stays responsive during disposal");
+    assert!(state.cancelled.load(Ordering::Acquire));
     let _ = tokio::time::timeout(Duration::from_secs(1), running)
         .await
         .expect("waiting task exits after disposal");

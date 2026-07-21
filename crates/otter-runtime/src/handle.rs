@@ -15,6 +15,9 @@
 //! # Invariants
 //!
 //! - VM and GC values never leave the isolate runner.
+//! - Module graph preparation produces owned bytecode and metadata on Tokio's
+//!   blocking pool; only realm-local instantiation/evaluation runs on the
+//!   isolate thread.
 //! - Command replies carry only owned public data.
 //! - Dropping a waiting future does not drop the isolate mid-turn; the
 //!   runner observes the cancelled reply channel at the completion point.
@@ -46,7 +49,8 @@ use crate::runtime_activity::{
 };
 use crate::{
     DiagnosticCode, DynamicImportBegin, ExecutionAttempt, ExecutionResult, OtterError, Runtime,
-    RuntimeConfig, SourceInput, TimerFireOutcome,
+    RuntimeConfig, RuntimeModuleLoaderState, RuntimePackageManagerHandle, SourceInput,
+    TimerFireOutcome,
 };
 use otter_vm::{DynamicImportLoader, TimerScheduler};
 
@@ -135,10 +139,70 @@ struct RuntimeHandleInner {
     tx: SyncSender<RuntimeMessage>,
     runner: Mutex<Option<std::thread::JoinHandle<()>>>,
     event_loop: TokioEventLoop,
+    module_preparation: ModulePreparation,
     interrupt: otter_vm::InterruptFlag,
     command_timeout: Duration,
     command_capacity: usize,
     counters: Arc<RuntimeCounters>,
+}
+
+#[derive(Clone)]
+struct ModulePreparation {
+    loader: RuntimeModuleLoaderState,
+    hosted_modules: Vec<crate::HostedModule>,
+    package_manager: RuntimePackageManagerHandle,
+    capabilities: crate::CapabilitySet,
+    remote_fetch: Arc<dyn crate::module_loader::RemoteModuleFetch>,
+}
+
+impl ModulePreparation {
+    fn new(config: &RuntimeConfig, event_loop: &TokioEventLoop) -> Self {
+        Self {
+            loader: RuntimeModuleLoaderState::new(config.loader.clone()),
+            hosted_modules: config.hosted_modules.clone(),
+            package_manager: RuntimePackageManagerHandle::from_loader_config(
+                config.loader.as_ref(),
+            ),
+            capabilities: config.capabilities.clone(),
+            remote_fetch: event_loop.blocking_module_fetcher(),
+        }
+    }
+
+    fn loader_for_entry(&self, entry: &std::path::Path) -> crate::module_loader::ModuleLoader {
+        self.loader
+            .for_entry(
+                entry,
+                &self.hosted_modules,
+                &self.package_manager,
+                &self.capabilities,
+            )
+            .with_remote_fetch(self.remote_fetch.clone())
+    }
+
+    fn prepare_source(
+        &self,
+        source: SourceInput,
+        url: String,
+    ) -> Result<crate::module_graph::LinkedProgram, crate::module_graph::GraphError> {
+        let loader = self.loader_for_entry(std::path::Path::new("."));
+        crate::module_graph::load_program_source(
+            &loader,
+            crate::module_loader::ResolvedSource {
+                url,
+                kind: source.kind,
+                jsx: None,
+                text: source.text,
+            },
+        )
+    }
+
+    fn prepare_path(
+        &self,
+        entry: PathBuf,
+    ) -> Result<crate::module_graph::LinkedProgram, crate::module_graph::GraphError> {
+        let loader = self.loader_for_entry(&entry);
+        crate::module_graph::load_program(&loader, &entry)
+    }
 }
 
 struct RuntimeCounters {
@@ -280,6 +344,12 @@ enum RuntimeMessage {
         result: Result<String, String>,
         liveness: RuntimeLiveness,
     },
+    DynamicImportGraphPrepared {
+        token: u64,
+        target_url: String,
+        result: Result<crate::module_graph::LinkedProgram, String>,
+        liveness: RuntimeLiveness,
+    },
     #[cfg(test)]
     DynamicModuleReady(ModuleJobId),
     #[cfg(test)]
@@ -307,13 +377,12 @@ enum RuntimeCommand {
     },
     RunModule {
         id: CommandId,
-        path: PathBuf,
+        linked: crate::module_graph::LinkedProgram,
         reply: RunReply,
     },
     RunModuleSource {
         id: CommandId,
-        source: SourceInput,
-        url: String,
+        linked: crate::module_graph::LinkedProgram,
         reply: RunReply,
     },
     Eval {
@@ -357,6 +426,7 @@ impl RuntimeHandle {
                 message: e.to_string(),
             })?,
         };
+        let module_preparation = ModulePreparation::new(&config, &event_loop);
         let (tx, rx) = sync_channel(capacity);
         let (interrupt_tx, interrupt_rx) = sync_channel(1);
         let counters = Arc::new(RuntimeCounters {
@@ -416,6 +486,7 @@ impl RuntimeHandle {
             tx,
             runner: Mutex::new(Some(runner)),
             event_loop,
+            module_preparation,
             interrupt,
             command_timeout,
             command_capacity: capacity,
@@ -509,13 +580,20 @@ impl RuntimeHandle {
 
     /// Run a module and retain partial JIT diagnostics on abrupt failure.
     pub async fn run_module_with_diagnostics(&self, path: impl Into<PathBuf>) -> ExecutionAttempt {
+        let preparation = self.inner.module_preparation.clone();
+        let path = path.into();
+        let task = self
+            .inner
+            .event_loop
+            .handle()
+            .spawn_blocking(move || preparation.prepare_path(path));
+        let linked = match self.await_module_preparation(task).await {
+            Ok(linked) => linked,
+            Err(error) => return ExecutionAttempt::from_result(Err(error), None, None),
+        };
         let (reply, rx) = oneshot::channel();
         let id = self.next_command_id();
-        if let Err(error) = self.submit(RuntimeCommand::RunModule {
-            id,
-            path: path.into(),
-            reply,
-        }) {
+        if let Err(error) = self.submit(RuntimeCommand::RunModule { id, linked, reply }) {
             return ExecutionAttempt::from_result(Err(error), None, None);
         }
         self.await_run_reply(rx).await
@@ -541,14 +619,20 @@ impl RuntimeHandle {
         source: SourceInput,
         url: impl Into<String>,
     ) -> ExecutionAttempt {
+        let preparation = self.inner.module_preparation.clone();
+        let url = url.into();
+        let task = self
+            .inner
+            .event_loop
+            .handle()
+            .spawn_blocking(move || preparation.prepare_source(source, url));
+        let linked = match self.await_module_preparation(task).await {
+            Ok(linked) => linked,
+            Err(error) => return ExecutionAttempt::from_result(Err(error), None, None),
+        };
         let (reply, rx) = oneshot::channel();
         let id = self.next_command_id();
-        if let Err(error) = self.submit(RuntimeCommand::RunModuleSource {
-            id,
-            source,
-            url: url.into(),
-            reply,
-        }) {
+        if let Err(error) = self.submit(RuntimeCommand::RunModuleSource { id, linked, reply }) {
             return ExecutionAttempt::from_result(Err(error), None, None);
         }
         self.await_run_reply(rx).await
@@ -785,6 +869,39 @@ impl RuntimeHandle {
             .counters
             .next_command_id
             .fetch_add(1, Ordering::Relaxed)
+    }
+
+    async fn await_module_preparation(
+        &self,
+        task: tokio::task::JoinHandle<
+            Result<crate::module_graph::LinkedProgram, crate::module_graph::GraphError>,
+        >,
+    ) -> Result<crate::module_graph::LinkedProgram, OtterError> {
+        let timeout = self.inner.command_timeout;
+        let outcome = if timeout == Duration::ZERO {
+            task.await
+        } else {
+            match tokio::time::timeout(timeout, task).await {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    self.inner
+                        .counters
+                        .timed_out_commands
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.inner
+                        .counters
+                        .failed_commands
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(OtterError::timeout_after(timeout));
+                }
+            }
+        };
+        outcome
+            .map_err(|error| OtterError::Internal {
+                code: "MODULE_PREPARE_TASK".to_string(),
+                message: error.to_string(),
+            })?
+            .map_err(crate::map_graph_error)
     }
 
     /// Snapshot cheap activity counters.
@@ -1064,6 +1181,8 @@ fn run_isolate(
     scheduler_tx: SyncSender<RuntimeMessage>,
     event_loop: TokioEventLoop,
 ) {
+    let module_preparation = ModulePreparation::new(&config, &event_loop);
+    let module_task_handle = event_loop.handle();
     let runtime_task_spawner = RuntimeTaskSpawner::new(
         Arc::new(InboxRuntimeTaskQueue {
             tx: scheduler_tx.clone(),
@@ -1105,6 +1224,8 @@ fn run_isolate(
         tx: scheduler_tx,
         counters,
         https_module_fetcher,
+        module_preparation,
+        module_task_handle,
         deferred_commands: VecDeque::new(),
         shutdown: false,
     };
@@ -1210,8 +1331,9 @@ impl HttpsModuleFetchSink for DynamicImportFetchWake {
 /// inside the isolate runner. The VM-thread opcode hands us a
 /// host-issued token + the resolved specifier; we post a
 /// [`RuntimeMessage::DynamicImportLoad`] inbox message that, on
-/// the next runner tick, drives the synchronous load + compile +
-/// link + evaluate and settles the matching promise.
+/// the next runner tick, resolves the request. Remote fetch plus graph
+/// preparation runs off-isolate; the resulting owned graph returns through the
+/// inbox for realm-local evaluation and promise settlement.
 ///
 /// Both fields are `Send + Sync`: `SyncSender` clones, `Arc`
 /// wraps the counters. The `String` payloads carry no VM state,
@@ -1351,6 +1473,8 @@ struct IsolateRunner {
     tx: SyncSender<RuntimeMessage>,
     counters: Arc<RuntimeCounters>,
     https_module_fetcher: HttpsModuleFetcherHandle,
+    module_preparation: ModulePreparation,
+    module_task_handle: tokio::runtime::Handle,
     deferred_commands: VecDeque<RuntimeCommand>,
     shutdown: bool,
 }
@@ -1539,6 +1663,55 @@ impl IsolateRunner {
                 result,
                 liveness,
             } => {
+                match result {
+                    Err(error) => {
+                        decrement_liveness(
+                            liveness,
+                            &self.counters.pending_ref_host_ops,
+                            &self.counters.pending_unref_host_ops,
+                        );
+                        let _ = self.runtime.complete_dynamic_import_prepared(
+                            token,
+                            &target_url,
+                            Err(error),
+                        );
+                        self.record_microtask_snapshot();
+                    }
+                    Ok(source) => {
+                        let preparation = self.module_preparation.clone();
+                        let task_handle = self.module_task_handle.clone();
+                        let tx = self.tx.clone();
+                        task_handle.spawn(async move {
+                            let source = SourceInput::from_javascript(source);
+                            let prepare_url = target_url.clone();
+                            let prepared = tokio::task::spawn_blocking(move || {
+                                preparation.prepare_source(source, prepare_url)
+                            })
+                            .await
+                            .map_err(|error| error.to_string())
+                            .and_then(|result| result.map_err(|error| error.to_string()));
+                            let message = RuntimeMessage::DynamicImportGraphPrepared {
+                                token,
+                                target_url,
+                                result: prepared,
+                                liveness,
+                            };
+                            // `SyncSender::send` may wait for bounded inbox
+                            // capacity. Keep that wait off Tokio's core workers;
+                            // the isolate will consume the message or shutdown
+                            // will disconnect the channel.
+                            let _ = tokio::task::spawn_blocking(move || tx.send(message)).await;
+                        });
+                    }
+                }
+                TickOutcome::Processed
+            }
+            RuntimeMessage::DynamicImportGraphPrepared {
+                token,
+                target_url,
+                result,
+                liveness,
+            } => {
                 decrement_liveness(
                     liveness,
                     &self.counters.pending_ref_host_ops,
@@ -1546,7 +1719,7 @@ impl IsolateRunner {
                 );
                 let _ = self
                     .runtime
-                    .complete_dynamic_import_https(token, &target_url, result);
+                    .complete_dynamic_import_prepared(token, &target_url, result);
                 self.record_microtask_snapshot();
                 TickOutcome::Processed
             }
@@ -1603,16 +1776,14 @@ impl IsolateRunner {
                 let attempt = self.runtime.finish_jit_debug_attempt(result);
                 send_run_reply(reply, attempt, &self.counters);
             }
-            RuntimeCommand::RunModule { path, reply, .. } => {
-                let result = self.runtime.run_module(path);
+            RuntimeCommand::RunModule { linked, reply, .. } => {
+                let result = self.runtime.run_prepared_module(linked);
                 let result = self.drive_event_loop_to_idle(result);
                 let attempt = self.runtime.finish_jit_debug_attempt(result);
                 send_run_reply(reply, attempt, &self.counters);
             }
-            RuntimeCommand::RunModuleSource {
-                source, url, reply, ..
-            } => {
-                let result = self.runtime.run_module_source(source, url);
+            RuntimeCommand::RunModuleSource { linked, reply, .. } => {
+                let result = self.runtime.run_prepared_module(linked);
                 let result = self.drive_event_loop_to_idle(result);
                 let attempt = self.runtime.finish_jit_debug_attempt(result);
                 send_run_reply(reply, attempt, &self.counters);

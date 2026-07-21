@@ -77,6 +77,15 @@ fn allowlist() -> BTreeMap<&'static str, &'static str> {
          Interpreter / Value / Local.",
     );
     map.insert(
+        "crates/otter-runtime/src/handle.rs",
+        "RuntimeHandle prepares module graphs away from the isolate. The blocking tasks \
+         capture only owned SourceInput/PathBuf/configuration and return an owned \
+         LinkedProgram; graph preparation never receives Interpreter / Value / Local. \
+         Dynamic-import tasks carry owned source, URL, liveness and a SyncSender, then \
+         enqueue the prepared graph for realm-local evaluation. The bounded-channel send \
+         itself is isolated on the blocking pool so it cannot park a Tokio core worker.",
+    );
+    map.insert(
         "crates/otter-modules/src/serve.rs",
         "Otter.serve's accept loop and per-connection tasks. Both spawns capture only \
          Send + 'static owned data: the std listener, a RuntimeTaskSpawner, an owned \

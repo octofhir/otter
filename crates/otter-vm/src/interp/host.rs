@@ -82,6 +82,22 @@ impl Interpreter {
         self.host_completion_sink.clone()
     }
 
+    /// Install a Rust-side Promise rejection observer for this isolate.
+    pub fn set_promise_rejection_hook(
+        &mut self,
+        hook: crate::promise_rejection::PromiseRejectionHookHandle,
+    ) {
+        self.promise_rejection_hook = Some(hook);
+    }
+
+    /// Clone the installed Promise rejection observer, if any.
+    #[must_use]
+    pub fn promise_rejection_hook(
+        &self,
+    ) -> Option<crate::promise_rejection::PromiseRejectionHookHandle> {
+        self.promise_rejection_hook.clone()
+    }
+
     /// Mutable handle to the timer-callback registry.
     pub fn timer_callbacks_mut(&mut self) -> &mut timers::TimerCallbacks {
         &mut self.timer_callbacks

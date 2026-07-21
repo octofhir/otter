@@ -308,6 +308,49 @@ fn programmatic_settle_resolves_pending_promise_with_string() {
     assert_eq!(log, vec!["resolved:hello".to_string()]);
 }
 
+#[test]
+fn materializer_builds_a_gc_managed_response_shape_on_the_isolate_turn() {
+    let (mut runtime, capture) = build_runtime_with_helper();
+    let (id, promise_value) = runtime
+        .register_pending_promise()
+        .expect("register pending promise");
+    runtime.set_global("__pending", promise_value);
+    runtime
+        .run_script(
+            SourceInput::from_javascript(
+                "__pending.then(value => console.log(value.status + ':' + value.body));",
+            ),
+            "<attach-rich-settlement>",
+        )
+        .expect("attach reaction");
+
+    let status = 200.0;
+    let body = "hello from owned host bytes".to_string();
+    assert!(
+        runtime
+            .settle_pending_promise_with(id, move |scope| {
+                let response = scope.object()?;
+                let status = scope.number(status);
+                scope.set(response, "status", status)?;
+                let body = scope.string(&body)?;
+                scope.set(response, "body", body)?;
+                Ok(response)
+            })
+            .expect("materialize and settle")
+    );
+    assert_eq!(
+        capture.snapshot(),
+        vec!["200:hello from owned host bytes".to_string()]
+    );
+    assert!(
+        !runtime
+            .settle_pending_promise_with(id, |_scope| {
+                panic!("duplicate settlement must not materialize a value")
+            })
+            .expect("duplicate is a no-op")
+    );
+}
+
 /// Programmatic: settle the same promise twice. The second
 /// settlement is a silent no-op per spec §27.2.1.4 / §27.2.1.7
 /// because the registry consumed the entry on the first call.

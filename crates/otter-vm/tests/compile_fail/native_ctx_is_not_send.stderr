@@ -890,7 +890,7 @@ note: required because it appears within the type `Vec<JsPromiseHandle>`
   |
   | pub struct Vec<T, #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global> {
   |            ^^^
-note: required because it appears within the type `otter_vm::promise_rejection::RejectionTracker`
+note: required because it appears within the type `promise_rejection::RejectionTracker`
  --> src/promise_rejection.rs
   |
   | pub(crate) struct RejectionTracker {

@@ -155,7 +155,7 @@ pub mod persistent_roots;
 pub mod promise;
 pub mod promise_dispatch;
 mod promise_ops;
-mod promise_rejection;
+pub mod promise_rejection;
 mod property_atom;
 mod property_dispatch;
 mod property_ic;
@@ -1188,6 +1188,10 @@ pub struct Interpreter {
     /// by the runtime layer like the timer scheduler; `None` in
     /// host-less embeddings (unit tests, sync-only hosts).
     host_completion_sink: Option<std::sync::Arc<dyn host_completion::HostCompletionSink>>,
+    /// Optional Rust-side observer for unhandled and later-handled Promise
+    /// rejections. Browser and server embedders use this instead of relying on
+    /// a magic JavaScript global.
+    promise_rejection_hook: Option<promise_rejection::PromiseRejectionHookHandle>,
     /// Per-isolate map from host-issued timer token to JS callback +
     /// extra arguments. Populated by `setTimeout` / `setInterval`,
     /// drained by the runtime layer when a `TimerFired` inbox

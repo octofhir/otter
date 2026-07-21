@@ -78,6 +78,22 @@ let otter = otter_runtime::Otter::builder()
 The sink receives already-rendered JS argument fields in call order. It
 must not store VM values, GC handles, or native contexts.
 
+## Throwing an existing JavaScript value
+
+DOM and Web-IDL bindings sometimes need to throw an object they already
+constructed, such as a `DOMException`. Use `NativeCtx::throw_value` and return
+the error immediately:
+
+```rust,ignore
+fn remove_child(ctx: &mut NativeCtx<'_>, exception: Value) -> Result<Value, NativeError> {
+    Err(ctx.throw_value("Document.removeChild", exception))
+}
+```
+
+Constructing `NativeError::Thrown` directly preserves only display text.
+`throw_value` stages the live value in the isolate's traced throw slot, so a
+JavaScript `catch` receives the same object, symbol, or primitive value.
+
 ## Synchronous Native Shape
 
 ```rust,ignore
@@ -130,6 +146,21 @@ The host request owns `PathBuf`, ids, and strings only. It does not capture
 `NativeCtx`, VM values, handles, or heap references. Completion must return
 through a typed runtime inbox message or service result, and promise
 settlement happens back on the isolate thread.
+
+Layer B can share an embedder-owned Tokio executor instead of creating a
+second one:
+
+```rust,ignore
+let runtime = Runtime::builder()
+    .tokio_handle(application_runtime.handle().clone())
+    .build_handle()?;
+```
+
+Layer A remains driven by the embedder's loop. Install a
+`HostCompletionSink` that spawns the owned future and posts each
+`HostCompletionJob` into that loop. When the event reaches the runtime's owning
+thread, call `Runtime::run_host_completion(job)`. Never run the completion job
+on a Tokio worker; it re-enters the isolate and may touch the GC heap.
 
 Macros may eventually reduce boilerplate, but they are syntax sugar over
 static specs and builders. Manual code is preferred when capability

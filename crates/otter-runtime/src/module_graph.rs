@@ -22,16 +22,16 @@
 //!      `(module_env, import_meta)`.
 //!
 //! # Contents
-//! - [`load_program`] — top-level entry that loads + links a graph
-//!   rooted at a `.ts` / `.js` file path and returns the unified
-//!   [`BytecodeModule`].
+//! - [`load_program`] — load + link a graph rooted at a file path.
+//! - [`load_program_source`] — load + link a graph whose entry source and URL
+//!   were already supplied by an embedder.
 //! - `ModuleGraphBuilder -> ModuleGraph -> LinkedProgram` — transient graph
 //!   discovery followed by frozen linked output.
 //! - [`GraphError`] — distinct error enum for graph-build failures.
 //!
 //! # Invariants
-//! - Module URLs are canonical `file://` strings (the loader
-//!   guarantees this).
+//! - Module URLs are canonical absolute URLs supplied by the loader or
+//!   embedder (`file:`, `http:`, `https:`, or a registered host scheme).
 //! - Each module is parsed and compiled exactly once per run.
 //! - Literal dynamic-import target failures are deferred into a synthetic
 //!   module init so the eventual `import()` rejects instead of failing the
@@ -1203,6 +1203,33 @@ pub struct LinkedProgram {
 /// - <https://tc39.es/ecma262/#sec-cyclic-module-records>
 pub fn load_program(loader: &ModuleLoader, entry_path: &Path) -> Result<LinkedProgram, GraphError> {
     load_program_inner(loader, entry_path, None).map(|(linked, _)| linked)
+}
+
+/// Load and link a module graph from an already-available entry source.
+///
+/// Dependencies still resolve and load through `loader`, relative to
+/// `entry.url`. This is the browser/server embedding path for HTTP modules and
+/// virtual sources: the entry is never written to a temporary file and its
+/// canonical URL is retained in `import.meta.url`, diagnostics, and relative
+/// import resolution.
+///
+/// # Errors
+/// Returns [`GraphError`] for an invalid entry URL, dependency load failure,
+/// parse/compile failure, or link failure.
+pub fn load_program_source(
+    loader: &ModuleLoader,
+    entry: crate::module_loader::ResolvedSource,
+) -> Result<LinkedProgram, GraphError> {
+    url::Url::parse(&entry.url).map_err(|error| {
+        GraphError::Loader(LoaderError::Resolve {
+            specifier: entry.url.clone(),
+            referrer: "<entry>".to_string(),
+            message: format!("module entry URL must be absolute: {error}"),
+        })
+    })?;
+    let builder = ModuleGraphBuilder::new(loader, entry.url, entry.kind, entry.text);
+    let (graph, _) = builder.build_with_timings()?;
+    graph.link()
 }
 
 /// Load, compile, and link a module graph while recording phase timings.

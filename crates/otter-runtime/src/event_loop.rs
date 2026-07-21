@@ -7,7 +7,8 @@
 //! # Contents
 //!
 //! - [`EventLoop`] — host scheduling trait.
-//! - [`TokioEventLoop`] — default Tokio-backed implementation.
+//! - [`TokioRuntimeHost`] — public, shareable Tokio-backed host services.
+//! - [`TokioEventLoop`] — isolate-facing implementation behind that host.
 //! - Timer sink and HTTPS host-service wiring support types.
 //!
 //! # Invariants
@@ -30,6 +31,75 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 
 use crate::host_services::{HttpsModuleFetchSink, HttpsModuleFetcher, HttpsModuleFetcherHandle};
+
+/// Shareable Tokio-backed host services for one application process.
+///
+/// A browser normally constructs one host and clones it into every per-page
+/// [`crate::RuntimeBuilder`]. The resulting isolates retain separate heaps,
+/// globals, microtask queues, and capability state while sharing the executor,
+/// HTTP client, and timer registry. A CLI can use the same host with one
+/// isolate.
+///
+/// This is a ready-made implementation, not a requirement for direct
+/// embedders. Layer A can instead install custom timer and completion sinks
+/// driven by another event loop.
+#[derive(Clone)]
+pub struct TokioRuntimeHost {
+    event_loop: TokioEventLoop,
+}
+
+impl TokioRuntimeHost {
+    /// Create a host that owns a new multi-thread Tokio runtime.
+    ///
+    /// # Errors
+    /// Returns [`std::io::Error`] when Tokio cannot create its worker threads.
+    pub fn new() -> Result<Self, std::io::Error> {
+        Ok(Self {
+            event_loop: TokioEventLoop::owned()?,
+        })
+    }
+
+    /// Wrap an embedder-owned Tokio runtime.
+    ///
+    /// The embedder must keep the runtime alive for at least as long as every
+    /// isolate built from this host.
+    #[must_use]
+    pub fn from_handle(handle: tokio::runtime::Handle) -> Self {
+        Self {
+            event_loop: TokioEventLoop::from_handle(handle),
+        }
+    }
+
+    /// Reuse the current Tokio runtime, or own a new one when called outside
+    /// an executor context.
+    ///
+    /// # Errors
+    /// Returns [`std::io::Error`] when fallback runtime creation fails.
+    pub fn current_or_new() -> Result<Self, std::io::Error> {
+        Ok(Self {
+            event_loop: TokioEventLoop::current_or_owned()?,
+        })
+    }
+
+    /// The shared executor handle for host integrations that perform owned,
+    /// non-GC async work.
+    #[must_use]
+    pub fn handle(&self) -> tokio::runtime::Handle {
+        self.event_loop.handle()
+    }
+
+    pub(crate) fn event_loop(&self) -> TokioEventLoop {
+        self.event_loop.clone()
+    }
+}
+
+impl std::fmt::Debug for TokioRuntimeHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokioRuntimeHost")
+            .field("owns_runtime", &self.event_loop.owned.is_some())
+            .finish_non_exhaustive()
+    }
+}
 
 /// Runtime-side sink notified when a host timer fires.
 ///

@@ -820,6 +820,30 @@ impl<'rt> NativeCtx<'rt> {
         self.call_owned(target, this_value, args.iter().copied().collect())
     }
 
+    /// Build a native-call failure that throws `value` verbatim into
+    /// JavaScript.
+    ///
+    /// Returning a plain [`NativeError::Thrown`] carries only diagnostic text
+    /// and cannot preserve object, symbol, or host-wrapper identity. This
+    /// method parks the original value in the interpreter's traced throw slot
+    /// before returning the dispatcher outcome, so an enclosing JavaScript
+    /// `catch` observes the exact same value.
+    ///
+    /// Callers should return the result immediately:
+    ///
+    /// ```ignore
+    /// return Err(ctx.throw_value("Document.removeChild", exception));
+    /// ```
+    ///
+    /// No allocation occurs after `value` is accepted. As with every raw
+    /// [`Value`] argument, it must be current when this method is called.
+    #[must_use]
+    pub fn throw_value(&mut self, name: &'static str, value: Value) -> NativeError {
+        let message = value.display_string(self.heap());
+        self.cx.interp.set_pending_uncaught_throw(value);
+        NativeError::Thrown { name, message }
+    }
+
     /// Compile a CommonJS wrapper on the current runtime turn.
     ///
     /// The synthesized module executes above an activation floor on this

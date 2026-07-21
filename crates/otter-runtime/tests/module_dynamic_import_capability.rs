@@ -10,12 +10,13 @@
 //! 1. Without `Capability::Net`, an HTTPS import (static or
 //!    dynamic literal) surfaces `MODULE_CAPABILITY_DENIED`
 //!    before any network I/O.
-//! 2. With `Capability::Net` granted, the capability check
-//!    passes — the loader then surfaces `UnsupportedSpecifier`
-//!    because the actual HTTPS fetcher is a follow-up slice.
-//!    The test asserts on the *transition* from capability-
-//!    denied to fetcher-required so that wiring the fetcher
-//!    later does not silently regress capability gating.
+//! 2. With `Capability::Net` granted, the Layer B loader fetches
+//!    HTTP module graphs and prepares them off-isolate before
+//!    realm-local evaluation. Direct Layer A runtimes without a
+//!    configured host fetcher still report a resolution error
+//!    after the capability gate passes.
+//! 3. Slow remote graph preparation does not prevent a concurrent
+//!    command from completing on the page isolate.
 //!
 //! Local literal `import("./mod.ts")` continues to work
 //! through the pre-resolved module graph; that path is also
@@ -71,6 +72,37 @@ async fn spawn_one_shot_http_server(body: String) -> std::net::SocketAddr {
             );
             let _ = stream.write_all(response.as_bytes()).await;
             let _ = stream.flush().await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    addr
+}
+
+async fn spawn_module_graph_http_server() -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _peer)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 2048];
+            let read = stream.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..read]);
+            let body = if request.starts_with("GET /dep.js ") {
+                "export const answer = 42;"
+            } else {
+                "import { answer } from './dep.js'; export { answer };"
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
             let _ = stream.shutdown().await;
         }
     });
@@ -473,6 +505,123 @@ async fn dynamic_import_fetches_https_module_with_net_capability() {
         .run_module(entry)
         .await
         .expect("HTTPS dynamic import must fetch + evaluate");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dynamic_http_import_prepares_static_dependencies_off_isolate() {
+    let addr = spawn_module_graph_http_server().await;
+    let host = addr.to_string();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = dir.path().join("entry.ts");
+    std::fs::write(
+        &entry,
+        format!(
+            r#"
+            const url = "http://{host}/mod.js";
+            const mod = await import(url);
+            if (mod.answer !== 42) {{
+                throw new Error("bad transitive HTTP namespace: " + mod.answer);
+            }}
+            "#
+        ),
+    )
+    .unwrap();
+
+    let mut capabilities = CapabilitySet::sandbox();
+    capabilities.net = Permission::allow(vec![host]);
+    let otter = Otter::builder()
+        .capabilities(capabilities)
+        .build()
+        .expect("otter");
+    otter
+        .run_module(entry)
+        .await
+        .expect("remote dynamic graph must load transitively");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_source_prepares_remote_graph_before_isolate_execution() {
+    let addr = spawn_module_graph_http_server().await;
+    let host = addr.to_string();
+    let mut capabilities = CapabilitySet::sandbox();
+    capabilities.net = Permission::allow(vec![host.clone()]);
+    let otter = Otter::builder()
+        .capabilities(capabilities)
+        .build()
+        .expect("otter");
+
+    otter
+        .run_module_source(
+            otter_runtime::SourceInput::from_javascript(
+                "import { answer } from './dep.js'; if (answer !== 42) throw new Error('bad answer');",
+            ),
+            format!("http://{host}/entry.js"),
+        )
+        .await
+        .expect("in-memory remote entry must prepare dependencies off-isolate");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_module_preparation_does_not_block_the_isolate() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (requested_tx, requested_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request).await;
+        let _ = requested_tx.send(());
+        let _ = release_rx.await;
+        let body = "export const answer = 42;";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.shutdown().await;
+    });
+
+    let host = addr.to_string();
+    let mut capabilities = CapabilitySet::sandbox();
+    capabilities.net = Permission::allow(vec![host.clone()]);
+    let otter = Otter::builder()
+        .capabilities(capabilities)
+        .build()
+        .expect("otter");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = dir.path().join("entry.js");
+    std::fs::write(
+        &entry,
+        format!(
+            "import {{ answer }} from 'http://{host}/dep.js'; if (answer !== 42) throw new Error('bad answer');"
+        ),
+    )
+    .expect("entry");
+    let preparing = {
+        let otter = otter.clone();
+        tokio::spawn(async move { otter.run_module(entry).await })
+    };
+
+    requested_rx.await.expect("dependency request");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        otter.run_script("globalThis.stillResponsive = true;"),
+    )
+    .await
+    .expect("isolate command must not wait for module I/O")
+    .expect("responsive script");
+
+    release_tx.send(()).expect("release response");
+    preparing
+        .await
+        .expect("preparation task")
+        .expect("prepared module executes");
 }
 
 /// HTTPS dynamic import must still respect the Net capability —

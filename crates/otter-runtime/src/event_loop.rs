@@ -221,11 +221,11 @@ impl TokioEventLoop {
         })
     }
 
-    /// Blocking remote-module fetcher for the synchronous module-graph loader
-    /// (static http/https imports). Backed by the same Tokio handle + client as
-    /// the async dynamic-import fetcher; the loader calls it on the isolate
-    /// thread and blocks that thread until the whole remote graph is fetched,
-    /// mirroring how it blocks on filesystem reads for local modules.
+    /// Blocking adapter used by the synchronous module-graph builder.
+    ///
+    /// Layer B runs that builder on Tokio's blocking pool, so HTTP/file reads,
+    /// parsing, compilation, and linking do not park the isolate. Direct Layer
+    /// A callers may still choose this adapter for synchronous preparation.
     pub(crate) fn blocking_module_fetcher(
         &self,
     ) -> Arc<dyn crate::module_loader::RemoteModuleFetch> {

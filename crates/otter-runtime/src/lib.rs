@@ -2373,9 +2373,9 @@ pub struct Runtime {
     promise_registry: promise_registry::PromiseRegistry,
     /// Sender for owned tasks that must run on the isolate event loop.
     runtime_task_spawner: Option<RuntimeTaskSpawner>,
-    /// Blocking remote-module fetch hook, wired by the isolate runner from the
-    /// event loop's HTTP client. Enables static http/https imports (the
-    /// Deno-style remote graph); `None` in embedders without remote loading.
+    /// Remote-module source provider used by direct Layer A graph builds and
+    /// file-backed dynamic imports. Layer B prepares remote graphs outside the
+    /// isolate and transfers only owned linked output back.
     remote_module_fetch: Option<Arc<dyn module_loader::RemoteModuleFetch>>,
 }
 
@@ -2608,25 +2608,59 @@ impl Runtime {
         }
     }
 
-    /// Finish an HTTPS dynamic import after the host fetcher has
-    /// returned owned UTF-8 source text.
-    pub(crate) fn complete_dynamic_import_https(
+    /// Finish a remote dynamic import after its complete graph was prepared
+    /// away from the isolate thread.
+    pub(crate) fn complete_dynamic_import_prepared(
         &mut self,
         token: u64,
         target_url: &str,
-        source: Result<String, String>,
+        linked: Result<module_graph::LinkedProgram, String>,
     ) -> Result<bool, OtterError> {
-        let reaction_outcome: Result<otter_vm::Value, otter_vm::Value> = match source
+        match linked
             .map_err(DynLoadError::type_error)
-            .and_then(|source| self.evaluate_dynamic_module_https_source(target_url, source))
+            .and_then(|linked| self.evaluate_dynamic_linked_module(target_url, linked))
         {
-            Ok(namespace) => Ok(namespace),
-            Err(DynLoadError::Diagnostic { kind, message }) => {
-                Err(self.alloc_dynamic_import_error(kind, message)?)
+            Ok(DynamicModuleLoad::Loaded(namespace)) => {
+                self.settle_dynamic_import_result(token, Ok(namespace))
             }
-            Err(DynLoadError::Thrown(value)) => Err(value),
-        };
-        self.settle_dynamic_import_result(token, reaction_outcome)
+            Ok(DynamicModuleLoad::PendingAsyncEvaluation {
+                promise,
+                target_url,
+                context,
+            }) => {
+                self.interp
+                    .settle_dynamic_import_on_async_inits(
+                        &context,
+                        token,
+                        vec![promise],
+                        std::sync::Arc::from(target_url.as_str()),
+                    )
+                    .map_err(|error| {
+                        map_vm_error(otter_vm::RunError {
+                            error,
+                            frames: Vec::new(),
+                            detail: None,
+                        })
+                    })?;
+                self.interp
+                    .drain_microtasks_with_default(Some(context))
+                    .map_err(|error| {
+                        enrich_runtime_diagnostic_with_cause(&mut self.interp, map_vm_error(error))
+                    })?;
+                Ok(true)
+            }
+            Ok(DynamicModuleLoad::FetchHttps { .. }) => Err(OtterError::Internal {
+                code: "DYNAMIC_IMPORT_PREPARED_FETCH".to_string(),
+                message: "prepared dynamic module requested a second entry fetch".to_string(),
+            }),
+            Err(DynLoadError::Diagnostic { kind, message }) => {
+                let value = self.alloc_dynamic_import_error(kind, message)?;
+                self.settle_dynamic_import_result(token, Err(value))
+            }
+            Err(DynLoadError::Thrown(value)) => {
+                self.settle_dynamic_import_result(token, Err(value))
+            }
+        }
     }
 
     fn settle_dynamic_import_result(
@@ -2684,6 +2718,7 @@ impl Runtime {
             Some(referrer)
         };
         let entry_for_loader: PathBuf = match referrer_opt {
+            Some(url) if module_loader::is_http_url(url) => PathBuf::from("."),
             Some(url) => url_to_path(url).ok_or_else(|| {
                 DynLoadError::type_error(format!(
                     "dynamic import: referrer is not a file:// URL: \"{url}\""
@@ -2723,6 +2758,14 @@ impl Runtime {
                     format!("dynamic import: load failed for \"{target_url}\": {e:?}"),
                 )
             })?;
+        self.evaluate_dynamic_linked_module(&target_url, linked)
+    }
+
+    fn evaluate_dynamic_linked_module(
+        &mut self,
+        target_url: &str,
+        linked: module_graph::LinkedProgram,
+    ) -> Result<DynamicModuleLoad, DynLoadError> {
         for metadata in &linked.metadata {
             self.source_maps.record_compiled_metadata(metadata);
         }
@@ -2749,13 +2792,13 @@ impl Runtime {
             &mut self.interp,
             NativeCallInfo::default_call(),
             Some(&context),
-            |ctx| ctx.evaluate_module(&target_url),
+            |ctx| ctx.evaluate_module(target_url),
         );
         match evaluation {
             Ok(Some(promise)) => {
                 return Ok(DynamicModuleLoad::PendingAsyncEvaluation {
                     promise,
-                    target_url,
+                    target_url: target_url.to_string(),
                     context,
                 });
             }
@@ -2779,7 +2822,7 @@ impl Runtime {
                 )));
             }
         }
-        let namespace = self.interp.module_env(&target_url).ok_or_else(|| {
+        let namespace = self.interp.module_env(target_url).ok_or_else(|| {
             DynLoadError::type_error(format!(
                 "dynamic import: namespace missing after load: \"{target_url}\""
             ))
@@ -2787,93 +2830,6 @@ impl Runtime {
         Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(
             namespace,
         )))
-    }
-
-    /// Compile + evaluate an already-fetched HTTPS module
-    /// dynamically.
-    ///
-    /// # Algorithm
-    /// 1. Parse the response body as UTF-8 source text once. Compile
-    ///    it as one ES-module fragment via
-    ///    `otter_compiler::compile_module_program`. Any own
-    ///    static imports are rejected for this slice — the
-    ///    HTTPS fetcher does not yet recurse into dependencies.
-    ///    Local file imports from an HTTPS module are also
-    ///    rejected for the same reason.
-    /// 2. Wrap the fragment in a one-module `BytecodeModule`
-    ///    suitable for `Interpreter::run_callable_sync`, allocate
-    ///    an env, mark it inited, then dispatch `<module-init>`.
-    /// 3. Settle with the populated env as the namespace.
-    fn evaluate_dynamic_module_https_source(
-        &mut self,
-        target_url: &str,
-        response_text: String,
-    ) -> Result<otter_vm::Value, DynLoadError> {
-        let host = otter_compiler::ModuleHostInfo {
-            module_url: target_url.to_string(),
-            resolved_imports: std::collections::HashMap::new(),
-        };
-        let fragment = otter_syntax::with_program(
-            response_text,
-            otter_syntax::SourceKind::JavaScript,
-            |program| {
-                otter_compiler::compile_module_program(
-                    program,
-                    otter_syntax::SourceKind::JavaScript,
-                    &host,
-                )
-            },
-        )
-        .map_err(|e| {
-            DynLoadError::syntax_error(format!(
-                "dynamic import: parse failed for \"{target_url}\": {e:?}"
-            ))
-        })?
-        .map_err(|e| {
-            DynLoadError::from_compile_error(
-                &e,
-                format!("dynamic import: compile failed for \"{target_url}\": {e:?}"),
-            )
-        })?;
-        if fragment_has_import_namespace_ops(&fragment) {
-            return Err(DynLoadError::type_error(format!(
-                "dynamic import: HTTPS module \"{target_url}\" has own static imports — not yet supported"
-            )));
-        }
-        let context = self.interp.link_module(fragment);
-        let env = self
-            .interp
-            .alloc_host_object_with_roots(&[], &[])
-            .map_err(|e| {
-                DynLoadError::type_error(format!("dynamic import: alloc env failed: {e}"))
-            })?;
-        self.interp
-            .register_module_env(std::sync::Arc::from(target_url), env);
-        otter_vm_init_marker_install(&mut self.interp, env);
-        let import_meta = alloc_dynamic_import_meta(&mut self.interp, env, target_url)?;
-        let callee = otter_vm::Value::function_id(context.main().id);
-        let args: smallvec::SmallVec<[otter_vm::Value; 8]> = smallvec::smallvec![
-            otter_vm::Value::object(env),
-            otter_vm::Value::object(import_meta),
-        ];
-        if let Err(err) =
-            self.interp
-                .run_callable_sync(&context, &callee, otter_vm::Value::undefined(), args)
-        {
-            if matches!(err, otter_vm::VmError::Uncaught)
-                && let Some(thrown) = self.interp.take_pending_uncaught_throw()
-            {
-                return Err(DynLoadError::Thrown(thrown));
-            }
-            return Err(DynLoadError::type_error(format!(
-                "dynamic import: HTTPS evaluation failed for \"{target_url}\": {err}"
-            )));
-        }
-        // `run_callable_sync` may have moved `env` (the local handle is not in
-        // any root set). Re-read the relocated handle from the GC-traced module
-        // env registry rather than returning the stale local.
-        let env = self.interp.module_env(target_url).unwrap_or(env);
-        Ok(otter_vm::Value::object(env))
     }
 
     /// Install `value` as a `globalThis.<name>` data property.
@@ -4092,6 +4048,22 @@ impl Runtime {
             .map(|(result, _)| self.attach_jit_debug_report(result))
     }
 
+    /// Execute a module graph prepared away from the isolate thread.
+    ///
+    /// Layer B builds and links remote graphs on Tokio's blocking pool, then
+    /// transfers this owned bytecode/metadata bundle to the isolate for the
+    /// GC- and realm-local instantiation/evaluation phase.
+    pub(crate) fn run_prepared_module(
+        &mut self,
+        linked: module_graph::LinkedProgram,
+    ) -> Result<ExecutionResult, OtterError> {
+        self.interp.begin_jit_debug_capture();
+        self.module_graph.last_entry_url = Some(linked.entry_url.clone());
+        self.module_graph.last_module_count = linked.module.module_inits.len();
+        self.execute_linked_module(linked, std::time::Instant::now(), None)
+            .map(|(result, _)| self.attach_jit_debug_report(result))
+    }
+
     /// Run a module while retaining partial JIT diagnostics on abrupt failure.
     pub fn run_module_with_diagnostics(
         &mut self,
@@ -5248,18 +5220,6 @@ impl DynLoadError {
         Self::diagnostic(otter_vm::ErrorKind::TypeError, message)
     }
 
-    fn syntax_error(message: impl Into<String>) -> Self {
-        Self::diagnostic(otter_vm::ErrorKind::SyntaxError, message)
-    }
-
-    fn from_compile_error(err: &otter_compiler::CompileError, message: impl Into<String>) -> Self {
-        let kind = match err {
-            otter_compiler::CompileError::Syntax { .. } => otter_vm::ErrorKind::SyntaxError,
-            _ => otter_vm::ErrorKind::TypeError,
-        };
-        Self::diagnostic(kind, message)
-    }
-
     fn from_graph_error(err: &module_graph::GraphError, message: impl Into<String>) -> Self {
         let kind = match err {
             module_graph::GraphError::Parse { .. } => otter_vm::ErrorKind::SyntaxError,
@@ -5273,63 +5233,6 @@ impl DynLoadError {
         };
         Self::diagnostic(kind, message)
     }
-}
-
-/// Sentinel property used to flag a `module_env` as already
-/// having had its `<module-init>` body executed. The file-backed
-/// dynamic-import path dedupes through the interpreter's module
-/// records; only the HTTPS single-module path still installs the
-/// marker for its separately linked fragments.
-const DYNAMIC_INIT_MARKER: &str = "__otter_module_inited__";
-
-fn otter_vm_init_marker_install(interp: &mut otter_vm::Interpreter, mut env: otter_vm::JsObject) {
-    otter_vm::object::set(
-        &mut env,
-        interp.gc_heap_mut(),
-        DYNAMIC_INIT_MARKER,
-        otter_vm::Value::boolean(true),
-    );
-}
-
-fn alloc_dynamic_import_meta(
-    interp: &mut otter_vm::Interpreter,
-    env: otter_vm::JsObject,
-    url: &str,
-) -> Result<otter_vm::JsObject, DynLoadError> {
-    let env_root = otter_vm::Value::object(env);
-    let mut import_meta = interp
-        .alloc_host_object_with_roots(&[&env_root], &[])
-        .map_err(|e| {
-            DynLoadError::type_error(format!("dynamic import: alloc import_meta failed: {e}"))
-        })?;
-    let url_string = otter_vm::JsString::from_str(url, interp.gc_heap_mut()).map_err(|err| {
-        DynLoadError::type_error(format!(
-            "dynamic import: alloc import_meta.url failed: {err}"
-        ))
-    })?;
-    otter_vm::object::set(
-        &mut import_meta,
-        interp.gc_heap_mut(),
-        "url",
-        otter_vm::Value::string(url_string),
-    );
-    Ok(import_meta)
-}
-
-/// `true` when the bytecode fragment contains any
-/// `Op::ImportNamespace` / `Op::ImportNamespaceDynamic`
-/// instruction. The HTTPS fetcher only handles modules without
-/// own imports for now — modules with imports need a recursive
-/// HTTPS-aware loader pipeline (next slice).
-fn fragment_has_import_namespace_ops(module: &otter_bytecode::BytecodeModule) -> bool {
-    module.functions.iter().any(|f| {
-        f.code.iter().any(|instr| {
-            matches!(
-                instr.op,
-                otter_bytecode::Op::ImportNamespace | otter_bytecode::Op::ImportNamespaceDynamic
-            )
-        })
-    })
 }
 
 /// Maximum depth the diagnostic cause-chain walker descends into

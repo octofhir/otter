@@ -51,16 +51,17 @@ pub struct RemoteModuleSource {
     pub final_url: String,
 }
 
-/// Blocking remote-module fetch hook.
+/// Synchronous remote-module source provider.
 ///
 /// Injected by the runtime and backed by the host event loop's HTTP client so
-/// the synchronous module-graph loader can pull http/https sources the same way
-/// it reads files — following redirects and reporting the response media type.
+/// the module-graph builder can pull http/https sources the same way it reads
+/// files — following redirects and reporting the response media type. Layer B
+/// invokes the whole builder on a blocking worker, never on the isolate thread.
 /// Absent in embedders that disable remote loading, where an http(s) import
 /// surfaces a clean [`LoaderError::Load`] instead of a network call.
 pub trait RemoteModuleFetch: Send + Sync + std::fmt::Debug {
-    /// Fetch `url`, following redirects. Blocking; called on the isolate
-    /// thread during graph construction.
+    /// Fetch `url`, following redirects. This may block its graph-build worker,
+    /// but must not retain VM/GC state.
     fn fetch(&self, url: &str) -> Result<RemoteModuleSource, String>;
 }
 

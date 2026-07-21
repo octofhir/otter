@@ -2,7 +2,7 @@
 //!
 //! Derive expands to a single `impl ::otter_gc::SafeTraceable` block.
 //! Every field that is not annotated with `#[pelt(skip)]` is funneled
-//! through [`::otter_vm::pelt::PeltField::pelt_trace`]; missing
+//! through [`::otter_vm::__macro_support::pelt::PeltField::pelt_trace`]; missing
 //! `PeltField` impls surface as ordinary compile errors at the field
 //! span, satisfying the "fail loudly on untraceable fields"
 //! acceptance gate for Phase 6.3.
@@ -23,7 +23,7 @@
 //!   already-existing per-body `_TYPE_TAG` const keeps tag
 //!   coordination centralised in the body's own module.
 //! - The expansion never references items outside `::otter_gc::*` and
-//!   `::otter_vm::pelt::*`, so downstream crates do not need to import
+//!   `::otter_vm::__macro_support::pelt::*`, so downstream crates do not need to import
 //!   anything beyond the derive itself.
 //!
 //! # See also
@@ -279,7 +279,7 @@ fn emit_field_call(
     match via {
         Some(path) => quote! { #path(#access, visitor); },
         None => quote! {
-            <_ as ::otter_vm::pelt::PeltField>::pelt_trace(#access, visitor);
+            <_ as ::otter_vm::__macro_support::pelt::PeltField>::pelt_trace(#access, visitor);
         },
     }
 }

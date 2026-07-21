@@ -33,3 +33,15 @@ fn runtime_hooks_reject_non_send_sync_state() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/compile_fail/runtime_hook_non_send_sync_rejected.rs");
 }
+
+#[test]
+fn generated_bindings_compile_through_hidden_support_boundary() {
+    let t = trybuild::TestCases::new();
+    t.pass("tests/compile_pass/macro_support_boundary.rs");
+}
+
+#[test]
+fn untraced_host_payload_requires_explicit_marker() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile_fail/untraced_host_value_slot_rejected.rs");
+}

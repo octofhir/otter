@@ -23,14 +23,17 @@
 //! - [Browser embedding](../../../docs/site/src/content/docs/extensions/browser-embedding.md)
 //! - [`crate::surface`] for advanced declarative extension implementation.
 
-pub use crate::module_loader::{RemoteModuleFetch, RemoteModuleSource};
+pub use crate::module_loader::{
+    ModuleLoadCancellation, RemoteModuleError, RemoteModuleFuture, RemoteModuleProvider,
+    RemoteModuleRequest, RemoteModuleSource,
+};
 pub use crate::{
     CapabilityRequest, CapabilitySet, ConfigError, ConsoleLevel, ConsoleSink, ConsoleSinkHandle,
     Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticKind, ExecutionAttempt,
-    ExecutionResult, InterruptHandle, IoErrorKind, Otter, OtterBuilder, OtterError, Permission,
-    RealmError, Runtime, RuntimeActivityStats, RuntimeBuilder, RuntimeCapability,
-    RuntimeCapabilityHook, RuntimeCompileHook, RuntimeDiagnosticHook, RuntimeGlobalInstaller,
-    RuntimeGlobalValue, RuntimeHandle, RuntimeHooks, RuntimeJobHook, RuntimeLoadHook,
-    RuntimeRealmContext, RuntimeRealmId, RuntimeResolveHook, RuntimeTask, RuntimeTaskSpawner,
-    SourceInput, StackFrame, TokioRuntimeHost,
+    ExecutionResult, HostAtomInterner, InterruptHandle, IoErrorKind, Otter, OtterBuilder,
+    OtterError, Permission, RealmError, Runtime, RuntimeActivityStats, RuntimeBuilder,
+    RuntimeCapability, RuntimeCapabilityHook, RuntimeCompileHook, RuntimeDiagnosticHook,
+    RuntimeGlobalInstaller, RuntimeGlobalValue, RuntimeHandle, RuntimeHooks, RuntimeHostAtom,
+    RuntimeHostAtomId, RuntimeJobHook, RuntimeLoadHook, RuntimeRealmContext, RuntimeRealmId,
+    RuntimeResolveHook, RuntimeTask, RuntimeTaskSpawner, SourceInput, StackFrame, TokioRuntimeHost,
 };

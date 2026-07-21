@@ -183,15 +183,15 @@ mod romp;
 /// ```
 ///
 /// `feature` is the bare variant name from
-/// `::otter_vm::BootstrapFeatures`. Optional fields `spec =
+/// `::otter_vm::__macro_support::BootstrapFeatures`. Optional fields `spec =
 /// MATH_SPEC,` and `intrinsic = MathIntrinsic,` override the
 /// derived ident names (default: `<NAME>_SPEC` and `Intrinsic`).
 ///
 /// # Generated symbols
 ///
-/// - `pub static <SPEC>: ::otter_vm::NamespaceSpec`
+/// - `pub static <SPEC>: ::otter_vm::__macro_support::NamespaceSpec`
 /// - `pub struct <INTRINSIC>;`
-/// - `impl ::otter_vm::BuiltinIntrinsic for <INTRINSIC>` with
+/// - `impl ::otter_vm::__macro_support::BuiltinIntrinsic for <INTRINSIC>` with
 ///   `NAME`, `FEATURE`, and `install`.
 ///
 /// Bootstrap registration stays explicit — add
@@ -229,9 +229,9 @@ pub fn holt(input: TokenStream) -> TokenStream {
 ///
 /// # Generated symbols
 ///
-/// - `pub static <SPEC>: ::otter_vm::ConstructorSpec`
+/// - `pub static <SPEC>: ::otter_vm::__macro_support::ConstructorSpec`
 /// - `pub struct <INTRINSIC>;`
-/// - `impl ::otter_vm::intrinsic_install::BuiltinIntrinsic for
+/// - `impl ::otter_vm::__macro_support::intrinsic_install::BuiltinIntrinsic for
 ///   <INTRINSIC>` whose `install` body allocates the
 ///   `NativeFunction` constructor and pins each static as an own
 ///   data property before binding the constructor on `globalThis`.
@@ -428,7 +428,7 @@ pub fn pelt_derive(input: TokenStream) -> TokenStream {
 ///
 /// Mirrors [`Pelt`] for the sweep-time finalize hook: every field
 /// that is not annotated with `#[groom(skip)]` is funneled through
-/// `::otter_vm::groom::GroomField::groom`, in declaration order.
+/// `::otter_vm::__macro_support::groom::GroomField::groom`, in declaration order.
 ///
 /// Bodies that opt into `Groom` must also implement
 /// `::otter_gc::SafeTraceable` (typically via `#[derive(Pelt)]`) and
@@ -484,29 +484,29 @@ pub fn raft(input: TokenStream) -> TokenStream {
         let length = method.length;
         let call = &method.call;
         quote! {
-            ::otter_vm::MethodSpec {
+            ::otter_vm::__macro_support::MethodSpec {
                 name: #js_name,
                 length: #length,
-                attrs: ::otter_vm::Attr::builtin_function(),
-                call: ::otter_vm::NativeCall::Static(#call),
+                attrs: ::otter_vm::__macro_support::Attr::builtin_function(),
+                call: ::otter_vm::__macro_support::NativeCall::Static(#call),
             }
         }
     });
 
     quote! {
         #[allow(non_upper_case_globals)]
-        static #methods_ident: &[::otter_vm::MethodSpec] = &[
+        static #methods_ident: &[::otter_vm::__macro_support::MethodSpec] = &[
             #(#method_entries),*
         ];
 
         #[allow(non_upper_case_globals)]
         #[doc = "Generated grouped static JavaScript namespace spec."]
-        #vis static #spec_ident: ::otter_vm::NamespaceSpec = ::otter_vm::NamespaceSpec {
+        #vis static #spec_ident: ::otter_vm::__macro_support::NamespaceSpec = ::otter_vm::__macro_support::NamespaceSpec {
             name: #namespace_name,
             methods: #methods_ident,
             accessors: &[],
             constants: &[],
-            attrs: ::otter_vm::Attr::global_binding(),
+            attrs: ::otter_vm::__macro_support::Attr::global_binding(),
         };
     }
     .into()

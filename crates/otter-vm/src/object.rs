@@ -113,14 +113,154 @@ fn next_shape_id() -> ShapeId {
     ShapeId(NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed))
 }
 
-/// Rust-owned data attached to a JavaScript object.
+/// Rust-owned, non-traced data attached to a JavaScript object.
 ///
-/// Host object data is isolate-local object state. It must not hold VM `Value`,
-/// `Gc`, `Local`, `NativeCtx`, or async futures; if JS values need to be held
-/// across GC, use explicit GC-managed payloads and trace hooks instead.
+/// This convenience marker is for payloads that contain no JavaScript values.
+/// Payloads which retain JavaScript references use
+/// [`TracedHostObjectData`] and [`HostValueSlot`] instead. The explicit empty
+/// implementation is intentional: choosing the untraced path must be visible
+/// at the payload type, rather than silently applying to every Rust type.
 pub trait HostObjectData: Any {}
 
-impl<T: Any> HostObjectData for T {}
+/// One collector-rewritten JavaScript reference inside traced host data.
+///
+/// The representation is deliberately private. A slot can only be populated
+/// from, or materialized into, a rooted [`crate::Local`] through
+/// [`crate::NativeScope`]. This prevents an extension from retaining a raw VM
+/// value across an allocating safepoint.
+pub struct HostValueSlot {
+    value: Value,
+}
+
+impl HostValueSlot {
+    /// Create an empty (`undefined`) host slot.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            value: Value::undefined(),
+        }
+    }
+
+    /// Remove the strong JavaScript reference from this slot.
+    pub fn clear(&mut self) {
+        self.value = Value::undefined();
+    }
+
+    /// Whether the slot currently contains no JavaScript reference.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.value.is_undefined()
+    }
+
+    pub(crate) fn value(&self) -> Value {
+        self.value
+    }
+
+    pub(crate) fn replace(&mut self, value: Value) {
+        self.value = value;
+    }
+
+    pub(crate) fn from_value(value: Value) -> Self {
+        Self { value }
+    }
+}
+
+impl Default for HostValueSlot {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl std::fmt::Debug for HostValueSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostValueSlot")
+            .field("empty", &self.is_empty())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Safe visitor exposed to [`TracedHostObjectData`] implementations.
+///
+/// It only accepts [`HostValueSlot`] fields and never exposes the collector's
+/// raw slot visitor or heap. Implementations must enumerate each strong slot
+/// exactly once and must not allocate or re-enter JavaScript while tracing.
+pub struct HostDataTracer<'a> {
+    visitor: &'a mut SlotVisitor<'a>,
+}
+
+impl HostDataTracer<'_> {
+    /// Trace one strong host slot.
+    pub fn trace(&mut self, slot: &mut HostValueSlot) {
+        slot.value.trace_value_slots(self.visitor);
+    }
+}
+
+/// Explicit tracing contract for Rust host-object payloads that retain
+/// JavaScript values.
+///
+/// Extensions store references only in [`HostValueSlot`] fields and enumerate
+/// those fields from [`Self::trace_gc_slots`]. The collector invokes the method
+/// while the mutator is stopped, allowing moving collections to rewrite the
+/// opaque slots in place without exposing any raw GC API to the extension.
+pub trait TracedHostObjectData: Any {
+    /// Enumerate every strong JavaScript slot owned by this payload.
+    fn trace_gc_slots(&mut self, tracer: &mut HostDataTracer<'_>);
+}
+
+trait ErasedTracedHostObjectData {
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+    fn trace_gc_slots_erased(&mut self, visitor: &mut SlotVisitor<'_>);
+}
+
+impl<T: TracedHostObjectData> ErasedTracedHostObjectData for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn trace_gc_slots_erased(&mut self, visitor: &mut SlotVisitor<'_>) {
+        let mut tracer = HostDataTracer { visitor };
+        self.trace_gc_slots(&mut tracer);
+    }
+}
+
+enum HostData {
+    Untraced(Box<dyn Any>),
+    Traced(Box<dyn ErasedTracedHostObjectData>),
+}
+
+impl HostData {
+    fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        match self {
+            Self::Untraced(data) => data.downcast_ref::<T>(),
+            Self::Traced(data) => data.as_any().downcast_ref::<T>(),
+        }
+    }
+
+    fn downcast_mut<T: Any>(&mut self) -> Option<&mut T> {
+        match self {
+            Self::Untraced(data) => data.downcast_mut::<T>(),
+            Self::Traced(data) => data.as_any_mut().downcast_mut::<T>(),
+        }
+    }
+
+    fn into_untraced<T: Any>(self) -> Result<Box<T>, Self> {
+        match self {
+            Self::Untraced(data) => data.downcast::<T>().map_err(Self::Untraced),
+            traced => Err(traced),
+        }
+    }
+
+    fn trace_gc_slots(&mut self, visitor: &mut SlotVisitor<'_>) {
+        if let Self::Traced(data) = self {
+            data.trace_gc_slots_erased(visitor);
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct MappedArgumentEntry {
@@ -632,7 +772,7 @@ struct ExoticSlots {
     /// Symbol-keyed own properties (descriptor slot representation).
     symbol_props: Vec<(JsSymbol, SlotData)>,
     /// Rust-owned payload for host-backed objects and VM-internal side data.
-    host_data: Option<Box<dyn Any>>,
+    host_data: Option<HostData>,
     /// Native `[[Call]]` for builtin callable ordinary objects.
     call_native: Option<Value>,
     /// Native `[[Construct]]` for constructor-shaped builtins (`Number`, …).
@@ -1040,11 +1180,11 @@ impl ObjectBody {
     }
 
     #[inline]
-    fn host_data_ref(&self) -> Option<&Box<dyn Any>> {
+    fn host_data_ref(&self) -> Option<&HostData> {
         self.exotic().and_then(|e| e.host_data.as_ref())
     }
     #[inline]
-    fn host_data_mut_opt(&mut self) -> Option<&mut Box<dyn Any>> {
+    fn host_data_mut_opt(&mut self) -> Option<&mut HostData> {
         self.exotic
             .as_deref_mut()
             .and_then(|e| e.host_data.as_mut())
@@ -1283,6 +1423,9 @@ impl otter_gc::SafeTraceable for ObjectBody {
                     v(p);
                 }
             }
+            if let Some(data) = exotic.host_data.as_mut() {
+                data.trace_gc_slots(v);
+            }
         }
     }
 }
@@ -1503,7 +1646,7 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
             extensible: true,
             slot_attrs_overridden: false,
             exotic: Some(Box::new(ExoticSlots {
-                host_data: Some(Box::new(data)),
+                host_data: Some(HostData::Untraced(Box::new(data))),
                 ..ExoticSlots::default()
             })),
         },
@@ -1531,7 +1674,36 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
             extensible: true,
             slot_attrs_overridden: false,
             exotic: Some(Box::new(ExoticSlots {
-                host_data: Some(Box::new(data)),
+                host_data: Some(HostData::Untraced(Box::new(data))),
+                ..ExoticSlots::default()
+            })),
+        },
+        external_visit,
+    )
+}
+
+/// Allocate a fresh host object whose payload explicitly traces JavaScript
+/// references through [`HostValueSlot`] fields.
+pub(crate) fn alloc_traced_host_object_with_shape_roots<T: TracedHostObjectData>(
+    heap: &mut otter_gc::GcHeap,
+    shape: ShapeHandle,
+    data: T,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsObject, otter_gc::OutOfMemory> {
+    heap.alloc_with_roots(
+        ObjectBody {
+            shape,
+            values_ptr: Cell::new(std::ptr::null_mut()),
+            values: Vec::new(),
+            inline_values: [CompressedValue::default(); INLINE_SLOT_CAP],
+            slab_len: 0,
+            dictionary_shape_id: ShapeId::UNASSIGNED,
+            shape_cache_mode: ShapeCacheMode::Fast,
+            jit_proto: otter_gc::Gc::null(),
+            extensible: true,
+            slot_attrs_overridden: false,
+            exotic: Some(Box::new(ExoticSlots {
+                host_data: Some(HostData::Traced(Box::new(data))),
                 ..ExoticSlots::default()
             })),
         },
@@ -1566,9 +1738,9 @@ pub(crate) fn install_mapped_arguments(
 ) {
     heap.with_payload(obj, |body| {
         if !entries.is_empty() {
-            body.exotic_mut().host_data = Some(Box::new(MappedArgumentsData {
+            body.exotic_mut().host_data = Some(HostData::Untraced(Box::new(MappedArgumentsData {
                 entries: entries.into_boxed_slice(),
-            }));
+            })));
         }
     });
 }
@@ -1586,7 +1758,7 @@ fn remove_mapped_argument(body: &mut ObjectBody, key: &str) {
     let Some(data) = body.exotic.as_deref_mut().and_then(|e| e.host_data.take()) else {
         return;
     };
-    match data.downcast::<MappedArgumentsData>() {
+    match data.into_untraced::<MappedArgumentsData>() {
         Ok(mapped) => {
             let retained: Vec<_> = mapped
                 .entries
@@ -1595,9 +1767,10 @@ fn remove_mapped_argument(body: &mut ObjectBody, key: &str) {
                 .filter(|entry| entry.key != key)
                 .collect();
             if !retained.is_empty() {
-                body.exotic_mut().host_data = Some(Box::new(MappedArgumentsData {
-                    entries: retained.into_boxed_slice(),
-                }));
+                body.exotic_mut().host_data =
+                    Some(HostData::Untraced(Box::new(MappedArgumentsData {
+                        entries: retained.into_boxed_slice(),
+                    })));
             }
         }
         Err(other) => {
@@ -2529,7 +2702,7 @@ pub fn with_host_data<T, R>(
     f: impl FnOnce(&T) -> R,
 ) -> Result<R, HostObjectError>
 where
-    T: HostObjectData,
+    T: Any,
 {
     heap.read_payload(obj, |body| {
         let data = body.host_data_ref().ok_or(HostObjectError::Missing)?;
@@ -2552,7 +2725,7 @@ pub fn with_host_data_mut<T, R>(
     f: impl FnOnce(&mut T) -> R,
 ) -> Result<R, HostObjectError>
 where
-    T: HostObjectData,
+    T: Any,
 {
     heap.with_payload(obj, |body| {
         let data = body.host_data_mut_opt().ok_or(HostObjectError::Missing)?;
@@ -2580,6 +2753,8 @@ pub(crate) struct DeferredNamespaceData {
     pub(crate) populated: std::cell::Cell<bool>,
 }
 
+impl HostObjectData for DeferredNamespaceData {}
+
 /// Side data marking a Module Namespace Exotic Object (ECMA-262
 /// §10.4.6). The object is a thin exotic view over the wrapped module
 /// environment `env` (an ordinary object that holds the live export
@@ -2592,11 +2767,26 @@ pub(crate) struct ModuleNamespaceData {
     /// The module's own environment object. Kept for GC reachability
     /// and as the fallback key source for unmodeled (host/builtin)
     /// modules that carry no ResolveExport table.
-    pub(crate) env: JsObject,
+    env: HostValueSlot,
     /// Canonical URL of the module this namespace exposes. Used to look
     /// up the module's §16.2.1.6 ResolveExport table so re-exported and
     /// star-exported names resolve to the defining module's live env.
     pub(crate) module_url: std::sync::Arc<str>,
+}
+
+impl ModuleNamespaceData {
+    pub(crate) fn new(env: JsObject, module_url: std::sync::Arc<str>) -> Self {
+        Self {
+            env: HostValueSlot::from_value(Value::object(env)),
+            module_url,
+        }
+    }
+}
+
+impl TracedHostObjectData for ModuleNamespaceData {
+    fn trace_gc_slots(&mut self, tracer: &mut HostDataTracer<'_>) {
+        tracer.trace(&mut self.env);
+    }
 }
 
 /// Wrapped module environment when `obj` is a Module Namespace Exotic
@@ -2606,7 +2796,7 @@ pub(crate) fn module_namespace_env(obj: JsObject, heap: &otter_gc::GcHeap) -> Op
     heap.read_payload(obj, |body| {
         body.host_data_ref()
             .and_then(|d| d.downcast_ref::<ModuleNamespaceData>())
-            .map(|d| d.env)
+            .and_then(|d| d.env.value().as_object())
     })
 }
 
@@ -4969,6 +5159,12 @@ mod tests {
         value: u32,
     }
 
+    impl HostObjectData for Counter {}
+
+    struct WrongHostData(String);
+
+    impl HostObjectData for WrongHostData {}
+
     #[test]
     fn host_object_data_downcasts_and_mutates() {
         let mut heap = fresh_heap();
@@ -5000,9 +5196,9 @@ mod tests {
         );
 
         let mut roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        let object =
-            alloc_host_object_with_roots(&mut heap, "not a counter".to_string(), &mut roots)
-                .unwrap();
+        let wrong = WrongHostData("not a counter".to_string());
+        assert_eq!(wrong.0, "not a counter");
+        let object = alloc_host_object_with_roots(&mut heap, wrong, &mut roots).unwrap();
         let err = with_host_data::<Counter, _>(object, &heap, |_| ()).unwrap_err();
         assert!(matches!(err, HostObjectError::TypeMismatch { .. }));
     }

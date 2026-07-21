@@ -87,6 +87,8 @@ pub struct HostInstance {
     class_name: &'static str,
 }
 
+impl crate::object::HostObjectData for HostInstance {}
+
 impl std::fmt::Debug for HostInstance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostInstance")

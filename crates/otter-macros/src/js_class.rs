@@ -376,12 +376,12 @@ fn arg_extraction(index: usize, ty: &Type, op: &LitStr) -> proc_macro2::TokenStr
         let #handle = __cx.park(
             args.get(#index)
                 .copied()
-                .unwrap_or_else(::otter_vm::Value::undefined),
+                .unwrap_or_else(::otter_vm::__macro_support::Value::undefined),
         );
-        let #arg: #ty = ::otter_vm::marshal::FromJs::from_js(
+        let #arg: #ty = ::otter_vm::__macro_support::marshal::FromJs::from_js(
             &mut __cx,
             #handle,
-            ::otter_vm::marshal::ValueIdent::Argument(#index),
+            ::otter_vm::__macro_support::marshal::ValueIdent::Argument(#index),
         )
         .map_err(|e| e.into_native(#op))?;
     }
@@ -537,15 +537,15 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
         };
         glue.extend(quote! {
             fn #ctor_glue_ident(
-                ctx: &mut ::otter_vm::NativeCtx<'_>,
-                args: &[::otter_vm::Value],
-            ) -> ::core::result::Result<::otter_vm::Value, ::otter_vm::NativeError> {
+                ctx: &mut ::otter_vm::__macro_support::NativeCtx<'_>,
+                args: &[::otter_vm::__macro_support::Value],
+            ) -> ::core::result::Result<::otter_vm::__macro_support::Value, ::otter_vm::__macro_support::NativeError> {
                 ctx.scope(|__scope| {
-                    let mut __cx = ::otter_vm::marshal::MarshalCx::new(__scope);
+                    let mut __cx = ::otter_vm::__macro_support::marshal::MarshalCx::new(__scope);
                     #(#extractions)*
                     let __data = #normalized;
                     let __instance =
-                        ::otter_vm::marshal::construct_instance(&mut __cx, #class_name, __data)
+                        ::otter_vm::__macro_support::marshal::construct_instance(&mut __cx, #class_name, __data)
                             .map_err(|e| e.into_native(#op))?;
                     ::core::result::Result::Ok(__cx.escape(__instance))
                 })
@@ -601,7 +601,9 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
                 quote!(__call)
             } else {
                 quote!(async move {
-                    ::core::result::Result::<_, ::otter_vm::marshal::JsError>::Ok(__call.await)
+                    ::core::result::Result::<_, ::otter_vm::__macro_support::marshal::JsError>::Ok(
+                        __call.await,
+                    )
                 })
             };
             quote! {
@@ -630,7 +632,7 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
             };
             quote! {
                 let __result = #normalized;
-                let __out = ::otter_vm::marshal::IntoJs::into_js(__result, &mut __cx)
+                let __out = ::otter_vm::__macro_support::marshal::IntoJs::into_js(__result, &mut __cx)
                     .map_err(|e| e.into_native(#op))?;
                 #promise_wrap
                 ::core::result::Result::Ok(__cx.escape(__out))
@@ -638,11 +640,11 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
         };
         glue.extend(quote! {
             fn #glue_ident(
-                ctx: &mut ::otter_vm::NativeCtx<'_>,
-                args: &[::otter_vm::Value],
-            ) -> ::core::result::Result<::otter_vm::Value, ::otter_vm::NativeError> {
+                ctx: &mut ::otter_vm::__macro_support::NativeCtx<'_>,
+                args: &[::otter_vm::__macro_support::Value],
+            ) -> ::core::result::Result<::otter_vm::__macro_support::Value, ::otter_vm::__macro_support::NativeError> {
                 ctx.scope(|__scope| {
-                    let mut __cx = ::otter_vm::marshal::MarshalCx::new(__scope);
+                    let mut __cx = ::otter_vm::__macro_support::marshal::MarshalCx::new(__scope);
                     #(#extractions)*
                     #output
                 })
@@ -708,16 +710,16 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
                     let glue_ident = format_ident!("__otter_js_class_{glue_prefix}_raw_{fn_ident}");
                     glue.extend(quote! {
                         fn #glue_ident(
-                            ctx: &mut ::otter_vm::NativeCtx<'_>,
-                            args: &[::otter_vm::Value],
+                            ctx: &mut ::otter_vm::__macro_support::NativeCtx<'_>,
+                            args: &[::otter_vm::__macro_support::Value],
                         ) -> ::core::result::Result<
-                            ::otter_vm::Value,
-                            ::otter_vm::NativeError,
+                            ::otter_vm::__macro_support::Value,
+                            ::otter_vm::__macro_support::NativeError,
                         > {
                             let __this_value = *ctx.this_value();
                             let __recv: #self_ty = ctx.scope(|__scope| {
                                 let mut __cx =
-                                    ::otter_vm::marshal::MarshalCx::new(__scope);
+                                    ::otter_vm::__macro_support::marshal::MarshalCx::new(__scope);
                                 let __this = __cx.park(__this_value);
                                 __cx.with_host_data::<#self_ty, #self_ty>(
                                     __this,
@@ -794,17 +796,19 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
                 quote!(__call)
             } else {
                 quote!(async move {
-                    ::core::result::Result::<_, ::otter_vm::marshal::JsError>::Ok(__call.await)
+                    ::core::result::Result::<_, ::otter_vm::__macro_support::marshal::JsError>::Ok(
+                        __call.await,
+                    )
                 })
             };
             glue.extend(quote! {
                 fn #glue_ident(
-                    ctx: &mut ::otter_vm::NativeCtx<'_>,
-                    args: &[::otter_vm::Value],
-                ) -> ::core::result::Result<::otter_vm::Value, ::otter_vm::NativeError> {
+                    ctx: &mut ::otter_vm::__macro_support::NativeCtx<'_>,
+                    args: &[::otter_vm::__macro_support::Value],
+                ) -> ::core::result::Result<::otter_vm::__macro_support::Value, ::otter_vm::__macro_support::NativeError> {
                     let __this_value = *ctx.this_value();
                     ctx.scope(|__scope| {
-                        let mut __cx = ::otter_vm::marshal::MarshalCx::new(__scope);
+                        let mut __cx = ::otter_vm::__macro_support::marshal::MarshalCx::new(__scope);
                         let __this = __cx.park(__this_value);
                         // Owned snapshot: nothing GC-touching crosses
                         // the .await inside the future.
@@ -881,7 +885,7 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
         let output = if matches!(kind, Emitted::Setter) {
             quote! {
                 #normalized;
-                ::core::result::Result::Ok(::otter_vm::Value::undefined())
+                ::core::result::Result::Ok(::otter_vm::__macro_support::Value::undefined())
             }
         } else {
             let promise_wrap = if promise {
@@ -895,7 +899,7 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
             };
             quote! {
                 let __result = #normalized;
-                let __out = ::otter_vm::marshal::IntoJs::into_js(__result, &mut __cx)
+                let __out = ::otter_vm::__macro_support::marshal::IntoJs::into_js(__result, &mut __cx)
                     .map_err(|e| e.into_native(#op))?;
                 #promise_wrap
                 ::core::result::Result::Ok(__cx.escape(__out))
@@ -903,12 +907,12 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
         };
         glue.extend(quote! {
             fn #glue_ident(
-                ctx: &mut ::otter_vm::NativeCtx<'_>,
-                args: &[::otter_vm::Value],
-            ) -> ::core::result::Result<::otter_vm::Value, ::otter_vm::NativeError> {
+                ctx: &mut ::otter_vm::__macro_support::NativeCtx<'_>,
+                args: &[::otter_vm::__macro_support::Value],
+            ) -> ::core::result::Result<::otter_vm::__macro_support::Value, ::otter_vm::__macro_support::NativeError> {
                 let __this_value = *ctx.this_value();
                 ctx.scope(|__scope| {
-                    let mut __cx = ::otter_vm::marshal::MarshalCx::new(__scope);
+                    let mut __cx = ::otter_vm::__macro_support::marshal::MarshalCx::new(__scope);
                     let __this = __cx.park(__this_value);
                     #(#extractions)*
                     #output
@@ -958,37 +962,37 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
     // Marshalling impls: snapshot extraction, instance construction,
     // union distinguishability, class metadata.
     glue.extend(quote! {
-        impl ::otter_vm::marshal::HostClassMeta for #self_ty {
+        impl ::otter_vm::__macro_support::marshal::HostClassMeta for #self_ty {
             const JS_NAME: &'static str = #class_name;
         }
 
-        impl ::otter_vm::marshal::IntoJs for #self_ty {
+        impl ::otter_vm::__macro_support::marshal::IntoJs for #self_ty {
             fn into_js<'s>(
                 self,
-                cx: &mut ::otter_vm::marshal::MarshalCx<'_, '_, 's>,
+                cx: &mut ::otter_vm::__macro_support::marshal::MarshalCx<'_, '_, 's>,
             ) -> ::core::result::Result<
-                ::otter_vm::marshal::JsValue<'s>,
-                ::otter_vm::marshal::JsError,
+                ::otter_vm::__macro_support::marshal::JsValue<'s>,
+                ::otter_vm::__macro_support::marshal::JsError,
             > {
-                ::otter_vm::marshal::class_instance(cx, #class_name, self)
+                ::otter_vm::__macro_support::marshal::class_instance(cx, #class_name, self)
             }
         }
 
-        impl<'s> ::otter_vm::marshal::FromJs<'s> for #self_ty {
+        impl<'s> ::otter_vm::__macro_support::marshal::FromJs<'s> for #self_ty {
             fn from_js(
-                cx: &mut ::otter_vm::marshal::MarshalCx<'_, '_, 's>,
-                v: ::otter_vm::marshal::JsValue<'s>,
-                ident: ::otter_vm::marshal::ValueIdent<'_>,
-            ) -> ::core::result::Result<Self, ::otter_vm::marshal::JsError> {
+                cx: &mut ::otter_vm::__macro_support::marshal::MarshalCx<'_, '_, 's>,
+                v: ::otter_vm::__macro_support::marshal::JsValue<'s>,
+                ident: ::otter_vm::__macro_support::marshal::ValueIdent<'_>,
+            ) -> ::core::result::Result<Self, ::otter_vm::__macro_support::marshal::JsError> {
                 let _ = ident;
                 cx.with_host_data::<Self, Self>(v, ::core::clone::Clone::clone)
             }
         }
 
-        impl ::otter_vm::marshal::JsUnionProbe for #self_ty {
+        impl ::otter_vm::__macro_support::marshal::JsUnionProbe for #self_ty {
             fn probe(
-                cx: &::otter_vm::marshal::MarshalCx<'_, '_, '_>,
-                v: ::otter_vm::marshal::JsValue<'_>,
+                cx: &::otter_vm::__macro_support::marshal::MarshalCx<'_, '_, '_>,
+                v: ::otter_vm::__macro_support::marshal::JsValue<'_>,
             ) -> bool {
                 cx.with_host_data::<Self, ()>(v, |_| ()).is_ok()
             }
@@ -1004,11 +1008,11 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
         let parent_ctor_ident = format_ident!("__otter_js_class_{glue_prefix}_parent_ctor");
         glue.extend(quote! {
             fn #parent_proto_ident(
-                global: ::otter_vm::JsObject,
+                global: ::otter_vm::__macro_support::JsObject,
                 heap: &mut ::otter_gc::GcHeap,
-            ) -> ::otter_vm::JsObject {
-                let parent_name = <#parent as ::otter_vm::marshal::HostClassMeta>::JS_NAME;
-                let ctor = ::otter_vm::object::get(global, heap, parent_name)
+            ) -> ::otter_vm::__macro_support::JsObject {
+                let parent_name = <#parent as ::otter_vm::__macro_support::marshal::HostClassMeta>::JS_NAME;
+                let ctor = ::otter_vm::__macro_support::object::get(global, heap, parent_name)
                     .and_then(|v| v.as_native_function())
                     .expect("js_class parent must be installed before the subclass");
                 let desc = ctor
@@ -1017,7 +1021,7 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
                     .flatten()
                     .expect("js_class parent prototype must exist");
                 match desc.kind {
-                    ::otter_vm::object::DescriptorKind::Data { value } => value
+                    ::otter_vm::__macro_support::object::DescriptorKind::Data { value } => value
                         .as_object()
                         .expect("js_class parent prototype must be an object"),
                     _ => panic!("js_class parent prototype must be a data descriptor"),
@@ -1025,11 +1029,11 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
             }
 
             fn #parent_ctor_ident(
-                global: ::otter_vm::JsObject,
+                global: ::otter_vm::__macro_support::JsObject,
                 heap: &mut ::otter_gc::GcHeap,
-            ) -> ::otter_vm::Value {
-                let parent_name = <#parent as ::otter_vm::marshal::HostClassMeta>::JS_NAME;
-                ::otter_vm::object::get(global, heap, parent_name)
+            ) -> ::otter_vm::__macro_support::Value {
+                let parent_name = <#parent as ::otter_vm::__macro_support::marshal::HostClassMeta>::JS_NAME;
+                ::otter_vm::__macro_support::object::get(global, heap, parent_name)
                     .expect("js_class parent must be installed before the subclass")
             }
         });

@@ -206,12 +206,12 @@ fn arg_extraction(index: usize, ty: &Type, op: &LitStr) -> proc_macro2::TokenStr
         let #handle = __cx.park(
             args.get(#index)
                 .copied()
-                .unwrap_or_else(::otter_runtime::Value::undefined),
+                .unwrap_or_else(::otter_runtime::__macro_support::Value::undefined),
         );
-        let #arg: #ty = ::otter_runtime::marshal::FromJs::from_js(
+        let #arg: #ty = ::otter_runtime::__macro_support::marshal::FromJs::from_js(
             &mut __cx,
             #handle,
-            ::otter_runtime::marshal::ValueIdent::Argument(#index),
+            ::otter_runtime::__macro_support::marshal::ValueIdent::Argument(#index),
         )
         .map_err(|e| e.into_native(#op))?;
     }
@@ -349,7 +349,7 @@ fn expand_inner(args: &ModuleArgs, module_impl: &mut ItemImpl) -> Result<proc_ma
                 quote!(__call)
             } else {
                 quote!(async move {
-                    ::core::result::Result::<_, ::otter_runtime::marshal::JsError>::Ok(__call.await)
+                    ::core::result::Result::<_, ::otter_runtime::__macro_support::marshal::JsError>::Ok(__call.await)
                 })
             };
             quote! {
@@ -378,7 +378,7 @@ fn expand_inner(args: &ModuleArgs, module_impl: &mut ItemImpl) -> Result<proc_ma
             };
             quote! {
                 let __result = #normalized;
-                let __out = ::otter_runtime::marshal::IntoJs::into_js(__result, &mut __cx)
+                let __out = ::otter_runtime::__macro_support::marshal::IntoJs::into_js(__result, &mut __cx)
                     .map_err(|e| e.into_native(#op))?;
                 #promise_wrap
                 ::core::result::Result::Ok(__cx.escape(__out))
@@ -390,17 +390,17 @@ fn expand_inner(args: &ModuleArgs, module_impl: &mut ItemImpl) -> Result<proc_ma
         let signature = if with_caps {
             quote! {
                 fn #glue_ident(
-                    ctx: &mut ::otter_runtime::NativeCtx<'_>,
-                    args: &[::otter_runtime::Value],
-                    caps: &::otter_runtime::CapabilitySet,
-                ) -> ::core::result::Result<::otter_runtime::Value, ::otter_runtime::NativeError>
+                    ctx: &mut ::otter_runtime::__macro_support::NativeCtx<'_>,
+                    args: &[::otter_runtime::__macro_support::Value],
+                    caps: &::otter_runtime::__macro_support::CapabilitySet,
+                ) -> ::core::result::Result<::otter_runtime::__macro_support::Value, ::otter_runtime::__macro_support::NativeError>
             }
         } else {
             quote! {
                 fn #glue_ident(
-                    ctx: &mut ::otter_runtime::NativeCtx<'_>,
-                    args: &[::otter_runtime::Value],
-                ) -> ::core::result::Result<::otter_runtime::Value, ::otter_runtime::NativeError>
+                    ctx: &mut ::otter_runtime::__macro_support::NativeCtx<'_>,
+                    args: &[::otter_runtime::__macro_support::Value],
+                ) -> ::core::result::Result<::otter_runtime::__macro_support::Value, ::otter_runtime::__macro_support::NativeError>
             }
         };
         let silence_caps = if with_caps && !export.takes_caps {
@@ -412,7 +412,7 @@ fn expand_inner(args: &ModuleArgs, module_impl: &mut ItemImpl) -> Result<proc_ma
             #signature {
                 #silence_caps
                 ctx.scope(|__scope| {
-                    let mut __cx = ::otter_runtime::marshal::MarshalCx::new(__scope);
+                    let mut __cx = ::otter_runtime::__macro_support::marshal::MarshalCx::new(__scope);
                     #(#extractions)*
                     #output
                 })

@@ -1,0 +1,26 @@
+error[E0277]: the trait bound `BadPayload: HostObjectData` is not satisfied
+  --> tests/compile_fail/untraced_host_value_slot_rejected.rs:8:31
+   |
+ 8 |       let _ = scope.host_object(BadPayload {
+   |  ___________________-----------_^
+   | |                   |
+   | |                   required by a bound introduced by this call
+ 9 | |         callback: RuntimeHostValueSlot::empty(),
+10 | |     });
+   | |_____^ unsatisfied trait bound
+   |
+help: the trait `HostObjectData` is not implemented for `BadPayload`
+  --> tests/compile_fail/untraced_host_value_slot_rejected.rs:3:1
+   |
+ 3 | struct BadPayload {
+   | ^^^^^^^^^^^^^^^^^
+help: the trait `HostObjectData` is implemented for `HostInstance`
+  --> $WORKSPACE/crates/otter-vm/src/marshal/host_class.rs
+   |
+   | impl crate::object::HostObjectData for HostInstance {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `otter_vm::runtime_cx::NativeScope::<'scope, 'rt>::host_object`
+  --> $WORKSPACE/crates/otter-vm/src/runtime_cx.rs
+   |
+   |     pub fn host_object<T: object::HostObjectData>(
+   |                           ^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `NativeScope::<'scope, 'rt>::host_object`

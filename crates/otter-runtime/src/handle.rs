@@ -32,12 +32,13 @@
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 //! - [Runtime architecture](../../../docs/book/src/engine/architecture.md)
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
 use tokio::sync::oneshot;
@@ -45,7 +46,6 @@ use tokio::sync::oneshot;
 use crate::event_loop::{
     EventLoop, RuntimeLiveness, TimerRequest, TimerToken, TimerWake, TokioEventLoop,
 };
-use crate::host_services::{HttpsModuleFetchSink, HttpsModuleFetcherHandle};
 use crate::runtime_activity::{
     RuntimeActivityAccounting, RuntimeKeepAlive, RuntimeTask, RuntimeTaskQueue, RuntimeTaskSpawner,
 };
@@ -143,6 +143,7 @@ struct RuntimeHandleInner {
     runner: Mutex<Option<std::thread::JoinHandle<()>>>,
     event_loop: TokioEventLoop,
     module_preparation: ModulePreparation,
+    module_cancellation: crate::module_loader::ModuleLoadCancellation,
     interrupt: otter_vm::InterruptFlag,
     command_timeout: Duration,
     command_capacity: usize,
@@ -156,11 +157,48 @@ struct ModulePreparation {
     package_manager: RuntimePackageManagerHandle,
     capabilities: crate::CapabilitySet,
     hooks: crate::RuntimeHooks,
-    remote_fetch: Arc<dyn crate::module_loader::RemoteModuleFetch>,
+    remote_provider: Arc<dyn crate::module_loader::RemoteModuleProvider>,
+    remote_cache: Arc<RemoteModuleCache>,
+}
+
+#[derive(Debug, Default)]
+struct RemoteModuleCache {
+    sources: RwLock<HashMap<String, crate::module_loader::RemoteModuleSource>>,
+}
+
+impl crate::module_loader::RemoteModuleFetch for RemoteModuleCache {
+    fn fetch(&self, url: &str) -> Result<crate::module_loader::RemoteModuleSource, String> {
+        self.sources
+            .read()
+            .map_err(|_| "remote module cache poisoned".to_string())?
+            .get(url)
+            .cloned()
+            .ok_or_else(|| format!("remote module `{url}` was not prefetched"))
+    }
+}
+
+struct CancelModuleLoadOnDrop(Option<crate::module_loader::ModuleLoadCancellation>);
+
+impl CancelModuleLoadOnDrop {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CancelModuleLoadOnDrop {
+    fn drop(&mut self) {
+        if let Some(cancellation) = &self.0 {
+            cancellation.cancel();
+        }
+    }
 }
 
 impl ModulePreparation {
     fn new(config: &RuntimeConfig, event_loop: &TokioEventLoop) -> Self {
+        let remote_provider = config
+            .remote_module_provider
+            .clone()
+            .unwrap_or_else(|| event_loop.remote_module_provider());
         Self {
             loader: RuntimeModuleLoaderState::new(config.loader.clone()),
             hosted_modules: config.hosted_modules.clone(),
@@ -169,7 +207,8 @@ impl ModulePreparation {
             ),
             capabilities: config.capabilities.clone(),
             hooks: config.hooks.clone(),
-            remote_fetch: event_loop.blocking_module_fetcher(),
+            remote_provider,
+            remote_cache: Arc::new(RemoteModuleCache::default()),
         }
     }
 
@@ -182,33 +221,252 @@ impl ModulePreparation {
                 &self.capabilities,
                 &self.hooks,
             )
-            .with_remote_fetch(self.remote_fetch.clone())
+            .with_remote_fetch(self.remote_cache.clone())
     }
 
-    fn prepare_source(
+    async fn prepare_source(
         &self,
         source: SourceInput,
         url: String,
+        cancellation: crate::module_loader::ModuleLoadCancellation,
     ) -> Result<crate::module_graph::LinkedProgram, crate::module_graph::GraphError> {
         let loader = self.loader_for_entry(std::path::Path::new("."));
-        crate::module_graph::load_program_source(
-            &loader,
-            crate::module_loader::ResolvedSource {
-                url,
-                kind: source.kind,
-                jsx: None,
-                text: source.text,
-            },
-        )
+        let entry = crate::module_loader::ResolvedSource {
+            url,
+            kind: source.kind,
+            jsx: None,
+            text: source.text,
+        };
+        self.prepare_entry(loader, entry, cancellation).await
     }
 
-    fn prepare_path(
+    async fn prepare_path(
         &self,
         entry: PathBuf,
+        cancellation: crate::module_loader::ModuleLoadCancellation,
     ) -> Result<crate::module_graph::LinkedProgram, crate::module_graph::GraphError> {
         let loader = self.loader_for_entry(&entry);
-        crate::module_graph::load_program(&loader, &entry)
+        let load_loader = crate::module_loader::ModuleLoader::with_config(loader.config().clone())
+            .with_remote_fetch(self.remote_cache.clone());
+        let load_entry = entry.clone();
+        let source = tokio::task::spawn_blocking(move || {
+            load_loader
+                .load(&load_entry.to_string_lossy(), None)
+                .map_err(crate::module_graph::GraphError::Loader)
+        })
+        .await
+        .map_err(module_prepare_join_error)??;
+        self.prepare_entry(loader, source, cancellation).await
     }
+
+    async fn prepare_remote_entry(
+        &self,
+        target_url: String,
+        cancellation: crate::module_loader::ModuleLoadCancellation,
+    ) -> Result<crate::module_graph::LinkedProgram, crate::module_graph::GraphError> {
+        let fetched = self
+            .fetch_remote(target_url.clone(), cancellation.clone())
+            .await?;
+        let entry = crate::module_loader::ResolvedSource {
+            kind: otter_syntax::remote_source_kind(
+                fetched.content_type.as_deref(),
+                &fetched.final_url,
+            ),
+            url: fetched.final_url,
+            jsx: None,
+            text: fetched.source,
+        };
+        let loader = self.loader_for_entry(std::path::Path::new("."));
+        self.prepare_entry(loader, entry, cancellation).await
+    }
+
+    async fn prepare_entry(
+        &self,
+        loader: crate::module_loader::ModuleLoader,
+        entry: crate::module_loader::ResolvedSource,
+        cancellation: crate::module_loader::ModuleLoadCancellation,
+    ) -> Result<crate::module_graph::LinkedProgram, crate::module_graph::GraphError> {
+        let mut cancel_guard = CancelModuleLoadOnDrop(Some(cancellation.clone()));
+        self.prefetch_remote_graph(&loader, entry.clone(), &cancellation)
+            .await?;
+        if cancellation.is_cancelled() {
+            return Err(crate::module_graph::GraphError::Interrupted);
+        }
+        let interrupt = otter_vm::InterruptFlag::new();
+        let interrupt_on_cancel = interrupt.clone();
+        let cancel_watch = cancellation.clone();
+        let watcher = tokio::spawn(async move {
+            cancel_watch.cancelled().await;
+            interrupt_on_cancel.interrupt();
+        });
+        let task = tokio::task::spawn_blocking(move || {
+            crate::module_graph::load_program_source_interruptible(&loader, entry, interrupt)
+        });
+        let result = task.await.map_err(module_prepare_join_error)?;
+        watcher.abort();
+        if result.is_ok() {
+            cancel_guard.disarm();
+        }
+        result
+    }
+
+    async fn prefetch_remote_graph(
+        &self,
+        loader: &crate::module_loader::ModuleLoader,
+        entry: crate::module_loader::ResolvedSource,
+        cancellation: &crate::module_loader::ModuleLoadCancellation,
+    ) -> Result<(), crate::module_graph::GraphError> {
+        const MAX_CONCURRENT_FETCHES: usize = 8;
+        let mut frontier = vec![entry];
+        let mut scanned = HashSet::new();
+        let mut requested = HashSet::new();
+        while !frontier.is_empty() {
+            if cancellation.is_cancelled() {
+                return Err(crate::module_graph::GraphError::Interrupted);
+            }
+            let scan_loader =
+                crate::module_loader::ModuleLoader::with_config(loader.config().clone())
+                    .with_remote_fetch(self.remote_cache.clone());
+            let scan_frontier = std::mem::take(&mut frontier);
+            let discovered = tokio::task::spawn_blocking(move || {
+                discover_remote_requests(&scan_loader, scan_frontier)
+            })
+            .await
+            .map_err(module_prepare_join_error)??;
+            let mut missing = Vec::new();
+            for (url, text) in discovered {
+                if !requested.insert(url.clone()) {
+                    continue;
+                }
+                let cached = self
+                    .remote_cache
+                    .sources
+                    .read()
+                    .map_err(|_| remote_cache_error(&url))?
+                    .get(&url)
+                    .cloned();
+                if let Some(source) = cached {
+                    if !text && scanned.insert(source.final_url.clone()) {
+                        frontier.push(remote_resolved_source(source));
+                    }
+                } else {
+                    missing.push((url, text));
+                }
+            }
+            for batch in missing.chunks(MAX_CONCURRENT_FETCHES) {
+                let mut tasks = tokio::task::JoinSet::new();
+                for (url, text) in batch.iter().cloned() {
+                    let preparation = self.clone();
+                    let cancellation = cancellation.clone();
+                    tasks.spawn(async move {
+                        let source = preparation.fetch_remote(url, cancellation).await?;
+                        Ok::<_, crate::module_graph::GraphError>((source, text))
+                    });
+                }
+                while let Some(result) = tasks.join_next().await {
+                    let (source, text) = result.map_err(module_prepare_join_error)??;
+                    if !text && scanned.insert(source.final_url.clone()) {
+                        frontier.push(remote_resolved_source(source));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn fetch_remote(
+        &self,
+        url: String,
+        cancellation: crate::module_loader::ModuleLoadCancellation,
+    ) -> Result<crate::module_loader::RemoteModuleSource, crate::module_graph::GraphError> {
+        if cancellation.is_cancelled() {
+            return Err(crate::module_graph::GraphError::Interrupted);
+        }
+        if let Some(source) = self
+            .remote_cache
+            .sources
+            .read()
+            .map_err(|_| remote_cache_error(&url))?
+            .get(&url)
+            .cloned()
+        {
+            return Ok(source);
+        }
+        let source = self
+            .remote_provider
+            .fetch(crate::module_loader::RemoteModuleRequest {
+                url: url.clone(),
+                cancellation,
+            })
+            .await
+            .map_err(|error| match error {
+                crate::module_loader::RemoteModuleError::Cancelled => {
+                    crate::module_graph::GraphError::Interrupted
+                }
+                other => crate::module_graph::GraphError::Loader(
+                    crate::module_loader::LoaderError::Load {
+                        url: url.clone(),
+                        message: other.to_string(),
+                    },
+                ),
+            })?;
+        let mut cache = self
+            .remote_cache
+            .sources
+            .write()
+            .map_err(|_| remote_cache_error(&url))?;
+        cache.insert(url, source.clone());
+        cache.insert(source.final_url.clone(), source.clone());
+        Ok(source)
+    }
+}
+
+fn module_prepare_join_error(error: tokio::task::JoinError) -> crate::module_graph::GraphError {
+    crate::module_graph::GraphError::Loader(crate::module_loader::LoaderError::Load {
+        url: "<module-prepare>".to_string(),
+        message: error.to_string(),
+    })
+}
+
+fn remote_cache_error(url: &str) -> crate::module_graph::GraphError {
+    crate::module_graph::GraphError::Loader(crate::module_loader::LoaderError::Load {
+        url: url.to_string(),
+        message: "remote module cache poisoned".to_string(),
+    })
+}
+
+fn remote_resolved_source(
+    source: crate::module_loader::RemoteModuleSource,
+) -> crate::module_loader::ResolvedSource {
+    crate::module_loader::ResolvedSource {
+        kind: otter_syntax::remote_source_kind(source.content_type.as_deref(), &source.final_url),
+        url: source.final_url,
+        jsx: None,
+        text: source.source,
+    }
+}
+
+fn discover_remote_requests(
+    loader: &crate::module_loader::ModuleLoader,
+    sources: Vec<crate::module_loader::ResolvedSource>,
+) -> Result<Vec<(String, bool)>, crate::module_graph::GraphError> {
+    let mut queue = sources;
+    let mut visited = HashSet::new();
+    let mut remote = Vec::new();
+    while let Some(source) = queue.pop() {
+        if !visited.insert(source.url.clone()) {
+            continue;
+        }
+        for request in crate::module_graph::scan_module_requests(source.text, source.kind)? {
+            let target = loader.resolve(&request.specifier, Some(&source.url))?;
+            if crate::module_loader::is_http_url(&target) {
+                remote.push((target, request.text));
+            } else if !request.text && !loader.is_hosted_url(&target) {
+                queue.push(loader.load_resolved(target)?);
+            }
+        }
+    }
+    Ok(remote)
 }
 
 struct RuntimeCounters {
@@ -382,12 +640,6 @@ enum RuntimeMessage {
         referrer: String,
         liveness: RuntimeLiveness,
     },
-    DynamicImportHttpsFetched {
-        token: u64,
-        target_url: String,
-        result: Result<String, String>,
-        liveness: RuntimeLiveness,
-    },
     DynamicImportGraphPrepared {
         token: u64,
         target_url: String,
@@ -493,6 +745,7 @@ impl RuntimeHandle {
             })?,
         };
         let module_preparation = ModulePreparation::new(&config, &event_loop);
+        let module_cancellation = crate::module_loader::ModuleLoadCancellation::new();
         let (tx, rx) = sync_channel(capacity);
         let (interrupt_tx, interrupt_rx) = sync_channel(1);
         let counters = Arc::new(RuntimeCounters {
@@ -527,6 +780,8 @@ impl RuntimeHandle {
         let runner_counters = counters.clone();
         let scheduler_tx = tx.clone();
         let scheduler_event_loop = event_loop.clone();
+        let runner_module_preparation = module_preparation.clone();
+        let runner_module_cancellation = module_cancellation.clone();
         let runner = std::thread::Builder::new()
             .name("otter-isolate".to_string())
             .stack_size(ISOLATE_THREAD_STACK_BYTES)
@@ -538,6 +793,8 @@ impl RuntimeHandle {
                     interrupt_tx,
                     scheduler_tx,
                     scheduler_event_loop,
+                    runner_module_preparation,
+                    runner_module_cancellation,
                 )
             })
             .map_err(|e| OtterError::Internal {
@@ -553,6 +810,7 @@ impl RuntimeHandle {
             runner: Mutex::new(Some(runner)),
             event_loop,
             module_preparation,
+            module_cancellation,
             interrupt,
             command_timeout,
             command_capacity: capacity,
@@ -648,12 +906,15 @@ impl RuntimeHandle {
     pub async fn run_module_with_diagnostics(&self, path: impl Into<PathBuf>) -> ExecutionAttempt {
         let preparation = self.inner.module_preparation.clone();
         let path = path.into();
-        let task = self
-            .inner
-            .event_loop
-            .handle()
-            .spawn_blocking(move || preparation.prepare_path(path));
-        let linked = match self.await_module_preparation(task).await {
+        let cancellation =
+            crate::module_loader::ModuleLoadCancellation::linked(&self.inner.module_cancellation);
+        let linked = match self
+            .await_module_preparation(
+                cancellation.clone(),
+                preparation.prepare_path(path, cancellation),
+            )
+            .await
+        {
             Ok(linked) => linked,
             Err(error) => return ExecutionAttempt::from_result(Err(error), None, None),
         };
@@ -687,12 +948,15 @@ impl RuntimeHandle {
     ) -> ExecutionAttempt {
         let preparation = self.inner.module_preparation.clone();
         let url = url.into();
-        let task = self
-            .inner
-            .event_loop
-            .handle()
-            .spawn_blocking(move || preparation.prepare_source(source, url));
-        let linked = match self.await_module_preparation(task).await {
+        let cancellation =
+            crate::module_loader::ModuleLoadCancellation::linked(&self.inner.module_cancellation);
+        let linked = match self
+            .await_module_preparation(
+                cancellation.clone(),
+                preparation.prepare_source(source, url, cancellation),
+            )
+            .await
+        {
             Ok(linked) => linked,
             Err(error) => return ExecutionAttempt::from_result(Err(error), None, None),
         };
@@ -725,12 +989,15 @@ impl RuntimeHandle {
     ) -> ExecutionAttempt {
         let preparation = self.inner.module_preparation.clone();
         let url = url.into();
-        let task = self
-            .inner
-            .event_loop
-            .handle()
-            .spawn_blocking(move || preparation.prepare_source(source, url));
-        let linked = match self.await_module_preparation(task).await {
+        let cancellation =
+            crate::module_loader::ModuleLoadCancellation::linked(&self.inner.module_cancellation);
+        let linked = match self
+            .await_module_preparation(
+                cancellation.clone(),
+                preparation.prepare_source(source, url, cancellation),
+            )
+            .await
+        {
             Ok(linked) => linked,
             Err(error) => return ExecutionAttempt::from_result(Err(error), None, None),
         };
@@ -823,6 +1090,7 @@ impl RuntimeHandle {
             return;
         }
         self.inner.interrupt.interrupt();
+        self.inner.module_cancellation.cancel();
         // Never park the caller (often a browser UI thread) behind a full
         // bounded isolate inbox. A full queue already guarantees the runner is
         // awake; it observes the atomic shutdown flag before its next tick.
@@ -1014,19 +1282,28 @@ impl RuntimeHandle {
             .fetch_add(1, Ordering::Relaxed)
     }
 
-    async fn await_module_preparation(
+    async fn await_module_preparation<F>(
         &self,
-        task: tokio::task::JoinHandle<
-            Result<crate::module_graph::LinkedProgram, crate::module_graph::GraphError>,
+        cancellation: crate::module_loader::ModuleLoadCancellation,
+        task: F,
+    ) -> Result<crate::module_graph::LinkedProgram, OtterError>
+    where
+        F: Future<
+            Output = Result<crate::module_graph::LinkedProgram, crate::module_graph::GraphError>,
         >,
-    ) -> Result<crate::module_graph::LinkedProgram, OtterError> {
+    {
         let timeout = self.inner.command_timeout;
         let outcome = if timeout == Duration::ZERO {
             task.await
         } else {
-            match tokio::time::timeout(timeout, task).await {
-                Ok(outcome) => outcome,
-                Err(_) => {
+            tokio::pin!(task);
+            tokio::select! {
+                outcome = &mut task => outcome,
+                () = tokio::time::sleep(timeout) => {
+                    cancellation.cancel();
+                    // Give an async provider one scheduler turn to observe its
+                    // cancellation token before its future is dropped.
+                    tokio::task::yield_now().await;
                     self.inner
                         .counters
                         .timed_out_commands
@@ -1039,12 +1316,7 @@ impl RuntimeHandle {
                 }
             }
         };
-        outcome
-            .map_err(|error| OtterError::Internal {
-                code: "MODULE_PREPARE_TASK".to_string(),
-                message: error.to_string(),
-            })?
-            .map_err(crate::map_graph_error)
+        outcome.map_err(crate::map_graph_error)
     }
 
     /// Snapshot cheap activity counters.
@@ -1356,11 +1628,16 @@ impl Drop for RuntimeHandleInner {
     fn drop(&mut self) {
         self.counters.shutdown.store(true, Ordering::Release);
         self.interrupt.interrupt();
+        self.module_cancellation.cancel();
         let _ = self.tx.try_send(RuntimeMessage::Shutdown);
-        // Dropping a JoinHandle detaches it. The atomic flag + interrupt +
-        // wake above guarantee termination without making the final handle's
-        // destructor a synchronous thread join on an arbitrary caller.
-        let _ = self.runner.lock().expect("runner mutex poisoned").take();
+        // The final handle owns the isolate lifecycle. Joining here makes
+        // runtime disposal a deterministic resource boundary: VM pages and
+        // traced host payloads are gone when the last handle has dropped.
+        // Explicit `shutdown()` remains the non-blocking signal for callers
+        // that must initiate teardown from a latency-sensitive thread.
+        if let Some(runner) = self.runner.lock().expect("runner mutex poisoned").take() {
+            let _ = runner.join();
+        }
     }
 }
 
@@ -1371,8 +1648,9 @@ fn run_isolate(
     interrupt_tx: SyncSender<otter_vm::InterruptFlag>,
     scheduler_tx: SyncSender<RuntimeMessage>,
     event_loop: TokioEventLoop,
+    module_preparation: ModulePreparation,
+    module_cancellation: crate::module_loader::ModuleLoadCancellation,
 ) {
-    let module_preparation = ModulePreparation::new(&config, &event_loop);
     let module_task_handle = event_loop.handle();
     let runtime_task_spawner = RuntimeTaskSpawner::new(
         Arc::new(InboxRuntimeTaskQueue {
@@ -1388,8 +1666,6 @@ fn run_isolate(
             Ok(runtime) => runtime,
             Err(_) => return,
         };
-    let https_module_fetcher = event_loop.https_module_fetcher();
-    runtime.install_remote_module_fetch(event_loop.blocking_module_fetcher());
     let timer_scheduler = Arc::new(InboxTimerScheduler {
         tx: scheduler_tx.clone(),
         event_loop,
@@ -1416,8 +1692,8 @@ fn run_isolate(
         rx,
         tx: scheduler_tx,
         counters,
-        https_module_fetcher,
         module_preparation,
+        module_cancellation,
         module_task_handle,
         deferred_commands: VecDeque::new(),
         shutdown: false,
@@ -1482,32 +1758,6 @@ impl TimerWake for RuntimeTimerWake {
                 expects_js_callback: self.expects_js_callback,
             },
             accounting,
-        );
-    }
-}
-
-struct DynamicImportFetchWake {
-    tx: SyncSender<RuntimeMessage>,
-    counters: Arc<RuntimeCounters>,
-    io_handle: tokio::runtime::Handle,
-    token: u64,
-    target_url: String,
-    liveness: RuntimeLiveness,
-}
-
-impl HttpsModuleFetchSink for DynamicImportFetchWake {
-    fn fetched(&self, result: Result<String, String>) {
-        post_internal_message(
-            &self.io_handle,
-            &self.tx,
-            &self.counters,
-            RuntimeMessage::DynamicImportHttpsFetched {
-                token: self.token,
-                target_url: self.target_url.clone(),
-                result,
-                liveness: self.liveness,
-            },
-            InternalPostAccounting::Host(self.liveness),
         );
     }
 }
@@ -1645,8 +1895,8 @@ struct IsolateRunner {
     rx: Receiver<RuntimeMessage>,
     tx: SyncSender<RuntimeMessage>,
     counters: Arc<RuntimeCounters>,
-    https_module_fetcher: HttpsModuleFetcherHandle,
     module_preparation: ModulePreparation,
+    module_cancellation: crate::module_loader::ModuleLoadCancellation,
     module_task_handle: tokio::runtime::Handle,
     deferred_commands: VecDeque<RuntimeCommand>,
     shutdown: bool,
@@ -1703,6 +1953,7 @@ impl IsolateRunner {
     fn shutdown(&mut self) {
         self.shutdown = true;
         self.counters.shutdown.store(true, Ordering::Relaxed);
+        self.module_cancellation.cancel();
     }
 
     fn process_message(&mut self, msg: RuntimeMessage) -> TickOutcome {
@@ -1820,53 +2071,18 @@ impl IsolateRunner {
                         self.record_microtask_snapshot();
                     }
                     Ok(DynamicImportBegin::FetchHttps { target_url }) => {
-                        let sink = Arc::new(DynamicImportFetchWake {
-                            tx: self.tx.clone(),
-                            counters: self.counters.clone(),
-                            io_handle: self.module_task_handle.clone(),
-                            token,
-                            target_url: target_url.clone(),
-                            liveness,
-                        });
-                        self.https_module_fetcher.fetch_utf8(target_url, sink);
-                    }
-                }
-                TickOutcome::Processed
-            }
-            RuntimeMessage::DynamicImportHttpsFetched {
-                token,
-                target_url,
-                result,
-                liveness,
-            } => {
-                match result {
-                    Err(error) => {
-                        decrement_liveness(
-                            liveness,
-                            &self.counters.pending_ref_host_ops,
-                            &self.counters.pending_unref_host_ops,
-                        );
-                        let _ = self.runtime.complete_dynamic_import_prepared(
-                            token,
-                            &target_url,
-                            Err(error),
-                        );
-                        self.record_microtask_snapshot();
-                    }
-                    Ok(source) => {
                         let preparation = self.module_preparation.clone();
                         let task_handle = self.module_task_handle.clone();
                         let tx = self.tx.clone();
                         let counters = self.counters.clone();
+                        let cancellation = crate::module_loader::ModuleLoadCancellation::linked(
+                            &self.module_cancellation,
+                        );
                         task_handle.spawn(async move {
-                            let source = SourceInput::from_javascript(source);
-                            let prepare_url = target_url.clone();
-                            let prepared = tokio::task::spawn_blocking(move || {
-                                preparation.prepare_source(source, prepare_url)
-                            })
-                            .await
-                            .map_err(|error| error.to_string())
-                            .and_then(|result| result.map_err(|error| error.to_string()));
+                            let prepared = preparation
+                                .prepare_remote_entry(target_url.clone(), cancellation)
+                                .await
+                                .map_err(|error| error.to_string());
                             let mut message = RuntimeMessage::DynamicImportGraphPrepared {
                                 token,
                                 target_url,

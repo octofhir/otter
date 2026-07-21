@@ -425,6 +425,17 @@ impl crate::Runtime {
         source: SourceInput,
         specifier: &str,
     ) -> Result<crate::ExecutionResult, OtterError> {
+        self.with_direct_timeout(move |runtime| {
+            runtime.run_script_in_realm_unbounded(realm, source, specifier)
+        })
+    }
+
+    fn run_script_in_realm_unbounded(
+        &mut self,
+        realm: RuntimeRealmId,
+        source: SourceInput,
+        specifier: &str,
+    ) -> Result<crate::ExecutionResult, OtterError> {
         self.validate_realm(realm)?;
         self.interp.begin_jit_debug_capture();
         let started = std::time::Instant::now();
@@ -481,12 +492,24 @@ impl crate::Runtime {
         source: SourceInput,
         url: impl Into<String>,
     ) -> Result<crate::ExecutionResult, OtterError> {
-        self.validate_realm(realm)?;
         let url = url.into();
+        self.with_direct_timeout(move |runtime| {
+            runtime.run_module_source_in_realm_unbounded(realm, source, url)
+        })
+    }
+
+    fn run_module_source_in_realm_unbounded(
+        &mut self,
+        realm: RuntimeRealmId,
+        source: SourceInput,
+        url: String,
+    ) -> Result<crate::ExecutionResult, OtterError> {
+        self.validate_realm(realm)?;
         let loader = self.module_loader_for_entry(Path::new("."));
+        let interrupt = self.interp.interrupt_handle();
         let linked = self
             .module_graph
-            .load_program_source(
+            .load_program_source_interruptible(
                 &loader,
                 crate::module_loader::ResolvedSource {
                     url,
@@ -494,6 +517,7 @@ impl crate::Runtime {
                     jsx: None,
                     text: source.text,
                 },
+                interrupt,
             )
             .map_err(crate::map_graph_error)?;
         self.run_prepared_module_in_realm(realm, linked)

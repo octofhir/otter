@@ -15,7 +15,7 @@
 //! # Invariants
 //! - Method names are unique per `holt!`; duplicates surface as a
 //!   compile error pointing at the offending literal.
-//! - Generated code references `::otter_vm::*` and
+//! - Generated code references `::otter_vm::__macro_support::*` and
 //!   `::otter_gc::GcHeap` only; nothing from `otter-macros`.
 //! - Output type idents:
 //!   - `spec`: derived as `<NAME>_SPEC` (name uppercased + `_SPEC`)
@@ -355,7 +355,7 @@ pub(crate) fn attrs_factory_path(
         .map(|ident| ident.to_string())
         .unwrap_or_else(|| default_factory.to_string());
     let factory_ident = Ident::new(&factory, Span::call_site());
-    quote! { ::otter_vm::Attr::#factory_ident() }
+    quote! { ::otter_vm::__macro_support::Attr::#factory_ident() }
 }
 
 pub(crate) fn expand(input: TokenStream) -> TokenStream {
@@ -417,11 +417,11 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         let call = &m.call;
         let attrs_path = attrs_factory_path(m.attrs.as_ref(), "builtin_function");
         quote! {
-            ::otter_vm::MethodSpec {
+            ::otter_vm::__macro_support::MethodSpec {
                 name: #js_name,
                 length: #length,
                 attrs: #attrs_path,
-                call: ::otter_vm::NativeCall::Static(#call),
+                call: ::otter_vm::__macro_support::NativeCall::Static(#call),
             }
         }
     });
@@ -430,19 +430,19 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         let js_name = &a.js_name;
         let get_tokens = match &a.get {
             Some(path) => quote! {
-                ::core::option::Option::Some(::otter_vm::NativeCall::Static(#path))
+                ::core::option::Option::Some(::otter_vm::__macro_support::NativeCall::Static(#path))
             },
             None => quote! { ::core::option::Option::None },
         };
         let set_tokens = match &a.set {
             Some(path) => quote! {
-                ::core::option::Option::Some(::otter_vm::NativeCall::Static(#path))
+                ::core::option::Option::Some(::otter_vm::__macro_support::NativeCall::Static(#path))
             },
             None => quote! { ::core::option::Option::None },
         };
         let attrs_path = attrs_factory_path(a.attrs.as_ref(), "builtin_function");
         quote! {
-            ::otter_vm::AccessorSpec {
+            ::otter_vm::__macro_support::AccessorSpec {
                 name: #js_name,
                 get_name: ::core::concat!("get ", #js_name),
                 set_name: ::core::concat!("set ", #js_name),
@@ -457,10 +457,14 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         let js_name = &c.js_name;
         let attrs_path = attrs_factory_path(c.attrs.as_ref(), "read_only");
         let value_tokens = match (c.kind.to_string().as_str(), c.value.as_ref()) {
-            ("Undefined", None) => quote! { ::otter_vm::ConstValue::Undefined },
-            ("Null", None) => quote! { ::otter_vm::ConstValue::Null },
-            ("Boolean", Some(expr)) => quote! { ::otter_vm::ConstValue::Boolean(#expr) },
-            ("Number", Some(expr)) => quote! { ::otter_vm::ConstValue::Number(#expr) },
+            ("Undefined", None) => quote! { ::otter_vm::__macro_support::ConstValue::Undefined },
+            ("Null", None) => quote! { ::otter_vm::__macro_support::ConstValue::Null },
+            ("Boolean", Some(expr)) => {
+                quote! { ::otter_vm::__macro_support::ConstValue::Boolean(#expr) }
+            }
+            ("Number", Some(expr)) => {
+                quote! { ::otter_vm::__macro_support::ConstValue::Number(#expr) }
+            }
             ("Undefined" | "Null", Some(_)) => {
                 return syn::Error::new_spanned(
                     &c.kind,
@@ -490,7 +494,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             }
         };
         quote! {
-            ::otter_vm::ConstSpec {
+            ::otter_vm::__macro_support::ConstSpec {
                 name: #js_name,
                 value: #value_tokens,
                 attrs: #attrs_path,
@@ -503,7 +507,8 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     // intentionally requires the variant ident bare (e.g. `CORE`)
     // for readability — `feature = BootstrapFeatures::CORE` would
     // be redundant in every invocation.
-    let feature_path = quote! { ::otter_vm::bootstrap::BootstrapFeatures::#feature };
+    let feature_path =
+        quote! { ::otter_vm::__macro_support::bootstrap::BootstrapFeatures::#feature };
     let js_glue_const = match &js_glue {
         Some(expr) => quote! {
             const JS_GLUE: ::core::option::Option<&'static str> =
@@ -518,24 +523,24 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         Some(tag) => quote! {
             fn install_well_knowns(
                 heap: &mut ::otter_gc::GcHeap,
-                global: ::otter_vm::JsObject,
-                well_known: &::otter_vm::symbol::WellKnownSymbols,
-            ) -> ::core::result::Result<(), ::otter_vm::JsSurfaceError> {
+                global: ::otter_vm::__macro_support::JsObject,
+                well_known: &::otter_vm::__macro_support::symbol::WellKnownSymbols,
+            ) -> ::core::result::Result<(), ::otter_vm::__macro_support::JsSurfaceError> {
                 let ::core::option::Option::Some(namespace) =
-                    ::otter_vm::object::get(global, heap, #name)
+                    ::otter_vm::__macro_support::object::get(global, heap, #name)
                         .and_then(|v| v.as_object())
                 else {
                     return ::core::result::Result::Ok(());
                 };
-                let tag_sym = well_known.get(::otter_vm::symbol::WellKnown::ToStringTag);
-                let value = ::otter_vm::string::JsString::from_str(#tag, heap)
-                    .map_err(|_| ::otter_vm::JsSurfaceError::OutOfMemory)?;
-                ::otter_vm::object::define_own_symbol_property_partial(
+                let tag_sym = well_known.get(::otter_vm::__macro_support::symbol::WellKnown::ToStringTag);
+                let value = ::otter_vm::__macro_support::string::JsString::from_str(#tag, heap)
+                    .map_err(|_| ::otter_vm::__macro_support::JsSurfaceError::OutOfMemory)?;
+                ::otter_vm::__macro_support::object::define_own_symbol_property_partial(
                     namespace,
                     heap,
                     tag_sym,
-                    ::otter_vm::object::PartialPropertyDescriptor {
-                        value: ::core::option::Option::Some(::otter_vm::Value::string(value)),
+                    ::otter_vm::__macro_support::object::PartialPropertyDescriptor {
+                        value: ::core::option::Option::Some(::otter_vm::__macro_support::Value::string(value)),
                         writable: ::core::option::Option::Some(false),
                         enumerable: ::core::option::Option::Some(false),
                         configurable: ::core::option::Option::Some(true),
@@ -550,50 +555,50 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
 
     quote! {
         #[allow(non_upper_case_globals)]
-        static #methods_ident: &[::otter_vm::MethodSpec] = &[
+        static #methods_ident: &[::otter_vm::__macro_support::MethodSpec] = &[
             #(#method_entries),*
         ];
 
         #[allow(non_upper_case_globals)]
-        static #constants_ident: &[::otter_vm::ConstSpec] = &[
+        static #constants_ident: &[::otter_vm::__macro_support::ConstSpec] = &[
             #(#constant_entries),*
         ];
 
         #[allow(non_upper_case_globals)]
-        static #accessors_ident: &[::otter_vm::AccessorSpec] = &[
+        static #accessors_ident: &[::otter_vm::__macro_support::AccessorSpec] = &[
             #(#accessor_entries),*
         ];
 
         #[doc = "Generated namespace spec (see `holt!`)."]
         #[allow(non_upper_case_globals)]
-        pub static #spec_ident: ::otter_vm::NamespaceSpec = ::otter_vm::NamespaceSpec {
+        pub static #spec_ident: ::otter_vm::__macro_support::NamespaceSpec = ::otter_vm::__macro_support::NamespaceSpec {
             name: #name,
             methods: #methods_ident,
             accessors: #accessors_ident,
             constants: #constants_ident,
-            attrs: ::otter_vm::Attr::global_binding(),
+            attrs: ::otter_vm::__macro_support::Attr::global_binding(),
         };
 
         #[doc = "Generated `BuiltinIntrinsic` adapter (see `holt!`)."]
         pub struct #intrinsic_ident;
 
-        impl ::otter_vm::intrinsic_install::BuiltinIntrinsic for #intrinsic_ident {
+        impl ::otter_vm::__macro_support::intrinsic_install::BuiltinIntrinsic for #intrinsic_ident {
             const NAME: &'static str = #name;
-            const FEATURE: ::otter_vm::bootstrap::BootstrapFeatures = #feature_path;
+            const FEATURE: ::otter_vm::__macro_support::bootstrap::BootstrapFeatures = #feature_path;
             #js_glue_const
             #install_well_knowns_fn
 
             fn install(
                 heap: &mut ::otter_gc::GcHeap,
-                global: ::otter_vm::JsObject,
-            ) -> ::core::result::Result<(), ::otter_vm::JsSurfaceError> {
-                let global_root = ::otter_vm::Value::object(global);
-                let namespace = ::otter_vm::NamespaceBuilder::from_spec_with_value_roots(
+                global: ::otter_vm::__macro_support::JsObject,
+            ) -> ::core::result::Result<(), ::otter_vm::__macro_support::JsSurfaceError> {
+                let global_root = ::otter_vm::__macro_support::Value::object(global);
+                let namespace = ::otter_vm::__macro_support::NamespaceBuilder::from_spec_with_value_roots(
                     heap,
                     &#spec_ident,
                     ::std::vec![global_root],
                 )
-                .map_err(::otter_vm::JsSurfaceError::from)?
+                .map_err(::otter_vm::__macro_support::JsSurfaceError::from)?
                 .build()?;
                 // §28.1 / §25.4 link to %Object.prototype% when the
                 // caller opts in via `link_object_prototype = true`.
@@ -607,23 +612,23 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 // shape; Reflect and Atomics opt in.
                 if #link_object_prototype
                     && let ::core::option::Option::Some(object_ctor) =
-                        ::otter_vm::object::get(global, heap, "Object")
+                        ::otter_vm::__macro_support::object::get(global, heap, "Object")
                             .and_then(|v| v.as_object())
                     && let ::core::option::Option::Some(object_proto) =
-                        ::otter_vm::object::get(object_ctor, heap, "prototype")
+                        ::otter_vm::__macro_support::object::get(object_ctor, heap, "prototype")
                             .and_then(|v| v.as_object())
                 {
-                    ::otter_vm::object::set_prototype(
+                    ::otter_vm::__macro_support::object::set_prototype(
                         namespace,
                         heap,
                         ::core::option::Option::Some(object_proto),
                     );
                 }
-                ::otter_vm::bootstrap::define_global_value(
+                ::otter_vm::__macro_support::bootstrap::define_global_value(
                     global,
                     heap,
-                    <Self as ::otter_vm::intrinsic_install::BuiltinIntrinsic>::NAME,
-                    ::otter_vm::Value::object(namespace),
+                    <Self as ::otter_vm::__macro_support::intrinsic_install::BuiltinIntrinsic>::NAME,
+                    ::otter_vm::__macro_support::Value::object(namespace),
                 );
                 ::core::result::Result::Ok(())
             }

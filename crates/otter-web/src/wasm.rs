@@ -70,7 +70,8 @@ use otter_runtime::marshal::{
     ArrayBuffer, IntoJs, JsError, JsValue, MarshalCx, ValueIdent, class_instance,
 };
 use otter_runtime::{
-    NativeCall, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError, RuntimeNativeFn,
+    RuntimeNativeCall as NativeCall, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeNativeFn,
     RuntimePersistentRootId as PersistentRootId, RuntimeValue as Value, object,
 };
 use wasmtime::{

@@ -211,6 +211,7 @@ fn promise_builders_settle() {
 fn host_ref_brand_checks() {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct Marker(u32);
+    impl crate::object::HostObjectData for Marker {}
     #[derive(Debug, Clone)]
     struct Other;
 

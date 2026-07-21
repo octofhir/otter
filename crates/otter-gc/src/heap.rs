@@ -2105,8 +2105,46 @@ impl std::fmt::Debug for GcHeap {
     }
 }
 
-// Drop: pages are owned by the spaces; their Drop returns them
-// to the cage automatically.
+impl Drop for GcHeap {
+    fn drop(&mut self) {
+        // Runtime disposal is a terminal STW boundary. Page ownership alone
+        // returns cage memory, but Rust payloads may own external resources
+        // (host data, strings, buffers, reservation tokens) that must be
+        // finalized and dropped before those pages disappear.
+        let dispose_page = |page: &crate::page::Page| {
+            // SAFETY: the heap has exclusive ownership during Drop; every
+            // non-filler, non-swept header precedes one live registered body.
+            unsafe {
+                page.for_each_object(|header, _| {
+                    let tag = (*header).type_tag();
+                    if tag == crate::header::FREE_TAG
+                        || (*header).is_swept()
+                        || (*header).is_forwarded()
+                    {
+                        return;
+                    }
+                    if let Some(finalize) = self.trace_table.get_finalize(tag) {
+                        finalize(header);
+                    }
+                    if let Some(drop_fn) = self.trace_table.get_drop(tag) {
+                        drop_fn(header);
+                    }
+                    (*header).set_swept();
+                });
+            }
+        };
+
+        for page in self.new_space.from_pages() {
+            dispose_page(page);
+        }
+        for page in self.old_space.pages() {
+            dispose_page(page);
+        }
+        for page in self.large_space.pages() {
+            dispose_page(page);
+        }
+    }
+}
 
 /// Header-only mark check for registry pruning: reads the mark bit
 /// straight off the object header without touching heap state.

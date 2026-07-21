@@ -42,6 +42,8 @@ pub struct SqlDatabase {
     path: Option<PathBuf>,
 }
 
+impl otter_runtime::RuntimeHostObjectData for SqlDatabase {}
+
 impl SqlDatabase {
     /// Open an in-memory SQLite database.
     pub fn memory() -> SqlResult<Self> {

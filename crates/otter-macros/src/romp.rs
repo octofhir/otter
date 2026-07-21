@@ -20,7 +20,7 @@
 //! ```
 //!
 //! Generated symbols:
-//! - `pub static <NAME>_EXTENSION: ::otter_vm::Extension` (upper-cased
+//! - `pub static <NAME>_EXTENSION: ::otter_vm::__macro_support::Extension` (upper-cased
 //!   `name`; override with `ident = MY_EXT`).
 //!
 //! Semantics carried by the runtime (`RuntimeBuilder::extension`):
@@ -158,7 +158,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         let source = &entry.source;
         let defines = &entry.defines;
         quote! {
-            ::otter_vm::ExtensionJs {
+            ::otter_vm::__macro_support::ExtensionJs {
                 source: #source,
                 defines: &[#(#defines),*],
             }
@@ -166,10 +166,10 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     });
     quote! {
         #[doc = "Generated extension descriptor (see `romp!`)."]
-        pub static #static_ident: ::otter_vm::Extension = ::otter_vm::Extension {
+        pub static #static_ident: ::otter_vm::__macro_support::Extension = ::otter_vm::__macro_support::Extension {
             name: #name,
             classes: &[
-                #(::otter_vm::GlobalClass::from_intrinsic::<#classes>(),)*
+                #(::otter_vm::__macro_support::GlobalClass::from_intrinsic::<#classes>(),)*
             ],
             js: &[#(#js_rows),*],
         };

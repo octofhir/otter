@@ -194,12 +194,12 @@ fn arg_extraction(index: usize, ty: &Type, op: &LitStr) -> proc_macro2::TokenStr
         let #handle = __cx.park(
             args.get(#index)
                 .copied()
-                .unwrap_or_else(::otter_vm::Value::undefined),
+                .unwrap_or_else(::otter_vm::__macro_support::Value::undefined),
         );
-        let #arg: #ty = ::otter_vm::marshal::FromJs::from_js(
+        let #arg: #ty = ::otter_vm::__macro_support::marshal::FromJs::from_js(
             &mut __cx,
             #handle,
-            ::otter_vm::marshal::ValueIdent::Argument(#index),
+            ::otter_vm::__macro_support::marshal::ValueIdent::Argument(#index),
         )
         .map_err(|e| e.into_native(#op))?;
     }
@@ -320,7 +320,9 @@ fn expand_inner(args: &NamespaceArgs, ns_impl: &mut ItemImpl) -> Result<proc_mac
                 quote!(__call)
             } else {
                 quote!(async move {
-                    ::core::result::Result::<_, ::otter_vm::marshal::JsError>::Ok(__call.await)
+                    ::core::result::Result::<_, ::otter_vm::__macro_support::marshal::JsError>::Ok(
+                        __call.await,
+                    )
                 })
             };
             quote! {
@@ -349,7 +351,7 @@ fn expand_inner(args: &NamespaceArgs, ns_impl: &mut ItemImpl) -> Result<proc_mac
             };
             quote! {
                 let __result = #normalized;
-                let __out = ::otter_vm::marshal::IntoJs::into_js(__result, &mut __cx)
+                let __out = ::otter_vm::__macro_support::marshal::IntoJs::into_js(__result, &mut __cx)
                     .map_err(|e| e.into_native(#op))?;
                 #promise_wrap
                 ::core::result::Result::Ok(__cx.escape(__out))
@@ -357,11 +359,11 @@ fn expand_inner(args: &NamespaceArgs, ns_impl: &mut ItemImpl) -> Result<proc_mac
         };
         glue.extend(quote! {
             fn #glue_ident(
-                ctx: &mut ::otter_vm::NativeCtx<'_>,
-                args: &[::otter_vm::Value],
-            ) -> ::core::result::Result<::otter_vm::Value, ::otter_vm::NativeError> {
+                ctx: &mut ::otter_vm::__macro_support::NativeCtx<'_>,
+                args: &[::otter_vm::__macro_support::Value],
+            ) -> ::core::result::Result<::otter_vm::__macro_support::Value, ::otter_vm::__macro_support::NativeError> {
                 ctx.scope(|__scope| {
-                    let mut __cx = ::otter_vm::marshal::MarshalCx::new(__scope);
+                    let mut __cx = ::otter_vm::__macro_support::marshal::MarshalCx::new(__scope);
                     #(#extractions)*
                     #output
                 })

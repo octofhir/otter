@@ -80,10 +80,25 @@ the live promise and reason on the owning thread; it replaces the legacy magic
 JavaScript reporter global.
 
 Execute an already-fetched module entry with
-`Runtime::run_module_source(source, canonical_url)`. The entry stays in memory;
-static dependencies resolve relative to its URL and use the configured loader
-or remote-fetch cache. File-backed `Runtime::run_module(path)` remains the CLI
-path and shares the same linker/evaluator after loading.
+`RuntimeHandle::run_module_source(source, canonical_url)`. The entry stays in
+memory. Install an embedder transport with
+`RuntimeBuilder::remote_module_provider`; its `RemoteModuleProvider::fetch`
+method receives an owned URL and `ModuleLoadCancellation`, and returns an owned
+future. Otter capability-checks each target, fetches at most eight remote graph
+nodes concurrently, caches requested and post-redirect canonical URLs, and
+moves AST/compile/link work to Tokio's blocking pool. Static graphs and dynamic
+imports use this same pipeline. Command timeout, dropped waiters, and
+`RuntimeHandle::shutdown` cancel in-flight provider work. Browser origin and
+CORS policy remain browser-owned and may be enforced by the provider.
+
+File-backed `RuntimeHandle::run_module(path)` shares that graph pipeline.
+Direct thread-pinned `Runtime` remains network-transport agnostic; use the
+sendable handle when a graph can require asynchronous remote I/O.
+
+`RuntimeBuilder::timeout` is also enforced for direct `Runtime::run_*` calls.
+The watchdog interrupts interpreter loops and graph preparation, reports
+`OtterError::Timeout`, clears the interrupt, and leaves the runtime reusable.
+`Duration::ZERO` disables this deadline.
 
 Additional same-agent globals use opaque realms. Both classic scripts and
 module graphs have direct and sendable high-level entry points:

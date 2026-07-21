@@ -13,9 +13,9 @@
 use std::sync::Arc;
 
 use otter_runtime::{
-    OtterError, Runtime, RuntimeGlobalInstaller, RuntimeNativeCall, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeNativeFn, RuntimeValue as Value, SourceInput,
-    runtime_arg_to_string, runtime_string_value, runtime_type_error,
+    OtterError, RuntimeGlobalInstaller, RuntimeNativeCall, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeNativeFn, RuntimeRealmContext, RuntimeValue as Value,
+    SourceInput, runtime_arg_to_string, runtime_string_value, runtime_type_error,
 };
 
 /// Pure-JS Web Platform globals — the sources live in the `romp!`
@@ -39,7 +39,7 @@ pub fn web_globals_installer() -> RuntimeGlobalInstaller {
     RuntimeGlobalInstaller::new(install)
 }
 
-fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
+fn install(runtime: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
     runtime.install_native_global("atob", 1, atob)?;
     runtime.install_native_global("btoa", 1, btoa)?;
     runtime.install_native_global("queueMicrotask", 1, queue_microtask)?;
@@ -78,7 +78,9 @@ fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
 /// `PromiseRejectionEvent` and `reportError` lazily, so those stay in the
 /// deferred `web_bootstrap.js` group and materialize the first time the reporter
 /// actually fires.
-fn install_promise_rejection_handling(runtime: &mut Runtime) -> Result<(), OtterError> {
+fn install_promise_rejection_handling(
+    runtime: &mut RuntimeRealmContext<'_>,
+) -> Result<(), OtterError> {
     // `handled` is false for the `unhandledrejection` notification and true for
     // the follow-up `rejectionhandled`. Defensive throughout: a throwing
     // handler must never abort the microtask drain the VM invokes this from.
@@ -114,7 +116,7 @@ fn install_promise_rejection_handling(runtime: &mut Runtime) -> Result<(), Otter
           });\n\
         })(globalThis);";
     runtime
-        .eval(SourceInput::from_javascript(shim))
+        .install_script(SourceInput::from_javascript(shim))
         .map_err(|err| OtterError::Internal {
             code: "WEB_REJECTION_INSTALL".to_string(),
             message: format!("promise-rejection surface install failed: {err}"),
@@ -127,7 +129,7 @@ fn install_promise_rejection_handling(runtime: &mut Runtime) -> Result<(), Otter
 /// accessor (`[Replaceable]`): reading returns the global object, and assigning
 /// shadows it with a data property, matching platform semantics. Installed
 /// eagerly (not lazily) so `self` is present before any Web class is touched.
-fn install_self(runtime: &mut Runtime) -> Result<(), OtterError> {
+fn install_self(runtime: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
     let shim = "Object.defineProperty(globalThis, 'self', {\n\
           get() { return globalThis; },\n\
           set(value) {\n\
@@ -139,7 +141,7 @@ fn install_self(runtime: &mut Runtime) -> Result<(), OtterError> {
           configurable: true,\n\
         });";
     runtime
-        .eval(SourceInput::from_javascript(shim))
+        .install_script(SourceInput::from_javascript(shim))
         .map_err(|err| OtterError::Internal {
             code: "WEB_SELF_INSTALL".to_string(),
             message: format!("self install failed: {err}"),
@@ -151,7 +153,7 @@ fn install_self(runtime: &mut Runtime) -> Result<(), OtterError> {
 /// object exposing `userAgent` with the engine name and crate version.
 /// Defined writable + configurable to match the WebIDL `[Replaceable]`
 /// attribute shape, and non-enumerable like the other Web globals.
-fn install_navigator(runtime: &mut Runtime) -> Result<(), OtterError> {
+fn install_navigator(runtime: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
     let shim = format!(
         "Object.defineProperty(globalThis, 'navigator', {{\n\
            value: {{ userAgent: 'Otter/{version}' }},\n\
@@ -162,7 +164,7 @@ fn install_navigator(runtime: &mut Runtime) -> Result<(), OtterError> {
         version = env!("CARGO_PKG_VERSION"),
     );
     runtime
-        .eval(SourceInput::from_javascript(shim))
+        .install_script(SourceInput::from_javascript(shim))
         .map_err(|err| OtterError::Internal {
             code: "WEB_NAVIGATOR_INSTALL".to_string(),
             message: format!("navigator install failed: {err}"),

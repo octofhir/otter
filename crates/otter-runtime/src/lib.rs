@@ -73,6 +73,7 @@ mod process_env;
 mod process_events;
 mod process_flags;
 pub mod promise_registry;
+mod realm;
 mod runtime_activity;
 pub mod structured_clone;
 pub mod surface;
@@ -121,6 +122,7 @@ pub use otter_vm::{
     JitDirectCallKind, JitInlineRejectionReason, JsObject, JsSurfaceError, MethodSpec, NativeCall,
     ObjectBuilder, Value, array, bootstrap, intrinsic_install, object, rooting,
 };
+pub use realm::{RuntimeGlobalValue, RuntimeRealmContext, RuntimeRealmId};
 // Unrenamed re-exports consumed by `#[js_class]`- and `couch!`-generated
 // glue, which must resolve the same `::otter_vm::…` paths whether they
 // expand inside `otter-vm` itself or in a binding crate that aliases
@@ -290,30 +292,36 @@ impl HostedModule {
     }
 }
 
-/// Cloneable callback that installs embedder globals on every runtime isolate.
+/// Cloneable callback that installs embedder globals in every configured realm.
 ///
 /// Runtime workers clone [`RuntimeConfig`], so installers registered on a
-/// parent runtime also run inside child worker isolates before user code
-/// starts. Installers must copy owned data into the runtime and must not expose
-/// isolate-local VM handles across runtime boundaries.
+/// parent runtime also run inside child worker isolates before user code starts.
+/// Additional realms replay the same installers through
+/// [`RuntimeRealmContext`], which exposes only high-level global installation,
+/// owned capabilities/task delivery and trusted bootstrap source. Raw VM/GC
+/// handles never cross this boundary.
 #[derive(Clone)]
 pub struct RuntimeGlobalInstaller {
-    install: Arc<dyn Fn(&mut Runtime) -> Result<(), OtterError> + Send + Sync>,
+    install:
+        Arc<dyn for<'a> Fn(&mut RuntimeRealmContext<'a>) -> Result<(), OtterError> + Send + Sync>,
 }
 
 impl RuntimeGlobalInstaller {
     /// Build a global installer from a sendable callback.
     #[must_use]
     pub fn new(
-        install: impl Fn(&mut Runtime) -> Result<(), OtterError> + Send + Sync + 'static,
+        install: impl for<'a> Fn(&mut RuntimeRealmContext<'a>) -> Result<(), OtterError>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         Self {
             install: Arc::new(install),
         }
     }
 
-    fn install(&self, runtime: &mut Runtime) -> Result<(), OtterError> {
-        (self.install)(runtime)
+    fn install(&self, realm: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
+        (self.install)(realm)
     }
 }
 
@@ -2311,8 +2319,17 @@ impl Runtime {
             worker::install_main_worker_globals(&mut runtime)?;
         }
         let global_installers = runtime.config.global_installers.clone();
+        let capabilities = runtime.config.capabilities.clone();
+        let hooks = runtime.config.hooks.clone();
+        let runtime_task_spawner = runtime.runtime_task_spawner.clone();
+        let mut realm = RuntimeRealmContext::new(
+            &mut runtime.interp,
+            &capabilities,
+            &hooks,
+            runtime_task_spawner,
+        );
         for installer in global_installers {
-            installer.install(&mut runtime)?;
+            installer.install(&mut realm)?;
         }
         // Extension JS (Web platform shims, etc.) installs its globals
         // eagerly, in declaration order, after the native function
@@ -4636,6 +4653,23 @@ impl Otter {
         specifier: impl Into<String>,
     ) -> Result<ExecutionResult, OtterError> {
         self.handle.run_script(source, specifier).await
+    }
+
+    /// Create and bootstrap an additional realm in this isolate.
+    pub async fn create_realm(&self) -> Result<RuntimeRealmId, OtterError> {
+        self.handle.create_realm().await
+    }
+
+    /// Run a classic source bundle in an additional realm.
+    pub async fn run_script_in_realm(
+        &self,
+        realm: RuntimeRealmId,
+        source: SourceInput,
+        specifier: impl Into<String>,
+    ) -> Result<ExecutionResult, OtterError> {
+        self.handle
+            .run_script_in_realm(realm, source, specifier)
+            .await
     }
 
     /// Run a source bundle and retain partial JIT diagnostics on failure.

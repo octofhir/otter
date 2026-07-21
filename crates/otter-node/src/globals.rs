@@ -5,7 +5,7 @@
 //! Web-platform globals (`atob`, `fetch`, `queueMicrotask`, `AbortController`,
 //! ...) are NOT here — they live in `otter-web`.
 
-use otter_runtime::{OtterError, Runtime, RuntimeGlobalInstaller};
+use otter_runtime::{OtterError, RuntimeGlobalInstaller, RuntimeRealmContext, SourceInput};
 
 /// Installer for the Node-specific globals. Registered by `with_node_apis`.
 #[must_use]
@@ -13,10 +13,9 @@ pub fn node_globals_installer() -> RuntimeGlobalInstaller {
     RuntimeGlobalInstaller::new(install)
 }
 
-fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
-    // `global` aliases `globalThis` (Node compatibility).
-    let global_this = runtime.global_this();
-    runtime.define_to_string_tag(global_this, "global")?;
-    runtime.set_global("global", global_this);
-    Ok(())
+fn install(runtime: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
+    runtime.install_script(SourceInput::from_javascript(
+        "Object.defineProperty(globalThis, Symbol.toStringTag, { value: 'global', configurable: true });\n\
+         Object.defineProperty(globalThis, 'global', { value: globalThis, writable: true, configurable: true });",
+    ))
 }

@@ -32,8 +32,9 @@ use otter_runtime::{
     CapabilitySet, HostedModule, OtterError, Runtime, RuntimeAttr as Attr, RuntimeGlobalInstaller,
     RuntimeKeepAlive, RuntimeLiveness, RuntimeLocal, RuntimeNativeCall,
     RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError, RuntimeNativeFn,
-    RuntimeNativeScope, RuntimePersistentRootId, RuntimeTask, RuntimeTaskSpawner,
-    RuntimeValue as Value, SourceInput, object, runtime_this_object, runtime_with_host_data,
+    RuntimeNativeScope, RuntimePersistentRootId, RuntimeRealmContext, RuntimeTask,
+    RuntimeTaskSpawner, RuntimeValue as Value, SourceInput, object, runtime_this_object,
+    runtime_with_host_data,
 };
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -102,7 +103,7 @@ pub fn otter_global_installer() -> RuntimeGlobalInstaller {
     RuntimeGlobalInstaller::new(install_global_otter)
 }
 
-fn install_global_otter(runtime: &mut Runtime) -> Result<(), OtterError> {
+fn install_global_otter(runtime: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
     let capabilities = runtime.capabilities().clone();
     let task_spawner = runtime.runtime_task_spawner();
     let serve_call: Arc<RuntimeNativeFn> =
@@ -113,7 +114,7 @@ fn install_global_otter(runtime: &mut Runtime) -> Result<(), OtterError> {
         RuntimeNativeCall::Dynamic(serve_call),
     )?;
     runtime
-        .eval(SourceInput::from_javascript(
+        .install_script(SourceInput::from_javascript(
             r#"
             (function (g) {
               'use strict';

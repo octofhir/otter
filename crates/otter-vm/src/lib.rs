@@ -298,6 +298,14 @@ pub use weak_refs::{JsFinalizationRegistry, JsWeakRef};
 // Eight-byte tagged value. Canonical `Value` export.
 pub use value::{Value, ValueKind};
 
+/// Opaque stable identity for an additional interpreter realm.
+///
+/// The id contains no GC pointer and is safe to retain across collections.
+/// Realm globals and intrinsics remain traced inside the interpreter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[doc(hidden)]
+pub struct HostRealmId(u32);
+
 /// Active-realm state that must switch together for cross-realm calls.
 ///
 /// This keeps the first real realm slice compact: the global object, error

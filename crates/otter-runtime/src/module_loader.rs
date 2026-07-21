@@ -14,10 +14,11 @@
 //! - [`LoaderError`] — distinct enum for resolve / load failures.
 //!
 //! # Invariants
-//! - All canonical URLs use the `file://` scheme with a fully
-//!   canonicalised filesystem path so identity comparison is
-//!   string equality. Two specifiers that point at the same
-//!   underlying file always produce the same URL.
+//! - Local canonical URLs use `file://` with a fully canonicalised path;
+//!   remote modules use absolute post-resolution `http(s)` URLs. Module
+//!   identity is canonical URL string equality.
+//! - Every network resolution passes through the runtime capability boundary
+//!   with both target and initiator URLs before any host I/O.
 //! - Package-scope lookup for graph-backed packages is indexed at loader
 //!   construction time. Filesystem package scopes are memoized by importer
 //!   directory as they are observed.
@@ -35,7 +36,7 @@ use otter_syntax::{SourceKind, remote_source_kind};
 use oxc_resolver::{ResolveOptions, Resolver, TsconfigDiscovery};
 
 use crate::package_graph_resolver;
-use crate::{CapabilitySet, Permission};
+use crate::{CapabilityRequest, CapabilitySet, RuntimeCapability, RuntimeHooks};
 
 /// One remote module fetched over http/https.
 #[derive(Debug, Clone)]
@@ -123,29 +124,6 @@ fn join_remote_url(referrer: &str, specifier: &str) -> Result<String, String> {
     base.join(specifier)
         .map(|u| u.to_string())
         .map_err(|e| format!("cannot resolve `{specifier}` against `{referrer}`: {e}"))
-}
-
-/// Extract the `host[:port]` portion of an `http://` / `https://`
-/// specifier. Returns `None` when the specifier is not an HTTP
-/// URL or when the URL is too malformed to identify a host
-/// (capability gating fails closed in that case via
-/// `LoaderError::UnsupportedSpecifier`).
-fn http_specifier_host(specifier: &str) -> Option<String> {
-    let after_scheme = specifier
-        .strip_prefix("https://")
-        .or_else(|| specifier.strip_prefix("http://"))?;
-    // Trim the path / query / fragment so the host pattern only
-    // sees authority data, matching the `host[:port]` shape
-    // documented for `Permission<String>` net patterns.
-    let end = after_scheme
-        .find(['/', '?', '#'])
-        .unwrap_or(after_scheme.len());
-    let host = &after_scheme[..end];
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
-    }
 }
 
 /// One resolved + loaded module.
@@ -445,6 +423,11 @@ pub struct LoaderConfig {
     /// embedders that forget to wire capabilities don't
     /// accidentally enable network module loading.
     pub capabilities: CapabilitySet,
+    /// Runtime capability hooks for privileged module requests.
+    ///
+    /// Runtime construction replaces this together with `capabilities`, so
+    /// module resolution and host APIs use one policy boundary.
+    pub(crate) capability_hooks: RuntimeHooks,
 }
 
 impl LoaderConfig {
@@ -475,6 +458,7 @@ impl LoaderConfig {
             hosted_specifiers: Vec::new(),
             package_graph: None,
             capabilities: CapabilitySet::sandbox(),
+            capability_hooks: RuntimeHooks::default(),
         }
     }
 }
@@ -651,16 +635,8 @@ impl ModuleLoader {
         // ENGINE_REFACTOR_EXECUTION_PLAN §P2.1; the loader
         // surfaces a clean capability denial before any network
         // I/O happens.
-        if let Some(host) = http_specifier_host(specifier) {
-            if !matches!(self.config.capabilities.net, Permission::AllowAll)
-                && !self.config.capabilities.net.matches(&host)
-            {
-                return Err(LoaderError::CapabilityDenied {
-                    specifier: specifier.to_string(),
-                    capability: "net".to_string(),
-                    resource: host,
-                });
-            }
+        if is_http_url(specifier) {
+            self.check_network_capability(specifier, referrer)?;
             // Capability granted: an absolute http(s) specifier resolves to
             // itself. The static graph loader fetches it through the wired
             // remote-fetch hook; the dynamic-import path handles it on the
@@ -684,16 +660,7 @@ impl ModuleLoader {
                     referrer: referrer.to_string(),
                     message,
                 })?;
-            if let Some(host) = http_specifier_host(&joined)
-                && !matches!(self.config.capabilities.net, Permission::AllowAll)
-                && !self.config.capabilities.net.matches(&host)
-            {
-                return Err(LoaderError::CapabilityDenied {
-                    specifier: joined,
-                    capability: "net".to_string(),
-                    resource: host,
-                });
-            }
+            self.check_network_capability(&joined, Some(referrer))?;
             return Ok(joined);
         }
         if let Some(rest) = specifier.strip_prefix("file://") {
@@ -818,6 +785,41 @@ impl ModuleLoader {
                 e.to_string(),
             )),
         }
+    }
+
+    fn check_network_capability(
+        &self,
+        target: &str,
+        initiator: Option<&str>,
+    ) -> Result<(), LoaderError> {
+        let url = url::Url::parse(target).map_err(|error| LoaderError::Resolve {
+            specifier: target.to_string(),
+            referrer: initiator.unwrap_or("<entry>").to_string(),
+            message: format!("invalid network URL: {error}"),
+        })?;
+        let initiator_url = initiator.and_then(|value| url::Url::parse(value).ok());
+        let request = CapabilityRequest::Network {
+            url: &url,
+            initiator: initiator_url.as_ref(),
+        };
+        if crate::hooks::check_capability_with_hooks(
+            &self.config.capability_hooks,
+            &self.config.capabilities,
+            RuntimeCapability::Net,
+            &request,
+        ) {
+            return Ok(());
+        }
+        let resource = match (url.host_str(), url.port()) {
+            (Some(host), Some(port)) => format!("{host}:{port}"),
+            (Some(host), None) => host.to_string(),
+            (None, _) => url.to_string(),
+        };
+        Err(LoaderError::CapabilityDenied {
+            specifier: target.to_string(),
+            capability: "net".to_string(),
+            resource,
+        })
     }
 
     /// Resolve, then read the source.

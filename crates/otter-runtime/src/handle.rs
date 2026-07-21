@@ -152,6 +152,7 @@ struct ModulePreparation {
     hosted_modules: Vec<crate::HostedModule>,
     package_manager: RuntimePackageManagerHandle,
     capabilities: crate::CapabilitySet,
+    hooks: crate::RuntimeHooks,
     remote_fetch: Arc<dyn crate::module_loader::RemoteModuleFetch>,
 }
 
@@ -164,6 +165,7 @@ impl ModulePreparation {
                 config.loader.as_ref(),
             ),
             capabilities: config.capabilities.clone(),
+            hooks: config.hooks.clone(),
             remote_fetch: event_loop.blocking_module_fetcher(),
         }
     }
@@ -175,6 +177,7 @@ impl ModulePreparation {
                 &self.hosted_modules,
                 &self.package_manager,
                 &self.capabilities,
+                &self.hooks,
             )
             .with_remote_fetch(self.remote_fetch.clone())
     }

@@ -1475,6 +1475,7 @@ impl RuntimeModuleLoaderState {
         hosted_modules: &[HostedModule],
         package_manager: &RuntimePackageManagerHandle,
         capabilities: &CapabilitySet,
+        hooks: &RuntimeHooks,
     ) -> module_loader::ModuleLoader {
         let mut cfg = match &self.configured {
             Some(cfg) => cfg.clone(),
@@ -1494,10 +1495,11 @@ impl RuntimeModuleLoaderState {
                 .map(|module| module.specifier().to_string()),
         );
         package_manager.apply_to_loader_config(&mut cfg);
-        // Propagate the runtime's capability state so the loader
-        // can reject `http:` / `https:` specifiers (and future
-        // privileged shapes) without consulting any extra hook.
+        // Keep module resolution on the same capability boundary as every
+        // other host API. Hooks receive complete URL + initiator data while
+        // the default policy remains the configured host allowlist.
         cfg.capabilities = capabilities.clone();
+        cfg.capability_hooks = hooks.clone();
         module_loader::ModuleLoader::with_config(cfg)
     }
 }
@@ -4286,6 +4288,7 @@ impl Runtime {
             &self.config.hosted_modules,
             &self.package_manager,
             &self.config.capabilities,
+            &self.config.hooks,
         );
         match &self.remote_module_fetch {
             Some(fetch) => loader.with_remote_fetch(fetch.clone()),
@@ -5541,7 +5544,11 @@ mod tests {
                 request: &CapabilityRequest<'_>,
             ) -> bool {
                 (capability == RuntimeCapability::Net
-                    && matches!(request, CapabilityRequest::Host("example.com")))
+                    && matches!(
+                        request,
+                        CapabilityRequest::Network { url, initiator: None }
+                            if url.as_str() == "https://example.com/module.js"
+                    ))
                     || capability == RuntimeCapability::Env
             }
         }
@@ -5552,9 +5559,13 @@ mod tests {
             .build()
             .unwrap();
 
+        let url = url::Url::parse("https://example.com/module.js").unwrap();
         assert!(runtime.check_capability(
             RuntimeCapability::Net,
-            &CapabilityRequest::Host("example.com")
+            &CapabilityRequest::Network {
+                url: &url,
+                initiator: None,
+            }
         ));
         assert!(
             runtime.check_capability(RuntimeCapability::Env, &CapabilityRequest::EnvVar("HOME"))

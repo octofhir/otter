@@ -383,6 +383,11 @@ enum RuntimeCommand {
         id: CommandId,
         reply: RealmReply,
     },
+    DisposeRealm {
+        id: CommandId,
+        realm: crate::RuntimeRealmId,
+        reply: CheckReply,
+    },
     RunScriptInRealm {
         id: CommandId,
         realm: crate::RuntimeRealmId,
@@ -677,6 +682,14 @@ impl RuntimeHandle {
         let id = self.next_command_id();
         self.submit(RuntimeCommand::CreateRealm { id, reply })?;
         self.await_realm_reply(rx).await
+    }
+
+    /// Dispose an additional realm on its owning isolate.
+    pub async fn dispose_realm(&self, realm: crate::RuntimeRealmId) -> Result<(), OtterError> {
+        let (reply, rx) = oneshot::channel();
+        let id = self.next_command_id();
+        self.submit(RuntimeCommand::DisposeRealm { id, realm, reply })?;
+        self.await_check_reply(rx).await
     }
 
     /// Execute a classic script in an additional realm.
@@ -1868,6 +1881,10 @@ impl IsolateRunner {
                 let result = self.runtime.create_realm();
                 send_realm_reply(reply, result, &self.counters);
             }
+            RuntimeCommand::DisposeRealm { realm, reply, .. } => {
+                let result = self.runtime.dispose_realm(realm);
+                send_check_reply(reply, result, &self.counters);
+            }
             RuntimeCommand::RunScriptInRealm {
                 realm,
                 source,
@@ -1971,6 +1988,7 @@ impl RuntimeCommand {
             | RuntimeCommand::RunFile { id, .. }
             | RuntimeCommand::RunScript { id, .. }
             | RuntimeCommand::CreateRealm { id, .. }
+            | RuntimeCommand::DisposeRealm { id, .. }
             | RuntimeCommand::RunScriptInRealm { id, .. }
             | RuntimeCommand::RunModule { id, .. }
             | RuntimeCommand::RunModuleSource { id, .. }

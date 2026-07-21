@@ -845,6 +845,31 @@ impl Interpreter {
         self.with_host_realm_id(realm.0, body)
     }
 
+    /// Whether an additional host realm is still live in this interpreter.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn has_host_realm(&self, realm: crate::HostRealmId) -> bool {
+        self.extra_realms.iter().any(|state| state.id == realm.0)
+    }
+
+    /// Stop tracing an additional host realm and invalidate its opaque id.
+    ///
+    /// The id is never reused. Objects still reachable from another realm or a
+    /// pending job remain ordinary GC objects, but can no longer reactivate the
+    /// disposed realm as an execution target.
+    #[doc(hidden)]
+    pub fn dispose_host_realm(&mut self, realm: crate::HostRealmId) -> bool {
+        let Some(index) = self
+            .extra_realms
+            .iter()
+            .position(|state| state.id == realm.0)
+        else {
+            return false;
+        };
+        self.extra_realms.remove(index);
+        true
+    }
+
     /// Run `body` with the realm identified by `global` as the active realm.
     pub fn with_host_realm_global<R>(
         &mut self,

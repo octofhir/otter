@@ -19,13 +19,25 @@
 //! - [`crate::RuntimeHandle`]
 
 use crate::{
-    CapabilitySet, DiagnosticCode, GlobalClassInner, OtterError, RuntimeConfig, RuntimeHooks,
-    RuntimeNativeCall, RuntimeNativeFastFn, RuntimeTaskSpawner, SourceInput,
+    CapabilitySet, DiagnosticCode, GlobalClassInner, OtterError, RealmError, RuntimeConfig,
+    RuntimeHooks, RuntimeNativeCall, RuntimeNativeFastFn, RuntimeTaskSpawner, SourceInput,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_REALM_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_realm_owner_id() -> u64 {
+    NEXT_REALM_OWNER_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("runtime realm owner id space exhausted")
+}
 
 /// Opaque identity for one additional realm owned by a runtime isolate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RuntimeRealmId(pub(crate) otter_vm::HostRealmId);
+pub struct RuntimeRealmId {
+    owner_id: u64,
+    realm: otter_vm::HostRealmId,
+}
 
 /// Owned primitive that can be installed without exposing VM values.
 #[derive(Debug, Clone, PartialEq)]
@@ -319,8 +331,25 @@ impl crate::Runtime {
                 }))
             })
             .map_err(map_realm_vm_error)?;
-        installed?;
-        Ok(RuntimeRealmId(realm))
+        if let Err(error) = installed {
+            let _ = self.interp.dispose_host_realm(realm);
+            return Err(error);
+        }
+        Ok(RuntimeRealmId {
+            owner_id: self.realm_owner_id,
+            realm,
+        })
+    }
+
+    /// Dispose an additional realm and invalidate its opaque identity.
+    ///
+    /// This releases the runtime's strong realm roots. The scalar id is never
+    /// reused, and later operations with it return [`RealmError::UnknownOrDisposed`].
+    pub fn dispose_realm(&mut self, realm: RuntimeRealmId) -> Result<(), OtterError> {
+        self.validate_realm(realm)?;
+        let removed = self.interp.dispose_host_realm(realm.realm);
+        debug_assert!(removed, "validated realm disappeared on one isolate thread");
+        Ok(())
     }
 
     /// Compile and execute a classic script in an additional realm.
@@ -333,12 +362,13 @@ impl crate::Runtime {
         source: SourceInput,
         specifier: &str,
     ) -> Result<crate::ExecutionResult, OtterError> {
+        self.validate_realm(realm)?;
         self.interp.begin_jit_debug_capture();
         let started = std::time::Instant::now();
         let compiled = self.compile_source(&source, specifier)?;
         let result = self
             .interp
-            .with_host_realm(realm.0, |interp| {
+            .with_host_realm(realm.realm, |interp| {
                 let context = interp.link_module(compiled.bytecode);
                 let script = interp.run(&context);
                 let checkpoint = interp.drain_microtasks(&context);
@@ -373,6 +403,20 @@ impl crate::Runtime {
             .map_err(crate::map_vm_error)?;
         let result = self.attach_execution_stats(result);
         Ok(self.attach_jit_debug_report(result))
+    }
+
+    fn validate_realm(&self, realm: RuntimeRealmId) -> Result<(), OtterError> {
+        if realm.owner_id != self.realm_owner_id {
+            return Err(OtterError::Realm {
+                reason: RealmError::WrongRuntime,
+            });
+        }
+        if !self.interp.has_host_realm(realm.realm) {
+            return Err(OtterError::Realm {
+                reason: RealmError::UnknownOrDisposed,
+            });
+        }
+        Ok(())
     }
 }
 

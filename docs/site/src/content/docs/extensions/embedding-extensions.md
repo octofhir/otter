@@ -106,12 +106,14 @@ let result = otter.run_script_in_realm(
     SourceInput::from_javascript("globalThis.frameState = 1"),
     "frame:initial",
 ).await?;
+otter.dispose_realm(realm).await?;
 ```
 
 Globals are isolated and repeated turns retain state in their target realm.
-Classic-script execution is realm-aware today. Realm-targeted module graphs and
-explicit realm disposal are later high-level additions; embedders must not work
-around them by retaining raw globals.
+Classic-script execution and explicit disposal are realm-aware today. Realm ids
+are isolate-bound, never reused, and stale/foreign ids return a typed
+`RealmError`. Realm-targeted module graphs are a later high-level addition;
+embedders must not work around them by retaining raw globals.
 
 ## What works where
 

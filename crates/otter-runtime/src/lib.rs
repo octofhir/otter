@@ -99,7 +99,7 @@ use serde::{Deserialize, Serialize};
 
 pub use compiled_program::CompiledProgram;
 pub use diagnostics::{Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticKind, StackFrame};
-pub use error::{ConfigError, IoErrorKind, OtterError};
+pub use error::{ConfigError, IoErrorKind, OtterError, RealmError};
 pub use event_loop::{RuntimeLiveness, TokioRuntimeHost};
 pub use handle::{RuntimeActivityStats, RuntimeHandle};
 pub use hooks::{
@@ -2303,6 +2303,7 @@ impl Runtime {
             )?;
         let mut runtime = Runtime {
             interp,
+            realm_owner_id: realm::next_realm_owner_id(),
             config,
             module_loader,
             module_graph: RuntimeModuleGraphState::default(),
@@ -2366,6 +2367,8 @@ impl Runtime {
 #[derive(Debug)]
 pub struct Runtime {
     interp: Interpreter,
+    /// Process-unique scalar used to reject realm ids from another isolate.
+    realm_owner_id: u64,
     config: RuntimeConfig,
     module_loader: RuntimeModuleLoaderState,
     module_graph: RuntimeModuleGraphState,
@@ -4658,6 +4661,11 @@ impl Otter {
     /// Create and bootstrap an additional realm in this isolate.
     pub async fn create_realm(&self) -> Result<RuntimeRealmId, OtterError> {
         self.handle.create_realm().await
+    }
+
+    /// Dispose an additional realm in this isolate.
+    pub async fn dispose_realm(&self, realm: RuntimeRealmId) -> Result<(), OtterError> {
+        self.handle.dispose_realm(realm).await
     }
 
     /// Run a classic source bundle in an additional realm.

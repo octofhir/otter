@@ -9,6 +9,7 @@
 //! # Contents
 //! - [`OtterError`] — top-level error enum.
 //! - [`ConfigError`] — companion enum for `OtterError::Config`.
+//! - [`RealmError`] — invalid or stale opaque realm identity.
 //! - [`IoErrorKind`] — small mapped subset of [`std::io::ErrorKind`].
 //! - [`OtterError::to_json`] — convenience for CLI `--json` output.
 //!
@@ -34,6 +35,12 @@ pub enum OtterError {
     Config {
         /// Specific configuration problem.
         reason: ConfigError,
+    },
+    /// An opaque realm id does not belong to this runtime or is no longer live.
+    #[error("invalid runtime realm: {reason}")]
+    Realm {
+        /// Stable reason suitable for programmatic handling.
+        reason: RealmError,
     },
     /// A hosted builtin module's namespace installer failed.
     #[error("hosted module '{specifier}' failed to install: {message}")]
@@ -160,6 +167,7 @@ impl OtterError {
         match self {
             OtterError::Compile { .. } | OtterError::Runtime { .. } => 1,
             OtterError::Config { .. }
+            | OtterError::Realm { .. }
             | OtterError::HostedModule { .. }
             | OtterError::SourceKind { .. }
             | OtterError::Io { .. } => 2,
@@ -170,6 +178,19 @@ impl OtterError {
             OtterError::Internal { .. } => 64,
         }
     }
+}
+
+/// Reason an opaque realm identity cannot be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RealmError {
+    /// The id was created by another runtime isolate.
+    #[error("the realm belongs to another runtime")]
+    WrongRuntime,
+    /// The realm was disposed or never existed in this runtime.
+    #[error("the realm is unknown or disposed")]
+    UnknownOrDisposed,
 }
 
 impl From<otter_gc::OutOfMemory> for OtterError {
@@ -251,6 +272,23 @@ mod tests {
         let json = err.to_json().unwrap();
         assert!(json.contains("\"kind\":\"timeout\""));
         assert!(json.contains("\"elapsed_ms\":1234"));
+    }
+
+    #[test]
+    fn realm_error_round_trips_with_stable_reason() {
+        let err = OtterError::Realm {
+            reason: RealmError::WrongRuntime,
+        };
+        let json = err.to_json().unwrap();
+        assert!(json.contains("\"kind\":\"realm\""));
+        assert!(json.contains("\"reason\":\"wrong_runtime\""));
+        let decoded: ErrorEnvelopeOwned = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded.error,
+            OtterError::Realm {
+                reason: RealmError::WrongRuntime
+            }
+        ));
     }
 
     #[test]

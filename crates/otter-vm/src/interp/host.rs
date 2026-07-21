@@ -117,7 +117,15 @@ impl Interpreter {
     /// Read a generic persistent root.
     #[must_use]
     pub fn persistent_root_get(&self, id: persistent_roots::PersistentRootId) -> Option<Value> {
-        self.persistent_roots.get(id)
+        self.persistent_roots.get(id, &self.gc_heap)
+    }
+
+    /// Insert a collector-managed weak cell into the persistent root table.
+    pub(crate) fn persistent_root_insert_weak(
+        &mut self,
+        weak_ref: crate::JsWeakRef,
+    ) -> persistent_roots::PersistentRootId {
+        self.persistent_roots.insert_weak(weak_ref)
     }
 
     /// Remove a generic persistent root.
@@ -125,7 +133,7 @@ impl Interpreter {
         &mut self,
         id: persistent_roots::PersistentRootId,
     ) -> Option<Value> {
-        self.persistent_roots.remove(id)
+        self.persistent_roots.remove(id, &self.gc_heap)
     }
 
     /// Borrow persistent roots for GC tracing.

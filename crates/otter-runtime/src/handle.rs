@@ -182,6 +182,12 @@ impl RuntimeTaskQueue for InboxRuntimeTaskQueue {
         task: Box<dyn RuntimeTask>,
         liveness: RuntimeLiveness,
     ) -> Result<(), OtterError> {
+        if self.counters.shutdown.load(Ordering::Acquire) {
+            return Err(OtterError::Internal {
+                code: DiagnosticCode::RuntimeShutdown.as_str().to_string(),
+                message: "runtime isolate is shutting down".to_string(),
+            });
+        }
         self.counters.retain_host_activity(liveness);
         match self
             .tx
@@ -304,6 +310,12 @@ enum RuntimeCommand {
         path: PathBuf,
         reply: RunReply,
     },
+    RunModuleSource {
+        id: CommandId,
+        source: SourceInput,
+        url: String,
+        reply: RunReply,
+    },
     Eval {
         id: CommandId,
         source: SourceInput,
@@ -338,10 +350,13 @@ impl RuntimeHandle {
     ) -> Result<Self, OtterError> {
         Runtime::validate_config(&config)?;
         let command_timeout = config.timeout();
-        let event_loop = TokioEventLoop::current_or_owned().map_err(|e| OtterError::Internal {
-            code: DiagnosticCode::TokioRuntimeCreate.as_str().to_string(),
-            message: e.to_string(),
-        })?;
+        let event_loop = match config.runtime_host() {
+            Some(host) => host.event_loop(),
+            None => TokioEventLoop::current_or_owned().map_err(|e| OtterError::Internal {
+                code: DiagnosticCode::TokioRuntimeCreate.as_str().to_string(),
+                message: e.to_string(),
+            })?,
+        };
         let (tx, rx) = sync_channel(capacity);
         let (interrupt_tx, interrupt_rx) = sync_channel(1);
         let counters = Arc::new(RuntimeCounters {
@@ -506,6 +521,39 @@ impl RuntimeHandle {
         self.await_run_reply(rx).await
     }
 
+    /// Run an in-memory ES module graph rooted at an absolute URL.
+    ///
+    /// # Errors
+    /// See [`OtterError`].
+    pub async fn run_module_source(
+        &self,
+        source: SourceInput,
+        url: impl Into<String>,
+    ) -> Result<ExecutionResult, OtterError> {
+        self.run_module_source_with_diagnostics(source, url)
+            .await
+            .into_result()
+    }
+
+    /// Run an in-memory module and retain partial JIT diagnostics on failure.
+    pub async fn run_module_source_with_diagnostics(
+        &self,
+        source: SourceInput,
+        url: impl Into<String>,
+    ) -> ExecutionAttempt {
+        let (reply, rx) = oneshot::channel();
+        let id = self.next_command_id();
+        if let Err(error) = self.submit(RuntimeCommand::RunModuleSource {
+            id,
+            source,
+            url: url.into(),
+            reply,
+        }) {
+            return ExecutionAttempt::from_result(Err(error), None, None);
+        }
+        self.await_run_reply(rx).await
+    }
+
     /// Evaluate a source bundle through the isolate runner.
     ///
     /// # Errors
@@ -532,6 +580,28 @@ impl RuntimeHandle {
             .fetch_add(1, Ordering::Relaxed);
         self.inner.interrupt.interrupt();
         let _ = self.inner.tx.try_send(RuntimeMessage::Interrupt);
+    }
+
+    /// Begin shutting down this isolate and invalidate every clone of the
+    /// handle.
+    ///
+    /// This is the page/worker lifecycle boundary for embedders that need
+    /// deterministic teardown before all handle clones naturally drop. The
+    /// cooperative interrupt wakes a running script; the shutdown message then
+    /// makes later commands and runtime-task delivery fail instead of reaching
+    /// a replacement or already-destroyed document.
+    pub fn shutdown(&self) {
+        if self.inner.counters.shutdown.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.inner.interrupt.interrupt();
+        let _ = self.inner.tx.send(RuntimeMessage::Shutdown);
+    }
+
+    /// `true` after explicit shutdown or isolate teardown has begun.
+    #[must_use]
+    pub fn is_shutdown(&self) -> bool {
+        self.inner.counters.shutdown.load(Ordering::Acquire)
     }
 
     /// Schedule a timer wake through the runtime inbox.
@@ -1539,6 +1609,14 @@ impl IsolateRunner {
                 let attempt = self.runtime.finish_jit_debug_attempt(result);
                 send_run_reply(reply, attempt, &self.counters);
             }
+            RuntimeCommand::RunModuleSource {
+                source, url, reply, ..
+            } => {
+                let result = self.runtime.run_module_source(source, url);
+                let result = self.drive_event_loop_to_idle(result);
+                let attempt = self.runtime.finish_jit_debug_attempt(result);
+                send_run_reply(reply, attempt, &self.counters);
+            }
             RuntimeCommand::Eval { source, reply, .. } => {
                 let result = self.runtime.eval(source);
                 let result = self.drive_event_loop_to_idle(result);
@@ -1618,6 +1696,7 @@ impl RuntimeCommand {
             | RuntimeCommand::RunFile { id, .. }
             | RuntimeCommand::RunScript { id, .. }
             | RuntimeCommand::RunModule { id, .. }
+            | RuntimeCommand::RunModuleSource { id, .. }
             | RuntimeCommand::Eval { id, .. } => *id,
         }
     }

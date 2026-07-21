@@ -6,9 +6,11 @@
 //!   keeps: `pending` (rejected, not yet reported) and `notified` (reported as
 //!   `unhandledrejection`, retained so a late handler can fire
 //!   `rejectionhandled`).
+//! - [`PromiseRejectionHook`] — the embedder-owned callback used by browser
+//!   hosts to materialize rejection events on the isolate thread.
 //! - [`Interpreter::run_promise_rejection_checkpoint`] — run once each time the
 //!   microtask queue drains empty. Re-reads each tracked promise's live
-//!   `[[PromiseIsHandled]]` and dispatches events through the JS reporter.
+//!   `[[PromiseIsHandled]]` and dispatches through the Rust hook or JS reporter.
 //!
 //! # Invariants
 //! - A promise enters `pending` only via [`RejectionTracker::note_rejected`],
@@ -21,16 +23,65 @@
 //! - Both lists are GC roots (traced from [`crate::runtime_state`]); a tracked
 //!   handle would otherwise be reclaimed while the reason is still pending
 //!   report.
-//! - Firing is a no-op (and both lists are cleared) when no JS reporter is
-//!   installed — a bare VM realm has no global to route the event to, so
+//! - Firing is a no-op (and both lists are cleared) when neither a Rust hook nor
+//!   a JS reporter is installed — a bare VM realm has no event target, so
 //!   accumulating handles there would leak.
 //!
 //! # See also
 //! `crates/otter-web/src/web_bootstrap.js` (`__otterFirePromiseRejection`) — the
 //! reporter that builds the `PromiseRejectionEvent`, invokes `globalThis.on*`,
 //! and falls back to `reportError`.
+use std::sync::Arc;
+
 use crate::*;
 use otter_gc::raw::SlotVisitor;
+
+/// Rust-side observer for the HTML Promise rejection checkpoint.
+///
+/// The callback always runs on the isolate's owning thread. `promise` and
+/// `reason` are raw values current at callback entry; a callback that allocates
+/// must park both in `ctx.scope` first. Implementations must not retain either
+/// value after returning.
+pub trait PromiseRejectionHook: Send + Sync + 'static {
+    /// Report one unhandled (`handled == false`) or later-handled
+    /// (`handled == true`) rejection.
+    fn notify(
+        &self,
+        ctx: &mut NativeCtx<'_>,
+        promise: Value,
+        reason: Value,
+        handled: bool,
+    ) -> Result<(), NativeError>;
+}
+
+/// Cloneable configured rejection hook.
+#[derive(Clone)]
+pub struct PromiseRejectionHookHandle(Arc<dyn PromiseRejectionHook>);
+
+impl PromiseRejectionHookHandle {
+    /// Wrap a hook implementation.
+    #[must_use]
+    pub fn new(hook: impl PromiseRejectionHook) -> Self {
+        Self(Arc::new(hook))
+    }
+
+    fn notify(
+        &self,
+        ctx: &mut NativeCtx<'_>,
+        promise: Value,
+        reason: Value,
+        handled: bool,
+    ) -> Result<(), NativeError> {
+        self.0.notify(ctx, promise, reason, handled)
+    }
+}
+
+impl std::fmt::Debug for PromiseRejectionHookHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PromiseRejectionHookHandle")
+            .finish_non_exhaustive()
+    }
+}
 
 /// Global name of the JS reporter the web layer installs. The VM invokes it at
 /// the checkpoint with `(promise, reason, wasHandled)`.
@@ -111,10 +162,12 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
     ) -> Result<(), RunError> {
-        // No reporter installed (bare VM realm): there is no global object to
-        // deliver the event to, so drop the tracked handles rather than leak.
+        // A Rust hook takes precedence over the compatibility JS reporter.
+        // With neither installed there is no host to deliver to, so drop the
+        // tracked handles rather than leak.
+        let has_hook = self.promise_rejection_hook().is_some();
         let reporter = crate::object::get(self.global_this, &self.gc_heap, REPORTER_GLOBAL);
-        if !reporter.is_some_and(|r| r.is_callable()) {
+        if !has_hook && !reporter.is_some_and(|r| r.is_callable()) {
             self.rejection_tracker.clear();
             return Ok(());
         }
@@ -158,6 +211,23 @@ impl Interpreter {
         promise: crate::promise::JsPromiseHandle,
         handled: bool,
     ) {
+        let reason = match promise.state(&self.gc_heap) {
+            crate::promise::PromiseState::Rejected(reason) => reason,
+            // Only rejected promises are tracked; a settled-elsewhere handle is
+            // stale bookkeeping, skip it.
+            _ => return,
+        };
+        let promise_value = Value::promise(promise);
+        if let Some(hook) = self.promise_rejection_hook() {
+            let _ = NativeCtx::with_host_context(
+                self,
+                NativeCallInfo::default_call(),
+                Some(context),
+                |ctx| hook.notify(ctx, promise_value, reason, handled),
+            );
+            return;
+        }
+
         // Re-fetch per call: the reporter Value is not rooted across the
         // reentrant dispatch a previous fire may have moved it through.
         let Some(reporter) = crate::object::get(self.global_this, &self.gc_heap, REPORTER_GLOBAL)
@@ -167,13 +237,6 @@ impl Interpreter {
         if !reporter.is_callable() {
             return;
         }
-        let reason = match promise.state(&self.gc_heap) {
-            crate::promise::PromiseState::Rejected(reason) => reason,
-            // Only rejected promises are tracked; a settled-elsewhere handle is
-            // stale bookkeeping, skip it.
-            _ => return,
-        };
-        let promise_value = Value::promise(promise);
         let this = Value::object(self.global_this);
         let args: smallvec::SmallVec<[Value; 8]> =
             smallvec::smallvec![promise_value, reason, Value::boolean(handled)];

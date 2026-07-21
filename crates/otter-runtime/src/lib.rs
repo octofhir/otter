@@ -99,7 +99,7 @@ use serde::{Deserialize, Serialize};
 pub use compiled_program::CompiledProgram;
 pub use diagnostics::{Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticKind, StackFrame};
 pub use error::{ConfigError, IoErrorKind, OtterError};
-pub use event_loop::RuntimeLiveness;
+pub use event_loop::{RuntimeLiveness, TokioRuntimeHost};
 pub use handle::{RuntimeActivityStats, RuntimeHandle};
 pub use hooks::{
     CapabilityRequest, RuntimeCapability, RuntimeCapabilityHook, RuntimeCompileHook,
@@ -140,6 +140,7 @@ pub use otter_vm::{
 // are public, so the types naming their arguments must be reachable
 // without a direct `otter-vm` dependency.
 pub use otter_vm::host_completion::{HostCompletionJob, HostCompletionSink, HostKeepAlive};
+pub use otter_vm::promise_rejection::{PromiseRejectionHook, PromiseRejectionHookHandle};
 pub use otter_vm::{
     DynamicImportLoader, DynamicImportLoaderHandle, TimerEntry, TimerScheduler,
     TimerSchedulerHandle,
@@ -1415,6 +1416,7 @@ pub(crate) struct RuntimeConfig {
     max_heap_bytes: u64,
     timeout: Duration,
     max_stack_depth: u32,
+    runtime_host: Option<TokioRuntimeHost>,
     capabilities: CapabilitySet,
     loader: Option<module_loader::LoaderConfig>,
     hosted_modules: Vec<HostedModule>,
@@ -1430,6 +1432,7 @@ pub(crate) struct RuntimeConfig {
     install_process_global: bool,
     install_worker_global: bool,
     console_sink: ConsoleSinkHandle,
+    promise_rejection_hook: Option<PromiseRejectionHookHandle>,
     hooks: RuntimeHooks,
     process_argv: Vec<String>,
     process_cwd: PathBuf,
@@ -1532,6 +1535,17 @@ impl RuntimeModuleGraphState {
         self.last_entry_url = Some(linked.entry_url.clone());
         self.last_module_count = linked.module.module_inits.len();
         Ok((linked, timings))
+    }
+
+    fn load_program_source(
+        &mut self,
+        loader: &module_loader::ModuleLoader,
+        entry: module_loader::ResolvedSource,
+    ) -> Result<module_graph::LinkedProgram, module_graph::GraphError> {
+        let linked = module_graph::load_program_source(loader, entry)?;
+        self.last_entry_url = Some(linked.entry_url.clone());
+        self.last_module_count = linked.module.module_inits.len();
+        Ok(linked)
     }
 }
 
@@ -1647,6 +1661,7 @@ impl Default for RuntimeConfig {
             max_heap_bytes: DEFAULT_MAX_HEAP_BYTES,
             timeout: DEFAULT_TIMEOUT,
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
+            runtime_host: None,
             capabilities: CapabilitySet::default(),
             loader: None,
             hosted_modules: Vec::new(),
@@ -1659,6 +1674,7 @@ impl Default for RuntimeConfig {
             install_process_global: true,
             install_worker_global: true,
             console_sink: otter_vm::console::default_console_sink(),
+            promise_rejection_hook: None,
             hooks: RuntimeHooks::default(),
             process_argv: process::default_argv(),
             process_cwd: process::default_cwd(),
@@ -1673,6 +1689,10 @@ impl Default for RuntimeConfig {
 impl RuntimeConfig {
     pub(crate) fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    pub(crate) fn runtime_host(&self) -> Option<TokioRuntimeHost> {
+        self.runtime_host.clone()
     }
 }
 
@@ -1741,6 +1761,34 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn max_stack_depth(mut self, depth: u32) -> Self {
         self.config.max_stack_depth = depth;
+        self
+    }
+
+    /// Share one Tokio-backed host across this isolate and sibling isolates.
+    ///
+    /// A browser should construct one [`TokioRuntimeHost`] for the process and
+    /// clone it into every page or worker builder. Each runtime still owns an
+    /// independent isolate; only executor-backed host services are shared.
+    #[must_use]
+    pub fn runtime_host(mut self, host: TokioRuntimeHost) -> Self {
+        self.config.runtime_host = Some(host);
+        self
+    }
+
+    /// Use an embedder-owned Tokio runtime for Layer B host I/O.
+    ///
+    /// [`Self::build_handle`] uses this handle for timers, remote module
+    /// fetches, and async native futures instead of discovering an ambient
+    /// runtime or creating another executor. The handle is cloned and the
+    /// embedder must keep its Tokio runtime alive for at least as long as the
+    /// returned [`RuntimeHandle`].
+    ///
+    /// A direct [`Runtime`] remains executor-agnostic: Layer A embedders install
+    /// their own [`HostCompletionSink`] and deliver the resulting jobs through
+    /// [`Runtime::run_host_completion`].
+    #[must_use]
+    pub fn tokio_handle(mut self, handle: tokio::runtime::Handle) -> Self {
+        self.config.runtime_host = Some(TokioRuntimeHost::from_handle(handle));
         self
     }
 
@@ -1861,6 +1909,17 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn console_sink(mut self, sink: ConsoleSinkHandle) -> Self {
         self.config.console_sink = sink;
+        self
+    }
+
+    /// Observe unhandled and later-handled Promise rejections from Rust.
+    ///
+    /// The hook is installed independently in every runtime built from this
+    /// builder and takes precedence over the legacy
+    /// `__otterFirePromiseRejection` JavaScript reporter.
+    #[must_use]
+    pub fn promise_rejection_hook(mut self, hook: impl PromiseRejectionHook) -> Self {
+        self.config.promise_rejection_hook = Some(PromiseRejectionHookHandle::new(hook));
         self
     }
 
@@ -2026,6 +2085,9 @@ impl Runtime {
         interp.set_max_stack_depth(config.max_stack_depth);
         interp.set_allow_blocking_atomics_wait(config.allow_blocking_atomics_wait);
         interp.set_console_sink(config.console_sink.clone());
+        if let Some(hook) = config.promise_rejection_hook.clone() {
+            interp.set_promise_rejection_hook(hook);
+        }
         let layer_a_dynamic_imports = LayerADynamicImportQueue::default();
         // Attached class glue and extension JS are deferred until the
         // runtime is fully assembled: the sources reference globals
@@ -2451,12 +2513,21 @@ impl Runtime {
         self.interp.set_host_completion_sink(sink);
     }
 
-    /// Run a host completion job posted by an async native method's
-    /// future. Executed on the isolate thread by the runner's inbox.
-    pub(crate) fn run_host_completion(
-        &mut self,
-        job: otter_vm::host_completion::HostCompletionJob,
-    ) {
+    /// Install or replace the Rust-side Promise rejection observer.
+    pub fn install_promise_rejection_hook(&mut self, hook: impl PromiseRejectionHook) {
+        self.interp
+            .set_promise_rejection_hook(PromiseRejectionHookHandle::new(hook));
+    }
+
+    /// Run a host completion job posted by an async native future.
+    ///
+    /// Layer B calls this from its isolate inbox. A Layer A embedder can
+    /// install a custom [`HostCompletionSink`] whose `complete` method posts
+    /// the owned job into the embedder's event queue, then call this method on
+    /// the runtime's owning thread when that event arrives. The job must never
+    /// run on an executor worker: it may allocate, resolve persistent roots,
+    /// and settle JavaScript promises in this isolate.
+    pub fn run_host_completion(&mut self, job: otter_vm::host_completion::HostCompletionJob) {
         job.run(&mut self.interp);
     }
 
@@ -3213,6 +3284,63 @@ impl Runtime {
         Ok(true)
     }
 
+    /// Resolve a registered host promise with a JavaScript value materialized
+    /// on this isolate's mutator turn.
+    ///
+    /// The host side carries only [`PromiseId`] plus owned Rust data. After an
+    /// inbox or browser-event hop, `materialize` runs inside a handle scope and
+    /// can build a `Response`, DOM wrapper, array, or any other GC-managed
+    /// value without sending a [`Value`] across threads or isolates.
+    ///
+    /// A late or duplicate id returns `Ok(false)` without calling
+    /// `materialize`. The registry entry is consumed before materialization,
+    /// including when the closure fails, so settlement remains one-shot.
+    ///
+    /// # Errors
+    /// Returns an embedder materialization error or a reaction-drain error.
+    pub fn settle_pending_promise_with<F>(
+        &mut self,
+        id: promise_registry::PromiseId,
+        materialize: F,
+    ) -> Result<bool, OtterError>
+    where
+        F: for<'scope, 'rt> FnOnce(
+            &mut RuntimeNativeScope<'scope, 'rt>,
+        ) -> Result<RuntimeLocal<'scope>, RuntimeNativeError>,
+    {
+        let root = match self.promise_registry.take(id) {
+            Some(root) => root,
+            None => return Ok(false),
+        };
+        let settled = otter_vm::NativeCtx::with_host_context(
+            &mut self.interp,
+            otter_vm::NativeCallInfo::default_call(),
+            None,
+            |ctx| {
+                ctx.scope(|mut scope| -> Result<bool, OtterError> {
+                    let Some(promise) = scope.take_persistent_root(root) else {
+                        return Ok(false);
+                    };
+                    let payload = materialize(&mut scope).map_err(map_native_error)?;
+                    scope
+                        .fulfill_promise(promise, payload)
+                        .map_err(map_native_error)?;
+                    Ok(true)
+                })
+            },
+        )?;
+        if !settled {
+            return Ok(false);
+        }
+        if let Err(err) = self.interp.drain_microtasks_with_default(None) {
+            return Err(enrich_runtime_diagnostic_with_cause(
+                &mut self.interp,
+                map_vm_error(err),
+            ));
+        }
+        Ok(true)
+    }
+
     /// Fire the timer identified by `token`. Routes through
     /// the per-isolate `TimerCallbacks` table to recover the JS
     /// callable + extra arguments + execution context, invokes the
@@ -3633,7 +3761,18 @@ impl Runtime {
         self.finish_jit_debug_attempt(result)
     }
 
-    fn run_script_with_context(
+    /// Run a classic script and return the execution context used for later
+    /// host-driven events in the same page/realm.
+    ///
+    /// Browser embedders retain the owned [`RuntimeExecutionContext`] beside
+    /// the document and pass it to [`Self::run_native_event`] for pointer,
+    /// keyboard, storage, and broadcast tasks. The context contains no borrow
+    /// of the runtime; all actual VM access still requires `&mut Runtime` on
+    /// the isolate's owning thread.
+    ///
+    /// # Errors
+    /// See [`OtterError`] variants.
+    pub fn run_script_with_context(
         &mut self,
         source: SourceInput,
         specifier: &str,
@@ -3796,7 +3935,10 @@ impl Runtime {
             Ok(value) => value,
             Err(err) => {
                 let mapped = map_vm_error(err);
-                return Err(enrich_runtime_diagnostic_with_cause(&mut self.interp, mapped));
+                return Err(enrich_runtime_diagnostic_with_cause(
+                    &mut self.interp,
+                    mapped,
+                ));
             }
         };
         // Both the checkpoint and the import pump allocate, and the young
@@ -3807,7 +3949,10 @@ impl Runtime {
             Ok(()) => self.pump_layer_a_dynamic_imports(&context),
             Err(err) => {
                 let mapped = map_vm_error(err);
-                Err(enrich_runtime_diagnostic_with_cause(&mut self.interp, mapped))
+                Err(enrich_runtime_diagnostic_with_cause(
+                    &mut self.interp,
+                    mapped,
+                ))
             }
         };
         if let Err(err) = settled {
@@ -3911,6 +4056,42 @@ impl Runtime {
             .map(|(result, _)| self.attach_jit_debug_report(result))
     }
 
+    /// Load, link, and execute an ES module graph from an in-memory entry.
+    ///
+    /// `url` is the module's canonical absolute URL. Static imports resolve
+    /// relative to it and load through the configured module loader / remote
+    /// fetch hook. The entry text itself is never read from the filesystem,
+    /// which makes this the `<script type="module">` and pre-fetched HTTP
+    /// module entry point for browser embedders.
+    ///
+    /// # Errors
+    /// See [`OtterError`] variants. A relative or malformed entry URL is a
+    /// resolution diagnostic.
+    pub fn run_module_source(
+        &mut self,
+        source: SourceInput,
+        url: impl Into<String>,
+    ) -> Result<ExecutionResult, OtterError> {
+        self.interp.begin_jit_debug_capture();
+        let start = std::time::Instant::now();
+        let url = url.into();
+        let loader = self.module_loader_for_entry(Path::new("."));
+        let linked = self
+            .module_graph
+            .load_program_source(
+                &loader,
+                module_loader::ResolvedSource {
+                    url,
+                    kind: source.kind,
+                    jsx: None,
+                    text: source.text,
+                },
+            )
+            .map_err(map_graph_error)?;
+        self.execute_linked_module(linked, start, None)
+            .map(|(result, _)| self.attach_jit_debug_report(result))
+    }
+
     /// Run a module while retaining partial JIT diagnostics on abrupt failure.
     pub fn run_module_with_diagnostics(
         &mut self,
@@ -4007,6 +4188,15 @@ impl Runtime {
                 .map_err(map_graph_error)?
         };
 
+        self.execute_linked_module(linked, start, timings)
+    }
+
+    fn execute_linked_module(
+        &mut self,
+        linked: module_graph::LinkedProgram,
+        start: std::time::Instant,
+        mut timings: Option<&mut module_graph::ModulePhaseTimings>,
+    ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
         let runtime_link_started = timings.is_some().then(std::time::Instant::now);
         let mut module = linked.module;
         for metadata in &linked.metadata {
@@ -4386,6 +4576,17 @@ impl Otter {
         self.handle.run_file(path.as_ref().to_path_buf()).await
     }
 
+    /// Run an in-memory ES module graph rooted at an absolute URL.
+    ///
+    /// This is the async facade over [`Runtime::run_module_source`].
+    pub async fn run_module_source(
+        &self,
+        source: SourceInput,
+        url: impl Into<String>,
+    ) -> Result<ExecutionResult, OtterError> {
+        self.handle.run_module_source(source, url).await
+    }
+
     /// Run a file and retain partial JIT diagnostics on abrupt failure.
     pub async fn run_file_with_diagnostics(&self, path: impl AsRef<Path>) -> ExecutionAttempt {
         self.handle
@@ -4620,6 +4821,22 @@ impl OtterBuilder {
         self
     }
 
+    /// Use an embedder-owned Tokio runtime for host I/O. See
+    /// [`RuntimeBuilder::tokio_handle`].
+    #[must_use]
+    pub fn tokio_handle(mut self, handle: tokio::runtime::Handle) -> Self {
+        self.runtime = self.runtime.tokio_handle(handle);
+        self
+    }
+
+    /// Share one [`TokioRuntimeHost`] with sibling isolates. See
+    /// [`RuntimeBuilder::runtime_host`].
+    #[must_use]
+    pub fn runtime_host(mut self, host: TokioRuntimeHost) -> Self {
+        self.runtime = self.runtime.runtime_host(host);
+        self
+    }
+
     /// Override the module-loader configuration.
     #[must_use]
     pub fn module_loader(mut self, loader: module_loader::LoaderConfig) -> Self {
@@ -4690,6 +4907,14 @@ impl OtterBuilder {
     #[must_use]
     pub fn console_sink(mut self, sink: ConsoleSinkHandle) -> Self {
         self.runtime = self.runtime.console_sink(sink);
+        self
+    }
+
+    /// Observe Promise rejection checkpoints. See
+    /// [`RuntimeBuilder::promise_rejection_hook`].
+    #[must_use]
+    pub fn promise_rejection_hook(mut self, hook: impl PromiseRejectionHook) -> Self {
+        self.runtime = self.runtime.promise_rejection_hook(hook);
         self
     }
 

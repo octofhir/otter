@@ -9,10 +9,16 @@
 //! settle with no executor round-trip, and rejections must surface as
 //! real error instances.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
 use otter_macros::{HostClass, js_class};
-use otter_runtime::{ConsoleLevel, ConsoleSink, GlobalClass, Otter, OtterError, SourceInput};
+use otter_runtime::{
+    ConsoleLevel, ConsoleSink, GlobalClass, HostCompletionJob, HostCompletionSink, HostKeepAlive,
+    Otter, OtterError, Runtime, SourceInput,
+};
 use otter_vm::marshal::JsError;
 
 #[derive(Debug, Default)]
@@ -84,6 +90,46 @@ fn build_otter(capture: Arc<LogCapture>) -> Otter {
         .global_classes([GlobalClass::from_intrinsic::<SleeperIntrinsic>()])
         .build()
         .expect("otter")
+}
+
+struct ChannelCompletionSink {
+    handle: tokio::runtime::Handle,
+    tx: Sender<HostCompletionJob>,
+}
+
+impl HostCompletionSink for ChannelCompletionSink {
+    fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+        self.handle.spawn(future);
+    }
+
+    fn complete(&self, job: HostCompletionJob) {
+        self.tx
+            .send(job)
+            .expect("Layer A completion receiver lives");
+    }
+
+    fn keep_alive(&self) -> HostKeepAlive {
+        HostKeepAlive::noop()
+    }
+
+    fn with_executor_context(&self, f: &mut dyn FnMut()) {
+        let _guard = self.handle.enter();
+        f();
+    }
+}
+
+fn build_layer_a(
+    capture: Arc<LogCapture>,
+    handle: tokio::runtime::Handle,
+) -> (Runtime, Receiver<HostCompletionJob>) {
+    let mut runtime = Runtime::builder()
+        .console_sink(capture)
+        .global_classes([GlobalClass::from_intrinsic::<SleeperIntrinsic>()])
+        .build()
+        .expect("runtime");
+    let (tx, rx) = channel();
+    runtime.install_host_completion_sink(Arc::new(ChannelCompletionSink { handle, tx }));
+    (runtime, rx)
 }
 
 /// Real async: the future parks on Tokio, the event loop stays alive
@@ -187,4 +233,58 @@ async fn async_method_composes_with_js_await() -> Result<(), OtterError> {
         .await?;
     assert_eq!(capture.snapshot(), vec!["seq:a+5|b+1".to_string()]);
     Ok(())
+}
+
+#[test]
+fn layer_a_embedder_delivers_async_completion_on_its_own_thread() {
+    let executor = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("Tokio runtime");
+    let capture = LogCapture::new();
+    let (mut runtime, completions) = build_layer_a(capture.clone(), executor.handle().clone());
+
+    runtime
+        .run_script(
+            SourceInput::from_javascript(
+                "new Sleeper('browser').wait(1).then(value => console.log(value));",
+            ),
+            "<layer-a-async>",
+        )
+        .expect("script starts async work");
+
+    let job = completions
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("executor posts the completion to the embedder queue");
+    runtime.run_host_completion(job);
+
+    assert_eq!(capture.snapshot(), vec!["browser+1".to_string()]);
+}
+
+#[test]
+fn build_handle_uses_an_explicit_embedder_tokio_runtime() {
+    let executor = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("Tokio runtime");
+    let capture = LogCapture::new();
+    let otter = Otter::builder()
+        .tokio_handle(executor.handle().clone())
+        .console_sink(capture.clone())
+        .global_classes([GlobalClass::from_intrinsic::<SleeperIntrinsic>()])
+        .build()
+        .expect("otter");
+
+    executor
+        .block_on(otter.handle().run_script(
+            SourceInput::from_javascript(
+                "new Sleeper('shared').wait(1).then(value => console.log(value));",
+            ),
+            "<explicit-tokio>",
+        ))
+        .expect("script completes on the supplied executor");
+
+    assert_eq!(capture.snapshot(), vec!["shared+1".to_string()]);
 }

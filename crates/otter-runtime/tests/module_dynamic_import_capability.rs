@@ -546,6 +546,48 @@ async fn dynamic_import_fetches_https_module_with_net_capability() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dynamic_http_import_settles_in_its_origin_realm() {
+    let addr = spawn_one_shot_http_server(
+        "export const answer = 42; export const url = import.meta.url;".to_string(),
+    )
+    .await;
+    let host = addr.to_string();
+    let mut capabilities = CapabilitySet::sandbox();
+    capabilities.net = Permission::allow(vec![host.clone()]);
+    let otter = Otter::builder()
+        .capabilities(capabilities)
+        .build()
+        .expect("otter");
+    let realm = otter.create_realm().await.expect("realm");
+    let target = format!("http://{host}/dynamic.js");
+
+    otter
+        .run_module_source_in_realm(
+            realm,
+            otter_runtime::SourceInput::from_javascript(format!(
+                "const target = {target:?}; const loaded = await import(target); globalThis.dynamicRealmResult = loaded.answer + ':' + loaded.url;"
+            )),
+            "https://origin.test/entry.js",
+        )
+        .await
+        .expect("realm dynamic import");
+    let result = otter
+        .run_script_in_realm(
+            realm,
+            otter_runtime::SourceInput::from_javascript("dynamicRealmResult"),
+            "realm:dynamic-result",
+        )
+        .await
+        .expect("realm result");
+    assert_eq!(result.completion_string(), format!("42:{target}"));
+    let default = otter
+        .run_script("typeof dynamicRealmResult")
+        .await
+        .expect("default realm check");
+    assert_eq!(default.completion_string(), "undefined");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dynamic_http_import_prepares_static_dependencies_off_isolate() {
     let addr = spawn_module_graph_http_server().await;
     let host = addr.to_string();

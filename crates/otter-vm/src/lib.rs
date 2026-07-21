@@ -306,12 +306,12 @@ pub use value::{Value, ValueKind};
 #[doc(hidden)]
 pub struct HostRealmId(u32);
 
-/// Active-realm state that must switch together for cross-realm calls.
+/// Complete active-realm state switched together for cross-realm calls.
 ///
-/// This keeps the first real realm slice compact: the global object, error
-/// constructors, and intrinsic prototype caches whose identity is observable
-/// through Test262 cross-realm checks.
-#[derive(Clone)]
+/// The global object, intrinsics, global lexical environment, templates,
+/// module map/evaluation caches, and rejection tracker all have realm identity.
+/// Keeping them in this single state object prevents an extra realm from
+/// reading roots or lifecycle state owned by the default realm.
 pub(crate) struct RealmState {
     /// Stable scalar identity. Function-to-realm metadata stores this id rather
     /// than a GC handle, so the metadata needs no separate root protocol.
@@ -326,6 +326,31 @@ pub(crate) struct RealmState {
     pub(crate) regexp_string_iterator_prototype: Option<JsObject>,
     pub(crate) iterator_helper_prototype: Option<JsObject>,
     pub(crate) wrap_for_valid_iterator_prototype: Option<JsObject>,
+    pub(crate) template_objects: rustc_hash::FxHashMap<(u32, u32), Value>,
+    pub(crate) realm_context: Option<ExecutionContext>,
+    pub(crate) module_environments: std::collections::HashMap<std::sync::Arc<str>, JsObject>,
+    pub(crate) host_module_env_cache: std::collections::HashMap<std::sync::Arc<str>, JsObject>,
+    pub(crate) module_init_upvalues:
+        std::collections::HashMap<std::sync::Arc<str>, Box<[crate::UpvalueCell]>>,
+    pub(crate) global_lexicals: rustc_hash::FxHashMap<Box<str>, (crate::UpvalueCell, bool)>,
+    pub(crate) global_lexical_epoch: u64,
+    pub(crate) global_lexical_load_ic: rustc_hash::FxHashMap<(u32, u32), crate::UpvalueCell>,
+    pub(crate) global_object_load_ic:
+        rustc_hash::FxHashMap<(u32, u32), crate::global_ops::GlobalObjectLoadCache>,
+    pub(crate) module_evaluation_depth: u32,
+    pub(crate) module_hoisted: std::collections::HashSet<std::sync::Arc<str>>,
+    pub(crate) module_resolution_cache:
+        std::collections::HashMap<(std::sync::Arc<str>, String), std::sync::Arc<str>>,
+    pub(crate) module_records:
+        std::collections::HashMap<std::sync::Arc<str>, module_records::ModuleRecordState>,
+    pub(crate) next_module_async_order: u64,
+    pub(crate) deferred_namespaces: std::collections::HashMap<std::sync::Arc<str>, JsObject>,
+    pub(crate) module_namespaces: std::collections::HashMap<std::sync::Arc<str>, JsObject>,
+    pub(crate) module_resolved_exports: std::collections::HashMap<
+        std::sync::Arc<str>,
+        std::collections::BTreeMap<String, (std::sync::Arc<str>, String)>,
+    >,
+    pub(crate) rejection_tracker: crate::promise_rejection::RejectionTracker,
 }
 
 impl RealmState {
@@ -349,6 +374,41 @@ impl RealmState {
         {
             object.trace_gc_roots(visitor);
         }
+        for value in self.template_objects.values() {
+            value.trace_value_slots(visitor);
+        }
+        for object in self
+            .module_environments
+            .values()
+            .chain(self.host_module_env_cache.values())
+            .chain(self.deferred_namespaces.values())
+            .chain(self.module_namespaces.values())
+        {
+            object.trace_gc_roots(visitor);
+        }
+        for spine in self.module_init_upvalues.values() {
+            for slot in spine.iter() {
+                let pointer = slot as *const crate::UpvalueCell as *mut otter_gc::raw::RawGc;
+                visitor(pointer);
+            }
+        }
+        for (slot, _) in self.global_lexicals.values() {
+            let pointer = slot as *const crate::UpvalueCell as *mut otter_gc::raw::RawGc;
+            visitor(pointer);
+        }
+        for slot in self.global_lexical_load_ic.values() {
+            let pointer = slot as *const crate::UpvalueCell as *mut otter_gc::raw::RawGc;
+            visitor(pointer);
+        }
+        for record in self.module_records.values() {
+            if let Some(value) = &record.evaluation_error {
+                value.trace_value_slots(visitor);
+            }
+            if let Some(promise) = &record.evaluation_promise {
+                promise.trace_value_slots(visitor);
+            }
+        }
+        self.rejection_tracker.trace(visitor);
     }
 }
 
@@ -873,8 +933,8 @@ pub struct Interpreter {
     /// land while this is non-zero defer their target's evaluation to
     /// a host job so they cannot preempt the running DFS.
     pub(crate) module_evaluation_depth: u32,
-    /// Modules whose link-phase (function-hoisting) init pass already
-    /// ran. Cleared with the rest of the module state.
+    /// Modules whose link-phase (function-hoisting) init pass already ran.
+    /// Retained for the realm lifetime so repeated entry graphs are idempotent.
     module_hoisted: std::collections::HashSet<std::sync::Arc<str>>,
     /// Cached `(referrer, specifier) → target` lookup, built
     /// lazily from [`otter_bytecode::BytecodeModule::module_resolutions`]
@@ -885,8 +945,7 @@ pub struct Interpreter {
     /// Per-module Cyclic Module Record evaluation state (§16.2.1.4):
     /// `[[Status]]`, `[[EvaluationError]]`, and the
     /// `[[TopLevelCapability]]`-shaped promise gate. Promise and error
-    /// values are traced as GC roots. Cleared with
-    /// `module_environments`.
+    /// values are traced as GC roots and retained for the realm lifetime.
     module_records:
         std::collections::HashMap<std::sync::Arc<str>, module_records::ModuleRecordState>,
     /// Monotonic `[[AsyncEvaluationOrder]]` source (§16.2.1.4); next
@@ -894,15 +953,14 @@ pub struct Interpreter {
     next_module_async_order: u64,
     /// Cache of deferred module namespace exotic objects, keyed by
     /// target module URL, so two `import defer * as` of the same module
-    /// yield the identical object (§16.2.1). Cleared with
-    /// `module_environments`.
+    /// yield the identical object (§16.2.1) for the realm lifetime.
     deferred_namespaces: std::collections::HashMap<std::sync::Arc<str>, JsObject>,
     /// Cache of eager Module Namespace Exotic Objects (§10.4.6), keyed
     /// by target module URL, so every `import * as ns` / `export * as
-    /// ns` of the same module yields the identical object. Cleared with
-    /// `module_environments`.
+    /// ns` of the same module yields the identical object for the realm
+    /// lifetime.
     module_namespaces: std::collections::HashMap<std::sync::Arc<str>, JsObject>,
-    /// Per-run §16.2.1.6 ResolveExport tables: importing module URL →
+    /// Per-realm §16.2.1.6 ResolveExport tables: importing module URL →
     /// (exported name → `(defining_module, binding)`). Populated by the
     /// runtime from each module's
     /// [`otter_compiler::CompiledModuleMetadata::resolved_exports`].
@@ -910,8 +968,7 @@ pub struct Interpreter {
     /// ([`Op::LoadImportBinding`], `[[Get]]`, `[[OwnPropertyKeys]]`, …)
     /// consult this so re-exported and star-exported names read the
     /// defining module's live environment. `binding == "*namespace*"`
-    /// resolves to `defining_module`'s namespace object. Cleared with
-    /// `module_environments`.
+    /// resolves to `defining_module`'s namespace object.
     module_resolved_exports: std::collections::HashMap<
         std::sync::Arc<str>,
         std::collections::BTreeMap<String, (std::sync::Arc<str>, String)>,

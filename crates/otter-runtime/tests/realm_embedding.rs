@@ -37,7 +37,7 @@ fn direct_runtime_realms_are_bootstrapped_isolated_and_reusable() {
         .run_script_in_realm(
             realm,
             SourceInput::from_javascript(
-                "globalThis.realmCounter = (globalThis.realmCounter || 0) + 1; hostName + ':' + hostInstallCount;",
+                "let realmLexical = 7; globalThis.realmCounter = (globalThis.realmCounter || 0) + 1; hostName + ':' + hostInstallCount;",
             ),
             "realm:first",
         )
@@ -47,29 +47,33 @@ fn direct_runtime_realms_are_bootstrapped_isolated_and_reusable() {
     let second = runtime
         .run_script_in_realm(
             realm,
-            SourceInput::from_javascript("++globalThis.realmCounter"),
+            SourceInput::from_javascript("++globalThis.realmCounter + realmLexical"),
             "realm:second",
         )
         .expect("second turn");
-    assert_eq!(second.completion_string(), "2");
+    assert_eq!(second.completion_string(), "9");
 
     let default = runtime
         .run_script(
-            SourceInput::from_javascript("typeof realmCounter + ':' + hostInstallCount"),
+            SourceInput::from_javascript(
+                "typeof realmCounter + ':' + typeof realmLexical + ':' + hostInstallCount",
+            ),
             "default:check",
         )
         .expect("default realm");
-    assert_eq!(default.completion_string(), "undefined:1");
+    assert_eq!(default.completion_string(), "undefined:undefined:1");
 
     let other = runtime.create_realm().expect("second realm");
     let isolated = runtime
         .run_script_in_realm(
             other,
-            SourceInput::from_javascript("typeof realmCounter + ':' + hostInstallCount"),
+            SourceInput::from_javascript(
+                "typeof realmCounter + ':' + typeof realmLexical + ':' + hostInstallCount",
+            ),
             "realm:isolated",
         )
         .expect("isolated realm");
-    assert_eq!(isolated.completion_string(), "undefined:1");
+    assert_eq!(isolated.completion_string(), "undefined:undefined:1");
 }
 
 #[test]

@@ -302,10 +302,11 @@ impl Interpreter {
         self.module_environments.get(url).cloned()
     }
 
-    /// Drop every recorded module environment + resolution
-    /// cache entry. Called between top-level `run` invocations
-    /// on the same interpreter so a fresh script never observes
-    /// stale modules.
+    /// Drop every recorded module environment + resolution cache entry.
+    ///
+    /// Normal top-level module runs intentionally do not call this: a realm's
+    /// canonical-URL module map survives across entry graphs, as required by
+    /// browser embeddings. Realm disposal drops the complete realm state.
     pub fn reset_module_state(&mut self) {
         self.module_environments.clear();
         self.module_init_upvalues.clear();

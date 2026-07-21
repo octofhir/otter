@@ -48,7 +48,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use otter_runtime::{
-    InterruptHandle, OtterError, Runtime, RuntimeGlobalInstaller, RuntimeRealmContext, SourceInput,
+    InterruptHandle, OtterError, Runtime, RuntimeExtensionContext, RuntimeExtensionInstaller,
+    SourceInput,
 };
 use otter_vm::binary::array_buffer::SharedBody;
 use otter_vm::string::JsString;
@@ -131,7 +132,7 @@ pub fn reset_for_next_test() {
 /// runtime. The runner calls this once per fresh runtime before
 /// the harness preamble runs so the JS-side `$262.agent` object
 /// in [`D262_HOST_PREAMBLE`] resolves to live bindings.
-pub fn install_natives(runtime: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
+pub fn install_natives(runtime: &mut RuntimeExtensionContext<'_>) -> Result<(), OtterError> {
     for (name, length, call) in NATIVES {
         runtime.install_native_global(name, *length, *call)?;
     }
@@ -435,7 +436,7 @@ fn run_agent_thread(
         .allow_blocking_atomics_wait(true)
         .process_global(false)
         .worker_global(false)
-        .global_installer(RuntimeGlobalInstaller::new(install_natives))
+        .extension_installer(RuntimeExtensionInstaller::new(install_natives))
         .build()
     {
         Ok(runtime) => runtime,
@@ -669,7 +670,7 @@ mod tests {
             .max_heap_bytes(64 * 1024 * 1024)
             .process_global(false)
             .worker_global(false)
-            .global_installer(RuntimeGlobalInstaller::new(install_natives))
+            .extension_installer(RuntimeExtensionInstaller::new(install_natives))
             .build()
             .expect("runtime");
         let source = format!(
@@ -703,7 +704,7 @@ mod tests {
             .allow_blocking_atomics_wait(true)
             .process_global(false)
             .worker_global(false)
-            .global_installer(RuntimeGlobalInstaller::new(install_natives))
+            .extension_installer(RuntimeExtensionInstaller::new(install_natives))
             .build()
             .expect("runtime");
         let source = format!(
@@ -766,7 +767,7 @@ mod tests {
             .allow_blocking_atomics_wait(true)
             .process_global(false)
             .worker_global(false)
-            .global_installer(RuntimeGlobalInstaller::new(install_natives))
+            .extension_installer(RuntimeExtensionInstaller::new(install_natives))
             .build()
             .expect("runtime");
         let source = format!(

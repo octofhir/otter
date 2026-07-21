@@ -7,11 +7,14 @@
 //! authoritative source of truth.
 //!
 //! # Contents
-//! - [`RuntimeModuleRecords`] — per-runtime module-record table.
+//! - [`RuntimeModuleRecords`] — per-realm module-record tables owned by one
+//!   runtime isolate.
 //! - [`RuntimeModuleRecord`] — one allocated record.
 //! - [`RuntimeModuleRecordState`] — spec-aligned lifecycle states.
 //!
 //! # Invariants
+//! - Each realm owns an independent module map. Repeated entry graphs in one
+//!   realm reuse evaluated records and environments by canonical URL.
 //! - Each record advances monotonically through the phase order
 //!   `Unresolved → Resolved → Compiled → Instantiated → Evaluating →
 //!   Evaluated|Errored`. The transition methods enforce that ordering;
@@ -82,10 +85,10 @@ pub(crate) struct RuntimeModuleRecord {
     pub(crate) state: RuntimeModuleRecordState,
 }
 
-/// Per-runtime table of allocated module records.
+/// Per-realm tables of allocated module records owned by one runtime.
 #[derive(Debug, Default)]
 pub(crate) struct RuntimeModuleRecords {
-    records: BTreeMap<String, RuntimeModuleRecord>,
+    realms: BTreeMap<u32, BTreeMap<String, RuntimeModuleRecord>>,
 }
 
 impl RuntimeModuleRecords {
@@ -99,10 +102,12 @@ impl RuntimeModuleRecords {
     /// per-phase hooks; the per-record state machine stays
     /// authoritative either way.
     ///
-    /// This also resets and repopulates the VM registry used by
-    /// `Op::ImportNamespace`. Every allocation, hosted installer, cache
-    /// publication, and registry publication runs in one native handle scope;
-    /// after registration the VM registry is the environment's sole root.
+    /// Existing canonical URLs in the active realm are retained. This is the
+    /// browser/module-map rule: a dependency imported by a later entry module
+    /// observes the same environment and is not evaluated twice. Every new
+    /// allocation, hosted installer, cache publication, and registry
+    /// publication runs in one native handle scope; after registration the VM
+    /// registry is the environment's sole root.
     pub(crate) fn allocate_for_module_inits(
         &mut self,
         interp: &mut Interpreter,
@@ -111,12 +116,14 @@ impl RuntimeModuleRecords {
         capabilities: &CapabilitySet,
         runtime_task_spawner: Option<RuntimeTaskSpawner>,
     ) -> Result<(), OtterError> {
-        self.records.clear();
-        interp.reset_module_state();
-        let records = &mut self.records;
+        let realm_id = interp.active_host_realm_id();
+        let records = self.realms.entry(realm_id).or_default();
         NativeCtx::with_host_context(interp, NativeCallInfo::default_call(), None, |ctx| {
             ctx.scope(|mut scope| {
                 for init in module_inits {
+                    if records.contains_key(&init.url) {
+                        continue;
+                    }
                     let env = if let Some(hosted) = hosted_modules
                         .iter()
                         .copied()
@@ -174,43 +181,59 @@ impl RuntimeModuleRecords {
     /// Mark all instantiated records as evaluating. Called once
     /// before the synthesised `<entry>` driver dispatches the
     /// first `<module-init>`.
-    pub(crate) fn mark_evaluating(&mut self) {
-        for record in self.records.values_mut() {
-            record.state = RuntimeModuleRecordState::Evaluating;
+    pub(crate) fn mark_evaluating(&mut self, realm_id: u32) {
+        for record in self.realms.entry(realm_id).or_default().values_mut() {
+            if record.state == RuntimeModuleRecordState::Instantiated {
+                record.state = RuntimeModuleRecordState::Evaluating;
+            }
         }
     }
 
     /// Mark all evaluating records as evaluated. Called when the
     /// `<entry>` driver returns successfully.
-    pub(crate) fn mark_evaluated(&mut self) {
-        for record in self.records.values_mut() {
-            record.state = RuntimeModuleRecordState::Evaluated;
+    pub(crate) fn mark_evaluated(&mut self, realm_id: u32) {
+        for record in self.realms.entry(realm_id).or_default().values_mut() {
+            if record.state == RuntimeModuleRecordState::Evaluating {
+                record.state = RuntimeModuleRecordState::Evaluated;
+            }
         }
     }
 
     /// Mark all in-progress records as errored. Called when any
     /// `<module-init>` raises an uncaught exception.
-    pub(crate) fn mark_errored(&mut self) {
-        for record in self.records.values_mut() {
-            record.state = RuntimeModuleRecordState::Errored;
+    pub(crate) fn mark_errored(&mut self, realm_id: u32) {
+        for record in self.realms.entry(realm_id).or_default().values_mut() {
+            if record.state == RuntimeModuleRecordState::Evaluating {
+                record.state = RuntimeModuleRecordState::Errored;
+            }
         }
     }
 
     /// Visit allocated records in deterministic URL order.
-    pub(crate) fn for_each_record(&self, mut f: impl FnMut(&str, u32)) {
-        for (url, record) in &self.records {
-            f(url, record.function_id);
+    pub(crate) fn for_each_record(&self, realm_id: u32, mut f: impl FnMut(&str, u32)) {
+        if let Some(records) = self.realms.get(&realm_id) {
+            for (url, record) in records {
+                f(url, record.function_id);
+            }
         }
+    }
+
+    /// Drop lifecycle metadata owned by a disposed realm.
+    pub(crate) fn dispose_realm(&mut self, realm_id: u32) {
+        self.realms.remove(&realm_id);
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.records.len()
+        self.realms.values().map(BTreeMap::len).sum()
     }
 
     #[cfg(test)]
     pub(crate) fn state(&self, url: &str) -> Option<RuntimeModuleRecordState> {
-        self.records.get(url).map(|record| record.state)
+        self.realms
+            .get(&0)
+            .and_then(|records| records.get(url))
+            .map(|record| record.state)
     }
 }
 

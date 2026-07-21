@@ -6,6 +6,8 @@
 //! - Host-realm construction publishes a provisional traced `RealmState`
 //!   before any later allocation and finalizes JS-visible error globals through
 //!   the handle arena.
+//! - Realm activation swaps the complete global, lexical, template, module,
+//!   namespace, inline-cache, and evaluation state as one isolate-local unit.
 //! - Introspection accessors expose property-IC, JIT, protector, and shape
 //!   epoch counters.
 //!
@@ -15,6 +17,7 @@
 //! - Root providers are dropped before their stack slots move into the
 //!   interpreter, and no GC allocation occurs during that move.
 //! - A half-built interpreter is never observable outside this module.
+//! - No realm-owned GC handle remains in an unswapped isolate-global cache.
 //! - Protector and shape epochs start at zero and are isolate-local plain data,
 //!   not GC roots.
 #![allow(unused_imports)]
@@ -215,6 +218,7 @@ impl Interpreter {
             deferred_namespaces: std::collections::HashMap::new(),
             module_namespaces: std::collections::HashMap::new(),
             module_resolved_exports: std::collections::HashMap::new(),
+            rejection_tracker: crate::promise_rejection::RejectionTracker::default(),
             feedback_directory: crate::interp::FeedbackDirectory::default(),
             jit_hook: None,
             jit_debug: crate::jit_debug::JitDebugState::default(),
@@ -263,7 +267,6 @@ impl Interpreter {
             pending_generator_throw: None,
             pending_uncaught_throw: None,
             iteration_anchors: Vec::new(),
-            rejection_tracker: crate::promise_rejection::RejectionTracker::default(),
             pending_uncaught_frames: None,
             module_sources: source_registry::SourceRegistry::default(),
             function_user_props: std::collections::HashMap::new(),
@@ -380,6 +383,57 @@ impl Interpreter {
         std::mem::swap(&mut self.global_this, &mut state.global_this);
         std::mem::swap(&mut self.error_classes, &mut state.error_classes);
         std::mem::swap(&mut self.realm_intrinsics, &mut state.realm_intrinsics);
+        std::mem::swap(&mut self.template_objects, &mut state.template_objects);
+        std::mem::swap(&mut self.realm_context, &mut state.realm_context);
+        std::mem::swap(
+            &mut self.module_environments,
+            &mut state.module_environments,
+        );
+        std::mem::swap(
+            &mut self.host_module_env_cache,
+            &mut state.host_module_env_cache,
+        );
+        std::mem::swap(
+            &mut self.module_init_upvalues,
+            &mut state.module_init_upvalues,
+        );
+        std::mem::swap(&mut self.global_lexicals, &mut state.global_lexicals);
+        std::mem::swap(
+            &mut self.global_lexical_epoch,
+            &mut state.global_lexical_epoch,
+        );
+        std::mem::swap(
+            &mut self.global_lexical_load_ic,
+            &mut state.global_lexical_load_ic,
+        );
+        std::mem::swap(
+            &mut self.global_object_load_ic,
+            &mut state.global_object_load_ic,
+        );
+        std::mem::swap(
+            &mut self.module_evaluation_depth,
+            &mut state.module_evaluation_depth,
+        );
+        std::mem::swap(&mut self.module_hoisted, &mut state.module_hoisted);
+        std::mem::swap(
+            &mut self.module_resolution_cache,
+            &mut state.module_resolution_cache,
+        );
+        std::mem::swap(&mut self.module_records, &mut state.module_records);
+        std::mem::swap(
+            &mut self.next_module_async_order,
+            &mut state.next_module_async_order,
+        );
+        std::mem::swap(
+            &mut self.deferred_namespaces,
+            &mut state.deferred_namespaces,
+        );
+        std::mem::swap(&mut self.module_namespaces, &mut state.module_namespaces);
+        std::mem::swap(
+            &mut self.module_resolved_exports,
+            &mut state.module_resolved_exports,
+        );
+        std::mem::swap(&mut self.rejection_tracker, &mut state.rejection_tracker);
         let swap_root = |cell: &crate::gc_trace::RootCell<Option<JsObject>>,
                          slot: &mut Option<JsObject>| {
             let current = cell.get();
@@ -417,7 +471,13 @@ impl Interpreter {
     }
 
     fn build_realm_state(&mut self, id: u32) -> Result<usize, VmError> {
+        // Building the new realm's error registry can collect before the
+        // provisional RealmState is published below. Keep every already-live
+        // interpreter/realm root visible during that bootstrap window.
+        let existing_roots = otter_gc::ExtraRoots::new(&*self);
+        let existing_roots_guard = self.gc_heap.register_extra_roots(existing_roots);
         let error_classes = ErrorClassRegistry::new(&mut self.gc_heap).map_err(crate::oom_to_vm)?;
+        drop(existing_roots_guard);
         let state_index = self.extra_realms.len();
         self.extra_realms.push(RealmState {
             id,
@@ -435,6 +495,24 @@ impl Interpreter {
             regexp_string_iterator_prototype: None,
             iterator_helper_prototype: None,
             wrap_for_valid_iterator_prototype: None,
+            template_objects: rustc_hash::FxHashMap::default(),
+            realm_context: None,
+            module_environments: std::collections::HashMap::new(),
+            host_module_env_cache: std::collections::HashMap::new(),
+            module_init_upvalues: std::collections::HashMap::new(),
+            global_lexicals: rustc_hash::FxHashMap::default(),
+            global_lexical_epoch: 0,
+            global_lexical_load_ic: rustc_hash::FxHashMap::default(),
+            global_object_load_ic: rustc_hash::FxHashMap::default(),
+            module_evaluation_depth: 0,
+            module_hoisted: std::collections::HashSet::new(),
+            module_resolution_cache: std::collections::HashMap::new(),
+            module_records: std::collections::HashMap::new(),
+            next_module_async_order: 0,
+            deferred_namespaces: std::collections::HashMap::new(),
+            module_namespaces: std::collections::HashMap::new(),
+            module_resolved_exports: std::collections::HashMap::new(),
+            rejection_tracker: crate::promise_rejection::RejectionTracker::default(),
         });
         let result = self.initialize_realm_state(state_index);
         if result.is_err() {
@@ -444,6 +522,12 @@ impl Interpreter {
     }
 
     fn initialize_realm_state(&mut self, state_index: usize) -> Result<(), VmError> {
+        // The provisional state is already present in `extra_realms`, but
+        // bootstrap helpers receive only `&mut GcHeap`. Register the owning
+        // interpreter for the complete initialization so every collection
+        // reaches both existing realms and the realm under construction.
+        let runtime_roots = otter_gc::ExtraRoots::new(&*self);
+        let _runtime_roots_guard = self.gc_heap.register_extra_roots(runtime_roots);
         let global_this = bootstrap::build_global_this(&mut self.gc_heap, &self.well_known_symbols)
             .map_err(|err| {
                 self.err_type((format!("createRealm bootstrap failed: {err}")).into())
@@ -845,6 +929,19 @@ impl Interpreter {
         self.with_host_realm_id(realm.0, body)
     }
 
+    /// Run `body` in the realm that owns a pending dynamic-import token.
+    #[doc(hidden)]
+    pub fn with_dynamic_import_realm<R>(
+        &mut self,
+        token: u64,
+        body: impl FnOnce(&mut Self) -> Result<R, VmError>,
+    ) -> Result<Option<R>, VmError> {
+        let Some(realm_id) = self.dynamic_import_registry.realm_id(token) else {
+            return Ok(None);
+        };
+        self.with_host_realm_id(realm_id, body).map(Some)
+    }
+
     /// Whether an additional host realm is still live in this interpreter.
     #[doc(hidden)]
     #[must_use]
@@ -886,7 +983,11 @@ impl Interpreter {
         else {
             return Err(self.err_type(("unknown host realm global".to_string()).into()));
         };
-        let mut realm = self.extra_realms.remove(index);
+        // `ExtraRoots` stores a type-erased pointer to the parked realm while
+        // the target realm is active. Keep that source in a `Box`: a plain
+        // stack local may be moved between call frames after registration,
+        // leaving the collector to rewrite an obsolete copy of its slots.
+        let mut realm = Box::new(self.extra_realms.remove(index));
         self.swap_active_realm_state(&mut realm);
         let previous_realm_id = self.active_realm_id;
         self.active_realm_id = realm.id;
@@ -894,20 +995,21 @@ impl Interpreter {
         self.active_realm_is_extra = true;
         let realm_roots_guard = self
             .gc_heap
-            .register_extra_roots(otter_gc::ExtraRoots::new(&realm));
+            .register_extra_roots(otter_gc::ExtraRoots::new(realm.as_ref()));
         let result = body(self);
         drop(realm_roots_guard);
         self.swap_active_realm_state(&mut realm);
         self.active_realm_id = previous_realm_id;
         self.active_realm_is_extra = was_extra;
-        self.extra_realms.insert(index, realm);
+        self.extra_realms.insert(index, *realm);
         result
     }
 
     /// Run `body` with a stable realm identity active. Bytecode function
     /// metadata uses scalar ids, while this boundary reuses the existing
     /// traced [`RealmState`] swap instead of retaining raw GC handles.
-    pub(crate) fn with_host_realm_id<R>(
+    #[doc(hidden)]
+    pub fn with_host_realm_id<R>(
         &mut self,
         realm_id: u32,
         body: impl FnOnce(&mut Self) -> Result<R, VmError>,
@@ -922,6 +1024,13 @@ impl Interpreter {
             .map(|realm| realm.global_this)
             .ok_or_else(|| self.err_type(("unknown host realm id".to_string()).into()))?;
         self.with_host_realm_global(global, body)
+    }
+
+    /// Scalar identity of the currently active realm (`0` is the default).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn active_host_realm_id(&self) -> u32 {
+        self.active_realm_id
     }
 
     /// Execute a host script in the realm identified by `global`.

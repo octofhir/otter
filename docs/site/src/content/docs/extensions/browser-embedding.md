@@ -6,6 +6,10 @@ Otter's browser-oriented embedding shape is one shared host and one isolate per
 document or worker. The host is process-wide infrastructure; it is not a
 JavaScript realm.
 
+Use `otter_runtime::embedding` as the application-facing import surface. It is
+the curated, owned API and intentionally excludes interpreter, value, object,
+GC-handle, and native mutation types.
+
 ```text
 BrowserHost
   ├─ TokioRuntimeHost (executor, timers, HTTP client)
@@ -21,11 +25,16 @@ let host = TokioRuntimeHost::new()?;
 
 let page_a = Runtime::builder()
     .runtime_host(host.clone())
-    .build_handle()?;
+    .build_handle_async().await?;
 let page_b = Runtime::builder()
     .runtime_host(host.clone())
-    .build_handle()?;
+    .build_handle_async().await?;
 ```
+
+The synchronous `build_handle()` remains available for CLI/tests. Browser page
+creation should use `build_handle_async()` (or `OtterBuilder::build_async()`),
+which runs isolate bootstrap and its startup handshake on Tokio's blocking pool
+instead of parking the UI/async caller.
 
 The isolates share executor-backed host services, but never `globalThis`, a GC
 heap, roots, microtasks, capability state, or JavaScript values. A direct
@@ -60,6 +69,10 @@ deliver an owned result DTO as a runtime task and call
 `Runtime::settle_pending_promise_with` inside that task; its materializer runs
 in a handle scope on the target isolate.
 
+Layer B `RuntimeHandle::settle_promise` is also non-blocking under inbox
+pressure: it retains the owned result and retries delivery on the shared Tokio
+host. Shutdown cancels the retry and releases its liveness accounting.
+
 Install `RuntimeBuilder::promise_rejection_hook` per page to translate the
 isolate's unhandled/later-handled rejection checkpoints into the browser's
 `unhandledrejection` and `rejectionhandled` event path. The Rust hook receives
@@ -71,6 +84,27 @@ Execute an already-fetched module entry with
 static dependencies resolve relative to its URL and use the configured loader
 or remote-fetch cache. File-backed `Runtime::run_module(path)` remains the CLI
 path and shares the same linker/evaluator after loading.
+
+Additional same-agent globals use opaque realms. Both classic scripts and
+module graphs have direct and sendable high-level entry points:
+
+```rust,ignore
+let frame = page.create_realm().await?;
+page.run_script_in_realm(frame, classic_source, "frame:inline-1").await?;
+page.run_module_source_in_realm(
+    frame,
+    module_source,
+    "https://example.test/frame/main.js",
+).await?;
+page.dispose_realm(frame).await?;
+```
+
+Each realm owns its global lexicals, module environments, module evaluation
+records, dynamic imports, host-promise settlement target, and timers. Its
+canonical-URL module map persists across separate entry graphs, so shared
+dependencies execute once per realm. Disposal cancels timers and rejects late
+realm routing by invalidating the opaque id. The isolate/agent still owns one
+FIFO task and microtask boundary shared by its realms.
 
 ## Standalone CLI
 

@@ -13,9 +13,10 @@
 use std::sync::Arc;
 
 use otter_runtime::{
-    OtterError, RuntimeGlobalInstaller, RuntimeNativeCall, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeNativeFn, RuntimeRealmContext, RuntimeValue as Value,
-    SourceInput, runtime_arg_to_string, runtime_string_value, runtime_type_error,
+    OtterError, RuntimeExtensionContext, RuntimeExtensionInstaller, RuntimeNativeCall,
+    RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError, RuntimeNativeFn,
+    RuntimeValue as Value, SourceInput, runtime_arg_to_string, runtime_string_value,
+    runtime_type_error,
 };
 
 /// Pure-JS Web Platform globals — the sources live in the `romp!`
@@ -35,11 +36,11 @@ const WEB_URLPATTERN: &str = include_str!("web_urlpattern.js");
 
 /// Installer for the Web function globals. Registered by `with_web_apis`.
 #[must_use]
-pub fn web_globals_installer() -> RuntimeGlobalInstaller {
-    RuntimeGlobalInstaller::new(install)
+pub fn web_globals_installer() -> RuntimeExtensionInstaller {
+    RuntimeExtensionInstaller::new(install)
 }
 
-fn install(runtime: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
+fn install(runtime: &mut RuntimeExtensionContext<'_>) -> Result<(), OtterError> {
     runtime.install_native_global("atob", 1, atob)?;
     runtime.install_native_global("btoa", 1, btoa)?;
     runtime.install_native_global("queueMicrotask", 1, queue_microtask)?;
@@ -79,7 +80,7 @@ fn install(runtime: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
 /// deferred `web_bootstrap.js` group and materialize the first time the reporter
 /// actually fires.
 fn install_promise_rejection_handling(
-    runtime: &mut RuntimeRealmContext<'_>,
+    runtime: &mut RuntimeExtensionContext<'_>,
 ) -> Result<(), OtterError> {
     // `handled` is false for the `unhandledrejection` notification and true for
     // the follow-up `rejectionhandled`. Defensive throughout: a throwing
@@ -129,7 +130,7 @@ fn install_promise_rejection_handling(
 /// accessor (`[Replaceable]`): reading returns the global object, and assigning
 /// shadows it with a data property, matching platform semantics. Installed
 /// eagerly (not lazily) so `self` is present before any Web class is touched.
-fn install_self(runtime: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
+fn install_self(runtime: &mut RuntimeExtensionContext<'_>) -> Result<(), OtterError> {
     let shim = "Object.defineProperty(globalThis, 'self', {\n\
           get() { return globalThis; },\n\
           set(value) {\n\
@@ -153,7 +154,7 @@ fn install_self(runtime: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError>
 /// object exposing `userAgent` with the engine name and crate version.
 /// Defined writable + configurable to match the WebIDL `[Replaceable]`
 /// attribute shape, and non-enumerable like the other Web globals.
-fn install_navigator(runtime: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
+fn install_navigator(runtime: &mut RuntimeExtensionContext<'_>) -> Result<(), OtterError> {
     let shim = format!(
         "Object.defineProperty(globalThis, 'navigator', {{\n\
            value: {{ userAgent: 'Otter/{version}' }},\n\

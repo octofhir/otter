@@ -218,8 +218,8 @@ impl Interpreter {
         &self.iteration_anchors
     }
 
-    /// Borrow the promise-rejection tracker for GC root tracing. Its two
-    /// handle lists retain rejected promises until the checkpoint reports them.
+    /// Borrow the active realm's promise-rejection tracker for GC root tracing.
+    /// Parked realm trackers are traced by their [`crate::RealmState`].
     #[must_use]
     pub(crate) fn rejection_tracker_for_trace(
         &self,

@@ -28,6 +28,9 @@
 //!   promise's persistent root (the promise then simply never
 //!   settles, the correct terminal behavior for abandoned work) and
 //!   the liveness hold.
+//! - A suspended completion materializes its JS result and drains reactions in
+//!   the realm that created the promise. A disposed origin drops the root
+//!   instead of settling into another realm.
 //! - Rejection reasons materialize as real `TypeError` instances when
 //!   the captured execution context allows constructor re-entry, and
 //!   degrade to string reasons otherwise.
@@ -57,6 +60,7 @@ pub struct PromiseCompleter {
     root: Option<PersistentRootId>,
     sink: Arc<dyn HostCompletionSink>,
     context: Option<ExecutionContext>,
+    realm_id: u32,
     keep_alive: Option<HostKeepAlive>,
 }
 
@@ -83,8 +87,9 @@ impl PromiseCompleter {
     fn finish<R: IntoJs + Send + 'static>(mut self, result: Result<R, JsError>) {
         let Some(root) = self.root.take() else { return };
         let context = self.context.clone();
+        let realm_id = self.realm_id;
         self.sink.complete(HostCompletionJob::new(move |interp| {
-            settle_from_root(interp, root, context, result);
+            settle_from_root(interp, root, realm_id, context, result);
         }));
         // The keep-alive is released only after the completion job is
         // posted, so the event loop cannot go idle in between.
@@ -108,6 +113,22 @@ impl Drop for PromiseCompleter {
 /// Settle the promise parked at `root` with `result`, converting on
 /// the isolate thread. Runs as a host completion job.
 fn settle_from_root<R: IntoJs>(
+    interp: &mut Interpreter,
+    root: PersistentRootId,
+    realm_id: u32,
+    context: Option<ExecutionContext>,
+    result: Result<R, JsError>,
+) {
+    let outcome = interp.with_host_realm_id(realm_id, move |interp| {
+        settle_from_root_in_active_realm(interp, root, context, result);
+        Ok(())
+    });
+    if outcome.is_err() {
+        let _ = interp.persistent_root_remove(root);
+    }
+}
+
+fn settle_from_root_in_active_realm<R: IntoJs>(
     interp: &mut Interpreter,
     root: PersistentRootId,
     context: Option<ExecutionContext>,
@@ -206,6 +227,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         };
         let context = self.ctx().context_ref().cloned();
         let interp = self.ctx().interp_mut();
+        let realm_id = interp.active_host_realm_id();
         let handle = crate::promise_dispatch::pending_runtime_rooted(interp, &[], &[])
             .map_err(|err| JsError::Type(err.to_string()))?;
         let promise_value = Value::promise(handle);
@@ -218,6 +240,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
                 root: Some(root),
                 sink,
                 context,
+                realm_id,
                 keep_alive: Some(keep_alive),
             },
         ))

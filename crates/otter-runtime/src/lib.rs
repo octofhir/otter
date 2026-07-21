@@ -3,11 +3,14 @@
 //! Two-layer surface per
 //! [the public runtime architecture](../../../docs/book/src/engine/architecture.md):
 //!
-//! - **Layer A — [`Otter`]**: zero-config entry point. The simple
-//!   case for embedders ("just run a script").
-//! - **Layer B — [`Runtime`] / [`RuntimeBuilder`]**: opt-in
-//!   advanced layer for capabilities, custom module loading, trace
-//!   sinks, profiling.
+//! - **Direct — [`Runtime`] / [`RuntimeBuilder`]**: thread-pinned runtime for
+//!   embedders that own the event loop.
+//! - **Sendable — [`RuntimeHandle`] / [`Otter`]**: production isolate runner
+//!   backed by a shared [`TokioRuntimeHost`].
+//!
+//! Applications should import orchestration types from [`embedding`]. That
+//! curated module is the mandatory high-level boundary and deliberately omits
+//! raw VM values, objects, GC handles, and native mutation contexts.
 //!
 //! Every fallible call returns [`Result<_, OtterError>`] —
 //! a single, structured, `serde::Serialize` enum. No
@@ -21,6 +24,7 @@
 //! - [`ExecutionAttempt`] — diagnostic-aware success/error envelope.
 //! - [`OtterError`], [`ConfigError`], [`IoErrorKind`] — error model.
 //! - [`InterruptHandle`] — cooperative cancellation.
+//! - [`embedding`] — preferred owned orchestration API.
 //!
 //! # Runtime Session
 //! [`Runtime`] is the active runtime session owner. [`RuntimeBuilder`] captures
@@ -59,6 +63,7 @@ mod commonjs;
 pub use commonjs::{require_commonjs_dependency, run_builtin_cjs_shim};
 pub mod compiled_program;
 pub mod diagnostics;
+pub mod embedding;
 pub mod error;
 mod event_loop;
 pub mod handle;
@@ -122,7 +127,7 @@ pub use otter_vm::{
     JitDirectCallKind, JitInlineRejectionReason, JsObject, JsSurfaceError, MethodSpec, NativeCall,
     ObjectBuilder, Value, array, bootstrap, intrinsic_install, object, rooting,
 };
-pub use realm::{RuntimeGlobalValue, RuntimeRealmContext, RuntimeRealmId};
+pub use realm::{RuntimeExtensionContext, RuntimeGlobalValue, RuntimeRealmContext, RuntimeRealmId};
 // Unrenamed re-exports consumed by `#[js_class]`- and `couch!`-generated
 // glue, which must resolve the same `::otter_vm::…` paths whether they
 // expand inside `otter-vm` itself or in a binding crate that aliases
@@ -329,6 +334,74 @@ impl std::fmt::Debug for RuntimeGlobalInstaller {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RuntimeGlobalInstaller")
             .finish_non_exhaustive()
+    }
+}
+
+/// Advanced native installer for engine extension crates.
+///
+/// Unlike [`RuntimeGlobalInstaller`], this callback receives
+/// [`RuntimeExtensionContext`] and can install VM-shaped native call targets.
+/// Application embedders should use the high-level installer and import from
+/// [`embedding`], which deliberately does not re-export this type.
+#[derive(Clone)]
+pub struct RuntimeExtensionInstaller {
+    install: Arc<
+        dyn for<'a> Fn(&mut RuntimeExtensionContext<'a>) -> Result<(), OtterError> + Send + Sync,
+    >,
+}
+
+impl RuntimeExtensionInstaller {
+    /// Build an advanced installer from a sendable callback.
+    #[must_use]
+    pub fn new(
+        install: impl for<'a> Fn(&mut RuntimeExtensionContext<'a>) -> Result<(), OtterError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            install: Arc::new(install),
+        }
+    }
+
+    fn install(&self, realm: &mut RuntimeExtensionContext<'_>) -> Result<(), OtterError> {
+        (self.install)(realm)
+    }
+}
+
+impl std::fmt::Debug for RuntimeExtensionInstaller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeExtensionInstaller")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ConfiguredRealmInstaller {
+    Global(RuntimeGlobalInstaller),
+    Extension(RuntimeExtensionInstaller),
+}
+
+impl ConfiguredRealmInstaller {
+    fn install(
+        &self,
+        interp: &mut otter_vm::Interpreter,
+        capabilities: &CapabilitySet,
+        hooks: &RuntimeHooks,
+        runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    ) -> Result<(), OtterError> {
+        match self {
+            Self::Global(installer) => {
+                let mut realm =
+                    RuntimeRealmContext::new(interp, capabilities, hooks, runtime_task_spawner);
+                installer.install(&mut realm)
+            }
+            Self::Extension(installer) => {
+                let mut realm =
+                    RuntimeExtensionContext::new(interp, capabilities, hooks, runtime_task_spawner);
+                installer.install(&mut realm)
+            }
+        }
     }
 }
 
@@ -1435,7 +1508,7 @@ pub(crate) struct RuntimeConfig {
     commonjs_addon_loader: Option<CommonJsAddonLoader>,
     global_classes: Vec<GlobalClass>,
     extensions: Vec<&'static Extension>,
-    global_installers: Vec<RuntimeGlobalInstaller>,
+    realm_installers: Vec<ConfiguredRealmInstaller>,
     allow_blocking_atomics_wait: bool,
     install_process_global: bool,
     install_worker_global: bool,
@@ -1679,7 +1752,7 @@ impl Default for RuntimeConfig {
             commonjs_addon_loader: None,
             global_classes: Vec::new(),
             extensions: Vec::new(),
-            global_installers: Vec::new(),
+            realm_installers: Vec::new(),
             allow_blocking_atomics_wait: false,
             install_process_global: true,
             install_worker_global: true,
@@ -1877,7 +1950,20 @@ impl RuntimeBuilder {
     /// on worker runtimes spawned from it.
     #[must_use]
     pub fn global_installer(mut self, installer: RuntimeGlobalInstaller) -> Self {
-        self.config.global_installers.push(installer);
+        self.config
+            .realm_installers
+            .push(ConfiguredRealmInstaller::Global(installer));
+        self
+    }
+
+    /// Register an advanced native installer for an engine extension crate.
+    ///
+    /// Browser/application orchestration should use [`Self::global_installer`].
+    #[must_use]
+    pub fn extension_installer(mut self, installer: RuntimeExtensionInstaller) -> Self {
+        self.config
+            .realm_installers
+            .push(ConfiguredRealmInstaller::Extension(installer));
         self
     }
 
@@ -2050,6 +2136,36 @@ impl RuntimeBuilder {
     /// isolate runner cannot be started.
     pub fn build_handle(self) -> Result<RuntimeHandle, OtterError> {
         RuntimeHandle::spawn(self.config)
+    }
+
+    /// Construct a sendable runtime handle without blocking the async caller
+    /// during isolate bootstrap.
+    ///
+    /// Browser page creation should prefer this method. Validation, thread
+    /// startup and the interrupt-handle handshake run on the configured shared
+    /// Tokio host's blocking pool; UI/core async workers remain free to drive
+    /// input, rendering and I/O.
+    ///
+    /// # Errors
+    /// Returns [`OtterError`] when no Tokio host/current runtime is available,
+    /// configuration is invalid, or isolate startup fails.
+    pub async fn build_handle_async(self) -> Result<RuntimeHandle, OtterError> {
+        let host_handle = match self.config.runtime_host() {
+            Some(host) => host.handle(),
+            None => {
+                tokio::runtime::Handle::try_current().map_err(|error| OtterError::Internal {
+                    code: DiagnosticCode::TokioRuntimeCreate.as_str().to_string(),
+                    message: format!("async isolate startup requires a Tokio runtime: {error}"),
+                })?
+            }
+        };
+        host_handle
+            .spawn_blocking(move || RuntimeHandle::spawn(self.config))
+            .await
+            .map_err(|error| OtterError::Internal {
+                code: DiagnosticCode::IsolateStart.as_str().to_string(),
+                message: format!("async isolate startup task failed: {error}"),
+            })?
     }
 }
 
@@ -2319,18 +2435,17 @@ impl Runtime {
         if runtime.config.install_worker_global {
             worker::install_main_worker_globals(&mut runtime)?;
         }
-        let global_installers = runtime.config.global_installers.clone();
+        let realm_installers = runtime.config.realm_installers.clone();
         let capabilities = runtime.config.capabilities.clone();
         let hooks = runtime.config.hooks.clone();
         let runtime_task_spawner = runtime.runtime_task_spawner.clone();
-        let mut realm = RuntimeRealmContext::new(
-            &mut runtime.interp,
-            &capabilities,
-            &hooks,
-            runtime_task_spawner,
-        );
-        for installer in global_installers {
-            installer.install(&mut realm)?;
+        for installer in realm_installers {
+            installer.install(
+                &mut runtime.interp,
+                &capabilities,
+                &hooks,
+                runtime_task_spawner.clone(),
+            )?;
         }
         // Extension JS (Web platform shims, etc.) installs its globals
         // eagerly, in declaration order, after the native function
@@ -2582,6 +2697,12 @@ impl Runtime {
         specifier: &str,
         referrer: &str,
     ) -> Result<DynamicImportBegin, OtterError> {
+        let Some(realm_id) = self.interp.dynamic_import_realm_id(token) else {
+            return Ok(DynamicImportBegin::Settled);
+        };
+        if realm_id != 0 {
+            return self.begin_dynamic_import_in_extra_realm(token, specifier, referrer);
+        }
         match self.load_dynamic_module(specifier, referrer) {
             Ok(DynamicModuleLoad::Loaded(namespace)) => self
                 .settle_dynamic_import_result(token, Ok(namespace))
@@ -2638,6 +2759,12 @@ impl Runtime {
         target_url: &str,
         linked: Result<module_graph::LinkedProgram, String>,
     ) -> Result<bool, OtterError> {
+        let Some(realm_id) = self.interp.dynamic_import_realm_id(token) else {
+            return Ok(false);
+        };
+        if realm_id != 0 {
+            return self.complete_dynamic_import_prepared_in_extra_realm(token, target_url, linked);
+        }
         match linked
             .map_err(DynLoadError::type_error)
             .and_then(|linked| self.evaluate_dynamic_linked_module(target_url, linked))
@@ -2683,6 +2810,135 @@ impl Runtime {
                 self.settle_dynamic_import_result(token, Err(value))
             }
         }
+    }
+
+    fn begin_dynamic_import_in_extra_realm(
+        &mut self,
+        token: u64,
+        specifier: &str,
+        referrer: &str,
+    ) -> Result<DynamicImportBegin, OtterError> {
+        use std::path::PathBuf;
+
+        let referrer_opt = (!referrer.is_empty()).then_some(referrer);
+        let entry_for_loader = match referrer_opt {
+            Some(url) if module_loader::is_http_url(url) => PathBuf::from("."),
+            Some(url) => url_to_path(url).ok_or_else(|| OtterError::Runtime {
+                diagnostic: Box::new(Diagnostic::new(
+                    DiagnosticKind::Type,
+                    DiagnosticCode::TypeError,
+                    format!("dynamic import: referrer is not a file:// URL: \"{url}\""),
+                )),
+            })?,
+            None => std::env::current_dir().map_err(|error| OtterError::Io {
+                path: PathBuf::from("."),
+                kind: IoErrorKind::from_std(error.kind()),
+                message: error.to_string(),
+            })?,
+        };
+        let loader = self.module_loader_for_entry(&entry_for_loader);
+        let target_url = match loader.resolve(specifier, referrer_opt) {
+            Ok(url) => url,
+            Err(error) => {
+                let message = format!("dynamic import: cannot resolve \"{specifier}\": {error:?}");
+                return self
+                    .settle_extra_realm_dynamic_error(
+                        token,
+                        otter_vm::ErrorKind::TypeError,
+                        message,
+                    )
+                    .map(|_| DynamicImportBegin::Settled);
+            }
+        };
+        let cached = self
+            .interp
+            .with_dynamic_import_realm(token, |interp| {
+                Ok(interp.module_env(&target_url).map(otter_vm::Value::object))
+            })
+            .map_err(realm::map_realm_vm_error)?
+            .flatten();
+        if let Some(namespace) = cached {
+            return self
+                .settle_extra_realm_dynamic_import(token, Ok(namespace))
+                .map(|_| DynamicImportBegin::Settled);
+        }
+        if module_loader::is_http_url(&target_url) {
+            return Ok(DynamicImportBegin::FetchHttps { target_url });
+        }
+        let target_path = url_to_path(&target_url).ok_or_else(|| OtterError::Runtime {
+            diagnostic: Box::new(Diagnostic::new(
+                DiagnosticKind::Type,
+                DiagnosticCode::TypeError,
+                format!("dynamic import: target is not a file:// URL: \"{target_url}\""),
+            )),
+        })?;
+        let linked = self
+            .module_graph
+            .load_program(&loader, &target_path)
+            .map_err(map_graph_error)?;
+        self.complete_dynamic_import_prepared_in_extra_realm(token, &target_url, Ok(linked))?;
+        Ok(DynamicImportBegin::Settled)
+    }
+
+    fn complete_dynamic_import_prepared_in_extra_realm(
+        &mut self,
+        token: u64,
+        target_url: &str,
+        linked: Result<module_graph::LinkedProgram, String>,
+    ) -> Result<bool, OtterError> {
+        let linked = match linked {
+            Ok(linked) => linked,
+            Err(message) => {
+                return self.settle_extra_realm_dynamic_error(
+                    token,
+                    otter_vm::ErrorKind::TypeError,
+                    message,
+                );
+            }
+        };
+        for metadata in &linked.metadata {
+            self.source_maps.record_compiled_metadata(metadata);
+        }
+        let target_url = target_url.to_string();
+        self.interp
+            .with_dynamic_import_realm(token, move |interp| {
+                Ok(evaluate_and_settle_dynamic_linked_module_on(
+                    interp,
+                    token,
+                    &target_url,
+                    linked,
+                ))
+            })
+            .map_err(realm::map_realm_vm_error)?
+            .unwrap_or(Ok(false))
+    }
+
+    fn settle_extra_realm_dynamic_import(
+        &mut self,
+        token: u64,
+        outcome: Result<otter_vm::Value, otter_vm::Value>,
+    ) -> Result<bool, OtterError> {
+        self.interp
+            .with_dynamic_import_realm(token, move |interp| {
+                Ok(settle_dynamic_import_result_on(interp, token, outcome))
+            })
+            .map_err(realm::map_realm_vm_error)?
+            .unwrap_or(Ok(false))
+    }
+
+    fn settle_extra_realm_dynamic_error(
+        &mut self,
+        token: u64,
+        kind: otter_vm::ErrorKind,
+        message: String,
+    ) -> Result<bool, OtterError> {
+        self.interp
+            .with_dynamic_import_realm(token, move |interp| {
+                Ok(alloc_dynamic_import_error_on(interp, kind, message)
+                    .and_then(|value| settle_dynamic_import_result_on(interp, token, Err(value))))
+            })
+            .map_err(realm::map_realm_vm_error)?
+            .unwrap_or(Ok(false))
     }
 
     fn settle_dynamic_import_result(
@@ -3172,7 +3428,9 @@ impl Runtime {
             })?;
         let promise = otter_vm::Value::promise(handle);
         let root = self.interp.persistent_root_insert(promise);
-        let id = self.promise_registry.register(root);
+        let id = self
+            .promise_registry
+            .register(root, self.interp.active_host_realm_id());
         Ok((id, promise))
     }
 
@@ -3190,76 +3448,19 @@ impl Runtime {
         id: promise_registry::PromiseId,
         outcome: promise_registry::HostSettleOutcome,
     ) -> Result<bool, OtterError> {
-        let root = match self.promise_registry.take(id) {
-            Some(root) => root,
+        let entry = match self.promise_registry.take(id) {
+            Some(entry) => entry,
             None => return Ok(false),
         };
         // Take the persistent root directly into a handle scope before
         // materializing the host payload. String allocation may trigger a
         // moving collection, so both the Promise and payload stay `Local`
         // through settlement.
-        let settled = otter_vm::NativeCtx::with_host_context(
-            &mut self.interp,
-            otter_vm::NativeCallInfo::default_call(),
-            None,
-            |ctx| {
-                ctx.scope(|mut scope| -> Result<bool, OtterError> {
-                    let Some(promise) = scope.take_persistent_root(root) else {
-                        return Ok(false);
-                    };
-                    use promise_registry::HostSettleOutcome;
-                    let (payload, reject) = match outcome {
-                        HostSettleOutcome::ResolveUndefined => {
-                            (scope.value(otter_vm::Value::undefined()), false)
-                        }
-                        HostSettleOutcome::ResolveNull => {
-                            (scope.value(otter_vm::Value::null()), false)
-                        }
-                        HostSettleOutcome::ResolveBoolean(value) => {
-                            (scope.value(otter_vm::Value::boolean(value)), false)
-                        }
-                        HostSettleOutcome::ResolveNumber(value) => (
-                            scope.value(otter_vm::Value::number(otter_vm::NumberValue::from_f64(
-                                value,
-                            ))),
-                            false,
-                        ),
-                        HostSettleOutcome::ResolveString(value) => (
-                            scope
-                                .string(&value)
-                                .map_err(promise_settle_string_to_error)?,
-                            false,
-                        ),
-                        HostSettleOutcome::RejectString(reason) => (
-                            scope
-                                .string(&reason)
-                                .map_err(promise_settle_string_to_error)?,
-                            true,
-                        ),
-                    };
-                    if reject {
-                        scope
-                            .reject_promise(promise, payload)
-                            .map_err(map_native_error)?;
-                    } else {
-                        scope
-                            .fulfill_promise(promise, payload)
-                            .map_err(map_native_error)?;
-                    }
-                    Ok(true)
-                })
-            },
-        )?;
-        if !settled {
-            return Ok(false);
-        }
-        if let Err(err) = self.interp.drain_microtasks_with_default(None) {
-            return Err(enrich_runtime_diagnostic_with_cause(
-                &mut self.interp,
-                map_vm_error(err),
-            ));
-        }
-        Ok(true)
+        self.interp
+            .with_host_realm_id(entry.realm_id, move |interp| {
+                Ok(settle_host_promise_on(interp, entry.root, outcome))
+            })
+            .map_err(realm::map_realm_vm_error)?
     }
 
     /// Resolve a registered host promise with a JavaScript value materialized
@@ -3286,37 +3487,15 @@ impl Runtime {
             &mut RuntimeNativeScope<'scope, 'rt>,
         ) -> Result<RuntimeLocal<'scope>, RuntimeNativeError>,
     {
-        let root = match self.promise_registry.take(id) {
-            Some(root) => root,
+        let entry = match self.promise_registry.take(id) {
+            Some(entry) => entry,
             None => return Ok(false),
         };
-        let settled = otter_vm::NativeCtx::with_host_context(
-            &mut self.interp,
-            otter_vm::NativeCallInfo::default_call(),
-            None,
-            |ctx| {
-                ctx.scope(|mut scope| -> Result<bool, OtterError> {
-                    let Some(promise) = scope.take_persistent_root(root) else {
-                        return Ok(false);
-                    };
-                    let payload = materialize(&mut scope).map_err(map_native_error)?;
-                    scope
-                        .fulfill_promise(promise, payload)
-                        .map_err(map_native_error)?;
-                    Ok(true)
-                })
-            },
-        )?;
-        if !settled {
-            return Ok(false);
-        }
-        if let Err(err) = self.interp.drain_microtasks_with_default(None) {
-            return Err(enrich_runtime_diagnostic_with_cause(
-                &mut self.interp,
-                map_vm_error(err),
-            ));
-        }
-        Ok(true)
+        self.interp
+            .with_host_realm_id(entry.realm_id, move |interp| {
+                Ok(settle_host_promise_with_on(interp, entry.root, materialize))
+            })
+            .map_err(realm::map_realm_vm_error)?
     }
 
     /// Fire the timer identified by `token`. Routes through
@@ -3837,13 +4016,26 @@ impl Runtime {
                 match self.begin_dynamic_import(token, &specifier, &referrer)? {
                     DynamicImportBegin::Settled => {}
                     DynamicImportBegin::FetchHttps { target_url } => {
-                        let reason = self.alloc_dynamic_import_error(
-                            otter_vm::ErrorKind::TypeError,
-                            format!(
-                                "dynamic import: remote module \"{target_url}\" requires the isolate runner"
-                            ),
-                        )?;
-                        self.settle_dynamic_import_result(token, Err(reason))?;
+                        let message = format!(
+                            "dynamic import: remote module \"{target_url}\" requires the isolate runner"
+                        );
+                        if self
+                            .interp
+                            .dynamic_import_realm_id(token)
+                            .is_some_and(|realm_id| realm_id != 0)
+                        {
+                            self.settle_extra_realm_dynamic_error(
+                                token,
+                                otter_vm::ErrorKind::TypeError,
+                                message,
+                            )?;
+                        } else {
+                            let reason = self.alloc_dynamic_import_error(
+                                otter_vm::ErrorKind::TypeError,
+                                message,
+                            )?;
+                            self.settle_dynamic_import_result(token, Err(reason))?;
+                        }
                     }
                 }
             }
@@ -4204,38 +4396,40 @@ impl Runtime {
             &self.config.capabilities,
             self.runtime_task_spawner.clone(),
         )?;
-        // After `allocate_for_module_inits` (which resets per-run module
-        // state); registering earlier would be wiped by that reset.
+        let realm_id = self.interp.active_host_realm_id();
+        // Environment allocation happens first so metadata publication cannot
+        // expose a resolution table without its target environment.
         self.register_resolved_exports(&linked.metadata);
         self.register_module_sources(&linked.module_sources);
-        self.module_records.for_each_record(|url, _function_id| {
-            // Self-loop edge: <entry>'s referrer is the entry's URL
-            // (the synthesized <entry> function carries empty
-            // module_url, so the dispatcher uses an empty string;
-            // we add edges keyed on both shapes).
-            module
-                .module_resolutions
-                .push(otter_bytecode::ModuleResolution {
-                    referrer: entry_url.clone(),
-                    specifier: url.to_string(),
-                    target: url.to_string(),
-                    deferred: false,
-                    dynamic: false,
-                    synthetic: true,
-                });
-            module
-                .module_resolutions
-                .push(otter_bytecode::ModuleResolution {
-                    referrer: String::new(),
-                    specifier: url.to_string(),
-                    target: url.to_string(),
-                    deferred: false,
-                    dynamic: false,
-                    synthetic: true,
-                });
-        });
+        self.module_records
+            .for_each_record(realm_id, |url, _function_id| {
+                // Self-loop edge: <entry>'s referrer is the entry's URL
+                // (the synthesized <entry> function carries empty
+                // module_url, so the dispatcher uses an empty string;
+                // we add edges keyed on both shapes).
+                module
+                    .module_resolutions
+                    .push(otter_bytecode::ModuleResolution {
+                        referrer: entry_url.clone(),
+                        specifier: url.to_string(),
+                        target: url.to_string(),
+                        deferred: false,
+                        dynamic: false,
+                        synthetic: true,
+                    });
+                module
+                    .module_resolutions
+                    .push(otter_bytecode::ModuleResolution {
+                        referrer: String::new(),
+                        specifier: url.to_string(),
+                        target: url.to_string(),
+                        deferred: false,
+                        dynamic: false,
+                        synthetic: true,
+                    });
+            });
 
-        self.module_records.mark_evaluating();
+        self.module_records.mark_evaluating(realm_id);
         if let (Some(timings), Some(started)) = (timings.as_deref_mut(), runtime_link_started) {
             timings.link_time_ns = timings
                 .link_time_ns
@@ -4266,7 +4460,7 @@ impl Runtime {
                     ..
                 }),
             ) => {
-                self.module_records.mark_evaluated();
+                self.module_records.mark_evaluated(realm_id);
                 if let (Some(timings), Some(started)) = (timings.as_deref_mut(), execute_started) {
                     timings.execute_time_ns =
                         started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
@@ -4275,14 +4469,14 @@ impl Runtime {
                 return Ok((self.attach_execution_stats(result), context));
             }
             (Err(script_err), _) => {
-                self.module_records.mark_errored();
+                self.module_records.mark_errored(realm_id);
                 return Err(enrich_runtime_diagnostic_with_cause(
                     &mut self.interp,
                     map_vm_error(script_err),
                 ));
             }
             (Ok(_), Err(drain_err)) => {
-                self.module_records.mark_errored();
+                self.module_records.mark_errored(realm_id);
                 return Err(enrich_runtime_diagnostic_with_cause(
                     &mut self.interp,
                     map_vm_error(drain_err),
@@ -4294,7 +4488,7 @@ impl Runtime {
         if let (Some(timings), Some(started)) = (timings, execute_started) {
             timings.execute_time_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         }
-        self.module_records.mark_evaluated();
+        self.module_records.mark_evaluated(realm_id);
         let result =
             ExecutionResult::from_vm_value(value, start.elapsed(), self.interp.gc_heap_mut())
                 .with_exit_code(process::exit_code(&self.interp));
@@ -4580,6 +4774,18 @@ impl Otter {
         url: impl Into<String>,
     ) -> Result<ExecutionResult, OtterError> {
         self.handle.run_module_source(source, url).await
+    }
+
+    /// Run an in-memory ES module graph in an additional realm.
+    pub async fn run_module_source_in_realm(
+        &self,
+        realm: RuntimeRealmId,
+        source: SourceInput,
+        url: impl Into<String>,
+    ) -> Result<ExecutionResult, OtterError> {
+        self.handle
+            .run_module_source_in_realm(realm, source, url)
+            .await
     }
 
     /// Run a file and retain partial JIT diagnostics on abrupt failure.
@@ -4920,6 +5126,14 @@ impl OtterBuilder {
         self
     }
 
+    /// Register an advanced native installer. See
+    /// [`RuntimeBuilder::extension_installer`].
+    #[must_use]
+    pub fn extension_installer(mut self, installer: RuntimeExtensionInstaller) -> Self {
+        self.runtime = self.runtime.extension_installer(installer);
+        self
+    }
+
     /// Override the implementation behind `console.*`.
     #[must_use]
     pub fn console_sink(mut self, sink: ConsoleSinkHandle) -> Self {
@@ -4986,6 +5200,17 @@ impl OtterBuilder {
     pub fn build(self) -> Result<Otter, OtterError> {
         Ok(Otter {
             handle: self.runtime.build_handle()?,
+        })
+    }
+
+    /// Construct the async facade without blocking the async caller during
+    /// isolate bootstrap. Browser page/worker creation should prefer this path.
+    ///
+    /// # Errors
+    /// See [`RuntimeBuilder::build_handle_async`].
+    pub async fn build_async(self) -> Result<Otter, OtterError> {
+        Ok(Otter {
+            handle: self.runtime.build_handle_async().await?,
         })
     }
 }
@@ -5245,6 +5470,272 @@ fn url_to_path(url: &str) -> Option<std::path::PathBuf> {
 ///   `<module-init>` threw a JS value. The settler uses that
 ///   value directly as the promise's rejection reason per
 ///   §16.2.1.7 step 7.b.i + §27.2.1.7.
+fn settle_host_promise_on(
+    interp: &mut Interpreter,
+    root: RuntimePersistentRootId,
+    outcome: HostSettleOutcome,
+) -> Result<bool, OtterError> {
+    let settled = otter_vm::NativeCtx::with_host_context(
+        interp,
+        otter_vm::NativeCallInfo::default_call(),
+        None,
+        |ctx| {
+            ctx.scope(|mut scope| -> Result<bool, OtterError> {
+                let Some(promise) = scope.take_persistent_root(root) else {
+                    return Ok(false);
+                };
+                let (payload, reject) = match outcome {
+                    HostSettleOutcome::ResolveUndefined => {
+                        (scope.value(otter_vm::Value::undefined()), false)
+                    }
+                    HostSettleOutcome::ResolveNull => (scope.value(otter_vm::Value::null()), false),
+                    HostSettleOutcome::ResolveBoolean(value) => {
+                        (scope.value(otter_vm::Value::boolean(value)), false)
+                    }
+                    HostSettleOutcome::ResolveNumber(value) => (
+                        scope.value(otter_vm::Value::number(otter_vm::NumberValue::from_f64(
+                            value,
+                        ))),
+                        false,
+                    ),
+                    HostSettleOutcome::ResolveString(value) => (
+                        scope
+                            .string(&value)
+                            .map_err(promise_settle_string_to_error)?,
+                        false,
+                    ),
+                    HostSettleOutcome::RejectString(reason) => (
+                        scope
+                            .string(&reason)
+                            .map_err(promise_settle_string_to_error)?,
+                        true,
+                    ),
+                };
+                if reject {
+                    scope
+                        .reject_promise(promise, payload)
+                        .map_err(map_native_error)?;
+                } else {
+                    scope
+                        .fulfill_promise(promise, payload)
+                        .map_err(map_native_error)?;
+                }
+                Ok(true)
+            })
+        },
+    )?;
+    if settled {
+        interp
+            .drain_microtasks_with_default(None)
+            .map_err(|error| enrich_runtime_diagnostic_with_cause(interp, map_vm_error(error)))?;
+    }
+    Ok(settled)
+}
+
+fn settle_host_promise_with_on<F>(
+    interp: &mut Interpreter,
+    root: RuntimePersistentRootId,
+    materialize: F,
+) -> Result<bool, OtterError>
+where
+    F: for<'scope, 'rt> FnOnce(
+        &mut RuntimeNativeScope<'scope, 'rt>,
+    ) -> Result<RuntimeLocal<'scope>, RuntimeNativeError>,
+{
+    let settled = otter_vm::NativeCtx::with_host_context(
+        interp,
+        otter_vm::NativeCallInfo::default_call(),
+        None,
+        |ctx| {
+            ctx.scope(|mut scope| -> Result<bool, OtterError> {
+                let Some(promise) = scope.take_persistent_root(root) else {
+                    return Ok(false);
+                };
+                let payload = materialize(&mut scope).map_err(map_native_error)?;
+                scope
+                    .fulfill_promise(promise, payload)
+                    .map_err(map_native_error)?;
+                Ok(true)
+            })
+        },
+    )?;
+    if settled {
+        interp
+            .drain_microtasks_with_default(None)
+            .map_err(|error| enrich_runtime_diagnostic_with_cause(interp, map_vm_error(error)))?;
+    }
+    Ok(settled)
+}
+
+fn evaluate_and_settle_dynamic_linked_module_on(
+    interp: &mut Interpreter,
+    token: u64,
+    target_url: &str,
+    linked: module_graph::LinkedProgram,
+) -> Result<bool, OtterError> {
+    let outcome = evaluate_dynamic_linked_module_on(interp, target_url, linked);
+    match outcome {
+        Ok(DynamicModuleLoad::Loaded(namespace)) => {
+            settle_dynamic_import_result_on(interp, token, Ok(namespace))
+        }
+        Ok(DynamicModuleLoad::PendingAsyncEvaluation {
+            promise,
+            target_url,
+            context,
+        }) => {
+            interp
+                .settle_dynamic_import_on_async_inits(
+                    &context,
+                    token,
+                    vec![promise],
+                    std::sync::Arc::from(target_url.as_str()),
+                )
+                .map_err(|error| {
+                    map_vm_error(otter_vm::RunError {
+                        error,
+                        frames: Vec::new(),
+                        detail: None,
+                    })
+                })?;
+            interp
+                .drain_microtasks_with_default(Some(context))
+                .map_err(|error| {
+                    enrich_runtime_diagnostic_with_cause(interp, map_vm_error(error))
+                })?;
+            Ok(true)
+        }
+        Ok(DynamicModuleLoad::FetchHttps { .. }) => Err(OtterError::Internal {
+            code: "DYNAMIC_IMPORT_PREPARED_FETCH".to_string(),
+            message: "prepared dynamic module requested a second entry fetch".to_string(),
+        }),
+        Err(DynLoadError::Diagnostic { kind, message }) => {
+            let value = alloc_dynamic_import_error_on(interp, kind, message)?;
+            settle_dynamic_import_result_on(interp, token, Err(value))
+        }
+        Err(DynLoadError::Thrown(value)) => {
+            settle_dynamic_import_result_on(interp, token, Err(value))
+        }
+    }
+}
+
+fn evaluate_dynamic_linked_module_on(
+    interp: &mut Interpreter,
+    target_url: &str,
+    linked: module_graph::LinkedProgram,
+) -> Result<DynamicModuleLoad, DynLoadError> {
+    for metadata in &linked.metadata {
+        if metadata.source_url.is_empty() || metadata.resolved_exports.is_empty() {
+            continue;
+        }
+        let table = metadata
+            .resolved_exports
+            .iter()
+            .map(|(name, resolved)| {
+                (
+                    name.clone(),
+                    (
+                        std::sync::Arc::from(resolved.defining_module.as_str()),
+                        resolved.binding.clone(),
+                    ),
+                )
+            })
+            .collect();
+        interp.register_module_resolved_exports(
+            std::sync::Arc::from(metadata.source_url.as_str()),
+            table,
+        );
+    }
+    for (url, text) in &linked.module_sources {
+        interp.register_module_source(url.clone(), std::sync::Arc::from(text.as_str()));
+    }
+    let context = interp.link_module(linked.module);
+    for init in context.module_inits() {
+        if interp.module_env(&init.url).is_some() {
+            continue;
+        }
+        let env = interp
+            .alloc_host_object_with_roots(&[], &[])
+            .map_err(|error| {
+                DynLoadError::type_error(format!("dynamic import: alloc env failed: {error}"))
+            })?;
+        interp.register_module_env(std::sync::Arc::from(init.url.as_str()), env);
+    }
+    let evaluation = NativeCtx::with_host_context(
+        interp,
+        NativeCallInfo::default_call(),
+        Some(&context),
+        |ctx| ctx.evaluate_module(target_url),
+    );
+    match evaluation {
+        Ok(Some(promise)) => {
+            return Ok(DynamicModuleLoad::PendingAsyncEvaluation {
+                promise,
+                target_url: target_url.to_string(),
+                context,
+            });
+        }
+        Ok(None) => {}
+        Err(error) => {
+            if matches!(error, otter_vm::VmError::Uncaught)
+                && let Some(thrown) = interp.take_pending_uncaught_throw()
+            {
+                return Err(DynLoadError::Thrown(thrown));
+            }
+            return Err(DynLoadError::type_error(format!(
+                "dynamic import: evaluation failed for \"{target_url}\": {error}"
+            )));
+        }
+    }
+    let namespace = interp.module_env(target_url).ok_or_else(|| {
+        DynLoadError::type_error(format!(
+            "dynamic import: namespace missing after load: \"{target_url}\""
+        ))
+    })?;
+    Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(
+        namespace,
+    )))
+}
+
+fn settle_dynamic_import_result_on(
+    interp: &mut Interpreter,
+    token: u64,
+    outcome: Result<otter_vm::Value, otter_vm::Value>,
+) -> Result<bool, OtterError> {
+    let settled_context = interp.settle_dynamic_import(token, outcome);
+    if let Some(context) = settled_context {
+        interp
+            .drain_microtasks_with_default(Some(context))
+            .map_err(|error| enrich_runtime_diagnostic_with_cause(interp, map_vm_error(error)))?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn alloc_dynamic_import_error_on(
+    interp: &mut Interpreter,
+    kind: otter_vm::ErrorKind,
+    message: String,
+) -> Result<otter_vm::Value, OtterError> {
+    let proto = interp.error_classes_for_trace().prototype(kind);
+    let proto_root = otter_vm::Value::object(proto);
+    let mut object = interp.alloc_host_object_with_roots(&[&proto_root], &[])?;
+    otter_vm::object::set_prototype(object, interp.gc_heap_mut(), Some(proto));
+    let message =
+        otter_vm::JsString::from_str(&message, interp.gc_heap_mut()).map_err(|error| {
+            OtterError::Internal {
+                code: DiagnosticCode::StringAlloc.as_str().to_string(),
+                message: error.to_string(),
+            }
+        })?;
+    otter_vm::object::set(
+        &mut object,
+        interp.gc_heap_mut(),
+        "message",
+        otter_vm::Value::string(message),
+    );
+    Ok(otter_vm::Value::object(object))
+}
+
 enum DynLoadError {
     Diagnostic {
         kind: otter_vm::ErrorKind,

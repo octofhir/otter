@@ -20,8 +20,8 @@
 //! - A record with `evaluation_error` set is always `Evaluated`
 //!   (§16.2.1.5 step 8: an abrupt completion transitions every module
 //!   on the stack to `evaluated`).
-//! - Records are cleared together with `module_environments` between
-//!   top-level `run` invocations.
+//! - Records and module environments persist for the owning realm's lifetime,
+//!   making evaluation idempotent across separate top-level entry graphs.
 //!
 //! # See also
 //! - [`crate::module_ops`]

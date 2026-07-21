@@ -11,7 +11,7 @@
 //! # Contents
 //!
 //! - [`PromiseId`] — opaque, monotonic token, `Send + Sync`.
-//! - [`PromiseRegistry`] — token → persistent-root map owned by
+//! - [`PromiseRegistry`] — token → persistent-root/origin-realm map owned by
 //!   [`crate::Runtime`].
 //! - [`HostSettleOutcome`] — owned host payload that crosses the
 //!   inbox hop (`Send + 'static`); converted to a JS [`Value`] on
@@ -28,6 +28,8 @@
 //! - Registry entries are opaque [`otter_vm::PersistentRootId`]s. The moving
 //!   collector rewrites the corresponding promise values in the
 //!   interpreter-owned root table.
+//! - Settlement switches to the entry's origin realm; disposal removes all
+//!   entries owned by that realm before its root graph is dropped.
 //! - The host payload type is `Send + 'static` and never carries a
 //!   GC handle. Conversion to `Value` happens in
 //!   [`crate::Runtime::settle_pending_promise`] on the runner
@@ -75,8 +77,14 @@ pub enum HostSettleOutcome {
 /// [`crate::Runtime`]; mutated only on the isolate runner thread.
 #[derive(Debug, Default)]
 pub struct PromiseRegistry {
-    entries: HashMap<u64, PersistentRootId>,
+    entries: HashMap<u64, PromiseEntry>,
     next_id: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PromiseEntry {
+    pub(crate) root: PersistentRootId,
+    pub(crate) realm_id: u32,
 }
 
 impl PromiseRegistry {
@@ -93,21 +101,33 @@ impl PromiseRegistry {
     ///
     /// The caller must insert the Promise value into the interpreter-owned
     /// root table before calling this method.
-    pub fn register(&mut self, root: PersistentRootId) -> PromiseId {
+    pub fn register(&mut self, root: PersistentRootId, realm_id: u32) -> PromiseId {
         let id = self.next_id;
         self.next_id = self
             .next_id
             .checked_add(1)
             .expect("promise id overflow is impossible inside one runtime lifetime");
-        self.entries.insert(id, root);
+        self.entries.insert(id, PromiseEntry { root, realm_id });
         PromiseId(id)
     }
 
     /// Pop the entry matching `id`, returning the stored persistent
     /// root (consumes the entry — settlement is one-shot per spec
     /// §27.2.1.{4,7}).
-    pub fn take(&mut self, id: PromiseId) -> Option<PersistentRootId> {
+    pub(crate) fn take(&mut self, id: PromiseId) -> Option<PromiseEntry> {
         self.entries.remove(&id.0)
+    }
+
+    /// Remove every pending host promise owned by a disposed realm.
+    pub(crate) fn take_realm(&mut self, realm_id: u32) -> Vec<PersistentRootId> {
+        let ids: Vec<u64> = self
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| (entry.realm_id == realm_id).then_some(*id))
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| self.entries.remove(&id).map(|entry| entry.root))
+            .collect()
     }
 
     /// Number of registered promises — diagnostic only.

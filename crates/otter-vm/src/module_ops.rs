@@ -1423,9 +1423,11 @@ impl Interpreter {
                     let pending =
                         promise_dispatch::PromiseBuilder::with_context(import_context.clone())
                             .pending_stack_rooted(self, stack, &[], &[])?;
-                    let token = self
-                        .dynamic_import_registry
-                        .insert(pending, import_context.clone());
+                    let token = self.dynamic_import_registry.insert(
+                        pending,
+                        import_context.clone(),
+                        self.active_realm_id,
+                    );
                     self.record_runtime_host_op_enqueued();
                     loader.schedule(token, specifier, referrer.clone());
                     pending

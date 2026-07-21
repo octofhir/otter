@@ -15,8 +15,8 @@
 //! - No raw moving value is retained across allocation, re-entry, or full GC.
 
 use otter_runtime::{
-    JitSelection, OtterError, Runtime, RuntimeExecutionStats, RuntimeGlobalInstaller,
-    RuntimeNativeCtx, RuntimeNativeError, RuntimeRealmContext, RuntimeValue, SourceInput,
+    JitSelection, OtterError, Runtime, RuntimeExecutionStats, RuntimeExtensionContext,
+    RuntimeExtensionInstaller, RuntimeNativeCtx, RuntimeNativeError, RuntimeValue, SourceInput,
 };
 
 fn structured_clone_native(
@@ -31,7 +31,7 @@ fn structured_clone_native(
     otter_runtime::web_structured_clone::structured_clone_with_options(ctx, value, options)
 }
 
-fn install_structured_clone(runtime: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
+fn install_structured_clone(runtime: &mut RuntimeExtensionContext<'_>) -> Result<(), OtterError> {
     runtime.install_native_global("structuredClone", 1, structured_clone_native)
 }
 
@@ -39,7 +39,7 @@ fn runtime(selection: JitSelection) -> Runtime {
     Runtime::builder()
         .jit_selection(selection)
         .jit_osr_threshold(u32::MAX)
-        .global_installer(RuntimeGlobalInstaller::new(install_structured_clone))
+        .extension_installer(RuntimeExtensionInstaller::new(install_structured_clone))
         .build()
         .expect("structured-clone runtime")
 }

@@ -29,7 +29,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use otter_runtime::{
-    ExecutionResult, InterruptHandle, JitSelection, OtterError, Runtime, RuntimeGlobalInstaller,
+    ExecutionResult, InterruptHandle, JitSelection, OtterError, Runtime, RuntimeExtensionInstaller,
     SourceInput,
 };
 
@@ -50,7 +50,9 @@ pub fn fresh_runtime(
         .jit_selection(jit_selection)
         .process_global(false)
         .worker_global(false)
-        .global_installer(RuntimeGlobalInstaller::new(crate::agent::install_natives))
+        .extension_installer(RuntimeExtensionInstaller::new(
+            crate::agent::install_natives,
+        ))
         .build()
 }
 

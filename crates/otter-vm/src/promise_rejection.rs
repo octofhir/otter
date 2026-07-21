@@ -20,7 +20,8 @@
 //! - The checkpoint always re-reads the live flag rather than trusting the
 //!   reject-time snapshot: a handler attached between rejection and the
 //!   checkpoint flips `is_handled`, and that promise must NOT be reported.
-//! - Both lists are GC roots (traced from [`crate::runtime_state`]); a tracked
+//! - Both lists are realm-owned GC roots (traced from the active or parked
+//!   [`crate::RealmState`]); a tracked
 //!   handle would otherwise be reclaimed while the reason is still pending
 //!   report.
 //! - Firing is a no-op (and both lists are cleared) when neither a Rust hook nor
@@ -88,7 +89,7 @@ impl std::fmt::Debug for PromiseRejectionHookHandle {
 const REPORTER_GLOBAL: &str = "__otterFirePromiseRejection";
 
 /// The HTML "about-to-be-notified rejected promises" and
-/// "outstanding rejected promises" sets, kept per interpreter.
+/// "outstanding rejected promises" sets, kept per realm.
 #[derive(Debug, Default)]
 pub(crate) struct RejectionTracker {
     /// Rejected while unhandled, awaiting the next checkpoint. Spec: the

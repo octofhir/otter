@@ -32,6 +32,8 @@
 //! - Cancellation deletes the entry from [`TimerCallbacks`] so a
 //!   late `TimerFired` (lost the cancel race) becomes a no-op
 //!   rather than running a stale callback.
+//! - Each callback is tagged with its scalar origin realm. Realm disposal
+//!   removes its entries and cancels the matching host deadlines.
 //!
 //! # See also
 //!
@@ -88,6 +90,8 @@ pub type TimerSchedulerHandle = Arc<dyn TimerScheduler>;
 /// only the opaque token leaves the VM.
 #[derive(Debug, Clone)]
 pub struct TimerEntry {
+    /// Scalar realm identity that scheduled the callback.
+    pub realm_id: u32,
     /// JS callable to invoke when the delay elapses.
     pub callback: Value,
     /// Extra positional arguments forwarded to the callback per
@@ -137,6 +141,20 @@ impl TimerCallbacks {
     /// the host cancels them.
     pub fn remove(&mut self, token: u64) -> Option<TimerEntry> {
         self.entries.remove(&token)
+    }
+
+    /// Remove and return host tokens owned by a disposed realm.
+    pub fn remove_realm(&mut self, realm_id: u32) -> Vec<u64> {
+        let mut tokens: Vec<u64> = self
+            .entries
+            .iter()
+            .filter_map(|(token, entry)| (entry.realm_id == realm_id).then_some(*token))
+            .collect();
+        tokens.sort_unstable();
+        for token in &tokens {
+            self.entries.remove(token);
+        }
+        tokens
     }
 
     /// Borrow an entry by token without removing it. Used by the
@@ -285,9 +303,11 @@ fn schedule_timer_common(
         })?;
     interp.record_runtime_host_op_enqueued();
     let token = scheduler.schedule(delay_ms, repeat.then_some(delay_ms));
+    let realm_id = interp.active_host_realm_id();
     interp.timer_callbacks_mut().insert(
         token,
         TimerEntry {
+            realm_id,
             callback,
             extra_args: extra,
             context,
@@ -360,9 +380,11 @@ fn set_immediate_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
         })?;
     interp.record_runtime_host_op_enqueued();
     let token = scheduler.schedule(0, None);
+    let realm_id = interp.active_host_realm_id();
     interp.timer_callbacks_mut().insert(
         token,
         TimerEntry {
+            realm_id,
             callback,
             extra_args: extra,
             context,

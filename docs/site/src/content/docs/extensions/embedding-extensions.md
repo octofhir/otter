@@ -77,11 +77,12 @@ is the whole cost model.
 
 ## High-level global installers and realms
 
-Public embedding code should not touch `Interpreter`, `Value`, `JsObject`,
-GC handles, or write barriers. A `RuntimeGlobalInstaller` receives a
+Public embedding code should import from `otter_runtime::embedding` and should
+not touch `Interpreter`, `Value`, `JsObject`, GC handles, or write barriers. A
+`RuntimeGlobalInstaller` receives a
 `RuntimeRealmContext`, whose deliberately small surface installs owned primitive
-configuration, registers extension natives, runs trusted bootstrap source,
-snapshots capabilities, and obtains owned task delivery:
+configuration, runs trusted bootstrap source, snapshots capabilities, and
+obtains owned task delivery:
 
 ```rust
 fn install_acme(realm: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
@@ -94,6 +95,14 @@ fn install_acme(realm: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
 let builder = Runtime::builder()
     .global_installer(RuntimeGlobalInstaller::new(install_acme));
 ```
+
+Native function-pointer installation is deliberately not present on
+`RuntimeRealmContext`. Engine extension crates that cannot express a surface
+through static `Extension` specs use the explicit advanced pair
+`RuntimeExtensionInstaller` / `RuntimeExtensionContext` and register it with
+`RuntimeBuilder::extension_installer`. Those types stay outside
+`otter_runtime::embedding`; application orchestration remains fully owned and
+high-level.
 
 The same installer and configured `Extension` classes/JS run for the default
 realm and every additional realm. Realm identity is the opaque, owned,
@@ -110,10 +119,11 @@ otter.dispose_realm(realm).await?;
 ```
 
 Globals are isolated and repeated turns retain state in their target realm.
-Classic-script execution and explicit disposal are realm-aware today. Realm ids
-are isolate-bound, never reused, and stale/foreign ids return a typed
-`RealmError`. Realm-targeted module graphs are a later high-level addition;
-embedders must not work around them by retaining raw globals.
+Classic scripts, canonical in-memory module graphs, dynamic imports, async host
+promise completions, timers, and explicit disposal are realm-aware. A realm's
+canonical-URL module map persists across entry graphs and remains independent
+from every other realm. Realm ids are isolate-bound, never reused, and
+stale/foreign ids return a typed `RealmError`.
 
 ## What works where
 

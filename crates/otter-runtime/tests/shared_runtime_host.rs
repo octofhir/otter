@@ -109,3 +109,18 @@ fn per_page_isolates_share_one_host_but_not_globals_or_heaps() {
         "events cannot be queued into a destroyed page"
     );
 }
+
+#[test]
+fn page_isolate_bootstrap_has_an_async_non_blocking_entry_point() {
+    let host = TokioRuntimeHost::new().expect("shared Tokio host");
+    let page = host
+        .handle()
+        .block_on(
+            Runtime::builder()
+                .runtime_host(host.clone())
+                .build_handle_async(),
+        )
+        .expect("page isolate starts through Tokio's blocking pool");
+
+    assert_eq!(eval(&host, &page, "21 * 2"), "42");
+}

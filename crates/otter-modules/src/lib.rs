@@ -57,14 +57,14 @@ pub trait OtterModulesBuilderExt: Sized {
 impl OtterModulesBuilderExt for RuntimeBuilder {
     fn with_otter_modules(self) -> Self {
         self.hosted_modules(HOSTED_MODULES.iter().copied())
-            .global_installer(serve::otter_global_installer())
+            .extension_installer(serve::otter_global_installer())
     }
 }
 
 impl OtterModulesBuilderExt for OtterBuilder {
     fn with_otter_modules(self) -> Self {
         self.hosted_modules(HOSTED_MODULES.iter().copied())
-            .global_installer(serve::otter_global_installer())
+            .extension_installer(serve::otter_global_installer())
     }
 }
 

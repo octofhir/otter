@@ -93,7 +93,7 @@ pub const fn web_api_classes() -> &'static [GlobalClass] {
 pub fn with_web_apis(builder: RuntimeBuilder) -> RuntimeBuilder {
     builder
         .extension(&WEB_EXTENSION)
-        .global_installer(globals::web_globals_installer())
+        .extension_installer(globals::web_globals_installer())
 }
 
 /// Register active Web API globals on a Layer-A builder.
@@ -101,7 +101,7 @@ pub fn with_web_apis(builder: RuntimeBuilder) -> RuntimeBuilder {
 pub fn with_web_apis_for_otter(builder: OtterBuilder) -> OtterBuilder {
     builder
         .extension(&WEB_EXTENSION)
-        .global_installer(globals::web_globals_installer())
+        .extension_installer(globals::web_globals_installer())
 }
 
 /// Ergonomic extension trait for enabling Web APIs on builders.

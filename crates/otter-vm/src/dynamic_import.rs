@@ -21,7 +21,7 @@
 //!
 //! - [`DynamicImportLoader`] — host scheduler trait.
 //! - [`DynamicImportRegistry`] — per-isolate `u64 → pending entry`
-//!   map for dynamic-import promises and their origin contexts.
+//!   map for dynamic-import promises, origin contexts, and realm ids.
 //!
 //! # Invariants
 //!
@@ -34,6 +34,8 @@
 //! - Cross-thread payloads on this trait are `Send + 'static`
 //!   (strings + a `u64` token); no [`crate::Value`] or
 //!   [`crate::JsPromiseHandle`] crosses the boundary.
+//! - Settlement re-enters the scalar origin realm. Disposing that realm
+//!   removes its pending entries, so a late host result is a no-op.
 //!
 //! # See also
 //!
@@ -77,6 +79,8 @@ pub struct DynamicImportEntry {
     /// drains reactions against this context when the host load
     /// settles.
     pub context: ExecutionContext,
+    /// Scalar id of the realm that executed `import()`.
+    pub realm_id: u32,
 }
 
 /// Per-interpreter map keyed by host-issued token.
@@ -100,7 +104,12 @@ impl DynamicImportRegistry {
     /// Register a fresh pending promise and return its token.
     /// Token allocation is monotonic — reuse is impossible inside
     /// one interpreter's lifetime.
-    pub fn insert(&mut self, handle: JsPromiseHandle, context: ExecutionContext) -> u64 {
+    pub fn insert(
+        &mut self,
+        handle: JsPromiseHandle,
+        context: ExecutionContext,
+        realm_id: u32,
+    ) -> u64 {
         let token = self.next_token;
         self.next_token = self
             .next_token
@@ -111,6 +120,7 @@ impl DynamicImportRegistry {
             DynamicImportEntry {
                 promise: handle,
                 context,
+                realm_id,
             },
         );
         token
@@ -120,6 +130,19 @@ impl DynamicImportRegistry {
     /// one-shot per §27.2.1.{4,7}).
     pub fn take(&mut self, token: u64) -> Option<DynamicImportEntry> {
         self.entries.remove(&token)
+    }
+
+    /// Realm that owns a pending import token.
+    #[must_use]
+    pub fn realm_id(&self, token: u64) -> Option<u32> {
+        self.entries.get(&token).map(|entry| entry.realm_id)
+    }
+
+    /// Drop pending imports owned by a disposed realm.
+    pub fn remove_realm(&mut self, realm_id: u32) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|_, entry| entry.realm_id != realm_id);
+        before - self.entries.len()
     }
 
     /// Number of pending dynamic-import promises — diagnostic only.

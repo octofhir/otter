@@ -176,11 +176,10 @@ impl ClassEntry {
 }
 
 unsafe fn trace_class_entries(slot: *mut (), visitor: &mut dyn FnMut(*mut RawGc)) {
-    // SAFETY: `ErrorClassRegistry::new` registers the address of its live
-    // `Vec<(ErrorKind, ClassEntry)>` for exactly the lifetime of the enclosing
-    // `RootScope`. The vector value itself does not move while the scope is
-    // active; reallocating its backing buffer is fine because it is read here
-    // on every trace.
+    // SAFETY: `ErrorClassRegistry::new` keeps the Vec value in a Box and
+    // registers that stable heap address for exactly the lifetime of the
+    // enclosing `RootScope`. Reallocating the Vec's backing buffer is fine
+    // because the Vec value itself is read here on every trace.
     let entries = unsafe { &mut *slot.cast::<Vec<(ErrorKind, ClassEntry)>>() };
     for (_, entry) in entries {
         visitor(std::ptr::addr_of_mut!(entry.prototype).cast::<RawGc>());
@@ -540,7 +539,7 @@ impl ErrorClassRegistry {
         let mut class_name_root = Value::undefined();
         let mut ctor_root = Value::undefined();
         let mut native_root = Value::undefined();
-        let mut entries: Vec<(ErrorKind, ClassEntry)> = Vec::with_capacity(8);
+        let mut entries: Box<Vec<(ErrorKind, ClassEntry)>> = Box::new(Vec::with_capacity(8));
         let mut roots = otter_gc::RootScope::new(gc_heap);
         // SAFETY: every slot above is declared before `roots`, so it outlives
         // the scope and remains at a stable stack address until construction
@@ -558,7 +557,7 @@ impl ErrorClassRegistry {
             roots.add_value(&mut ctor_root);
             roots.add_value(&mut native_root);
             roots.add_erased(
-                (&mut entries as *mut Vec<(ErrorKind, ClassEntry)>).cast::<()>(),
+                (entries.as_mut() as *mut Vec<(ErrorKind, ClassEntry)>).cast::<()>(),
                 trace_class_entries,
             );
         }

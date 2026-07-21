@@ -217,3 +217,36 @@ fn without_a_scheduler_set_timeout_reports_the_missing_host_capability() {
         "the diagnostic names the missing host capability: {error:?}"
     );
 }
+
+#[test]
+fn disposing_a_realm_cancels_every_timer_owned_by_that_realm() {
+    let scheduler = Arc::new(RecordingScheduler::default());
+    let mut runtime = runtime_with(&scheduler);
+    let realm = runtime.create_realm().expect("realm");
+
+    runtime
+        .run_script_in_realm(
+            realm,
+            SourceInput::from_javascript(
+                "setTimeout(() => { globalThis.mustNotRun = true; }, 1000);\
+                 setInterval(() => { globalThis.mustNotRun = true; }, 1000);",
+            ),
+            "realm:timers",
+        )
+        .expect("schedule realm timers");
+    let tokens = scheduler.tokens();
+    assert_eq!(tokens.len(), 2);
+
+    runtime.dispose_realm(realm).expect("dispose realm");
+    assert_eq!(
+        scheduler.cancelled.lock().expect("cancelled").as_slice(),
+        tokens.as_slice(),
+        "realm teardown must cancel host deadlines, not merely drop callbacks"
+    );
+    for token in tokens {
+        assert_eq!(
+            runtime.fire_timer(token).expect("late fire is harmless"),
+            TimerFireOutcome::Missing
+        );
+    }
+}

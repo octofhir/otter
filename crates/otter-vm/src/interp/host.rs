@@ -109,6 +109,19 @@ impl Interpreter {
         &self.timer_callbacks
     }
 
+    /// Cancel and forget every timer owned by a disposed realm.
+    #[doc(hidden)]
+    pub fn cancel_timers_for_realm(&mut self, realm_id: u32) -> usize {
+        let scheduler = self.timer_scheduler();
+        let tokens = self.timer_callbacks.remove_realm(realm_id);
+        if let Some(scheduler) = scheduler {
+            for token in &tokens {
+                let _ = scheduler.cancel(*token);
+            }
+        }
+        tokens.len()
+    }
+
     /// Insert a generic persistent root and return its id.
     pub fn persistent_root_insert(&mut self, value: Value) -> persistent_roots::PersistentRootId {
         self.persistent_roots.insert(value)
@@ -162,6 +175,19 @@ impl Interpreter {
     /// Mutable handle to the dynamic-import registry.
     pub fn dynamic_import_registry_mut(&mut self) -> &mut dynamic_import::DynamicImportRegistry {
         &mut self.dynamic_import_registry
+    }
+
+    /// Scalar realm identity for a pending dynamic-import token.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn dynamic_import_realm_id(&self, token: u64) -> Option<u32> {
+        self.dynamic_import_registry.realm_id(token)
+    }
+
+    /// Forget pending dynamic imports owned by a disposed realm.
+    #[doc(hidden)]
+    pub fn remove_dynamic_imports_for_realm(&mut self, realm_id: u32) -> usize {
+        self.dynamic_import_registry.remove_realm(realm_id)
     }
 }
 

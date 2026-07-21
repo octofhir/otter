@@ -56,6 +56,11 @@ pub(crate) trait RuntimeTaskQueue: Send + Sync + 'static {
         task: Box<dyn RuntimeTask>,
         liveness: RuntimeLiveness,
     ) -> Result<(), OtterError>;
+
+    /// Enqueue engine-owned completion work without dropping it under
+    /// backpressure. Implementations must retry asynchronously or cancel it
+    /// during shutdown; they must not block the caller.
+    fn enqueue_boxed_guaranteed(&self, task: Box<dyn RuntimeTask>, liveness: RuntimeLiveness);
 }
 
 /// Cloneable sender for scheduling typed tasks onto the runtime event loop.
@@ -99,6 +104,11 @@ impl RuntimeTaskSpawner {
         liveness: RuntimeLiveness,
     ) -> Result<(), OtterError> {
         self.queue.enqueue_boxed(Box::new(task), liveness)
+    }
+
+    pub(crate) fn enqueue_guaranteed(&self, task: impl RuntimeTask, liveness: RuntimeLiveness) {
+        self.queue
+            .enqueue_boxed_guaranteed(Box::new(task), liveness);
     }
 
     /// Retain one long-lived host resource in the runtime liveness counters.
@@ -253,9 +263,8 @@ impl otter_vm::host_completion::HostCompletionSink for SpawnerCompletionSink {
     }
 
     fn complete(&self, job: otter_vm::host_completion::HostCompletionJob) {
-        let _ = self
-            .spawner
-            .enqueue(HostCompletionTask { job }, RuntimeLiveness::Ref);
+        self.spawner
+            .enqueue_guaranteed(HostCompletionTask { job }, RuntimeLiveness::Ref);
     }
 
     fn keep_alive(&self) -> otter_vm::host_completion::HostKeepAlive {

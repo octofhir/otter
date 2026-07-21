@@ -124,6 +124,61 @@ async fn fetch_performs_buffered_get() -> Result<(), OtterError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_completion_materializes_and_settles_in_its_origin_realm() -> Result<(), OtterError> {
+    let (url, server) = spawn_one_shot(|_request| {
+        let body = "realm fetch";
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    });
+    let otter = Otter::builder()
+        .with_web_apis()
+        .capabilities(allow_net())
+        .build()?;
+    let page = otter.handle();
+    let realm = page.create_realm().await?;
+
+    page.run_script_in_realm(
+        realm,
+        SourceInput::from_javascript(format!(
+            r#"
+            globalThis.fetchState = "pending";
+            fetch("{url}")
+              .then((response) => response.text().then((text) => {{
+                globalThis.fetchState =
+                  (response instanceof Response) + ":" + text;
+              }}))
+              .catch((error) => {{ globalThis.fetchState = "error:" + error; }});
+            "#
+        )),
+        "realm:fetch",
+    )
+    .await?;
+    server.join().expect("server thread");
+
+    assert_eq!(
+        page.run_script_in_realm(
+            realm,
+            SourceInput::from_javascript("fetchState"),
+            "realm:fetch-result",
+        )
+        .await?
+        .completion_string(),
+        "true:realm fetch"
+    );
+    assert_eq!(
+        page.eval(SourceInput::from_javascript("typeof fetchState"))
+            .await?
+            .completion_string(),
+        "undefined",
+        "async completion must not leak into the isolate's default realm"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fetch_response_body_is_a_readable_stream() -> Result<(), OtterError> {
     let (url, server) = spawn_one_shot(|_request| {
         let body = "chunk-a chunk-b";

@@ -18,6 +18,8 @@
 //! - Module graph preparation produces owned bytecode and metadata on Tokio's
 //!   blocking pool; only realm-local instantiation/evaluation runs on the
 //!   isolate thread.
+//! - Script and module commands carry opaque realm ids; async settlement and
+//!   disposal are routed on the owning isolate.
 //! - Command replies carry only owned public data.
 //! - Dropping a waiting future does not drop the isolate mid-turn; the
 //!   runner observes the cancelled reply channel at the completion point.
@@ -242,6 +244,7 @@ struct RuntimeCounters {
 struct InboxRuntimeTaskQueue {
     tx: SyncSender<RuntimeMessage>,
     counters: Arc<RuntimeCounters>,
+    io_handle: tokio::runtime::Handle,
 }
 
 impl RuntimeTaskQueue for InboxRuntimeTaskQueue {
@@ -278,6 +281,43 @@ impl RuntimeTaskQueue for InboxRuntimeTaskQueue {
                     code: DiagnosticCode::RuntimeShutdown.as_str().to_string(),
                     message: "runtime isolate is no longer accepting tasks".to_string(),
                 })
+            }
+        }
+    }
+
+    fn enqueue_boxed_guaranteed(&self, task: Box<dyn RuntimeTask>, liveness: RuntimeLiveness) {
+        if self.counters.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        self.counters.retain_host_activity(liveness);
+        let message = RuntimeMessage::RuntimeTask { task, liveness };
+        match self.tx.try_send(message) {
+            Ok(()) => {}
+            Err(TrySendError::Disconnected(_)) => {
+                self.counters.cancel_host_activity(liveness);
+            }
+            Err(TrySendError::Full(mut message)) => {
+                let tx = self.tx.clone();
+                let counters = self.counters.clone();
+                self.io_handle.spawn(async move {
+                    loop {
+                        if counters.shutdown.load(Ordering::Acquire) {
+                            counters.cancel_host_activity(liveness);
+                            return;
+                        }
+                        match tx.try_send(message) {
+                            Ok(()) => return,
+                            Err(TrySendError::Full(returned)) => {
+                                message = returned;
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                            }
+                            Err(TrySendError::Disconnected(_)) => {
+                                counters.cancel_host_activity(liveness);
+                                return;
+                            }
+                        }
+                    }
+                });
             }
         }
     }
@@ -402,6 +442,12 @@ enum RuntimeCommand {
     },
     RunModuleSource {
         id: CommandId,
+        linked: crate::module_graph::LinkedProgram,
+        reply: RunReply,
+    },
+    RunModuleInRealm {
+        id: CommandId,
+        realm: crate::RuntimeRealmId,
         linked: crate::module_graph::LinkedProgram,
         reply: RunReply,
     },
@@ -658,6 +704,49 @@ impl RuntimeHandle {
         self.await_run_reply(rx).await
     }
 
+    /// Run an in-memory ES module graph in an additional realm.
+    pub async fn run_module_source_in_realm(
+        &self,
+        realm: crate::RuntimeRealmId,
+        source: SourceInput,
+        url: impl Into<String>,
+    ) -> Result<ExecutionResult, OtterError> {
+        self.run_module_source_in_realm_with_diagnostics(realm, source, url)
+            .await
+            .into_result()
+    }
+
+    /// Run a realm-targeted module and retain partial JIT diagnostics.
+    pub async fn run_module_source_in_realm_with_diagnostics(
+        &self,
+        realm: crate::RuntimeRealmId,
+        source: SourceInput,
+        url: impl Into<String>,
+    ) -> ExecutionAttempt {
+        let preparation = self.inner.module_preparation.clone();
+        let url = url.into();
+        let task = self
+            .inner
+            .event_loop
+            .handle()
+            .spawn_blocking(move || preparation.prepare_source(source, url));
+        let linked = match self.await_module_preparation(task).await {
+            Ok(linked) => linked,
+            Err(error) => return ExecutionAttempt::from_result(Err(error), None, None),
+        };
+        let (reply, rx) = oneshot::channel();
+        let id = self.next_command_id();
+        if let Err(error) = self.submit(RuntimeCommand::RunModuleInRealm {
+            id,
+            realm,
+            linked,
+            reply,
+        }) {
+            return ExecutionAttempt::from_result(Err(error), None, None);
+        }
+        self.await_run_reply(rx).await
+    }
+
     /// Evaluate a source bundle through the isolate runner.
     ///
     /// # Errors
@@ -734,7 +823,10 @@ impl RuntimeHandle {
             return;
         }
         self.inner.interrupt.interrupt();
-        let _ = self.inner.tx.send(RuntimeMessage::Shutdown);
+        // Never park the caller (often a browser UI thread) behind a full
+        // bounded isolate inbox. A full queue already guarantees the runner is
+        // awake; it observes the atomic shutdown flag before its next tick.
+        let _ = self.inner.tx.try_send(RuntimeMessage::Shutdown);
     }
 
     /// `true` after explicit shutdown or isolate teardown has begun.
@@ -755,6 +847,7 @@ impl RuntimeHandle {
         let wake = Arc::new(RuntimeTimerWake {
             tx: self.inner.tx.clone(),
             counters: self.inner.counters.clone(),
+            io_handle: self.inner.event_loop.handle(),
             liveness: RuntimeLiveness::Ref,
             repeat: request.repeat.is_some(),
             expects_js_callback: false,
@@ -778,6 +871,9 @@ impl RuntimeHandle {
     /// A late or duplicate settlement (the host raced its own
     /// cancellation, or the matching script run has already
     /// returned and dropped its module) is a silent no-op.
+    /// A saturated isolate inbox never blocks this caller and never drops the
+    /// completion: delivery is retried asynchronously on the shared Tokio
+    /// runtime until the isolate accepts it or begins shutdown.
     pub fn settle_promise(
         &self,
         id: PromiseId,
@@ -789,26 +885,17 @@ impl RuntimeHandle {
             &self.inner.counters.pending_ref_host_ops,
             &self.inner.counters.pending_unref_host_ops,
         );
-        if self
-            .inner
-            .tx
-            .try_send(RuntimeMessage::SettlePromise {
+        post_internal_message(
+            &self.inner.event_loop.handle(),
+            &self.inner.tx,
+            &self.inner.counters,
+            RuntimeMessage::SettlePromise {
                 id,
                 outcome,
                 liveness,
-            })
-            .is_err()
-        {
-            decrement_liveness(
-                liveness,
-                &self.inner.counters.pending_ref_host_ops,
-                &self.inner.counters.pending_unref_host_ops,
-            );
-            self.inner
-                .counters
-                .failed_host_ops
-                .fetch_add(1, Ordering::Relaxed);
-        }
+            },
+            InternalPostAccounting::Host(liveness),
+        );
     }
 
     /// Retain one long-lived host resource in the runtime liveness counters.
@@ -844,6 +931,7 @@ impl RuntimeHandle {
             Arc::new(InboxRuntimeTaskQueue {
                 tx: self.inner.tx.clone(),
                 counters: self.inner.counters.clone(),
+                io_handle: self.inner.event_loop.handle(),
             }),
             self.inner.counters.clone(),
             Some(self.inner.event_loop.handle()),
@@ -1266,11 +1354,13 @@ impl RuntimeHandle {
 
 impl Drop for RuntimeHandleInner {
     fn drop(&mut self) {
-        self.counters.shutdown.store(true, Ordering::Relaxed);
-        let _ = self.tx.send(RuntimeMessage::Shutdown);
-        if let Some(runner) = self.runner.lock().expect("runner mutex poisoned").take() {
-            let _ = runner.join();
-        }
+        self.counters.shutdown.store(true, Ordering::Release);
+        self.interrupt.interrupt();
+        let _ = self.tx.try_send(RuntimeMessage::Shutdown);
+        // Dropping a JoinHandle detaches it. The atomic flag + interrupt +
+        // wake above guarantee termination without making the final handle's
+        // destructor a synchronous thread join on an arbitrary caller.
+        let _ = self.runner.lock().expect("runner mutex poisoned").take();
     }
 }
 
@@ -1288,6 +1378,7 @@ fn run_isolate(
         Arc::new(InboxRuntimeTaskQueue {
             tx: scheduler_tx.clone(),
             counters: counters.clone(),
+            io_handle: event_loop.handle(),
         }),
         counters.clone(),
         Some(event_loop.handle()),
@@ -1316,6 +1407,7 @@ fn run_isolate(
     let dynamic_import_loader = Arc::new(InboxDynamicImportLoader {
         tx: scheduler_tx.clone(),
         counters: counters.clone(),
+        io_handle: module_task_handle.clone(),
     });
     runtime.install_dynamic_import_loader(dynamic_import_loader);
     let _ = interrupt_tx.send(runtime.interrupt_handle().raw_flag());
@@ -1367,6 +1459,7 @@ const FIRST_IMMEDIATE_TOKEN: u64 = 1u64 << 63;
 struct RuntimeTimerWake {
     tx: SyncSender<RuntimeMessage>,
     counters: Arc<RuntimeCounters>,
+    io_handle: tokio::runtime::Handle,
     liveness: RuntimeLiveness,
     repeat: bool,
     expects_js_callback: bool,
@@ -1374,31 +1467,29 @@ struct RuntimeTimerWake {
 
 impl TimerWake for RuntimeTimerWake {
     fn timer_fired(&self, token: TimerToken) {
-        if self
-            .tx
-            .try_send(RuntimeMessage::TimerFired {
+        let accounting = if self.repeat {
+            InternalPostAccounting::DropOnFull
+        } else {
+            InternalPostAccounting::Timer(self.liveness)
+        };
+        post_internal_message(
+            &self.io_handle,
+            &self.tx,
+            &self.counters,
+            RuntimeMessage::TimerFired {
                 token,
                 liveness: self.liveness,
                 expects_js_callback: self.expects_js_callback,
-            })
-            .is_err()
-            && !self.repeat
-        {
-            decrement_liveness(
-                self.liveness,
-                &self.counters.pending_ref_timers,
-                &self.counters.pending_unref_timers,
-            );
-            self.counters
-                .cancelled_timers
-                .fetch_add(1, Ordering::Relaxed);
-        }
+            },
+            accounting,
+        );
     }
 }
 
 struct DynamicImportFetchWake {
     tx: SyncSender<RuntimeMessage>,
     counters: Arc<RuntimeCounters>,
+    io_handle: tokio::runtime::Handle,
     token: u64,
     target_url: String,
     liveness: RuntimeLiveness,
@@ -1406,25 +1497,18 @@ struct DynamicImportFetchWake {
 
 impl HttpsModuleFetchSink for DynamicImportFetchWake {
     fn fetched(&self, result: Result<String, String>) {
-        if self
-            .tx
-            .try_send(RuntimeMessage::DynamicImportHttpsFetched {
+        post_internal_message(
+            &self.io_handle,
+            &self.tx,
+            &self.counters,
+            RuntimeMessage::DynamicImportHttpsFetched {
                 token: self.token,
                 target_url: self.target_url.clone(),
                 result,
                 liveness: self.liveness,
-            })
-            .is_err()
-        {
-            decrement_liveness(
-                self.liveness,
-                &self.counters.pending_ref_host_ops,
-                &self.counters.pending_unref_host_ops,
-            );
-            self.counters
-                .failed_host_ops
-                .fetch_add(1, Ordering::Relaxed);
-        }
+            },
+            InternalPostAccounting::Host(self.liveness),
+        );
     }
 }
 
@@ -1442,6 +1526,7 @@ impl HttpsModuleFetchSink for DynamicImportFetchWake {
 struct InboxDynamicImportLoader {
     tx: SyncSender<RuntimeMessage>,
     counters: Arc<RuntimeCounters>,
+    io_handle: tokio::runtime::Handle,
 }
 
 impl DynamicImportLoader for InboxDynamicImportLoader {
@@ -1452,25 +1537,18 @@ impl DynamicImportLoader for InboxDynamicImportLoader {
             &self.counters.pending_ref_host_ops,
             &self.counters.pending_unref_host_ops,
         );
-        if self
-            .tx
-            .try_send(RuntimeMessage::DynamicImportLoad {
+        post_internal_message(
+            &self.io_handle,
+            &self.tx,
+            &self.counters,
+            RuntimeMessage::DynamicImportLoad {
                 token,
                 specifier,
                 referrer,
                 liveness,
-            })
-            .is_err()
-        {
-            decrement_liveness(
-                liveness,
-                &self.counters.pending_ref_host_ops,
-                &self.counters.pending_unref_host_ops,
-            );
-            self.counters
-                .failed_host_ops
-                .fetch_add(1, Ordering::Relaxed);
-        }
+            },
+            InternalPostAccounting::Host(liveness),
+        );
     }
 }
 
@@ -1488,24 +1566,17 @@ impl TimerScheduler for InboxTimerScheduler {
         // scheduler does not guarantee that for `sleep(0)`.
         if delay_ms == 0 && repeat_ms.is_none() {
             let token = TimerToken(self.next_immediate_token.fetch_add(1, Ordering::Relaxed));
-            if self
-                .tx
-                .try_send(RuntimeMessage::TimerFired {
+            post_internal_message(
+                &self.event_loop.handle(),
+                &self.tx,
+                &self.counters,
+                RuntimeMessage::TimerFired {
                     token,
                     liveness,
                     expects_js_callback: true,
-                })
-                .is_err()
-            {
-                decrement_liveness(
-                    liveness,
-                    &self.counters.pending_ref_timers,
-                    &self.counters.pending_unref_timers,
-                );
-                self.counters
-                    .cancelled_timers
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+                },
+                InternalPostAccounting::Timer(liveness),
+            );
             return token.0;
         }
         let request = TimerRequest {
@@ -1515,6 +1586,7 @@ impl TimerScheduler for InboxTimerScheduler {
         let wake = Arc::new(RuntimeTimerWake {
             tx: self.tx.clone(),
             counters: self.counters.clone(),
+            io_handle: self.event_loop.handle(),
             liveness,
             repeat: repeat_ms.is_some(),
             expects_js_callback: true,
@@ -1588,6 +1660,10 @@ enum TickOutcome {
 
 impl IsolateRunner {
     fn poll_one_tick(&mut self) -> TickOutcome {
+        if self.counters.shutdown.load(Ordering::Acquire) {
+            self.shutdown();
+            return TickOutcome::Shutdown;
+        }
         if let Some(command) = self.deferred_commands.pop_front() {
             return self.process_message(RuntimeMessage::Command(command));
         }
@@ -1606,11 +1682,9 @@ impl IsolateRunner {
                 TickOutcome::Shutdown => return,
             }
             // Every poll consumes a message, so every outcome must be
-            // honoured here — discarding a `Shutdown` consumed by this
-            // poll would re-enter the blocking `recv()` while the
-            // handle's `Drop` is parked in `join()` holding its `tx`
-            // clone: the channel never disconnects and both threads
-            // deadlock.
+            // honoured here. Discarding a consumed `Shutdown` would re-enter
+            // the blocking receive even though the atomic shutdown signal has
+            // already asked this detached isolate thread to terminate.
             match self.poll_one_tick() {
                 TickOutcome::Processed => {}
                 TickOutcome::Shutdown => return,
@@ -1749,6 +1823,7 @@ impl IsolateRunner {
                         let sink = Arc::new(DynamicImportFetchWake {
                             tx: self.tx.clone(),
                             counters: self.counters.clone(),
+                            io_handle: self.module_task_handle.clone(),
                             token,
                             target_url: target_url.clone(),
                             liveness,
@@ -1782,6 +1857,7 @@ impl IsolateRunner {
                         let preparation = self.module_preparation.clone();
                         let task_handle = self.module_task_handle.clone();
                         let tx = self.tx.clone();
+                        let counters = self.counters.clone();
                         task_handle.spawn(async move {
                             let source = SourceInput::from_javascript(source);
                             let prepare_url = target_url.clone();
@@ -1791,17 +1867,35 @@ impl IsolateRunner {
                             .await
                             .map_err(|error| error.to_string())
                             .and_then(|result| result.map_err(|error| error.to_string()));
-                            let message = RuntimeMessage::DynamicImportGraphPrepared {
+                            let mut message = RuntimeMessage::DynamicImportGraphPrepared {
                                 token,
                                 target_url,
                                 result: prepared,
                                 liveness,
                             };
-                            // `SyncSender::send` may wait for bounded inbox
-                            // capacity. Keep that wait off Tokio's core workers;
-                            // the isolate will consume the message or shutdown
-                            // will disconnect the channel.
-                            let _ = tokio::task::spawn_blocking(move || tx.send(message)).await;
+                            // Preserve the completion without blocking either a
+                            // Tokio core worker or a blocking-pool worker behind
+                            // bounded inbox capacity. The isolate drains this
+                            // queue while it waits for referenced host work.
+                            loop {
+                                if counters.shutdown.load(Ordering::Acquire) {
+                                    decrement_liveness(
+                                        liveness,
+                                        &counters.pending_ref_host_ops,
+                                        &counters.pending_unref_host_ops,
+                                    );
+                                    counters.cancelled_host_ops.fetch_add(1, Ordering::Relaxed);
+                                    break;
+                                }
+                                match tx.try_send(message) {
+                                    Ok(()) => break,
+                                    Err(TrySendError::Full(returned)) => {
+                                        message = returned;
+                                        tokio::time::sleep(Duration::from_millis(1)).await;
+                                    }
+                                    Err(TrySendError::Disconnected(_)) => break,
+                                }
+                            }
                         });
                     }
                 }
@@ -1909,6 +2003,17 @@ impl IsolateRunner {
                 let attempt = self.runtime.finish_jit_debug_attempt(result);
                 send_run_reply(reply, attempt, &self.counters);
             }
+            RuntimeCommand::RunModuleInRealm {
+                realm,
+                linked,
+                reply,
+                ..
+            } => {
+                let result = self.runtime.run_prepared_module_in_realm(realm, linked);
+                let result = self.drive_event_loop_to_idle(result);
+                let attempt = self.runtime.finish_jit_debug_attempt(result);
+                send_run_reply(reply, attempt, &self.counters);
+            }
             RuntimeCommand::Eval { source, reply, .. } => {
                 let result = self.runtime.eval(source);
                 let result = self.drive_event_loop_to_idle(result);
@@ -1992,6 +2097,7 @@ impl RuntimeCommand {
             | RuntimeCommand::RunScriptInRealm { id, .. }
             | RuntimeCommand::RunModule { id, .. }
             | RuntimeCommand::RunModuleSource { id, .. }
+            | RuntimeCommand::RunModuleInRealm { id, .. }
             | RuntimeCommand::Eval { id, .. } => *id,
         }
     }
@@ -2046,6 +2152,76 @@ fn decrement_liveness(
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
 }
 
+#[derive(Clone, Copy)]
+enum InternalPostAccounting {
+    /// Host completion that must be delivered exactly once while the isolate
+    /// is alive.
+    Host(RuntimeLiveness),
+    /// One-shot timer wake that must not disappear under inbox pressure.
+    Timer(RuntimeLiveness),
+    /// Repeating timer ticks may coalesce while the isolate is saturated.
+    DropOnFull,
+}
+
+fn post_internal_message(
+    io_handle: &tokio::runtime::Handle,
+    tx: &SyncSender<RuntimeMessage>,
+    counters: &Arc<RuntimeCounters>,
+    message: RuntimeMessage,
+    accounting: InternalPostAccounting,
+) {
+    match tx.try_send(message) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) if matches!(accounting, InternalPostAccounting::DropOnFull) => {}
+        Err(TrySendError::Disconnected(_)) => cancel_internal_post(counters, accounting),
+        Err(TrySendError::Full(mut message)) => {
+            let tx = tx.clone();
+            let counters = counters.clone();
+            io_handle.spawn(async move {
+                loop {
+                    if counters.shutdown.load(Ordering::Acquire) {
+                        cancel_internal_post(&counters, accounting);
+                        return;
+                    }
+                    match tx.try_send(message) {
+                        Ok(()) => return,
+                        Err(TrySendError::Full(returned)) => {
+                            message = returned;
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        Err(TrySendError::Disconnected(_)) => {
+                            cancel_internal_post(&counters, accounting);
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
+fn cancel_internal_post(counters: &RuntimeCounters, accounting: InternalPostAccounting) {
+    match accounting {
+        InternalPostAccounting::Host(liveness) => {
+            decrement_liveness(
+                liveness,
+                &counters.pending_ref_host_ops,
+                &counters.pending_unref_host_ops,
+            );
+            counters.cancelled_host_ops.fetch_add(1, Ordering::Relaxed);
+        }
+        InternalPostAccounting::Timer(liveness) => {
+            decrement_liveness(
+                liveness,
+                &counters.pending_ref_timers,
+                &counters.pending_unref_timers,
+            );
+            counters.cancelled_timers.fetch_add(1, Ordering::Relaxed);
+        }
+        InternalPostAccounting::DropOnFull => {}
+    }
+}
+
 #[cfg(test)]
 mod shutdown_tests {
     use super::*;
@@ -2085,6 +2261,6 @@ mod shutdown_tests {
         });
         dropped_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("last handle drop must join the isolate without deadlocking");
+            .expect("last handle drop must return without blocking on the isolate");
     }
 }

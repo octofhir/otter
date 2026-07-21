@@ -5,7 +5,12 @@
 //! - [`RuntimeGlobalValue`] — owned primitive accepted by safe installers.
 //! - [`RuntimeRealmContext`] — safe installer surface shared by the default
 //!   realm and additional realms.
+//! - [`RuntimeExtensionContext`] — explicitly advanced native installer
+//!   surface kept out of the curated application embedding module.
 //! - Configured class/extension installation for a newly active realm.
+//! - Realm-targeted classic scripts and canonical module graphs.
+//! - Realm teardown for host promises, dynamic imports, timers, module records,
+//!   and traced VM state.
 //!
 //! # Invariants
 //! - Public realm APIs never expose interpreter, value, object, or GC handles.
@@ -13,6 +18,8 @@
 //!   interpreter.
 //! - Installer callbacks can add globals and run bootstrap source, but cannot
 //!   reach raw heap mutation or retain an isolate-local borrow.
+//! - Async completion and module evaluation always re-enter the scalar origin
+//!   realm; stale or foreign ids never fall back to the default realm.
 //!
 //! # See also
 //! - [`crate::RuntimeGlobalInstaller`]
@@ -22,6 +29,7 @@ use crate::{
     CapabilitySet, DiagnosticCode, GlobalClassInner, OtterError, RealmError, RuntimeConfig,
     RuntimeHooks, RuntimeNativeCall, RuntimeNativeFastFn, RuntimeTaskSpawner, SourceInput,
 };
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_REALM_OWNER_ID: AtomicU64 = AtomicU64::new(1);
@@ -147,42 +155,6 @@ impl<'a> RuntimeRealmContext<'a> {
         Ok(())
     }
 
-    /// Install a static native function as a realm global.
-    pub fn install_native_global(
-        &mut self,
-        name: &'static str,
-        length: u8,
-        call: RuntimeNativeFastFn,
-    ) -> Result<(), OtterError> {
-        let value = self
-            .interp
-            .native_function_static_host_rooted(name, length, call, &[], &[])
-            .map_err(|oom| OtterError::OutOfMemory {
-                requested_bytes: oom.requested_bytes(),
-                heap_limit_bytes: oom.heap_limit_bytes(),
-            })?;
-        self.interp.set_global(name, value);
-        Ok(())
-    }
-
-    /// Install a captured native call target as a realm global.
-    pub fn install_native_global_call(
-        &mut self,
-        name: &'static str,
-        length: u8,
-        call: RuntimeNativeCall,
-    ) -> Result<(), OtterError> {
-        let value = self
-            .interp
-            .native_function_from_call_host_rooted(name, length, call, &[], &[])
-            .map_err(|oom| OtterError::OutOfMemory {
-                requested_bytes: oom.requested_bytes(),
-                heap_limit_bytes: oom.heap_limit_bytes(),
-            })?;
-        self.interp.set_global(name, value);
-        Ok(())
-    }
-
     /// Execute trusted bootstrap source in the active realm.
     ///
     /// This surface is for extension installation. Page code should use
@@ -209,6 +181,82 @@ impl<'a> RuntimeRealmContext<'a> {
         self.interp
             .drain_microtasks(&context)
             .map_err(crate::map_vm_error)
+    }
+}
+
+/// Advanced realm installer surface for engine extension crates.
+///
+/// Applications should use [`RuntimeRealmContext`] through
+/// [`crate::RuntimeGlobalInstaller`]. This separate context is intentionally
+/// absent from [`crate::embedding`]: it exposes native call targets needed by
+/// product crates such as `otter-web`, while keeping raw VM-shaped binding
+/// types out of the mandatory application embedding path.
+pub struct RuntimeExtensionContext<'a> {
+    realm: RuntimeRealmContext<'a>,
+}
+
+impl<'a> RuntimeExtensionContext<'a> {
+    pub(crate) fn new(
+        interp: &'a mut otter_vm::Interpreter,
+        capabilities: &'a CapabilitySet,
+        hooks: &'a RuntimeHooks,
+        runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    ) -> Self {
+        Self {
+            realm: RuntimeRealmContext::new(interp, capabilities, hooks, runtime_task_spawner),
+        }
+    }
+
+    /// Install a static native function as a realm global.
+    pub fn install_native_global(
+        &mut self,
+        name: &'static str,
+        length: u8,
+        call: RuntimeNativeFastFn,
+    ) -> Result<(), OtterError> {
+        let value = self
+            .realm
+            .interp
+            .native_function_static_host_rooted(name, length, call, &[], &[])
+            .map_err(|oom| OtterError::OutOfMemory {
+                requested_bytes: oom.requested_bytes(),
+                heap_limit_bytes: oom.heap_limit_bytes(),
+            })?;
+        self.realm.interp.set_global(name, value);
+        Ok(())
+    }
+
+    /// Install a captured native call target as a realm global.
+    pub fn install_native_global_call(
+        &mut self,
+        name: &'static str,
+        length: u8,
+        call: RuntimeNativeCall,
+    ) -> Result<(), OtterError> {
+        let value = self
+            .realm
+            .interp
+            .native_function_from_call_host_rooted(name, length, call, &[], &[])
+            .map_err(|oom| OtterError::OutOfMemory {
+                requested_bytes: oom.requested_bytes(),
+                heap_limit_bytes: oom.heap_limit_bytes(),
+            })?;
+        self.realm.interp.set_global(name, value);
+        Ok(())
+    }
+}
+
+impl<'a> std::ops::Deref for RuntimeExtensionContext<'a> {
+    type Target = RuntimeRealmContext<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.realm
+    }
+}
+
+impl<'a> std::ops::DerefMut for RuntimeExtensionContext<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.realm
     }
 }
 
@@ -302,15 +350,20 @@ impl crate::Runtime {
             .with_host_realm(realm, |interp| {
                 Ok(interp.with_runtime_roots(|interp| {
                     let pending = install_class_surfaces(interp, &config)?;
+                    for installer in &config.realm_installers {
+                        installer.install(
+                            interp,
+                            &config.capabilities,
+                            &config.hooks,
+                            task_spawner.clone(),
+                        )?;
+                    }
                     let mut context = RuntimeRealmContext::new(
                         interp,
                         &config.capabilities,
                         &config.hooks,
                         task_spawner,
                     );
-                    for installer in &config.global_installers {
-                        installer.install(&mut context)?;
-                    }
                     for (name, source) in pending.extension_js {
                         context
                             .install_script(SourceInput::from_javascript(source))
@@ -347,6 +400,16 @@ impl crate::Runtime {
     /// reused, and later operations with it return [`RealmError::UnknownOrDisposed`].
     pub fn dispose_realm(&mut self, realm: RuntimeRealmId) -> Result<(), OtterError> {
         self.validate_realm(realm)?;
+        let realm_id = self
+            .interp
+            .with_host_realm(realm.realm, |interp| Ok(interp.active_host_realm_id()))
+            .map_err(map_realm_vm_error)?;
+        for root in self.promise_registry.take_realm(realm_id) {
+            let _ = self.interp.persistent_root_remove(root);
+        }
+        let _ = self.interp.remove_dynamic_imports_for_realm(realm_id);
+        let _ = self.interp.cancel_timers_for_realm(realm_id);
+        self.module_records.dispose_realm(realm_id);
         let removed = self.interp.dispose_host_realm(realm.realm);
         debug_assert!(removed, "validated realm disappeared on one isolate thread");
         Ok(())
@@ -366,13 +429,13 @@ impl crate::Runtime {
         self.interp.begin_jit_debug_capture();
         let started = std::time::Instant::now();
         let compiled = self.compile_source(&source, specifier)?;
-        let result = self
+        let (result, context) = self
             .interp
             .with_host_realm(realm.realm, |interp| {
                 let context = interp.link_module(compiled.bytecode);
                 let script = interp.run(&context);
                 let checkpoint = interp.drain_microtasks(&context);
-                match (script, checkpoint) {
+                let result = match (script, checkpoint) {
                     (
                         Err(otter_vm::RunError {
                             error: otter_vm::VmError::Exit { code },
@@ -386,21 +449,86 @@ impl crate::Runtime {
                             error: otter_vm::VmError::Exit { code },
                             ..
                         }),
-                    ) => Ok(Ok(crate::ExecutionResult::from_exit_code(
+                    ) => Ok(crate::ExecutionResult::from_exit_code(
                         code,
                         started.elapsed(),
-                    ))),
-                    (Err(error), _) | (Ok(_), Err(error)) => Ok(Err(error)),
-                    (Ok(value), Ok(())) => Ok(Ok(crate::ExecutionResult::from_vm_value(
+                    )),
+                    (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+                    (Ok(value), Ok(())) => Ok(crate::ExecutionResult::from_vm_value(
                         value,
                         started.elapsed(),
                         interp.gc_heap_mut(),
                     )
-                    .with_exit_code(crate::process::exit_code(interp)))),
-                }
+                    .with_exit_code(crate::process::exit_code(interp))),
+                };
+                Ok((result, context))
             })
-            .map_err(map_realm_vm_error)?
-            .map_err(crate::map_vm_error)?;
+            .map_err(map_realm_vm_error)?;
+        let result = result.map_err(crate::map_vm_error)?;
+        self.pump_layer_a_dynamic_imports(&context)?;
+        let result = self.attach_execution_stats(result);
+        Ok(self.attach_jit_debug_report(result))
+    }
+
+    /// Load, link, and execute an in-memory ES module graph in a realm.
+    ///
+    /// The entry keeps its canonical absolute URL for relative resolution,
+    /// `import.meta.url`, diagnostics, and dynamic import. All graph-owned VM
+    /// state is installed while the target realm is active.
+    pub fn run_module_source_in_realm(
+        &mut self,
+        realm: RuntimeRealmId,
+        source: SourceInput,
+        url: impl Into<String>,
+    ) -> Result<crate::ExecutionResult, OtterError> {
+        self.validate_realm(realm)?;
+        let url = url.into();
+        let loader = self.module_loader_for_entry(Path::new("."));
+        let linked = self
+            .module_graph
+            .load_program_source(
+                &loader,
+                crate::module_loader::ResolvedSource {
+                    url,
+                    kind: source.kind,
+                    jsx: None,
+                    text: source.text,
+                },
+            )
+            .map_err(crate::map_graph_error)?;
+        self.run_prepared_module_in_realm(realm, linked)
+    }
+
+    pub(crate) fn run_prepared_module_in_realm(
+        &mut self,
+        realm: RuntimeRealmId,
+        linked: crate::module_graph::LinkedProgram,
+    ) -> Result<crate::ExecutionResult, OtterError> {
+        self.validate_realm(realm)?;
+        self.interp.begin_jit_debug_capture();
+        self.module_graph.last_entry_url = Some(linked.entry_url.clone());
+        self.module_graph.last_module_count = linked.module.module_inits.len();
+        for metadata in &linked.metadata {
+            self.source_maps.record_compiled_metadata(metadata);
+        }
+        let config = self.config.clone();
+        let task_spawner = self.runtime_task_spawner.clone();
+        let records = &mut self.module_records;
+        let started = std::time::Instant::now();
+        let (result, context) = self
+            .interp
+            .with_host_realm(realm.realm, |interp| {
+                Ok(execute_linked_module_in_active_realm(
+                    interp,
+                    records,
+                    &config,
+                    task_spawner,
+                    linked,
+                    started,
+                ))
+            })
+            .map_err(map_realm_vm_error)??;
+        self.pump_layer_a_dynamic_imports(&context)?;
         let result = self.attach_execution_stats(result);
         Ok(self.attach_jit_debug_report(result))
     }
@@ -420,7 +548,106 @@ impl crate::Runtime {
     }
 }
 
-fn map_realm_vm_error(error: otter_vm::VmError) -> OtterError {
+fn execute_linked_module_in_active_realm(
+    interp: &mut otter_vm::Interpreter,
+    records: &mut crate::module_records::RuntimeModuleRecords,
+    config: &RuntimeConfig,
+    task_spawner: Option<RuntimeTaskSpawner>,
+    linked: crate::module_graph::LinkedProgram,
+    started: std::time::Instant,
+) -> Result<(crate::ExecutionResult, otter_vm::ExecutionContext), OtterError> {
+    let mut module = linked.module;
+    let entry_url = linked.entry_url;
+    records.allocate_for_module_inits(
+        interp,
+        &module.module_inits,
+        &config.hosted_modules,
+        &config.capabilities,
+        task_spawner,
+    )?;
+    let realm_id = interp.active_host_realm_id();
+    for metadata in &linked.metadata {
+        if metadata.source_url.is_empty() || metadata.resolved_exports.is_empty() {
+            continue;
+        }
+        let table = metadata
+            .resolved_exports
+            .iter()
+            .map(|(name, resolved)| {
+                (
+                    name.clone(),
+                    (
+                        std::sync::Arc::from(resolved.defining_module.as_str()),
+                        resolved.binding.clone(),
+                    ),
+                )
+            })
+            .collect();
+        interp.register_module_resolved_exports(
+            std::sync::Arc::from(metadata.source_url.as_str()),
+            table,
+        );
+    }
+    for (url, text) in &linked.module_sources {
+        interp.register_module_source(url.clone(), std::sync::Arc::from(text.as_str()));
+    }
+    records.for_each_record(realm_id, |url, _| {
+        for referrer in [&entry_url, ""] {
+            module
+                .module_resolutions
+                .push(otter_bytecode::ModuleResolution {
+                    referrer: referrer.to_string(),
+                    specifier: url.to_string(),
+                    target: url.to_string(),
+                    deferred: false,
+                    dynamic: false,
+                    synthetic: true,
+                });
+        }
+    });
+    records.mark_evaluating(realm_id);
+    let context = interp.link_module(module);
+    let script = interp.run(&context);
+    let checkpoint = interp.drain_microtasks(&context);
+    let value = match (script, checkpoint) {
+        (
+            Err(otter_vm::RunError {
+                error: otter_vm::VmError::Exit { code },
+                ..
+            }),
+            _,
+        )
+        | (
+            Ok(_),
+            Err(otter_vm::RunError {
+                error: otter_vm::VmError::Exit { code },
+                ..
+            }),
+        ) => {
+            records.mark_evaluated(realm_id);
+            return Ok((
+                crate::ExecutionResult::from_exit_code(code, started.elapsed()),
+                context,
+            ));
+        }
+        (Err(error), _) | (Ok(_), Err(error)) => {
+            records.mark_errored(realm_id);
+            return Err(crate::enrich_runtime_diagnostic_with_cause(
+                interp,
+                crate::map_vm_error(error),
+            ));
+        }
+        (Ok(value), Ok(())) => value,
+    };
+    records.mark_evaluated(realm_id);
+    Ok((
+        crate::ExecutionResult::from_vm_value(value, started.elapsed(), interp.gc_heap_mut())
+            .with_exit_code(crate::process::exit_code(interp)),
+        context,
+    ))
+}
+
+pub(crate) fn map_realm_vm_error(error: otter_vm::VmError) -> OtterError {
     crate::map_vm_error(otter_vm::RunError {
         error,
         frames: Vec::new(),

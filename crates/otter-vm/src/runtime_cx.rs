@@ -629,6 +629,27 @@ impl<'rt> NativeCtx<'rt> {
         self.alloc_host_object_with_roots(data, &[], &[])
     }
 
+    /// Allocate a host-data object whose payload explicitly traces opaque
+    /// JavaScript reference slots.
+    pub fn alloc_traced_host_object<T: object::TracedHostObjectData>(
+        &mut self,
+        data: T,
+    ) -> Result<object::JsObject, otter_gc::OutOfMemory> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
+        let shape_root = self.cx.interp.shape_root();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
+        };
+        object::alloc_traced_host_object_with_shape_roots(
+            self.heap_mut(),
+            shape_root,
+            data,
+            &mut external_visit,
+        )
+    }
+
     /// Resolve the prototype that `new <constructor_name>()` installs on its
     /// instances — i.e. `globalThis[constructor_name].prototype` — or `None`
     /// when that is not an object.
@@ -2047,6 +2068,63 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         Ok(self.value(Value::object(object)))
     }
 
+    /// Allocate an object carrying explicitly traced Rust-owned host data.
+    pub fn traced_host_object<T: object::TracedHostObjectData>(
+        &mut self,
+        data: T,
+    ) -> Result<Local<'scope>, NativeError> {
+        let object = self.ctx.alloc_traced_host_object(data)?;
+        Ok(self.value(Value::object(object)))
+    }
+
+    /// Replace one declared traced host-data slot from a rooted local value.
+    ///
+    /// `select` identifies the slot without exposing its representation. The
+    /// operation is allocation-free, then records the normal object write
+    /// barrier so an old host object may safely retain a young value.
+    pub fn set_host_data_value<T: object::TracedHostObjectData>(
+        &mut self,
+        host: Local<'_>,
+        value: Local<'_>,
+        select: impl FnOnce(&mut T) -> &mut object::HostValueSlot,
+    ) -> Result<(), NativeError> {
+        let host_raw = self.raw(host);
+        let value_raw = self.raw(value);
+        let object = host_raw.as_object().ok_or_else(|| NativeError::TypeError {
+            name: "NativeScope::set_host_data_value",
+            reason: "host value is not an object".to_string(),
+        })?;
+        object::with_host_data_mut::<T, _>(object, self.ctx.heap_mut(), |data| {
+            select(data).replace(value_raw);
+        })
+        .map_err(|error| NativeError::TypeError {
+            name: "NativeScope::set_host_data_value",
+            reason: error.to_string(),
+        })?;
+        self.ctx.heap_mut().record_write(object, &value_raw);
+        Ok(())
+    }
+
+    /// Root and return one declared traced host-data slot.
+    pub fn host_data_value<T: object::TracedHostObjectData>(
+        &mut self,
+        host: Local<'_>,
+        select: impl FnOnce(&T) -> &object::HostValueSlot,
+    ) -> Result<Local<'scope>, NativeError> {
+        let host_raw = self.raw(host);
+        let object = host_raw.as_object().ok_or_else(|| NativeError::TypeError {
+            name: "NativeScope::host_data_value",
+            reason: "host value is not an object".to_string(),
+        })?;
+        let value =
+            object::with_host_data::<T, _>(object, self.ctx.heap(), |data| select(data).value())
+                .map_err(|error| NativeError::TypeError {
+                    name: "NativeScope::host_data_value",
+                    reason: error.to_string(),
+                })?;
+        Ok(self.value(value))
+    }
+
     /// Borrow host data behind a rooted object, including an ancestor view of
     /// a declared host-class instance.
     ///
@@ -2401,6 +2479,16 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         Ok(self.value(result))
     }
 
+    /// Perform JavaScript `Get(receiver, atom)` without allocating or decoding
+    /// the repeated host property name.
+    pub fn get_atom(
+        &mut self,
+        receiver: Local<'_>,
+        atom: &crate::HostAtom,
+    ) -> Result<Local<'scope>, NativeError> {
+        self.get(receiver, atom.as_str())
+    }
+
     /// Store a string-keyed property through the rooted object path.
     pub fn set(
         &mut self,
@@ -2414,6 +2502,16 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
             .interp
             .scoped_set(self.token, object, key, value);
         result.map_err(|error| self.vm_error(error, "NativeScope::set"))
+    }
+
+    /// Store a property through an interned host name.
+    pub fn set_atom(
+        &mut self,
+        object: Local<'_>,
+        atom: &crate::HostAtom,
+        value: Local<'_>,
+    ) -> Result<(), NativeError> {
+        self.set(object, atom.as_str(), value)
     }
 
     /// Store a symbol-keyed property on a rooted ordinary object or Array
@@ -2697,6 +2795,39 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
             })
     }
 
+    /// Borrow a JavaScript string as UTF-8 for one non-allocating callback.
+    ///
+    /// ASCII Latin-1 strings are borrowed directly from the GC body. Other
+    /// strings use an owned lossy UTF-8 fallback whose `&str` is still limited
+    /// to the callback. No borrow can escape this method or survive a later VM
+    /// allocation.
+    pub fn with_string_str<R>(
+        &self,
+        value: Local<'_>,
+        f: impl FnOnce(&str) -> R,
+    ) -> Result<R, NativeError> {
+        let raw = self.raw(value);
+        let string = raw
+            .as_string(self.ctx.heap())
+            .ok_or_else(|| NativeError::TypeError {
+                name: "NativeScope::with_string_str",
+                reason: "expected a string".to_string(),
+            })?;
+        let mut callback = Some(f);
+        if let Some(Some(result)) = string.with_latin1(self.ctx.heap(), |bytes| {
+            bytes.is_ascii().then(|| {
+                let text = std::str::from_utf8(bytes).expect("ASCII is valid UTF-8");
+                callback.take().expect("callback runs once")(text)
+            })
+        }) {
+            return Ok(result);
+        }
+        let owned = string.to_lossy_string(self.ctx.heap());
+        Ok(callback.take().expect("callback unused by fallback")(
+            &owned,
+        ))
+    }
+
     /// Render a rooted value with the VM's non-coercing diagnostic display.
     #[must_use]
     pub fn display_string(&self, value: Local<'_>) -> String {
@@ -2795,6 +2926,12 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         self.raw(value).as_object().is_some_and(|object| {
             object::get_own_descriptor(object, self.ctx.heap(), key).is_some()
         })
+    }
+
+    /// Descriptor-only own-property probe through an interned host name.
+    #[must_use]
+    pub fn has_own_atom_property(&self, value: Local<'_>, atom: &crate::HostAtom) -> bool {
+        self.has_own_string_property(value, atom.as_str())
     }
 
     /// Return an ordinary object's `[[DateValue]]`, if present.
@@ -3308,6 +3445,7 @@ mod tests {
             label: String,
             count: usize,
         }
+        impl crate::object::HostObjectData for HostState {}
 
         let mut interp = Interpreter::new();
         with_default_ctx(&mut interp, |ctx| {

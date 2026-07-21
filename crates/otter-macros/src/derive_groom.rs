@@ -6,7 +6,7 @@
 //! finalize wrapper in the heap's type-tag dispatch table.
 //!
 //! Every field that is not annotated with `#[groom(skip)]` is funneled
-//! through [`::otter_vm::groom::GroomField::groom`]; missing
+//! through [`::otter_vm::__macro_support::groom::GroomField::groom`]; missing
 //! `GroomField` impls surface as ordinary compile errors at the field
 //! span — the same "fail loudly on un-finalize-able fields" gate the
 //! [`Pelt`](super) derive uses for tracing.
@@ -29,7 +29,7 @@
 //!
 //! # See also
 //!
-//! - [`::otter_vm::groom`] — `GroomField` trait + blanket impls.
+//! - [`::otter_vm::__macro_support::groom`] — `GroomField` trait + blanket impls.
 //! - [`::otter_gc::SafeFinalize`] — trait the derive implements on
 //!   the body type.
 
@@ -140,7 +140,7 @@ fn emit_field_call(
     match via {
         Some(path) => quote! { #path(#access); },
         None => quote! {
-            <_ as ::otter_vm::groom::GroomField>::groom(#access);
+            <_ as ::otter_vm::__macro_support::groom::GroomField>::groom(#access);
         },
     }
 }

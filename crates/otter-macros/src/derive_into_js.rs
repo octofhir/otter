@@ -72,20 +72,20 @@ fn expand_inner(input: &DeriveInput) -> Result<proc_macro2::TokenStream> {
         }
         let js_name = LitStr::new(&js_name, field_ident.span());
         writes.push(quote! {
-            let __value = ::otter_vm::marshal::IntoJs::into_js(self.#field_ident, cx)?;
+            let __value = ::otter_vm::__macro_support::marshal::IntoJs::into_js(self.#field_ident, cx)?;
             cx.set(__object, #js_name, __value)?;
         });
     }
 
     let ident = &input.ident;
     Ok(quote! {
-        impl ::otter_vm::marshal::IntoJs for #ident {
+        impl ::otter_vm::__macro_support::marshal::IntoJs for #ident {
             fn into_js<'s>(
                 self,
-                cx: &mut ::otter_vm::marshal::MarshalCx<'_, '_, 's>,
+                cx: &mut ::otter_vm::__macro_support::marshal::MarshalCx<'_, '_, 's>,
             ) -> ::core::result::Result<
-                ::otter_vm::marshal::JsValue<'s>,
-                ::otter_vm::marshal::JsError,
+                ::otter_vm::__macro_support::marshal::JsValue<'s>,
+                ::otter_vm::__macro_support::marshal::JsError,
             > {
                 let __object = cx.object()?;
                 #(#writes)*

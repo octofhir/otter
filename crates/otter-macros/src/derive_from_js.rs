@@ -155,7 +155,7 @@ fn expand_dictionary(
         } else {
             quote! {
                 return ::core::result::Result::Err(
-                    ::otter_vm::marshal::JsError::Type(::std::format!(
+                    ::otter_vm::__macro_support::marshal::JsError::Type(::std::format!(
                         "{ident}: required member '{}' is missing",
                         #js_name,
                     )),
@@ -170,10 +170,10 @@ fn expand_dictionary(
                 if cx.is_undefined(__member) {
                     #missing
                 } else {
-                    ::otter_vm::marshal::FromJs::from_js(
+                    ::otter_vm::__macro_support::marshal::FromJs::from_js(
                         cx,
                         __member,
-                        ::otter_vm::marshal::ValueIdent::Member(#js_name),
+                        ::otter_vm::__macro_support::marshal::ValueIdent::Member(#js_name),
                     )?
                 }
             };
@@ -182,12 +182,12 @@ fn expand_dictionary(
     let field_idents: Vec<_> = members.iter().map(|m| m.field_ident).collect();
     let ident = &input.ident;
     Ok(quote! {
-        impl<'s> ::otter_vm::marshal::FromJs<'s> for #ident {
+        impl<'s> ::otter_vm::__macro_support::marshal::FromJs<'s> for #ident {
             fn from_js(
-                cx: &mut ::otter_vm::marshal::MarshalCx<'_, '_, 's>,
-                v: ::otter_vm::marshal::JsValue<'s>,
-                ident: ::otter_vm::marshal::ValueIdent<'_>,
-            ) -> ::core::result::Result<Self, ::otter_vm::marshal::JsError> {
+                cx: &mut ::otter_vm::__macro_support::marshal::MarshalCx<'_, '_, 's>,
+                v: ::otter_vm::__macro_support::marshal::JsValue<'s>,
+                ident: ::otter_vm::__macro_support::marshal::ValueIdent<'_>,
+            ) -> ::core::result::Result<Self, ::otter_vm::__macro_support::marshal::JsError> {
                 let __nullish = cx.is_nullish(v);
                 #(#reads)*
                 let _ = ident;
@@ -228,12 +228,12 @@ fn expand_union(input: &DeriveInput, data: &syn::DataEnum) -> Result<proc_macro2
             // Catch-all: unconditional conversion (a coercing type —
             // string, number — belongs here per WebIDL ordering).
             arms.push(quote! {
-                ::otter_vm::marshal::FromJs::from_js(cx, v, ident).map(Self::#variant_ident)
+                ::otter_vm::__macro_support::marshal::FromJs::from_js(cx, v, ident).map(Self::#variant_ident)
             });
         } else {
             arms.push(quote! {
-                if <#inner_ty as ::otter_vm::marshal::JsUnionProbe>::probe(cx, v) {
-                    return ::otter_vm::marshal::FromJs::from_js(cx, v, ident)
+                if <#inner_ty as ::otter_vm::__macro_support::marshal::JsUnionProbe>::probe(cx, v) {
+                    return ::otter_vm::__macro_support::marshal::FromJs::from_js(cx, v, ident)
                         .map(Self::#variant_ident);
                 }
             });
@@ -241,12 +241,12 @@ fn expand_union(input: &DeriveInput, data: &syn::DataEnum) -> Result<proc_macro2
     }
     let ident = &input.ident;
     Ok(quote! {
-        impl<'s> ::otter_vm::marshal::FromJs<'s> for #ident {
+        impl<'s> ::otter_vm::__macro_support::marshal::FromJs<'s> for #ident {
             fn from_js(
-                cx: &mut ::otter_vm::marshal::MarshalCx<'_, '_, 's>,
-                v: ::otter_vm::marshal::JsValue<'s>,
-                ident: ::otter_vm::marshal::ValueIdent<'_>,
-            ) -> ::core::result::Result<Self, ::otter_vm::marshal::JsError> {
+                cx: &mut ::otter_vm::__macro_support::marshal::MarshalCx<'_, '_, 's>,
+                v: ::otter_vm::__macro_support::marshal::JsValue<'s>,
+                ident: ::otter_vm::__macro_support::marshal::ValueIdent<'_>,
+            ) -> ::core::result::Result<Self, ::otter_vm::__macro_support::marshal::JsError> {
                 #(#arms)*
             }
         }

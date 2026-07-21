@@ -394,6 +394,8 @@ struct ServeServer {
     control: Arc<ServeServerControl>,
 }
 
+impl otter_runtime::RuntimeHostObjectData for ServeServer {}
+
 struct HttpRequest {
     method: String,
     url: String,

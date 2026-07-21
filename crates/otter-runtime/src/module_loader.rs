@@ -22,14 +22,19 @@
 //! - Package-scope lookup for graph-backed packages is indexed at loader
 //!   construction time. Filesystem package scopes are memoized by importer
 //!   directory as they are observed.
-//! - Source caching is deferred to the higher-level graph driver.
+//! - Remote source caching and concurrent fetch scheduling are owned by the
+//!   higher-level async graph driver. This loader only reads its completed
+//!   cache while CPU-bound graph construction runs on a blocking worker.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-hostloadimportedmodule>
 //!   — the host-defined module-loading hook this struct backs.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use otter_syntax::{SourceKind, remote_source_kind};
@@ -52,17 +57,132 @@ pub struct RemoteModuleSource {
     pub final_url: String,
 }
 
-/// Synchronous remote-module source provider.
+#[derive(Debug)]
+struct ModuleLoadCancellationInner {
+    cancelled: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+/// Cloneable cancellation token for remote module work.
+#[derive(Debug, Clone)]
+pub struct ModuleLoadCancellation {
+    local: Arc<ModuleLoadCancellationInner>,
+    parent: Option<Arc<ModuleLoadCancellationInner>>,
+}
+
+impl ModuleLoadCancellation {
+    /// Create a live token.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            local: Arc::new(ModuleLoadCancellationInner {
+                cancelled: AtomicBool::new(false),
+                notify: tokio::sync::Notify::new(),
+            }),
+            parent: None,
+        }
+    }
+
+    /// Create an independently cancellable child that also observes `parent`.
+    #[must_use]
+    pub fn linked(parent: &Self) -> Self {
+        Self {
+            local: Arc::new(ModuleLoadCancellationInner {
+                cancelled: AtomicBool::new(false),
+                notify: tokio::sync::Notify::new(),
+            }),
+            parent: Some(parent.local.clone()),
+        }
+    }
+
+    /// Cancel this load and wake provider futures.
+    pub fn cancel(&self) {
+        if !self.local.cancelled.swap(true, Ordering::AcqRel) {
+            self.local.notify.notify_waiters();
+        }
+    }
+
+    /// Whether cancellation has been requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.local.cancelled.load(Ordering::Acquire)
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.cancelled.load(Ordering::Acquire))
+    }
+
+    /// Wait until cancellation is requested.
+    pub async fn cancelled(&self) {
+        loop {
+            let local = self.local.notify.notified();
+            let parent = self.parent.as_ref().map(|parent| parent.notify.notified());
+            if self.is_cancelled() {
+                return;
+            }
+            match parent {
+                Some(parent) => {
+                    tokio::select! {
+                        () = local => {}
+                        () = parent => {}
+                    }
+                }
+                None => local.await,
+            }
+        }
+    }
+}
+
+impl Default for ModuleLoadCancellation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Owned request passed to an asynchronous remote module provider.
+#[derive(Debug, Clone)]
+pub struct RemoteModuleRequest {
+    /// Canonical pre-fetch URL authorized by the runtime capability hook.
+    pub url: String,
+    /// Cancellation triggered by command timeout, waiter cancellation, or
+    /// runtime disposal.
+    pub cancellation: ModuleLoadCancellation,
+}
+
+/// Typed, owned remote module provider error.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RemoteModuleError {
+    /// The runtime or caller cancelled the operation.
+    #[error("remote module load cancelled")]
+    Cancelled,
+    /// Provider-side fetch failure.
+    #[error("remote module fetch failed for `{url}`: {message}")]
+    Fetch {
+        /// Requested URL.
+        url: String,
+        /// Owned provider diagnostic.
+        message: String,
+    },
+}
+
+/// Boxed provider future carrying owned data only.
+pub type RemoteModuleFuture =
+    Pin<Box<dyn Future<Output = Result<RemoteModuleSource, RemoteModuleError>> + Send + 'static>>;
+
+/// Fully asynchronous remote-module source provider.
 ///
-/// Injected by the runtime and backed by the host event loop's HTTP client so
-/// the module-graph builder can pull http/https sources the same way it reads
-/// files — following redirects and reporting the response media type. Layer B
-/// invokes the whole builder on a blocking worker, never on the isolate thread.
-/// Absent in embedders that disable remote loading, where an http(s) import
-/// surfaces a clean [`LoaderError::Load`] instead of a network call.
-pub trait RemoteModuleFetch: Send + Sync + std::fmt::Debug {
-    /// Fetch `url`, following redirects. This may block its graph-build worker,
-    /// but must not retain VM/GC state.
+/// The engine performs capability checks before calling this interface. Hosts
+/// may apply additional policy, caching, or transport decisions, but browser
+/// origin/CORS policy remains outside the engine.
+pub trait RemoteModuleProvider: Send + Sync + std::fmt::Debug + 'static {
+    /// Fetch one module without blocking an isolate or Tokio worker.
+    fn fetch(&self, request: RemoteModuleRequest) -> RemoteModuleFuture;
+}
+
+/// Synchronous cache view consumed only by the CPU graph builder after the
+/// async fetch/prefetch phase has completed.
+pub(crate) trait RemoteModuleFetch: Send + Sync + std::fmt::Debug {
     fn fetch(&self, url: &str) -> Result<RemoteModuleSource, String>;
 }
 
@@ -551,7 +671,7 @@ impl ModuleLoader {
     /// The runtime wires this from its event loop's HTTP client; without it,
     /// http(s) imports fail with a clean load error instead of a network call.
     #[must_use]
-    pub fn with_remote_fetch(mut self, remote_fetch: Arc<dyn RemoteModuleFetch>) -> Self {
+    pub(crate) fn with_remote_fetch(mut self, remote_fetch: Arc<dyn RemoteModuleFetch>) -> Self {
         self.remote_fetch = Some(remote_fetch);
         self
     }

@@ -99,9 +99,11 @@ fn a_throwing_script_reports_the_error_and_leaves_the_runtime_usable() {
     );
 
     let recovered = runtime
-        .eval_value(SourceInput::from_javascript("1 + 1"), "<test>", |_ctx, v| {
-            v.as_f64()
-        })
+        .eval_value(
+            SourceInput::from_javascript("1 + 1"),
+            "<test>",
+            |_ctx, v| v.as_f64(),
+        )
         .expect("the isolate stays usable");
     assert_eq!(recovered, Some(2.0));
 }

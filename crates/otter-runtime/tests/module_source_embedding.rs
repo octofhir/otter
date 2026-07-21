@@ -1,45 +1,48 @@
 //! Browser embedders execute modules from canonical URLs without temp files.
 
+use otter_runtime::module_loader::{
+    RemoteModuleError, RemoteModuleFuture, RemoteModuleProvider, RemoteModuleRequest,
+    RemoteModuleSource,
+};
+use otter_runtime::{CapabilitySet, Otter, Permission, Runtime, SourceInput, TokioRuntimeHost};
 use std::collections::BTreeMap;
-use std::sync::Arc;
-
-use otter_runtime::module_loader::{RemoteModuleFetch, RemoteModuleSource};
-use otter_runtime::{CapabilitySet, Permission, Runtime, SourceInput, TokioRuntimeHost};
 
 #[derive(Debug)]
 struct CachedModules {
     sources: BTreeMap<String, String>,
 }
 
-impl RemoteModuleFetch for CachedModules {
-    fn fetch(&self, url: &str) -> Result<RemoteModuleSource, String> {
-        let source = self
-            .sources
-            .get(url)
-            .cloned()
-            .ok_or_else(|| format!("cache miss for {url}"))?;
-        Ok(RemoteModuleSource {
-            source,
-            content_type: Some("text/javascript".to_string()),
-            final_url: url.to_string(),
+impl RemoteModuleProvider for CachedModules {
+    fn fetch(&self, request: RemoteModuleRequest) -> RemoteModuleFuture {
+        let source = self.sources.get(&request.url).cloned();
+        Box::pin(async move {
+            let source = source.ok_or_else(|| RemoteModuleError::Fetch {
+                url: request.url.clone(),
+                message: "cache miss".to_string(),
+            })?;
+            Ok(RemoteModuleSource {
+                source,
+                content_type: Some("text/javascript".to_string()),
+                final_url: request.url,
+            })
         })
     }
 }
 
-#[test]
-fn http_entry_and_static_dependency_execute_from_memory() {
+#[tokio::test]
+async fn http_entry_and_static_dependency_execute_from_memory() {
     let mut capabilities = CapabilitySet::sandbox();
     capabilities.net = Permission::AllowAll;
-    let mut runtime = Runtime::builder()
+    let runtime = Otter::builder()
         .capabilities(capabilities)
+        .remote_module_provider(CachedModules {
+            sources: BTreeMap::from([(
+                "https://example.test/assets/dep.js".to_string(),
+                "export const answer = 41;".to_string(),
+            )]),
+        })
         .build()
         .expect("runtime");
-    runtime.install_remote_module_fetch(Arc::new(CachedModules {
-        sources: BTreeMap::from([(
-            "https://example.test/assets/dep.js".to_string(),
-            "export const answer = 41;".to_string(),
-        )]),
-    }));
 
     runtime
         .run_module_source(
@@ -50,18 +53,21 @@ fn http_entry_and_static_dependency_execute_from_memory() {
             ),
             "https://example.test/index.js",
         )
+        .await
         .expect("in-memory HTTP graph executes");
 
     assert_eq!(
         runtime
-            .eval(SourceInput::from_javascript("moduleSourceResult"))
+            .eval("moduleSourceResult")
+            .await
             .expect("read result")
             .completion_string(),
         "42"
     );
     assert_eq!(
         runtime
-            .eval(SourceInput::from_javascript("moduleSourceUrl"))
+            .eval("moduleSourceUrl")
+            .await
             .expect("read URL")
             .completion_string(),
         "https://example.test/index.js"
@@ -111,22 +117,22 @@ fn sendable_page_isolate_accepts_an_in_memory_module_entry() {
     );
 }
 
-#[test]
-fn module_graph_executes_only_in_its_target_realm() {
+#[tokio::test]
+async fn module_graph_executes_only_in_its_target_realm() {
     let mut capabilities = CapabilitySet::sandbox();
     capabilities.net = Permission::AllowAll;
-    let mut runtime = Runtime::builder()
+    let runtime = Otter::builder()
         .capabilities(capabilities)
+        .remote_module_provider(CachedModules {
+            sources: BTreeMap::from([(
+                "https://realm.test/dep.js".to_string(),
+                "export const answer = 41;".to_string(),
+            )]),
+        })
         .build()
         .expect("runtime");
-    runtime.install_remote_module_fetch(Arc::new(CachedModules {
-        sources: BTreeMap::from([(
-            "https://realm.test/dep.js".to_string(),
-            "export const answer = 41;".to_string(),
-        )]),
-    }));
-    let first = runtime.create_realm().expect("first realm");
-    let second = runtime.create_realm().expect("second realm");
+    let first = runtime.create_realm().await.expect("first realm");
+    let second = runtime.create_realm().await.expect("second realm");
 
     runtime
         .run_module_source_in_realm(
@@ -136,6 +142,7 @@ fn module_graph_executes_only_in_its_target_realm() {
             ),
             "https://realm.test/entry.js",
         )
+        .await
         .expect("first realm module");
     assert_eq!(
         runtime
@@ -144,16 +151,15 @@ fn module_graph_executes_only_in_its_target_realm() {
                 SourceInput::from_javascript("realmModule + ':' + realmModuleUrl"),
                 "realm:first-check",
             )
+            .await
             .expect("first realm result")
             .completion_string(),
         "42:https://realm.test/entry.js"
     );
     assert_eq!(
         runtime
-            .run_script(
-                SourceInput::from_javascript("typeof realmModule"),
-                "default:module-check",
-            )
+            .run_script("typeof realmModule")
+            .await
             .expect("default realm remains isolated")
             .completion_string(),
         "undefined"
@@ -165,6 +171,7 @@ fn module_graph_executes_only_in_its_target_realm() {
                 SourceInput::from_javascript("typeof realmModule"),
                 "realm:second-check",
             )
+            .await
             .expect("second realm remains isolated")
             .completion_string(),
         "undefined"
@@ -202,23 +209,23 @@ fn sendable_isolate_routes_module_to_opaque_realm() {
     );
 }
 
-#[test]
-fn canonical_module_map_persists_per_realm_across_entry_graphs() {
+#[tokio::test]
+async fn canonical_module_map_persists_per_realm_across_entry_graphs() {
     let mut capabilities = CapabilitySet::sandbox();
     capabilities.net = Permission::AllowAll;
-    let mut runtime = Runtime::builder()
+    let runtime = Otter::builder()
         .capabilities(capabilities)
+        .remote_module_provider(CachedModules {
+            sources: BTreeMap::from([(
+                "https://modules.test/shared.js".to_string(),
+                "globalThis.sharedRuns = (globalThis.sharedRuns || 0) + 1; export const value = sharedRuns;"
+                    .to_string(),
+            )]),
+        })
         .build()
         .expect("runtime");
-    runtime.install_remote_module_fetch(Arc::new(CachedModules {
-        sources: BTreeMap::from([(
-            "https://modules.test/shared.js".to_string(),
-            "globalThis.sharedRuns = (globalThis.sharedRuns || 0) + 1; export const value = sharedRuns;"
-                .to_string(),
-        )]),
-    }));
-    let first = runtime.create_realm().expect("first realm");
-    let second = runtime.create_realm().expect("second realm");
+    let first = runtime.create_realm().await.expect("first realm");
+    let second = runtime.create_realm().await.expect("second realm");
 
     for (url, target) in [
         ("https://modules.test/first.js", "firstValue"),
@@ -232,6 +239,7 @@ fn canonical_module_map_persists_per_realm_across_entry_graphs() {
                 )),
                 url,
             )
+            .await
             .expect("entry graph");
     }
     assert_eq!(
@@ -241,6 +249,7 @@ fn canonical_module_map_persists_per_realm_across_entry_graphs() {
                 SourceInput::from_javascript("sharedRuns + ':' + firstValue + ':' + secondValue"),
                 "realm:first-module-map",
             )
+            .await
             .expect("first module map")
             .completion_string(),
         "1:1:1"
@@ -254,6 +263,7 @@ fn canonical_module_map_persists_per_realm_across_entry_graphs() {
             ),
             "https://modules.test/other.js",
         )
+        .await
         .expect("second realm graph");
     assert_eq!(
         runtime
@@ -262,6 +272,7 @@ fn canonical_module_map_persists_per_realm_across_entry_graphs() {
                 SourceInput::from_javascript("sharedRuns + ':' + secondRealmValue"),
                 "realm:second-module-map",
             )
+            .await
             .expect("second module map")
             .completion_string(),
         "1:1",

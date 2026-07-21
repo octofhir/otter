@@ -8,12 +8,13 @@
 //! - Runtime-owned aliases for native values, calls, attributes, and specs.
 //! - Helper constructors for methods, accessors, constants, classes, and
 //!   namespaces.
-//! - Host-object helper functions for Rust-owned receiver state.
+//! - Host-object helpers for plain Rust state and explicitly traced JS slots.
 //!
 //! # Invariants
 //! - Specs contain only static metadata and native call targets.
 //! - Builders are bound to a single native mutator turn and must not be stored.
-//! - Host-object data must not store JS values, handles, contexts, or futures.
+//! - Plain host-object data stores no JS values. Traced payloads enumerate only
+//!   opaque slots and never see a raw collector visitor.
 //! - This facade must compile down to the existing static backend without
 //!   runtime metadata parsing or hot-path registries.
 //!
@@ -23,7 +24,12 @@
 
 use std::sync::Arc;
 
-pub use otter_vm::object::HostObjectData as RuntimeHostObjectData;
+pub use otter_vm::HostAtomInterner;
+pub use otter_vm::object::{
+    HostDataTracer as RuntimeHostDataTracer, HostObjectData as RuntimeHostObjectData,
+    HostValueSlot as RuntimeHostValueSlot, TracedHostObjectData as RuntimeTracedHostObjectData,
+};
+pub use otter_vm::{HostAtom as RuntimeHostAtom, HostAtomId as RuntimeHostAtomId};
 
 /// Runtime-owned object handle alias.
 pub type RuntimeJsObject = otter_vm::JsObject;

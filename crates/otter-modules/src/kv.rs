@@ -47,6 +47,8 @@ pub struct KvStore {
     can_write: bool,
 }
 
+impl otter_runtime::RuntimeHostObjectData for KvStore {}
+
 impl KvStore {
     /// Open an in-memory store.
     #[must_use]

@@ -212,13 +212,10 @@ impl Interpreter {
             let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                 env_value.trace_value_slots(visitor);
             };
-            let obj = crate::object::alloc_host_object_with_shape_roots(
+            let obj = crate::object::alloc_traced_host_object_with_shape_roots(
                 &mut interp.gc_heap,
                 shape_root,
-                crate::object::ModuleNamespaceData {
-                    env: env_object,
-                    module_url,
-                },
+                crate::object::ModuleNamespaceData::new(env_object, module_url),
                 &mut external_visit,
             )?;
             let obj = interp.scoped_value(scope, Value::object(obj));

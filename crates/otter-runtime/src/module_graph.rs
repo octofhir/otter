@@ -97,6 +97,9 @@ fn duration_ns(duration: Duration) -> u64 {
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum GraphError {
+    /// Cooperative graph preparation cancellation.
+    #[error("module graph preparation interrupted")]
+    Interrupted,
     /// Loader-side failure (resolve / load / extension).
     #[error("{0}")]
     Loader(#[from] LoaderError),
@@ -207,6 +210,7 @@ struct ModuleGraphBuilder<'a> {
     load_count: usize,
     module_sources: BTreeMap<String, String>,
     timings: Option<ModulePhaseTimings>,
+    interrupt: Option<otter_vm::InterruptFlag>,
 }
 
 impl<'a> ModuleGraphBuilder<'a> {
@@ -224,6 +228,7 @@ impl<'a> ModuleGraphBuilder<'a> {
             load_count: 0,
             module_sources: BTreeMap::new(),
             timings: None,
+            interrupt: None,
         }
     }
 
@@ -237,6 +242,23 @@ impl<'a> ModuleGraphBuilder<'a> {
         let mut builder = Self::new(loader, entry_url, entry_kind, entry_text);
         builder.timings = Some(timings);
         builder
+    }
+
+    fn with_interrupt(mut self, interrupt: otter_vm::InterruptFlag) -> Self {
+        self.interrupt = Some(interrupt);
+        self
+    }
+
+    fn check_interrupted(&self) -> Result<(), GraphError> {
+        if self
+            .interrupt
+            .as_ref()
+            .is_some_and(otter_vm::InterruptFlag::is_set)
+        {
+            Err(GraphError::Interrupted)
+        } else {
+            Ok(())
+        }
     }
 
     fn add_resolve_time(&mut self, elapsed: Duration) {
@@ -287,6 +309,12 @@ impl<'a> ModuleGraphBuilder<'a> {
     }
 
     fn read_text_file(&mut self, url: &str) -> Result<String, LoaderError> {
+        if crate::module_loader::is_http_url(url) {
+            return self
+                .loader
+                .load_resolved(url.to_string())
+                .map(|source| source.text);
+        }
         let path = url.strip_prefix("file://").unwrap_or(url);
         if self.timings.is_none() {
             return std::fs::read_to_string(path).map_err(|error| LoaderError::Load {
@@ -307,6 +335,7 @@ impl<'a> ModuleGraphBuilder<'a> {
         mut self,
     ) -> Result<(ModuleGraph, Option<ModulePhaseTimings>), GraphError> {
         while let Some((url, kind, text, dynamic)) = self.queue.pop() {
+            self.check_interrupted()?;
             let url_for_error = url.clone();
             if let Err(err) = self.load_one(url, kind, text, dynamic) {
                 if dynamic {
@@ -367,6 +396,7 @@ impl<'a> ModuleGraphBuilder<'a> {
             let mut eager_static_specs: HashSet<String> = HashSet::new();
             let mut dynamic_specs: HashSet<String> = HashSet::new();
             for request in &requests {
+                self.check_interrupted()?;
                 // import-attributes `type: "text"` — the attribute is
                 // part of the module-map key, so the text variant gets
                 // its own marker URL and a synthesised
@@ -407,7 +437,13 @@ impl<'a> ModuleGraphBuilder<'a> {
                     }
                     continue;
                 }
-                let target = self.resolve(&request.specifier, Some(&url))?;
+                let requested_target = self.resolve(&request.specifier, Some(&url))?;
+                let (target, loaded) = if self.nodes.contains_key(&requested_target) {
+                    (requested_target, None)
+                } else {
+                    let loaded = self.load_resolved(requested_target)?;
+                    (loaded.url.clone(), Some(loaded))
+                };
                 resolved_imports.insert(request.specifier.clone(), target.clone());
                 if request.dynamic {
                     dynamic_specs.insert(request.specifier.clone());
@@ -418,8 +454,9 @@ impl<'a> ModuleGraphBuilder<'a> {
                     target: target.clone(),
                     deferred: request.deferred,
                 });
-                if !self.nodes.contains_key(&target) {
-                    let loaded = self.load_resolved(target)?;
+                if !self.nodes.contains_key(&target)
+                    && let Some(loaded) = loaded
+                {
                     queued.push((
                         loaded.url,
                         loaded.kind,
@@ -550,6 +587,7 @@ fn dynamic_failure_fragment(url: &str, err: &GraphError) -> Result<BytecodeModul
 
 fn dynamic_failure_constructor(err: &GraphError) -> &'static str {
     match err {
+        GraphError::Interrupted => "Error",
         GraphError::Parse { .. } => "SyntaxError",
         GraphError::Compile { error, .. } => match error {
             CompileError::Syntax { .. } => "SyntaxError",
@@ -581,6 +619,34 @@ fn collect_module_requests(program: &Program<'_>) -> Vec<ModuleRequest> {
         visitor.visit_statement(stmt);
     }
     visitor.out
+}
+
+/// Owned dependency request used by the async remote prefetch phase.
+#[derive(Debug, Clone)]
+pub(crate) struct PrefetchRequest {
+    pub(crate) specifier: String,
+    pub(crate) text: bool,
+}
+
+/// Parse one module off the async executor and return its literal dependency
+/// requests. Resolution and host I/O remain separate phases.
+pub(crate) fn scan_module_requests(
+    text: String,
+    kind: SourceKind,
+) -> Result<Vec<PrefetchRequest>, GraphError> {
+    with_program(text, kind, |program| {
+        Ok(collect_module_requests(program)
+            .into_iter()
+            .map(|request| PrefetchRequest {
+                specifier: request.specifier,
+                text: request.attr_type.as_deref() == Some("text"),
+            })
+            .collect())
+    })
+    .map_err(|error| GraphError::Parse {
+        url: "<module-prefetch>".to_string(),
+        error,
+    })?
 }
 
 /// Module-map key suffix distinguishing the `with { type: "text" }`
@@ -1202,7 +1268,15 @@ pub struct LinkedProgram {
 /// - <https://tc39.es/ecma262/#sec-link>
 /// - <https://tc39.es/ecma262/#sec-cyclic-module-records>
 pub fn load_program(loader: &ModuleLoader, entry_path: &Path) -> Result<LinkedProgram, GraphError> {
-    load_program_inner(loader, entry_path, None).map(|(linked, _)| linked)
+    load_program_inner(loader, entry_path, None, None).map(|(linked, _)| linked)
+}
+
+pub(crate) fn load_program_interruptible(
+    loader: &ModuleLoader,
+    entry_path: &Path,
+    interrupt: otter_vm::InterruptFlag,
+) -> Result<LinkedProgram, GraphError> {
+    load_program_inner(loader, entry_path, None, Some(interrupt)).map(|(linked, _)| linked)
 }
 
 /// Load and link a module graph from an already-available entry source.
@@ -1232,6 +1306,24 @@ pub fn load_program_source(
     graph.link()
 }
 
+pub(crate) fn load_program_source_interruptible(
+    loader: &ModuleLoader,
+    entry: crate::module_loader::ResolvedSource,
+    interrupt: otter_vm::InterruptFlag,
+) -> Result<LinkedProgram, GraphError> {
+    url::Url::parse(&entry.url).map_err(|error| {
+        GraphError::Loader(LoaderError::Resolve {
+            specifier: entry.url.clone(),
+            referrer: "<entry>".to_string(),
+            message: format!("module entry URL must be absolute: {error}"),
+        })
+    })?;
+    let builder = ModuleGraphBuilder::new(loader, entry.url, entry.kind, entry.text)
+        .with_interrupt(interrupt);
+    let (graph, _) = builder.build_with_timings()?;
+    graph.link()
+}
+
 /// Load, compile, and link a module graph while recording phase timings.
 ///
 /// This is an explicit benchmark/diagnostic path. [`load_program`] performs the
@@ -1243,8 +1335,12 @@ pub fn load_program_profiled(
     loader: &ModuleLoader,
     entry_path: &Path,
 ) -> Result<(LinkedProgram, ModulePhaseTimings), GraphError> {
-    let (linked, timings) =
-        load_program_inner(loader, entry_path, Some(ModulePhaseTimings::default()))?;
+    let (linked, timings) = load_program_inner(
+        loader,
+        entry_path,
+        Some(ModulePhaseTimings::default()),
+        None,
+    )?;
     Ok((linked, timings.expect("profiled graph carries timings")))
 }
 
@@ -1252,6 +1348,7 @@ fn load_program_inner(
     loader: &ModuleLoader,
     entry_path: &Path,
     mut timings: Option<ModulePhaseTimings>,
+    interrupt: Option<otter_vm::InterruptFlag>,
 ) -> Result<(LinkedProgram, Option<ModulePhaseTimings>), GraphError> {
     // Read the entry directly so the user sees clear errors when
     // the entry path is malformed before any specifier-resolution
@@ -1293,6 +1390,10 @@ fn load_program_inner(
             ModuleGraphBuilder::new_profiled(loader, entry_url, entry_kind, entry_text, timings)
         }
         None => ModuleGraphBuilder::new(loader, entry_url, entry_kind, entry_text),
+    };
+    let builder = match interrupt {
+        Some(interrupt) => builder.with_interrupt(interrupt),
+        None => builder,
     };
     let (graph, mut timings) = builder.build_with_timings()?;
     let link_started = timings.is_some().then(Instant::now);

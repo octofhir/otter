@@ -295,26 +295,26 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     let expanded = quote! {
         #[doc = #install_doc]
         pub fn #install_ident<'scope, 'rt>(
-            scope: &mut ::otter_runtime::RuntimeNativeScope<'scope, 'rt>,
-            capabilities: &::otter_runtime::CapabilitySet,
+            scope: &mut ::otter_runtime::__macro_support::RuntimeNativeScope<'scope, 'rt>,
+            capabilities: &::otter_runtime::__macro_support::CapabilitySet,
             runtime_task_spawner: ::core::option::Option<
-                ::otter_runtime::RuntimeTaskSpawner,
+                ::otter_runtime::__macro_support::RuntimeTaskSpawner,
             >,
         ) -> ::core::result::Result<
-            ::otter_runtime::RuntimeLocal<'scope>,
-            ::otter_runtime::RuntimeNativeError,
+            ::otter_runtime::__macro_support::RuntimeLocal<'scope>,
+            ::otter_runtime::__macro_support::RuntimeNativeError,
         > {
             let _ = runtime_task_spawner;
             #capability_use
             let namespace = scope.bare_object()?;
             let __lodge_method_attrs =
-                ::otter_runtime::RuntimeAttr::builtin_function().to_flags();
+                ::otter_runtime::__macro_support::RuntimeAttr::builtin_function().to_flags();
             #(#export_installs)*
             ::core::result::Result::Ok(namespace)
         }
 
         #[doc = #static_doc]
-        pub static #static_ident: ::otter_runtime::HostedModule = ::otter_runtime::HostedModule::new(
+        pub static #static_ident: ::otter_runtime::__macro_support::HostedModule = ::otter_runtime::__macro_support::HostedModule::new(
             #module_url,
             #install_ident,
         );

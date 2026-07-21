@@ -98,7 +98,7 @@ fn expand_inner(input: &DeriveInput) -> Result<proc_macro2::TokenStream> {
     let ident = &input.ident;
     let body = match parent_field {
         Some(parent) => quote! {
-            impl ::otter_vm::marshal::HostAncestry for #ident {
+            impl ::otter_vm::__macro_support::marshal::HostAncestry for #ident {
                 fn ancestor(
                     &self,
                     target: ::core::any::TypeId,
@@ -106,7 +106,7 @@ fn expand_inner(input: &DeriveInput) -> Result<proc_macro2::TokenStream> {
                     if target == ::core::any::TypeId::of::<Self>() {
                         ::core::option::Option::Some(self)
                     } else {
-                        ::otter_vm::marshal::HostAncestry::ancestor(&self.#parent, target)
+                        ::otter_vm::__macro_support::marshal::HostAncestry::ancestor(&self.#parent, target)
                     }
                 }
 
@@ -117,13 +117,13 @@ fn expand_inner(input: &DeriveInput) -> Result<proc_macro2::TokenStream> {
                     if target == ::core::any::TypeId::of::<Self>() {
                         ::core::option::Option::Some(self)
                     } else {
-                        ::otter_vm::marshal::HostAncestry::ancestor_mut(&mut self.#parent, target)
+                        ::otter_vm::__macro_support::marshal::HostAncestry::ancestor_mut(&mut self.#parent, target)
                     }
                 }
             }
         },
         None => quote! {
-            impl ::otter_vm::marshal::HostAncestry for #ident {}
+            impl ::otter_vm::__macro_support::marshal::HostAncestry for #ident {}
         },
     };
     Ok(body)

@@ -62,11 +62,19 @@ pub type JsFinalizationRegistry = otter_gc::Gc<FinalizationRegistryBody>;
 /// [`process_weak_refs_and_finalizers`] after marking, so the derive
 /// skips it deliberately.
 #[derive(Debug, Clone, otter_macros::Pelt)]
-#[pelt(tag = WEAK_REF_BODY_TYPE_TAG)]
+#[pelt(tag = WEAK_REF_BODY_TYPE_TAG, ephemeron_via = weak_ref_ephemeron_walk)]
 pub struct WeakRefBody {
     #[pelt(skip)]
     target: RawGc,
     prototype_override: Option<Value>,
+}
+
+fn weak_ref_ephemeron_walk(
+    body: &mut WeakRefBody,
+    visitor: &mut otter_gc::trace::EphemeronVisitor<'_>,
+) {
+    let mut visit_no_values = |_slot_visitor: &mut otter_gc::raw::SlotVisitor<'_>| {};
+    visitor(&mut body.target as *mut RawGc, &mut visit_no_values);
 }
 
 /// One registered finalization cell.
@@ -145,6 +153,7 @@ pub(crate) fn alloc_weak_ref_with_roots(
     heap.with_payload(weak_ref, |body| {
         body.target = target;
     });
+    heap.register_ephemeron_table(weak_ref);
     heap.register_weak_ref(weak_ref);
     Ok(weak_ref)
 }
@@ -159,6 +168,7 @@ pub(crate) fn alloc_weak_ref_for_mark_sweep_fixture(
         target,
         prototype_override: None,
     })?;
+    heap.register_ephemeron_table(weak_ref);
     heap.register_weak_ref(weak_ref);
     Ok(weak_ref)
 }

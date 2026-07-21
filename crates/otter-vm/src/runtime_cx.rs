@@ -561,6 +561,18 @@ impl<'rt> NativeCtx<'rt> {
         self.cx.interp.persistent_root_insert(value)
     }
 
+    /// Insert a weak persistent root for a host-owned resource.
+    ///
+    /// The returned id does not keep `value` alive. Reading it yields `None`
+    /// after the collector determines that no strong references remain.
+    pub fn persistent_root_insert_weak(
+        &mut self,
+        value: Value,
+    ) -> Result<crate::PersistentRootId, crate::VmError> {
+        let weak_ref = self.alloc_weak_ref(&value, &[], &[])?;
+        Ok(self.cx.interp.persistent_root_insert_weak(weak_ref))
+    }
+
     /// Read a generic persistent root.
     #[must_use]
     pub fn persistent_root_get(&self, id: crate::PersistentRootId) -> Option<Value> {
@@ -1699,6 +1711,19 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
     pub fn take_persistent_root(&mut self, id: crate::PersistentRootId) -> Option<Local<'scope>> {
         let value = self.ctx.cx.interp.persistent_root_remove(id)?;
         Some(self.value(value))
+    }
+
+    /// Keep `value` weakly reachable after this handle scope ends.
+    ///
+    /// The returned id can be read through [`NativeCtx::persistent_root_get`]
+    /// or removed with [`Self::take_persistent_root`]. A collected target reads
+    /// as `None`.
+    pub fn persistent_root_insert_weak(
+        &mut self,
+        value: Local<'_>,
+    ) -> Result<crate::PersistentRootId, crate::VmError> {
+        let value = self.raw(value);
+        self.ctx.persistent_root_insert_weak(value)
     }
 
     /// Root argument `index`; a missing argument becomes `undefined`.
@@ -3229,6 +3254,51 @@ mod tests {
             after > before,
             "NativeCtx weak-ref helpers should allocate through root-aware young allocation"
         );
+    }
+
+    #[test]
+    fn weak_persistent_root_releases_unreachable_target() {
+        let mut interp = Interpreter::new();
+        let weak_root = with_default_ctx(&mut interp, |ctx| {
+            let target = Value::object(ctx.alloc_object().expect("weak target"));
+            ctx.persistent_root_insert_weak(target)
+                .expect("weak persistent root")
+        });
+
+        assert!(interp.persistent_root_get(weak_root).is_some());
+        interp.force_gc().expect("full GC");
+        assert!(
+            interp.persistent_root_get(weak_root).is_none(),
+            "a weak persistent root must not retain its target"
+        );
+        assert!(interp.persistent_root_remove(weak_root).is_none());
+    }
+
+    #[test]
+    fn weak_persistent_root_observes_strongly_rooted_target() {
+        let mut interp = Interpreter::new();
+        let (weak_root, strong_root) = with_default_ctx(&mut interp, |ctx| {
+            let target = Value::object(ctx.alloc_object().expect("shared target"));
+            let strong_root = ctx.persistent_root_insert(target);
+            let weak_root = ctx
+                .persistent_root_insert_weak(target)
+                .expect("weak persistent root");
+            (weak_root, strong_root)
+        });
+
+        interp.force_gc().expect("full GC");
+        let weak_value = interp
+            .persistent_root_get(weak_root)
+            .expect("weak target remains live");
+        let strong_value = interp
+            .persistent_root_get(strong_root)
+            .expect("strong target remains live");
+        assert_eq!(weak_value, strong_value);
+
+        assert!(interp.persistent_root_remove(strong_root).is_some());
+        interp.force_gc().expect("second full GC");
+        assert!(interp.persistent_root_get(weak_root).is_none());
+        assert!(interp.persistent_root_remove(weak_root).is_none());
     }
 
     #[test]

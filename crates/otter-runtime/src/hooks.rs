@@ -102,8 +102,17 @@ pub enum RuntimeCapability {
 pub enum CapabilityRequest<'a> {
     /// Filesystem path.
     Path(&'a Path),
-    /// Host, optionally including a port.
-    Host(&'a str),
+    /// Network URL plus the canonical module/document URL that initiated it.
+    ///
+    /// The engine's default policy checks only the configured host allowlist.
+    /// Embedders may use the complete URLs for richer generic policy without
+    /// teaching the runtime about origins, documents, or navigation.
+    Network {
+        /// Absolute target URL.
+        url: &'a url::Url,
+        /// Absolute initiator URL when one exists.
+        initiator: Option<&'a url::Url>,
+    },
     /// Environment variable name.
     EnvVar(&'a str),
     /// Subprocess command name or path.
@@ -337,7 +346,9 @@ pub fn default_check_capability(
         (RuntimeCapability::Write, CapabilityRequest::Path(path)) => {
             capabilities.write.matches_path(path)
         }
-        (RuntimeCapability::Net, CapabilityRequest::Host(host)) => capabilities.net.matches(host),
+        (RuntimeCapability::Net, CapabilityRequest::Network { url, .. }) => {
+            network_url_allowed(capabilities, url)
+        }
         (RuntimeCapability::Env, CapabilityRequest::EnvVar(name)) => capabilities.env_allows(name),
         (RuntimeCapability::Run, CapabilityRequest::Command(command)) => {
             capabilities.run.matches(command)
@@ -347,6 +358,17 @@ pub fn default_check_capability(
         }
         _ => false,
     }
+}
+
+fn network_url_allowed(capabilities: &CapabilitySet, url: &url::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if capabilities.net.matches(host) {
+        return true;
+    }
+    url.port()
+        .is_some_and(|port| capabilities.net.matches(&format!("{host}:{port}")))
 }
 
 /// Apply the active runtime hook while preserving non-overridable security

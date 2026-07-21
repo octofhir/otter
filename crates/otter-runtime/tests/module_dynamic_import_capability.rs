@@ -235,6 +235,44 @@ fn https_import_passes_capability_gate_under_allow_all() {
     }
 }
 
+#[test]
+fn module_capability_hook_receives_target_and_initiator_urls() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = dir.path().join("entry.ts");
+    std::fs::write(&entry, r#"import "https://example.invalid/path/mod.js";"#).unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let hook_seen = seen.clone();
+    let mut runtime = RuntimeBuilder::default()
+        .capabilities(CapabilitySet::sandbox())
+        .capability_hook(
+            move |_capabilities: &CapabilitySet,
+                  capability: otter_runtime::RuntimeCapability,
+                  request: &otter_runtime::CapabilityRequest<'_>| {
+                let otter_runtime::CapabilityRequest::Network { url, initiator } = request else {
+                    return false;
+                };
+                if capability != otter_runtime::RuntimeCapability::Net {
+                    return false;
+                }
+                *hook_seen.lock().expect("seen") =
+                    Some((url.to_string(), initiator.map(url::Url::to_string)));
+                true
+            },
+        )
+        .build()
+        .expect("runtime");
+
+    let error = runtime
+        .run_module(&entry)
+        .expect_err("direct runtime has no remote fetch provider");
+    assert!(matches!(error, OtterError::Compile { .. }));
+    let (target, initiator) = seen.lock().expect("seen").clone().expect("hook called");
+    assert_eq!(target, "https://example.invalid/path/mod.js");
+    let canonical_entry = std::fs::canonicalize(entry).expect("canonical entry");
+    let expected_initiator = url::Url::from_file_path(canonical_entry).expect("entry URL");
+    assert_eq!(initiator.as_deref(), Some(expected_initiator.as_str()));
+}
+
 /// Local `file://` imports must not be gated by `Net` — the
 /// capability machinery only fires for the `http:` / `https:`
 /// shapes today.

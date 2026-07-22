@@ -6,7 +6,7 @@
 //! method lookup before falling into the shared callable path.
 //!
 //! # Contents
-//! - `CallMethodValue` executable operand decoding.
+//! - `CallMethodValue` typed execution-operand decoding.
 //! - Callback-driven Array and TypedArray prototype methods.
 //!
 //! # Invariants
@@ -28,11 +28,11 @@ use smallvec::SmallVec;
 use crate::function_ops::BindMetadataGet;
 use crate::native_abi::RuntimeStubId;
 use crate::{
-    ActiveFrameMut, ExecutionContext, GeneratorResumeKind, Interpreter, JsString, NumberValue,
-    PendingBindFunction, PendingBindStage, Value, VmError, VmGetOutcome, VmPropertyKey, bigint,
+    ActiveFrameMut, CodeBlock, CodeBlockInstruction, ExecutionContext, GeneratorResumeKind,
+    Interpreter, JsString, NumberValue, PendingBindFunction, PendingBindStage, Value, VmError,
+    VmGetOutcome, VmPropertyKey, bigint,
     boolean::prototype as boolean_prototype,
     bootstrap_collections, cache_ir, collections_prototype, date, descriptor_value,
-    executable::OperandView,
     function_metadata, math,
     native_function::VmIntrinsicFunction,
     number,
@@ -171,6 +171,42 @@ fn is_function_prototype_intrinsic_value(
             .and_then(|obj| crate::object::call_native(obj, heap))
             .and_then(|native_value| native_value.as_native_function())
             .is_some_and(|native| native.is_vm_intrinsic(heap, intrinsic))
+}
+
+#[derive(Clone, Copy)]
+enum MethodOperands<'a> {
+    Execution {
+        function: &'a CodeBlock,
+        instruction: &'a CodeBlockInstruction,
+    },
+    #[cfg(test)]
+    Decoded(crate::executable::OperandView<'a>),
+}
+
+impl MethodOperands<'_> {
+    #[inline]
+    fn register(self, index: usize) -> Option<u16> {
+        match self {
+            Self::Execution {
+                function,
+                instruction,
+            } => function.register(instruction, index),
+            #[cfg(test)]
+            Self::Decoded(operands) => register_operand(operands.get(index)).ok(),
+        }
+    }
+
+    #[inline]
+    fn const_index(self, index: usize) -> Option<u32> {
+        match self {
+            Self::Execution {
+                function,
+                instruction,
+            } => function.const_index(instruction, index),
+            #[cfg(test)]
+            Self::Decoded(operands) => const_operand(operands.get(index)).ok(),
+        }
+    }
 }
 
 impl Interpreter {
@@ -507,20 +543,45 @@ impl Interpreter {
     /// - `Function` / `Closure` / `BoundFunction` — only the
     ///   `call`, `apply`, and `bind` shapes are recognised; anything
     ///   else surfaces as `UnknownIntrinsic`.
+    #[cfg(test)]
     pub(crate) fn do_call_method_value<'a>(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
-        operands: impl Into<OperandView<'a>>,
+        operands: impl Into<crate::executable::OperandView<'a>>,
     ) -> Result<(), VmError> {
-        let operands = operands.into();
-        let dst = register_operand(operands.first())?;
-        let recv_reg = register_operand(operands.get(1))?;
-        let name_idx = const_operand(operands.get(2))?;
-        let argc = match operands.get(3) {
-            Some(Operand::ConstIndex(n)) => n as usize,
-            _ => return Err(VmError::InvalidOperand),
-        };
+        self.do_call_method_value_inner(stack, context, MethodOperands::Decoded(operands.into()))
+    }
+
+    /// Execute a verified `CallMethodValue` record without re-decoding its
+    /// schema tags on every invocation.
+    pub(crate) fn do_call_method_value_exec(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        function: &CodeBlock,
+        instruction: &CodeBlockInstruction,
+    ) -> Result<(), VmError> {
+        self.do_call_method_value_inner(
+            stack,
+            context,
+            MethodOperands::Execution {
+                function,
+                instruction,
+            },
+        )
+    }
+
+    fn do_call_method_value_inner(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        operands: MethodOperands<'_>,
+    ) -> Result<(), VmError> {
+        let dst = operands.register(0).ok_or(VmError::InvalidOperand)?;
+        let recv_reg = operands.register(1).ok_or(VmError::InvalidOperand)?;
+        let name_idx = operands.const_index(2).ok_or(VmError::InvalidOperand)?;
+        let argc = operands.const_index(3).ok_or(VmError::InvalidOperand)? as usize;
         let top_idx = stack.len() - 1;
         if let Some(result) = self.continue_pending_bind_function(stack, context, dst) {
             return result;
@@ -528,7 +589,7 @@ impl Interpreter {
         let recv_value = *read_register(&stack[top_idx], recv_reg)?;
         let mut arg_values: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc);
         for i in 0..argc {
-            let r = register_operand(operands.get(4 + i))?;
+            let r = operands.register(4 + i).ok_or(VmError::InvalidOperand)?;
             arg_values.push(*read_register(&stack[top_idx], r)?);
         }
         if recv_value.is_nullish() {

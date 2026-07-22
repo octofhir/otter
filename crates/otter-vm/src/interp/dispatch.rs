@@ -209,7 +209,9 @@ impl Interpreter {
             // `&mut Frame` borrow while pushing / popping.
             match op {
                 Op::ReturnValue | Op::Return => {
-                    let src = register_operand(function.operand(instr, 0))?;
+                    let src = function
+                        .register(instr, 0)
+                        .ok_or_else(|| VmError::InvalidOperand)?;
                     let value = stack[top_idx]
                         .registers
                         .get(src as usize)
@@ -293,7 +295,6 @@ impl Interpreter {
                     continue;
                 }
                 Op::CallMethodValue => {
-                    let operands = function.operand_view(instr);
                     let depth_before = stack.len();
                     let feedback_site = instr.property_ic_site();
                     // Capture the receiver/prototype layout before the call for
@@ -328,7 +329,7 @@ impl Interpreter {
                     } else {
                         None
                     };
-                    self.do_call_method_value(stack, context, operands)?;
+                    self.do_call_method_value_exec(stack, context, function, instr)?;
                     // Tier-up hook, mirroring `Op::Call`: a bytecode method
                     // callee pushed via `invoke` lands as a fresh pc==0 frame.
                     if jit_installed && stack.len() > depth_before {
@@ -548,22 +549,25 @@ impl Interpreter {
                 // the dispatch loop afterwards — the in-frame
                 // match below has no arm for `Op::ToPrimitive`.
                 Op::ToPrimitive => {
-                    let operands = function.operand_view(instr);
                     // Hot fast path: an already-primitive source (the dominant
                     // case — numeric loop operands) is its own ToPrimitive
                     // result. Skip the hint-token decode and the parked-ladder
                     // resume check; a primitive operand never parks. Reading
                     // `src` (the original operand, not `dst`) keeps the object
                     // resume path — where `src` stays non-primitive — intact.
-                    let dst = register_operand(operands.first())?;
-                    let src = register_operand(operands.get(1))?;
+                    let dst = function
+                        .register(instr, 0)
+                        .ok_or_else(|| VmError::InvalidOperand)?;
+                    let src = function
+                        .register(instr, 1)
+                        .ok_or_else(|| VmError::InvalidOperand)?;
                     let recv = *read_register(&stack[top_idx], src)?;
                     if abstract_ops::is_primitive(&recv) {
                         write_register(&mut stack[top_idx], dst, recv)?;
                         stack[top_idx].advance_pc()?;
                         continue;
                     }
-                    self.drive_to_primitive(stack, context, operands)?;
+                    self.drive_to_primitive(stack, context, function.operand_view(instr))?;
                     continue;
                 }
                 // §7.4.3 `GetIterator`. Built-in iterables fall

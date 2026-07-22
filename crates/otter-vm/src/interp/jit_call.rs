@@ -1009,11 +1009,12 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let op = code_block.op(instruction);
         stack[caller_index].pc = call_pc;
-        let operands = code_block.operand_view(instruction);
         match op {
-            otter_bytecode::Op::Call => self.do_call(stack, context, operands)?,
+            otter_bytecode::Op::Call => {
+                self.do_call(stack, context, code_block.operand_view(instruction))?
+            }
             otter_bytecode::Op::CallMethodValue => {
-                self.do_call_method_value(stack, context, operands)?;
+                self.do_call_method_value_exec(stack, context, code_block, instruction)?;
             }
             _ => return Err(VmError::InvalidOperand),
         }

@@ -42,6 +42,8 @@
 //! - A [`FrameState`] carries one [`DeoptSlot`] per interpreter virtual
 //!   register the frame defines, in register-index order, matching the windowed
 //!   register numbering the frame ABI fixes.
+//! - Literal recipes are not physical locations and may be shared by any
+//!   number of slots. They let optimized code omit values needed only by deopt.
 //! - A [`StackMap`] indexes the same compiled slots the frame state locates;
 //!   bit `i` set means slot `i` holds a tagged pointer the collector relocates.
 
@@ -60,8 +62,6 @@ pub struct DeoptVerifyLimits {
     pub min_stack_slot_offset: i32,
     /// Largest valid frame-pointer-relative stack-slot byte offset.
     pub max_stack_slot_offset: i32,
-    /// Number of constants addressable by [`DeoptLocation::Constant`].
-    pub constant_count: u32,
 }
 
 /// Failure to verify concrete deopt metadata.
@@ -127,17 +127,6 @@ pub enum DeoptVerifyError {
         /// Misaligned frame-pointer-relative byte offset.
         offset: i32,
     },
-    /// A constant location exceeds the function's declared constant pool.
-    ConstantOutOfRange {
-        /// Frame state's exact byte-PC.
-        byte_pc: u32,
-        /// Interpreter slot containing the location.
-        slot: usize,
-        /// Invalid constant-pool index.
-        constant: u32,
-        /// Declared constant count.
-        constant_count: u32,
-    },
     /// An exit rebuilds no frames at all.
     EmptyFrameChain,
 }
@@ -186,8 +175,9 @@ pub enum DeoptLocation {
     Register(u16),
     /// A spill stack slot, by signed byte offset from the frame pointer.
     StackSlot(i32),
-    /// A compile-time constant, by index into the function's constant pool.
-    Constant(u32),
+    /// A compile-time raw literal rematerialized only when this exit runs.
+    /// [`DeoptSlot::repr`] defines how the bits become a tagged VM value.
+    Literal(u64),
 }
 
 /// One interpreter virtual register at a deopt point: where it lives and how to
@@ -300,8 +290,11 @@ impl DeoptFrame {
 
         let mut locations = BTreeMap::new();
         for (slot_index, slot) in self.slots.iter().enumerate() {
-            let key = location_key(slot.location);
-            if let Some(first_slot) = locations.insert(key, slot_index) {
+            // Literals are reconstruction recipes, not storage. Repeating one
+            // is intentional; only physical homes must remain unique.
+            if let Some(key) = location_key(slot.location)
+                && let Some(first_slot) = locations.insert(key, slot_index)
+            {
                 return Err(DeoptVerifyError::DuplicateLocation {
                     byte_pc: self.byte_pc,
                     first_slot,
@@ -340,17 +333,9 @@ impl DeoptFrame {
                         offset,
                     });
                 }
-                DeoptLocation::Constant(constant) if constant >= limits.constant_count => {
-                    return Err(DeoptVerifyError::ConstantOutOfRange {
-                        byte_pc: self.byte_pc,
-                        slot: slot_index,
-                        constant,
-                        constant_count: limits.constant_count,
-                    });
-                }
                 DeoptLocation::Register(_)
                 | DeoptLocation::StackSlot(_)
-                | DeoptLocation::Constant(_) => {}
+                | DeoptLocation::Literal(_) => {}
             }
 
             match slot.repr {
@@ -361,11 +346,11 @@ impl DeoptFrame {
     }
 }
 
-fn location_key(location: DeoptLocation) -> (u8, i64) {
+fn location_key(location: DeoptLocation) -> Option<(u8, i64)> {
     match location {
-        DeoptLocation::Register(register) => (0, i64::from(register)),
-        DeoptLocation::StackSlot(offset) => (1, i64::from(offset)),
-        DeoptLocation::Constant(constant) => (2, i64::from(constant)),
+        DeoptLocation::Register(register) => Some((0, i64::from(register))),
+        DeoptLocation::StackSlot(offset) => Some((1, i64::from(offset))),
+        DeoptLocation::Literal(_) => None,
     }
 }
 
@@ -535,7 +520,6 @@ mod tests {
             machine_register_count: 8,
             min_stack_slot_offset: -64,
             max_stack_slot_offset: 64,
-            constant_count: 4,
         }
     }
 
@@ -682,7 +666,7 @@ mod tests {
                     repr: DeoptRepr::Float64,
                 },
                 DeoptSlot {
-                    location: DeoptLocation::Constant(2),
+                    location: DeoptLocation::Literal(2),
                     repr: DeoptRepr::Int32,
                 },
             ],
@@ -716,22 +700,20 @@ mod tests {
             })
         );
 
-        let out_of_range = single_frame(
+        let repeated_literal = single_frame(
             20,
-            vec![DeoptSlot {
-                location: DeoptLocation::Constant(4),
-                repr: DeoptRepr::Tagged,
-            }],
+            vec![
+                DeoptSlot {
+                    location: DeoptLocation::Literal(4),
+                    repr: DeoptRepr::Tagged,
+                },
+                DeoptSlot {
+                    location: DeoptLocation::Literal(4),
+                    repr: DeoptRepr::Tagged,
+                },
+            ],
         );
-        assert_eq!(
-            out_of_range.verify(verify_limits()),
-            Err(DeoptVerifyError::ConstantOutOfRange {
-                byte_pc: 20,
-                slot: 0,
-                constant: 4,
-                constant_count: 4,
-            })
-        );
+        assert_eq!(repeated_literal.verify(verify_limits()), Ok(()));
     }
 
     #[test]

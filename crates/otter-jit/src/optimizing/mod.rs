@@ -9,6 +9,8 @@
 //! or by on-stack replacement at a hot loop header. CFG edges carry
 //! sequentialized phi moves, while every back-edge polls the VM thread's
 //! interrupt and fuel cells before returning to its dominating header.
+//! Side-effect-free loops version invariant own-data Number loads after one
+//! complete all-hit iteration, without moving accessor or miss semantics.
 //! Installed code enters through the shared reentrant `JitCtx` ABI and
 //! homes transition operands in the canonical native register window and
 //! publishes only precise tagged roots around allocating element transitions.
@@ -17,6 +19,7 @@
 //! - [`compile_optimized`] — whole-pipeline compilation entry point.
 //! - [`OptimizedCode`] — executable code plus deopt and allocation metadata.
 //! - `cranelift` — restartable, call-free Number leaves.
+//! - `loop_versioning` — safe speculative invariant property-load planning.
 //! - `pipeline` / `unit` — backend-neutral orchestration and its owned,
 //!   verified analysis product.
 //!
@@ -65,6 +68,7 @@ mod arm64;
 mod artifact;
 #[cfg(target_arch = "aarch64")]
 mod cranelift;
+pub(crate) mod loop_versioning;
 pub(crate) mod pipeline;
 pub(crate) mod unit;
 

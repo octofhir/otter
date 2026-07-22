@@ -15,6 +15,8 @@
 //! - Guarded plain- and method-callee splicing with multi-frame exact-PC
 //!   deoptimization and synthetic `this` binding.
 //! - Loop-invariant method-identity caching and receiver-property guard fusion.
+//! - Loop-versioned own-data Number property loads, activated only after one
+//!   complete all-hit iteration and invalidated by every semantic miss.
 //! - Unboxed numeric residency through source-lowered coercion scaffolding.
 //! - Tagged-number guards, mixed-representation arithmetic, spills, boxing,
 //!   and bail exits backed by exact deopt frame states.
@@ -30,6 +32,9 @@
 //!   with the VM's frozen number-tag mask before entering an unboxed operation.
 //!   `ToPrimitive` / `ToNumeric` accept only those checked number encodings;
 //!   other values bail before any user-observable coercion can run.
+//! - Property loop caches contain only tagged Number bits, never GC pointers.
+//!   Accessor/proxy/non-number/miss paths cannot activate a version, and every
+//!   non-backedge loop entry starts with an empty cache.
 //! - `Add`/`Sub` use the arm64 signed-overflow flag and `Mul` compares its
 //!   signed 64-bit product with the sign-extended low word. Overflow bails at
 //!   the arithmetic instruction's exact logical PC; it never silently wraps.
@@ -103,6 +108,10 @@ use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG};
 use super::{
     OptimizedCode, OptimizedMetadata,
     artifact::render_optimized_unit,
+    loop_versioning::{
+        PropertyLoopCache, PropertyLoopCachePlan, analyze_property_loop_caches,
+        natural_loop_blocks, transparent_origin,
+    },
     pipeline::{
         OptimizationError, OptimizationPipeline, total_spill_slots as analyzed_spill_slot_count,
     },
@@ -139,7 +148,6 @@ use crate::{
         liveness::Liveness,
         regalloc::{
             Allocation, EdgeMoves, Location, Move, RegClass, RegisterBudget, has_non_dead_use,
-            is_dead_phi,
         },
         repr::{ConversionKind, ReprMap, Representation},
         ssa::{SsaFunction, SsaInstr, ValueDef, ValueId},
@@ -189,6 +197,9 @@ struct Eligibility {
     /// receiver body is cached after the first exact identity check in each
     /// native entry/OSR activation.
     cached_method_guard: Option<(InlineId, u32)>,
+    /// Loop-versioned own-data Number loads. A loop becomes cache-active only
+    /// after every listed site completed one fast IC hit in the same iteration.
+    property_loop_cache: PropertyLoopCachePlan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -720,21 +731,61 @@ fn fused_method_property_for_frame(tree: &InlineTree, ssa: &SsaFunction, inline:
         })
 }
 
-fn natural_loop_blocks(
-    cfg: &ControlFlowGraph,
-    latch: BlockId,
-    header: BlockId,
-) -> BTreeSet<BlockId> {
-    let mut blocks = BTreeSet::from([header, latch]);
-    let mut pending = vec![latch];
-    while let Some(block) = pending.pop() {
-        for predecessor in cfg.blocks[block.0 as usize].preds.iter().copied() {
-            if blocks.insert(predecessor) && predecessor != header {
-                pending.push(predecessor);
-            }
-        }
+fn property_cache_offset(base: u32, slot: u32) -> Result<u32, Unsupported> {
+    slot.checked_mul(STACK_SLOT_BYTES)
+        .and_then(|offset| base.checked_add(offset))
+        .ok_or(Unsupported::OperandShape(
+            "optimizing property loop cache offset overflow",
+        ))
+}
+
+fn emit_reset_property_loop_cache(
+    ops: &mut Assembler,
+    cache_base: u32,
+    cache: &PropertyLoopCache,
+) -> Result<(), Unsupported> {
+    dynasm!(ops ; .arch aarch64 ; mov x9, xzr);
+    emit_sp_str_x(ops, 9, property_cache_offset(cache_base, cache.ready_slot)?);
+    emit_load_u64(ops, 9, VALUE_HOLE);
+    for &slot in cache.value_slots.iter() {
+        emit_sp_str_x(ops, 9, property_cache_offset(cache_base, slot)?);
     }
-    blocks
+    Ok(())
+}
+
+fn emit_reset_all_property_loop_caches(
+    ops: &mut Assembler,
+    cache_base: u32,
+    plan: &PropertyLoopCachePlan,
+) -> Result<(), Unsupported> {
+    for cache in plan.loops.values() {
+        emit_reset_property_loop_cache(ops, cache_base, cache)?;
+    }
+    Ok(())
+}
+
+/// Finish a training iteration. The loop is versioned only if every property
+/// site stored a Number from its fast own-data path during this same iteration.
+fn emit_finish_property_loop_iteration(
+    ops: &mut Assembler,
+    cache_base: u32,
+    cache: &PropertyLoopCache,
+) -> Result<(), Unsupported> {
+    let done = ops.new_dynamic_label();
+    let incomplete = ops.new_dynamic_label();
+    emit_sp_ldr_x(ops, 9, property_cache_offset(cache_base, cache.ready_slot)?);
+    dynasm!(ops ; .arch aarch64 ; cbnz x9, =>done);
+    emit_load_u64(ops, 10, VALUE_HOLE);
+    for &slot in cache.value_slots.iter() {
+        emit_sp_ldr_x(ops, 9, property_cache_offset(cache_base, slot)?);
+        dynasm!(ops ; .arch aarch64 ; cmp x9, x10 ; b.eq =>incomplete);
+    }
+    dynasm!(ops ; .arch aarch64 ; movz x9, #1);
+    emit_sp_str_x(ops, 9, property_cache_offset(cache_base, cache.ready_slot)?);
+    dynasm!(ops ; .arch aarch64 ; b =>done ; =>incomplete);
+    emit_reset_property_loop_cache(ops, cache_base, cache)?;
+    dynasm!(ops ; .arch aarch64 ; =>done);
+    Ok(())
 }
 
 fn guard_cache_safe_instruction(
@@ -793,20 +844,6 @@ fn cached_method_guard_site(
     ssa: &SsaFunction,
     back_edges: &BTreeMap<(BlockId, BlockId), (DeoptExitId, u32)>,
 ) -> Option<(InlineId, u32)> {
-    fn transparent_origin(ssa: &SsaFunction, mut value: ValueId) -> Option<ValueId> {
-        loop {
-            let data = ssa.values.get(value.0 as usize)?;
-            match &data.def {
-                ValueDef::Op {
-                    op: Op::LoadLocal | Op::StoreLocal,
-                    inputs,
-                    ..
-                } if inputs.len() == 1 => value = inputs[0],
-                _ => return Some(value),
-            }
-        }
-    }
-
     let mut candidates = Vec::new();
     for block in &cfg.blocks {
         for instruction in &ssa.blocks[block.id.0 as usize].instrs {
@@ -1683,6 +1720,11 @@ fn check_eligibility(
     )?;
     let osr_entries = build_osr_entry_sites(cfg, ssa, liveness, frame_states)?;
     let cached_method_guard = cached_method_guard_site(tree, cfg, ssa, &back_edges);
+    let property_loop_cache = analyze_property_loop_caches(
+        cfg,
+        ssa,
+        &back_edges.keys().copied().collect::<BTreeSet<_>>(),
+    );
     Ok(Eligibility {
         guarded_uses: guarded_numeric_uses,
         back_edges,
@@ -1691,6 +1733,7 @@ fn check_eligibility(
         math_call_arguments,
         insufficient_feedback,
         cached_method_guard,
+        property_loop_cache,
     })
 }
 
@@ -1962,6 +2005,45 @@ fn is_boolean_value(ssa: &SsaFunction, value: ValueId) -> bool {
     )
 }
 
+/// Whether `instructions[index]` can leave its numeric comparison in flags for
+/// the immediately following `JumpIf*`.
+///
+/// The branch materializes the proven boolean separately on both CFG edges, so
+/// later exact-PC deopt states still see the bytecode destination even when it
+/// is otherwise only frame-state live. Cold-feedback deopts cannot participate:
+/// they resume at the comparison/branch boundary before an edge value exists.
+fn fused_numeric_compare_at(
+    tree: &InlineTree,
+    instructions: &[SsaInstr],
+    index: usize,
+    insufficient_feedback: &BTreeSet<(InlineId, u32)>,
+) -> bool {
+    let Some(comparison) = instructions.get(index) else {
+        return false;
+    };
+    let Some(branch) = instructions.get(index.saturating_add(1)) else {
+        return false;
+    };
+    if !matches!(
+        comparison.op,
+        Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq | Op::Equal | Op::NotEqual
+    ) || !matches!(branch.op, Op::JumpIfTrue | Op::JumpIfFalse)
+        || comparison.inline != branch.inline
+        || insufficient_feedback.contains(&(comparison.inline, comparison.pc))
+        || insufficient_feedback.contains(&(branch.inline, branch.pc))
+    {
+        return false;
+    }
+    let Some(result) = comparison.result else {
+        return false;
+    };
+    if branch.inputs.as_ref() != [result] {
+        return false;
+    }
+    let feedback = frame_feedback(tree, comparison);
+    feedback.is_int32_only() || feedback.is_numeric_only()
+}
+
 /// Reduce the tagged `Value` in `x9` to `VALUE_TRUE` / `VALUE_FALSE` in `x9`
 /// per §7.1.2 `ToBoolean`. Int32 and boxed doubles (including `±0`/NaN),
 /// booleans, `null`, and `undefined` decide inline; every heap cell resolves
@@ -2197,16 +2279,26 @@ fn emit(
     } else {
         allocated_spill_bytes
     };
-    let poll_counter_slot = (!eligibility.back_edges.is_empty()).then_some(after_fused_slots);
-    let spill_frame_bytes = if poll_counter_slot.is_some() {
-        after_fused_slots
-            .checked_add(16)
-            .ok_or(Unsupported::OperandShape(
-                "optimizing poll counter spill frame overflow",
-            ))?
-    } else {
-        after_fused_slots
-    };
+    let property_cache_base = after_fused_slots;
+    let property_cache_bytes = eligibility
+        .property_loop_cache
+        .slot_count
+        .checked_mul(STACK_SLOT_BYTES)
+        .ok_or(Unsupported::OperandShape(
+            "optimizing property loop cache frame overflow",
+        ))?;
+    let spill_frame_bytes = property_cache_base
+        .checked_add(property_cache_bytes)
+        .and_then(|bytes| bytes.checked_add(15))
+        .map(|bytes| bytes & !15)
+        .ok_or(Unsupported::OperandShape(
+            "optimizing property loop cache frame overflow",
+        ))?;
+    if spill_frame_bytes > MAX_SPILL_FRAME_BYTES {
+        return Err(Unsupported::OperandShape(
+            "optimizing property loop cache frame exceeds arm64 immediates",
+        ));
+    }
     let mut code_map = capture_artifacts.then(CodeMapCapture::default);
     let mut relocations = RelocationCapture::new(capture_artifacts);
     let mut direct_call_events = capture_events.then(|| {
@@ -2302,9 +2394,13 @@ fn emit(
         let receiver_slot = fused_method_receiver_slot.expect("cached guard reserves a slot");
         emit_sp_str_x(&mut ops, 9, receiver_slot);
     }
-    if let Some(poll_counter_slot) = poll_counter_slot {
-        emit_load_u32(&mut ops, 9, OPTIMIZED_POLL_BATCH);
-        emit_sp_str_x(&mut ops, 9, poll_counter_slot);
+    emit_reset_all_property_loop_caches(
+        &mut ops,
+        property_cache_base,
+        &eligibility.property_loop_cache,
+    )?;
+    if !eligibility.back_edges.is_empty() {
+        dynasm!(ops ; .arch aarch64 ; movz w29, OPTIMIZED_POLL_BATCH);
     }
 
     dynasm!(ops
@@ -2326,11 +2422,12 @@ fn emit(
                 emit_load_parameter(&mut ops, index, 9);
                 emit_store_tagged_location(&mut ops, allocation.location(value.id), 9)?;
             }
-            ValueDef::Uninitialized { .. } => {
+            ValueDef::Uninitialized { .. } if has_non_dead_use(ssa, value.id) => {
                 emit_load_u32(&mut ops, 9, otter_vm::Value::undefined().to_bits() as u32);
                 emit_store_tagged_location(&mut ops, allocation.location(value.id), 9)?;
             }
-            ValueDef::ExceptionInput { .. }
+            ValueDef::Uninitialized { .. }
+            | ValueDef::ExceptionInput { .. }
             | ValueDef::InlineUndefinedReturn { .. }
             | ValueDef::InlineResult { .. }
             | ValueDef::Phi { .. }
@@ -2351,19 +2448,13 @@ fn emit(
         let block_prelude_start = ops.offset().0;
         let label = block_labels[block_id.0 as usize];
         dynasm!(ops ; .arch aarch64 ; =>label);
-        emit_initialize_dead_phis(
-            &mut ops,
-            ssa,
-            reprs,
-            allocation,
-            &ssa.blocks[block_id.0 as usize].phis,
-        )?;
         if block_id != cfg.entry {
             for &head in &ssa.blocks[block_id.0 as usize].phis {
                 if matches!(
                     ssa.values[head.0 as usize].def,
                     ValueDef::Uninitialized { .. } | ValueDef::InlineUndefinedReturn { .. }
-                ) {
+                ) && has_non_dead_use(ssa, head)
+                {
                     emit_load_u32(&mut ops, 9, otter_vm::Value::undefined().to_bits() as u32);
                     emit_store_tagged_location(&mut ops, allocation.location(head), 9)?;
                 }
@@ -2377,7 +2468,8 @@ fn emit(
                 block_id.0,
             ));
         }
-        for instruction in &ssa.blocks[block_id.0 as usize].instrs {
+        let block_instructions = &ssa.blocks[block_id.0 as usize].instrs;
+        for (instruction_index, instruction) in block_instructions.iter().enumerate() {
             let instruction_start = ops.offset().0;
             if eligibility
                 .insufficient_feedback
@@ -2831,6 +2923,28 @@ fn emit(
                     debug_assert_eq!(site.safepoint_id, site.frame_map.id);
                     let miss = ops.new_dynamic_label();
                     let done = ops.new_dynamic_label();
+                    let loop_cache_site = eligibility
+                        .property_loop_cache
+                        .sites
+                        .get(&(instruction.inline, instruction.pc));
+                    if let Some(loop_cache_site) = loop_cache_site {
+                        let loop_cache =
+                            &eligibility.property_loop_cache.loops[&loop_cache_site.header];
+                        emit_sp_ldr_x(
+                            &mut ops,
+                            9,
+                            property_cache_offset(property_cache_base, loop_cache.ready_slot)?,
+                        );
+                        let not_ready = ops.new_dynamic_label();
+                        dynasm!(ops ; .arch aarch64 ; cbz x9, =>not_ready);
+                        emit_sp_ldr_x(
+                            &mut ops,
+                            9,
+                            property_cache_offset(property_cache_base, loop_cache_site.value_slot)?,
+                        );
+                        emit_store_tagged_location(&mut ops, result_location, 9)?;
+                        dynasm!(ops ; .arch aarch64 ; b =>done ; =>not_ready);
+                    }
 
                     // Inline own-data probe through the self-patching cell:
                     // guard cell tag, body tag, and shape, then read the value
@@ -2899,7 +3013,7 @@ fn emit(
                         dynasm!(ops
                             ; .arch aarch64
                             ; cbz x13, =>miss
-                            ; ldr w9, [x13, x17]       // 4-byte compressed slot
+                            ; ldr w9, [x13, x17]
                         );
                         let boxed_entry = ops.new_dynamic_label();
                         let continuation = ops.new_dynamic_label();
@@ -2917,6 +3031,29 @@ fn emit(
                             boxed_entry,
                         );
                         dynasm!(ops ; .arch aarch64 ; =>continuation);
+                        if let Some(loop_cache_site) = loop_cache_site {
+                            let not_number = ops.new_dynamic_label();
+                            let cache_number = ops.new_dynamic_label();
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; movz x15, NUMBER_TAG_HI16, lsl #48
+                                ; and x14, x9, x15
+                                ; cmp x14, x15
+                                ; b.eq =>cache_number
+                                ; tst x9, x15
+                                ; b.eq =>not_number
+                                ; =>cache_number
+                            );
+                            emit_sp_str_x(
+                                &mut ops,
+                                9,
+                                property_cache_offset(
+                                    property_cache_base,
+                                    loop_cache_site.value_slot,
+                                )?,
+                            );
+                            dynasm!(ops ; .arch aarch64 ; =>not_number);
+                        }
                         emit_store_tagged_location(&mut ops, result_location, 9)?;
                         dynasm!(ops ; .arch aarch64 ; b =>done);
                     }
@@ -2924,6 +3061,13 @@ fn emit(
                     // Miss: the window transition resolves full `[[Get]]`
                     // semantics and self-patches this site's cell.
                     dynasm!(ops ; .arch aarch64 ; =>miss);
+                    if let Some(loop_cache_site) = loop_cache_site {
+                        emit_reset_property_loop_cache(
+                            &mut ops,
+                            property_cache_base,
+                            &eligibility.property_loop_cache.loops[&loop_cache_site.header],
+                        )?;
+                    }
                     emit_materialize_element_transition(
                         &mut ops,
                         reprs,
@@ -4227,6 +4371,12 @@ fn emit(
                 | Op::Equal
                 | Op::NotEqual => {
                     let feedback = frame_feedback(tree, instruction);
+                    let fused_branch = fused_numeric_compare_at(
+                        tree,
+                        block_instructions,
+                        instruction_index,
+                        &eligibility.insufficient_feedback,
+                    );
                     if feedback.is_int32_only() {
                         emit_load_int_operand(
                             &mut ops,
@@ -4246,7 +4396,11 @@ fn emit(
                             10,
                             guard_deopt,
                         )?;
-                        emit_int_comparison(&mut ops, instruction.op);
+                        if fused_branch {
+                            emit_int_compare_flags(&mut ops);
+                        } else {
+                            emit_int_comparison(&mut ops, instruction.op);
+                        }
                     } else if feedback.is_numeric_only() {
                         emit_load_float_operand(
                             &mut ops,
@@ -4266,7 +4420,11 @@ fn emit(
                             FP_SCRATCH_2,
                             guard_deopt,
                         )?;
-                        emit_float_comparison(&mut ops, instruction.op);
+                        if fused_branch {
+                            emit_float_compare_flags(&mut ops);
+                        } else {
+                            emit_float_comparison(&mut ops, instruction.op);
+                        }
                     } else {
                         // Mixed operands: total strict (in)equality over the
                         // tagged values, shared with the template tier. The
@@ -4296,12 +4454,14 @@ fn emit(
                         crate::template::arm64::values::emit_box_bool(&mut ops, 13, 12);
                         dynasm!(ops ; .arch aarch64 ; mov x11, x13);
                     }
-                    emit_store_tagged_location(
-                        &mut ops,
-                        allocation
-                            .location(instruction.result.expect("eligibility checked result")),
-                        11,
-                    )?;
+                    if !fused_branch {
+                        emit_store_tagged_location(
+                            &mut ops,
+                            allocation
+                                .location(instruction.result.expect("eligibility checked result")),
+                            11,
+                        )?;
+                    }
                 }
                 Op::Jump => {
                     let target = block.normal_succs[0];
@@ -4310,8 +4470,8 @@ fn emit(
                         &mut relocations,
                         allocation,
                         eligibility,
+                        property_cache_base,
                         poll_entry,
-                        poll_counter_slot,
                         threw,
                         &block_labels,
                         block_id,
@@ -4322,56 +4482,135 @@ fn emit(
                     let Terminator::Branch { taken, fallthrough } = block.terminator else {
                         return Err(Unsupported::OperandShape("optimizing branch terminator"));
                     };
-                    emit_load_tagged_location(
-                        &mut ops,
-                        allocation.location(instruction.inputs[0]),
-                        9,
-                    )?;
-                    // A provably-boolean condition compares directly; any other
-                    // tagged value is reduced to `VALUE_TRUE`/`VALUE_FALSE` first.
-                    if !is_boolean_value(ssa, instruction.inputs[0]) {
-                        let bail = ops.new_dynamic_label();
-                        emit_truthiness_reduce(&mut ops, &mut relocations, to_boolean_entry, bail);
-                        deopt_exits.push((
-                            bail,
-                            deopt_exit_at(frame_states, instruction)?,
-                            instruction.pc,
-                        ));
-                    }
-                    emit_load_u32(&mut ops, 10, VALUE_TRUE as u32);
-                    let taken_edge = ops.new_dynamic_label();
-                    if instruction.op == Op::JumpIfTrue {
-                        dynasm!(ops ; .arch aarch64 ; cmp x9, x10 ; b.eq =>taken_edge);
+                    if let Some(compare_index) = instruction_index.checked_sub(1).filter(|&index| {
+                        fused_numeric_compare_at(
+                            tree,
+                            block_instructions,
+                            index,
+                            &eligibility.insufficient_feedback,
+                        )
+                    }) {
+                        let comparison = &block_instructions[compare_index];
+                        let result = comparison
+                            .result
+                            .expect("fused comparison owns its branch condition");
+                        let branch_on_true = instruction.op == Op::JumpIfTrue;
+                        let taken_edge = ops.new_dynamic_label();
+                        let feedback = frame_feedback(tree, comparison);
+                        if feedback.is_int32_only() {
+                            emit_int_comparison_branch(
+                                &mut ops,
+                                comparison.op,
+                                branch_on_true,
+                                taken_edge,
+                            );
+                        } else {
+                            debug_assert!(feedback.is_numeric_only());
+                            emit_float_comparison_branch(
+                                &mut ops,
+                                comparison.op,
+                                branch_on_true,
+                                taken_edge,
+                            );
+                        }
+
+                        // The comparison's bytecode destination remains part of
+                        // later exact-PC frame states. Each outgoing edge proves
+                        // its boolean value, so materialize that constant after
+                        // the flags branch instead of boxing and spilling before
+                        // immediately loading it back for `JumpIf*`.
+                        emit_store_boolean_constant(
+                            &mut ops,
+                            allocation.location(result),
+                            !branch_on_true,
+                        )?;
+                        emit_cfg_edge(
+                            &mut ops,
+                            &mut relocations,
+                            allocation,
+                            eligibility,
+                            property_cache_base,
+                            poll_entry,
+                            threw,
+                            &block_labels,
+                            block_id,
+                            fallthrough,
+                        )?;
+                        dynasm!(ops ; .arch aarch64 ; =>taken_edge);
+                        emit_store_boolean_constant(
+                            &mut ops,
+                            allocation.location(result),
+                            branch_on_true,
+                        )?;
+                        emit_cfg_edge(
+                            &mut ops,
+                            &mut relocations,
+                            allocation,
+                            eligibility,
+                            property_cache_base,
+                            poll_entry,
+                            threw,
+                            &block_labels,
+                            block_id,
+                            taken,
+                        )?;
                     } else {
-                        dynasm!(ops ; .arch aarch64 ; cmp x9, x10 ; b.ne =>taken_edge);
+                        emit_load_tagged_location(
+                            &mut ops,
+                            allocation.location(instruction.inputs[0]),
+                            9,
+                        )?;
+                        // A provably-boolean condition compares directly; any other
+                        // tagged value is reduced to `VALUE_TRUE`/`VALUE_FALSE` first.
+                        if !is_boolean_value(ssa, instruction.inputs[0]) {
+                            let bail = ops.new_dynamic_label();
+                            emit_truthiness_reduce(
+                                &mut ops,
+                                &mut relocations,
+                                to_boolean_entry,
+                                bail,
+                            );
+                            deopt_exits.push((
+                                bail,
+                                deopt_exit_at(frame_states, instruction)?,
+                                instruction.pc,
+                            ));
+                        }
+                        emit_load_u32(&mut ops, 10, VALUE_TRUE as u32);
+                        let taken_edge = ops.new_dynamic_label();
+                        if instruction.op == Op::JumpIfTrue {
+                            dynasm!(ops ; .arch aarch64 ; cmp x9, x10 ; b.eq =>taken_edge);
+                        } else {
+                            dynasm!(ops ; .arch aarch64 ; cmp x9, x10 ; b.ne =>taken_edge);
+                        }
+
+                        emit_cfg_edge(
+                            &mut ops,
+                            &mut relocations,
+                            allocation,
+                            eligibility,
+                            property_cache_base,
+                            poll_entry,
+                            threw,
+                            &block_labels,
+                            block_id,
+                            fallthrough,
+                        )?;
+                        dynasm!(ops ; .arch aarch64 ; =>taken_edge);
+
+                        emit_cfg_edge(
+                            &mut ops,
+                            &mut relocations,
+                            allocation,
+                            eligibility,
+                            property_cache_base,
+                            poll_entry,
+                            threw,
+                            &block_labels,
+                            block_id,
+                            taken,
+                        )?;
                     }
-
-                    emit_cfg_edge(
-                        &mut ops,
-                        &mut relocations,
-                        allocation,
-                        eligibility,
-                        poll_entry,
-                        poll_counter_slot,
-                        threw,
-                        &block_labels,
-                        block_id,
-                        fallthrough,
-                    )?;
-                    dynasm!(ops ; .arch aarch64 ; =>taken_edge);
-
-                    emit_cfg_edge(
-                        &mut ops,
-                        &mut relocations,
-                        allocation,
-                        eligibility,
-                        poll_entry,
-                        poll_counter_slot,
-                        threw,
-                        &block_labels,
-                        block_id,
-                        taken,
-                    )?;
                 }
                 // A plain call: generated code guards one VM-baked target,
                 // enters its stable code generation with a stack-owned rooted
@@ -4724,8 +4963,8 @@ fn emit(
                 &mut relocations,
                 allocation,
                 eligibility,
+                property_cache_base,
                 poll_entry,
-                poll_counter_slot,
                 threw,
                 &block_labels,
                 block_id,
@@ -4860,9 +5099,13 @@ fn emit(
             let receiver_slot = fused_method_receiver_slot.expect("cached guard reserves a slot");
             emit_sp_str_x(&mut ops, 9, receiver_slot);
         }
-        if let Some(poll_counter_slot) = poll_counter_slot {
-            emit_load_u32(&mut ops, 9, OPTIMIZED_POLL_BATCH);
-            emit_sp_str_x(&mut ops, 9, poll_counter_slot);
+        emit_reset_all_property_loop_caches(
+            &mut ops,
+            property_cache_base,
+            &eligibility.property_loop_cache,
+        )?;
+        if !eligibility.back_edges.is_empty() {
+            dynasm!(ops ; .arch aarch64 ; movz w29, OPTIMIZED_POLL_BATCH);
         }
         dynasm!(ops
             ; .arch aarch64
@@ -4907,8 +5150,8 @@ fn emit_cfg_edge(
     relocations: &mut RelocationCapture,
     allocation: &Allocation,
     eligibility: &Eligibility,
+    property_cache_base: u32,
     poll_entry: ResolvedRuntimeEntry,
-    poll_counter_slot: Option<u32>,
     threw: DynamicLabel,
     block_labels: &[DynamicLabel],
     predecessor: BlockId,
@@ -4919,14 +5162,16 @@ fn emit_cfg_edge(
         allocation,
         edge_moves(allocation, predecessor, target)?,
     )?;
-    if eligibility.back_edges.contains_key(&(predecessor, target)) {
-        emit_backedge_poll(
-            ops,
-            relocations,
-            poll_entry,
-            poll_counter_slot.expect("back edge reserves a poll counter"),
-            threw,
-        );
+    let is_back_edge = eligibility.back_edges.contains_key(&(predecessor, target));
+    if let Some(cache) = eligibility.property_loop_cache.loops.get(&target) {
+        if is_back_edge {
+            emit_finish_property_loop_iteration(ops, property_cache_base, cache)?;
+        } else {
+            emit_reset_property_loop_cache(ops, property_cache_base, cache)?;
+        }
+    }
+    if is_back_edge {
+        emit_backedge_poll(ops, relocations, poll_entry, threw);
     }
     let target_label = block_labels[target.0 as usize];
     dynasm!(ops ; .arch aarch64 ; b =>target_label);
@@ -4944,21 +5189,17 @@ fn emit_backedge_poll(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     poll_entry: ResolvedRuntimeEntry,
-    poll_counter_slot: u32,
     threw: DynamicLabel,
 ) {
     let batched = ops.new_dynamic_label();
     let slow = ops.new_dynamic_label();
     let cont = ops.new_dynamic_label();
-    emit_sp_ldr_w(ops, 9, poll_counter_slot);
     dynasm!(ops
         ; .arch aarch64
-        ; subs w9, w9, #1
+        ; subs w29, w29, #1
+        ; b.ne =>batched
+        ; movz w29, OPTIMIZED_POLL_BATCH
     );
-    emit_sp_str_x(ops, 9, poll_counter_slot);
-    dynasm!(ops ; .arch aarch64 ; b.ne =>batched);
-    emit_load_u32(ops, 9, OPTIMIZED_POLL_BATCH);
-    emit_sp_str_x(ops, 9, poll_counter_slot);
     dynasm!(ops
         ; .arch aarch64
         ; ldr x17, [x20, THREAD_OFFSET]
@@ -4983,8 +5224,12 @@ fn emit_backedge_poll(
     );
 }
 
-fn emit_int_comparison(ops: &mut Assembler, op: Op) {
+fn emit_int_compare_flags(ops: &mut Assembler) {
     dynasm!(ops ; .arch aarch64 ; cmp w9, w10);
+}
+
+fn emit_int_comparison(ops: &mut Assembler, op: Op) {
+    emit_int_compare_flags(ops);
     match op {
         Op::LessThan => dynasm!(ops ; .arch aarch64 ; cset w11, lt),
         Op::LessEq => dynasm!(ops ; .arch aarch64 ; cset w11, le),
@@ -5001,12 +5246,39 @@ fn emit_int_comparison(ops: &mut Assembler, op: Op) {
     );
 }
 
+fn emit_int_comparison_branch(
+    ops: &mut Assembler,
+    op: Op,
+    branch_on_true: bool,
+    target: DynamicLabel,
+) {
+    match (op, branch_on_true) {
+        (Op::LessThan, true) => dynasm!(ops ; .arch aarch64 ; b.lt =>target),
+        (Op::LessThan, false) => dynasm!(ops ; .arch aarch64 ; b.ge =>target),
+        (Op::LessEq, true) => dynasm!(ops ; .arch aarch64 ; b.le =>target),
+        (Op::LessEq, false) => dynasm!(ops ; .arch aarch64 ; b.gt =>target),
+        (Op::GreaterThan, true) => dynasm!(ops ; .arch aarch64 ; b.gt =>target),
+        (Op::GreaterThan, false) => dynasm!(ops ; .arch aarch64 ; b.le =>target),
+        (Op::GreaterEq, true) => dynasm!(ops ; .arch aarch64 ; b.ge =>target),
+        (Op::GreaterEq, false) => dynasm!(ops ; .arch aarch64 ; b.lt =>target),
+        (Op::Equal, true) => dynasm!(ops ; .arch aarch64 ; b.eq =>target),
+        (Op::Equal, false) => dynasm!(ops ; .arch aarch64 ; b.ne =>target),
+        (Op::NotEqual, true) => dynasm!(ops ; .arch aarch64 ; b.ne =>target),
+        (Op::NotEqual, false) => dynasm!(ops ; .arch aarch64 ; b.eq =>target),
+        _ => unreachable!("eligibility checked comparison branch"),
+    }
+}
+
 /// Materialize a tagged boolean for an IEEE-754 comparison. AArch64's
 /// unordered `fcmp` flags make `mi`/`ls` the relational conditions that stay
 /// false for NaN; `eq` is likewise false, while `ne` is true as JavaScript
 /// requires for numeric inequality.
-fn emit_float_comparison(ops: &mut Assembler, op: Op) {
+fn emit_float_compare_flags(ops: &mut Assembler) {
     dynasm!(ops ; .arch aarch64 ; fcmp D(FP_SCRATCH), D(FP_SCRATCH_2));
+}
+
+fn emit_float_comparison(ops: &mut Assembler, op: Op) {
+    emit_float_compare_flags(ops);
     match op {
         Op::LessThan => dynasm!(ops ; .arch aarch64 ; cset w11, mi),
         Op::LessEq => dynasm!(ops ; .arch aarch64 ; cset w11, ls),
@@ -5021,6 +5293,42 @@ fn emit_float_comparison(ops: &mut Assembler, op: Op) {
         ; movz w12, VALUE_FALSE_LOW
         ; add w11, w11, w12
     );
+}
+
+fn emit_float_comparison_branch(
+    ops: &mut Assembler,
+    op: Op,
+    branch_on_true: bool,
+    target: DynamicLabel,
+) {
+    match (op, branch_on_true) {
+        (Op::LessThan, true) => dynasm!(ops ; .arch aarch64 ; b.mi =>target),
+        (Op::LessThan, false) => dynasm!(ops ; .arch aarch64 ; b.pl =>target),
+        (Op::LessEq, true) => dynasm!(ops ; .arch aarch64 ; b.ls =>target),
+        (Op::LessEq, false) => dynasm!(ops ; .arch aarch64 ; b.hi =>target),
+        (Op::GreaterThan, true) => dynasm!(ops ; .arch aarch64 ; b.gt =>target),
+        (Op::GreaterThan, false) => dynasm!(ops ; .arch aarch64 ; b.le =>target),
+        (Op::GreaterEq, true) => dynasm!(ops ; .arch aarch64 ; b.ge =>target),
+        (Op::GreaterEq, false) => dynasm!(ops ; .arch aarch64 ; b.lt =>target),
+        (Op::Equal, true) => dynasm!(ops ; .arch aarch64 ; b.eq =>target),
+        (Op::Equal, false) => dynasm!(ops ; .arch aarch64 ; b.ne =>target),
+        (Op::NotEqual, true) => dynasm!(ops ; .arch aarch64 ; b.ne =>target),
+        (Op::NotEqual, false) => dynasm!(ops ; .arch aarch64 ; b.eq =>target),
+        _ => unreachable!("eligibility checked comparison branch"),
+    }
+}
+
+fn emit_store_boolean_constant(
+    ops: &mut Assembler,
+    location: Location,
+    truthy: bool,
+) -> Result<(), Unsupported> {
+    if truthy {
+        dynasm!(ops ; .arch aarch64 ; movz w11, VALUE_TRUE as u32);
+    } else {
+        dynasm!(ops ; .arch aarch64 ; movz w11, VALUE_FALSE as u32);
+    }
+    emit_store_tagged_location(ops, location, 11)
 }
 
 fn edge_moves(
@@ -5082,6 +5390,9 @@ fn emit_raw_move(
     src: Location,
     dst: Location,
 ) -> Result<(), Unsupported> {
+    if src == dst {
+        return Ok(());
+    }
     match (src, dst) {
         (Location::Register(RegClass::Gpr, src), Location::Register(RegClass::Gpr, dst)) => {
             let src = gpr_move_register(src)?;
@@ -5220,39 +5531,6 @@ fn emit_store_move_fp(
     Ok(())
 }
 
-/// Give pruned, structurally dead phis representation-valid homes. They emit
-/// no predecessor copies, but exact deopt writeback may still name their
-/// compiler-scratch register slots before later bytecode overwrites them.
-fn emit_initialize_dead_phis(
-    ops: &mut Assembler,
-    ssa: &SsaFunction,
-    reprs: &ReprMap,
-    allocation: &Allocation,
-    phis: &[ValueId],
-) -> Result<(), Unsupported> {
-    for &phi in phis {
-        if !is_dead_phi(ssa, phi) {
-            continue;
-        }
-        match reprs.representation(phi) {
-            Representation::Tagged => {
-                emit_load_u32(ops, 9, otter_vm::Value::undefined().to_bits() as u32);
-                emit_store_tagged_location(ops, allocation.location(phi), 9)?;
-            }
-            Representation::Int32 => {
-                emit_load_u32(ops, 9, 0);
-                emit_store_location(ops, allocation.location(phi), 9)?;
-            }
-            Representation::Float64 => {
-                emit_load_u64(ops, 9, 0.0_f64.to_bits());
-                dynasm!(ops ; .arch aarch64 ; fmov D(FP_SCRATCH), x9);
-                emit_store_fp_location(ops, allocation, allocation.location(phi), FP_SCRATCH)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 fn gpr_move_register(register: u8) -> Result<u8, Unsupported> {
     if register == ALLOCATABLE_REGISTER_COUNT {
         Ok(12)
@@ -5377,13 +5655,11 @@ fn emit_deopt_writeback(
                     }
                 }
             }
-            DeoptLocation::Constant(_) if slot.repr == DeoptRepr::Float64 => {
-                return Err(Unsupported::OperandShape(
-                    "optimizing float64 deopt constant",
-                ));
-            }
-            DeoptLocation::Constant(_) => {
-                emit_load_u32(ops, 9, otter_vm::Value::undefined().to_bits() as u32);
+            DeoptLocation::Literal(raw) => {
+                emit_load_u64(ops, 9, raw);
+                if slot.repr == DeoptRepr::Float64 {
+                    dynasm!(ops ; .arch aarch64 ; fmov D(FP_SCRATCH), x9);
+                }
             }
         }
         match slot.repr {

@@ -287,10 +287,20 @@ impl CodeBlock {
                     // Resolved by `ExecutionContext::jit_compile_snapshot`, which
                     // can read the number-constant pool for a `LoadNumber`.
                     load_number: None,
-                    arith_feedback: crate::feedback::ArithFeedback::from_bits(
-                        self.feedback_at(index)
-                            .map_or(0, crate::feedback::InstructionFeedback::arith_bits),
-                    ),
+                    // A site that has never executed falls back to the
+                    // compiler's TypeScript annotation, which is enough for the
+                    // optimizing tier to pick a guarded numeric lowering
+                    // instead of treating the site as unreachable. Any
+                    // recorded observation supersedes the annotation.
+                    arith_feedback: match self
+                        .feedback_at(index)
+                        .map_or(0, crate::feedback::InstructionFeedback::arith_bits)
+                    {
+                        0 if self.has_number_hint(index) => {
+                            crate::feedback::ArithFeedback::number_annotation_seed()
+                        }
+                        bits => crate::feedback::ArithFeedback::from_bits(bits),
+                    },
                 })
                 .collect(),
             // Baked by `Interpreter::bake_global_lexical_loads`, which owns the
@@ -387,6 +397,7 @@ impl CodeBlock {
             feedback,
             byte_pcs: byte_pcs.into_boxed_slice(),
             byte_spans: Box::new([]),
+            number_hints: Box::new([]),
         })
     }
 
@@ -864,6 +875,14 @@ pub struct CodeBlock {
     /// Source-map entries with `pc` expressed as a byte offset into the
     /// encoded stream. Empty when the underlying [`Function::spans`] is empty.
     pub(crate) byte_spans: Box<[SpanEntry]>,
+    /// One bit per instruction index: the compiler saw TypeScript `number` on
+    /// both operands of this site. Empty when the body carries no annotations.
+    ///
+    /// Read only when the site's feedback cell is still empty, so a recorded
+    /// profile always wins. Seeding an unwarmed site lets the optimizing tier
+    /// lower it under its ordinary numeric guard instead of refusing it for
+    /// lack of a profile; a wrong annotation trips that guard once.
+    pub(crate) number_hints: Box<[u64]>,
 }
 
 impl Clone for CodeBlock {
@@ -897,6 +916,7 @@ impl Clone for CodeBlock {
             feedback: self.feedback.clone(),
             byte_pcs: self.byte_pcs.clone(),
             byte_spans: self.byte_spans.clone(),
+            number_hints: self.number_hints.clone(),
         }
     }
 }
@@ -957,6 +977,18 @@ impl CodeBlock {
         let feedback = crate::feedback::FeedbackVector::for_instruction_ops(
             function.code.iter().map(|instruction| instruction.op),
         );
+        let number_hints = if function.number_hint_sites.is_empty() {
+            Box::new([]) as Box<[u64]>
+        } else {
+            let mut bits = vec![0u64; code.len().div_ceil(64)];
+            for &site in &function.number_hint_sites {
+                let index = site as usize;
+                if index < code.len() {
+                    bits[index / 64] |= 1 << (index % 64);
+                }
+            }
+            bits.into_boxed_slice()
+        };
         let mapped_argument_bindings = function
             .mapped_argument_bindings
             .iter()
@@ -1023,7 +1055,17 @@ impl CodeBlock {
             feedback,
             byte_pcs: instr_to_byte_pc,
             byte_spans,
+            number_hints,
         }
+    }
+
+    /// `true` when the compiler marked this instruction's operands as
+    /// statically `number`. Advisory — see [`Self::number_hints`].
+    fn has_number_hint(&self, instruction_index: usize) -> bool {
+        let word = instruction_index / 64;
+        self.number_hints
+            .get(word)
+            .is_some_and(|bits| bits & (1 << (instruction_index % 64)) != 0)
     }
 }
 
@@ -1200,6 +1242,7 @@ const fn operand_payload(operand: Operand) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Value;
     use otter_bytecode::{BytecodeModule, Instruction, SourceKind};
 
     fn function(code: Vec<Instruction>) -> Function {
@@ -1221,6 +1264,50 @@ mod tests {
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
         }
+    }
+
+    #[test]
+    fn number_annotation_seeds_only_unrecorded_arithmetic() {
+        let mut hinted = function(vec![
+            Instruction {
+                pc: 0,
+                op: Op::Add,
+                operands: vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ],
+            },
+            Instruction {
+                pc: 1,
+                op: Op::Mul,
+                operands: vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ],
+            },
+        ]);
+        hinted.number_hint_sites = vec![0];
+        let executable = ExecutableModule::from_bytecode(&module(hinted));
+        let code_block = executable.function_arc(0).expect("function");
+
+        // The unrecorded hinted site reads as numeric, so the optimizing tier
+        // lowers it under a guard instead of treating it as unreachable.
+        let snapshot = code_block.jit_compile_snapshot();
+        assert!(snapshot.feedback_at(0).is_numeric_only());
+        assert!(!snapshot.feedback_at(0).is_int32_only());
+        // An unhinted site keeps reporting that it never executed.
+        assert!(snapshot.feedback_at(1).is_unseen());
+
+        // A real observation supersedes the annotation, including the
+        // narrower `int32` case the annotation cannot express.
+        code_block
+            .feedback_at(0)
+            .expect("arith cell")
+            .record_arith(Value::number_i32(1), Value::number_i32(2));
+        let snapshot = code_block.jit_compile_snapshot();
+        assert!(snapshot.feedback_at(0).is_int32_only());
     }
 
     #[test]

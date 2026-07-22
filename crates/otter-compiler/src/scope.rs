@@ -42,6 +42,10 @@ pub(crate) struct BindingInfo {
     /// strict mode (sloppy writes are silently dropped after the RHS
     /// evaluates).
     pub(crate) fn_self_name: bool,
+    /// Static type read off the binding's TypeScript annotation.
+    /// Advisory: nothing checks it at runtime, so it may only seed
+    /// speculation that a guard can undo.
+    pub(crate) type_hint: TypeHint,
 }
 
 /// Where a binding lives in the running frame.

@@ -546,6 +546,19 @@ impl ArithFeedback {
         self.0
     }
 
+    /// Cell a never-executed site inherits from a TypeScript `number`
+    /// annotation on both its operands.
+    ///
+    /// Both numeric bits are set, so the site reads as numeric but not as
+    /// `int32`-only: an annotation cannot distinguish the two, and the wider
+    /// `Float64` lowering covers every Number. The seed is used only where a
+    /// real observation is absent, so a warmed-up site can still narrow to
+    /// `int32`.
+    #[must_use]
+    pub const fn number_annotation_seed() -> Self {
+        Self(ARITH_INT32 | ARITH_FLOAT64)
+    }
+
     /// `true` when no operand representation has ever been recorded.
     #[must_use]
     pub const fn is_empty(self) -> bool {

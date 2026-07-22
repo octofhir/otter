@@ -93,6 +93,33 @@ fn expr_is_numeric(expr: &Expression<'_>) -> bool {
     }
 }
 
+/// `true` for opcodes whose optimizing-tier lowering is selected from the
+/// arithmetic feedback cell, and which therefore already emit a
+/// representation guard with a deoptimization exit. Only these may consume an
+/// annotation-derived seed.
+const fn op_takes_number_hint(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Rem
+            | Op::Pow
+            | Op::BitwiseAnd
+            | Op::BitwiseOr
+            | Op::BitwiseXor
+            | Op::Shl
+            | Op::Shr
+            | Op::LessThan
+            | Op::LessEq
+            | Op::GreaterThan
+            | Op::GreaterEq
+            | Op::Equal
+            | Op::NotEqual
+    )
+}
+
 pub(crate) fn compile_logical(
     cx: &mut Compiler,
     l: &LogicalExpression<'_>,
@@ -209,6 +236,9 @@ fn compile_binary_to(
     let rhs_prim = expr_is_primitive(&b.right);
     let lhs_num = expr_is_numeric(&b.left);
     let rhs_num = expr_is_numeric(&b.right);
+    // Read the annotation-derived hint before lowering the operands: the
+    // bindings it consults are the ones in scope at the source position.
+    let number_typed_operands = expr_number_typed(cx, &b.left) && expr_number_typed(cx, &b.right);
     // Operand temps (and their coercion temps) are dead once the
     // result opcode below has read them, so recycle the whole range
     // into the destination register. See `FunctionContext::reset_scratch`.
@@ -358,6 +388,12 @@ fn compile_binary_to(
     };
     cx.reset_scratch(mark);
     let dst = destination.unwrap_or_else(|| cx.alloc_scratch());
+    // Seeds the optimizing tier's representation choice for a site that has
+    // not warmed up yet. Restricted to opcodes that carry a numeric guard and
+    // a deopt exit, so a wrong annotation costs one deoptimization.
+    if number_typed_operands && op_takes_number_hint(op) {
+        cx.mark_number_hint_site();
+    }
     cx.emit(
         op,
         vec![

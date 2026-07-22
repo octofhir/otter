@@ -371,6 +371,7 @@ mod tests {
                 contains_direct_eval: false,
                 code: Vec::<Instruction>::new().into(),
                 spans: Vec::<SpanEntry>::new(),
+                number_hint_sites: Vec::new(),
             }],
             constants: Vec::new(),
             module_resolutions: Vec::new(),

@@ -209,6 +209,7 @@ pub(crate) fn compile_function_full(
         compile_rest_parameter(parent, &rest.rest.argument, span)?;
     }
     parent.in_param_init = false;
+    crate::type_hints::annotate_formal_parameters(parent, params);
     let mapped_argument_bindings = if uses_mapped_arguments {
         mapped_formal_parameter_bindings(parent, params)
     } else {
@@ -324,6 +325,7 @@ pub(crate) fn compile_function_full(
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.direct_eval_bindings = direct_eval_meta;
     slot.contains_direct_eval = contains_direct_eval;
+    slot.number_hint_sites = child.number_hint_sites;
     slot.code = child.code.finish();
     slot.spans = child.spans;
     Ok((function_id, captures))
@@ -508,6 +510,7 @@ pub(crate) fn compile_arrow_function(
         compile_rest_parameter(parent, &rest.rest.argument, span)?;
     }
     parent.in_param_init = false;
+    crate::type_hints::annotate_formal_parameters(parent, &arrow.params);
 
     let mut direct_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = Vec::new();
     if arrow.expression {
@@ -602,6 +605,7 @@ pub(crate) fn compile_arrow_function(
     slot.is_arrow = true;
     slot.direct_eval_bindings = direct_eval_meta;
     slot.contains_direct_eval = contains_direct_eval;
+    slot.number_hint_sites = child.number_hint_sites;
     slot.code = child.code.finish();
     slot.spans = child.spans;
     Ok((function_id, captures))

@@ -111,6 +111,14 @@ pub(crate) struct Compiler {
     /// inherited so a nested direct eval keeps the signal
     /// (§19.2.1.1 step 5).
     pub(crate) eval_new_target_allowed: bool,
+    /// Memoized `expr_number_typed` results, keyed by AST-node address.
+    ///
+    /// Type hints are read top-down at every binary operator, so a chained
+    /// arithmetic expression would re-walk each subtree once per enclosing
+    /// operator. Nodes live in the parse arena for the whole compile, so their
+    /// addresses are stable keys. Purely a compile-time cache; dropping an
+    /// entry would only cost time.
+    pub(crate) number_typed_cache: RefCell<HashMap<usize, bool>>,
 }
 
 impl Compiler {
@@ -132,6 +140,7 @@ impl Compiler {
             script_global_lexicals: std::collections::HashSet::new(),
             in_field_initializer: false,
             eval_new_target_allowed: false,
+            number_typed_cache: RefCell::new(HashMap::new()),
         }
     }
 

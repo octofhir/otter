@@ -527,6 +527,7 @@ fn try_emit_inline_numeric_method(
     call_byte_pc: u32,
     mut code_map: Option<&mut CodeMapCapture>,
     done: DynamicLabel,
+    guard_miss: DynamicLabel,
     bail: DynamicLabel,
 ) -> Result<bool, Unsupported> {
     let template_plan = inline_method_template_plan(view, method)?;
@@ -583,7 +584,7 @@ fn try_emit_inline_numeric_method(
         },
         17,
         plan.has_receiver_property().then_some(16),
-        bail,
+        guard_miss,
     )?;
     if plan.has_receiver_property() {
         // Receiver-property offsets were baked from `recv_shape`, whose guard
@@ -593,7 +594,7 @@ fn try_emit_inline_numeric_method(
         emit_slab_base(ops, view, 13, 14);
         dynasm!(ops
             ; .arch aarch64
-            ; cbz x13, =>bail
+            ; cbz x13, =>guard_miss
             ; mov x17, x13
         );
     }
@@ -1135,6 +1136,7 @@ pub(super) fn emit_method_call(
             code_map.as_deref_mut(),
             done,
             bail,
+            bail,
         )?
     {
         if let (Some(events), Some(target)) = (
@@ -1156,6 +1158,33 @@ pub(super) fn emit_method_call(
         }
         dynasm!(ops ; .arch aarch64 ; =>done);
         return Ok(());
+    }
+    // A site that observed several inlinable shapes emits one guarded body per
+    // shape. Each guard miss falls through to the next candidate rather than
+    // deoptimizing, so an unobserved shape reaches the ordinary dispatch below
+    // instead of pinning the whole site back to the interpreter. Only a bail
+    // raised inside an accepted body is a real deopt.
+    for method in view.inline_poly_methods.get(&byte_pc).into_iter().flatten() {
+        let next_candidate = ops.new_dynamic_label();
+        if try_emit_inline_numeric_method(
+            ops,
+            relocations,
+            view,
+            method,
+            dst,
+            receiver,
+            argc,
+            arg0,
+            arg1,
+            logical_pc,
+            byte_pc,
+            code_map.as_deref_mut(),
+            done,
+            next_candidate,
+            bail,
+        )? {
+            dynasm!(ops ; .arch aarch64 ; =>next_candidate);
+        }
     }
     // Guarded monomorphic collection fast paths precede existing dispatch;
     // every guard miss lands on the next layer.

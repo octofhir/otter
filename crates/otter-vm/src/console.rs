@@ -172,6 +172,12 @@ fn format_args(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Vec<String> {
     let heap = ctx.heap();
     args.iter()
         .map(|value| {
+            // A console argument is inspected, not coerced with `ToString`:
+            // a BigInt keeps the `n` suffix that distinguishes it from the
+            // Number with the same digits.
+            if let Some(big_int) = value.as_big_int() {
+                return format!("{}n", big_int.to_decimal_string(heap));
+            }
             if let Some(obj) = value.as_object()
                 && (object::get(obj, heap, "name").is_some()
                     || object::get(obj, heap, "message").is_some())

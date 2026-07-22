@@ -231,7 +231,6 @@ impl Interpreter {
                     continue;
                 }
                 Op::Call => {
-                    let operands = function.operand_view(instr);
                     let depth_before = stack.len();
                     let static_native_target = if jit_installed {
                         register_operand(function.operand(instr, 1))
@@ -249,7 +248,7 @@ impl Interpreter {
                     } else {
                         None
                     };
-                    self.do_call(stack, context, operands)?;
+                    self.do_call_exec(stack, context, function, instr)?;
                     // Record the resolved typed target before a tier-up hook
                     // consumes a newly pushed bytecode frame. Static natives
                     // complete synchronously and therefore leave stack depth
@@ -285,13 +284,11 @@ impl Interpreter {
                     continue;
                 }
                 Op::TailCall => {
-                    let operands = function.operand_view(instr);
-                    self.do_tail_call(stack, context, operands)?;
+                    self.do_tail_call_exec(stack, context, function, instr)?;
                     continue;
                 }
                 Op::CallWithThis => {
-                    let operands = function.operand_view(instr);
-                    self.do_call_with_this(stack, context, operands)?;
+                    self.do_call_with_this_exec(stack, context, function, instr)?;
                     continue;
                 }
                 Op::CallMethodValue => {
@@ -349,9 +346,8 @@ impl Interpreter {
                     continue;
                 }
                 Op::New => {
-                    let operands = function.operand_view(instr);
                     let depth_before = stack.len();
-                    self.do_construct(stack, context, operands)?;
+                    self.do_construct_exec(stack, context, function, instr)?;
                     // Tier-up hook, mirroring `Op::Call`: a bytecode
                     // constructor frame pushed by `new` can enter JIT at pc=0.
                     if jit_installed

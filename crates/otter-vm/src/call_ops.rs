@@ -39,16 +39,20 @@
 use std::cell::UnsafeCell;
 
 use crate::activation_stack::ActivationStack;
-use otter_bytecode::Operand;
 use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
 
 use crate::{
     AsyncFrameState, CodeBlock, ExecutionContext, Frame, Interpreter, JsObject, NativeCallInfo,
     NativeCtx, NativeFunction, Value, VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
-    argument_window::BytecodeArgumentWindow, executable::OperandView, frame_state::UpvalueSpine,
-    is_constructor_runtime, native_to_vm_error_with_stack, operand_decode::register_operand,
-    promise_dispatch, read_register, runtime_cx::NativeCallRoots, write_register,
+    argument_window::{ArgumentOperands, BytecodeArgumentWindow},
+    executable::OperandView,
+    frame_state::UpvalueSpine,
+    is_constructor_runtime, native_to_vm_error_with_stack,
+    operand_decode::register_operand,
+    promise_dispatch, read_register,
+    runtime_cx::NativeCallRoots,
+    write_register,
 };
 
 /// Mutable root state for synchronous JS re-entry before a callee frame owns
@@ -1133,7 +1137,7 @@ impl Interpreter {
         context: &ExecutionContext,
         callee: &Value,
         this_value: Value,
-        operands: OperandView<'_>,
+        operands: ArgumentOperands<'_>,
         first_arg_operand: usize,
         argc: usize,
         dst: u16,
@@ -1182,7 +1186,8 @@ impl Interpreter {
         };
         let mut prepared = {
             let caller = &stack[top_idx];
-            let args = BytecodeArgumentWindow::new(caller, operands, first_arg_operand, argc);
+            let args =
+                BytecodeArgumentWindow::from_operands(caller, operands, first_arg_operand, argc);
             self.prepare_bytecode_call_frame_from_window(
                 context,
                 stack,
@@ -1212,7 +1217,7 @@ impl Interpreter {
         context: &ExecutionContext,
         callee: &Value,
         this_value: Value,
-        operands: OperandView<'_>,
+        operands: ArgumentOperands<'_>,
         first_arg_operand: usize,
         argc: usize,
         dst: u16,
@@ -1220,7 +1225,8 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let args = {
             let caller = &stack[top_idx];
-            let window = BytecodeArgumentWindow::new(caller, operands, first_arg_operand, argc);
+            let window =
+                BytecodeArgumentWindow::from_operands(caller, operands, first_arg_operand, argc);
             window.to_smallvec8()?
         };
 
@@ -1275,19 +1281,39 @@ impl Interpreter {
     /// Handle `Op::Call`: push a new frame for the callee with
     /// arguments copied into the parameter slots and `this` bound
     /// to `Value::undefined()` (foundation strict default).
+    #[cfg(test)]
     pub(crate) fn do_call<'a>(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl Into<OperandView<'a>>,
     ) -> Result<(), VmError> {
-        let operands = operands.into();
-        let dst = register_operand(operands.first())?;
-        let callee_reg = register_operand(operands.get(1))?;
-        let argc = match operands.get(2) {
-            Some(Operand::ConstIndex(n)) => n,
-            _ => return Err(VmError::InvalidOperand),
-        };
+        self.do_call_inner(stack, context, ArgumentOperands::decoded(operands.into()))
+    }
+
+    pub(crate) fn do_call_exec(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        function: &CodeBlock,
+        instruction: &crate::CodeBlockInstruction,
+    ) -> Result<(), VmError> {
+        self.do_call_inner(
+            stack,
+            context,
+            ArgumentOperands::execution(function, instruction),
+        )
+    }
+
+    fn do_call_inner(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        operands: ArgumentOperands<'_>,
+    ) -> Result<(), VmError> {
+        let dst = operands.register(0)?;
+        let callee_reg = operands.register(1)?;
+        let argc = operands.const_index(2)?;
 
         let top_idx = stack.len() - 1;
         let callee = *read_register(&stack[top_idx], callee_reg)?;
@@ -1316,8 +1342,9 @@ impl Interpreter {
         )? {
             return Ok(());
         }
-        let args = BytecodeArgumentWindow::new(&stack[top_idx], operands, 3, argc as usize)
-            .to_smallvec8()?;
+        let args =
+            BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 3, argc as usize)
+                .to_smallvec8()?;
         self.invoke(stack, context, &callee, Value::undefined(), args, dst)
     }
 
@@ -1332,18 +1359,29 @@ impl Interpreter {
     /// handlers. Frames whose completion needs post-processing
     /// (constructors, async result frames, or any frame that still
     /// owns a handler/cold record) fall back to ordinary
-    /// [`Self::do_call`], preserving behaviour at a small depth cost.
-    pub(crate) fn do_tail_call(
+    /// [`Self::do_call_inner`], preserving behaviour at a small depth cost.
+    pub(crate) fn do_tail_call_exec(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
-        operands: OperandView<'_>,
+        function: &CodeBlock,
+        instruction: &crate::CodeBlockInstruction,
     ) -> Result<(), VmError> {
-        let callee_reg = register_operand(operands.get(1))?;
-        let argc = match operands.get(2) {
-            Some(Operand::ConstIndex(n)) => n as usize,
-            _ => return Err(VmError::InvalidOperand),
-        };
+        self.do_tail_call_inner(
+            stack,
+            context,
+            ArgumentOperands::execution(function, instruction),
+        )
+    }
+
+    fn do_tail_call_inner(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        operands: ArgumentOperands<'_>,
+    ) -> Result<(), VmError> {
+        let callee_reg = operands.register(1)?;
+        let argc = operands.const_index(2)? as usize;
         let top_idx = stack.len() - 1;
 
         // Snapshot everything that lives in the doomed frame, and decide
@@ -1363,14 +1401,11 @@ impl Interpreter {
             if !tco_safe {
                 // Restore ordinary call semantics: `do_call` advances the
                 // caller pc and pushes a fresh callee frame above this one.
-                return self.do_call(stack, context, operands);
+                return self.do_call_inner(stack, context, operands);
             }
             let callee = *read_register(frame, callee_reg)?;
-            let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc);
-            for i in 0..argc {
-                let r = register_operand(operands.get(3 + i))?;
-                args.push(*read_register(frame, r)?);
-            }
+            let args =
+                BytecodeArgumentWindow::from_operands(frame, operands, 3, argc).to_smallvec8()?;
             // `return_register` indexes the caller frame (one below this
             // one); after the pop it becomes the new top frame, so the
             // callee writes its result exactly where this frame would have.
@@ -1572,19 +1607,39 @@ impl Interpreter {
     /// register receives either the constructor's returned object
     /// or the freshly allocated receiver — `pop_frame` performs
     /// that swap so the unwind path is uniform across call shapes.
+    #[cfg(test)]
     pub(crate) fn do_construct<'a>(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl Into<OperandView<'a>>,
     ) -> Result<(), VmError> {
-        let operands = operands.into();
-        let dst = register_operand(operands.first())?;
-        let callee_reg = register_operand(operands.get(1))?;
-        let argc = match operands.get(2) {
-            Some(Operand::ConstIndex(n)) => n,
-            _ => return Err(VmError::InvalidOperand),
-        };
+        self.do_construct_inner(stack, context, ArgumentOperands::decoded(operands.into()))
+    }
+
+    pub(crate) fn do_construct_exec(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        function: &CodeBlock,
+        instruction: &crate::CodeBlockInstruction,
+    ) -> Result<(), VmError> {
+        self.do_construct_inner(
+            stack,
+            context,
+            ArgumentOperands::execution(function, instruction),
+        )
+    }
+
+    fn do_construct_inner(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        operands: ArgumentOperands<'_>,
+    ) -> Result<(), VmError> {
+        let dst = operands.register(0)?;
+        let callee_reg = operands.register(1)?;
+        let argc = operands.const_index(2)?;
         let top_idx = stack.len() - 1;
         let callee = *read_register(&stack[top_idx], callee_reg)?;
         if !is_constructor_runtime(&callee, context, &self.gc_heap) {
@@ -1603,8 +1658,9 @@ impl Interpreter {
         )? {
             return Ok(());
         }
-        let args = BytecodeArgumentWindow::new(&stack[top_idx], operands, 3, argc as usize)
-            .to_smallvec8()?;
+        let args =
+            BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 3, argc as usize)
+                .to_smallvec8()?;
         self.dispatch_construct(stack, context, callee, args, dst)
     }
 
@@ -1614,7 +1670,7 @@ impl Interpreter {
         context: &ExecutionContext,
         callee: Value,
         callee_reg: u16,
-        operands: OperandView<'_>,
+        operands: ArgumentOperands<'_>,
         first_arg_operand: usize,
         argc: usize,
         dst: u16,
@@ -1644,7 +1700,12 @@ impl Interpreter {
             let top_idx = stack.len() - 1;
             let frame = {
                 let caller = &stack[top_idx];
-                let args = BytecodeArgumentWindow::new(caller, operands, first_arg_operand, argc);
+                let args = BytecodeArgumentWindow::from_operands(
+                    caller,
+                    operands,
+                    first_arg_operand,
+                    argc,
+                );
                 self.build_construct_bytecode_frame_from_window(
                     context,
                     current,
@@ -1707,8 +1768,12 @@ impl Interpreter {
             && let Some(function) = context.exec_function(function_id)
         {
             let top_idx = stack.len() - 1;
-            let args_window =
-                BytecodeArgumentWindow::new(&stack[top_idx], operands, first_arg_operand, argc);
+            let args_window = BytecodeArgumentWindow::from_operands(
+                &stack[top_idx],
+                operands,
+                first_arg_operand,
+                argc,
+            );
             let args = args_window.to_smallvec8()?;
             let init = self.simple_constructor_init(context, function_id, function);
             if self.try_finish_simple_constructor_init(
@@ -1726,7 +1791,8 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let frame = {
             let caller = &stack[top_idx];
-            let args = BytecodeArgumentWindow::new(caller, operands, first_arg_operand, argc);
+            let args =
+                BytecodeArgumentWindow::from_operands(caller, operands, first_arg_operand, argc);
             self.build_construct_bytecode_frame_from_window(
                 context,
                 current,
@@ -2361,19 +2427,30 @@ impl Interpreter {
     /// site supplies an explicit `this` register. Used by
     /// `Function.prototype.call` lowering and the array-literal
     /// path of `Function.prototype.apply`.
-    pub(crate) fn do_call_with_this(
+    pub(crate) fn do_call_with_this_exec(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
-        operands: OperandView<'_>,
+        function: &CodeBlock,
+        instruction: &crate::CodeBlockInstruction,
     ) -> Result<(), VmError> {
-        let dst = register_operand(operands.first())?;
-        let callee_reg = register_operand(operands.get(1))?;
-        let this_reg = register_operand(operands.get(2))?;
-        let argc = match operands.get(3) {
-            Some(Operand::ConstIndex(n)) => n,
-            _ => return Err(VmError::InvalidOperand),
-        };
+        self.do_call_with_this_inner(
+            stack,
+            context,
+            ArgumentOperands::execution(function, instruction),
+        )
+    }
+
+    fn do_call_with_this_inner(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        operands: ArgumentOperands<'_>,
+    ) -> Result<(), VmError> {
+        let dst = operands.register(0)?;
+        let callee_reg = operands.register(1)?;
+        let this_reg = operands.register(2)?;
+        let argc = operands.const_index(3)?;
         let top_idx = stack.len() - 1;
         let callee = *read_register(&stack[top_idx], callee_reg)?;
         let this_value = *read_register(&stack[top_idx], this_reg)?;
@@ -2402,8 +2479,9 @@ impl Interpreter {
         )? {
             return Ok(());
         }
-        let args = BytecodeArgumentWindow::new(&stack[top_idx], operands, 4, argc as usize)
-            .to_smallvec8()?;
+        let args =
+            BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 4, argc as usize)
+                .to_smallvec8()?;
         self.invoke(stack, context, &callee, this_value, args, dst)
     }
     /// Synchronously invoke `callee(args)` with the given `this` and

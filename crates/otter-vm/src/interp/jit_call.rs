@@ -1011,7 +1011,7 @@ impl Interpreter {
         stack[caller_index].pc = call_pc;
         match op {
             otter_bytecode::Op::Call => {
-                self.do_call(stack, context, code_block.operand_view(instruction))?
+                self.do_call_exec(stack, context, code_block, instruction)?
             }
             otter_bytecode::Op::CallMethodValue => {
                 self.do_call_method_value_exec(stack, context, code_block, instruction)?;

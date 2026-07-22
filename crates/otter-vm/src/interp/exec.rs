@@ -506,6 +506,7 @@ impl Interpreter {
             _new_target_for_callee,
             _derived_this_cell,
             _callee_env,
+            _callee_closure,
         ) = match Self::bytecode_call_target_parts(*current, *effective_this, &self.gc_heap) {
             Ok(parts) => parts,
             Err(error) => {

@@ -664,7 +664,7 @@ fn render_deopt(table: &DeoptTable) -> String {
     #[serde(rename_all = "camelCase")]
     struct Slot {
         location_kind: &'static str,
-        location_value: i64,
+        location_value: String,
         representation: &'static str,
     }
 
@@ -707,12 +707,12 @@ fn render_deopt(table: &DeoptTable) -> String {
                         .map(|slot| {
                             let (location_kind, location_value) = match slot.location {
                                 DeoptLocation::Register(register) => {
-                                    ("register", i64::from(register))
+                                    ("register", register.to_string())
                                 }
                                 DeoptLocation::StackSlot(offset) => {
-                                    ("stackSlot", i64::from(offset))
+                                    ("stackSlot", offset.to_string())
                                 }
-                                DeoptLocation::Constant(index) => ("constant", i64::from(index)),
+                                DeoptLocation::Literal(raw) => ("literal", format!("0x{raw:016x}")),
                             };
                             Slot {
                                 location_kind,

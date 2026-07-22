@@ -12,8 +12,9 @@
 //! - Register allocation locations and selected representations are recomputed per slot.
 //! - GPR deopt register IDs and spill offsets retain their existing numbering;
 //!   FP registers and spills follow their GPR namespace to prevent collisions.
-//! - A missing abstract value maps to a register-specific undefined constant with a
-//!   tagged representation, keeping multiple dead registers location-distinct.
+//! - Missing values, uninitialized seeds, valueless inline returns, and
+//!   structurally dead phis lower to literal reconstruction recipes. They need
+//!   no live machine home and identical recipes may be shared by many slots.
 //! - Inlined frame chains remain outermost-first; caller frames resume after
 //!   their plain or method call while the innermost frame resumes at its exact
 //!   side-exit byte PC.
@@ -36,9 +37,9 @@ use otter_vm::{
 use super::{
     frame_state::{AbstractFrameState, FrameStateTable},
     inline::{InlineFrame, InlineId, InlineTree},
-    regalloc::{Allocation, Location, RegClass},
+    regalloc::{Allocation, Location, RegClass, is_dead_phi},
     repr::{ReprError, ReprMap, Representation},
-    ssa::{SsaFunction, ValueId},
+    ssa::{SsaFunction, ValueDef, ValueId},
 };
 
 const STACK_SLOT_BYTES: u32 = std::mem::size_of::<u64>() as u32;
@@ -548,15 +549,10 @@ fn lower_slot(
     reprs: &ReprMap,
     pc: u32,
 ) -> Result<DeoptSlot, DeoptLoweringError> {
-    let Some(value) = value else {
-        // Unreachable/dead abstract registers cannot be read before a definition
-        // on a bytecode-valid path. Each register reserves its own constant-pool
-        // entry containing `undefined`, preserving concrete-location uniqueness.
-        return Ok(DeoptSlot {
-            location: DeoptLocation::Constant(u32::from(register)),
-            repr: DeoptRepr::Tagged,
-        });
-    };
+    if let Some(slot) = rematerialized_deopt_slot(ssa, reprs, value) {
+        return Ok(slot);
+    }
+    let value = value.expect("non-rematerialized deopt slot owns an SSA value");
     if value.0 as usize >= ssa.values.len() {
         return Err(DeoptLoweringError::ValueOutOfRange {
             pc,
@@ -627,6 +623,42 @@ fn lower_slot(
     Ok(DeoptSlot { location, repr })
 }
 
+/// Return a deopt-only literal recipe for a value that needs no preserved home.
+///
+/// Dead phis are compiler scratch state: by definition no emitted instruction
+/// or successor phi consumes them. The old backend eagerly filled their homes
+/// with the same representation-valid zero/undefined values at every block
+/// entry. Recording those bits in the exit table preserves reconstruction while
+/// deleting that work from normal execution.
+pub(crate) fn rematerialized_deopt_slot(
+    ssa: &SsaFunction,
+    reprs: &ReprMap,
+    value: Option<ValueId>,
+) -> Option<DeoptSlot> {
+    let representation = match value {
+        None => Representation::Tagged,
+        Some(value)
+            if matches!(
+                ssa.values.get(value.0 as usize)?.def,
+                ValueDef::Uninitialized { .. } | ValueDef::InlineUndefinedReturn { .. }
+            ) =>
+        {
+            Representation::Tagged
+        }
+        Some(value) if is_dead_phi(ssa, value) => reprs.representation(value),
+        Some(_) => return None,
+    };
+    let (raw, repr) = match representation {
+        Representation::Tagged => (otter_vm::Value::undefined().to_bits(), DeoptRepr::Tagged),
+        Representation::Int32 => (0, DeoptRepr::Int32),
+        Representation::Float64 => (0.0_f64.to_bits(), DeoptRepr::Float64),
+    };
+    Some(DeoptSlot {
+        location: DeoptLocation::Literal(raw),
+        repr,
+    })
+}
+
 fn spill_offset(slot: u32) -> Result<i32, DeoptLoweringError> {
     let bytes = slot
         .checked_mul(STACK_SLOT_BYTES)
@@ -689,7 +721,6 @@ fn verify_limits(
             + u16::from(allocation.register_budget.fp),
         min_stack_slot_offset: 0,
         max_stack_slot_offset,
-        constant_count: u32::from(ssa.register_count),
     })
 }
 
@@ -977,7 +1008,7 @@ mod tests {
     }
 
     #[test]
-    fn uninitialized_register_uses_undefined_constant() {
+    fn uninitialized_register_uses_undefined_literal() {
         let pipeline = pipeline(
             0,
             1,
@@ -1000,7 +1031,10 @@ mod tests {
         )
         .expect("a dead register lowers without reading allocation state");
 
-        assert_eq!(slot.location, DeoptLocation::Constant(0));
+        assert_eq!(
+            slot.location,
+            DeoptLocation::Literal(otter_vm::Value::undefined().to_bits())
+        );
         assert_eq!(slot.repr, DeoptRepr::Tagged);
         assert_eq!(
             DeoptRepr::Tagged.reconstitute(otter_vm::Value::undefined().to_bits()),

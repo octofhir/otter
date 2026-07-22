@@ -33,7 +33,7 @@ use crate::{
     Unsupported,
     ir::{
         cfg::{CfgError, ControlFlowGraph},
-        deopt_lower::{DeoptLowering, DeoptLoweringError},
+        deopt_lower::{DeoptLowering, DeoptLoweringError, rematerialized_deopt_slot},
         dom::{DomError, DominatorTree},
         frame_state::{FrameStateError, FrameStateTable},
         inline::{InlineError, InlineTree},
@@ -162,7 +162,7 @@ impl OptimizationPipeline {
             .map_err(OptimizationError::FrameStateVerification)?;
 
         let linear_scan_spill_slot_count = total_spill_slots(&allocation)?;
-        let mut allocation = legalize_deopt_locations(&allocation, &frame_states)?;
+        let mut allocation = legalize_deopt_locations(&allocation, &frame_states, &ssa, &reprs)?;
         allocation
             .rebuild_edge_moves(&ssa, &cfg, &reprs)
             .map_err(OptimizationError::LegalizedPhiMoves)?;
@@ -205,11 +205,16 @@ pub(crate) fn total_spill_slots(allocation: &Allocation) -> Result<u32, Optimiza
 fn legalize_deopt_locations(
     allocation: &Allocation,
     frame_states: &FrameStateTable,
+    ssa: &SsaFunction,
+    reprs: &ReprMap,
 ) -> Result<Allocation, OptimizationError> {
     let mut legalized = allocation.clone();
     for state in frame_states.states() {
         let mut owners = BTreeMap::<Location, ValueId>::new();
         for value in state.registers.iter().flatten().copied() {
+            if rematerialized_deopt_slot(ssa, reprs, Some(value)).is_some() {
+                continue;
+            }
             let location = legalized.location(value);
             if owners.get(&location).is_some_and(|owner| *owner != value) {
                 let class = location.class();

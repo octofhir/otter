@@ -14,8 +14,9 @@
 //! - Parsing and bytecode lowering are outside call and kernel execution samples.
 //! - Kernel fixture setup runs once before warmup; samples run a precompiled call stub.
 //! - One interpreter owns all warmup and measured kernel executions.
-//! - Kernel JIT counter snapshots bracket warmup plus measurement and never
-//!   execute inside a timed sample.
+//! - Kernel VM/JIT counter snapshots bracket warmup plus measurement and never
+//!   execute inside a timed sample; compile/layout diagnostics describe the
+//!   prepared module once.
 //! - Feedback seeding, JIT snapshot construction, and compiler-hook
 //!   construction are outside native-emitter samples.
 //! - Every idle-memory sample owns a fresh release process and runtime.
@@ -44,6 +45,7 @@ use otter_benchmark::{
     MetricUnit, OutcomeStatus, RuntimeReuse as SchemaRuntimeReuse, SamplingPlan, Statistic,
     current_build_profile,
 };
+use otter_bytecode::encoding::measure_wordcode_function;
 use otter_compiler::compile_script_source;
 use otter_jit::OtterJitCompiler;
 use otter_runtime::{JitSelection, Runtime, SourceInput, module_graph::ModulePhaseTimings};
@@ -288,6 +290,7 @@ struct Measurements {
     full_gc_cycles: Vec<u64>,
     release_binary_bytes: Vec<u64>,
     jit_counters: Vec<(&'static str, u64)>,
+    diagnostics: Vec<(&'static str, MetricUnit, u64)>,
 }
 
 #[derive(Debug)]
@@ -632,6 +635,19 @@ fn benchmark_result(record: RunRecord) -> BenchmarkResult {
             .expect("one JIT counter always admits a single-value aggregate"),
         );
     }
+    for &(name, unit, value) in &record.measurements.diagnostics {
+        metrics.push(
+            Metric::from_u64_samples(
+                name,
+                unit,
+                MetricDirection::Informational,
+                MetricRole::Diagnostic,
+                vec![value],
+                Statistic::Single,
+            )
+            .expect("one run diagnostic always admits a single-value aggregate"),
+        );
+    }
 
     let status = if record.failure.is_some() {
         OutcomeStatus::Failed
@@ -886,11 +902,19 @@ fn validate_kernel_checksum(actual: f64, expected: f64) -> Result<(), String> {
 
 const KERNEL_INVOCATION_FUNCTION: &str = "__otter_benchmark_kernel_invocation__";
 
+struct PreparedKernel {
+    context: ExecutionContext,
+    invocation_id: u32,
+    compile_time_ns: u64,
+    bytecode_bytes: u64,
+    opcode_count: u64,
+}
+
 fn compile_kernel_context(
     source: &str,
     source_path: &Path,
     function_name: &str,
-) -> Result<(ExecutionContext, u32), RunFailure> {
+) -> Result<PreparedKernel, RunFailure> {
     if function_name == KERNEL_INVOCATION_FUNCTION {
         return Err(RunFailure {
             kind: RunFailureKind::Input,
@@ -901,6 +925,7 @@ fn compile_kernel_context(
     }
     let source =
         format!("{source}\nfunction {KERNEL_INVOCATION_FUNCTION}(){{return {function_name}();}}\n");
+    let compile_started = Instant::now();
     let module = compile_script_source(
         &source,
         SourceKind::JavaScript,
@@ -910,6 +935,23 @@ fn compile_kernel_context(
         kind: RunFailureKind::Compile,
         message: format!("bytecode compile failed: {error}"),
     })?;
+    let compile_time_ns = elapsed_ns(compile_started);
+    let bytecode_bytes = module
+        .functions
+        .iter()
+        .map(|function| {
+            u64::from(
+                measure_wordcode_function(&function.code)
+                    .expect("compiled kernel wordcode was already verified")
+                    .total_bytes,
+            )
+        })
+        .sum();
+    let opcode_count = module
+        .functions
+        .iter()
+        .map(|function| function.code.len() as u64)
+        .sum();
 
     let matching_functions = module
         .functions
@@ -951,7 +993,13 @@ fn compile_kernel_context(
         .find(|function| function.name == KERNEL_INVOCATION_FUNCTION)
         .expect("exactly one invocation function was counted")
         .id;
-    Ok((ExecutionContext::from_module(module), invocation_id))
+    Ok(PreparedKernel {
+        context: ExecutionContext::from_module(module),
+        invocation_id,
+        compile_time_ns,
+        bytecode_bytes,
+        opcode_count,
+    })
 }
 
 fn run_kernel_invocation(
@@ -1032,11 +1080,17 @@ fn run_kernel(
             );
         }
     };
-    let (context, invocation_id) =
-        match compile_kernel_context(&source, &source_path, &function_name) {
-            Ok(prepared) => prepared,
-            Err(error) => return fail(error.kind, error.message),
-        };
+    let prepared = match compile_kernel_context(&source, &source_path, &function_name) {
+        Ok(prepared) => prepared,
+        Err(error) => return fail(error.kind, error.message),
+    };
+    let PreparedKernel {
+        context,
+        invocation_id,
+        compile_time_ns,
+        bytecode_bytes,
+        opcode_count,
+    } = prepared;
     let mut interpreter = Interpreter::new();
     configure_interpreter(&mut interpreter, jit_tier, jit_osr_threshold);
     if let Err(error) = interpreter.run(&context) {
@@ -1046,6 +1100,8 @@ fn run_kernel(
         );
     }
     let jit_before = interpreter.jit_runtime_stats();
+    let budget_before = interpreter.runtime_budget_stats();
+    let property_before = interpreter.property_ic_stats();
     for index in 0..warmup {
         let value = match run_kernel_invocation(&mut interpreter, &context, invocation_id) {
             Ok(value) => value,
@@ -1106,6 +1162,52 @@ fn run_kernel(
         measurements.execution_time_ns.push(elapsed);
     }
     measurements.jit_counters = jit_counter_deltas(jit_before, interpreter.jit_runtime_stats());
+    let budget_after = interpreter.runtime_budget_stats();
+    let property_after = interpreter.property_ic_stats();
+    measurements.diagnostics = vec![
+        (
+            "bytecode-compile-time",
+            MetricUnit::Nanoseconds,
+            compile_time_ns,
+        ),
+        ("bytecode-size", MetricUnit::Bytes, bytecode_bytes),
+        ("static-opcode-count", MetricUnit::Count, opcode_count),
+        (
+            "vm-reductions",
+            MetricUnit::Count,
+            budget_after
+                .reductions_executed
+                .saturating_sub(budget_before.reductions_executed),
+        ),
+        (
+            "vm-bytecode-calls",
+            MetricUnit::Count,
+            budget_after
+                .bytecode_calls
+                .saturating_sub(budget_before.bytecode_calls),
+        ),
+        (
+            "property-ic-load-hits",
+            MetricUnit::Count,
+            property_after
+                .load_hits
+                .saturating_sub(property_before.load_hits),
+        ),
+        (
+            "property-ic-load-misses",
+            MetricUnit::Count,
+            property_after
+                .load_misses
+                .saturating_sub(property_before.load_misses),
+        ),
+        (
+            "property-ic-load-installs",
+            MetricUnit::Count,
+            property_after
+                .load_installs
+                .saturating_sub(property_before.load_installs),
+        ),
+    ];
 
     RunRecord {
         name,
@@ -2712,9 +2814,12 @@ mod tests {
     #[test]
     fn kernel_invocation_survives_full_gc_after_setup() {
         let source = "function engineKernel(){return 42;}";
-        let (context, invocation_id) =
-            compile_kernel_context(source, Path::new("kernel.js"), "engineKernel")
-                .expect("compile kernel");
+        let PreparedKernel {
+            context,
+            invocation_id,
+            ..
+        } = compile_kernel_context(source, Path::new("kernel.js"), "engineKernel")
+            .expect("compile kernel");
         let mut interpreter = Interpreter::new();
         interpreter.run(&context).expect("evaluate setup");
         interpreter.force_gc().expect("force full GC");

@@ -78,8 +78,10 @@ pub struct RuntimeBudgetStats {
     pub turns_finished: u64,
     /// Total reduction units charged.
     pub reductions_executed: u64,
-    /// Reduction units charged in the currently active root turn.
-    pub current_turn_reductions: u64,
+    /// `reductions_executed` sampled when the active root turn began. The
+    /// turn-local count is the delta against it ([`Self::current_turn_reductions`]),
+    /// so the per-instruction charge updates exactly one counter.
+    pub turn_start_reductions: u64,
     /// Largest completed root-turn reduction count.
     pub max_turn_reductions: u64,
     /// GC-cell allocation bytes observed in the currently active root turn.
@@ -133,9 +135,16 @@ pub struct RuntimeBudgetStats {
 }
 
 impl RuntimeBudgetStats {
+    /// Reduction units charged since the active root turn began.
+    #[must_use]
+    pub const fn current_turn_reductions(&self) -> u64 {
+        self.reductions_executed
+            .saturating_sub(self.turn_start_reductions)
+    }
+
     pub(crate) fn begin_turn(&mut self) {
         self.turns_started = self.turns_started.saturating_add(1);
-        self.current_turn_reductions = 0;
+        self.turn_start_reductions = self.reductions_executed;
         self.current_turn_allocated_bytes = 0;
         self.current_turn_host_ops = 0;
         self.current_external_bytes = 0;
@@ -143,7 +152,8 @@ impl RuntimeBudgetStats {
 
     pub(crate) fn finish_turn(&mut self, elapsed: Duration, budget: RuntimeBudget) {
         self.turns_finished = self.turns_finished.saturating_add(1);
-        self.max_turn_reductions = self.max_turn_reductions.max(self.current_turn_reductions);
+        let turn_reductions = self.current_turn_reductions();
+        self.max_turn_reductions = self.max_turn_reductions.max(turn_reductions);
         self.max_turn_allocated_bytes = self
             .max_turn_allocated_bytes
             .max(self.current_turn_allocated_bytes);
@@ -151,7 +161,7 @@ impl RuntimeBudgetStats {
         let nanos = duration_nanos(elapsed);
         self.max_turn_nanos = self.max_turn_nanos.max(nanos);
         if budget_exceeded(
-            self.current_turn_reductions,
+            turn_reductions,
             self.current_turn_allocated_bytes,
             self.current_turn_host_ops,
             nanos,
@@ -160,7 +170,7 @@ impl RuntimeBudgetStats {
         ) {
             self.budget_limit_observations = self.budget_limit_observations.saturating_add(1);
         }
-        self.current_turn_reductions = 0;
+        self.turn_start_reductions = self.reductions_executed;
         self.current_turn_allocated_bytes = 0;
         self.current_turn_host_ops = 0;
         self.current_external_bytes = 0;
@@ -200,7 +210,6 @@ impl RuntimeBudgetStats {
     #[inline]
     pub(crate) fn record_reductions(&mut self, units: u64) {
         self.reductions_executed = self.reductions_executed.saturating_add(units);
-        self.current_turn_reductions = self.current_turn_reductions.saturating_add(units);
     }
 
     pub(crate) fn record_bytecode_calls(&mut self, calls: u64) {

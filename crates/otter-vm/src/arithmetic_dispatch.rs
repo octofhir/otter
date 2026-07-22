@@ -237,6 +237,12 @@ impl Interpreter {
 
     /// Evaluate `+` without coupling its observable semantics to frame storage.
     pub(crate) fn add_value(&mut self, lhs: Value, rhs: Value) -> Result<Value, VmError> {
+        // Number + Number is the dominant shape and allocates nothing, so it
+        // needs neither the handle scope nor the `ToNumeric` ladder: both
+        // operands are already the `Num`/`Num` case below.
+        if let (Some(a), Some(b)) = (lhs.as_number(), rhs.as_number()) {
+            return Ok(Value::number(number::add(a, b)));
+        }
         self.with_handle_scope(|interp, scope| {
             let lhs = interp.scoped_value(scope, lhs);
             let rhs = interp.scoped_value(scope, rhs);
@@ -642,6 +648,12 @@ fn numeric_binary_value(
     op: fn(NumberValue, NumberValue) -> NumberValue,
     bigint_op: BigIntBinop,
 ) -> Result<Value, VmError> {
+    // Two numbers are already their own `ToNumeric` result; folding them here
+    // skips building and matching two `NumericKind` values that each carry a
+    // BigInt payload.
+    if let (Some(a), Some(b)) = (lhs.as_number(), rhs.as_number()) {
+        return Ok(Value::number(op(a, b)));
+    }
     let lnum =
         abstract_ops::to_numeric_kind(&lhs, interp.gc_heap()).ok_or(VmError::TypeMismatch)?;
     let rnum =

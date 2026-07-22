@@ -557,6 +557,49 @@ impl CodeBlock {
         }
     }
 
+    /// All verified operand words of one instruction, in schema order.
+    ///
+    /// Variadic call sites read their whole argument run through this slice so
+    /// per-argument decoding collapses to one indexed load.
+    #[must_use]
+    pub(crate) fn operand_words<'a>(&'a self, instr: &'a CodeBlockInstruction) -> &'a [u32] {
+        let count = instr.operand_count as usize;
+        if count <= instr.inline_operand_words.len() {
+            &instr.inline_operand_words[..count]
+        } else {
+            let base = instr.inline_operand_words[0] as usize;
+            self.overflow_operand_words
+                .get(base..base + count)
+                .unwrap_or(&[])
+        }
+    }
+
+    /// Verified operand word `index` of one instruction.
+    ///
+    /// Construction verifies operand kinds and count against the opcode schema,
+    /// so dispatch reads a declared operand directly instead of re-deriving its
+    /// kind and re-checking presence on every executed instruction.
+    #[inline]
+    #[must_use]
+    pub(crate) fn word(&self, instr: &CodeBlockInstruction, index: usize) -> u32 {
+        debug_assert!(
+            index < instr.operand_count as usize,
+            "declared operand index in range"
+        );
+        if (instr.operand_count as usize) <= instr.inline_operand_words.len() {
+            instr.inline_operand_words[index]
+        } else {
+            self.overflow_operand_words[instr.inline_operand_words[0] as usize + index]
+        }
+    }
+
+    /// Register operand `index`.
+    #[inline]
+    #[must_use]
+    pub(crate) fn reg(&self, instr: &CodeBlockInstruction, index: usize) -> u16 {
+        self.word(instr, index) as u16
+    }
+
     /// One schema-typed operand.
     #[must_use]
     pub fn operand(&self, instr: &CodeBlockInstruction, index: usize) -> Option<Operand> {
@@ -1093,6 +1136,55 @@ impl CodeBlockInstruction {
     #[must_use]
     pub fn property_ic_site(&self) -> Option<usize> {
         (self.property_ic_site != NO_PROPERTY_IC_SITE).then_some(self.property_ic_site as usize)
+    }
+
+    /// Operand word `index` of an instruction whose schema shape is fixed at no
+    /// more than four operands.
+    ///
+    /// Such an instruction always carries every operand in the record itself, so
+    /// dispatch reads the word with no count test, no overflow-table load, and
+    /// no owning-CodeBlock access. Opcodes with a variadic tail or a wider fixed
+    /// shape must use the CodeBlock accessors, which resolve the overflow table.
+    #[inline]
+    #[must_use]
+    const fn inline_word(&self, index: usize) -> u32 {
+        debug_assert!(
+            index < self.operand_count as usize,
+            "declared operand index in range"
+        );
+        debug_assert!(
+            self.operand_count as usize <= self.inline_operand_words.len(),
+            "narrow fixed-shape operands are inline"
+        );
+        self.inline_operand_words[index]
+    }
+
+    /// Register operand `index` of a narrow fixed-shape instruction.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn reg(&self, index: usize) -> u16 {
+        self.inline_word(index) as u16
+    }
+
+    /// The common `dst, lhs, rhs` register triple.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn reg3(&self) -> (u16, u16, u16) {
+        (self.reg(0), self.reg(1), self.reg(2))
+    }
+
+    /// Constant-pool index operand `index` of a narrow fixed-shape instruction.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn const_word(&self, index: usize) -> u32 {
+        self.inline_word(index)
+    }
+
+    /// Signed immediate operand `index` of a narrow fixed-shape instruction.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn imm(&self, index: usize) -> i32 {
+        self.inline_word(index) as i32
     }
 }
 

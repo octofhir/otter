@@ -29,10 +29,23 @@ Second-order note: the same table shows that after removing type checks, the nex
 biggest single lever was the **number representation** (int-vs-double), not more
 inlining. That matches Otter's repr-selection work being the right next lever.
 
-**Status.** Not started. `crates/otter-compiler` ignores TS type annotations entirely
-(no `type_annotation` reference anywhere), so this is greenfield: carry the annotation
-from the oxc AST through the compiler into `CodeBlock`, then seed `ArithFeedback` /
-method ICs from it at compile-snapshot time.
+**Status.** Landed for the numeric half (`f00c7bdf`). `number` annotations on
+parameters, variable declarators, and `as number` assertions become a per-binding
+static hint; arithmetic and comparison sites with statically-Number operands are
+recorded on `Function::number_hint_sites`, carried into `CodeBlock` as a bitset, and
+read by `jit_compile_snapshot` **only when the feedback cell is still empty**. A real
+observation always supersedes the seed, so a warmed-up site still narrows from
+`Float64` to `Int32`. Confined to opcodes that already emit a representation guard, so
+a wrong annotation costs one deopt.
+
+Measured: a hot function with a cold arithmetic branch takes 998 optimizing-tier bails
+unannotated, 0 annotated. Steady-state wall time is unchanged — the win is warmup, as
+the item predicts.
+
+The method-IC half is **not** done and is not obviously doable the same way: a class
+annotation cannot be resolved to a `ShapeId` at compile-snapshot time, since shapes are
+runtime identities. It would need a compile-time class → shape registry, which is a
+separate design.
 
 ## 2. Self-hosted builtins in a compiled JS/TS subset
 
@@ -90,7 +103,8 @@ into the bench harness as a tracked number.
 
 ## Ranked take-aways for Otter
 
-1. TS annotations as feedback seed for faster tier-up (guarded by existing deopt).
+1. ~~TS annotations as feedback seed for faster tier-up~~ — numeric half landed; the
+   method-IC half needs a compile-time class → shape registry first.
 2. Array `push`/`pop` inlining — blocked on a mutating-leaf ABI or a dense-buffer
    representation change.
 3. Build-time snapshot of builtin shim setup — startup only, small absolute win.

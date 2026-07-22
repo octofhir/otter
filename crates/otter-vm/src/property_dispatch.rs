@@ -3466,7 +3466,7 @@ impl Interpreter {
     /// run (data slot, non-object receiver, or absent property).
     ///
     /// # Algorithm — §10.1.8 OrdinaryGet
-    /// 1. Decode the operands and read the receiver register.
+    /// 1. Read the receiver register from the operands decoded by dispatch.
     /// 2. Probe the receiver's own + prototype chain.
     ///    - Absent / data slot: hand off to the in-frame fast path.
     ///    - Accessor with no getter: write `undefined` to `dst`,
@@ -3483,21 +3483,15 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
-        operands: impl crate::executable::OperandSource,
+        dst: u16,
+        obj_reg: u16,
+        atomized_key: AtomizedPropertyKey<'_>,
+        site: usize,
     ) -> Result<bool, VmError> {
-        let dst = register_operand(operands.first())?;
-        let obj_reg = register_operand(operands.get(1))?;
-        let name_idx = const_operand(operands.get(2))?;
-        let atomized_key = context
-            .property_atom(name_idx)
-            .ok_or(VmError::InvalidOperand)?;
         let name = atomized_key.name();
         let top_idx = stack.len() - 1;
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
         if let Some(obj) = receiver.as_object() {
-            let site = context
-                .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
-                .ok_or(VmError::InvalidOperand)?;
             let mut site_disabled = self
                 .feedback_directory
                 .property_is_megamorphic(site, PropertyIcKind::Load)

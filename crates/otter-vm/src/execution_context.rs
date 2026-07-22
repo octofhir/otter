@@ -34,9 +34,7 @@ use otter_bytecode::{BytecodeModule, Constant, Function, ModuleInit, Operand};
 use std::sync::Arc;
 
 use crate::code_space::{ChunkTables, CodeSpace, ResolvedCtx};
-use crate::executable::{
-    CodeBlock, CodeBlockInstruction, ExecutableModule, code_block_cfg::CodeBlockExceptionRegion,
-};
+use crate::executable::{CodeBlock, CodeBlockInstruction, ExecutableModule};
 use crate::property_atom::{AtomTable, AtomizedPropertyKey};
 
 /// Cloneable dispatch context for VM-owned JS jobs.
@@ -334,16 +332,6 @@ impl ExecutionContext {
         }
     }
 
-    /// Decode the common `dst, lhs, rhs` register triple.
-    #[must_use]
-    pub(crate) fn exec_register3(&self, instr: &CodeBlockInstruction) -> Option<(u16, u16, u16)> {
-        Some((
-            self.exec_register(instr, 0)?,
-            self.exec_register(instr, 1)?,
-            self.exec_register(instr, 2)?,
-        ))
-    }
-
     /// Decode one constant-pool index operand.
     #[must_use]
     pub(crate) fn exec_const_index(
@@ -364,16 +352,6 @@ impl ExecutionContext {
             Some(Operand::Imm32(value)) => Some(value),
             _ => None,
         }
-    }
-
-    /// Pre-resolved static handlers owned by an `EnterTry` instruction.
-    #[must_use]
-    pub(crate) fn exec_exception_region(
-        &self,
-        instr: &CodeBlockInstruction,
-    ) -> Option<CodeBlockExceptionRegion> {
-        self.exec_function(instr.code_block_id())?
-            .exception_region(instr.instruction_pc)
     }
 
     /// One past the highest dense named-property IC site id used by

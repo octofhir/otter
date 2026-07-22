@@ -1,8 +1,9 @@
-//! Authoritative register-wordcode storage and mutable construction.
+//! Authoritative compiler/wire wordcode storage and mutable construction.
 //!
 //! Compiler and linker code build one [`FunctionCode`] through
-//! [`FunctionCodeBuilder`]. The interpreter and JIT consume that same frozen
-//! product; decoded operand DTOs are reserved for cold serialization tooling.
+//! [`FunctionCodeBuilder`]. The VM verifies and translates that frozen product
+//! once into its execution-specific layout; decoded operand DTOs are reserved
+//! for cold serialization tooling.
 //!
 //! # Contents
 //! - [`Instruction`] — compact opcode plus inline words or one overflow range.
@@ -15,7 +16,8 @@
 //! - Up to four words are instruction-local; longer forms use one function-wide
 //!   dense overflow table and never allocate per instruction.
 //! - Instruction position is the only logical PC; records carry no PC field.
-//! - A frozen [`FunctionCode`] is already the execution representation.
+//! - A frozen [`FunctionCode`] is the canonical compiler, wire, and debug
+//!   representation, not a required interpreter memory layout.
 //!
 //! # See also
 //! - [`crate::opcode_schema`]
@@ -29,7 +31,7 @@ use crate::{Op, Operand, opcode_schema};
 pub const INLINE_OPERAND_WORDS: usize = 4;
 const NO_OVERFLOW_OPERANDS: u32 = u32::MAX;
 
-/// One compact logical instruction in authoritative execution wordcode.
+/// One compact logical instruction in authoritative compiler wordcode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Instruction {
     /// Opcode identity; operand formats come from its schema row.
@@ -68,7 +70,7 @@ impl Instruction {
     }
 }
 
-/// Frozen authoritative execution wordcode for one function.
+/// Frozen authoritative compiler/wire wordcode for one function.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionCode {
     instructions: Box<[Instruction]>,

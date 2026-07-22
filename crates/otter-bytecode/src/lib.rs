@@ -7,10 +7,10 @@
 //! # Contents
 //! - [`Op`] — canonical opcode enum (`Nop`, `LoadUndefined`, `Return`
 //!   for the harness slice; extended slice-by-slice).
-//! - [`FunctionCode`] / [`WordInstruction`] — authoritative compact execution
+//! - [`FunctionCode`] / [`WordInstruction`] — authoritative compiler/wire
 //!   wordcode and schema-driven operand access.
 //! - [`Instruction`] — cold decoded wire/debug DTO.
-//! - [`Function`] — one compiled function: registers, authoritative wordcode,
+//! - [`Function`] — one compiled function: registers, compiler wordcode,
 //!   spans, and constants index.
 //! - [`BytecodeModule`] — top-level container the compiler emits and
 //!   the VM consumes.
@@ -24,6 +24,9 @@
 //!   inside [`Function::spans`] are sorted by logical PC.
 //! - Decoded [`Instruction`] values and byte PCs never enter the hot execution
 //!   representation.
+//! - The VM verifies and translates compiler wordcode once into its own
+//!   execution records; this crate does not prescribe the interpreter's hot
+//!   layout.
 //! - Mnemonics are `SCREAMING_SNAKE_CASE` and match the strings the
 //!   disassembler emits.
 //! - Opcode byte assignments have one source in [`opcode_schema`]; encoding

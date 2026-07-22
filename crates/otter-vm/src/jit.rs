@@ -982,6 +982,16 @@ pub enum JitMethodHint {
     None,
     /// `String.prototype.charCodeAt`.
     StringCharCodeAt,
+    /// `String.prototype.codePointAt`.
+    StringCodePointAt,
+    /// `String.prototype.indexOf`.
+    StringIndexOf,
+    /// `String.prototype.includes`.
+    StringIncludes,
+    /// `String.prototype.startsWith`.
+    StringStartsWith,
+    /// `String.prototype.endsWith`.
+    StringEndsWith,
     /// `Number.prototype.toString`.
     NumberToString,
 }

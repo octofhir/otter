@@ -57,17 +57,23 @@ impl Interpreter {
         &self,
         hint: crate::jit::JitMethodHint,
     ) -> Option<crate::jit::JitPrimitiveMethodGuard> {
-        let (proto, name, leaf_stub_id, receiver_type_tag) = match hint {
-            crate::jit::JitMethodHint::StringCharCodeAt => (
-                self.realm_intrinsics.string_prototype?,
-                "charCodeAt",
-                crate::native_abi::STUB_STRING_CHAR_CODE_AT_LEAF.id,
-                crate::string::JS_STRING_BODY_TYPE_TAG,
-            ),
-            crate::jit::JitMethodHint::None | crate::jit::JitMethodHint::NumberToString => {
-                return None;
-            }
+        use crate::jit::JitMethodHint;
+        use crate::native_abi::{
+            STUB_STRING_CHAR_CODE_AT_LEAF, STUB_STRING_CODE_POINT_AT_LEAF,
+            STUB_STRING_ENDS_WITH_LEAF, STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF,
+            STUB_STRING_STARTS_WITH_LEAF,
         };
+        let (name, leaf_stub_id) = match hint {
+            JitMethodHint::StringCharCodeAt => ("charCodeAt", STUB_STRING_CHAR_CODE_AT_LEAF.id),
+            JitMethodHint::StringCodePointAt => ("codePointAt", STUB_STRING_CODE_POINT_AT_LEAF.id),
+            JitMethodHint::StringIndexOf => ("indexOf", STUB_STRING_INDEX_OF_LEAF.id),
+            JitMethodHint::StringIncludes => ("includes", STUB_STRING_INCLUDES_LEAF.id),
+            JitMethodHint::StringStartsWith => ("startsWith", STUB_STRING_STARTS_WITH_LEAF.id),
+            JitMethodHint::StringEndsWith => ("endsWith", STUB_STRING_ENDS_WITH_LEAF.id),
+            JitMethodHint::None | JitMethodHint::NumberToString => return None,
+        };
+        let proto = self.realm_intrinsics.string_prototype?;
+        let receiver_type_tag = crate::string::JS_STRING_BODY_TYPE_TAG;
         let (hit, lookup) = crate::object::lookup_own_slot(proto, &self.gc_heap, name);
         let hit = hit?;
         let method = match lookup {
@@ -75,15 +81,9 @@ impl Interpreter {
             crate::object::PropertyLookup::Accessor { .. }
             | crate::object::PropertyLookup::Absent => return None,
         };
-        match hint {
-            crate::jit::JitMethodHint::StringCharCodeAt => {
-                if !crate::string::prototype::is_char_code_at_builtin(method, &self.gc_heap) {
-                    return None;
-                }
-            }
-            crate::jit::JitMethodHint::None | crate::jit::JitMethodHint::NumberToString => {
-                return None;
-            }
+        let bridge = crate::string::prototype::prototype_bridge(name)?;
+        if !crate::string::prototype::is_prototype_builtin(method, &self.gc_heap, bridge) {
+            return None;
         }
         let builtin_fn_addr = method
             .as_native_function()

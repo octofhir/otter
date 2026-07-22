@@ -468,15 +468,42 @@ fn impl_char_code_at(
     Ok(Value::number(value))
 }
 
-pub(crate) fn is_char_code_at_builtin(value: Value, heap: &otter_gc::GcHeap) -> bool {
+/// `true` when `value` is still the original native trampoline for one
+/// `String.prototype` method, whether held bare or behind a callable object.
+pub(crate) fn is_prototype_builtin(
+    value: Value,
+    heap: &otter_gc::GcHeap,
+    bridge: StringNativeBridge,
+) -> bool {
     value
         .as_native_function()
-        .is_some_and(|native| native.is_static_fn(heap, bridge_char_code_at))
+        .is_some_and(|native| native.is_static_fn(heap, bridge))
         || value
             .as_object()
             .and_then(|obj| crate::object::call_native(obj, heap))
             .and_then(|native| native.as_native_function())
-            .is_some_and(|native| native.is_static_fn(heap, bridge_char_code_at))
+            .is_some_and(|native| native.is_static_fn(heap, bridge))
+}
+
+/// Native trampoline shape every `String.prototype` method is installed under.
+pub(crate) type StringNativeBridge = fn(&mut NativeCtx<'_>, &[Value]) -> Result<Value, NativeError>;
+
+/// The trampoline backing one JIT-recognized `String.prototype` method.
+#[must_use]
+pub(crate) fn prototype_bridge(name: &str) -> Option<StringNativeBridge> {
+    match name {
+        "charCodeAt" => Some(bridge_char_code_at),
+        "codePointAt" => Some(bridge_code_point_at),
+        "indexOf" => Some(bridge_index_of),
+        "includes" => Some(bridge_includes),
+        "startsWith" => Some(bridge_starts_with),
+        "endsWith" => Some(bridge_ends_with),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_char_code_at_builtin(value: Value, heap: &otter_gc::GcHeap) -> bool {
+    is_prototype_builtin(value, heap, bridge_char_code_at)
 }
 
 pub(crate) fn fast_primitive_char_code_at(

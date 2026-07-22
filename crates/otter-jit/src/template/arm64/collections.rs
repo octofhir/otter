@@ -356,7 +356,10 @@ pub(crate) fn emit_primitive_method_guarded_call(
     miss: DynamicLabel,
     done: DynamicLabel,
 ) -> Result<bool, Unsupported> {
-    if view.cage_base == 0 {
+    // Every primitive leaf takes exactly the receiver and one operand. A site
+    // passing a second argument (`indexOf(needle, from)`) means something the
+    // leaf does not model, so it keeps the general path.
+    if view.cage_base == 0 || site.argc > 1 {
         return Ok(false);
     }
     let Some(stub) = leaf_no_alloc_stub2_by_id(guard.leaf_stub_id) else {

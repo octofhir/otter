@@ -33,8 +33,10 @@ use crate::native_abi::{
     STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC,
     STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
     STUB_NUMBER_REM_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF,
-    STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF, SafepointId, SafepointRecord,
-    TaggedLocationKind, validate_stub_descriptor,
+    STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_STRING_ENDS_WITH_LEAF,
+    STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF, STUB_STRING_STARTS_WITH_LEAF,
+    STUB_TO_BOOLEAN_LEAF, SafepointId, SafepointRecord, TaggedLocationKind,
+    validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
@@ -392,6 +394,36 @@ pub const STRING_CHAR_CODE_AT_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     entry: string_char_code_at_leaf,
 };
 
+/// Callable ABI entry for `String.prototype.codePointAt`.
+pub const STRING_CODE_POINT_AT_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_STRING_CODE_POINT_AT_LEAF,
+    entry: string_code_point_at_leaf,
+};
+
+/// Callable ABI entry for `String.prototype.indexOf`.
+pub const STRING_INDEX_OF_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_STRING_INDEX_OF_LEAF,
+    entry: string_index_of_leaf,
+};
+
+/// Callable ABI entry for `String.prototype.includes`.
+pub const STRING_INCLUDES_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_STRING_INCLUDES_LEAF,
+    entry: string_includes_leaf,
+};
+
+/// Callable ABI entry for `String.prototype.startsWith`.
+pub const STRING_STARTS_WITH_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_STRING_STARTS_WITH_LEAF,
+    entry: string_starts_with_leaf,
+};
+
+/// Callable ABI entry for `String.prototype.endsWith`.
+pub const STRING_ENDS_WITH_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_STRING_ENDS_WITH_LEAF,
+    entry: string_ends_with_leaf,
+};
+
 /// Callable ABI entry for the strict-equality probe.
 pub const STRICT_EQ_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: STUB_STRICT_EQ_LEAF,
@@ -481,6 +513,11 @@ pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocS
         id if id == STUB_TO_BOOLEAN_LEAF.id => Some(TO_BOOLEAN_LEAF),
         id if id == STUB_NUMBER_REM_LEAF.id => Some(NUMBER_REM_LEAF),
         id if id == STUB_STRING_CHAR_CODE_AT_LEAF.id => Some(STRING_CHAR_CODE_AT_LEAF),
+        id if id == STUB_STRING_CODE_POINT_AT_LEAF.id => Some(STRING_CODE_POINT_AT_LEAF),
+        id if id == STUB_STRING_INDEX_OF_LEAF.id => Some(STRING_INDEX_OF_LEAF),
+        id if id == STUB_STRING_INCLUDES_LEAF.id => Some(STRING_INCLUDES_LEAF),
+        id if id == STUB_STRING_STARTS_WITH_LEAF.id => Some(STRING_STARTS_WITH_LEAF),
+        id if id == STUB_STRING_ENDS_WITH_LEAF.id => Some(STRING_ENDS_WITH_LEAF),
         _ => None,
     }
 }
@@ -831,6 +868,147 @@ pub extern "C" fn string_char_code_at_leaf(
     };
     RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::number(
         crate::NumberValue::from_i32(i32::from(unit)),
+    )))
+}
+
+/// Resolve two operand words to a string receiver and a string argument, the
+/// shape every two-string leaf probe below shares.
+fn string_pair(
+    heap: &otter_gc::GcHeap,
+    receiver_bits: u64,
+    arg_bits: u64,
+) -> Option<(crate::JsString, crate::JsString)> {
+    let receiver = Value::from_abi_bits(receiver_bits).as_string(heap)?;
+    let argument = Value::from_abi_bits(arg_bits).as_string(heap)?;
+    Some((receiver, argument))
+}
+
+/// `String.prototype.codePointAt` over a string receiver and an integral
+/// index, resolving a surrogate pair to its scalar value. A non-string
+/// receiver, a non-integral index, or an index outside `[0, len)` misses so
+/// the general path owns coercion and the `undefined` result.
+#[must_use]
+pub extern "C" fn string_code_point_at_leaf(
+    heap: *const otter_gc::GcHeap,
+    receiver_bits: u64,
+    index_bits: u64,
+) -> RuntimeStubResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let Some(heap) = heap_ref(heap) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    let (Some(string), Some(index)) = (
+        Value::from_abi_bits(receiver_bits).as_string(heap),
+        Value::from_abi_bits(index_bits).as_i32(),
+    ) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    if index < 0 {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    }
+    let index = index as u32;
+    let Some(first) = string.char_code_at(index, heap) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    // §22.1.3.4 CodePointAt: a leading surrogate followed by a trailing one
+    // yields the combined scalar value; anything else yields the unit itself.
+    let code_point = match string.char_code_at(index + 1, heap) {
+        Some(second) if (0xD800..0xDC00).contains(&first) && (0xDC00..0xE000).contains(&second) => {
+            0x1_0000 + ((u32::from(first) - 0xD800) << 10) + (u32::from(second) - 0xDC00)
+        }
+        _ => u32::from(first),
+    };
+    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::number(
+        crate::NumberValue::from_i32(code_point as i32),
+    )))
+}
+
+/// `String.prototype.indexOf` over two string operands, searching from index
+/// zero. A non-string operand misses so the general path owns coercion.
+#[must_use]
+pub extern "C" fn string_index_of_leaf(
+    heap: *const otter_gc::GcHeap,
+    receiver_bits: u64,
+    needle_bits: u64,
+) -> RuntimeStubResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let Some(heap) = heap_ref(heap) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    let Some((haystack, needle)) = string_pair(heap, receiver_bits, needle_bits) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    let Ok(found) = haystack.index_of(needle, 0, None, heap) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    let position = found.map_or(-1, |index| index as i32);
+    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::number(
+        crate::NumberValue::from_i32(position),
+    )))
+}
+
+/// `String.prototype.includes` over two string operands, searching from index
+/// zero. A non-string operand misses so the general path owns coercion and the
+/// RegExp-argument rejection.
+#[must_use]
+pub extern "C" fn string_includes_leaf(
+    heap: *const otter_gc::GcHeap,
+    receiver_bits: u64,
+    needle_bits: u64,
+) -> RuntimeStubResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let Some(heap) = heap_ref(heap) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    let Some((haystack, needle)) = string_pair(heap, receiver_bits, needle_bits) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    let Ok(found) = haystack.index_of(needle, 0, None, heap) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::boolean(found.is_some())))
+}
+
+/// `String.prototype.startsWith` over two string operands, anchored at index
+/// zero. A non-string operand misses so the general path owns coercion and the
+/// RegExp-argument rejection.
+#[must_use]
+pub extern "C" fn string_starts_with_leaf(
+    heap: *const otter_gc::GcHeap,
+    receiver_bits: u64,
+    prefix_bits: u64,
+) -> RuntimeStubResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let Some(heap) = heap_ref(heap) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    let Some((string, prefix)) = string_pair(heap, receiver_bits, prefix_bits) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::boolean(
+        string.starts_with(prefix, 0, heap),
+    )))
+}
+
+/// `String.prototype.endsWith` over two string operands, anchored at the
+/// receiver's end. A non-string operand misses so the general path owns
+/// coercion and the RegExp-argument rejection.
+#[must_use]
+pub extern "C" fn string_ends_with_leaf(
+    heap: *const otter_gc::GcHeap,
+    receiver_bits: u64,
+    suffix_bits: u64,
+) -> RuntimeStubResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let Some(heap) = heap_ref(heap) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    let Some((string, suffix)) = string_pair(heap, receiver_bits, suffix_bits) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    let end = string.len();
+    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::boolean(
+        string.ends_with(suffix, end, heap),
     )))
 }
 

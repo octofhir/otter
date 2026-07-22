@@ -215,7 +215,7 @@ mod test_support;
 pub use active_frame::{ActiveFrameError, ActiveFrameMut, ActiveFrameRef, ActiveFrameStorage};
 pub use arithmetic_dispatch::NumericRuntimeOp;
 pub use cpu_profile::CpuProfile;
-pub use execution_context::ExecutionContext;
+pub use execution_context::{CallFeedbackStats, ExecutionContext};
 pub use frame_state::{
     AsyncFrameState, Frame, PendingBindFunction, PendingBindStage, PendingGetIterator,
     PendingIteratorNext, PendingToPrimitive, ToPrimitiveStage, TryHandler,

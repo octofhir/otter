@@ -8,6 +8,7 @@
 //! # Contents
 //!
 //! - [`ExecutionContext`] — cloneable VM-owned dispatch context.
+//! - [`CallFeedbackStats`] — owned diagnostic summary of retained call sites.
 //!
 //! # Invariants
 //!
@@ -36,6 +37,19 @@ use std::sync::Arc;
 use crate::code_space::{ChunkTables, CodeSpace, ResolvedCtx};
 use crate::executable::{CodeBlock, CodeBlockInstruction, ExecutableModule};
 use crate::property_atom::{AtomTable, AtomizedPropertyKey};
+
+/// Owned snapshot of bounded ordinary-call feedback in one execution context.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallFeedbackStats {
+    /// Retained observations across mono/poly sites; megamorphic sites saturate.
+    pub retained_observations: u64,
+    /// Sites retaining exactly one target.
+    pub monomorphic_sites: u64,
+    /// Sites retaining multiple bounded targets.
+    pub polymorphic_sites: u64,
+    /// Sites whose bounded target population saturated.
+    pub megamorphic_sites: u64,
+}
 
 /// Cloneable dispatch context for VM-owned JS jobs.
 pub struct ExecutionContext {
@@ -360,6 +374,37 @@ impl ExecutionContext {
     #[must_use]
     pub(crate) fn property_ic_site_end(&self) -> usize {
         self.executable.property_ic_site_end() as usize
+    }
+
+    /// Summarize bounded ordinary-call feedback without exposing VM cells.
+    #[must_use]
+    pub fn call_feedback_stats(&self) -> CallFeedbackStats {
+        let mut stats = CallFeedbackStats::default();
+        for local_index in 0..self.module.functions.len() {
+            let Some(function) = self.executable.function(local_index as u32) else {
+                continue;
+            };
+            for instruction_index in 0..function.code.len() {
+                match function.call_distribution_at(instruction_index) {
+                    Some(crate::feedback::CallSiteDistribution::Mono(target)) => {
+                        stats.monomorphic_sites += 1;
+                        stats.retained_observations += u64::from(target.hits);
+                    }
+                    Some(crate::feedback::CallSiteDistribution::Poly(targets)) => {
+                        stats.polymorphic_sites += 1;
+                        stats.retained_observations += targets
+                            .iter()
+                            .map(|target| u64::from(target.hits))
+                            .sum::<u64>();
+                    }
+                    Some(crate::feedback::CallSiteDistribution::Megamorphic) => {
+                        stats.megamorphic_sites += 1;
+                    }
+                    None => {}
+                }
+            }
+        }
+        stats
     }
 
     /// Directory entries mapping this chunk's globally dense property site ids

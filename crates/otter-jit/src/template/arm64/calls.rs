@@ -156,27 +156,6 @@ fn inline_callee_template_plan(
     inline_leaf_template_plan(view, &callee.code_block, &callee.instructions)
 }
 
-pub(super) fn has_emit_eligible_inline_method(view: &JitCompileSnapshot) -> bool {
-    if view.inline_methods.is_empty() {
-        return false;
-    }
-    let Ok(caller_plan) = TemplatePlan::build(view) else {
-        return false;
-    };
-    caller_plan.instructions.iter().any(|instruction| {
-        let TemplateOp::MethodCall { argc, byte_pc, .. } = instruction.op else {
-            return false;
-        };
-        let Some(method) = view.inline_methods.get(&byte_pc) else {
-            return false;
-        };
-        inline_method_template_plan(view, method).is_ok_and(|method_plan| {
-            view.cage_base != 0
-                && InlineLeafPlan::build_method(method, &method_plan, usize::from(argc)).is_some()
-        })
-    })
-}
-
 /// Load one compact inline slot without changing the caller register base.
 fn emit_load_inline_slot(ops: &mut Assembler, target: u8, slot: InlineScratchSlot) {
     dynasm!(ops ; .arch aarch64 ; ldr X(target), [sp, slot.byte_offset()]);

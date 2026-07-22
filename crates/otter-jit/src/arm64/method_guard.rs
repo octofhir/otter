@@ -54,13 +54,42 @@ pub(crate) fn emit_method_guard(
     receiver_body_register: Option<u8>,
     bail: DynamicLabel,
 ) -> Result<(), Unsupported> {
+    emit_load_reg(ops, 9, site.receiver)?;
+    emit_method_guard_from_tagged_register(
+        ops,
+        relocations,
+        view,
+        site.guard,
+        9,
+        callable_register,
+        receiver_body_register,
+        bail,
+    )
+}
+
+/// Re-read and validate one method target from an already-loaded tagged value.
+///
+/// Optimizing-tier SSA values need not live in the interpreter window, so this
+/// entry accepts the physical register containing the receiver while sharing
+/// the exact same shape/prototype/callable contract as baseline calls.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_method_guard_from_tagged_register(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    guard: &JitMethodGuard,
+    tagged_receiver_register: u8,
+    callable_register: u8,
+    receiver_body_register: Option<u8>,
+    bail: DynamicLabel,
+) -> Result<(), Unsupported> {
     if view.cage_base == 0 {
         return Err(Unsupported::OperandShape("method guard cage base"));
     }
 
-    emit_load_reg(ops, 9, site.receiver)?;
     dynasm!(ops
         ; .arch aarch64
+        ; mov x9, X(tagged_receiver_register)
         ; movz x11, NUMBER_TAG_HI16, lsl #48
         ; orr x11, x11, #0x2
         ; tst x9, x11
@@ -82,13 +111,13 @@ pub(crate) fn emit_method_guard(
         ; b.ne =>bail
         ; ldr w14, [x13, view.object_shape_byte]
     );
-    emit_load_u64(ops, 15, u64::from(site.guard.recv_shape));
+    emit_load_u64(ops, 15, u64::from(guard.recv_shape));
     dynasm!(ops ; .arch aarch64 ; cmp w14, w15 ; b.ne =>bail);
     if let Some(register) = receiver_body_register {
         dynasm!(ops ; .arch aarch64 ; mov X(register), x13);
     }
 
-    for &hop_shape in &site.guard.proto_chain {
+    for &hop_shape in &guard.proto_chain {
         dynasm!(ops
             ; .arch aarch64
             ; ldr w9, [x13, view.jit_proto_byte]
@@ -107,14 +136,14 @@ pub(crate) fn emit_method_guard(
     dynasm!(ops
         ; .arch aarch64
         ; cbz x13, =>bail
-        ; ldr w9, [x13, site.guard.method_value_byte]
+        ; ldr w9, [x13, guard.method_value_byte]
     );
     emit_decompress_slot(ops, relocations, view.cage_base as u64, bail);
     dynasm!(ops ; .arch aarch64 ; mov X(callable_register), x9);
 
     let closure = ops.new_dynamic_label();
     let guarded = ops.new_dynamic_label();
-    emit_load_u64(ops, 10, value_tag::box_function_id(site.guard.method_fid));
+    emit_load_u64(ops, 10, value_tag::box_function_id(guard.method_fid));
     dynasm!(ops
         ; .arch aarch64
         ; cmp X(callable_register), x10
@@ -142,7 +171,7 @@ pub(crate) fn emit_method_guard(
         ; b.ne =>bail
         ; ldr w11, [X(callable_register), view.closure_call_layout.function_id_byte]
     );
-    emit_load_u64(ops, 12, u64::from(site.guard.method_fid));
+    emit_load_u64(ops, 12, u64::from(guard.method_fid));
     dynasm!(ops
         ; .arch aarch64
         ; cmp w11, w12

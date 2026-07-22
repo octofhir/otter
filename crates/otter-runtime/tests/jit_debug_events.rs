@@ -3,7 +3,7 @@
 //! # Contents
 //! - Default-off behavior and ordered template compile events.
 //! - Optimizing OSR consumes unary feedback without an immediate side exit.
-//! - Eligible numeric methods select the guarded template-inline backend.
+//! - Eligible numeric methods splice into guarded optimizing-tier bodies.
 //! - Abrupt completion followed by explicit report draining.
 //! - Report ownership across full GC, later allocation, and nested JIT entry.
 //! - Async [`otter_runtime::Otter`] event-loop success and abrupt-failure
@@ -206,7 +206,7 @@ fn unary_feedback_keeps_extracted_native_call_loop_optimized() {
 
 #[test]
 #[cfg(target_arch = "aarch64")]
-fn numeric_method_candidate_selects_template_inline_backend() {
+fn numeric_method_candidate_splices_into_optimizing_backend() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
         .jit_osr_threshold(1)
@@ -263,24 +263,10 @@ engineKernel(128);
                 function_id,
                 tier: JitDebugTier::Optimizing,
                 target: JitDebugTarget::Osr { .. },
-                outcome: JitDebugCompileOutcome::Unsupported { reason },
-            } if *function_id == engine_kernel
-                && reason.contains("prefers the template method-inline path")
-        )),
-        "optimizer must deliberately yield to method inlining: {:?}",
-        report.events()
-    );
-    assert!(
-        report.events().iter().any(|event| matches!(
-            event,
-            JitDebugEvent::CompileFinished {
-                function_id,
-                tier: JitDebugTier::Template,
-                target: JitDebugTarget::Osr { .. },
                 outcome: JitDebugCompileOutcome::Compiled { .. },
             } if *function_id == engine_kernel
         )),
-        "template fallback must compile the method-inline body: {:?}",
+        "optimizer must compile the method-inline body: {:?}",
         report.events()
     );
     assert!(
@@ -293,6 +279,88 @@ engineKernel(128);
             } if *function_id == engine_kernel
         )),
         "backend selection must not be reported as a runtime side exit: {:?}",
+        report.events()
+    );
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn optimized_method_deopt_preserves_this_overflow_invalidation_and_abrupt_completion() {
+    let mut runtime = Runtime::builder()
+        .jit_selection(JitSelection::ProductionTiered)
+        .jit_osr_threshold(1)
+        .jit_debug(JitDebugRequest::events())
+        .build()
+        .expect("production-tiered runtime with events");
+    let result = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+function apply(value) {
+  return this.base + value;
+}
+
+const receiver = { base: 4, apply };
+
+function kernel(start, limit) {
+  let total = 0;
+  for (let i = 0; i < limit; i = i + 1) {
+    total = total + receiver.apply(start + i);
+  }
+  return total;
+}
+
+const hot = kernel(0, 128);
+
+// The method guard remains valid, but the inlined add overflows int32. The
+// side exit must reconstruct both frames at the exact callee PC.
+receiver.base = 2147483647;
+const overflow = kernel(1, 2);
+
+// Replacing the method without changing the receiver shape must reject the
+// cached identity before entry and execute the replacement exactly once.
+receiver.base = 10;
+receiver.apply = function replacement(value) {
+  return this.base * 2 + value;
+};
+const replaced = kernel(0, 3);
+
+// A second replacement exercises guard-miss deopt through catch/finally. No
+// already-started call may be replayed after its throw.
+receiver.apply = function abrupt(value) {
+  if (value === 1) throw new Error("boom");
+  return value;
+};
+let abrupt = 0;
+try {
+  abrupt = kernel(0, 4);
+} catch (error) {
+  abrupt = 100;
+} finally {
+  abrupt = abrupt + 7;
+}
+
+[hot, overflow, replaced, abrupt].join("|");
+"#,
+            ),
+            "jit-debug-optimized-method-deopt.js",
+        )
+        .expect("method deopt and invalidation fixture");
+    let report = result
+        .jit_debug_report()
+        .expect("enabled run owns a report");
+
+    assert_eq!(result.completion_string(), "8640|4294967297|63|107");
+    assert!(
+        report.events().iter().any(|event| matches!(
+            event,
+            JitDebugEvent::CompileFinished {
+                tier: JitDebugTier::Optimizing,
+                outcome: JitDebugCompileOutcome::Compiled { .. },
+                ..
+            }
+        )),
+        "fixture must enter the optimizing tier before its side exits: {:?}",
         report.events()
     );
 }

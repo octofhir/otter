@@ -14,6 +14,9 @@
 //!   FP registers and spills follow their GPR namespace to prevent collisions.
 //! - A missing abstract value maps to a register-specific undefined constant with a
 //!   tagged representation, keeping multiple dead registers location-distinct.
+//! - Inlined frame chains remain outermost-first; caller frames resume after
+//!   their plain or method call while the innermost frame resumes at its exact
+//!   side-exit byte PC.
 //!
 //! # See also
 //! - [`super::frame_state`] for abstract interpreter-register state.
@@ -171,7 +174,7 @@ pub enum DeoptLoweringError {
         /// Registers the function's own body defines.
         expected: usize,
     },
-    /// A caller in a chain does not resume immediately after a call.
+    /// A caller in a chain does not resume immediately after a call opcode.
     CallerDoesNotResumeAfterACall {
         /// Function whose frame is malformed.
         function_id: u32,
@@ -295,7 +298,8 @@ impl DeoptLowering {
         // Every rebuilt frame must be one the interpreter could have built: its
         // slots must cover exactly that function's register window, it must
         // resume inside its own body, and every caller must resume immediately
-        // after a real call — the interpreter advances past a call before
+        // after a real plain or method call — the interpreter advances past a
+        // call before
         // pushing its callee, so a caller that resumed anywhere else would
         // either re-run the call or skip an instruction.
         for state in self.table.entries() {
@@ -332,7 +336,10 @@ impl DeoptLowering {
                         .checked_sub(1)
                         .and_then(|index| body.instructions.get(index));
                     let is_call = call.is_some_and(|instruction| {
-                        instruction.op(body.code_block.as_ref()) == Op::Call
+                        matches!(
+                            instruction.op(body.code_block.as_ref()),
+                            Op::Call | Op::CallMethodValue
+                        )
                     });
                     if !is_call {
                         return Err(DeoptLoweringError::CallerDoesNotResumeAfterACall {

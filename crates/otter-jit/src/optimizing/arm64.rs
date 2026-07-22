@@ -5,21 +5,24 @@
 //! - Reducible loop checks, numeric comparisons, and per-edge phi copies.
 //! - Loop-header OSR trampolines materializing allocated state from the
 //!   interpreter register window.
-//! - Cooperative back-edge polling with loop-header bail writeback.
+//! - Bounded batched back-edge polling with loop-header bail writeback.
 //! - Precise live-tagged GC safepoints around element, property, global,
 //!   comparison, and method-call transitions.
 //! - Direct live-value reads from baked global lexical cells and guarded
 //!   global-object property records.
 //! - Baked stable-entry plain and method calls with stack-owned rooted callee
 //!   frames.
-//! - Guarded numeric fast paths for source-lowered coercion scaffolding.
+//! - Guarded plain- and method-callee splicing with multi-frame exact-PC
+//!   deoptimization and synthetic `this` binding.
+//! - Loop-invariant method-identity caching and receiver-property guard fusion.
+//! - Unboxed numeric residency through source-lowered coercion scaffolding.
 //! - Tagged-number guards, mixed-representation arithmetic, spills, boxing,
 //!   and bail exits backed by exact deopt frame states.
 //!
 //! # Invariants
 //! - `x20` retains the sole `JitCtx` argument and `x19` retains the canonical
 //!   `NativeFrame.register_base`.
-//!   GPR linear-scan registers `0..4` map to `x21..x24`, disjoint from both
+//!   GPR linear-scan registers `0..8` map to `x21..x28`, disjoint from both
 //!   fixed ABI registers; FP registers `0..8` map to the AAPCS64 callee-saved
 //!   `d8..d15`. `x8..x15` and `d16..d17` are caller-saved scratch registers.
 //!   GPR spill slots precede FP spill slots in one aligned stack frame.
@@ -38,9 +41,10 @@
 //!   instead of receiving cross-representation edge copies.
 //! - Float64 arithmetic never bails for overflow or division by zero. NaNs
 //!   remain unordered in comparisons and are canonicalized whenever boxed.
-//! - Every backwards bytecode edge targets a dominating loop header. Its phi moves
-//!   execute before the interrupt/fuel poll so a poll exit reconstructs the
-//!   loop-header frame, and no optimized loop can bypass cooperative polling.
+//! - Every backwards bytecode edge targets a dominating loop header. Its phi
+//!   moves execute before a native countdown; every sixteenth edge checks the
+//!   interrupt cell and debits the shared fuel by sixteen. A slow poll therefore
+//!   reconstructs the loop-header frame, and interrupt latency remains bounded.
 //! - Every OSR trampoline loads exactly the live loop-header frame-state
 //!   values, unboxes them into their allocated locations, and only then
 //!   branches to the header body. A representation mismatch bails with the
@@ -65,6 +69,11 @@
 //!   code. A method guard-chain miss completes through the canonical
 //!   `GetMethod + Call` transition; plain-call misses and native-entry lease
 //!   failures take the caller's exact deopt exit.
+//! - A spliced method guard may be cached only when the receiver is defined
+//!   outside one natural loop and every loop operation is non-mutating and
+//!   non-reentrant. Entry and OSR initialize the cache independently; the
+//!   first iteration proves identity and later iterations reuse only the
+//!   guarded receiver body.
 //!   Poll slow paths still bail so the interpreter owns interrupt/budget handling.
 //!
 //! # See also
@@ -103,7 +112,8 @@ use crate::{
     arm64::{
         DirectCallForm, DirectCallSite, MethodGuardSite, StaticNativeCallSite,
         direct_call_artifact, direct_call_target_is_supported, emit_direct_call, emit_method_guard,
-        emit_static_native_call, static_native_target_is_supported,
+        emit_method_guard_from_tagged_register, emit_static_native_call,
+        static_native_target_is_supported,
     },
     artifact::{
         ArtifactRequest, CodeMapCapture, CodeRegion, NativeCompileOutput, build_bundle,
@@ -125,7 +135,7 @@ use crate::{
         deopt_lower::DeoptLowering,
         dom::DominatorTree,
         frame_state::{AbstractFrameState, FrameStateTable},
-        inline::{InlineId, InlineTree},
+        inline::{InlineCallKind, InlineFrame, InlineId, InlineTree},
         liveness::Liveness,
         regalloc::{
             Allocation, EdgeMoves, Location, Move, RegClass, RegisterBudget, has_non_dead_use,
@@ -146,6 +156,7 @@ const FP_REGISTERS: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
 const FP_SCRATCH: u8 = 16;
 const FP_SCRATCH_2: u8 = 17;
 const STACK_SLOT_BYTES: u32 = 8;
+const OPTIMIZED_POLL_BATCH: u32 = 16;
 const MAX_SPILL_FRAME_BYTES: u32 = 1 << 20;
 const MAX_PARAMETER_OFFSET: u32 = 32_760;
 
@@ -174,6 +185,10 @@ struct Eligibility {
     /// reached, the interpreter runs it, records feedback, bumps the epoch,
     /// and the next compile sees real types.
     insufficient_feedback: BTreeSet<(InlineId, u32)>,
+    /// Sole monomorphic method guard proven loop-invariant for this unit. Its
+    /// receiver body is cached after the first exact identity check in each
+    /// native entry/OSR activation.
+    cached_method_guard: Option<(InlineId, u32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,7 +329,7 @@ pub(super) fn compile_with_artifacts(
     // spliced frame does not have, and one unsuitable callee would otherwise
     // cost the whole unit its compilation.
     let unit = OptimizationPipeline::new(REGISTER_BUDGET)
-        .analyze(view, splice_lowerable)
+        .analyze(view, splice_lowerable, splice_lowerable_method)
         .map_err(OptimizationError::into_unsupported)?;
 
     let eligibility = check_eligibility(
@@ -335,7 +350,10 @@ pub(super) fn compile_with_artifacts(
         .reverse_postorder()
         .iter()
         .flat_map(|block| unit.ssa.blocks[block.0 as usize].instrs.iter())
-        .filter(|instruction| instruction.op == Op::LoadProperty)
+        .filter(|instruction| {
+            instruction.op == Op::LoadProperty
+                && inline_method_property(&unit.tree, instruction).is_none()
+        })
         .count();
     let mut load_ic_cells =
         vec![crate::entry::WhiskerIcCell::default(); load_property_sites].into_boxed_slice();
@@ -571,6 +589,267 @@ fn splice_lowerable(callee: &otter_vm::JitInlineCallee) -> bool {
     })
 }
 
+/// `true` when a method body can execute wholly inside the optimizing unit.
+///
+/// Property reads must have one VM-baked sealed data slot. Calls, stores,
+/// allocations, and other effectful operations stay on the ordinary generated
+/// call path so a side exit never repeats a committed effect.
+fn splice_lowerable_method(method: &otter_vm::JitInlineMethod) -> bool {
+    method.instructions.iter().all(|instruction| {
+        let op = instruction.op(method.code_block.as_ref());
+        if op == Op::LoadProperty && !method.prop_offsets.contains_key(&instruction.byte_pc) {
+            return false;
+        }
+        matches!(
+            op,
+            Op::LoadInt32
+                | Op::LoadNumber
+                | Op::LoadUndefined
+                | Op::LoadNull
+                | Op::LoadTrue
+                | Op::LoadFalse
+                | Op::LoadThis
+                | Op::LoadLocal
+                | Op::StoreLocal
+                | Op::LoadProperty
+                | Op::ToPrimitive
+                | Op::ToNumeric
+                | Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Rem
+                | Op::Neg
+                | Op::Increment
+                | Op::LogicalNot
+                | Op::BitwiseAnd
+                | Op::BitwiseOr
+                | Op::BitwiseXor
+                | Op::Shl
+                | Op::Shr
+                | Op::Equal
+                | Op::NotEqual
+                | Op::LessThan
+                | Op::LessEq
+                | Op::GreaterThan
+                | Op::GreaterEq
+                | Op::Jump
+                | Op::JumpIfTrue
+                | Op::JumpIfFalse
+                | Op::Return
+                | Op::ReturnValue
+                | Op::ReturnUndefined
+        )
+    })
+}
+
+/// Direct value-slab read proven by an enclosing method identity guard.
+fn inline_method_property<'a>(
+    tree: &'a InlineTree,
+    instruction: &SsaInstr,
+) -> Option<(&'a InlineFrame, u32, u32)> {
+    if instruction.inline == InlineId::ROOT || instruction.op != Op::LoadProperty {
+        return None;
+    }
+    let frame = tree.frames.get(instruction.inline.0 as usize)?;
+    let method = frame.method.as_ref()?;
+    let byte_pc = frame.instructions.get(instruction.pc as usize)?.byte_pc;
+    let value_byte = *method.prop_offsets.get(&byte_pc)?;
+    let guard = match &frame.call_site.as_ref()?.kind {
+        InlineCallKind::Method { guard, .. } => guard,
+        InlineCallKind::Plain { .. } => return None,
+    };
+    let expected_shape = method
+        .prop_shapes
+        .get(&byte_pc)
+        .copied()
+        .unwrap_or(guard.recv_shape);
+    Some((frame, value_byte, expected_shape))
+}
+
+/// Receiver-own property load that can consume the method guard's already
+/// validated receiver body instead of probing the same cell and shape twice.
+///
+/// Only the leading `LoadLocal`/`LoadThis` scaffolding may separate the call
+/// guard from this load. Those operations cannot allocate, throw, or mutate the
+/// heap, so the raw body pointer remains valid in the reserved native-stack
+/// slot until the fused load consumes it.
+fn fused_inline_method_property<'a>(
+    tree: &'a InlineTree,
+    ssa: &SsaFunction,
+    instruction: &SsaInstr,
+) -> Option<(&'a InlineFrame, &'a otter_vm::jit::JitMethodGuard, u32)> {
+    let (frame, value_byte, expected_shape) = inline_method_property(tree, instruction)?;
+    let call_site = frame.call_site.as_ref()?;
+    let InlineCallKind::Method { guard, .. } = &call_site.kind else {
+        return None;
+    };
+    let synthetic_this = ssa.frames.get(instruction.inline.0 as usize)?.this_value?;
+    let loaded_this = *instruction.inputs.first()?;
+    let loads_synthetic_this = matches!(
+        &ssa.values.get(loaded_this.0 as usize)?.def,
+        ValueDef::Op {
+            inline,
+            op: Op::LoadThis,
+            inputs,
+            ..
+        } if *inline == instruction.inline && inputs.as_ref() == [synthetic_this]
+    );
+    if expected_shape != guard.recv_shape || !loads_synthetic_this {
+        return None;
+    }
+    let property_pc = usize::try_from(instruction.pc).ok()?;
+    if frame.instructions.iter().take(property_pc).any(|metadata| {
+        !matches!(
+            metadata.op(frame.code_block.as_ref()),
+            Op::LoadLocal | Op::LoadThis
+        )
+    }) {
+        return None;
+    }
+    Some((frame, guard, value_byte))
+}
+
+fn fused_method_property_for_frame(tree: &InlineTree, ssa: &SsaFunction, inline: InlineId) -> bool {
+    ssa.blocks
+        .iter()
+        .flat_map(|block| &block.instrs)
+        .any(|instruction| {
+            instruction.inline == inline
+                && fused_inline_method_property(tree, ssa, instruction).is_some()
+        })
+}
+
+fn natural_loop_blocks(
+    cfg: &ControlFlowGraph,
+    latch: BlockId,
+    header: BlockId,
+) -> BTreeSet<BlockId> {
+    let mut blocks = BTreeSet::from([header, latch]);
+    let mut pending = vec![latch];
+    while let Some(block) = pending.pop() {
+        for predecessor in cfg.blocks[block.0 as usize].preds.iter().copied() {
+            if blocks.insert(predecessor) && predecessor != header {
+                pending.push(predecessor);
+            }
+        }
+    }
+    blocks
+}
+
+fn guard_cache_safe_instruction(
+    tree: &InlineTree,
+    cfg: &ControlFlowGraph,
+    block: BlockId,
+    instruction: &SsaInstr,
+) -> bool {
+    match instruction.op {
+        Op::LoadInt32
+        | Op::LoadNumber
+        | Op::LoadUndefined
+        | Op::LoadNull
+        | Op::LoadTrue
+        | Op::LoadFalse
+        | Op::LoadLocal
+        | Op::StoreLocal
+        | Op::LoadThis
+        | Op::ToPrimitive
+        | Op::ToNumeric
+        | Op::Add
+        | Op::Sub
+        | Op::Mul
+        | Op::Div
+        | Op::Rem
+        | Op::Neg
+        | Op::Increment
+        | Op::LogicalNot
+        | Op::BitwiseAnd
+        | Op::BitwiseOr
+        | Op::BitwiseXor
+        | Op::Shl
+        | Op::Shr
+        | Op::Equal
+        | Op::NotEqual
+        | Op::LessThan
+        | Op::LessEq
+        | Op::GreaterThan
+        | Op::GreaterEq
+        | Op::Jump
+        | Op::JumpIfTrue
+        | Op::JumpIfFalse => true,
+        Op::LoadProperty => inline_method_property(tree, instruction).is_some(),
+        Op::CallMethodValue => is_spliced_call(cfg, block, instruction),
+        Op::Return | Op::ReturnValue | Op::ReturnUndefined => matches!(
+            cfg.blocks[block.0 as usize].terminator,
+            Terminator::InlineReturn { .. }
+        ),
+        _ => false,
+    }
+}
+
+fn cached_method_guard_site(
+    tree: &InlineTree,
+    cfg: &ControlFlowGraph,
+    ssa: &SsaFunction,
+    back_edges: &BTreeMap<(BlockId, BlockId), (DeoptExitId, u32)>,
+) -> Option<(InlineId, u32)> {
+    fn transparent_origin(ssa: &SsaFunction, mut value: ValueId) -> Option<ValueId> {
+        loop {
+            let data = ssa.values.get(value.0 as usize)?;
+            match &data.def {
+                ValueDef::Op {
+                    op: Op::LoadLocal | Op::StoreLocal,
+                    inputs,
+                    ..
+                } if inputs.len() == 1 => value = inputs[0],
+                _ => return Some(value),
+            }
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for block in &cfg.blocks {
+        for instruction in &ssa.blocks[block.id.0 as usize].instrs {
+            if instruction.op != Op::CallMethodValue || !is_spliced_call(cfg, block.id, instruction)
+            {
+                continue;
+            }
+            let Terminator::InlineCall { callee_entry, .. } = block.terminator else {
+                continue;
+            };
+            if !fused_method_property_for_frame(
+                tree,
+                ssa,
+                cfg.blocks[callee_entry.0 as usize].inline,
+            ) {
+                continue;
+            }
+            candidates.push((block.id, instruction));
+        }
+    }
+    let [(call_block, call)] = candidates.as_slice() else {
+        return None;
+    };
+    let receiver = transparent_origin(ssa, *call.inputs.first()?)?;
+    for &(latch, header) in back_edges.keys() {
+        let loop_blocks = natural_loop_blocks(cfg, latch, header);
+        if !loop_blocks.contains(call_block)
+            || loop_blocks.contains(&ssa.values.get(receiver.0 as usize)?.def_block)
+        {
+            continue;
+        }
+        if loop_blocks.iter().all(|block| {
+            ssa.blocks[block.0 as usize]
+                .instrs
+                .iter()
+                .all(|instruction| guard_cache_safe_instruction(tree, cfg, *block, instruction))
+        }) {
+            return Some((call.inline, call.pc));
+        }
+    }
+    None
+}
+
 /// Canonical instruction index of `byte_pc` within `function_id`'s body.
 fn logical_pc(tree: &InlineTree, function_id: u32, byte_pc: u32) -> Result<u32, Unsupported> {
     let frame = tree
@@ -688,7 +967,7 @@ fn check_eligibility(
     }
 
     let mut guarded_uses = BTreeMap::<(u32, ValueId), Option<u32>>::new();
-    let mut allowed_conversions = BTreeSet::new();
+    let mut allowed_conversions = BTreeSet::<(InlineId, u32, usize)>::new();
     let mut element_transition_instructions = Vec::new();
     let mut math_call_arguments = BTreeMap::new();
     let mut insufficient_feedback = BTreeSet::new();
@@ -728,7 +1007,11 @@ fn check_eligibility(
                 for conversion in reprs.conversions() {
                     if conversion.inline == instruction.inline && conversion.at_pc == instruction.pc
                     {
-                        allowed_conversions.insert((conversion.at_pc, conversion.operand_index));
+                        allowed_conversions.insert((
+                            conversion.inline,
+                            conversion.at_pc,
+                            conversion.operand_index,
+                        ));
                     }
                 }
                 continue;
@@ -738,6 +1021,18 @@ fn check_eligibility(
                 Op::LoadNumber => check_number_constant_result(view, instruction, reprs)?,
                 Op::LoadUndefined => check_tagged_constant_result(instruction, reprs)?,
                 Op::LoadNull => check_tagged_constant_result(instruction, reprs)?,
+                Op::LoadThis if instruction.inline != InlineId::ROOT => {
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("inlined LoadThis result"))?;
+                    if instruction.inputs.len() != 1
+                        || !instruction.input_registers.is_empty()
+                        || reprs.representation(result) != Representation::Tagged
+                        || reprs.representation(instruction.inputs[0]) != Representation::Tagged
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                }
                 Op::LoadThis => check_tagged_constant_result(instruction, reprs)?,
                 Op::LoadTrue | Op::LoadFalse => check_boolean_result(instruction, reprs)?,
                 Op::LoadLocal | Op::StoreLocal => {
@@ -760,12 +1055,13 @@ fn check_eligibility(
                     if instruction.inputs.len() != 1
                         || instruction.input_registers.len() != 1
                         || instruction.result_register.is_none()
-                        || reprs.representation(result) != Representation::Tagged
+                        || reprs.representation(result)
+                            != reprs.representation(instruction.inputs[0])
                     {
                         return Err(Unsupported::Opcode(instruction.op));
                     }
-                    check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     if reprs.representation(instruction.inputs[0]) == Representation::Tagged {
+                        check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                         guarded_uses.insert((instruction.pc, instruction.inputs[0]), None);
                     }
                 }
@@ -803,6 +1099,20 @@ fn check_eligibility(
                         block,
                         instruction_index,
                     ));
+                }
+                Op::LoadProperty if inline_method_property(tree, instruction).is_some() => {
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("inlined property-load result"))?;
+                    if reprs.representation(result) != Representation::Tagged
+                        || instruction.inputs.len() != 1
+                        || instruction.input_registers.len() != 1
+                        || instruction.result_register.is_none()
+                        || reprs.representation(instruction.inputs[0]) != Representation::Tagged
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                 }
                 Op::LoadProperty => {
                     // `WRITE_READ_CONST`: the object is the sole register input,
@@ -917,7 +1227,7 @@ fn check_eligibility(
                         instruction_index,
                     ));
                 }
-                Op::CallMethodValue => {
+                Op::CallMethodValue if !is_spliced_call(cfg, block, instruction) => {
                     // `dst, receiver, name-const, argc-const, arg-regs...`. The
                     // receiver plus up to `MAX_METHOD_ARGS` tagged arguments are
                     // register inputs; resolution runs the full method walk and
@@ -942,6 +1252,17 @@ fn check_eligibility(
                         block,
                         instruction_index,
                     ));
+                }
+                Op::CallMethodValue if is_spliced_call(cfg, block, instruction) => {
+                    if instruction.result.is_some()
+                        || instruction.result_register.is_some()
+                        || instruction.inputs.is_empty()
+                        || instruction.inputs.len() != instruction.input_registers.len()
+                        || reprs.representation(instruction.inputs[0]) != Representation::Tagged
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                 }
                 Op::New => {
                     // `dst, callee, argc-const, arg-regs...`. Construction may
@@ -1187,6 +1508,32 @@ fn check_eligibility(
                     if instruction.result.is_some() || instruction.inputs.len() != 1 {
                         return Err(Unsupported::OperandShape("optimizing return shape"));
                     }
+                    // Representation selection describes a bytecode return as
+                    // leaving the native unit and therefore records numeric
+                    // boxing. A spliced return stays inside the unit: its CFG
+                    // edge performs the callee-result phi conversion directly.
+                    for conversion in reprs.conversions().iter().filter(|conversion| {
+                        conversion.inline == instruction.inline
+                            && conversion.at_pc == instruction.pc
+                    }) {
+                        if conversion.operand_index != 0
+                            || conversion.value != instruction.inputs[0]
+                            || conversion.may_deopt
+                            || !matches!(
+                                conversion.kind,
+                                ConversionKind::BoxInt32 | ConversionKind::BoxFloat64
+                            )
+                        {
+                            return Err(Unsupported::OperandShape(
+                                "optimizing inlined return conversion",
+                            ));
+                        }
+                        allowed_conversions.insert((
+                            conversion.inline,
+                            conversion.at_pc,
+                            conversion.operand_index,
+                        ));
+                    }
                 }
                 Op::ReturnUndefined
                     if matches!(
@@ -1256,7 +1603,9 @@ fn check_eligibility(
                         Representation::Tagged => continue,
                     };
                     let conversion = reprs.conversions().iter().find(|conversion| {
-                        conversion.at_pc == instruction.pc && conversion.operand_index == 0
+                        conversion.inline == instruction.inline
+                            && conversion.at_pc == instruction.pc
+                            && conversion.operand_index == 0
                     });
                     if !matches!(
                         conversion,
@@ -1269,7 +1618,7 @@ fn check_eligibility(
                             "optimizing return requires numeric boxing",
                         ));
                     }
-                    allowed_conversions.insert((instruction.pc, 0));
+                    allowed_conversions.insert((instruction.inline, instruction.pc, 0));
                 }
                 Op::ReturnUndefined => {
                     if instruction.result.is_some() || !instruction.inputs.is_empty() {
@@ -1284,7 +1633,11 @@ fn check_eligibility(
     }
 
     if reprs.conversions().iter().any(|conversion| {
-        !allowed_conversions.contains(&(conversion.at_pc, conversion.operand_index))
+        !allowed_conversions.contains(&(
+            conversion.inline,
+            conversion.at_pc,
+            conversion.operand_index,
+        ))
     }) {
         return Err(Unsupported::OperandShape(
             "optimizing subset has an unsupported conversion",
@@ -1329,6 +1682,7 @@ fn check_eligibility(
         element_transition_instructions,
     )?;
     let osr_entries = build_osr_entry_sites(cfg, ssa, liveness, frame_states)?;
+    let cached_method_guard = cached_method_guard_site(tree, cfg, ssa, &back_edges);
     Ok(Eligibility {
         guarded_uses: guarded_numeric_uses,
         back_edges,
@@ -1336,6 +1690,7 @@ fn check_eligibility(
         element_transitions,
         math_call_arguments,
         insufficient_feedback,
+        cached_method_guard,
     })
 }
 
@@ -1506,7 +1861,7 @@ fn frame_register_for_value(frame_state: &AbstractFrameState, value: ValueId) ->
 fn check_tagged_inputs(
     instruction: &SsaInstr,
     reprs: &ReprMap,
-    allowed_conversions: &mut BTreeSet<(u32, usize)>,
+    allowed_conversions: &mut BTreeSet<(InlineId, u32, usize)>,
 ) -> Result<(), Unsupported> {
     for (operand_index, &input) in instruction.inputs.iter().enumerate() {
         let expected_kind = match reprs.representation(input) {
@@ -1515,7 +1870,9 @@ fn check_tagged_inputs(
             Representation::Float64 => ConversionKind::BoxFloat64,
         };
         let conversion = reprs.conversions().iter().find(|conversion| {
-            conversion.at_pc == instruction.pc && conversion.operand_index == operand_index
+            conversion.inline == instruction.inline
+                && conversion.at_pc == instruction.pc
+                && conversion.operand_index == operand_index
         });
         if !matches!(
             conversion,
@@ -1528,7 +1885,7 @@ fn check_tagged_inputs(
                 "optimizing element transition requires tagged operands",
             ));
         }
-        allowed_conversions.insert((instruction.pc, operand_index));
+        allowed_conversions.insert((instruction.inline, instruction.pc, operand_index));
     }
     Ok(())
 }
@@ -1539,7 +1896,7 @@ fn check_numeric_inputs(
     reprs: &ReprMap,
     required: Representation,
     guarded_uses: &mut BTreeMap<(u32, ValueId), Option<u32>>,
-    allowed_conversions: &mut BTreeSet<(u32, usize)>,
+    allowed_conversions: &mut BTreeSet<(InlineId, u32, usize)>,
 ) -> Result<(), Unsupported> {
     for (operand_index, &input) in instruction.inputs.iter().enumerate() {
         let actual = reprs.representation(input);
@@ -1555,7 +1912,9 @@ fn check_numeric_inputs(
             _ => return Err(Unsupported::Opcode(instruction.op)),
         };
         let conversion = reprs.conversions().iter().find(|conversion| {
-            conversion.at_pc == instruction.pc && conversion.operand_index == operand_index
+            conversion.inline == instruction.inline
+                && conversion.at_pc == instruction.pc
+                && conversion.operand_index == operand_index
         });
         let may_deopt = matches!(
             expected_kind,
@@ -1581,7 +1940,7 @@ fn check_numeric_inputs(
             };
             guarded_uses.insert((instruction.pc, input), parameter_index);
         }
-        allowed_conversions.insert((instruction.pc, operand_index));
+        allowed_conversions.insert((instruction.inline, instruction.pc, operand_index));
     }
     Ok(())
 }
@@ -1819,7 +2178,35 @@ fn emit(
         number_rem_entry,
         function_id,
     } = plan;
-    let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
+    let allocated_spill_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
+    let fused_method_receiver_slot = ssa
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instrs)
+        .any(|instruction| fused_inline_method_property(tree, ssa, instruction).is_some())
+        .then_some(allocated_spill_bytes);
+    // Keep the ordinary allocation spill namespace unchanged. Focused
+    // codegen state occupies aligned pairs after it and is never part of the
+    // deopt spill namespace.
+    let after_fused_slots = if fused_method_receiver_slot.is_some() {
+        allocated_spill_bytes
+            .checked_add(16)
+            .ok_or(Unsupported::OperandShape(
+                "optimizing fused method spill frame overflow",
+            ))?
+    } else {
+        allocated_spill_bytes
+    };
+    let poll_counter_slot = (!eligibility.back_edges.is_empty()).then_some(after_fused_slots);
+    let spill_frame_bytes = if poll_counter_slot.is_some() {
+        after_fused_slots
+            .checked_add(16)
+            .ok_or(Unsupported::OperandShape(
+                "optimizing poll counter spill frame overflow",
+            ))?
+    } else {
+        after_fused_slots
+    };
     let mut code_map = capture_artifacts.then(CodeMapCapture::default);
     let mut relocations = RelocationCapture::new(capture_artifacts);
     let mut direct_call_events = capture_events.then(|| {
@@ -1910,6 +2297,15 @@ fn emit(
         .collect();
     let entry = ops.offset();
     emit_prologue(&mut ops, spill_frame_bytes);
+    if eligibility.cached_method_guard.is_some() {
+        dynasm!(ops ; .arch aarch64 ; mov x9, xzr);
+        let receiver_slot = fused_method_receiver_slot.expect("cached guard reserves a slot");
+        emit_sp_str_x(&mut ops, 9, receiver_slot);
+    }
+    if let Some(poll_counter_slot) = poll_counter_slot {
+        emit_load_u32(&mut ops, 9, OPTIMIZED_POLL_BATCH);
+        emit_sp_str_x(&mut ops, 9, poll_counter_slot);
+    }
 
     dynasm!(ops
         ; .arch aarch64
@@ -2092,12 +2488,20 @@ fn emit(
                     )?;
                 }
                 Op::LoadThis => {
-                    // `this` is canonical tagged state in the active NativeFrame.
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-                        ; ldr x9, [x10, NATIVE_FRAME_THIS_OFFSET]
-                    );
+                    if instruction.inline == InlineId::ROOT {
+                        // Root `this` is canonical tagged state in NativeFrame.
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                            ; ldr x9, [x10, NATIVE_FRAME_THIS_OFFSET]
+                        );
+                    } else {
+                        emit_load_tagged_location(
+                            &mut ops,
+                            allocation.location(instruction.inputs[0]),
+                            9,
+                        )?;
+                    }
                     emit_store_tagged_location(
                         &mut ops,
                         allocation.location(
@@ -2325,6 +2729,74 @@ fn emit(
                     );
                     emit_reload_element_transition(&mut ops, allocation, site, None)?;
                     dynasm!(ops ; .arch aarch64 ; =>done);
+                }
+                Op::LoadProperty if inline_method_property(tree, instruction).is_some() => {
+                    let (_inline_frame, value_byte, expected_shape) =
+                        inline_method_property(tree, instruction).expect("guarded above");
+                    let fused = fused_inline_method_property(tree, ssa, instruction).is_some();
+                    let result_location = allocation.location(
+                        instruction
+                            .result
+                            .expect("eligibility checked inlined property result"),
+                    );
+                    let deopt = ops.new_dynamic_label();
+                    deopt_exits.push((
+                        deopt,
+                        deopt_exit_at(frame_states, instruction)?,
+                        instruction.pc,
+                    ));
+                    if fused {
+                        emit_sp_ldr_x(
+                            &mut ops,
+                            13,
+                            fused_method_receiver_slot.expect("fused site reserves a slot"),
+                        );
+                    } else {
+                        emit_load_tagged_location(
+                            &mut ops,
+                            allocation.location(instruction.inputs[0]),
+                            9,
+                        )?;
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; movz x11, NUMBER_TAG_HI16, lsl #48
+                            ; orr x11, x11, #0x2
+                            ; tst x9, x11
+                            ; b.ne =>deopt
+                            ; mov w12, w9
+                        );
+                        emit_load_symbolic_u64(
+                            &mut ops,
+                            &mut relocations,
+                            13,
+                            view.cage_base as u64,
+                            RelocationTarget::GcCageBase,
+                        );
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; add x13, x13, x12
+                            ; ldrb w14, [x13]
+                            ; cmp w14, OBJECT_BODY_TYPE_TAG
+                            ; b.ne =>deopt
+                            ; ldr w14, [x13, view.object_shape_byte]
+                        );
+                        emit_load_u32(&mut ops, 15, expected_shape);
+                        dynasm!(ops ; .arch aarch64 ; cmp w14, w15 ; b.ne =>deopt);
+                    }
+                    crate::template::arm64::values::emit_slab_base(&mut ops, view, 13, 14);
+                    emit_load_u32(&mut ops, 15, value_byte);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; cbz x13, =>deopt
+                        ; ldr w9, [x13, x15]
+                    );
+                    crate::template::arm64::values::emit_decompress_slot(
+                        &mut ops,
+                        &mut relocations,
+                        view.cage_base as u64,
+                        deopt,
+                    );
+                    emit_store_tagged_location(&mut ops, result_location, 9)?;
                 }
                 Op::LoadProperty => {
                     let dst = instruction
@@ -3093,6 +3565,96 @@ fn emit(
                         )),
                     )?;
                 }
+                Op::CallMethodValue if is_spliced_call(cfg, block_id, instruction) => {
+                    let Terminator::InlineCall { callee_entry, .. } =
+                        cfg.blocks[block_id.0 as usize].terminator
+                    else {
+                        return Err(Unsupported::OperandShape(
+                            "optimizing spliced-method terminator",
+                        ));
+                    };
+                    let callee =
+                        &tree.frames[cfg.blocks[callee_entry.0 as usize].inline.0 as usize];
+                    let call_site = callee.call_site.as_ref().ok_or(Unsupported::OperandShape(
+                        "optimizing spliced-method call site",
+                    ))?;
+                    let InlineCallKind::Method { guard, .. } = &call_site.kind else {
+                        return Err(Unsupported::OperandShape(
+                            "optimizing spliced-method call kind",
+                        ));
+                    };
+                    let deopt = ops.new_dynamic_label();
+                    deopt_exits.push((
+                        deopt,
+                        deopt_exit_at(frame_states, instruction)?,
+                        instruction.pc,
+                    ));
+                    let fused_receiver = fused_method_property_for_frame(
+                        tree,
+                        ssa,
+                        cfg.blocks[callee_entry.0 as usize].inline,
+                    );
+                    let cached = eligibility.cached_method_guard
+                        == Some((instruction.inline, instruction.pc));
+                    let already_guarded = cached.then(|| ops.new_dynamic_label());
+                    if let Some(already_guarded) = already_guarded {
+                        emit_sp_ldr_x(
+                            &mut ops,
+                            17,
+                            fused_method_receiver_slot.expect("cached guard reserves a slot"),
+                        );
+                        dynasm!(ops ; .arch aarch64 ; cbnz x17, =>already_guarded);
+                    }
+                    emit_load_tagged_location(
+                        &mut ops,
+                        allocation.location(instruction.inputs[0]),
+                        9,
+                    )?;
+                    emit_method_guard_from_tagged_register(
+                        &mut ops,
+                        &mut relocations,
+                        view,
+                        guard,
+                        9,
+                        if fused_receiver { 16 } else { 17 },
+                        fused_receiver.then_some(17),
+                        deopt,
+                    )?;
+                    if fused_receiver {
+                        emit_sp_str_x(
+                            &mut ops,
+                            17,
+                            fused_method_receiver_slot.expect("fused site reserves a slot"),
+                        );
+                    }
+                    if let Some(already_guarded) = already_guarded {
+                        dynasm!(ops ; .arch aarch64 ; =>already_guarded);
+                    }
+
+                    if instruction.inline == InlineId::ROOT {
+                        let frame = &tree.frames[instruction.inline.0 as usize];
+                        let byte_pc = frame.instructions[instruction.pc as usize].byte_pc;
+                        if let (Some(events), Some(target)) = (
+                            direct_call_events.as_mut(),
+                            view.direct_methods
+                                .get(&byte_pc)
+                                .and_then(|targets| targets.first()),
+                        ) {
+                            events.insert(
+                                (byte_pc, target.target_index),
+                                optimizing_direct_call_event(
+                                    otter_vm::JitDirectCallKind::Method,
+                                    instruction.pc,
+                                    byte_pc,
+                                    &target.callee,
+                                    target.target_index,
+                                    target.target_count,
+                                    otter_vm::JitDirectCallLoweringOutcome::Inlined,
+                                ),
+                            );
+                        }
+                    }
+                }
                 Op::CallMethodValue => {
                     let dst = instruction
                         .result_register
@@ -3749,6 +4311,7 @@ fn emit(
                         allocation,
                         eligibility,
                         poll_entry,
+                        poll_counter_slot,
                         threw,
                         &block_labels,
                         block_id,
@@ -3789,6 +4352,7 @@ fn emit(
                         allocation,
                         eligibility,
                         poll_entry,
+                        poll_counter_slot,
                         threw,
                         &block_labels,
                         block_id,
@@ -3802,6 +4366,7 @@ fn emit(
                         allocation,
                         eligibility,
                         poll_entry,
+                        poll_counter_slot,
                         threw,
                         &block_labels,
                         block_id,
@@ -4160,6 +4725,7 @@ fn emit(
                 allocation,
                 eligibility,
                 poll_entry,
+                poll_counter_slot,
                 threw,
                 &block_labels,
                 block_id,
@@ -4289,6 +4855,15 @@ fn emit(
         let offset = ops.offset().0;
         let representation_bail = ops.new_dynamic_label();
         emit_prologue(&mut ops, spill_frame_bytes);
+        if eligibility.cached_method_guard.is_some() {
+            dynasm!(ops ; .arch aarch64 ; mov x9, xzr);
+            let receiver_slot = fused_method_receiver_slot.expect("cached guard reserves a slot");
+            emit_sp_str_x(&mut ops, 9, receiver_slot);
+        }
+        if let Some(poll_counter_slot) = poll_counter_slot {
+            emit_load_u32(&mut ops, 9, OPTIMIZED_POLL_BATCH);
+            emit_sp_str_x(&mut ops, 9, poll_counter_slot);
+        }
         dynasm!(ops
             ; .arch aarch64
             ; mov x20, x0
@@ -4333,6 +4908,7 @@ fn emit_cfg_edge(
     allocation: &Allocation,
     eligibility: &Eligibility,
     poll_entry: ResolvedRuntimeEntry,
+    poll_counter_slot: Option<u32>,
     threw: DynamicLabel,
     block_labels: &[DynamicLabel],
     predecessor: BlockId,
@@ -4344,36 +4920,45 @@ fn emit_cfg_edge(
         edge_moves(allocation, predecessor, target)?,
     )?;
     if eligibility.back_edges.contains_key(&(predecessor, target)) {
-        emit_backedge_poll(ops, relocations, poll_entry, threw);
+        emit_backedge_poll(
+            ops,
+            relocations,
+            poll_entry,
+            poll_counter_slot.expect("back edge reserves a poll counter"),
+            threw,
+        );
     }
     let target_label = block_labels[target.0 as usize];
     dynasm!(ops ; .arch aarch64 ; b =>target_label);
     Ok(())
 }
 
-/// Poll every optimized back-edge without re-entering the VM.
+/// Amortized cooperative back-edge poll.
 ///
-/// The policy mirrors the baseline read/decrement pattern: the interrupt byte
-/// is read first, then the shared fuel is decremented and stored (clamped at
-/// zero so repeated entries cannot underflow it). An interrupt or non-positive
-/// fuel value bails at the loop header. The interpreter then
-/// resumes with the shared fuel still exhausted and performs its ordinary
-/// interrupt/budget checkpoint on its next back-edge. Thus optimized code
-/// bails at least as often as the interpreter/baseline poll cadence, never
-/// less often, while keeping all refill and error policy inside the VM.
-/// Cooperative back-edge poll, matching the template tier: the fast path
-/// decrements the fuel cell inline; an exhausted budget or a raised interrupt
-/// calls the leaf poll stub, which refills the budget and returns to the
-/// compiled loop, or raises (interrupt, timeout) through the throw epilogue.
-/// Deoptimizing here would abandon the compiled loop once per budget window.
+/// A native activation-local countdown keeps the common back edge independent
+/// of VM-thread memory. Every bounded batch, generated code checks the shared
+/// interrupt cell and subtracts the whole batch from shared fuel before using
+/// the canonical leaf refill/throw path. This matches the bounded safepoint
+/// latency used by unrolled production JIT loops without changing total fuel.
 fn emit_backedge_poll(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     poll_entry: ResolvedRuntimeEntry,
+    poll_counter_slot: u32,
     threw: DynamicLabel,
 ) {
+    let batched = ops.new_dynamic_label();
     let slow = ops.new_dynamic_label();
     let cont = ops.new_dynamic_label();
+    emit_sp_ldr_w(ops, 9, poll_counter_slot);
+    dynasm!(ops
+        ; .arch aarch64
+        ; subs w9, w9, #1
+    );
+    emit_sp_str_x(ops, 9, poll_counter_slot);
+    dynasm!(ops ; .arch aarch64 ; b.ne =>batched);
+    emit_load_u32(ops, 9, OPTIMIZED_POLL_BATCH);
+    emit_sp_str_x(ops, 9, poll_counter_slot);
     dynasm!(ops
         ; .arch aarch64
         ; ldr x17, [x20, THREAD_OFFSET]
@@ -4382,7 +4967,7 @@ fn emit_backedge_poll(
         ; cbnz w9, =>slow
         ; ldr x9, [x17, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET]
         ; ldr x10, [x9]
-        ; subs x10, x10, #1
+        ; subs x10, x10, OPTIMIZED_POLL_BATCH
         ; str x10, [x9]
         ; b.gt =>cont
         ; =>slow
@@ -4394,6 +4979,7 @@ fn emit_backedge_poll(
         ; blr x16
         ; cbnz x0, =>threw
         ; =>cont
+        ; =>batched
     );
 }
 
@@ -5068,7 +5654,9 @@ fn conversion_kind_at(
         .conversions()
         .iter()
         .find(|conversion| {
-            conversion.at_pc == instruction.pc && conversion.operand_index == operand_index
+            conversion.inline == instruction.inline
+                && conversion.at_pc == instruction.pc
+                && conversion.operand_index == operand_index
         })
         .map(|conversion| conversion.kind)
 }
@@ -5091,25 +5679,30 @@ fn emit_tagged_numeric_coercion(
             ))?;
             emit_load_tagged_location(ops, allocation.location(input), 9)?;
             emit_guard_number(ops, 9, deopt);
+            emit_store_tagged_location(
+                ops,
+                allocation.location(
+                    instruction
+                        .result
+                        .expect("eligibility checked numeric coercion result"),
+                ),
+                9,
+            )
         }
-        Representation::Int32 => {
-            emit_load_location(ops, allocation.location(input), 9)?;
-            emit_box_int32(ops, 9, 10);
-        }
-        Representation::Float64 => {
-            emit_load_fp_location(ops, allocation, allocation.location(input), FP_SCRATCH)?;
-            emit_box_double(ops, FP_SCRATCH, 9);
-        }
-    }
-    emit_store_tagged_location(
-        ops,
-        allocation.location(
-            instruction
-                .result
-                .expect("eligibility checked numeric coercion result"),
+        Representation::Int32 | Representation::Float64 => emit_move(
+            ops,
+            allocation,
+            Move {
+                src: allocation.location(input),
+                dst: allocation.location(
+                    instruction
+                        .result
+                        .expect("eligibility checked numeric coercion result"),
+                ),
+                conversion: None,
+            },
         ),
-        9,
-    )
+    }
 }
 
 fn emit_load_int_operand(

@@ -433,7 +433,7 @@ pub struct JitInlineCallee {
 /// This guard is shared by leaf inlining and compiler-generated method calls:
 /// both must re-read the current slot and prove the same callable before any
 /// effect.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JitMethodGuard {
     /// Method function id the slot identity check is keyed on.
     pub method_fid: u32,
@@ -450,15 +450,17 @@ pub struct JitMethodGuard {
 /// Carries the method's body plus the shared identity guard. Per body
 /// `LoadProperty`/`StoreProperty` byte-PC, the value byte offset within the
 /// decompressed receiver.
-/// Method identity is verified inline every call: the emitter chases the
-/// flat prototype handle once per
+/// Method identity is verified inline before body entry: the emitter chases
+/// the flat prototype handle once per
 /// [`JitMethodGuard::proto_chain`] entry,
 /// guards each hopped object's shape, reads the method slot at
 /// [`JitMethodGuard::method_value_byte`] from the final holder, and
 /// compares the resolved closure's `function_id` to
 /// [`JitMethodGuard::method_fid`]. A prototype-method reassignment or any
 /// shape change along the chain side-exits at the original method call before
-/// effects.
+/// effects. An optimizing backend may reuse that proof across iterations only
+/// after proving the receiver loop-invariant and the whole natural loop free
+/// of mutation and reentrant execution.
 #[derive(Debug, Clone)]
 pub struct JitInlineMethod {
     /// Authoritative method execution body owning operand side tables.

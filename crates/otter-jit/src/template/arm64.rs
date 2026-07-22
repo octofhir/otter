@@ -103,10 +103,6 @@ use crate::entry::{
 };
 use otter_vm::native_abi as abi;
 
-pub(crate) fn has_emit_eligible_inline_method(view: &JitCompileSnapshot) -> bool {
-    calls::has_emit_eligible_inline_method(view)
-}
-
 /// Boolean/nullish immediates as 32-bit `dynasm` operands.
 const VALUE_TRUE_IMM: u32 = VALUE_TRUE as u32;
 const VALUE_FALSE_IMM: u32 = VALUE_FALSE as u32;

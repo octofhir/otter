@@ -16,6 +16,9 @@
 //!   schema; this module owns no opcode classification table.
 //! - Renamed instructions retain the source and destination register identities
 //!   needed by later frame-state reconstruction.
+//! - A spliced method frame binds `LoadThis` to the caller's guarded receiver
+//!   through one synthetic SSA input; it never reads the outer native frame's
+//!   `this` slot.
 //! - Values are dense and deterministic in normal-edge block RPO, with block
 //!   head definitions before bytecode results.
 //!
@@ -38,7 +41,7 @@ use smallvec::SmallVec;
 use super::{
     cfg::{BlockId, ControlFlowGraph, Terminator},
     dom::{DomError, DominanceFrontier, DominatorTree},
-    inline::{InlineId, InlineTree},
+    inline::{InlineCallKind, InlineId, InlineTree},
 };
 
 /// Dense SSA value identity; every value is defined exactly once.
@@ -170,6 +173,8 @@ pub struct SsaFrame {
     pub register_count: u16,
     /// Formal parameter count of this frame's body.
     pub param_count: u16,
+    /// Caller value used by synthetic `LoadThis` inputs in a method frame.
+    pub this_value: Option<ValueId>,
 }
 
 /// Failure to construct or verify SSA form.
@@ -787,6 +792,7 @@ impl SsaFunction {
                 .map(|frame| SsaFrame {
                     register_count: frame.code_block.register_count,
                     param_count: frame.code_block.param_count,
+                    this_value: None,
                 })
                 .collect(),
         };
@@ -848,6 +854,21 @@ impl SsaFunction {
                             && let Some(call_site) =
                                 tree.frames[inline.0 as usize].call_site.as_ref()
                         {
+                            if let InlineCallKind::Method {
+                                receiver_register, ..
+                            } = call_site.kind
+                            {
+                                let receiver = stacks
+                                    [layout.variable(call_site.parent, receiver_register)]
+                                .last()
+                                .copied()
+                                .ok_or(SsaError::MissingReachingDefinition {
+                                    block: block_id,
+                                    pc: None,
+                                    register: receiver_register,
+                                })?;
+                                self.frames[inline.0 as usize].this_value = Some(receiver);
+                            }
                             for (parameter, &argument) in
                                 call_site.argument_registers.iter().enumerate()
                             {
@@ -897,6 +918,12 @@ impl SsaFunction {
                                         register,
                                     })?;
                                 inputs.push(value);
+                            }
+                            if self.blocks[block_index].instrs[instruction_index].op == Op::LoadThis
+                                && inline != InlineId::ROOT
+                                && let Some(this_value) = self.frames[inline.0 as usize].this_value
+                            {
+                                inputs.push(this_value);
                             }
                             let result = self.blocks[block_index].instrs[instruction_index].result;
                             self.blocks[block_index].instrs[instruction_index].inputs =
@@ -1206,7 +1233,14 @@ impl SsaFunction {
                 return Err(SsaError::InstructionLayoutMismatch { block: block_id });
             }
             for (instruction_index, instruction) in block.instrs.iter().enumerate() {
-                if instruction.input_registers.len() != instruction.inputs.len() {
+                let synthetic_this = instruction.op == Op::LoadThis
+                    && instruction.inline != InlineId::ROOT
+                    && instruction.input_registers.is_empty()
+                    && self.frames[instruction.inline.0 as usize]
+                        .this_value
+                        .is_some_and(|value| instruction.inputs.as_slice() == [value]);
+                if !synthetic_this && instruction.input_registers.len() != instruction.inputs.len()
+                {
                     return Err(SsaError::InputRegisterCountMismatch {
                         pc: instruction.pc,
                         inputs: instruction.inputs.len(),

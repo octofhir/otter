@@ -754,6 +754,67 @@ pub const STUB_STRING_CHAR_CODE_AT_LEAF: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusPair,
 );
 
+/// Leaf `String.prototype.codePointAt` over a string receiver and an integral
+/// index. Misses on a non-string receiver, a non-integral or out-of-range
+/// index, so the general path owns coercion and the `undefined` result.
+pub const STUB_STRING_CODE_POINT_AT_LEAF: RuntimeStubDescriptor = descriptor(
+    71,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::StatusPair,
+);
+
+/// Leaf `String.prototype.indexOf` over two string operands, searching from
+/// index zero. Misses when either operand is not a string.
+pub const STUB_STRING_INDEX_OF_LEAF: RuntimeStubDescriptor = descriptor(
+    72,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::StatusPair,
+);
+
+/// Leaf `String.prototype.includes` over two string operands, searching from
+/// index zero. Misses when either operand is not a string.
+pub const STUB_STRING_INCLUDES_LEAF: RuntimeStubDescriptor = descriptor(
+    73,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::StatusPair,
+);
+
+/// Leaf `String.prototype.startsWith` over two string operands, anchored at
+/// index zero. Misses when either operand is not a string.
+pub const STUB_STRING_STARTS_WITH_LEAF: RuntimeStubDescriptor = descriptor(
+    74,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::StatusPair,
+);
+
+/// Leaf `String.prototype.endsWith` over two string operands, anchored at the
+/// receiver's end. Misses when either operand is not a string.
+pub const STUB_STRING_ENDS_WITH_LEAF: RuntimeStubDescriptor = descriptor(
+    75,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::StatusPair,
+);
+
 /// Completes one full `Op::New` construct in the VM for a New site outside
 /// the compiled subset; the constructor body may run arbitrary JS.
 pub const STUB_JIT_CONSTRUCT: RuntimeStubDescriptor = descriptor(
@@ -1175,6 +1236,11 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         68 => "jit_deopt_stack_call",
         69 => "jit_resolve_direct_entry",
         70 => "string_char_code_at_leaf",
+        71 => "string_code_point_at_leaf",
+        72 => "string_index_of_leaf",
+        73 => "string_includes_leaf",
+        74 => "string_starts_with_leaf",
+        75 => "string_ends_with_leaf",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1251,6 +1317,11 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_DEOPT_STACK_CALL,
     STUB_JIT_RESOLVE_DIRECT_ENTRY,
     STUB_STRING_CHAR_CODE_AT_LEAF,
+    STUB_STRING_CODE_POINT_AT_LEAF,
+    STUB_STRING_INDEX_OF_LEAF,
+    STUB_STRING_INCLUDES_LEAF,
+    STUB_STRING_STARTS_WITH_LEAF,
+    STUB_STRING_ENDS_WITH_LEAF,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

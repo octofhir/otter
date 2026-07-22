@@ -311,6 +311,11 @@ impl ExecutionContext {
             {
                 instr.method_hint = match name {
                     "charCodeAt" => crate::jit::JitMethodHint::StringCharCodeAt,
+                    "codePointAt" => crate::jit::JitMethodHint::StringCodePointAt,
+                    "indexOf" => crate::jit::JitMethodHint::StringIndexOf,
+                    "includes" => crate::jit::JitMethodHint::StringIncludes,
+                    "startsWith" => crate::jit::JitMethodHint::StringStartsWith,
+                    "endsWith" => crate::jit::JitMethodHint::StringEndsWith,
                     "toString" => crate::jit::JitMethodHint::NumberToString,
                     _ => crate::jit::JitMethodHint::None,
                 };

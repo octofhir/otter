@@ -302,7 +302,7 @@ struct PreparedBytecodeFrame {
 }
 
 /// `(function_id, upvalues, this, new_target, derived_this_cell,
-/// eval_env)` resolved from a callable value for a bytecode call.
+/// eval_env, closure)` resolved from a callable value for a bytecode call.
 pub(crate) type BytecodeCallTargetParts = (
     u32,
     crate::frame_state::UpvalueSpine,
@@ -310,6 +310,7 @@ pub(crate) type BytecodeCallTargetParts = (
     Option<Value>,
     Option<crate::UpvalueCell>,
     Option<crate::eval_env::EvalEnvHandle>,
+    Option<crate::closure::JsClosure>,
 );
 
 #[derive(Clone)]
@@ -569,15 +570,19 @@ impl Interpreter {
                 None,
                 None,
                 None,
+                None,
             ));
         }
-        if let Some(c) = current.as_closure(heap) {
-            let function_id = c.function_id();
-            let (upvalues, bound_this, bound_new_target, bound_derived_this, eval_env) = heap
-                .read_payload(c.handle, |body| {
+        if let Some(handle) = current
+            .as_raw_gc()
+            .and_then(|raw| raw.checked_cast::<crate::closure::JsClosureBody>())
+        {
+            let (function_id, upvalues, bound_this, bound_new_target, bound_derived_this, eval_env) =
+                heap.read_payload(handle, |body| {
                     let ups: crate::frame_state::UpvalueSpine =
                         body.upvalues.clone().into_boxed_slice();
                     (
+                        body.call_header.function_id,
                         ups,
                         body.bound_this_option(),
                         body.bound_new_target_option(),
@@ -585,6 +590,7 @@ impl Interpreter {
                         body.eval_env_option(),
                     )
                 });
+            let c = crate::closure::JsClosure::from_parts(handle, function_id);
             let this_value = bound_this.unwrap_or(effective_this);
             return Ok((
                 function_id,
@@ -593,6 +599,7 @@ impl Interpreter {
                 bound_new_target,
                 bound_derived_this,
                 eval_env,
+                Some(c),
             ));
         }
         Err(VmError::NotCallable)
@@ -984,9 +991,8 @@ impl Interpreter {
     #[allow(clippy::too_many_arguments)]
     fn prepare_bytecode_call_frame_from_window(
         &mut self,
-        context: &ExecutionContext,
         stack: &ActivationStack,
-        function_id: u32,
+        function: &CodeBlock,
         parent_upvalues: UpvalueSpine,
         this_for_callee: Value,
         new_target_for_callee: Option<Value>,
@@ -996,9 +1002,6 @@ impl Interpreter {
         return_register: Option<u16>,
         async_state: Option<AsyncFrameState>,
     ) -> Result<PreparedBytecodeFrame, VmError> {
-        let function = context
-            .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
         let this_for_callee =
@@ -1034,7 +1037,7 @@ impl Interpreter {
             frame,
             is_generator: function.is_generator,
             is_async_generator: function.is_async_generator,
-            generator_function_id: function_id,
+            generator_function_id: function.id,
             callee_closure: None,
         };
         window_rollback.commit();
@@ -1144,19 +1147,6 @@ impl Interpreter {
     ) -> Result<bool, VmError> {
         let current = *callee;
         let effective_this = this_value;
-        if current.as_class_constructor().is_some() {
-            // §10.3.1 — a class constructor's [[Call]] always
-            // throws; only [[Construct]] may enter it.
-            return Err(self.err_type(
-                ("Class constructor cannot be invoked without 'new'".to_string()).into(),
-            ));
-        }
-        if current.is_bound_function() {
-            return Ok(false);
-        }
-        if !current.is_function() && !current.is_closure() {
-            return Ok(false);
-        }
         let (
             function_id,
             parent_upvalues,
@@ -1164,7 +1154,18 @@ impl Interpreter {
             new_target_for_callee,
             derived_this_cell,
             callee_eval_env,
-        ) = Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
+            callee_closure,
+        ) = match Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap) {
+            Ok(parts) => parts,
+            Err(_) if current.as_class_constructor().is_some() => {
+                // §10.3.1 — a class constructor's [[Call]] always throws;
+                // only [[Construct]] may enter it.
+                return Err(self.err_type(
+                    ("Class constructor cannot be invoked without 'new'".to_string()).into(),
+                ));
+            }
+            Err(_) => return Ok(false),
+        };
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -1189,9 +1190,8 @@ impl Interpreter {
             let args =
                 BytecodeArgumentWindow::from_operands(caller, operands, first_arg_operand, argc);
             self.prepare_bytecode_call_frame_from_window(
-                context,
                 stack,
-                function_id,
+                function,
                 parent_upvalues,
                 this_for_callee,
                 new_target_for_callee,
@@ -1206,7 +1206,7 @@ impl Interpreter {
         // activations. It records the exact invoked closure even when this
         // particular body never executes a named-SELF opcode.
         prepared.frame.self_value = current;
-        prepared.callee_closure = current.as_closure(&self.gc_heap);
+        prepared.callee_closure = callee_closure;
         self.push_prepared_bytecode_call_frame(stack, context, dst, prepared)?;
         Ok(true)
     }
@@ -1490,11 +1490,12 @@ impl Interpreter {
                 new_target_for_callee,
                 derived_this_cell,
                 callee_eval_env,
+                callee_closure,
             ) = Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
             return self.push_bytecode_call_frame(
                 stack,
                 context,
-                current.as_closure(&self.gc_heap),
+                callee_closure,
                 function_id,
                 parent_upvalues,
                 this_for_callee,
@@ -1585,11 +1586,12 @@ impl Interpreter {
             new_target_for_callee,
             derived_this_cell,
             callee_eval_env,
+            callee_closure,
         ) = Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
         self.push_bytecode_call_frame(
             stack,
             context,
-            current.as_closure(&self.gc_heap),
+            callee_closure,
             function_id,
             parent_upvalues,
             this_for_callee,
@@ -2783,7 +2785,7 @@ impl Interpreter {
         context: &ExecutionContext,
         roots: &SyncJsCallRoots,
     ) -> Result<Value, VmError> {
-        let (function_id, _, this_for_callee, _, _, _) = Self::bytecode_call_target_parts(
+        let (function_id, _, this_for_callee, _, _, _, _) = Self::bytecode_call_target_parts(
             roots.target(),
             roots.receiver_value(),
             &self.gc_heap,
@@ -2814,7 +2816,7 @@ impl Interpreter {
         // The promise allocation above can relocate closure-owned cells. Read
         // the target parts again from the registered target instead of using a
         // detached pre-allocation snapshot.
-        let (_, _, this_for_callee, _, _, _) = Self::bytecode_call_target_parts(
+        let (_, _, this_for_callee, _, _, _, _) = Self::bytecode_call_target_parts(
             roots.target(),
             roots.receiver_value(),
             &self.gc_heap,
@@ -2823,7 +2825,7 @@ impl Interpreter {
         let this_for_callee =
             self.this_for_bytecode_call_runtime_rooted(function, roots.receiver_value(), &[])?;
         roots.set_receiver(this_for_callee);
-        let (_, parent_upvalues, _, _, _, _) = Self::bytecode_call_target_parts(
+        let (_, parent_upvalues, _, _, _, _, _) = Self::bytecode_call_target_parts(
             roots.target(),
             roots.receiver_value(),
             &self.gc_heap,
@@ -2832,7 +2834,7 @@ impl Interpreter {
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
         // Building own upvalue cells can collect as well; refresh every
         // closure-owned optional handle before installing it on the frame.
-        let (_, _, _, new_target_for_callee, derived_this_cell, callee_eval_env) =
+        let (_, _, _, new_target_for_callee, derived_this_cell, callee_eval_env, _) =
             Self::bytecode_call_target_parts(
                 roots.target(),
                 roots.receiver_value(),

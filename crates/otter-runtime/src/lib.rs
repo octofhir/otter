@@ -5494,10 +5494,9 @@ fn source_path_package_type(
 pub(crate) fn map_graph_error(err: module_graph::GraphError) -> OtterError {
     match err {
         module_graph::GraphError::Interrupted => OtterError::Interrupted,
-        // Capability gating per ENGINE_REFACTOR_EXECUTION_PLAN
-        // §P2.1: surface capability denials with their own error
-        // code so embedders / CLI users can distinguish a missing
-        // permission from a genuinely unresolvable specifier.
+        // Surface capability denials with their own error code so embedders
+        // and CLI users can distinguish a missing permission from a genuinely
+        // unresolvable specifier.
         module_graph::GraphError::Loader(module_loader::LoaderError::CapabilityDenied {
             specifier,
             capability,

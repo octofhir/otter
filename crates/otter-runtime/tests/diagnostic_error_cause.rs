@@ -1,4 +1,4 @@
-//! `Error.cause` chain coverage for ENGINE_REFACTOR_EXECUTION_PLAN §P2.3.
+//! `Error.cause` chain coverage for structured runtime diagnostics.
 //!
 //! §20.5.6.1.1 InstallErrorCause: when `new Error(message, options)`
 //! is called with `options` containing a `cause` property, the

@@ -35,7 +35,7 @@
 //!
 //! # See also
 //! - [`crate::object`] — host-data storage on exotic slots.
-//! - `EXTENSION_API_PLAN.md` §3.2–§3.4 — the design.
+//! - `docs/site/src/content/docs/extensions/declarative-bindings.md`
 
 use std::any::{Any, TypeId};
 

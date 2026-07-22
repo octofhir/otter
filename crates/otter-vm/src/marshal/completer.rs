@@ -37,7 +37,7 @@
 //!
 //! # See also
 //! - [`crate::host_completion`] — the sink contract this rides.
-//! - `EXTENSION_API_PLAN.md` §3.5 / §6.6 — the design.
+//! - `docs/site/src/content/docs/extensions/declarative-bindings.md`
 
 use std::future::Future;
 use std::pin::Pin;

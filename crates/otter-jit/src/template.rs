@@ -30,7 +30,7 @@
 //!   exists.
 //!
 //! # See also
-//! - `JIT_REFACTOR_PLAN.md` — replacement-compiler direction and gates.
+//! - `OTTER_PLAN.md` — active engine direction and verification gates.
 //! - [`crate::entry`] — the shared entry ABI, typed lowering, and runtime
 //!   transitions this compiler consumes.
 

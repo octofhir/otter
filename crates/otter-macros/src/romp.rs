@@ -37,7 +37,7 @@
 //! # See also
 //! - [`crate::js_class`](super::js_class) — the class declarations
 //!   listed in `classes`.
-//! - `EXTENSION_API_PLAN.md` §5 — the design.
+//! - `docs/site/src/content/docs/extensions/declarative-bindings.md`
 
 use proc_macro::TokenStream;
 use proc_macro2::Span;

@@ -6,8 +6,7 @@
 //!   diagnostics (matches the `TypeError` / `RangeError` etc.
 //!   surface JS scripts observe).
 //! - [`DiagnosticCode`] / [`DiagnosticCategory`] — closed,
-//!   stable wire-format code set per
-//!   [`ENGINE_REFACTOR_EXECUTION_PLAN.md`] §P2.3.
+//!   stable wire-format code set.
 //! - [`StackFrame`] — runtime stack-frame metadata.
 //!
 //! # Invariants

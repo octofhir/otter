@@ -1,9 +1,8 @@
 //! P2.2 Slice D regression coverage: every `tokio::spawn` site in
 //! the active runtime/VM stack must be boundary-safe.
 //!
-//! ENGINE_REFACTOR_EXECUTION_PLAN §P2.2 acceptance:
-//! "No `tokio::spawn` of work that touches `Interpreter` / `Value` /
-//! `Local` outside the runtime scheduler boundary."
+//! No `tokio::spawn` work may touch `Interpreter`, `Value`, or `Local` outside
+//! the runtime scheduler boundary.
 //!
 //! Two layers protect that property:
 //!
@@ -19,7 +18,7 @@
 //!
 //! Adding a new spawn site requires updating this allowlist with a
 //! short reason, which forces the contributor to think about the
-//! VM/JS boundary the same way the plan demands.
+//! VM/JS boundary explicitly.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

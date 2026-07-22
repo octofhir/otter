@@ -1,5 +1,4 @@
-//! Stack-frame source mapping coverage for
-//! ENGINE_REFACTOR_EXECUTION_PLAN §P2.3.
+//! Stack-frame source-mapping coverage for structured diagnostics.
 //!
 //! Asserts that a runtime throw surfaces a [`StackFrame`] whose
 //! [`StackFrame::span`] is the **original source byte range** of

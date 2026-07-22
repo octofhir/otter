@@ -158,5 +158,4 @@ macros (`couch!`, `holt!`, …) emit static specs plus install glue that builds
 through the by-reference `bootstrap::*_with_value_roots` allocators — the object
 being assembled is rooted across every install allocation, so macro users
 inherit sound value construction and never touch raw handles. Your method bodies
-build values with `ctx.scope` (above). Design: `HANDLE_SCOPE_PLAN.md` (repo
-root).
+build values with `ctx.scope` (above).

@@ -1,5 +1,4 @@
-//! Snapshot guard for the closed [`otter_runtime::DiagnosticCode`]
-//! set per ENGINE_REFACTOR_EXECUTION_PLAN §P2.3.
+//! Snapshot guard for the closed [`otter_runtime::DiagnosticCode`] set.
 //!
 //! Asserts the wire-format code strings produced across the
 //! workspace (otter-syntax, otter-pm-manifest, otter-vm JSON

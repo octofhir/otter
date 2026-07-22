@@ -2,13 +2,10 @@
 //! and timer ordering across the runtime drain + run-until-idle
 //! boundary.
 //!
-//! ENGINE_REFACTOR_EXECUTION_PLAN §P2.2 acceptance:
-//! "Microtask + timer ordering test fixture passes deterministically."
-//! Slice A pins the microtask half; Slice B pins the timer half
-//! and the microtask-precedes-timer ordering rule from HTML
-//! §8.1.5.5. Both halves drain through the same runtime entry-
-//! point (`IsolateRunner::process_message` → `Runtime::fire_timer`
-//! / `Interpreter::drain_microtasks`).
+//! The fixture pins both the microtask half and the timer half, including the
+//! microtask-precedes-timer ordering rule from HTML §8.1.5.5. Both halves drain
+//! through the same runtime entry point (`IsolateRunner::process_message` →
+//! `Runtime::fire_timer` / `Interpreter::drain_microtasks`).
 //!
 //! The microtask queue itself lives on `otter_vm::Interpreter`
 //! because tasks carry parked frames + GC handles, which are

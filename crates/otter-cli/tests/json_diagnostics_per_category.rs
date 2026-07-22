@@ -1,8 +1,7 @@
-//! `otter --json <file>` per-category parity coverage for
-//! ENGINE_REFACTOR_EXECUTION_PLAN §P2.3.
+//! `otter --json <file>` per-category diagnostic parity coverage.
 //!
-//! Each fixture trips a diagnostic in a different plan-mandated
-//! category. The CLI is invoked with `--json`, stdout/stderr is
+//! Each fixture trips a diagnostic in a different runtime category. The CLI
+//! is invoked with `--json`, stdout/stderr is
 //! parsed via `serde_json`, and we assert the typed wire shape:
 //!
 //! - error envelope deserializes into a known

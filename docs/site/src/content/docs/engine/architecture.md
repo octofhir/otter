@@ -133,13 +133,12 @@ The shipped engine diagnostics are deliberately default-off:
 
 The current step trace and CPU sampler do not observe instructions executing
 inside native JIT bodies. Artifact bundles expose the compiled representation
-but do not sample live execution. Annotated assembly, JIT-aware sampling,
-Chrome/Perfetto async traces, and timeout ring-buffer dumps remain roadmap
-work.
+but do not sample live execution. JIT-aware sampling, Chrome/Perfetto async
+traces, and timeout ring-buffer dumps remain roadmap work.
 
 New debug/profiling features must stay default-off and use standard output
-formats where possible. The implementation order and artifact contract live
-in the repository root `DEBUG_TRACE_PROFILING_PLAN.md`.
+formats where possible. The active implementation order lives in the
+repository root `OTTER_PLAN.md`.
 
 Documentation for stable contributor workflows belongs in this book.
 Historical task and ADR files are not part of the living contributor docs.

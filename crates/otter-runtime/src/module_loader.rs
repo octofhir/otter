@@ -485,9 +485,9 @@ pub enum LoaderError {
     },
     /// The runtime denied the matching capability for this
     /// specifier. Currently surfaced for `http:` / `https:`
-    /// specifiers without [`crate::RuntimeCapability::Net`]; per
-    /// ENGINE_REFACTOR_EXECUTION_PLAN §P2.1, every privileged
-    /// remote / dynamic import requires an explicit capability.
+    /// specifiers without [`crate::RuntimeCapability::Net`]; every
+    /// privileged remote or dynamic import requires an explicit
+    /// capability.
     #[error("capability `{capability}` denied for `{specifier}`")]
     CapabilityDenied {
         /// Raw specifier the importer requested.
@@ -751,10 +751,8 @@ impl ModuleLoader {
         }
         // §16.2.1.5 HostLoadImportedModule — the host owns the
         // gating decision for privileged specifier shapes.
-        // `http:` / `https:` modules require `Net` per
-        // ENGINE_REFACTOR_EXECUTION_PLAN §P2.1; the loader
-        // surfaces a clean capability denial before any network
-        // I/O happens.
+        // `http:` / `https:` modules require `Net`; the loader surfaces a
+        // clean capability denial before any network I/O happens.
         if is_http_url(specifier) {
             self.check_network_capability(specifier, referrer)?;
             // Capability granted: an absolute http(s) specifier resolves to

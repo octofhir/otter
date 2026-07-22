@@ -64,16 +64,41 @@ is *zero* interpreted prelude and no JS shim evaluation cost.
 (`build.rs`) instead of evaluating the JS shims (`web_bootstrap.js`, the
 `crates/otter-node/src/*.js` set, …) per isolate.
 
-**Status.** Deprioritised on measurement: hello-world startup is ~30 ms wall total, so
-the shim-eval share cannot be a large absolute win. Revisit if startup becomes a target
-(edge/serverless) or if the shim set grows.
+**Status.** Measured, and the earlier deprioritisation rested on a wrong number. The
+share is *not* small — it is nearly all of startup:
+
+| phase (hello-world, best of 3) | cost |
+| --- | --- |
+| whole process | 18.5 ms |
+| `runtime_build` | 18.3 ms |
+| ↳ `with_web_apis` | 16.2 ms |
+| ↳↳ parse + compile of the 4 web shims (128 KB) | 6.2 ms |
+| ↳↳ shim execution + native class installs | ~10 ms |
+| `with_node_apis`, `with_otter_modules` | ~0.1 ms each (lazy) |
+
+What a build-time snapshot can actually remove is the 6.2 ms compile, not the ~10 ms of
+execution — that would need a serialized *heap* image, not serialized bytecode. And the
+saving is the compile cost minus rehydration: a `serde_json` round-trip of the same
+modules costs 5.3 ms, so JSON is a net loss; a compact binary encoding would have to
+land near 1.5 ms to make the item worth ~4.5 ms of an 18.5 ms startup.
+
+So the item stays open but is correctly ranked last: it needs a binary `BytecodeModule`
+encoding plus a `build.rs` codegen pipeline in `otter-web` to buy ~25 % of startup, and
+nothing else in the file is blocked on it. Note that the lazy alternative is closed: the
+lazy web-globals path was deliberately removed because a shim eval nested inside a
+native getter frame is a rooting hazard.
 
 The second half of this item — letting the JIT see through native builtins instead of
-crossing the bridge — has landed for the string probe family and collection leaf reads.
-Extending it further means Array `push`/`pop`, which needs either a mutating-leaf ABI
-(`*mut GcHeap`, currently every leaf takes `*const`) or a representation change: the
-dense element buffer is a `Vec`, whose length cannot be adjusted from machine code, so
-the `array_methods` feedback the VM already bakes stays unconsumed.
+crossing the bridge — has landed for the string probe family, collection leaf reads,
+and now dense Array `push` / `pop`. The blocker named here was real and is now gone: a
+`MutatingLeafValue2` signature (`*mut GcHeap`, class still `LeafNoAlloc`) carries `pop`,
+and `push` reuses the existing `AllocValue3` entry because appending may grow the
+buffer. Machine code guards the receiver as an `ArrayBody` with no exotic sidecar and
+reuses the prototype/builtin identity guards; the preconditions it cannot see (writable
+`length`, extensibility, an accessor override in range, the indexed-accessor protector)
+are re-checked by the entry, which misses so the site falls through to ordinary
+dispatch. The dense-buffer representation change turned out to be unnecessary — only the
+ABI was missing.
 
 ## 3. Deliberate memory-footprint target
 
@@ -85,8 +110,14 @@ as a **metric**: track baseline RSS of `otter` on a hello-world and treat regres
 first-class, since serverless/edge is a target surface. Cheap to add to the bench
 harness alongside the existing timing numbers.
 
-**Status.** Measured once — hello-world is ~40 MB max RSS, ~30 ms wall. Not yet wired
-into the bench harness as a tracked number.
+**Status.** Landed. `benchmarks/run-startup.sh` reports best-of-N wall time and peak RSS
+for `otter`, `node`, and `bun` on a hello-world, and `run-all.sh` runs it first (it is
+cheap). `measure_wall_and_rss` in `common.sh` reads both numbers out of `/usr/bin/time`
+itself, handling the BSD (`-l`, seconds + bytes) and GNU (`-v`, `h:mm:ss` + kilobytes)
+dialects, so the harness's own fork/exec is excluded.
+
+Current numbers on this machine: otter 20 ms / 38 MB, node 20 ms / 44 MB, bun 10 ms /
+20 MB. Startup wall is at parity with node; peak RSS is between bun and node.
 
 ## 4. Explicitly *not* adoptable
 
@@ -105,7 +136,13 @@ into the bench harness as a tracked number.
 
 1. ~~TS annotations as feedback seed for faster tier-up~~ — numeric half landed; the
    method-IC half needs a compile-time class → shape registry first.
-2. Array `push`/`pop` inlining — blocked on a mutating-leaf ABI or a dense-buffer
-   representation change.
-3. Build-time snapshot of builtin shim setup — startup only, small absolute win.
-4. RSS as a tracked benchmark metric.
+2. ~~Array `push`/`pop` inlining~~ — landed through a new mutating-leaf ABI; the
+   dense-buffer representation change proved unnecessary.
+3. Build-time snapshot of builtin shim setup — the only item still open. Worth ~4.5 ms
+   of an 18.5 ms startup, and only with a compact binary `BytecodeModule` encoding;
+   see the measured breakdown above before starting it.
+4. ~~RSS as a tracked benchmark metric~~ — landed as `benchmarks/run-startup.sh`.
+
+The next builtin worth seeing through the bridge, now that the mutating-leaf ABI exists,
+is the dense `shift` / `unshift` pair — same guard chain, same entry shapes, and the
+element move is already a VM helper.

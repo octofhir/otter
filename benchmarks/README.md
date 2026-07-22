@@ -92,12 +92,13 @@ activity. Stable-link health is explicit through
 `jit-to-rust-call-transitions`, and `jit-code-generations`; compare those with
 `jit-generated-calls` to distinguish native residency from compile churn.
 
-The same snapshot window reports `vm-reductions`, `vm-bytecode-calls`, and
-named-property load-IC hits, misses, and installs. One-time module diagnostics
-report bytecode compile time, exact serialized bytecode size, and static opcode
-count. These values are diagnostic rather than ranking inputs: counter totals
-cover all warmup and measured invocations, while compile and layout values
-describe the prepared module once.
+The same snapshot window reports `vm-reductions`, `vm-bytecode-calls`,
+named-property load-IC hits, misses, and installs, plus retained ordinary-call
+observations. Final mono/poly/megamorphic call-site counts describe the bounded
+feedback state. One-time module diagnostics report bytecode compile time, exact
+serialized bytecode size, and static opcode count. These values are diagnostic
+rather than ranking inputs: counter totals cover all warmup and measured
+invocations, while compile and layout values describe the prepared module once.
 
 ```bash
 cargo run --release -p otter-benchmark --features engine \

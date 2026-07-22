@@ -1102,6 +1102,7 @@ fn run_kernel(
     let jit_before = interpreter.jit_runtime_stats();
     let budget_before = interpreter.runtime_budget_stats();
     let property_before = interpreter.property_ic_stats();
+    let call_before = context.call_feedback_stats();
     for index in 0..warmup {
         let value = match run_kernel_invocation(&mut interpreter, &context, invocation_id) {
             Ok(value) => value,
@@ -1164,6 +1165,7 @@ fn run_kernel(
     measurements.jit_counters = jit_counter_deltas(jit_before, interpreter.jit_runtime_stats());
     let budget_after = interpreter.runtime_budget_stats();
     let property_after = interpreter.property_ic_stats();
+    let call_after = context.call_feedback_stats();
     measurements.diagnostics = vec![
         (
             "bytecode-compile-time",
@@ -1206,6 +1208,28 @@ fn run_kernel(
             property_after
                 .load_installs
                 .saturating_sub(property_before.load_installs),
+        ),
+        (
+            "call-feedback-retained-observations",
+            MetricUnit::Count,
+            call_after
+                .retained_observations
+                .saturating_sub(call_before.retained_observations),
+        ),
+        (
+            "call-feedback-monomorphic-sites",
+            MetricUnit::Count,
+            call_after.monomorphic_sites,
+        ),
+        (
+            "call-feedback-polymorphic-sites",
+            MetricUnit::Count,
+            call_after.polymorphic_sites,
+        ),
+        (
+            "call-feedback-megamorphic-sites",
+            MetricUnit::Count,
+            call_after.megamorphic_sites,
         ),
     ];
 

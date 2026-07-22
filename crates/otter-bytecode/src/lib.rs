@@ -2014,6 +2014,17 @@ pub struct Function {
     pub code: FunctionCode,
     /// `pc -> source span` table.
     pub spans: Vec<SpanEntry>,
+    /// Instruction PCs of arithmetic / comparison sites whose operands are
+    /// both statically annotated (or provably) TypeScript `number`.
+    ///
+    /// Advisory only. Annotations are unsound by construction, so the entry is
+    /// consumed exclusively where a representation guard already exists: it
+    /// seeds an otherwise-empty feedback cell so the optimizing tier can lower
+    /// the site on first compile instead of bailing for lack of a profile. A
+    /// wrong annotation costs one deoptimization, after which the recorded
+    /// feedback supersedes the seed permanently.
+    #[serde(default)]
+    pub number_hint_sites: Vec<u32>,
 }
 
 /// One tagged-template call site (§13.2.8.4): cooked strings

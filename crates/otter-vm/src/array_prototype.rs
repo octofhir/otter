@@ -4771,6 +4771,7 @@ mod tests {
             contains_direct_eval: false,
             code: code.into(),
             spans,
+            number_hint_sites: Vec::new(),
         }
     }
 
@@ -4816,6 +4817,7 @@ mod tests {
             contains_direct_eval: false,
             code: code.into(),
             spans,
+            number_hint_sites: Vec::new(),
         }
     }
 

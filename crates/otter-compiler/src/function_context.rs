@@ -163,6 +163,11 @@ pub(crate) struct FunctionContext {
     /// discard the `n` completions those finallys parked
     /// ([`otter_bytecode::Op::PopParkedFinally`]).
     pub(crate) finally_body_depth: u32,
+    /// Instruction PCs whose operands are statically `number` per the
+    /// TypeScript annotations in scope. Emitted onto
+    /// [`Function::number_hint_sites`] and consumed as an advisory seed for an
+    /// empty feedback cell — never as a proof.
+    pub(crate) number_hint_sites: Vec<u32>,
 }
 
 impl FunctionContext {
@@ -202,6 +207,7 @@ impl FunctionContext {
             completion_reg: None,
             completion_suppressed: false,
             finally_body_depth: 0,
+            number_hint_sites: Vec::new(),
         }
     }
 
@@ -364,6 +370,7 @@ impl FunctionContext {
                 is_const,
                 initialized: false,
                 fn_self_name: false,
+                type_hint: TypeHint::Unknown,
             },
         );
         Ok(storage)
@@ -455,8 +462,32 @@ impl FunctionContext {
                 is_const,
                 initialized: false,
                 fn_self_name: false,
+                type_hint: TypeHint::Unknown,
             },
         );
+    }
+
+    /// Attach a static type hint to the innermost binding of `name`.
+    ///
+    /// Silently does nothing when the name is not bound in this context: the
+    /// hint is advisory, so losing it is only a missed optimization.
+    pub(crate) fn annotate_binding(&mut self, name: &str, hint: TypeHint) {
+        if hint == TypeHint::Unknown {
+            return;
+        }
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(info) = scope.bindings.get_mut(name) {
+                info.type_hint = hint;
+                return;
+            }
+        }
+    }
+
+    /// Mark the next emitted instruction as statically `number`-typed on both
+    /// operands. Call immediately before the [`Self::emit`] it describes.
+    pub(crate) fn mark_number_hint_site(&mut self) {
+        let pc = self.next_pc();
+        self.number_hint_sites.push(pc);
     }
 
     pub(crate) fn lookup_binding(&self, name: &str) -> Option<BindingInfo> {

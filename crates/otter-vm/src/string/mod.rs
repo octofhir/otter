@@ -633,9 +633,7 @@ impl JsString {
     /// `>=` for two strings.
     #[must_use]
     pub fn compare_lex(self, other: JsString, heap: &GcHeap) -> std::cmp::Ordering {
-        let a = gc_body::to_utf16_vec(heap, self.handle);
-        let b = gc_body::to_utf16_vec(heap, other.handle);
-        a.cmp(&b)
+        gc_body::compare_string_bodies(heap, self.handle, other.handle)
     }
 }
 

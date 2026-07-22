@@ -419,6 +419,13 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     values. A zero-width
     `inlineInstruction` is an intentionally coalesced operation, not missing
     capture.
+  - Optimizing plain/method splices use ordinary `instruction` regions keyed by
+    `inlineFrame`; the caller call opcode owns the identity guard and the
+    callee frame owns its body operations. `deopt.json` records the complete
+    outermost-first caller/callee chain. A loop-invariant method guard keeps
+    its full identity check on the first iteration and uses a native-stack
+    receiver-body cache on later iterations; entry and OSR caches are distinct
+    activations and start empty.
   - Compiler-generated plain and method calls expose `directCallGuard`,
     `directCallFrameSetup`, `directCallNativeEntry`, `directCallReturn`,
     `directCallCleanup`, and `directCallEntryReject`; methods additionally

@@ -74,6 +74,11 @@ Wasm ES modules, and WASI.
 - [x] Template coverage reached all 163 synchronously completable active
   opcodes. The nine suspend/tail/module opcodes remain deliberate exact side
   exits until the optimizing tier owns suspend/resume and deopt.
+- [x] Optimizing monomorphic plain/method callee splicing landed with synthetic
+  `this`, multi-frame exact-PC deopt, loop-invariant method-guard caching,
+  numeric coercion residency, and bounded batched polling. On the controlled
+  M1 matrix it improved the method-call kernel by 1.56x and the five-kernel
+  geomean by 1.17x.
 
 ### 1.1 x86_64 Template Backend
 
@@ -87,8 +92,8 @@ Wasm ES modules, and WASI.
 Each lever lands independently with workload measurements plus a
 differential/GC-stress regression case.
 
-- [ ] Add profitable self-recursive, callee-splice, and polymorphic-method
-  inlining for measured Richards/DeltaBlue gaps.
+- [ ] Add profitable self-recursive and bounded polymorphic-method inlining for
+  measured Richards/DeltaBlue gaps.
 - [ ] Keep floating-point values resident where measurements justify it.
 - [ ] Add fused compare/branch templates.
 - [ ] Improve PIC probing and protector/version cells.
@@ -109,10 +114,10 @@ differential/GC-stress regression case.
 
 - [ ] Stabilize typed feedback epochs and bounded target/type distributions.
 - [ ] Complete dependency/protector invalidation contracts.
-- [ ] Complete the deopt frame-state schema, verifier, and interpreter-frame
+- [x] Complete the deopt frame-state schema, verifier, and interpreter-frame
   reification stub.
-- [ ] Enforce callee-identity guards for spliced calls.
-- [ ] Stabilize backend-independent typed SSA, CFG, liveness, register
+- [x] Enforce callee-identity guards for spliced calls.
+- [x] Stabilize backend-independent typed SSA, CFG, liveness, register
   allocation, and safepoint models.
 - [ ] Tune tier policy from real hot workloads.
 
@@ -124,9 +129,11 @@ compilation remain measurement-triggered, not prerequisites.
 
 ### 1.5 Optimizing Tier
 
-- [ ] Start with local numeric specialization and verified deopt.
-- [ ] Add inlining only after call-target stability and reconstructed-frame
-  tests are proven.
+- [x] Start with local numeric specialization and verified deopt.
+- [x] Add monomorphic plain and method inlining after call-target stability and
+  reconstructed-frame tests are proven.
+- [ ] Add loop constant propagation, LICM, dead scaffolding elimination, and
+  measured unrolling to close the remaining native instruction-count gap.
 - [ ] Choose Cranelift/custom emission from measurements rather than treating a
   backend as an architectural premise.
 - [ ] Own suspend/resume semantics for `TailCall`, generator/await/promise, and
@@ -241,4 +248,3 @@ cargo test -p otter-runtime runtime_task_runs_on_isolate_loop
 
 Smoke coverage includes both serve surfaces, a `Response` round trip, POST body
 stream identity, and stop/ref/unref liveness.
-

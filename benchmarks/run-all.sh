@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 #
-# Run the standard benchmark suite set. By default this runs V8 v7 and selected
-# Octane smoke workloads; full Octane/ARES-6/Web Tooling runs are intentionally
-# explicit because they can be very long.
+# Run the standard benchmark suite set. Startup cost (wall + peak RSS) runs
+# first and is cheap; it then runs V8 v7 and selected Octane smoke workloads.
+# Full Octane/ARES-6/Web Tooling runs are intentionally explicit because they
+# can be very long.
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+"$HERE/run-startup.sh"
 "$HERE/run-v8-v7.sh"
 "$HERE/run-octane.sh" richards crypto regexp splay
 

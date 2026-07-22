@@ -430,7 +430,9 @@ mod tests {
             .filter(|descriptor| {
                 !matches!(
                     descriptor.signature,
-                    RuntimeStubSignature::LeafValue2 | RuntimeStubSignature::AllocValue3
+                    RuntimeStubSignature::LeafValue2
+                        | RuntimeStubSignature::MutatingLeafValue2
+                        | RuntimeStubSignature::AllocValue3
                 )
             })
             .count();

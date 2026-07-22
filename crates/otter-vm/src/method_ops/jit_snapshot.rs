@@ -26,14 +26,28 @@ impl Interpreter {
     pub(crate) fn jit_array_method_feedback(
         &self,
         site: usize,
+        push_safepoint_id: crate::native_abi::SafepointId,
     ) -> Option<crate::jit::JitArrayMethod> {
+        use crate::native_abi::{NO_SAFEPOINT, STUB_ARRAY_POP_LEAF, STUB_ARRAY_PUSH_ALLOC};
+
         let ic = match self.feedback_directory.method_ic(site)? {
             MethodCallIc::Array(ic) => ic,
             MethodCallIc::Collection(_) => return None,
         };
-        let kind = match ic.tag {
-            crate::array_prototype::ArrayMethodTag::Pop => crate::jit::JitArrayMethodKind::Pop,
-            crate::array_prototype::ArrayMethodTag::Push => crate::jit::JitArrayMethodKind::Push,
+        // `pop` only rewrites the dense tail, so it runs as a mutating leaf
+        // with no safepoint; `push` may grow the buffer and needs the
+        // allocating entry with a precise root map.
+        let (kind, stub_id, safepoint_id) = match ic.tag {
+            crate::array_prototype::ArrayMethodTag::Pop => (
+                crate::jit::JitArrayMethodKind::Pop,
+                STUB_ARRAY_POP_LEAF.id,
+                NO_SAFEPOINT,
+            ),
+            crate::array_prototype::ArrayMethodTag::Push => (
+                crate::jit::JitArrayMethodKind::Push,
+                STUB_ARRAY_PUSH_ALLOC.id,
+                push_safepoint_id,
+            ),
             _ => return None,
         };
         let proto = self.realm_intrinsics.array_prototype?;
@@ -50,6 +64,8 @@ impl Interpreter {
             method_value_byte: compressed_slot_byte(ic.proto_slot),
             builtin_fn_addr,
             kind,
+            stub_id,
+            safepoint_id,
         })
     }
 

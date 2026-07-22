@@ -1323,6 +1323,10 @@ impl Interpreter {
     /// Bake dense-array `push` / `pop` method-call guard metadata so the
     /// baseline can splice an inline fast path for the site. Guard misses
     /// side-exit before method effects.
+    ///
+    /// `pop` runs as a mutating leaf and needs no root map. `push` may grow the
+    /// dense buffer, so its site reserves a frame-slot safepoint the same way
+    /// the allocating collection writes do.
     pub(crate) fn bake_array_methods(&self, view: &mut jit::JitCompileSnapshot) {
         for instr in &view.instructions {
             if instr.op(&view.code_block) != Op::CallMethodValue {
@@ -1331,9 +1335,35 @@ impl Interpreter {
             let Some(site) = instr.property_ic_site(&view.code_block) else {
                 continue;
             };
-            if let Some(feedback) = self.jit_array_method_feedback(site) {
-                view.array_methods.insert(instr.byte_pc, feedback);
+            let push_safepoint_id = view.safepoints.len() as native_abi::SafepointId;
+            let Some(feedback) = self.jit_array_method_feedback(site, push_safepoint_id) else {
+                continue;
+            };
+            match feedback.kind {
+                jit::JitArrayMethodKind::Pop => {
+                    if !crate::runtime_stubs::mutating_leaf_stub2_by_id(feedback.stub_id)
+                        .is_some_and(crate::runtime_stubs::MutatingLeafStub2::is_valid)
+                    {
+                        continue;
+                    }
+                }
+                jit::JitArrayMethodKind::Push => {
+                    if !crate::runtime_stubs::alloc_value_stub_by_id(feedback.stub_id)
+                        .is_some_and(|stub| stub.is_valid_for_safepoint(push_safepoint_id))
+                    {
+                        continue;
+                    }
+                    view.safepoints.insert(
+                        push_safepoint_id,
+                        native_abi::SafepointRecord::frame_slot_window(
+                            push_safepoint_id,
+                            native_abi::NO_FRAME_STATE,
+                            view.code_block.register_count,
+                        ),
+                    );
+                }
             }
+            view.array_methods.insert(instr.byte_pc, feedback);
         }
     }
 

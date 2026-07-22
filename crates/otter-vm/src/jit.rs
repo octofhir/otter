@@ -387,6 +387,12 @@ pub struct JitArrayMethod {
     pub builtin_fn_addr: usize,
     /// Which builtin this site resolved to.
     pub kind: JitArrayMethodKind,
+    /// Typed VM entry generated code calls once every guard holds: a mutating
+    /// leaf for `pop`, an allocating entry for `push`.
+    pub stub_id: crate::native_abi::RuntimeStubId,
+    /// Safepoint to publish for the allocating `push` entry.
+    /// [`crate::native_abi::NO_SAFEPOINT`] for the non-allocating `pop` leaf.
+    pub safepoint_id: crate::native_abi::SafepointId,
 }
 
 /// JIT-readable guard for primitive prototype builtin calls.

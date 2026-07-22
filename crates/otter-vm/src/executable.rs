@@ -1,16 +1,16 @@
 //! Authoritative immutable CodeBlock execution representation.
 //!
 //! `otter-bytecode` owns the compiler/debug DTO shape. The VM owns this
-//! compact view so hot dispatch reads opcodes, schema-typed operand words, and
-//! named-property IC sites directly while byte coordinates stay cold.
+//! compact view so hot dispatch reads opcodes, verified operand words, and
+//! named-property IC sites from one record while byte coordinates stay cold.
 //!
 //! # Contents
 //! - [`ExecutableModuleBuilder`] — transient builder over compiler bytecode.
 //! - [`ExecutableModule`] — VM-owned frozen function table.
 //! - [`CodeBlock`] — one verified function body: immutable wordcode/control
 //!   flow plus dense advisory feedback cells keyed by logical PC.
-//! - [`CodeBlockInstruction`] — compact site identity selecting one wordcode
-//!   record and its VM-local IC metadata.
+//! - [`CodeBlockInstruction`] — the sole VM execution record: opcode, verified
+//!   operand words, canonical PC, and VM-local IC metadata.
 //!
 //! # Invariants
 //! - `frame.pc` is the dense instruction index into `CodeBlock::code`.
@@ -18,11 +18,12 @@
 //!   hot instruction records carry the canonical logical instruction PC.
 //! - Cold byte PCs are a one-way logical-PC source/profiling map; execution has
 //!   no byte-PC-to-instruction reverse lookup.
-//! - Operand payloads are untagged 32-bit words. Their kinds come exclusively
-//!   from the opcode schema and are decoded through [`CodeBlock`] accessors.
-//! - Up to four operand words live in the authoritative wordcode record. Any
-//!   longer instruction uses the CodeBlock-owned overflow table; site metadata
-//!   owns neither operand storage nor reference counts.
+//! - Operand payloads are untagged 32-bit words verified against the opcode
+//!   schema while the CodeBlock is built. Typed hot accessors read them without
+//!   repeating schema or function-table lookup.
+//! - Up to four operand words live in the execution record. Any longer
+//!   instruction uses the CodeBlock-owned overflow table; no parallel active
+//!   wordcode array or per-instruction reference count remains.
 //! - Branch-class `Imm32` operands hold instruction-index deltas relative to
 //!   the next instruction. `NO_HANDLER_OFFSET` is preserved for absent
 //!   try-handler slots by the serialized verifier.
@@ -40,7 +41,7 @@ pub(crate) mod code_block_cfg;
 
 use otter_bytecode::{
     ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Function, FunctionCode,
-    FunctionCodeBuilder, Op, Operand, SpanEntry, WordInstruction,
+    FunctionCodeBuilder, Op, Operand, SpanEntry,
     encoding::{
         FunctionLayout, layout_wordcode_function, measure_wordcode_function,
         translate_spans_to_byte_pcs,
@@ -338,15 +339,18 @@ impl CodeBlock {
             .expect("test bytecode size fits the schema")
             .total_bytes;
         let byte_pcs: Vec<_> = instructions.iter().map(|instr| instr.byte_pc).collect();
+        let mut overflow_operand_words = Vec::new();
         let code: Vec<_> = instructions
             .iter()
             .enumerate()
             .map(|(word_index, instr)| {
-                CodeBlockInstruction::from_word_index(
-                    word_index as u32,
+                CodeBlockInstruction::from_wordcode(
+                    &wordcode,
+                    word_index,
                     id,
                     instr.instruction_pc,
                     NO_PROPERTY_IC_SITE,
+                    &mut overflow_operand_words,
                 )
             })
             .collect();
@@ -377,7 +381,7 @@ impl CodeBlock {
             direct_eval_bindings: Box::new([]),
             contains_direct_eval: false,
             code: code.into_boxed_slice(),
-            wordcode,
+            overflow_operand_words: overflow_operand_words.into_boxed_slice(),
             bytecode_byte_len,
             control_flow,
             feedback,
@@ -475,16 +479,16 @@ impl CodeBlock {
             .collect()
     }
 
-    /// Opcode from the authoritative wordcode record.
+    /// Opcode from the active VM execution record.
     #[must_use]
     pub fn op(&self, instr: &CodeBlockInstruction) -> Op {
-        self.word_instruction(instr).op
+        instr.op
     }
 
     /// Opcode at one canonical instruction index.
     #[must_use]
     pub fn op_at(&self, index: usize) -> Option<Op> {
-        self.wordcode.get(index).map(|instruction| instruction.op)
+        self.code.get(index).map(|instruction| instruction.op)
     }
 
     /// Exact encoded byte length of this function's bytecode stream.
@@ -532,21 +536,21 @@ impl CodeBlock {
     /// Number of schema-typed operands on this instruction.
     #[must_use]
     pub fn operand_count(&self, instr: &CodeBlockInstruction) -> usize {
-        self.word_instruction(instr).operand_count()
+        instr.operand_count as usize
     }
 
     /// Whether every operand word lives in the instruction record.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn operands_are_inline(&self, instr: &CodeBlockInstruction) -> bool {
-        self.word_instruction(instr).operands_are_inline()
+        instr.operand_count as usize <= instr.inline_operand_words.len()
     }
 
     /// Borrowed schema-decoded operand view with no materialisation.
     #[must_use]
     pub const fn operand_view<'a>(&'a self, instr: &'a CodeBlockInstruction) -> OperandView<'a> {
         OperandView {
-            source: OperandViewSource::Wordcode {
+            source: OperandViewSource::Execution {
                 code_block: self,
                 instr,
             },
@@ -556,16 +560,20 @@ impl CodeBlock {
     /// One schema-typed operand.
     #[must_use]
     pub fn operand(&self, instr: &CodeBlockInstruction, index: usize) -> Option<Operand> {
-        self.wordcode.operand(self.word_instruction(instr), index)
+        let word = self.operand_word(instr, index)?;
+        let kind = otter_bytecode::opcode_schema::operand_kind_at(instr.op, index)?;
+        otter_bytecode::opcode_schema::decode_operand_word(kind, word)
     }
 
     /// Decode one register operand.
     #[must_use]
     pub fn register(&self, instr: &CodeBlockInstruction, index: usize) -> Option<u16> {
-        match self.operand(instr, index) {
-            Some(Operand::Register(reg)) => Some(reg),
-            _ => None,
-        }
+        let word = self.operand_word(instr, index)?;
+        debug_assert_eq!(
+            otter_bytecode::opcode_schema::operand_kind_at(instr.op, index),
+            Some(otter_bytecode::opcode_schema::OperandKind::Register)
+        );
+        u16::try_from(word).ok()
     }
 
     /// Decode the common `dst, lhs, rhs` register triple.
@@ -581,24 +589,36 @@ impl CodeBlock {
     /// Decode one constant-pool index operand.
     #[must_use]
     pub fn const_index(&self, instr: &CodeBlockInstruction, index: usize) -> Option<u32> {
-        match self.operand(instr, index) {
-            Some(Operand::ConstIndex(value)) => Some(value),
-            _ => None,
-        }
+        let word = self.operand_word(instr, index)?;
+        debug_assert_eq!(
+            otter_bytecode::opcode_schema::operand_kind_at(instr.op, index),
+            Some(otter_bytecode::opcode_schema::OperandKind::ConstIndex)
+        );
+        Some(word)
     }
 
     /// Decode one signed immediate operand.
     #[must_use]
     pub fn imm32(&self, instr: &CodeBlockInstruction, index: usize) -> Option<i32> {
-        match self.operand(instr, index) {
-            Some(Operand::Imm32(value)) => Some(value),
-            _ => None,
-        }
+        let word = self.operand_word(instr, index)?;
+        debug_assert_eq!(
+            otter_bytecode::opcode_schema::operand_kind_at(instr.op, index),
+            Some(otter_bytecode::opcode_schema::OperandKind::Imm32)
+        );
+        Some(word as i32)
     }
 
-    fn word_instruction(&self, instr: &CodeBlockInstruction) -> &WordInstruction {
-        debug_assert_eq!(instr.code_block_id(), self.id);
-        &self.wordcode[instr.word_index as usize]
+    #[inline]
+    fn operand_word(&self, instr: &CodeBlockInstruction, index: usize) -> Option<u32> {
+        if index >= instr.operand_count as usize {
+            return None;
+        }
+        if instr.operand_count as usize <= instr.inline_operand_words.len() {
+            return instr.inline_operand_words.get(index).copied();
+        }
+        self.overflow_operand_words
+            .get(instr.inline_operand_words[0] as usize + index)
+            .copied()
     }
 }
 
@@ -613,7 +633,7 @@ pub struct OperandView<'a> {
 
 #[derive(Clone, Copy)]
 enum OperandViewSource<'a> {
-    Wordcode {
+    Execution {
         code_block: &'a CodeBlock,
         instr: &'a CodeBlockInstruction,
     },
@@ -626,7 +646,7 @@ impl<'a> OperandView<'a> {
     #[must_use]
     pub fn len(self) -> usize {
         match self.source {
-            OperandViewSource::Wordcode { code_block, instr } => code_block.operand_count(instr),
+            OperandViewSource::Execution { code_block, instr } => code_block.operand_count(instr),
             #[cfg(test)]
             OperandViewSource::Decoded(decoded) => decoded.len(),
         }
@@ -642,7 +662,7 @@ impl<'a> OperandView<'a> {
     #[must_use]
     pub fn get(self, index: usize) -> Option<Operand> {
         match self.source {
-            OperandViewSource::Wordcode { code_block, instr } => code_block.operand(instr, index),
+            OperandViewSource::Execution { code_block, instr } => code_block.operand(instr, index),
             #[cfg(test)]
             OperandViewSource::Decoded(decoded) => decoded.get(index).copied(),
         }
@@ -785,10 +805,10 @@ pub struct CodeBlock {
     /// this function contains a direct eval call site (the binding
     /// table may still be empty).
     pub(crate) contains_direct_eval: bool,
-    /// Hot instruction stream indexed directly by the frame's canonical PC.
+    /// Sole hot instruction stream indexed directly by the frame's canonical PC.
     pub code: Box<[CodeBlockInstruction]>,
-    /// Authoritative schema-typed execution wordcode shared by VM and JIT.
-    wordcode: FunctionCode,
+    /// Operand words for uncommon instructions wider than four operands.
+    overflow_operand_words: Box<[u32]>,
     /// Exact encoded byte length computed with the authoritative layout.
     bytecode_byte_len: u32,
     /// Precomputed logical-PC block, loop, and exception-region tables.
@@ -828,7 +848,7 @@ impl Clone for CodeBlock {
             direct_eval_bindings: self.direct_eval_bindings.clone(),
             contains_direct_eval: self.contains_direct_eval,
             code: self.code.clone(),
-            wordcode: self.wordcode.clone(),
+            overflow_operand_words: self.overflow_operand_words.clone(),
             bytecode_byte_len: self.bytecode_byte_len,
             control_flow: self.control_flow.clone(),
             feedback: self.feedback.clone(),
@@ -857,8 +877,8 @@ impl CodeBlock {
                 function.name, function.id
             )
         });
-        let wordcode = function.code.clone();
-        let control_flow = CodeBlockControlFlow::from_verified_wordcode(&wordcode);
+        let control_flow = CodeBlockControlFlow::from_verified_wordcode(&function.code);
+        let mut overflow_operand_words = Vec::new();
         let code = function
             .code
             .iter()
@@ -880,11 +900,13 @@ impl CodeBlock {
                     }
                     _ => NO_PROPERTY_IC_SITE,
                 };
-                CodeBlockInstruction::from_word_index(
-                    idx as u32,
+                CodeBlockInstruction::from_wordcode(
+                    &function.code,
+                    idx,
                     function.id,
                     idx as u32,
                     property_ic_site,
+                    &mut overflow_operand_words,
                 )
             })
             .collect::<Vec<_>>()
@@ -952,7 +974,7 @@ impl CodeBlock {
                 .collect(),
             contains_direct_eval: function.contains_direct_eval,
             code,
-            wordcode,
+            overflow_operand_words: overflow_operand_words.into_boxed_slice(),
             bytecode_byte_len: code_byte_len,
             control_flow,
             feedback,
@@ -992,43 +1014,76 @@ pub(crate) struct ExecMappedArgumentBinding {
     pub(crate) storage: ArgumentBindingStorage,
 }
 
-/// Dense VM site metadata selecting one authoritative wordcode instruction.
-///
-/// This record owns no opcode/operand payload and no `Arc`; the owning
-/// [`CodeBlock`] resolves `word_index` against its single [`FunctionCode`].
+/// Dense VM execution record built once from verified compiler wordcode.
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CodeBlockInstruction {
-    /// Dense index into the owning CodeBlock wordcode; tests may carry a distinct PC.
-    word_index: u32,
-    /// Owning CodeBlock identity used to resolve runtime function state.
-    code_block_id: u32,
     /// Canonical dense instruction index used by interpreter and JIT CFG.
     pub instruction_pc: u32,
     /// Dense module-local property IC site id for named property ops.
     property_ic_site: u32,
+    /// Owning CodeBlock id for cold context-resolving helpers.
+    code_block_id: u32,
+    /// Common operand payloads, already schema-verified.
+    inline_operand_words: [u32; 4],
+    /// Opcode dispatched directly by the interpreter and read by JIT planning.
+    op: Op,
+    /// Number of verified operand words.
+    operand_count: u8,
+    reserved: [u8; 2],
 }
 
-const _: [(); 16] = [(); std::mem::size_of::<CodeBlockInstruction>()];
+const _: [(); 32] = [(); std::mem::size_of::<CodeBlockInstruction>()];
 const _: [(); 4] = [(); std::mem::align_of::<CodeBlockInstruction>()];
 
 impl CodeBlockInstruction {
-    pub(crate) fn from_word_index(
-        word_index: u32,
+    fn from_wordcode(
+        code: &FunctionCode,
+        word_index: usize,
         code_block_id: u32,
         instruction_pc: u32,
         property_ic_site: u32,
+        overflow_operand_words: &mut Vec<u32>,
     ) -> Self {
+        let source = &code[word_index];
+        let operand_count = source.operand_count();
+        let mut inline_operand_words = [0; 4];
+        if operand_count <= inline_operand_words.len() {
+            for (index, slot) in inline_operand_words
+                .iter_mut()
+                .take(operand_count)
+                .enumerate()
+            {
+                *slot = operand_payload(
+                    code.operand(source, index)
+                        .expect("verified wordcode operand must decode"),
+                );
+            }
+        } else {
+            let offset = u32::try_from(overflow_operand_words.len())
+                .expect("executable operand table exceeds u32");
+            inline_operand_words[0] = offset;
+            overflow_operand_words.extend((0..operand_count).map(|index| {
+                operand_payload(
+                    code.operand(source, index)
+                        .expect("verified wordcode operand must decode"),
+                )
+            }));
+        }
         Self {
-            word_index,
-            code_block_id,
             instruction_pc,
             property_ic_site,
+            code_block_id,
+            inline_operand_words,
+            op: source.op,
+            operand_count: u8::try_from(operand_count)
+                .expect("executable operand count exceeds u8"),
+            reserved: [0; 2],
         }
     }
 
-    /// Owning CodeBlock identity.
+    /// Owning CodeBlock identity for cold context-resolving helpers.
     #[must_use]
     pub(crate) const fn code_block_id(&self) -> u32 {
         self.code_block_id
@@ -1038,6 +1093,15 @@ impl CodeBlockInstruction {
     #[must_use]
     pub fn property_ic_site(&self) -> Option<usize> {
         (self.property_ic_site != NO_PROPERTY_IC_SITE).then_some(self.property_ic_site as usize)
+    }
+}
+
+#[inline]
+const fn operand_payload(operand: Operand) -> u32 {
+    match operand {
+        Operand::Register(value) => value as u32,
+        Operand::ConstIndex(value) => value,
+        Operand::Imm32(value) => value as u32,
     }
 }
 
@@ -1114,7 +1178,8 @@ mod tests {
 
         assert_eq!(function.op(instr), Op::Add);
         assert!(function.operands_are_inline(instr));
-        assert_eq!(std::mem::size_of::<WordInstruction>(), 24);
+        assert_eq!(std::mem::size_of::<otter_bytecode::WordInstruction>(), 24);
+        assert_eq!(std::mem::size_of::<CodeBlockInstruction>(), 32);
         assert_eq!(function.register(instr, 0), Some(0));
         assert_eq!(function.register(instr, 1), Some(1));
         assert_eq!(function.register(instr, 2), Some(2));

@@ -15,22 +15,20 @@ the corresponding flag is present.
 
 ## Capture a run
 
-Build the release CLI, then run a reproducible tier:
+Build the release CLI, then run the production tier policy:
 
 ```sh
 cargo build --release -p otter-cli
 
 target/release/otter \
-  --jit-tier=template \
   --jit-events=jit-events.json \
   --jit-artifacts=jit-artifacts \
   run examples/jit_bench.js
 ```
 
-Use `--jit-tier=template` to isolate template lowering,
-`--jit-tier=production-tiered` to include the optimizing tier, and
-`--jit-tier=interpreter` as the no-native-code oracle. A diagnostics target is
-never implied by the tier.
+Normal CLI execution always includes the optimizing tier with template
+fallback. Use `--jitless` as the no-native-code oracle. Diagnostics remain
+default-off in either mode.
 
 `--jit-events` without a value defaults to `otter-jit-events.json`.
 `--jit-artifacts` without a value defaults to `otter-jit-artifacts`. Both flags
@@ -443,7 +441,7 @@ must not be used for cross-process comparison or as an executable pointer.
 Use this order when a hot function produces a wrong result or unexpected
 fallback:
 
-1. Re-run with `--jit-tier=interpreter` to establish the bytecode oracle.
+1. Re-run with `--jitless` to establish the bytecode oracle.
 2. Capture `--jit-events` and find the function's `compilePrepared`,
    call plan/final-lowering events, `compileFinished`, OSR, bail, or deopt
    records. For a static-native site, compare `staticNativeCallPlan` with

@@ -336,10 +336,9 @@ Pure Rust implementation - no external JavaScript engine dependencies.
 ## Debugging
 
 - Long-running scripts/servers: use `--timeout 0` (disables the timeout).
-- Reproducible tier selection: use
-  `--jit-tier=production-tiered`, `--jit-tier=template`, or
-  `--jit-tier=interpreter`. Legacy JIT environment variables are translated
-  only at the CLI boundary.
+- Normal CLI execution always uses the production tier policy. `--jitless`
+  selects the existing interpreter-only runtime path for semantic-oracle and
+  no-native-code comparisons; there is no user-facing tier selector.
 - When editing embedded JS shims: they are compiled in via `include_str!` and passed through `CString::new(...)` (no `\0` bytes).
 - Bytecode disassembly (compile and exit):
   - Text: `cargo run -p otter-cli -- --dump-bytecode <file>`
@@ -352,9 +351,9 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     its format, and native JIT bodies do not currently emit step events.
 - Structured JIT events:
   - Default artifact path:
-    `cargo run -p otter-cli -- --jit-events --jit-tier=template run <file>`
+    `cargo run -p otter-cli -- --jit-events run <file>`
   - Explicit path:
-    `cargo run -p otter-cli -- --jit-events=/tmp/otter-jit-events.json --jit-tier=production-tiered run <file>`
+    `cargo run -p otter-cli -- --jit-events=/tmp/otter-jit-events.json run <file>`
   - `--jit-events=-` writes the JSON report to stderr. Prefer a file when the
     program itself uses stderr or when `--json` is active.
   - The current report contains typed compile,
@@ -373,9 +372,9 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     report delivery; no empty artifact is fabricated in that case.
 - JIT compile artifacts:
   - Default directory:
-    `cargo run -p otter-cli -- --jit-artifacts --jit-tier=template run <file>`
+    `cargo run -p otter-cli -- --jit-artifacts run <file>`
   - Explicit directory:
-    `cargo run -p otter-cli -- --jit-artifacts=/tmp/otter-jit-artifacts --jit-tier=production-tiered run <file>`
+    `cargo run -p otter-cli -- --jit-artifacts=/tmp/otter-jit-artifacts run <file>`
   - Combine `--jit-events=<path>` and `--jit-artifacts=<directory>`;
     `codeObjectId` joins a successful compile event to its bundle manifest.
   - The artifact target must not already exist. Under the cooperative
@@ -426,6 +425,11 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     its full identity check on the first iteration and uses a native-stack
     receiver-body cache on later iterations; entry and OSR caches are distinct
     activations and start empty.
+  - Side-effect-free optimizing loops may version invariant property reads.
+    Activation requires every site to produce an own-data Number IC hit in one
+    complete iteration. Any miss, accessor/proxy path, or non-number keeps the
+    original property operation; cached slots contain no GC references and are
+    reset on every non-backedge loop entry and OSR activation.
   - Compiler-generated plain and method calls expose `directCallGuard`,
     `directCallFrameSetup`, `directCallNativeEntry`, `directCallReturn`,
     `directCallCleanup`, and `directCallEntryReject`; methods additionally

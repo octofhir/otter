@@ -979,10 +979,10 @@ impl Interpreter {
     ///
     /// Rather than reproduce the call's frame setup — the upvalue spine, `this`,
     /// argument binding, the register window — this rewinds the caller to its
-    /// call and runs the interpreter's own `Op::Call` path over the restored
-    /// window. The frame that comes out is by construction the frame a real call
-    /// would have produced, including the advanced caller PC and the return
-    /// register the callee's eventual return writes through.
+    /// call and runs the interpreter's own ordinary- or method-call path over
+    /// the restored window. The frame that comes out is by construction the
+    /// frame a real call would have produced, including the advanced caller PC,
+    /// exact method receiver, and return destination.
     ///
     /// The frame is then fast-forwarded to `callee_pc`, the instruction the
     /// exit names, and its register-window base is returned so emitted code can
@@ -990,7 +990,8 @@ impl Interpreter {
     ///
     /// # Safety
     /// `stack`'s top frame must be the caller, with its registers already
-    /// restored, and `call_pc` must name an `Op::Call` in the caller's body.
+    /// restored, and `call_pc` must name an `Op::Call` or
+    /// `Op::CallMethodValue` in the caller's body.
     pub unsafe fn jit_deopt_reify_inlined_frame(
         &mut self,
         context: &ExecutionContext,
@@ -1006,12 +1007,16 @@ impl Interpreter {
         let instruction = code_block
             .instr_at_index(call_pc as usize)
             .ok_or(VmError::InvalidOperand)?;
-        if code_block.op(instruction) != otter_bytecode::Op::Call {
-            return Err(VmError::InvalidOperand);
-        }
+        let op = code_block.op(instruction);
         stack[caller_index].pc = call_pc;
         let operands = code_block.operand_view(instruction);
-        self.do_call(stack, context, operands)?;
+        match op {
+            otter_bytecode::Op::Call => self.do_call(stack, context, operands)?,
+            otter_bytecode::Op::CallMethodValue => {
+                self.do_call_method_value(stack, context, operands)?;
+            }
+            _ => return Err(VmError::InvalidOperand),
+        }
         // A bytecode callee is now on top; a native or otherwise non-bytecode
         // callee would have completed in place, which the identity guard at the
         // spliced call site rules out.

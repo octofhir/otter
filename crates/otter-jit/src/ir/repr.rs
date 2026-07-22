@@ -12,8 +12,9 @@
 //! # Invariants
 //! - Representations widen monotonically as `Int32 < Float64 < Tagged`.
 //! - Phi representations are the least upper bound of all incoming values.
-//! - `LoadLocal` / `StoreLocal` preserve their input representation; local
-//!   bytecode moves never force an otherwise numeric SSA value to be boxed.
+//! - `LoadLocal` / `StoreLocal` and numeric-proven `ToPrimitive` / `ToNumeric`
+//!   preserve their input representation; compiler scaffolding never forces
+//!   an otherwise numeric SSA value to be boxed.
 //! - Speculative numeric representations require arithmetic feedback from the
 //!   immutable compile snapshot.
 //! - Conversions are complete, unique, and ordered by canonical PC and operand.
@@ -211,7 +212,7 @@ impl ReprMap {
                 ValueDef::Phi { .. }
                 | ValueDef::InlineResult { .. }
                 | ValueDef::Op {
-                    op: Op::LoadLocal | Op::StoreLocal,
+                    op: Op::LoadLocal | Op::StoreLocal | Op::ToPrimitive | Op::ToNumeric,
                     ..
                 } => Representation::Int32,
                 _ => selected_non_phi_representation(tree, &value.def),
@@ -228,7 +229,7 @@ impl ReprMap {
                         })
                     }
                     ValueDef::Op {
-                        op: Op::LoadLocal | Op::StoreLocal,
+                        op: Op::LoadLocal | Op::StoreLocal | Op::ToPrimitive | Op::ToNumeric,
                         inputs,
                         ..
                     } if inputs.len() == 1 => reprs[inputs[0].0 as usize],
@@ -248,7 +249,10 @@ impl ReprMap {
         let mut conversions = Vec::new();
         for block in &ssa.blocks {
             for instruction in &block.instrs {
-                let required = if matches!(instruction.op, Op::LoadLocal | Op::StoreLocal) {
+                let required = if matches!(
+                    instruction.op,
+                    Op::LoadLocal | Op::StoreLocal | Op::ToPrimitive | Op::ToNumeric
+                ) {
                     reprs[instruction
                         .result
                         .expect("local moves have one SSA result")
@@ -330,7 +334,7 @@ impl ReprMap {
                 def => {
                     let expected = match def {
                         ValueDef::Op {
-                            op: Op::LoadLocal | Op::StoreLocal,
+                            op: Op::LoadLocal | Op::StoreLocal | Op::ToPrimitive | Op::ToNumeric,
                             inputs,
                             ..
                         } if inputs.len() == 1 => self.representation(inputs[0]),
@@ -375,7 +379,10 @@ impl ReprMap {
 
         for block in &ssa.blocks {
             for instruction in &block.instrs {
-                let required = if matches!(instruction.op, Op::LoadLocal | Op::StoreLocal) {
+                let required = if matches!(
+                    instruction.op,
+                    Op::LoadLocal | Op::StoreLocal | Op::ToPrimitive | Op::ToNumeric
+                ) {
                     self.representation(
                         instruction.result.expect("local moves have one SSA result"),
                     )
@@ -875,6 +882,47 @@ mod tests {
             map.representation(op_value_at(&ssa, 0)),
             Representation::Int32
         );
+        assert_eq!(
+            map.representation(op_value_at(&ssa, 1)),
+            Representation::Int32
+        );
+        assert_eq!(
+            map.representation(op_value_at(&ssa, 2)),
+            Representation::Int32
+        );
+        assert!(map.conversions().is_empty());
+        assert_eq!(map.verify(&view, &ssa), Ok(()));
+    }
+
+    #[test]
+    fn numeric_coercion_scaffolding_preserves_int32_residency() {
+        let (view, ssa) = build(
+            0,
+            3,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(4)]),
+                (
+                    Op::ToPrimitive,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(1),
+                        Operand::Register(0),
+                    ],
+                ),
+                (Op::ReturnUndefined, vec![]),
+            ],
+            &[(2, ARITH_INT32)],
+        );
+
+        let map = ReprMap::compute(&view, &ssa);
         assert_eq!(
             map.representation(op_value_at(&ssa, 1)),
             Representation::Int32

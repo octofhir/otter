@@ -19,8 +19,9 @@
 //!   it, so a single forward walk sees every caller before its callees.
 //! - The root frame has no parent and replaces no call site; every other frame
 //!   has both.
-//! - A frame's `call_pc` names a real `Op::Call` instruction in its parent's
-//!   body, and at most one frame claims a given (parent, call_pc).
+//! - A frame's `call_pc` names a real `Op::Call` or `Op::CallMethodValue`
+//!   instruction in its parent's body, and at most one frame claims a given
+//!   (parent, call_pc).
 //! - No function id repeats along a root-to-leaf path, so a recursive cycle can
 //!   never be spliced into itself.
 //! - Splicing is a speculation, not a proof: the emitter still guards the
@@ -34,7 +35,8 @@
 use std::sync::Arc;
 
 use otter_bytecode::Op;
-use otter_vm::{CodeBlock, JitCompileSnapshot, JitInstructionMetadata};
+use otter_vm::jit::JitMethodGuard;
+use otter_vm::{CodeBlock, JitCompileSnapshot, JitInlineMethod, JitInstructionMetadata};
 
 /// Maximum callee instruction count accepted for splicing.
 ///
@@ -59,14 +61,53 @@ impl InlineId {
 pub struct InlineCallSite {
     /// Frame owning the call instruction.
     pub parent: InlineId,
-    /// Canonical logical PC of the `Op::Call` in the parent's body.
+    /// Canonical logical PC of the call opcode in the parent's body.
     pub call_pc: u32,
     /// Parent register the call's result is written to.
     pub result_register: u16,
-    /// Parent register holding the callee value the identity guard checks.
-    pub callee_register: u16,
+    /// Dynamic call shape and the parent value guarded before entry.
+    pub kind: InlineCallKind,
     /// Parent registers holding the arguments, in formal-parameter order.
     pub argument_registers: Vec<u16>,
+}
+
+/// Dynamic call shape replaced by one spliced frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InlineCallKind {
+    /// Ordinary call guarded by the callable's bytecode function identity.
+    Plain {
+        /// Parent register holding the callable value.
+        callee_register: u16,
+    },
+    /// Method call guarded by receiver/prototype/method-slot identity.
+    Method {
+        /// Parent register holding the exact `this` receiver.
+        receiver_register: u16,
+        /// VM-baked immutable guard facts re-read by generated code.
+        guard: JitMethodGuard,
+    },
+}
+
+impl InlineCallSite {
+    /// Parent register whose value becomes an inlined method frame's `this`.
+    #[must_use]
+    pub fn receiver_register(&self) -> Option<u16> {
+        match self.kind {
+            InlineCallKind::Plain { .. } => None,
+            InlineCallKind::Method {
+                receiver_register, ..
+            } => Some(receiver_register),
+        }
+    }
+}
+
+/// Method-only slot facts retained with a spliced frame.
+#[derive(Debug, Clone)]
+pub struct InlineMethodData {
+    /// Body byte PC to guarded value-slab byte offset.
+    pub prop_offsets: rustc_hash::FxHashMap<u32, u32>,
+    /// Non-receiver body byte PC to required object shape.
+    pub prop_shapes: rustc_hash::FxHashMap<u32, u32>,
 }
 
 /// One function body in the compiled unit.
@@ -82,6 +123,8 @@ pub struct InlineFrame {
     pub code_block: Arc<CodeBlock>,
     /// Instruction overlays in canonical logical-PC order.
     pub instructions: Vec<JitInstructionMetadata>,
+    /// Direct property facts for a method frame; absent for root/plain bodies.
+    pub method: Option<InlineMethodData>,
 }
 
 impl InlineFrame {
@@ -197,7 +240,7 @@ impl InlineTree {
     /// else keeps its ordinary call.
     #[must_use]
     pub fn build(view: &JitCompileSnapshot) -> Self {
-        Self::build_where(view, |_| true)
+        Self::build_where(view, |_| true, |_| true)
     }
 
     /// Decide the inline tree, splicing only callees `accept` approves.
@@ -208,10 +251,12 @@ impl InlineTree {
     #[must_use]
     pub fn build_where(
         view: &JitCompileSnapshot,
-        accept: impl Fn(&otter_vm::JitInlineCallee) -> bool,
+        accept_plain: impl Fn(&otter_vm::JitInlineCallee) -> bool,
+        accept_method: impl Fn(&JitInlineMethod) -> bool,
     ) -> Self {
         let mut frames = Self::trivial(view).frames;
-        let accept = &accept;
+        let accept_plain = &accept_plain;
+        let accept_method = &accept_method;
         // Breadth-first over the frames already accepted, so `MAX_INLINE_DEPTH`
         // is enforced by construction and every parent precedes its callees.
         let mut next = 0usize;
@@ -222,15 +267,17 @@ impl InlineTree {
                 next += 1;
                 continue;
             }
-            let candidates = Self::candidates_in(view, &frames, parent_id, accept);
-            for (call_site, callee) in candidates {
+            let candidates =
+                Self::candidates_in(view, &frames, parent_id, accept_plain, accept_method);
+            for candidate in candidates {
                 let id = InlineId(frames.len() as u32);
                 frames.push(InlineFrame {
                     id,
-                    call_site: Some(call_site),
-                    function_id: callee.function_id,
-                    code_block: Arc::clone(&callee.code_block),
-                    instructions: callee.instructions.clone(),
+                    call_site: Some(candidate.call_site),
+                    function_id: candidate.function_id,
+                    code_block: candidate.code_block,
+                    instructions: candidate.instructions,
+                    method: candidate.method,
                 });
             }
             next += 1;
@@ -248,6 +295,7 @@ impl InlineTree {
                 function_id: view.code_block.id,
                 code_block: Arc::clone(&view.code_block),
                 instructions: view.instructions.clone(),
+                method: None,
             }],
         }
     }
@@ -263,8 +311,9 @@ impl InlineTree {
         view: &JitCompileSnapshot,
         frames: &[InlineFrame],
         parent_id: InlineId,
-        accept: impl Fn(&otter_vm::JitInlineCallee) -> bool,
-    ) -> Vec<(InlineCallSite, otter_vm::JitInlineCallee)> {
+        accept_plain: impl Fn(&otter_vm::JitInlineCallee) -> bool,
+        accept_method: impl Fn(&JitInlineMethod) -> bool,
+    ) -> Vec<InlineCandidate> {
         if parent_id != InlineId::ROOT {
             return Vec::new();
         }
@@ -272,31 +321,66 @@ impl InlineTree {
         let code_block = parent.code_block.as_ref();
         let mut accepted = Vec::new();
         for instruction in &parent.instructions {
-            if instruction.op(code_block) != Op::Call {
-                continue;
+            match instruction.op(code_block) {
+                Op::Call => {
+                    let Some(callee) = view.inline_callees.get(&instruction.byte_pc) else {
+                        continue;
+                    };
+                    if callee.instructions.len() > MAX_INLINE_INSTRUCTIONS
+                        || !accept_plain(callee)
+                        || Self::path_contains(frames, parent_id, callee.function_id)
+                    {
+                        continue;
+                    }
+                    let Some(call_site) =
+                        Self::decode_call_site(parent_id, instruction, code_block)
+                    else {
+                        continue;
+                    };
+                    if call_site.argument_registers.len() != usize::from(callee.param_count) {
+                        continue;
+                    }
+                    accepted.push(InlineCandidate {
+                        call_site,
+                        function_id: callee.function_id,
+                        code_block: Arc::clone(&callee.code_block),
+                        instructions: callee.instructions.clone(),
+                        method: None,
+                    });
+                }
+                Op::CallMethodValue => {
+                    let Some(method) = view.inline_methods.get(&instruction.byte_pc) else {
+                        continue;
+                    };
+                    if method.instructions.len() > MAX_INLINE_INSTRUCTIONS
+                        || !accept_method(method)
+                        || Self::path_contains(frames, parent_id, method.guard.method_fid)
+                    {
+                        continue;
+                    }
+                    let Some(call_site) =
+                        Self::decode_method_site(parent_id, instruction, code_block, &method.guard)
+                    else {
+                        continue;
+                    };
+                    if call_site.argument_registers.len() != usize::from(method.param_count) {
+                        continue;
+                    }
+                    accepted.push(InlineCandidate {
+                        call_site,
+                        function_id: method.guard.method_fid,
+                        code_block: Arc::clone(&method.code_block),
+                        instructions: method.instructions.clone(),
+                        method: Some(InlineMethodData {
+                            prop_offsets: method.prop_offsets.clone(),
+                            prop_shapes: method.prop_shapes.clone(),
+                        }),
+                    });
+                }
+                _ => {}
             }
-            let Some(callee) = view.inline_callees.get(&instruction.byte_pc) else {
-                continue;
-            };
-            if callee.instructions.len() > MAX_INLINE_INSTRUCTIONS || !accept(callee) {
-                continue;
-            }
-            // A function id already on this path would splice a recursive body
-            // into itself; it keeps its ordinary call.
-            if Self::path_contains(frames, parent_id, callee.function_id) {
-                continue;
-            }
-            let Some(call_site) = Self::decode_call_site(parent_id, instruction, code_block) else {
-                continue;
-            };
-            // Only exact-arity calls are modelled: a missing argument is
-            // `undefined` and a surplus one is dropped, neither of which the
-            // spliced parameter mapping expresses.
-            if call_site.argument_registers.len() != usize::from(callee.param_count) {
-                continue;
-            }
-            accepted.push((call_site, callee.clone()));
         }
+        accepted.sort_by_key(|candidate| candidate.call_site.call_pc);
         accepted
     }
 
@@ -332,7 +416,44 @@ impl InlineTree {
             parent,
             call_pc: instruction.instruction_pc(code_block),
             result_register,
-            callee_register,
+            kind: InlineCallKind::Plain { callee_register },
+            argument_registers,
+        })
+    }
+
+    /// Decode `CallMethodValue`'s `dst, receiver, name, argc, arguments…`.
+    fn decode_method_site(
+        parent: InlineId,
+        instruction: &JitInstructionMetadata,
+        code_block: &CodeBlock,
+        guard: &JitMethodGuard,
+    ) -> Option<InlineCallSite> {
+        const ARGUMENT_TAIL_START: usize = 4;
+        let operands = instruction.operand_view(code_block);
+        let register = |index: usize| match operands.get(index) {
+            Some(otter_bytecode::Operand::Register(register)) => Some(register),
+            _ => None,
+        };
+        let result_register = register(0)?;
+        let receiver_register = register(1)?;
+        let otter_bytecode::Operand::ConstIndex(argc) = operands.get(3)? else {
+            return None;
+        };
+        if operands.len() != ARGUMENT_TAIL_START + argc as usize {
+            return None;
+        }
+        let mut argument_registers = Vec::with_capacity(argc as usize);
+        for index in ARGUMENT_TAIL_START..operands.len() {
+            argument_registers.push(register(index)?);
+        }
+        Some(InlineCallSite {
+            parent,
+            call_pc: instruction.instruction_pc(code_block),
+            result_register,
+            kind: InlineCallKind::Method {
+                receiver_register,
+                guard: guard.clone(),
+            },
             argument_registers,
         })
     }
@@ -405,7 +526,11 @@ impl InlineTree {
                     call_pc: call_site.call_pc,
                 });
             };
-            if instruction.op(parent.code_block.as_ref()) != Op::Call {
+            let expected_op = match call_site.kind {
+                InlineCallKind::Plain { .. } => Op::Call,
+                InlineCallKind::Method { .. } => Op::CallMethodValue,
+            };
+            if instruction.op(parent.code_block.as_ref()) != expected_op {
                 return Err(InlineError::CallSiteNotACall {
                     id: frame.id,
                     call_pc: call_site.call_pc,
@@ -419,6 +544,12 @@ impl InlineTree {
             }
             if call_site.argument_registers.len() != usize::from(frame.code_block.param_count) {
                 return Err(InlineError::ArityMismatch { id: frame.id });
+            }
+            if matches!(call_site.kind, InlineCallKind::Method { .. }) != frame.method.is_some() {
+                return Err(InlineError::CallSiteNotACall {
+                    id: frame.id,
+                    call_pc: call_site.call_pc,
+                });
             }
             if Self::path_contains(&self.frames, call_site.parent, frame.function_id) {
                 return Err(InlineError::RecursiveFrame {
@@ -442,6 +573,14 @@ impl InlineTree {
     pub fn is_trivial(&self) -> bool {
         self.frames.len() == 1
     }
+}
+
+struct InlineCandidate {
+    call_site: InlineCallSite,
+    function_id: u32,
+    code_block: Arc<CodeBlock>,
+    instructions: Vec<JitInstructionMetadata>,
+    method: Option<InlineMethodData>,
 }
 
 /// Borrow an in-progress frame list as a tree for depth queries.
@@ -537,7 +676,7 @@ mod tests {
         assert_eq!(call_site.parent, InlineId::ROOT);
         assert_eq!(call_site.call_pc, 0);
         assert_eq!(call_site.result_register, 0);
-        assert_eq!(call_site.callee_register, 1);
+        assert_eq!(call_site.kind, InlineCallKind::Plain { callee_register: 1 });
         assert_eq!(call_site.argument_registers, vec![2_u16]);
         assert_eq!(frame.depth(&tree), 1);
     }

@@ -106,10 +106,9 @@ fn try_materialize_compiled_error(ctx: &mut JitCtx, err: VmError) -> Result<bool
 /// Rebuild an inlined callee's interpreter frame at a deopt exit.
 ///
 /// The optimized code has already restored the caller's registers into its
-/// window; this hands the caller back to the interpreter's own `Op::Call` path
-/// at `call_pc`, so the frame the interpreter gets is exactly the one a real
-/// call would have built, fast-forwarded to `callee_pc`. The emitted code then
-/// restores the callee's registers into the returned window.
+/// window; this hands the caller back to the interpreter's own ordinary- or
+/// method-call path at `call_pc`, so the frame is rebuilt with canonical
+/// argument and `this` semantics, then fast-forwarded to `callee_pc`.
 ///
 /// Returns the new frame's register-window base, or `0` when the call path
 /// raised — a stack overflow the interpreter would have raised at this same

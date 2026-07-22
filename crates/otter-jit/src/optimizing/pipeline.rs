@@ -115,8 +115,9 @@ impl OptimizationPipeline {
         self,
         view: &JitCompileSnapshot,
         accept_inline: impl Fn(&JitInlineCallee) -> bool,
+        accept_method_inline: impl Fn(&otter_vm::JitInlineMethod) -> bool,
     ) -> Result<OptimizedUnit, OptimizationError> {
-        let tree = InlineTree::build_where(view, accept_inline);
+        let tree = InlineTree::build_where(view, accept_inline, accept_method_inline);
         tree.verify()
             .map_err(OptimizationError::InlineTreeVerification)?;
 

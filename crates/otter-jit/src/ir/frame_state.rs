@@ -8,11 +8,14 @@
 //! - [`FrameStateError`] — precise construction and verification failures.
 //!
 //! # Invariants
-//! - Every canonical instruction PC has exactly one state, sorted by PC.
+//! - Every frame-local canonical instruction PC has exactly one state, sorted
+//!   by `(inline frame, PC)`.
 //! - State slots are interpreter registers, never machine locations.
 //! - Construction follows the same normal-edge dominator forest and block-head
 //!   definitions as SSA renaming, including independent exception-handler roots.
 //! - Verification uses full-edge dominance and cross-checks every SSA operand.
+//! - A spliced callee state links to the caller state at either `Call` or
+//!   `CallMethodValue`, so deopt rebuilds the full paused call chain.
 //!
 //! # See also
 //! - [`crate::ir::ssa`]
@@ -522,7 +525,14 @@ impl FrameStateTable {
                     }
                 }
 
-                if instruction.input_registers.len() != instruction.inputs.len() {
+                let synthetic_this = instruction.op == otter_bytecode::Op::LoadThis
+                    && instruction.inline != InlineId::ROOT
+                    && instruction.input_registers.is_empty()
+                    && ssa.frames[instruction.inline.0 as usize]
+                        .this_value
+                        .is_some_and(|value| instruction.inputs.as_slice() == [value]);
+                if !synthetic_this && instruction.input_registers.len() != instruction.inputs.len()
+                {
                     return Err(FrameStateError::OperandRegisterCountMismatch {
                         pc: instruction.pc,
                         inputs: instruction.inputs.len(),

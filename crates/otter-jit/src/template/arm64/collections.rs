@@ -266,7 +266,7 @@ fn emit_builtin_identity_guard(
 /// Emit the guarded non-allocating collection read (`map.get`/`map.has`/
 /// `set.has`) through the compile-time-resolved `LeafValue2` entry. Returns
 /// `false` when the site cannot take the fast path at all.
-pub(super) fn emit_leaf_method_guarded_call(
+pub(crate) fn emit_leaf_method_guarded_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,

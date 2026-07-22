@@ -922,8 +922,8 @@ pub(super) fn emit_call(
         return Ok(());
     }
     let direct_target = view.direct_callees.get(&byte_pc);
-    if let Some(candidate) = view.inline_callees.get(&byte_pc) {
-        if try_emit_inline_numeric_callee(
+    if let Some(candidate) = view.inline_callees.get(&byte_pc)
+        && try_emit_inline_numeric_callee(
             ops,
             relocations,
             view,
@@ -937,25 +937,24 @@ pub(super) fn emit_call(
             code_map.as_deref_mut(),
             done,
             bail,
-        )? {
-            if let (Some(events), Some(target)) = (direct_call_events.as_deref_mut(), direct_target)
-            {
-                events.insert(
-                    (byte_pc, 0),
-                    direct_call_lowering_event(
-                        otter_vm::JitDirectCallKind::Plain,
-                        logical_pc,
-                        byte_pc,
-                        target,
-                        0,
-                        1,
-                        otter_vm::JitDirectCallLoweringOutcome::Inlined,
-                    ),
-                );
-            }
-            dynasm!(ops ; .arch aarch64 ; =>done);
-            return Ok(());
+        )?
+    {
+        if let (Some(events), Some(target)) = (direct_call_events.as_deref_mut(), direct_target) {
+            events.insert(
+                (byte_pc, 0),
+                direct_call_lowering_event(
+                    otter_vm::JitDirectCallKind::Plain,
+                    logical_pc,
+                    byte_pc,
+                    target,
+                    0,
+                    1,
+                    otter_vm::JitDirectCallLoweringOutcome::Inlined,
+                ),
+            );
         }
+        dynasm!(ops ; .arch aarch64 ; =>done);
+        return Ok(());
     }
 
     if let Some(target) = direct_target.filter(|target| direct_call_target_is_supported(target)) {
@@ -1001,7 +1000,7 @@ pub(super) fn emit_call(
         return Ok(());
     }
 
-    if let (Some(events), Some(target)) = (direct_call_events.as_deref_mut(), direct_target) {
+    if let (Some(events), Some(target)) = (direct_call_events, direct_target) {
         events.insert(
             (byte_pc, 0),
             direct_call_lowering_event(
@@ -1141,8 +1140,7 @@ pub(super) fn emit_method_call(
     let planned_methods = view.direct_methods.get(&byte_pc);
     if planned_methods.is_none_or(|methods| methods.len() == 1 && methods[0].target_count == 1)
         && let Some(method) = view.inline_methods.get(&byte_pc)
-    {
-        if try_emit_inline_numeric_method(
+        && try_emit_inline_numeric_method(
             ops,
             relocations,
             view,
@@ -1157,27 +1155,27 @@ pub(super) fn emit_method_call(
             code_map.as_deref_mut(),
             done,
             bail,
-        )? {
-            if let (Some(events), Some(target)) = (
-                direct_call_events.as_deref_mut(),
-                planned_methods.and_then(|methods| methods.first()),
-            ) {
-                events.insert(
-                    (byte_pc, target.target_index),
-                    direct_call_lowering_event(
-                        otter_vm::JitDirectCallKind::Method,
-                        logical_pc,
-                        byte_pc,
-                        &target.callee,
-                        target.target_index,
-                        target.target_count,
-                        otter_vm::JitDirectCallLoweringOutcome::Inlined,
-                    ),
-                );
-            }
-            dynasm!(ops ; .arch aarch64 ; =>done);
-            return Ok(());
+        )?
+    {
+        if let (Some(events), Some(target)) = (
+            direct_call_events.as_deref_mut(),
+            planned_methods.and_then(|methods| methods.first()),
+        ) {
+            events.insert(
+                (byte_pc, target.target_index),
+                direct_call_lowering_event(
+                    otter_vm::JitDirectCallKind::Method,
+                    logical_pc,
+                    byte_pc,
+                    &target.callee,
+                    target.target_index,
+                    target.target_count,
+                    otter_vm::JitDirectCallLoweringOutcome::Inlined,
+                ),
+            );
         }
+        dynasm!(ops ; .arch aarch64 ; =>done);
+        return Ok(());
     }
     // Guarded monomorphic collection fast paths precede existing dispatch;
     // every guard miss lands on the next layer.

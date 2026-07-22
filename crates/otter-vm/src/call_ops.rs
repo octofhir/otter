@@ -2991,12 +2991,12 @@ impl Interpreter {
                 frame.return_register = None;
                 frame.self_value = self_value;
                 frame.this_value = this_for_callee;
-                if state.has_parent_upvalues {
-                    if let Err(error) = parent_upvalues.copy_into(frame.upvalues.as_mut()) {
-                        self.frame_release_cold(&mut frame);
-                        self.reclaim_registers(&mut frame);
-                        return Err(error);
-                    }
+                if state.has_parent_upvalues
+                    && let Err(error) = parent_upvalues.copy_into(frame.upvalues.as_mut())
+                {
+                    self.frame_release_cold(&mut frame);
+                    self.reclaim_registers(&mut frame);
+                    return Err(error);
                 }
                 frame
             }

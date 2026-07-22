@@ -141,7 +141,7 @@ pub(crate) fn emit_static_native_call(
             dynasm!(ops ; .arch aarch64 ; =>done);
         }
     }
-    if let Some(code_map) = code_map.as_deref_mut() {
+    if let Some(code_map) = code_map {
         code_map.record(CodeRegion::static_native_structural(
             "staticNativeCallBody",
             body_start,

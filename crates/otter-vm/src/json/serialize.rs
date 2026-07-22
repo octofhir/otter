@@ -1057,7 +1057,7 @@ impl Interpreter {
         // through a stale handle, and return the moved handle.
         let obj_root = self.json_root_push(Value::object(obj));
         let value_root = self.json_root_push(value);
-        let result = (|| {
+        let result: Result<_, VmError> = {
             let object_proto = self.object_prototype_object_opt();
             let recv = self.json_root_get_object(obj_root);
             object::set_prototype_value(recv, self.gc_heap_mut(), object_proto.map(Value::object));
@@ -1065,7 +1065,7 @@ impl Interpreter {
             let leaf = self.json_root_get(value_root);
             object::set(&mut recv, self.gc_heap_mut(), "", leaf);
             Ok(self.json_root_get_object(obj_root))
-        })();
+        };
         self.json_root_pop_to(obj_root);
         result
     }

@@ -105,10 +105,9 @@ pub(super) fn lower(
         if let UnwindInst::PushFrameRegs {
             offset_upward_to_caller_sp,
         } = instruction
+            && setup_bytes.replace(*offset_upward_to_caller_sp).is_some()
         {
-            if setup_bytes.replace(*offset_upward_to_caller_sp).is_some() {
-                return None;
-            }
+            return None;
         }
     }
     let setup_bytes = setup_bytes?;

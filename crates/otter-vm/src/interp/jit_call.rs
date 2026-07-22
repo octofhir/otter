@@ -112,10 +112,8 @@ impl Interpreter {
                     jit_debug::JitDebugTarget::Entry,
                     pc,
                 );
-                if !optimized {
-                    if !self.reoptimize_arith_overflow_bail(context, fid, pc) {
-                        self.note_jit_entry_bail(fid);
-                    }
+                if !optimized && !self.reoptimize_arith_overflow_bail(context, fid, pc) {
+                    self.note_jit_entry_bail(fid);
                 }
                 Ok(None)
             }
@@ -555,10 +553,8 @@ impl Interpreter {
                     jit_debug::JitDebugTarget::SyncEntry,
                     pc,
                 );
-                if !optimized {
-                    if !self.reoptimize_arith_overflow_bail(context, fid, pc) {
-                        self.note_jit_entry_bail(fid);
-                    }
+                if !optimized && !self.reoptimize_arith_overflow_bail(context, fid, pc) {
+                    self.note_jit_entry_bail(fid);
                 }
                 Ok(None)
             }

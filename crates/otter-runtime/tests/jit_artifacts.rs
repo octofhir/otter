@@ -678,8 +678,8 @@ String(hot(48));
         "globalLexicalCell",
         "propertyIcCell",
         "templateOperandSlice",
-        "collectionHeapReference",
-        "collectionBuiltinFunction",
+        "guardedHeapReference",
+        "guardedBuiltinFunction",
     ] {
         assert!(
             kinds.contains(expected),

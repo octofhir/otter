@@ -45,6 +45,7 @@ use otter_vm::{
 
 use super::collections::{
     MethodSite, emit_alloc_method_guarded_call, emit_leaf_method_guarded_call,
+    emit_primitive_method_guarded_call,
 };
 use super::transitions::TransitionTable;
 use super::values::{
@@ -1171,6 +1172,21 @@ pub(super) fn emit_method_call(
             done,
         )? {
             dynasm!(ops ; .arch aarch64 ; =>after_leaf);
+        }
+    }
+    if let Some(guard) = view.primitive_method_guards.get(&byte_pc) {
+        let after_primitive = ops.new_dynamic_label();
+        if emit_primitive_method_guarded_call(
+            ops,
+            relocations,
+            view,
+            guard,
+            byte_pc,
+            &method_site,
+            after_primitive,
+            done,
+        )? {
+            dynasm!(ops ; .arch aarch64 ; =>after_primitive);
         }
     }
     if let Some(alloc) = view.collection_alloc_methods.get(&byte_pc) {

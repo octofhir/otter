@@ -36,9 +36,9 @@ use yaxpeax_arch::{Arch, Decoder, U8Reader};
 use yaxpeax_arm::armv8::a64::ARMv8;
 
 use super::relocation::{
-    CollectionFeedbackKind, CollectionHeapComponent, DirectBranch, DirectBranchKind,
-    PropertyIcAccess, RelocationTarget, TemplateOperandArena, TemplateOperandRole,
-    ValidatedRelocation, ValidatedRelocations, decode_direct_branch,
+    DirectBranch, DirectBranchKind, GuardedBuiltinKind, GuardedHeapComponent, PropertyIcAccess,
+    RelocationTarget, TemplateOperandArena, TemplateOperandRole, ValidatedRelocation,
+    ValidatedRelocations, decode_direct_branch,
 };
 use super::{
     CodeMapCapture, CodeRegion, InlineScratchEntryArtifact, InlineScratchLayoutArtifact,
@@ -512,22 +512,22 @@ fn symbolic_target(target: &RelocationTarget) -> String {
         } => {
             format!("optimizedMathArguments(inlineFrame={inline_frame},pc={logical_pc},len={len})")
         }
-        RelocationTarget::CollectionHeapReference {
+        RelocationTarget::GuardedHeapReference {
             component,
             feedback_kind,
             byte_pc,
             runtime_stub_id,
         } => format!(
-            "collectionHeapReference(component={},feedback={},bytePc={byte_pc},runtimeStubId={runtime_stub_id})",
+            "guardedHeapReference(component={},feedback={},bytePc={byte_pc},runtimeStubId={runtime_stub_id})",
             heap_component_name(*component),
             feedback_kind_name(*feedback_kind)
         ),
-        RelocationTarget::CollectionBuiltinFunction {
+        RelocationTarget::GuardedBuiltinFunction {
             feedback_kind,
             byte_pc,
             runtime_stub_id,
         } => format!(
-            "collectionBuiltinFunction(feedback={},bytePc={byte_pc},runtimeStubId={runtime_stub_id})",
+            "guardedBuiltinFunction(feedback={},bytePc={byte_pc},runtimeStubId={runtime_stub_id})",
             feedback_kind_name(*feedback_kind)
         ),
         RelocationTarget::StaticNativeBuiltinFunction { target, byte_pc } => {
@@ -567,17 +567,18 @@ fn operand_role_name(role: TemplateOperandRole) -> &'static str {
     }
 }
 
-fn heap_component_name(component: CollectionHeapComponent) -> &'static str {
+fn heap_component_name(component: GuardedHeapComponent) -> &'static str {
     match component {
-        CollectionHeapComponent::Prototype => "prototype",
-        CollectionHeapComponent::PrototypeShape => "prototypeShape",
+        GuardedHeapComponent::Prototype => "prototype",
+        GuardedHeapComponent::PrototypeShape => "prototypeShape",
     }
 }
 
-fn feedback_kind_name(kind: CollectionFeedbackKind) -> &'static str {
+fn feedback_kind_name(kind: GuardedBuiltinKind) -> &'static str {
     match kind {
-        CollectionFeedbackKind::Leaf => "leaf",
-        CollectionFeedbackKind::Alloc => "alloc",
+        GuardedBuiltinKind::Leaf => "leaf",
+        GuardedBuiltinKind::Alloc => "alloc",
+        GuardedBuiltinKind::Primitive => "primitive",
     }
 }
 

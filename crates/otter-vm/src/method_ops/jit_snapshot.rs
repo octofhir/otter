@@ -57,10 +57,13 @@ impl Interpreter {
         &self,
         hint: crate::jit::JitMethodHint,
     ) -> Option<crate::jit::JitPrimitiveMethodGuard> {
-        let (proto, name) = match hint {
-            crate::jit::JitMethodHint::StringCharCodeAt => {
-                (self.realm_intrinsics.string_prototype?, "charCodeAt")
-            }
+        let (proto, name, leaf_stub_id, receiver_type_tag) = match hint {
+            crate::jit::JitMethodHint::StringCharCodeAt => (
+                self.realm_intrinsics.string_prototype?,
+                "charCodeAt",
+                crate::native_abi::STUB_STRING_CHAR_CODE_AT_LEAF.id,
+                crate::string::JS_STRING_BODY_TYPE_TAG,
+            ),
             crate::jit::JitMethodHint::None | crate::jit::JitMethodHint::NumberToString => {
                 return None;
             }
@@ -90,6 +93,8 @@ impl Interpreter {
             proto_shape: crate::object::shape(proto, &self.gc_heap).offset(),
             method_value_byte: compressed_slot_byte(hit.slot),
             builtin_fn_addr,
+            leaf_stub_id,
+            receiver_type_tag,
         })
     }
 

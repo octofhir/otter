@@ -740,6 +740,20 @@ pub const STUB_NUMBER_REM_LEAF: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusPair,
 );
 
+/// Leaf `String.prototype.charCodeAt` over a string receiver and an integral
+/// index: walks the body to one code unit, boxed without allocation. Misses
+/// (non-string receiver, non-integral or out-of-range index) report through
+/// the status word so the caller falls back to the general method path.
+pub const STUB_STRING_CHAR_CODE_AT_LEAF: RuntimeStubDescriptor = descriptor(
+    70,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::StatusPair,
+);
+
 /// Completes one full `Op::New` construct in the VM for a New site outside
 /// the compiled subset; the constructor body may run arbitrary JS.
 pub const STUB_JIT_CONSTRUCT: RuntimeStubDescriptor = descriptor(
@@ -1160,6 +1174,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         67 => "jit_deopt_reify_frame",
         68 => "jit_deopt_stack_call",
         69 => "jit_resolve_direct_entry",
+        70 => "string_char_code_at_leaf",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1235,6 +1250,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_DEOPT_REIFY_FRAME,
     STUB_JIT_DEOPT_STACK_CALL,
     STUB_JIT_RESOLVE_DIRECT_ENTRY,
+    STUB_STRING_CHAR_CODE_AT_LEAF,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

@@ -28,15 +28,15 @@
 
 use crate::native_abi::{
     CodeRegistryView, NO_SAFEPOINT, RuntimeStubAllocContext, RuntimeStubDescriptor, RuntimeStubId,
-    RuntimeStubResult, RuntimeStubResultPair, STUB_COLLECTION_MAP_DELETE_ALLOC,
-    STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC,
-    STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC,
-    STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
-    STUB_NUMBER_REM_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF,
-    STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_STRING_ENDS_WITH_LEAF,
-    STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF, STUB_STRING_STARTS_WITH_LEAF,
-    STUB_TO_BOOLEAN_LEAF, SafepointId, SafepointRecord, TaggedLocationKind,
-    validate_stub_descriptor,
+    RuntimeStubResult, RuntimeStubResultPair, STUB_ARRAY_POP_LEAF, STUB_ARRAY_PUSH_ALLOC,
+    STUB_COLLECTION_MAP_DELETE_ALLOC, STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF,
+    STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC,
+    STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC,
+    STUB_COLLECTION_SET_HAS_LEAF, STUB_NUMBER_REM_LEAF, STUB_STRICT_EQ_LEAF,
+    STUB_STRING_CHAR_CODE_AT_LEAF, STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC,
+    STUB_STRING_ENDS_WITH_LEAF, STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF,
+    STUB_STRING_STARTS_WITH_LEAF, STUB_TO_BOOLEAN_LEAF, SafepointId, SafepointRecord,
+    TaggedLocationKind, validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
@@ -79,6 +79,50 @@ impl LeafNoAllocStub2 {
     pub fn invoke_raw(
         self,
         heap: *const otter_gc::GcHeap,
+        a0_bits: u64,
+        a1_bits: u64,
+    ) -> RuntimeStubResult {
+        (self.entry)(heap, a0_bits, a1_bits).into_result()
+    }
+}
+
+/// Two-argument mutating leaf runtime stub ABI.
+///
+/// Identical to [`LeafNoAllocStub2Fn`] with a mutable heap: the entry rewrites
+/// GC-managed state in place and runs any required write barrier, but still
+/// must not allocate, trigger collection, or re-enter JS, so the call site
+/// publishes no safepoint and no rooting packet.
+pub type MutatingLeafStub2Fn =
+    extern "C" fn(*mut otter_gc::GcHeap, u64, u64) -> RuntimeStubResultPair;
+
+/// Callable mutating-leaf stub entry with its ABI descriptor.
+#[derive(Clone, Copy)]
+pub struct MutatingLeafStub2 {
+    /// Passive descriptor shared with profiler/JIT metadata.
+    pub descriptor: RuntimeStubDescriptor,
+    /// Machine-callable Rust entrypoint with the descriptor's fixed ABI shape.
+    pub entry: MutatingLeafStub2Fn,
+}
+
+impl MutatingLeafStub2 {
+    /// `true` when descriptor metadata matches this callable ABI shape.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        validate_stub_descriptor(self.descriptor, NO_SAFEPOINT)
+            && self.descriptor.argument_count == 2
+    }
+
+    /// Raw native entry address for generated code.
+    #[must_use]
+    pub fn entry_addr(self) -> usize {
+        self.entry as usize
+    }
+
+    /// Invoke this entry with raw ABI bits.
+    #[must_use]
+    pub fn invoke_raw(
+        self,
+        heap: *mut otter_gc::GcHeap,
         a0_bits: u64,
         a1_bits: u64,
     ) -> RuntimeStubResult {
@@ -502,6 +546,27 @@ pub const STRING_CONCAT_ALLOC: AllocValueStub = AllocValueStub {
     entry: Some(string_concat_alloc),
 };
 
+/// Callable ABI entry for `Array.prototype.pop` over a dense array.
+pub const ARRAY_POP_LEAF: MutatingLeafStub2 = MutatingLeafStub2 {
+    descriptor: STUB_ARRAY_POP_LEAF,
+    entry: array_pop_leaf,
+};
+
+/// ABI descriptor for `Array.prototype.push` over a dense array.
+pub const ARRAY_PUSH_ALLOC: AllocValueStub = AllocValueStub {
+    descriptor: STUB_ARRAY_PUSH_ALLOC,
+    entry: Some(array_push_alloc),
+};
+
+/// Resolve a two-argument mutating leaf stub by ABI descriptor id.
+#[must_use]
+pub const fn mutating_leaf_stub2_by_id(id: RuntimeStubId) -> Option<MutatingLeafStub2> {
+    match id {
+        id if id == STUB_ARRAY_POP_LEAF.id => Some(ARRAY_POP_LEAF),
+        _ => None,
+    }
+}
+
 /// Resolve a fixed two-argument leaf/no-allocation stub by ABI descriptor id.
 #[must_use]
 pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocStub2> {
@@ -534,6 +599,7 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
         id if id == STUB_COLLECTION_MAP_DELETE_ALLOC.id => Some(COLLECTION_MAP_DELETE_ALLOC),
         id if id == STUB_COLLECTION_SET_DELETE_ALLOC.id => Some(COLLECTION_SET_DELETE_ALLOC),
         id if id == STUB_STRING_CONCAT_ALLOC.id => Some(STRING_CONCAT_ALLOC),
+        id if id == STUB_ARRAY_PUSH_ALLOC.id => Some(ARRAY_PUSH_ALLOC),
         _ => None,
     }
 }
@@ -542,6 +608,7 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
 #[must_use]
 pub(crate) fn is_vm_owned_runtime_stub(id: RuntimeStubId) -> bool {
     leaf_no_alloc_stub2_by_id(id).is_some()
+        || mutating_leaf_stub2_by_id(id).is_some()
         || alloc_value_stub_by_id(id)
             .and_then(|stub| stub.entry)
             .is_some()
@@ -1542,6 +1609,146 @@ fn string_concat_alloc_inner(
             Err(_) => RuntimeStubResult::out_of_memory(),
         }
     })()
+}
+
+/// `true` when a dense-array receiver still satisfies the `push` / `pop` fast
+/// path over `[start, end)`.
+///
+/// Generated code proves the receiver is an ordinary dense array with the
+/// original `%Array.prototype%` builtin in its slot. It cannot see the
+/// remaining spec preconditions — a writable `length`, extensibility, an
+/// accessor or attribute override in range, or the dense-size cap — so the
+/// stub re-checks them and misses instead of falling back internally.
+fn dense_range_is_fast(
+    arr: crate::array::JsArray,
+    heap: &otter_gc::GcHeap,
+    start: usize,
+    end: usize,
+) -> bool {
+    crate::array::is_ordinary_dense(arr, heap)
+        && crate::array::length_writable(arr, heap)
+        && crate::array::can_fast_fill_dense_range(arr, heap, start, end)
+}
+
+/// Leaf `Array.prototype.pop` over a dense array.
+///
+/// Truncation drops one reference and refreshes the cached element base and
+/// length; it never allocates, so no safepoint or rooting packet is needed.
+#[must_use]
+pub extern "C" fn array_pop_leaf(
+    heap: *mut otter_gc::GcHeap,
+    recv_bits: u64,
+    _unused_bits: u64,
+) -> RuntimeStubResultPair {
+    RuntimeStubResultPair::from_result(array_pop_leaf_inner(heap, recv_bits))
+}
+
+fn array_pop_leaf_inner(heap: *mut otter_gc::GcHeap, recv_bits: u64) -> RuntimeStubResult {
+    let Some(heap) = heap_mut(heap) else {
+        return RuntimeStubResult::miss();
+    };
+    let Some(arr) = Value::from_abi_bits(recv_bits).as_array() else {
+        return RuntimeStubResult::miss();
+    };
+    let len = crate::array::len(arr, heap);
+    // The last index must be a present own element: a hole would make the
+    // spec's `Get` read an inherited value off the prototype chain.
+    if len == 0
+        || !crate::array::has_own_element(arr, heap, len - 1)
+        || !dense_range_is_fast(arr, heap, len - 1, len)
+    {
+        return RuntimeStubResult::miss();
+    }
+    RuntimeStubResult::ok_value(crate::array::pop(arr, heap))
+}
+
+/// Allocating `Array.prototype.push` over a dense array.
+///
+/// Appending may grow the dense buffer, which can move the receiver, so the
+/// receiver is re-read from the rooted packet and the growth path threads the
+/// caller roots through any emergency collection.
+#[must_use]
+pub extern "C" fn array_push_alloc(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    value_bits: u64,
+    unused_bits: u64,
+) -> RuntimeStubResultPair {
+    alloc_value_stub_result_pair(
+        ctx,
+        array_push_alloc_inner(ctx, safepoint, recv_bits, value_bits, unused_bits),
+    )
+}
+
+fn array_push_alloc_inner(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    value_bits: u64,
+    unused_bits: u64,
+) -> RuntimeStubResult {
+    let Some(ctx) = alloc_context_mut(ctx) else {
+        return RuntimeStubResult::miss();
+    };
+    let Some(interp) = alloc_interpreter_mut(ctx) else {
+        return RuntimeStubResult::miss();
+    };
+    // `push` creates a *new* index, so the spec consults the prototype chain
+    // for an inherited indexed setter there. The realm protector trips as soon
+    // as any indexed accessor is installed anywhere, and generated code cannot
+    // read it, so it is part of the stub's precondition set.
+    if interp.array_index_accessor_protector {
+        return RuntimeStubResult::miss();
+    }
+    // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
+    // table and frame-slot window must remain live for this call.
+    let Ok(roots) = (unsafe {
+        alloc_value_stub_call_roots(
+            ctx,
+            safepoint,
+            [
+                Value::from_abi_bits(recv_bits),
+                Value::from_abi_bits(value_bits),
+                Value::from_abi_bits(unused_bits),
+            ],
+        )
+    }) else {
+        return RuntimeStubResult::miss();
+    };
+    let _roots_guard = interp
+        .gc_heap
+        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    let Some(arr) = roots.value(0).as_array() else {
+        return RuntimeStubResult::miss();
+    };
+    let len = crate::array::len(arr, &interp.gc_heap);
+    if !dense_range_is_fast(arr, &interp.gc_heap, len, len + 1) {
+        return RuntimeStubResult::miss();
+    }
+    let value = roots.value(1);
+    // Growth may collect; the rooted receiver and pending value are traced so
+    // the handle survives and the helper republishes the moved array.
+    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        roots.value(0).trace_value_slots(visitor);
+        value.trace_value_slots(visitor);
+    };
+    match crate::array::push_with_roots(arr, &mut interp.gc_heap, value, &mut visit) {
+        Ok(new_len) => {
+            RuntimeStubResult::ok_value(Value::number(crate::NumberValue::from_f64(new_len as f64)))
+        }
+        Err(_) => RuntimeStubResult::out_of_memory(),
+    }
+}
+
+fn heap_mut(heap: *mut otter_gc::GcHeap) -> Option<&'static mut otter_gc::GcHeap> {
+    if heap.is_null() {
+        return None;
+    }
+    // SAFETY: runtime stub callers pass the current isolate heap pointer.
+    // Mutating leaf stubs neither allocate nor retain it, so the exclusive
+    // borrow lasts only for this call.
+    Some(unsafe { &mut *heap })
 }
 
 fn heap_ref(heap: *const otter_gc::GcHeap) -> Option<&'static otter_gc::GcHeap> {

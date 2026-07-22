@@ -4,6 +4,8 @@
 //! - Identity guards proving a monomorphic `Map`/`Set` builtin method site.
 //! - The leaf (`LeafValue2`) call for non-allocating collection reads.
 //! - The allocating (`AllocValue3`) call publishing a concrete safepoint.
+//! - The dense-array `push` / `pop` calls, which reuse the same guard chain
+//!   over an `ArrayBody` receiver plus an empty-exotic-sidecar check.
 //!
 //! # Invariants
 //! - Guards prove receiver type tag, clean guard flags, prototype identity,
@@ -23,8 +25,13 @@
 //!   precede.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
-use otter_vm::runtime_stubs::{alloc_value_stub_by_id, leaf_no_alloc_stub2_by_id};
-use otter_vm::{JitCollectionAllocMethod, JitCollectionLeafMethod, JitCompileSnapshot};
+use otter_vm::runtime_stubs::{
+    alloc_value_stub_by_id, leaf_no_alloc_stub2_by_id, mutating_leaf_stub2_by_id,
+};
+use otter_vm::{
+    JitArrayMethod, JitArrayMethodKind, JitCollectionAllocMethod, JitCollectionLeafMethod,
+    JitCompileSnapshot,
+};
 
 use super::values::{
     emit_decompress_slot, emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64,
@@ -513,6 +520,162 @@ pub(super) fn emit_alloc_method_guarded_call(
         ; add sp, sp, ALLOC_CTX_STACK_SIZE
         ; cbnz x5, =>miss
     );
+    emit_store_reg(ops, 0, site.dst)?;
+    dynasm!(ops ; .arch aarch64 ; b =>done);
+    Ok(true)
+}
+
+/// Prove the receiver is an ordinary dense array: an `ArrayBody` cell with no
+/// exotic sidecar. An absent sidecar means the realm `%Array.prototype%` is
+/// still the receiver's `[[Prototype]]` and nothing on the instance can shadow
+/// the method or override an element's attributes, which is what makes the
+/// prototype-slot guard below sufficient. On success `x13` holds the header
+/// pointer.
+fn emit_dense_array_receiver_guard(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    receiver: u16,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let exotic_byte = view.array_layout.exotic_byte;
+    emit_receiver_type_guard(
+        ops,
+        relocations,
+        view,
+        receiver,
+        u32::from(view.array_layout.type_tag),
+        miss,
+    )?;
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x14, [x13, exotic_byte]
+        ; cbnz x14, =>miss
+    );
+    Ok(())
+}
+
+/// Emit the guarded dense-array `push` / `pop` call. `pop` runs through a
+/// mutating leaf entry, `push` through the allocating entry with the
+/// snapshot-assigned safepoint. Returns `false` when the site cannot take the
+/// fast path at all.
+///
+/// The inline guard chain proves the receiver shape and the builtin identity;
+/// the remaining spec preconditions (writable `length`, extensibility, no
+/// accessor override in range, the indexed-accessor protector) are re-checked
+/// by the entry, which reports a miss so the site falls through to ordinary
+/// dispatch.
+pub(super) fn emit_array_method_guarded_call(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    method: &JitArrayMethod,
+    byte_pc: u32,
+    site: &MethodSite,
+    miss: DynamicLabel,
+    done: DynamicLabel,
+) -> Result<bool, Unsupported> {
+    if view.cage_base == 0 || view.array_layout.type_tag == 0 {
+        return Ok(false);
+    }
+    // `pop()` takes no argument and `push(x)` exactly one. A different arity
+    // means multi-append or a stray operand, neither of which the typed entries
+    // model, so the site keeps the general path.
+    let expected_argc = match method.kind {
+        JitArrayMethodKind::Pop => 0,
+        JitArrayMethodKind::Push => 1,
+    };
+    if site.argc != expected_argc {
+        return Ok(false);
+    }
+    emit_dense_array_receiver_guard(ops, relocations, view, site.receiver, miss)?;
+    emit_prototype_guard(
+        ops,
+        relocations,
+        view,
+        method.proto_offset,
+        method.proto_shape,
+        GuardedBuiltinKind::Array,
+        byte_pc,
+        method.stub_id,
+        miss,
+    );
+    emit_builtin_identity_guard(
+        ops,
+        relocations,
+        view,
+        method.method_value_byte,
+        method.builtin_fn_addr,
+        true,
+        GuardedBuiltinKind::Array,
+        byte_pc,
+        method.stub_id,
+        miss,
+    );
+    match method.kind {
+        JitArrayMethodKind::Pop => {
+            let Some(stub) = mutating_leaf_stub2_by_id(method.stub_id) else {
+                return Ok(false);
+            };
+            debug_assert!(stub.is_valid());
+            // Mutating leaf call: `(heap, receiver bits, unused) -> pair`.
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x0, [x20, THREAD_OFFSET]
+                ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+            );
+            emit_load_reg(ops, 1, site.receiver)?;
+            emit_load_u64(ops, 2, VALUE_UNDEFINED);
+            emit_load_runtime_stub(
+                ops,
+                relocations,
+                16,
+                stub.entry_addr() as u64,
+                stub.descriptor,
+            );
+            dynasm!(ops
+                ; .arch aarch64
+                ; blr x16
+                ; and x1, x1, #0xff
+                ; cbnz x1, =>miss
+            );
+        }
+        JitArrayMethodKind::Push => {
+            let Some(stub) = alloc_value_stub_by_id(method.stub_id) else {
+                return Ok(false);
+            };
+            let Some(stub_addr) = stub.entry_addr() else {
+                return Ok(false);
+            };
+            let Some(arg0) = site.arg0 else {
+                return Ok(false);
+            };
+            dynasm!(ops
+                ; .arch aarch64
+                ; sub sp, sp, ALLOC_CTX_STACK_SIZE
+                ; ldr x9, [x20, THREAD_OFFSET]
+                ; str x9, [sp, ALLOC_CTX_THREAD_OFFSET]
+                ; movz w9, method.safepoint_id
+                ; str w9, [sp, ALLOC_CTX_SAFEPOINT_ID_OFFSET]
+                ; strh wzr, [sp, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET]
+                ; str xzr, [sp, ALLOC_CTX_SPILL_SLOTS_OFFSET]
+                ; mov x0, sp
+            );
+            emit_load_u64(ops, 1, u64::from(method.safepoint_id));
+            emit_load_reg(ops, 2, site.receiver)?;
+            emit_load_reg(ops, 3, arg0)?;
+            emit_load_u64(ops, 4, VALUE_UNDEFINED);
+            emit_load_runtime_stub(ops, relocations, 16, stub_addr as u64, stub.descriptor);
+            dynasm!(ops
+                ; .arch aarch64
+                ; blr x16
+                ; and x1, x1, #0xff
+                ; mov x5, x1
+                ; add sp, sp, ALLOC_CTX_STACK_SIZE
+                ; cbnz x5, =>miss
+            );
+        }
+    }
     emit_store_reg(ops, 0, site.dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done);
     Ok(true)

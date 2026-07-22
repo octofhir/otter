@@ -96,6 +96,8 @@ pub(crate) enum GuardedBuiltinKind {
     Alloc,
     /// Primitive prototype builtin reached through a leaf entry.
     Primitive,
+    /// Dense-array `push` / `pop` builtin reached through a typed entry.
+    Array,
 }
 
 /// Semantic identity for one address materialized in native code.
@@ -181,6 +183,7 @@ fn runtime_stub_signature_name(signature: RuntimeStubSignature) -> &'static str 
         RuntimeStubSignature::Poll1 => "poll1",
         RuntimeStubSignature::Variadic => "variadic",
         RuntimeStubSignature::NullaryValue => "nullaryValue",
+        RuntimeStubSignature::MutatingLeafValue2 => "mutatingLeafValue2",
     }
 }
 
@@ -1059,6 +1062,7 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
                 GuardedBuiltinKind::Leaf => 0,
                 GuardedBuiltinKind::Alloc => 1,
                 GuardedBuiltinKind::Primitive => 2,
+                GuardedBuiltinKind::Array => 3,
             });
             put_u32(output, *byte_pc);
             put_u32(output, *runtime_stub_id);
@@ -1073,6 +1077,7 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
                 GuardedBuiltinKind::Leaf => 0,
                 GuardedBuiltinKind::Alloc => 1,
                 GuardedBuiltinKind::Primitive => 2,
+                GuardedBuiltinKind::Array => 3,
             });
             put_u32(output, *byte_pc);
             put_u32(output, *runtime_stub_id);

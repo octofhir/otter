@@ -138,6 +138,13 @@ pub enum RuntimeStubSignature {
     Variadic = 3,
     /// Nullary value producer (`fn() -> value bits`).
     NullaryValue = 4,
+    /// `(heap_mut, value0, value1)` leaf mutation.
+    ///
+    /// Same shape as [`Self::LeafValue2`] with a mutable heap: the entry may
+    /// rewrite GC-managed state in place (and must run the matching write
+    /// barriers) but still cannot allocate, trigger collection, or re-enter
+    /// JS, so the call site publishes no safepoint.
+    MutatingLeafValue2 = 5,
 }
 
 /// Safepoint requirement encoded in the descriptor.
@@ -1162,6 +1169,37 @@ pub const STUB_JIT_RESOLVE_DIRECT_ENTRY: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::ValueWord,
 );
 
+/// Leaf dense-array `Array.prototype.pop` mutation.
+///
+/// Truncating the dense buffer drops a reference and rewrites the cached
+/// length pair; neither allocates. The entry re-checks the dense
+/// preconditions the inline guard cannot see (writable `length`, a present
+/// own last element, no accessor override in range) and reports a miss when
+/// they fail, so the call site falls through to ordinary dispatch.
+pub const STUB_ARRAY_POP_LEAF: RuntimeStubDescriptor = descriptor(
+    76,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::MutatingLeafValue2,
+    2,
+    RuntimeStubEffects::leaf(false, true),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::StatusPair,
+);
+/// Allocating dense-array `Array.prototype.push` mutation.
+///
+/// Appending may grow the dense buffer, so the site publishes a precise
+/// safepoint. Like the `pop` entry it re-checks the dense preconditions and
+/// misses instead of falling back internally.
+pub const STUB_ARRAY_PUSH_ALLOC: RuntimeStubDescriptor = descriptor(
+    77,
+    RuntimeStubClass::Alloc,
+    RuntimeStubSignature::AllocValue3,
+    3,
+    RuntimeStubEffects::allocating(false, true),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::StatusPair,
+);
+
 /// Human-readable symbol for a runtime-stub id in the current contract.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -1241,6 +1279,8 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         73 => "string_includes_leaf",
         74 => "string_starts_with_leaf",
         75 => "string_ends_with_leaf",
+        76 => "array_pop_leaf",
+        77 => "array_push_alloc",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1322,6 +1362,8 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_STRING_INCLUDES_LEAF,
     STUB_STRING_STARTS_WITH_LEAF,
     STUB_STRING_ENDS_WITH_LEAF,
+    STUB_ARRAY_POP_LEAF,
+    STUB_ARRAY_PUSH_ALLOC,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.
@@ -1334,7 +1376,9 @@ pub const fn validate_stub_descriptor(
     let throwing_matches = desc.effects.contains(RuntimeStubEffects::MAY_THROW)
         == matches!(desc.exception, RuntimeStubException::Status);
     let result_matches = match desc.signature {
-        RuntimeStubSignature::LeafValue2 | RuntimeStubSignature::AllocValue3 => {
+        RuntimeStubSignature::LeafValue2
+        | RuntimeStubSignature::MutatingLeafValue2
+        | RuntimeStubSignature::AllocValue3 => {
             matches!(desc.result_abi, RuntimeStubResultAbi::StatusPair)
         }
         RuntimeStubSignature::Poll1 => {

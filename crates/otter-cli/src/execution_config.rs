@@ -1,7 +1,6 @@
 //! Owned runtime execution configuration for CLI commands.
 //!
 //! # Contents
-//! - [`CliJitTier`] — stable CLI spelling for execution-tier selection.
 //! - [`CliExecutionConfig`] — timeout, trace, JIT tier, and structured JIT
 //!   diagnostics captured once after argument parsing and applied to either
 //!   public runtime builder.
@@ -9,8 +8,8 @@
 //! # Invariants
 //! - Runtime-backed command paths receive this value explicitly. No timeout,
 //!   trace, or tier setting travels through process-global mutable state.
-//! - Legacy environment variables are translated once at the CLI boundary;
-//!   runtime, VM, and JIT crates consume only structured configuration.
+//! - Normal CLI execution always uses the production tier policy; `--jitless`
+//!   selects the same interpreter-only runtime path used by the semantic oracle.
 //! - `None` keeps the runtime timeout default while `Some(Duration::ZERO)`
 //!   explicitly disables it.
 //! - Engine crates only return owned JIT reports. This outer configuration
@@ -20,32 +19,10 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use clap::ValueEnum;
 use otter_runtime::{
     JitArtifactBatch, JitDebugReport, JitDebugRequest, JitDebugTier, JitSelection, OtterBuilder,
     RuntimeBuilder, TracerFactory,
 };
-
-/// User-facing execution-tier selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum CliJitTier {
-    /// Production optimizing tier with template fallback.
-    ProductionTiered,
-    /// Template compiler only.
-    Template,
-    /// Bytecode interpreter only.
-    Interpreter,
-}
-
-impl From<CliJitTier> for JitSelection {
-    fn from(value: CliJitTier) -> Self {
-        match value {
-            CliJitTier::ProductionTiered => Self::ProductionTiered,
-            CliJitTier::Template => Self::Template,
-            CliJitTier::Interpreter => Self::InterpreterOnly,
-        }
-    }
-}
 
 /// Owned execution settings shared by every runtime-backed CLI command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,17 +49,19 @@ impl Default for CliExecutionConfig {
 }
 
 impl CliExecutionConfig {
-    /// Capture CLI arguments and legacy compatibility knobs exactly once.
+    /// Capture CLI arguments and the internal OSR diagnostic knob exactly once.
     pub(crate) fn new(
         timeout_secs: Option<u64>,
         trace_target: Option<String>,
-        jit_tier: Option<CliJitTier>,
+        jitless: bool,
         jit_events_target: Option<String>,
         jit_artifacts_target: Option<String>,
     ) -> Self {
-        let jit_selection = jit_tier
-            .map(JitSelection::from)
-            .unwrap_or_else(legacy_jit_selection);
+        let jit_selection = if jitless {
+            JitSelection::InterpreterOnly
+        } else {
+            JitSelection::ProductionTiered
+        };
         Self {
             timeout: timeout_secs.map(Duration::from_secs),
             trace_target,
@@ -132,16 +111,11 @@ impl CliExecutionConfig {
     }
 
     /// Stable CLI spelling for diagnostics and reproducibility metadata.
-    pub(crate) const fn jit_tier_name(&self) -> &'static str {
+    pub(crate) const fn execution_mode_name(&self) -> &'static str {
         match self.jit_selection {
-            JitSelection::ProductionTiered => "production-tiered",
-            JitSelection::Template => "template",
+            JitSelection::ProductionTiered | JitSelection::Template => "production",
             JitSelection::InterpreterOnly => "interpreter",
         }
-    }
-
-    pub(crate) const fn interpreter_only(&self) -> bool {
-        matches!(self.jit_selection, JitSelection::InterpreterOnly)
     }
 
     /// Return whether the CLI must retain and serialize structured JIT events.
@@ -299,14 +273,6 @@ fn write_json_file(path: &Path, value: &impl serde::Serialize) -> io::Result<()>
     writer.flush()
 }
 
-fn legacy_jit_selection() -> JitSelection {
-    if std::env::var("OTTER_JIT").as_deref() == Ok("0") {
-        JitSelection::InterpreterOnly
-    } else {
-        JitSelection::ProductionTiered
-    }
-}
-
 fn legacy_jit_osr_threshold() -> Option<u32> {
     std::env::var("OTTER_JIT_OSR_THRESHOLD")
         .ok()
@@ -339,22 +305,6 @@ fn trace_factory_for_target(target: &str) -> TracerFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn explicit_tiers_map_without_ambient_state() {
-        assert_eq!(
-            JitSelection::from(CliJitTier::ProductionTiered),
-            JitSelection::ProductionTiered
-        );
-        assert_eq!(
-            JitSelection::from(CliJitTier::Template),
-            JitSelection::Template
-        );
-        assert_eq!(
-            JitSelection::from(CliJitTier::Interpreter),
-            JitSelection::InterpreterOnly
-        );
-    }
 
     #[test]
     fn absent_and_zero_timeout_remain_distinct() {

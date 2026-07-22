@@ -423,6 +423,7 @@ impl Interpreter {
     /// # Errors
     /// - [`VmError::InvalidOperand`] when the stack is empty or
     ///   the caller's return register is out of bounds.
+    ///
     /// Pop one frame without crossing the caller-owned activation `floor`.
     ///
     /// Nested VM execution shares the same physical stack as its caller.  A

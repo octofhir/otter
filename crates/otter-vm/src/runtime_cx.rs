@@ -3114,13 +3114,13 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         this_value: Local<'_>,
         args: &[Local<'_>],
     ) -> Result<Local<'scope>, VmError> {
-        let context = self.ctx.context.clone().ok_or(VmError::InvalidOperand)?;
+        let context = self.ctx.context.ok_or(VmError::InvalidOperand)?;
         let target = self.raw(target);
         let this_value = self.raw(this_value);
         let args: smallvec::SmallVec<[Value; 8]> =
             args.iter().map(|value| self.raw(*value)).collect();
         let result = self.ctx.cx.with_parts(|interp, stack| {
-            interp.run_callable_sync_rooted(stack, &context, &target, this_value, args)
+            interp.run_callable_sync_rooted(stack, context, &target, this_value, args)
         })?;
         Ok(self.value(result))
     }

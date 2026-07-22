@@ -857,13 +857,14 @@ impl NativeFunction {
         let native = target
             .as_native_function()
             .expect("native function value must decode");
-        let existing = match {
+        let existing = {
             let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                 target.trace_value_slot_mut(visitor);
                 crate::pelt::PeltField::pelt_trace(&mut descriptor, visitor);
             };
             native.own_property_descriptor_with_roots(heap, key, &mut external_visit)
-        } {
+        };
+        let existing = match existing {
             Ok(existing) => existing,
             Err(_) => return false,
         };

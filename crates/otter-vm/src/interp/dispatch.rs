@@ -274,10 +274,11 @@ impl Interpreter {
                     }
                     // Tier-up hook: only when a bytecode callee frame was just
                     // pushed and a JIT is installed. Cheap (one bool) when off.
-                    if jit_installed && bytecode_pushed {
-                        if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)? {
-                            return Ok(value);
-                        }
+                    if jit_installed
+                        && bytecode_pushed
+                        && let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)?
+                    {
+                        return Ok(value);
                     }
                     continue;
                 }

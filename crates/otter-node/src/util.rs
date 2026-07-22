@@ -47,7 +47,7 @@ fn capture_call_sites(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             name: "util.getCallSites",
             reason: "missing execution context".to_string(),
         })?;
-    let json = ctx.capture_call_sites_json(&context, skip, count);
+    let json = ctx.capture_call_sites_json(context, skip, count);
     ctx.scope(|mut scope| {
         let json = scope.string(&json)?;
         Ok(scope.finish(json))

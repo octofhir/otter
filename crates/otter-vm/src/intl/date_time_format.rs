@@ -1118,34 +1118,35 @@ pub(crate) fn date_time_format_format_range_to_parts(
     ctx.scope(|mut scope| {
         let result = scope.array(result_len)?;
         let mut index = 0usize;
-        let mut append = |ty: &str, value: &str, source: &str| -> Result<(), NativeError> {
-            let part = scope.object()?;
-            let ty = scope.string(ty)?;
-            scope.set(part, "type", ty)?;
-            let value = scope.string(value)?;
-            scope.set(part, "value", value)?;
-            let source = scope.string(source)?;
-            scope.set(part, "source", source)?;
-            scope.set_index(result, index, part)?;
-            index += 1;
-            Ok(())
-        };
+        {
+            let mut append = |ty: &str, value: &str, source: &str| -> Result<(), NativeError> {
+                let part = scope.object()?;
+                let ty = scope.string(ty)?;
+                scope.set(part, "type", ty)?;
+                let value = scope.string(value)?;
+                scope.set(part, "value", value)?;
+                let source = scope.string(source)?;
+                scope.set(part, "source", source)?;
+                scope.set_index(result, index, part)?;
+                index += 1;
+                Ok(())
+            };
 
-        if collapsed {
-            for (ty, value) in &start_parts {
-                append(ty, value, "shared")?;
-            }
-        } else {
-            for (ty, value) in &start_parts {
-                append(ty, value, "startRange")?;
-            }
-            append("literal", RANGE_SEPARATOR, "shared")?;
-            for (ty, value) in &end_parts {
-                append(ty, value, "endRange")?;
+            if collapsed {
+                for (ty, value) in &start_parts {
+                    append(ty, value, "shared")?;
+                }
+            } else {
+                for (ty, value) in &start_parts {
+                    append(ty, value, "startRange")?;
+                }
+                append("literal", RANGE_SEPARATOR, "shared")?;
+                for (ty, value) in &end_parts {
+                    append(ty, value, "endRange")?;
+                }
             }
         }
 
-        drop(append);
         Ok(scope.finish(result))
     })
 }

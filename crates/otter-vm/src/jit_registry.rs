@@ -484,10 +484,10 @@ impl JitCodeRegistry {
                 active_count: cell.active_count(),
                 param_count: cell.param_count,
                 register_count: cell.register_count,
-                generated_entries: u64::from(entries),
-                generated_returns: u64::from(returns),
-                generated_deopts: u64::from(deopts),
-                generated_throws: u64::from(throws),
+                generated_entries: entries,
+                generated_returns: returns,
+                generated_deopts: deopts,
+                generated_throws: throws,
                 generated_bail_streak: streak,
                 dependencies: registered.map(|registered| {
                     let mut dependencies = registered.dependencies.to_vec();
@@ -513,10 +513,6 @@ impl JitCodeRegistry {
         let mut feedback = Vec::new();
         for (&code_object_id, cell) in &self.entry_cells {
             let (entries, returns, deopts, throws, _) = cell.generated_feedback();
-            let entries = u64::from(entries);
-            let returns = u64::from(returns);
-            let deopts = u64::from(deopts);
-            let throws = u64::from(throws);
             let seen = self
                 .generated_feedback_seen
                 .entry(code_object_id)

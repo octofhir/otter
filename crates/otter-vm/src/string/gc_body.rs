@@ -956,6 +956,25 @@ fn flat_content(repr: &JsStringBodyRepr, len: usize) -> Option<FlatContent<'_>> 
 }
 
 impl FlatContent<'_> {
+    /// Lexicographic code-unit ordering across any pairing of Latin-1 /
+    /// WTF-16 storage. Latin-1 bytes zero-extend to their code units, so
+    /// byte order and code-unit order agree and the two-byte case compares
+    /// the raw slices directly.
+    fn content_cmp(&self, other: &FlatContent<'_>) -> std::cmp::Ordering {
+        match (self, other) {
+            (FlatContent::Latin1(a), FlatContent::Latin1(b)) => a.cmp(b),
+            (FlatContent::Wide(a), FlatContent::Wide(b)) => a.cmp(b),
+            (FlatContent::Latin1(bytes), FlatContent::Wide(units)) => bytes
+                .iter()
+                .map(|&b| u16::from(b))
+                .cmp(units.iter().copied()),
+            (FlatContent::Wide(units), FlatContent::Latin1(bytes)) => units
+                .iter()
+                .copied()
+                .cmp(bytes.iter().map(|&b| u16::from(b))),
+        }
+    }
+
     /// Code-unit equality across any pairing of Latin-1 / WTF-16 storage. A
     /// Latin-1 byte zero-extends to its `u16` code unit.
     fn content_eq(&self, other: &FlatContent<'_>) -> bool {
@@ -1017,6 +1036,34 @@ pub fn equals_string_bodies(heap: &GcHeap, a: JsStringHandle, b: JsStringHandle)
         return answer;
     }
     to_utf16_vec(heap, a) == to_utf16_vec(heap, b)
+}
+
+/// Lexicographic code-unit ordering of two string bodies. Both sides flat
+/// (inline or side storage, either width) compare in place; a `Cons` /
+/// `Sliced` operand falls back to materialising both sides.
+#[must_use]
+pub fn compare_string_bodies(
+    heap: &GcHeap,
+    a: JsStringHandle,
+    b: JsStringHandle,
+) -> std::cmp::Ordering {
+    if a == b {
+        return std::cmp::Ordering::Equal;
+    }
+    if let Some(ordering) = heap.read_payload(a, |ba| {
+        heap.read_payload(b, |bb| {
+            match (
+                flat_content(&ba.repr, ba.len as usize),
+                flat_content(&bb.repr, bb.len as usize),
+            ) {
+                (Some(va), Some(vb)) => Some(va.content_cmp(&vb)),
+                _ => None,
+            }
+        })
+    }) {
+        return ordering;
+    }
+    to_utf16_vec(heap, a).cmp(&to_utf16_vec(heap, b))
 }
 
 /// Copy a string body's flat Latin-1 bytes into `out` when it is a short,

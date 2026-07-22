@@ -717,14 +717,23 @@ fn impl_repeat(
     if count == 0 || recv.is_empty() {
         return Ok(Value::string(JsString::empty(ctx.heap_mut())?));
     }
-    let units = recv.to_utf16_vec(ctx.heap_mut());
-    let total = (units.len() as u64).saturating_mul(count as u64);
+    let total = u64::from(recv.len()).saturating_mul(count as u64);
     if total > u32::MAX as u64 {
         return Err(range_error(
             "String.prototype",
             "result would exceed maximum string length",
         ));
     }
+    // A Latin-1 receiver repeats byte-wise: widening it would double the
+    // working buffer only for `from_utf16_units` to narrow the result back.
+    if let Some(bytes) = recv.with_latin1(ctx.heap(), <[u8]>::to_vec) {
+        let mut buf = Vec::with_capacity(total as usize);
+        for _ in 0..count {
+            buf.extend_from_slice(&bytes);
+        }
+        return Ok(Value::string(JsString::from_latin1(&buf, ctx.heap_mut())?));
+    }
+    let units = recv.to_utf16_vec(ctx.heap_mut());
     let mut buf = Vec::with_capacity(total as usize);
     for _ in 0..count {
         buf.extend_from_slice(&units);
@@ -819,6 +828,27 @@ fn trim_impl(
     side: TrimSide,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
+    // Latin-1 bodies locate the trim bounds in place and take a slice, so the
+    // content is never widened and the untrimmed span is never copied.
+    if let Some((start, end)) = recv.with_latin1(ctx.heap(), |bytes| {
+        let ws = |b: u8| is_ws_code_unit(u16::from(b));
+        let start = match side {
+            TrimSide::Both | TrimSide::Start => {
+                bytes.iter().position(|&b| !ws(b)).unwrap_or(bytes.len())
+            }
+            TrimSide::End => 0,
+        };
+        let end = match side {
+            TrimSide::Both | TrimSide::End => {
+                bytes.iter().rposition(|&b| !ws(b)).map_or(start, |i| i + 1)
+            }
+            TrimSide::Start => bytes.len(),
+        };
+        (start as u32, end.max(start) as u32)
+    }) {
+        let out = recv.slice(start, end - start, ctx.heap_mut())?;
+        return Ok(Value::string(out));
+    }
     let units = recv.to_utf16_vec(ctx.heap_mut());
     let start = match side {
         TrimSide::Both | TrimSide::Start => units
@@ -1471,12 +1501,41 @@ fn locale_case_map(units: &[u16], upper: bool, language: Option<&str>) -> Vec<u1
     out
 }
 
+/// Case-mapped bytes for an ASCII-only Latin-1 body, or `None` when the
+/// receiver is a rope, a wide body, or carries any byte above `0x7F`.
+///
+/// No code point below `0x80` has a SpecialCasing 1→N expansion or a
+/// conditional rule, and every ASCII mapping lands back in ASCII, so the
+/// byte-wise map is the full Unicode result. Skips the widen, the code-point
+/// decode, and the mapping-table walk.
+fn ascii_case_mapped_bytes(
+    recv: JsString,
+    upper: bool,
+    heap: &otter_gc::GcHeap,
+) -> Option<Vec<u8>> {
+    recv.with_latin1(heap, |bytes| {
+        bytes.is_ascii().then(|| {
+            if upper {
+                bytes.to_ascii_uppercase()
+            } else {
+                bytes.to_ascii_lowercase()
+            }
+        })
+    })?
+}
+
 fn impl_to_lower_case(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
     _args: &[Value],
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
+    if let Some(bytes) = ascii_case_mapped_bytes(recv, false, ctx.heap()) {
+        return Ok(Value::string(JsString::from_latin1(
+            &bytes,
+            ctx.heap_mut(),
+        )?));
+    }
     let units = recv.to_utf16_vec(ctx.heap_mut());
     let lowered = unicode_case_map(&units, false);
     Ok(Value::string(JsString::from_utf16_units(
@@ -1491,6 +1550,12 @@ fn impl_to_upper_case(
     _args: &[Value],
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
+    if let Some(bytes) = ascii_case_mapped_bytes(recv, true, ctx.heap()) {
+        return Ok(Value::string(JsString::from_latin1(
+            &bytes,
+            ctx.heap_mut(),
+        )?));
+    }
     let units = recv.to_utf16_vec(ctx.heap_mut());
     let upper = unicode_case_map(&units, true);
     Ok(Value::string(JsString::from_utf16_units(

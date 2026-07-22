@@ -65,6 +65,23 @@ impl<'code> ArgumentOperands<'code> {
         Self::Decoded(operands)
     }
 
+    /// Verified operand words of an execution record, in schema order.
+    ///
+    /// `None` only for the decoded test view, which keeps the validating
+    /// per-operand path.
+    #[inline]
+    #[must_use]
+    pub(crate) fn words(self) -> Option<&'code [u32]> {
+        match self {
+            Self::Execution {
+                function,
+                instruction,
+            } => Some(function.operand_words(instruction)),
+            #[cfg(test)]
+            Self::Decoded(_) => None,
+        }
+    }
+
     #[inline]
     pub(crate) fn register(self, index: usize) -> Result<u16, VmError> {
         match self {
@@ -101,21 +118,31 @@ impl<'code> ArgumentOperands<'code> {
 pub(crate) struct BytecodeArgumentWindow<'frame, 'code> {
     caller: &'frame Frame,
     operands: ArgumentOperands<'code>,
+    /// Argument register words of a verified execution record, already sliced
+    /// to this window. `None` for the decoded test view and for any window whose
+    /// declared length runs past the operand stream; both take the validating
+    /// per-operand path.
+    arg_words: Option<&'code [u32]>,
     first_arg_operand: usize,
     len: usize,
 }
 
 impl<'frame, 'code> BytecodeArgumentWindow<'frame, 'code> {
     #[must_use]
-    pub(crate) const fn from_operands(
+    pub(crate) fn from_operands(
         caller: &'frame Frame,
         operands: ArgumentOperands<'code>,
         first_arg_operand: usize,
         len: usize,
     ) -> Self {
+        let arg_words = operands.words().and_then(|words| {
+            let end = first_arg_operand.checked_add(len)?;
+            words.get(first_arg_operand..end)
+        });
         Self {
             caller,
             operands,
+            arg_words,
             first_arg_operand,
             len,
         }
@@ -124,6 +151,9 @@ impl<'frame, 'code> BytecodeArgumentWindow<'frame, 'code> {
     fn get(&self, index: usize) -> Result<&Value, VmError> {
         if index >= self.len {
             return Err(VmError::InvalidOperand);
+        }
+        if let Some(words) = self.arg_words {
+            return read_register(self.caller, words[index] as u16);
         }
         let operand_index = self
             .first_arg_operand
@@ -152,6 +182,23 @@ impl<'frame, 'code> BytecodeArgumentWindow<'frame, 'code> {
         frame: &mut Frame,
     ) -> Result<BoundExtras, VmError> {
         let bind_count = (function.param_count as usize).min(self.len);
+        if !function.needs_arguments && !function.has_rest {
+            // Ordinary callee: parameters are the only destination, so arguments
+            // past the last parameter are dropped without visiting them and no
+            // side-record vector is built.
+            for index in 0..bind_count {
+                let value = *self.get(index)?;
+                let slot = frame
+                    .registers
+                    .get_mut(index)
+                    .ok_or(VmError::InvalidOperand)?;
+                *slot = value;
+            }
+            return Ok(BoundExtras {
+                rest_args: SmallVec::new(),
+                incoming_args: SmallVec::new(),
+            });
+        }
         let mut rest_args: SmallVec<[Value; 4]> = SmallVec::new();
         let mut incoming_args: SmallVec<[Value; 4]> = SmallVec::new();
         for index in 0..self.len {

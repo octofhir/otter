@@ -247,7 +247,14 @@ impl Interpreter {
     /// keeps its registers in the interpreter arena. Cold deoptimization may
     /// temporarily mirror one published frame in the materialized stack, which
     /// the transfer count removes here.
+    #[inline]
     pub(crate) fn jit_generated_call_depth(&self) -> u32 {
+        // No published activation means no generated frame and no transferred
+        // one either, so the whole scan and the saturating transfer subtraction
+        // collapse to zero. Every bytecode call consults this depth.
+        if self.jit_native_activation_top == 0 {
+            return 0;
+        }
         let published = self.jit_native_activations[..self.jit_native_activation_top]
             .iter()
             .filter(|activation| {

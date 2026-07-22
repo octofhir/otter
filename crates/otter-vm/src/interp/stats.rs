@@ -77,7 +77,7 @@ impl Interpreter {
         }
         let elapsed_nanos = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
         if runtime_budget::budget_exceeded(
-            self.runtime_budget_stats.current_turn_reductions,
+            self.runtime_budget_stats.current_turn_reductions(),
             self.runtime_budget_stats.current_turn_allocated_bytes,
             self.runtime_budget_stats.current_turn_host_ops,
             elapsed_nanos,

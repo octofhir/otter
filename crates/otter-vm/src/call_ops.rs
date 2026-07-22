@@ -1311,9 +1311,18 @@ impl Interpreter {
         context: &ExecutionContext,
         operands: ArgumentOperands<'_>,
     ) -> Result<(), VmError> {
-        let dst = operands.register(0)?;
-        let callee_reg = operands.register(1)?;
-        let argc = operands.const_index(2)?;
+        // The call header (`dst`, callee, argc) reads from one operand-word
+        // slice; a call with two or more arguments spills past the inline words,
+        // so the header cannot use the fixed-arity accessors.
+        let (dst, callee_reg, argc) = match operands.words() {
+            Some([dst, callee, argc, ..]) => (*dst as u16, *callee as u16, *argc),
+            Some(_) => return Err(VmError::InvalidOperand),
+            None => (
+                operands.register(0)?,
+                operands.register(1)?,
+                operands.const_index(2)?,
+            ),
+        };
 
         let top_idx = stack.len() - 1;
         let callee = *read_register(&stack[top_idx], callee_reg)?;

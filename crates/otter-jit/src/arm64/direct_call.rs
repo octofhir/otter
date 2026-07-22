@@ -618,7 +618,8 @@ pub(crate) fn emit_direct_call(
         ; ldr x13, [x20, NATIVE_FRAME_OFFSET]
         ; ldr x14, [x20, THREAD_OFFSET]
         ; ldr x15, [x14, VM_THREAD_CODE_OBJECT_ID_OFFSET]
-        ; stp x13, x15, [sp, layout.caller_frame as i32]
+        ; str x13, [sp, layout.caller_frame]
+        ; str x15, [sp, layout.caller_code_object_id]
         ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
         ; ldr x10, [x9]
         ; ldr x11, [x20, ACTIVATION_BASE_OFFSET]
@@ -731,7 +732,8 @@ pub(crate) fn emit_direct_call(
         ; .arch aarch64
         ; =>cleanup
         // Restore caller publication before retiring the callee generation.
-        ; ldp x13, x15, [sp, layout.caller_frame as i32]
+        ; ldr x13, [sp, layout.caller_frame]
+        ; ldr x15, [sp, layout.caller_code_object_id]
         ; str x13, [x20, NATIVE_FRAME_OFFSET]
         ; ldr x14, [x20, THREAD_OFFSET]
         ; stp x13, x15, [x14, VM_THREAD_CURRENT_FRAME_OFFSET as i32]

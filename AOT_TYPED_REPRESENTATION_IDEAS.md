@@ -4,30 +4,9 @@ Notes on techniques observed in an ahead-of-time JS→Wasm/native compiler line 
 filtered for what is actually applicable to Otter (bytecode VM + template/optimizing JIT).
 Each item states the technique, why it works, and the concrete Otter mapping.
 
-## 1. Latin-1 ("byte") string representation
+Items already landed have been removed; what follows is the open remainder.
 
-**Technique.** Strings are immutable in JS, so the full code-point range of a literal
-(and of most derived strings) is known at creation time. If every code unit is `< 256`,
-store one byte per char instead of two. Layout stays `[u32 length][data]`, only the
-element width changes; the string's *type tag* distinguishes the two forms.
-
-**Payoff.** ~50% memory cut on ASCII-dominant workloads (JSON keys, identifiers, HTTP
-headers, source text), plus better cache behaviour on scan-heavy ops (`indexOf`,
-`charCodeAt`, comparison, hashing).
-
-**Cost / pitfall.** Every string op becomes a 2×2 matrix (byte×byte, byte×wide,
-wide×byte, wide×wide). Without care this explodes the builtin surface. Mitigations:
-- Make the *only* mixed-form path a widening promotion, then run one wide algorithm.
-- Keep a monomorphic fast path for byte×byte (the common case) and one generic fallback.
-- Concat result form = `byte if both operands byte`, cheap to compute from the tags.
-
-**Otter mapping.** `JsStringBody` already carries a `utf16_cache`; a `Latin1` variant
-next to the existing representation would let the cache be skipped entirely for ASCII
-(the cache exists to avoid re-decoding). Also directly benefits the regex engine:
-an ASCII-only subject enables the byte-level prefilter/LUT prescan already on the
-regex backlog.
-
-## 2. Type annotations as *hints*, never as contracts ("progressive typing")
+## 1. Type annotations as *hints*, never as contracts ("progressive typing")
 
 **Technique.** Parse TS annotations and feed them to codegen as optimization hints.
 Untyped code keeps full dynamic behaviour; typed code drops redundant type checks and
@@ -50,7 +29,12 @@ Second-order note: the same table shows that after removing type checks, the nex
 biggest single lever was the **number representation** (int-vs-double), not more
 inlining. That matches Otter's repr-selection work being the right next lever.
 
-## 3. Self-hosted builtins in a compiled JS/TS subset
+**Status.** Not started. `crates/otter-compiler` ignores TS type annotations entirely
+(no `type_annotation` reference anywhere), so this is greenfield: carry the annotation
+from the oxc AST through the compiler into `CodeBlock`, then seed `ArithFeedback` /
+method ICs from it at compile-snapshot time.
+
+## 2. Self-hosted builtins in a compiled JS/TS subset
 
 **Technique.** Write the standard library (String, Array, Math, …) in a restricted,
 typed JS/TS dialect with escape-hatch intrinsics (raw wasm ops, raw pointers, explicit
@@ -63,37 +47,22 @@ is *zero* interpreted prelude and no JS shim evaluation cost.
   bridge-bound workload disappears by construction.
 - Startup does not pay for shim parsing/eval.
 
-**Otter mapping.** Otter's builtin JS shims (`setup-builtins-*.js`) are today real JS
-evaluated at boot, and its native builtins sit behind the native bridge (documented as
-the bottleneck for `serve`, map/set, and several benches). Two separable steps:
-1. **Snapshot the shim work** at build time (`build.rs`) instead of evaluating shims
-   per isolate — pure startup win, no semantic change.
-2. **Let the JIT see through builtins**: for the hottest natives, provide an inlinable
-   IR body (or an intrinsic node) so the optimizing tier can splice it instead of
-   emitting a bridge call. This is the same lever as the existing inline work, applied
-   to the library rather than to user methods.
+**Otter mapping.** Remaining piece: **snapshot the shim work** at build time
+(`build.rs`) instead of evaluating the JS shims (`web_bootstrap.js`, the
+`crates/otter-node/src/*.js` set, …) per isolate.
 
-## 4. Precompiled/generated Unicode and regex tables
+**Status.** Deprioritised on measurement: hello-world startup is ~30 ms wall total, so
+the shim-eval share cannot be a large absolute win. Revisit if startup becomes a target
+(edge/serverless) or if the shim set grows.
 
-**Technique.** Unicode property data and regex character-class tables are *generated*
-into source at build time rather than computed or loaded at runtime.
+The second half of this item — letting the JIT see through native builtins instead of
+crossing the bridge — has landed for the string probe family and collection leaf reads.
+Extending it further means Array `push`/`pop`, which needs either a mutating-leaf ABI
+(`*mut GcHeap`, currently every leaf takes `*const`) or a representation change: the
+dense element buffer is a `Vec`, whose length cannot be adjusted from machine code, so
+the `array_methods` feedback the VM already bakes stays unconsumed.
 
-**Otter mapping.** Aligns with the ASCII-class bitmap item already on the regex list;
-extend to case-folding tables for the case-insensitive prefilter.
-
-## 5. Conformance strategy: measure the *set*, accept a plateau, then polyfill
-
-**Technique.** Track a conformance percentage continuously, but treat coverage as a
-curve with a knee — past a threshold the remaining tail is cheaper to cover by
-transpilation/polyfill than by engine work. Also observed: **test-suite wall time grows
-as conformance improves**, because failing tests exit early. Do not read a slower suite
-as a regression.
-
-**Otter mapping.** Otter already gates on failing-set diffs rather than a raw
-percentage — keep that; it is the stronger form. The transferable bit is the runtime
-expectation: a rising suite duration is an expected artifact, not a signal.
-
-## 6. Deliberate memory-footprint target
+## 3. Deliberate memory-footprint target
 
 **Technique.** A native-compiled binary with no JIT and no interpreter lands around
 ~1 MB RSS versus 40 MB+ for JIT runtimes, which unlocks embedded/edge deployment.
@@ -103,7 +72,10 @@ as a **metric**: track baseline RSS of `otter` on a hello-world and treat regres
 first-class, since serverless/edge is a target surface. Cheap to add to the bench
 harness alongside the existing timing numbers.
 
-## 7. Explicitly *not* adoptable
+**Status.** Measured once — hello-world is ~40 MB max RSS, ~30 ms wall. Not yet wired
+into the bench harness as a tracked number.
+
+## 4. Explicitly *not* adoptable
 
 - **AOT-only, no interpreter/JIT.** Removes deopt entirely, which forces every type
   assumption to be conservative or unsound. Otter's tiered design is strictly stronger.
@@ -111,12 +83,15 @@ harness alongside the existing timing numbers.
   codegen is a conformance debt Otter should not take on.
 - **Compile-to-C backend.** Interesting for embedded distribution, orthogonal to
   current perf goals.
+- **Conformance plateau + polyfill.** Otter already gates on failing-set diffs, which
+  is the stronger form. One transferable expectation only: suite wall time *grows* as
+  conformance improves, because failing tests exit early — a slower suite is not a
+  regression signal.
 
 ## Ranked take-aways for Otter
 
-1. Latin-1 string representation — largest structural win, touches memory *and* regex.
-2. Builtin inlining through the native bridge (bridge cost is a measured bottleneck).
-3. Build-time snapshot of builtin shim setup — startup only, low risk.
-4. TS annotations as feedback seed for faster tier-up (guarded by existing deopt).
-5. Generated Unicode/class tables for the regex engine.
-6. RSS as a tracked benchmark metric.
+1. TS annotations as feedback seed for faster tier-up (guarded by existing deopt).
+2. Array `push`/`pop` inlining — blocked on a mutating-leaf ABI or a dense-buffer
+   representation change.
+3. Build-time snapshot of builtin shim setup — startup only, small absolute win.
+4. RSS as a tracked benchmark metric.

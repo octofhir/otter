@@ -1,6 +1,6 @@
 //! Snapshot of the default `globalThis` shape after bootstrap.
 //!
-//! This is the P1.3 anchor test: any change to the global object
+//! This is the bootstrap anchor test: any change to the global object
 //! shape — new globals, reordered installs, attribute drift,
 //! prototype-identity drift — surfaces as a string diff in this
 //! single fixture. Reviewers can read the diff and decide whether
@@ -20,9 +20,6 @@
 //!   slice.
 //! - `process` retains its realm global, well-known tag symbol, and
 //!   `%Function.prototype%` identity under `OTTER_GC_STRESS=full`.
-//!
-//! # See also
-//! - `ENGINE_REFACTOR_EXECUTION_PLAN.md` P1.3.
 
 use otter_runtime::{Runtime, SourceInput};
 

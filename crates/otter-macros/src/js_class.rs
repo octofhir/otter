@@ -79,7 +79,7 @@
 //! # See also
 //! - [`crate::couch`](super::couch) — the spec/installer machinery
 //!   this expands into.
-//! - `EXTENSION_API_PLAN.md` (repo root) — the design.
+//! - `docs/site/src/content/docs/extensions/declarative-bindings.md`
 
 use proc_macro::TokenStream;
 use proc_macro2::Span;

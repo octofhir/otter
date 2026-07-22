@@ -2,8 +2,7 @@
 //! lexical predeclaration and the linker's per-fragment constant
 //! pool merge.
 //!
-//! These tests pin two foundational gaps surfaced by the
-//! P2.1 audit (`ENGINE_REFACTOR_EXECUTION_PLAN.md` §P2.1):
+//! These tests pin two foundational module-linking invariants:
 //!
 //! 1. `hoist_lexical_names`/`hoist_var_names_in_stmt`/
 //!    `hoist_function_declarations` must walk through

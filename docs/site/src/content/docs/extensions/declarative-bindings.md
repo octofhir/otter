@@ -276,7 +276,5 @@ the default, not a mandate.
 
 - [Handle Scopes](/extensions/handle-scopes/) — the rooting contract
   the generated glue rides.
-- `EXTENSION_API_PLAN.md` (repo root) — the full design, VM additions,
-  and migration state.
 - `crates/otter-web/src/blob.rs`, `url.rs`, `crypto.rs` — the worked
   exemplars.

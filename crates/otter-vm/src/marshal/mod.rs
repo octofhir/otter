@@ -44,7 +44,8 @@
 //! - [`crate::handles`] — the handle-scope arena this layer builds on.
 //! - `docs/site/src/content/docs/extensions/handle-scopes.md` — the
 //!   rooting contract.
-//! - `EXTENSION_API_PLAN.md` (repo root) — the design this implements.
+//! - `docs/site/src/content/docs/extensions/declarative-bindings.md` — the
+//!   contributor-facing binding design.
 
 mod completer;
 mod cx;

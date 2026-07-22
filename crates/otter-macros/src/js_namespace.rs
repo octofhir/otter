@@ -53,7 +53,7 @@
 //!
 //! # See also
 //! - [`crate::holt`](super::holt) — the spec/installer machinery.
-//! - `EXTENSION_API_PLAN.md` §4 — the design.
+//! - `docs/site/src/content/docs/extensions/declarative-bindings.md`
 
 use proc_macro::TokenStream;
 use proc_macro2::Span;

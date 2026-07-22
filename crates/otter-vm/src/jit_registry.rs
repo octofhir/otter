@@ -39,7 +39,7 @@
 //!
 //! # See also
 //! - [`crate::native_abi::CodeRegistryView`] — the published lookup surface.
-//! - `JIT_REFACTOR_PLAN.md` Phase 4 for the lifetime states this backs.
+//! - `OTTER_PLAN.md` for the active JIT direction and lifetime invariants.
 
 use crate::jit::{
     JitCodeGenerationSnapshot, JitDirectCallPlan, JitDirectCallThisMode, JitFunctionCode,

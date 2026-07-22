@@ -1,5 +1,4 @@
-//! `--json` round-trip parity for every plan-mandated diagnostic
-//! category per ENGINE_REFACTOR_EXECUTION_PLAN §P2.3.
+//! `--json` round-trip parity for every structured diagnostic category.
 //!
 //! Acceptance: "Sample failures across all seven categories
 //! produce both pretty and `--json` outputs that round-trip

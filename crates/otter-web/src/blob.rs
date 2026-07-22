@@ -24,8 +24,7 @@
 //!
 //! # See also
 //! - <https://w3c.github.io/FileAPI/>
-//! - `EXTENSION_API_PLAN.md` §7 — this file is the design's worked
-//!   exemplar.
+//! - `docs/site/src/content/docs/extensions/declarative-bindings.md`
 
 use std::sync::Arc;
 

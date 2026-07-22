@@ -1,10 +1,9 @@
-//! Stable diagnostic codes and categories per ADR
-//! [`ENGINE_REFACTOR_EXECUTION_PLAN.md`] §P2.3.
+//! Stable diagnostic codes and categories for the runtime boundary.
 //!
 //! # Contents
 //! - [`DiagnosticCode`] — closed enum of every diagnostic code the
 //!   active runtime stack emits. Replaces ad-hoc string literals.
-//! - [`DiagnosticCategory`] — the seven plan-mandated categories
+//! - [`DiagnosticCategory`] — the seven runtime categories
 //!   (load / resolve / parse / compile / permission / runtime /
 //!   package-manager) plus a residual `Internal` bucket for
 //!   bug-class invariant violations.

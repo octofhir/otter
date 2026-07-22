@@ -2,10 +2,7 @@
 //! through the unified loader and capability gating for
 //! `http:` / `https:` specifiers.
 //!
-//! ENGINE_REFACTOR_EXECUTION_PLAN §P2.1 acceptance:
-//! "Dynamic-import test denies a registry/HTTP specifier when
-//! the matching capability is absent and resolves it when
-//! present." This file pins both halves:
+//! This file pins both capability-gating outcomes:
 //!
 //! 1. Without `Capability::Net`, an HTTPS import (static or
 //!    dynamic literal) surfaces `MODULE_CAPABILITY_DENIED`
@@ -325,8 +322,7 @@ fn dynamic_literal_import_settles_top_level_await() {
 /// resolve through the same pre-linked module graph. The specifier
 /// expression evaluates at runtime; the linker has already merged
 /// the target module because it was imported statically (or as a
-/// literal `import("./x")`) earlier in the program. Pinned by
-/// ENGINE_REFACTOR_EXECUTION_PLAN §P2.2 Slice C follow-up.
+/// literal `import("./x")`) earlier in the program.
 #[test]
 fn dynamic_import_with_variable_specifier_resolves_through_linker_graph() {
     let dir = tempfile::tempdir().expect("tempdir");

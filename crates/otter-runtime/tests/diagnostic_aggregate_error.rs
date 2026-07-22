@@ -1,5 +1,4 @@
-//! AggregateError diagnostic coverage for
-//! ENGINE_REFACTOR_EXECUTION_PLAN §P2.3.
+//! AggregateError coverage for structured runtime diagnostics.
 //!
 //! §20.5.7.1 AggregateError(errors, message [, options]) — the
 //! constructor stamps `errors` as a non-enumerable own data

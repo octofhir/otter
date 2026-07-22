@@ -84,30 +84,17 @@ fn assert_persisted_assembly(path: &std::path::Path) {
 }
 
 #[test]
-fn explicit_jit_tier_modes_are_accepted() {
+fn production_is_the_only_normal_cli_policy() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    for tier in ["production-tiered", "template", "interpreter"] {
-        let info = otter_command(tmp.path())
-            .arg(format!("--jit-tier={tier}"))
-            .arg("--json")
-            .arg("info")
-            .output()
-            .expect("report explicit JIT tier");
-        assert_success(&info);
-        let info: serde_json::Value =
-            serde_json::from_slice(&info.stdout).expect("valid info JSON");
-        assert_eq!(info["jit_tier"], tier);
-        assert_eq!(info["interpreter_only"], tier == "interpreter");
+    let info = otter_command(tmp.path())
+        .arg("--json")
+        .arg("info")
+        .output()
+        .expect("report production tier");
+    assert_success(&info);
+    let info: serde_json::Value = serde_json::from_slice(&info.stdout).expect("valid info JSON");
+    assert_eq!(info["execution_mode"], "production");
 
-        let output = otter_command(tmp.path())
-            .arg(format!("--jit-tier={tier}"))
-            .arg("--print")
-            .arg("40 + 2")
-            .output()
-            .expect("run explicit JIT tier");
-        assert_success(&output);
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
-    }
     assert!(
         !tmp.path().join("otter-jit-events.json").exists(),
         "default-off runs must not create a diagnostics artifact"
@@ -119,13 +106,35 @@ fn explicit_jit_tier_modes_are_accepted() {
 }
 
 #[test]
+fn jitless_selects_the_interpreter() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let info = otter_command(tmp.path())
+        .arg("--jitless")
+        .arg("--json")
+        .arg("info")
+        .output()
+        .expect("report jitless tier");
+    assert_success(&info);
+    let info: serde_json::Value = serde_json::from_slice(&info.stdout).expect("valid info JSON");
+    assert_eq!(info["execution_mode"], "interpreter");
+
+    let output = otter_command(tmp.path())
+        .arg("--jitless")
+        .arg("--print")
+        .arg("40 + 2")
+        .output()
+        .expect("run without native tiers");
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+}
+
+#[test]
 fn structured_jit_events_are_typed() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let events_path = tmp.path().join("otter-jit-events.json");
     let output = otter_command(tmp.path())
         .env("OTTER_JIT_OSR_THRESHOLD", "1")
         .arg("--jit-events")
-        .arg("--jit-tier=template")
         .arg("--print")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
@@ -144,7 +153,10 @@ fn structured_jit_events_are_typed() {
     assert_eq!(report["truncated"], false);
     assert!(events.len() >= 2);
     assert_eq!(events[0]["type"], "compilePrepared");
-    assert_eq!(events[0]["tier"], "template");
+    assert!(matches!(
+        events[0]["tier"].as_str(),
+        Some("template" | "optimizing")
+    ));
     assert_eq!(events[0]["target"]["kind"], "osr");
     assert!(events[0]["functionId"].is_u64());
     assert!(events[0].get("function_id").is_none());
@@ -160,7 +172,6 @@ fn abrupt_failure_still_writes_partial_jit_events() {
     let output = otter_command(tmp.path())
         .env("OTTER_JIT_OSR_THRESHOLD", "1")
         .arg(format!("--jit-events={}", events_path.display()))
-        .arg("--jit-tier=template")
         .arg("--eval")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
@@ -188,7 +199,6 @@ fn command_timeout_does_not_fabricate_an_empty_jit_report() {
     let output = otter_command(tmp.path())
         .arg("--timeout=1")
         .arg(format!("--jit-events={}", events_path.display()))
-        .arg("--jit-tier=template")
         .arg("--eval")
         .arg("while (true) {}")
         .output()
@@ -219,7 +229,6 @@ fn late_timeout_preserves_earlier_file_jit_events() {
         .env("OTTER_JIT_OSR_THRESHOLD", "1")
         .arg("--timeout=1")
         .arg(format!("--jit-events={}", events_path.display()))
-        .arg("--jit-tier=template")
         .arg("--allow-read=*")
         .arg("first.js")
         .arg("second.js")
@@ -255,7 +264,6 @@ fn late_input_error_preserves_earlier_file_jit_events() {
     let output = otter_command(tmp.path())
         .env("OTTER_JIT_OSR_THRESHOLD", "1")
         .arg(format!("--jit-events={}", events_path.display()))
-        .arg("--jit-tier=template")
         .arg("--allow-read=*")
         .arg("first.js")
         .arg("invalid.js")
@@ -282,7 +290,6 @@ fn jit_artifacts_are_complete_and_offset_consistent() {
     let output = otter_command(tmp.path())
         .env("OTTER_JIT_OSR_THRESHOLD", "1")
         .arg(format!("--jit-artifacts={}", artifacts_path.display()))
-        .arg("--jit-tier=template")
         .arg("--print")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
@@ -308,7 +315,7 @@ fn jit_artifacts_are_complete_and_offset_consistent() {
     let directories = index["bundles"].as_array().expect("bundle directories");
     assert!(!directories.is_empty(), "at least one native compile");
     let directory_name = directories[0].as_str().expect("directory name");
-    assert!(directory_name.starts_with("jit-0000-template-f"));
+    assert!(directory_name.starts_with("jit-0000-"));
     assert!(directory_name.contains("-c"));
     let directory = artifacts_path.join(directory_name);
 
@@ -316,7 +323,10 @@ fn jit_artifacts_are_complete_and_offset_consistent() {
         &std::fs::read(directory.join("manifest.json")).expect("read artifact manifest"),
     )
     .expect("valid artifact manifest");
-    assert_eq!(manifest["tier"], "template");
+    assert!(matches!(
+        manifest["tier"].as_str(),
+        Some("template" | "optimizing")
+    ));
     assert_eq!(manifest["entry"]["kind"], "osr");
     assert_eq!(manifest["module"], "<eval>");
     assert!(manifest["functionId"].is_u64());
@@ -334,7 +344,6 @@ fn jit_artifacts_are_complete_and_offset_consistent() {
     for name in [
         "manifest.json",
         "bytecode.txt",
-        "template-plan.txt",
         "code.bin",
         "code-normalized.bin",
         "asm.txt",
@@ -348,13 +357,18 @@ fn jit_artifacts_are_complete_and_offset_consistent() {
         );
         assert!(directory.join(name).is_file(), "missing payload {name}");
     }
-    let absent = manifest["filesAbsent"].as_array().expect("absent files");
-    for name in ["optimized-ir.txt", "deopt.json"] {
-        assert!(
-            absent.iter().any(|value| value == name),
-            "missing absent inventory entry {name}"
-        );
-        assert!(!directory.join(name).exists(), "unexpected payload {name}");
+    let tier_file = if manifest["tier"] == "template" {
+        "template-plan.txt"
+    } else {
+        "optimized-ir.txt"
+    };
+    assert!(
+        present.iter().any(|value| value == tier_file),
+        "missing tier input {tier_file}"
+    );
+    assert!(directory.join(tier_file).is_file());
+    if manifest["tier"] == "optimizing" {
+        assert!(directory.join("deopt.json").is_file());
     }
 
     let code = std::fs::read(directory.join("code.bin")).expect("read code.bin");
@@ -378,11 +392,12 @@ fn jit_artifacts_are_complete_and_offset_consistent() {
             .expect("read bytecode")
             .starts_with("; otter bytecode\n")
     );
-    assert!(
-        std::fs::read_to_string(directory.join("template-plan.txt"))
-            .expect("read template plan")
-            .starts_with("; otter template plan\n")
-    );
+    let tier_input = std::fs::read_to_string(directory.join(tier_file)).expect("read tier input");
+    if manifest["tier"] == "template" {
+        assert!(tier_input.starts_with("; otter template plan\n"));
+    } else {
+        assert!(tier_input.starts_with("; otter optimized unit\n"));
+    }
 
     let code_map: serde_json::Value = serde_json::from_slice(
         &std::fs::read(directory.join("code-map.json")).expect("read code map"),
@@ -413,7 +428,7 @@ fn jit_artifacts_are_complete_and_offset_consistent() {
 }
 
 #[cfg(target_arch = "aarch64")]
-fn capture_portable_template_code(
+fn capture_portable_production_code(
     root: &std::path::Path,
     directory_name: &str,
 ) -> (Vec<u8>, Vec<serde_json::Value>) {
@@ -421,7 +436,6 @@ fn capture_portable_template_code(
     let output = otter_command(root)
         .env("OTTER_JIT_OSR_THRESHOLD", "1")
         .arg(format!("--jit-artifacts={}", artifacts_path.display()))
-        .arg("--jit-tier=template")
         .arg("--print")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
@@ -456,8 +470,8 @@ fn capture_portable_template_code(
 #[test]
 fn normalized_jit_code_is_stable_across_processes() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let first = capture_portable_template_code(tmp.path(), "portable-first");
-    let second = capture_portable_template_code(tmp.path(), "portable-second");
+    let first = capture_portable_production_code(tmp.path(), "portable-first");
+    let second = capture_portable_production_code(tmp.path(), "portable-second");
 
     assert_eq!(first.0, second.0, "portable code changed across processes");
     assert_eq!(
@@ -474,7 +488,6 @@ fn abrupt_failure_still_writes_partial_jit_artifacts() {
     let output = otter_command(tmp.path())
         .env("OTTER_JIT_OSR_THRESHOLD", "1")
         .arg(format!("--jit-artifacts={}", artifacts_path.display()))
-        .arg("--jit-tier=template")
         .arg("--eval")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
@@ -517,7 +530,6 @@ fn existing_artifact_target_is_not_overwritten() {
     let output = otter_command(tmp.path())
         .env("OTTER_JIT_OSR_THRESHOLD", "1")
         .arg(format!("--jit-artifacts={}", artifacts_path.display()))
-        .arg("--jit-tier=template")
         .arg("--print")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
@@ -562,7 +574,6 @@ fn artifact_persistence_still_runs_when_event_write_fails() {
         .env("OTTER_JIT_OSR_THRESHOLD", "1")
         .arg(format!("--jit-events={}", invalid_events_target.display()))
         .arg(format!("--jit-artifacts={}", artifacts_path.display()))
-        .arg("--jit-tier=template")
         .arg("--print")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
@@ -605,7 +616,7 @@ if (total !== 19900) throw new Error("bad total");
 
     let output = otter_command(tmp.path())
         .arg(format!("--trace={}", trace.display()))
-        .arg("--jit-tier=interpreter")
+        .arg("--jitless")
         .arg("--allow-read=*")
         .arg("run")
         .arg("entry.js")

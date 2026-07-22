@@ -44,7 +44,7 @@ mod error_render;
 mod execution_config;
 
 use error_render::emit_error;
-use execution_config::{CliExecutionConfig, CliJitTier};
+use execution_config::CliExecutionConfig;
 
 /// Otter — JS/TS engine (foundation phase).
 #[derive(Debug, Parser)]
@@ -124,9 +124,9 @@ struct Cli {
     )]
     jit_artifacts: Option<String>,
 
-    /// Select the execution tiers used by runtime-backed commands.
-    #[arg(long = "jit-tier", value_enum, global = true)]
-    jit_tier: Option<CliJitTier>,
+    /// Disable all JIT tiers and execute through the bytecode interpreter.
+    #[arg(long, global = true)]
+    jitless: bool,
 
     /// Capability flags (Deno-style).
     #[command(flatten)]
@@ -513,7 +513,7 @@ async fn main() -> ExitCode {
     let execution = CliExecutionConfig::new(
         cli.timeout_secs,
         cli.trace.clone(),
-        cli.jit_tier,
+        cli.jitless,
         cli.jit_events.clone(),
         cli.jit_artifacts.clone(),
     );
@@ -2703,8 +2703,7 @@ fn run_info(json: bool, execution: &CliExecutionConfig) -> Result<ExitCode, Otte
             "name": "otter",
             "version": env!("CARGO_PKG_VERSION"),
             "phase": "foundation",
-            "jit_tier": execution.jit_tier_name(),
-            "interpreter_only": execution.interpreter_only(),
+        "execution_mode": execution.execution_mode_name(),
             "rust_edition": "2024",
         });
         println!("{}", serde_json::to_string(&info).unwrap());
@@ -2712,7 +2711,7 @@ fn run_info(json: bool, execution: &CliExecutionConfig) -> Result<ExitCode, Otte
         println!(
             "otter v{} (foundation, {})",
             env!("CARGO_PKG_VERSION"),
-            execution.jit_tier_name(),
+            execution.execution_mode_name(),
         );
     }
     Ok(ExitCode::SUCCESS)

@@ -404,6 +404,10 @@ pub struct JitPrimitiveMethodGuard {
     pub method_value_byte: u32,
     /// Raw static native builtin function address expected in the method slot.
     pub builtin_fn_addr: usize,
+    /// Typed leaf entry generated code calls once every guard holds.
+    pub leaf_stub_id: crate::native_abi::RuntimeStubId,
+    /// `GcHeader::type_tag` the receiver cell must carry.
+    pub receiver_type_tag: u8,
 }
 
 /// A callee the baseline may splice into a caller's `Op::Call` site.

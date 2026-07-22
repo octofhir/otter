@@ -32,8 +32,9 @@ use crate::native_abi::{
     STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC,
     STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC,
     STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
-    STUB_NUMBER_REM_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF,
-    SafepointId, SafepointRecord, TaggedLocationKind, validate_stub_descriptor,
+    STUB_NUMBER_REM_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF,
+    STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF, SafepointId, SafepointRecord,
+    TaggedLocationKind, validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
@@ -385,6 +386,12 @@ pub const COLLECTION_MAP_GET_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     entry: collection_map_get_leaf,
 };
 
+/// Callable ABI entry for `String.prototype.charCodeAt`.
+pub const STRING_CHAR_CODE_AT_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_STRING_CHAR_CODE_AT_LEAF,
+    entry: string_char_code_at_leaf,
+};
+
 /// Callable ABI entry for the strict-equality probe.
 pub const STRICT_EQ_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: STUB_STRICT_EQ_LEAF,
@@ -473,6 +480,7 @@ pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocS
         id if id == STUB_STRICT_EQ_LEAF.id => Some(STRICT_EQ_LEAF),
         id if id == STUB_TO_BOOLEAN_LEAF.id => Some(TO_BOOLEAN_LEAF),
         id if id == STUB_NUMBER_REM_LEAF.id => Some(NUMBER_REM_LEAF),
+        id if id == STUB_STRING_CHAR_CODE_AT_LEAF.id => Some(STRING_CHAR_CODE_AT_LEAF),
         _ => None,
     }
 }
@@ -793,6 +801,36 @@ pub extern "C" fn number_rem_leaf(
     let rem = a.as_f64() % b.as_f64();
     RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::number(
         crate::NumberValue::Double(rem),
+    )))
+}
+
+/// `String.prototype.charCodeAt` over a string receiver and an integral index.
+/// Walks the body to the requested code unit without allocating; a non-string
+/// receiver, a non-integral index, or an index outside `[0, len)` misses so the
+/// general method path owns coercion and the NaN result.
+#[must_use]
+pub extern "C" fn string_char_code_at_leaf(
+    heap: *const otter_gc::GcHeap,
+    receiver_bits: u64,
+    index_bits: u64,
+) -> RuntimeStubResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let Some(heap) = heap_ref(heap) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    let receiver = Value::from_abi_bits(receiver_bits);
+    let index = Value::from_abi_bits(index_bits);
+    let (Some(string), Some(index)) = (receiver.as_string(heap), index.as_i32()) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    if index < 0 {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    }
+    let Some(unit) = string.char_code_at(index as u32, heap) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::number(
+        crate::NumberValue::from_i32(i32::from(unit)),
     )))
 }
 

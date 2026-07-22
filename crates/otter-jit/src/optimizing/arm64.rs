@@ -105,6 +105,8 @@ use otter_vm::native_abi::{
 };
 use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG};
 
+use crate::template::arm64::collections::{MethodSite, emit_primitive_method_guarded_call};
+
 use super::{
     OptimizedCode, OptimizedMetadata,
     artifact::render_optimized_unit,
@@ -3936,6 +3938,27 @@ fn emit(
                             );
                         }
                         dynasm!(ops ; .arch aarch64 ; =>next_target);
+                    }
+                    if let Some(guard) = view.primitive_method_guards.get(&byte_pc) {
+                        let after_primitive = ops.new_dynamic_label();
+                        if emit_primitive_method_guarded_call(
+                            &mut ops,
+                            &mut relocations,
+                            view,
+                            guard,
+                            byte_pc,
+                            &MethodSite {
+                                dst,
+                                receiver,
+                                argc: arg_regs.len() as u16,
+                                arg0: arg_regs.first().copied(),
+                                arg1: arg_regs.get(1).copied(),
+                            },
+                            after_primitive,
+                            succeeded,
+                        )? {
+                            dynasm!(ops ; .arch aarch64 ; =>after_primitive);
+                        }
                     }
                     let packed_meta = u64::from(dst)
                         | (u64::from(receiver) << 16)

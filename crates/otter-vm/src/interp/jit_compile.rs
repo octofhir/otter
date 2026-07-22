@@ -310,6 +310,7 @@ impl Interpreter {
             jit_debug::JitDebugTier::Optimizing,
             false,
         );
+        self.bake_primitive_method_guards(&mut snapshot);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
         });

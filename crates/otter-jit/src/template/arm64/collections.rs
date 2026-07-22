@@ -31,7 +31,7 @@ use super::values::{
     emit_load_u64, emit_store_reg,
 };
 use crate::artifact::relocation::{
-    CollectionFeedbackKind, CollectionHeapComponent, RelocationCapture, RelocationTarget,
+    GuardedBuiltinKind, GuardedHeapComponent, RelocationCapture, RelocationTarget,
 };
 use crate::entry::{
     ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
@@ -40,34 +40,24 @@ use crate::entry::{
 };
 
 /// Method-call operand bundle shared by the guarded fast paths.
-pub(super) struct MethodSite {
-    pub(super) dst: u16,
-    pub(super) receiver: u16,
-    pub(super) argc: u16,
-    pub(super) arg0: Option<u16>,
-    pub(super) arg1: Option<u16>,
+pub(crate) struct MethodSite {
+    pub(crate) dst: u16,
+    pub(crate) receiver: u16,
+    pub(crate) argc: u16,
+    pub(crate) arg0: Option<u16>,
+    pub(crate) arg1: Option<u16>,
 }
 
-/// Emit the receiver + prototype + builtin identity guard chain shared by the
-/// leaf and allocating collection calls. On success `x15` holds the
-/// prototype's value-slab pointer; every failed guard branches to `miss`.
-#[allow(clippy::too_many_arguments)]
-fn emit_receiver_guards(
+/// Prove the receiver is a heap cell carrying `receiver_type_tag`. On success
+/// `x13` holds its header pointer.
+fn emit_receiver_type_guard(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     receiver: u16,
     receiver_type_tag: u32,
-    proto_offset: u32,
-    proto_shape: u32,
-    feedback_kind: CollectionFeedbackKind,
-    byte_pc: u32,
-    runtime_stub_id: u32,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported> {
-    let guard_flags_byte = view.collection_layout.guard_flags_byte;
-    let object_shape_byte = view.object_shape_byte;
-    let object_values_ptr_byte = view.object_values_ptr_byte;
     emit_load_reg(ops, 9, receiver)?;
     dynasm!(ops
         ; .arch aarch64
@@ -90,9 +80,26 @@ fn emit_receiver_guards(
         ; ldrb w14, [x13]
         ; cmp w14, receiver_type_tag
         ; b.ne =>miss
-        ; ldr w14, [x13, guard_flags_byte]
-        ; cbnz w14, =>miss
     );
+    Ok(())
+}
+
+/// Prove the realm prototype still has the expected identity and shape. On
+/// success `x15` holds its value-slab pointer.
+#[allow(clippy::too_many_arguments)]
+fn emit_prototype_guard(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    proto_offset: u32,
+    proto_shape: u32,
+    feedback_kind: GuardedBuiltinKind,
+    byte_pc: u32,
+    runtime_stub_id: u32,
+    miss: DynamicLabel,
+) {
+    let object_shape_byte = view.object_shape_byte;
+    let object_values_ptr_byte = view.object_values_ptr_byte;
     emit_load_symbol_u64(
         ops,
         relocations,
@@ -105,8 +112,8 @@ fn emit_receiver_guards(
         relocations,
         12,
         u64::from(proto_offset),
-        RelocationTarget::CollectionHeapReference {
-            component: CollectionHeapComponent::Prototype,
+        RelocationTarget::GuardedHeapReference {
+            component: GuardedHeapComponent::Prototype,
             feedback_kind,
             byte_pc,
             runtime_stub_id,
@@ -125,8 +132,8 @@ fn emit_receiver_guards(
         relocations,
         12,
         u64::from(proto_shape),
-        RelocationTarget::CollectionHeapReference {
-            component: CollectionHeapComponent::PrototypeShape,
+        RelocationTarget::GuardedHeapReference {
+            component: GuardedHeapComponent::PrototypeShape,
             feedback_kind,
             byte_pc,
             runtime_stub_id,
@@ -138,6 +145,43 @@ fn emit_receiver_guards(
         ; b.ne =>miss
         ; ldr x15, [x15, object_values_ptr_byte]
         ; cbz x15, =>miss
+    );
+}
+
+/// Emit the receiver + prototype + builtin identity guard chain shared by the
+/// leaf and allocating collection calls. On success `x15` holds the
+/// prototype's value-slab pointer; every failed guard branches to `miss`.
+#[allow(clippy::too_many_arguments)]
+fn emit_receiver_guards(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    receiver: u16,
+    receiver_type_tag: u32,
+    proto_offset: u32,
+    proto_shape: u32,
+    feedback_kind: GuardedBuiltinKind,
+    byte_pc: u32,
+    runtime_stub_id: u32,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let guard_flags_byte = view.collection_layout.guard_flags_byte;
+    emit_receiver_type_guard(ops, relocations, view, receiver, receiver_type_tag, miss)?;
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr w14, [x13, guard_flags_byte]
+        ; cbnz w14, =>miss
+    );
+    emit_prototype_guard(
+        ops,
+        relocations,
+        view,
+        proto_offset,
+        proto_shape,
+        feedback_kind,
+        byte_pc,
+        runtime_stub_id,
+        miss,
     );
     Ok(())
 }
@@ -151,7 +195,7 @@ fn emit_builtin_identity_guard(
     method_value_byte: u32,
     builtin_fn_addr: usize,
     decompress_via_slot: bool,
-    feedback_kind: CollectionFeedbackKind,
+    feedback_kind: GuardedBuiltinKind,
     byte_pc: u32,
     runtime_stub_id: u32,
     miss: DynamicLabel,
@@ -206,7 +250,7 @@ fn emit_builtin_identity_guard(
         relocations,
         15,
         builtin_fn_addr as u64,
-        RelocationTarget::CollectionBuiltinFunction {
+        RelocationTarget::GuardedBuiltinFunction {
             feedback_kind,
             byte_pc,
             runtime_stub_id,
@@ -247,7 +291,7 @@ pub(super) fn emit_leaf_method_guarded_call(
         u32::from(leaf.receiver_type_tag),
         leaf.proto_offset,
         leaf.proto_shape,
-        CollectionFeedbackKind::Leaf,
+        GuardedBuiltinKind::Leaf,
         byte_pc,
         leaf.leaf_stub_id,
         miss,
@@ -259,7 +303,7 @@ pub(super) fn emit_leaf_method_guarded_call(
         leaf.method_value_byte,
         leaf.builtin_fn_addr,
         true,
-        CollectionFeedbackKind::Leaf,
+        GuardedBuiltinKind::Leaf,
         byte_pc,
         leaf.leaf_stub_id,
         miss,
@@ -273,6 +317,91 @@ pub(super) fn emit_leaf_method_guarded_call(
     emit_load_reg(ops, 1, site.receiver)?;
     if let Some(key) = site.arg0 {
         emit_load_reg(ops, 2, key)?;
+    } else {
+        emit_load_u64(ops, 2, VALUE_UNDEFINED);
+    }
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        16,
+        stub.entry_addr() as u64,
+        stub.descriptor,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; and x1, x1, #0xff
+        ; cbnz x1, =>miss
+    );
+    emit_store_reg(ops, 0, site.dst)?;
+    dynasm!(ops ; .arch aarch64 ; b =>done);
+    Ok(true)
+}
+
+/// Emit the guarded primitive prototype builtin call (`"…".charCodeAt(i)`)
+/// through its compile-time-resolved `LeafValue2` entry.
+///
+/// The receiver's cell type tag stands in for the collection guard-flag word:
+/// a primitive body carries no expando or override state, so proving the tag
+/// plus the realm prototype's shape and method-slot identity is the whole
+/// guard. Returns `false` when the site cannot take the fast path at all.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_primitive_method_guarded_call(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    guard: &otter_vm::JitPrimitiveMethodGuard,
+    byte_pc: u32,
+    site: &MethodSite,
+    miss: DynamicLabel,
+    done: DynamicLabel,
+) -> Result<bool, Unsupported> {
+    if view.cage_base == 0 {
+        return Ok(false);
+    }
+    let Some(stub) = leaf_no_alloc_stub2_by_id(guard.leaf_stub_id) else {
+        return Ok(false);
+    };
+    debug_assert!(stub.is_valid());
+    emit_receiver_type_guard(
+        ops,
+        relocations,
+        view,
+        site.receiver,
+        u32::from(guard.receiver_type_tag),
+        miss,
+    )?;
+    emit_prototype_guard(
+        ops,
+        relocations,
+        view,
+        guard.proto_offset,
+        guard.proto_shape,
+        GuardedBuiltinKind::Primitive,
+        byte_pc,
+        guard.leaf_stub_id,
+        miss,
+    );
+    emit_builtin_identity_guard(
+        ops,
+        relocations,
+        view,
+        guard.method_value_byte,
+        guard.builtin_fn_addr,
+        true,
+        GuardedBuiltinKind::Primitive,
+        byte_pc,
+        guard.leaf_stub_id,
+        miss,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x0, [x20, THREAD_OFFSET]
+        ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+    );
+    emit_load_reg(ops, 1, site.receiver)?;
+    if let Some(arg0) = site.arg0 {
+        emit_load_reg(ops, 2, arg0)?;
     } else {
         emit_load_u64(ops, 2, VALUE_UNDEFINED);
     }
@@ -325,7 +454,7 @@ pub(super) fn emit_alloc_method_guarded_call(
         u32::from(alloc.receiver_type_tag),
         alloc.proto_offset,
         alloc.proto_shape,
-        CollectionFeedbackKind::Alloc,
+        GuardedBuiltinKind::Alloc,
         byte_pc,
         alloc.alloc_stub_id,
         miss,
@@ -337,7 +466,7 @@ pub(super) fn emit_alloc_method_guarded_call(
         alloc.method_value_byte,
         alloc.builtin_fn_addr,
         false,
-        CollectionFeedbackKind::Alloc,
+        GuardedBuiltinKind::Alloc,
         byte_pc,
         alloc.alloc_stub_id,
         miss,

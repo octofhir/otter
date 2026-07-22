@@ -46,8 +46,8 @@ const TARGET_GC_CAGE_BASE: u8 = 2;
 const TARGET_PROPERTY_IC_CELL: u8 = 3;
 const TARGET_TEMPLATE_OPERAND_SLICE: u8 = 4;
 const TARGET_OPTIMIZED_MATH_ARGUMENTS: u8 = 5;
-const TARGET_COLLECTION_HEAP_REFERENCE: u8 = 6;
-const TARGET_COLLECTION_BUILTIN_FUNCTION: u8 = 7;
+const TARGET_GUARDED_HEAP_REFERENCE: u8 = 6;
+const TARGET_GUARDED_BUILTIN_FUNCTION: u8 = 7;
 const TARGET_DIRECT_CALL_ENTRY_CELL: u8 = 8;
 const TARGET_STATIC_NATIVE_BUILTIN_FUNCTION: u8 = 9;
 const TARGET_GLOBAL_LEXICAL_CELL: u8 = 10;
@@ -81,17 +81,21 @@ pub(crate) enum TemplateOperandRole {
 /// Address-stable heap component used by a collection fast path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum CollectionHeapComponent {
+pub(crate) enum GuardedHeapComponent {
     Prototype,
     PrototypeShape,
 }
 
-/// Allocation behavior of a collection runtime fallback.
+/// Which guarded builtin family a relocation belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum CollectionFeedbackKind {
+pub(crate) enum GuardedBuiltinKind {
+    /// Non-allocating collection read.
     Leaf,
+    /// Allocating collection write.
     Alloc,
+    /// Primitive prototype builtin reached through a leaf entry.
+    Primitive,
 }
 
 /// Semantic identity for one address materialized in native code.
@@ -131,14 +135,14 @@ pub(crate) enum RelocationTarget {
         logical_pc: u32,
         len: u32,
     },
-    CollectionHeapReference {
-        component: CollectionHeapComponent,
-        feedback_kind: CollectionFeedbackKind,
+    GuardedHeapReference {
+        component: GuardedHeapComponent,
+        feedback_kind: GuardedBuiltinKind,
         byte_pc: u32,
         runtime_stub_id: u32,
     },
-    CollectionBuiltinFunction {
-        feedback_kind: CollectionFeedbackKind,
+    GuardedBuiltinFunction {
+        feedback_kind: GuardedBuiltinKind,
         byte_pc: u32,
         runtime_stub_id: u32,
     },
@@ -1040,33 +1044,35 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             put_u32(output, *logical_pc);
             put_u32(output, *len);
         }
-        RelocationTarget::CollectionHeapReference {
+        RelocationTarget::GuardedHeapReference {
             component,
             feedback_kind,
             byte_pc,
             runtime_stub_id,
         } => {
-            output.push(TARGET_COLLECTION_HEAP_REFERENCE);
+            output.push(TARGET_GUARDED_HEAP_REFERENCE);
             output.push(match component {
-                CollectionHeapComponent::Prototype => 0,
-                CollectionHeapComponent::PrototypeShape => 1,
+                GuardedHeapComponent::Prototype => 0,
+                GuardedHeapComponent::PrototypeShape => 1,
             });
             output.push(match feedback_kind {
-                CollectionFeedbackKind::Leaf => 0,
-                CollectionFeedbackKind::Alloc => 1,
+                GuardedBuiltinKind::Leaf => 0,
+                GuardedBuiltinKind::Alloc => 1,
+                GuardedBuiltinKind::Primitive => 2,
             });
             put_u32(output, *byte_pc);
             put_u32(output, *runtime_stub_id);
         }
-        RelocationTarget::CollectionBuiltinFunction {
+        RelocationTarget::GuardedBuiltinFunction {
             feedback_kind,
             byte_pc,
             runtime_stub_id,
         } => {
-            output.push(TARGET_COLLECTION_BUILTIN_FUNCTION);
+            output.push(TARGET_GUARDED_BUILTIN_FUNCTION);
             output.push(match feedback_kind {
-                CollectionFeedbackKind::Leaf => 0,
-                CollectionFeedbackKind::Alloc => 1,
+                GuardedBuiltinKind::Leaf => 0,
+                GuardedBuiltinKind::Alloc => 1,
+                GuardedBuiltinKind::Primitive => 2,
             });
             put_u32(output, *byte_pc);
             put_u32(output, *runtime_stub_id);
@@ -1406,14 +1412,14 @@ mod tests {
                 logical_pc: 6,
                 len: 7,
             },
-            RelocationTarget::CollectionHeapReference {
-                component: CollectionHeapComponent::Prototype,
-                feedback_kind: CollectionFeedbackKind::Leaf,
+            RelocationTarget::GuardedHeapReference {
+                component: GuardedHeapComponent::Prototype,
+                feedback_kind: GuardedBuiltinKind::Leaf,
                 byte_pc: 8,
                 runtime_stub_id: 9,
             },
-            RelocationTarget::CollectionBuiltinFunction {
-                feedback_kind: CollectionFeedbackKind::Alloc,
+            RelocationTarget::GuardedBuiltinFunction {
+                feedback_kind: GuardedBuiltinKind::Alloc,
                 byte_pc: 10,
                 runtime_stub_id: 11,
             },

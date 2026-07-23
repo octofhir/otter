@@ -146,12 +146,23 @@ impl Interpreter {
         mut obj: object::JsObject,
         key: &str,
     ) {
-        if self.realm_intrinsics.array_prototype != Some(obj) {
-            return;
-        }
         let Some(index) = object::array_index_property_name(key) else {
             return;
         };
+        // An indexed property on a realm prototype becomes visible through
+        // every ordinary dense array's holes, so the element fast paths that
+        // answer a hole as `undefined` have to stop taking their shortcut.
+        // Assignment reaches the object through this shape-advancing store
+        // rather than through `define_own_property`, so the latch is tripped
+        // from both places.
+        if self.realm_intrinsics.array_prototype == Some(obj)
+            || self.realm_intrinsics.object_prototype == Some(obj)
+        {
+            self.activate_array_index_accessor_protector();
+        }
+        if self.realm_intrinsics.array_prototype != Some(obj) {
+            return;
+        }
         let new_len = f64::from(index) + 1.0;
         let current = object::get(obj, &self.gc_heap, "length")
             .and_then(|value| value.as_number())

@@ -28,24 +28,27 @@ impl Interpreter {
         site: usize,
         push_safepoint_id: crate::native_abi::SafepointId,
     ) -> Option<crate::jit::JitArrayMethod> {
-        use crate::native_abi::{NO_SAFEPOINT, STUB_ARRAY_POP_LEAF, STUB_ARRAY_PUSH_ALLOC};
+        use crate::native_abi::{
+            NO_SAFEPOINT, STUB_ARRAY_POP_LEAF, STUB_ARRAY_PUSH_ALLOC, STUB_ARRAY_SHIFT_LEAF,
+            STUB_ARRAY_UNSHIFT_ALLOC,
+        };
 
         let ic = match self.feedback_directory.method_ic(site)? {
             MethodCallIc::Array(ic) => ic,
             MethodCallIc::Collection(_) => return None,
         };
-        // `pop` only rewrites the dense tail, so it runs as a mutating leaf
-        // with no safepoint; `push` may grow the buffer and needs the
+        // `pop` / `shift` only rewrite the dense buffer, so they run as mutating
+        // leaves with no safepoint; `push` / `unshift` may grow it and need the
         // allocating entry with a precise root map.
+        use crate::array_prototype::ArrayMethodTag as Tag;
+        use crate::jit::JitArrayMethodKind as Kind;
         let (kind, stub_id, safepoint_id) = match ic.tag {
-            crate::array_prototype::ArrayMethodTag::Pop => (
-                crate::jit::JitArrayMethodKind::Pop,
-                STUB_ARRAY_POP_LEAF.id,
-                NO_SAFEPOINT,
-            ),
-            crate::array_prototype::ArrayMethodTag::Push => (
-                crate::jit::JitArrayMethodKind::Push,
-                STUB_ARRAY_PUSH_ALLOC.id,
+            Tag::Pop => (Kind::Pop, STUB_ARRAY_POP_LEAF.id, NO_SAFEPOINT),
+            Tag::Shift => (Kind::Shift, STUB_ARRAY_SHIFT_LEAF.id, NO_SAFEPOINT),
+            Tag::Push => (Kind::Push, STUB_ARRAY_PUSH_ALLOC.id, push_safepoint_id),
+            Tag::Unshift => (
+                Kind::Unshift,
+                STUB_ARRAY_UNSHIFT_ALLOC.id,
                 push_safepoint_id,
             ),
             _ => return None,

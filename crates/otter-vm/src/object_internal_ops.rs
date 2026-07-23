@@ -1264,6 +1264,22 @@ impl Interpreter {
         })
     }
 
+    /// `true` when `target` is a realm prototype that an ordinary dense array
+    /// inherits from, so an indexed property defined on it becomes visible
+    /// through that array's holes.
+    fn is_realm_element_prototype(&self, target: Value) -> bool {
+        let Some(object) = target.as_object() else {
+            return false;
+        };
+        [
+            self.realm_intrinsics.array_prototype,
+            self.realm_intrinsics.object_prototype,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|prototype| prototype == object)
+    }
+
     /// Flip the existing array-index accessor protector latch and publish its
     /// sole epoch transition. Redundant observations are strict no-ops.
     pub(crate) fn activate_array_index_accessor_protector(&mut self) {
@@ -1330,15 +1346,29 @@ impl Interpreter {
                 ));
             }
         }
-        // Array index-store protector: an accessor landing on an
-        // array-index key anywhere (most relevantly
-        // %Array.prototype% / %Object.prototype%) forces array
-        // element writes onto the OrdinarySet prototype-walk slow
-        // path. Conservative — never reset.
-        if (descriptor.get.is_some() || descriptor.set.is_some())
-            && key
-                .string_name()
-                .is_some_and(|name| crate::object::array_index_property_name(name).is_some())
+        // Array index protector, tripped by either of two observations and
+        // never reset:
+        //
+        // 1. An accessor landing on an array-index key *anywhere* (most
+        //    relevantly %Array.prototype% / %Object.prototype%) forces array
+        //    element writes onto the OrdinarySet prototype-walk slow path.
+        // 2. Any indexed property — data included — landing on %Array.prototype%
+        //    or %Object.prototype%. An ordinary dense array inherits from
+        //    exactly those two objects, so an in-bounds hole can then resolve
+        //    to an inherited value instead of `undefined`, and the fast
+        //    hole-read shortcut must stop taking it.
+        //
+        // The second condition is deliberately restricted to the two realm
+        // prototypes: an indexed data property on some unrelated plain object
+        // cannot be reached from a dense array with no per-instance prototype
+        // override, and tripping on those would latch the protector for
+        // ordinary object use.
+        if key
+            .string_name()
+            .is_some_and(|name| crate::object::array_index_property_name(name).is_some())
+            && (descriptor.get.is_some()
+                || descriptor.set.is_some()
+                || self.is_realm_element_prototype(*target))
         {
             self.activate_array_index_accessor_protector();
         }

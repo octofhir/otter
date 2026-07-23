@@ -2842,6 +2842,22 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
+        // Dense fast path (symmetric with `array_pop`): a fully dense array with
+        // a writable `length` and no accessor/attribute override slides the
+        // element buffer down directly — no `ToString(index)` key and no
+        // per-element get/set/delete protocol. `is_fully_dense` rules out holes,
+        // which would otherwise make the spec's `Get` read an inherited value.
+        if let Some(arr) = o.as_array()
+            && crate::array::is_fully_dense(arr, self.gc_heap())
+        {
+            let cur = crate::array::len(arr, self.gc_heap());
+            if cur > 0
+                && crate::array::length_writable(arr, self.gc_heap())
+                && crate::array::can_fast_fill_dense_range(arr, self.gc_heap(), 0, cur)
+            {
+                return Ok(crate::array::dense_shift(arr, self.gc_heap_mut()));
+            }
+        }
         let len = length_of_array_like(self, stack, context, &o)?;
         if len == 0 {
             self.array_set_length_throwing(stack, context, o, 0.0)?;
@@ -2886,6 +2902,48 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
+        // Dense fast path (symmetric with `array_push`): inserting at the head
+        // of a fully dense array slides the element buffer up directly. Like
+        // `push` it creates fresh indices, so the indexed-accessor protector
+        // gates it; unlike `push` the spec moves every existing element, which
+        // is exactly what makes the generic path expensive.
+        if let Some(arr) = o.as_array()
+            && !self.array_index_accessor_protector
+            && crate::array::is_fully_dense(arr, self.gc_heap())
+        {
+            let cur = crate::array::len(arr, self.gc_heap());
+            if crate::array::length_writable(arr, self.gc_heap())
+                && crate::array::can_fast_fill_dense_range(
+                    arr,
+                    self.gc_heap(),
+                    cur,
+                    cur + args.len(),
+                )
+            {
+                let mut new_len = cur;
+                for (i, &arg) in args.iter().enumerate().rev() {
+                    let rest = &args[..i];
+                    let mut visit = |v: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                        for slice in roots {
+                            for val in *slice {
+                                val.trace_value_slots(v);
+                            }
+                        }
+                        for val in rest {
+                            val.trace_value_slots(v);
+                        }
+                    };
+                    new_len = crate::array::dense_unshift_with_roots(
+                        arr,
+                        self.gc_heap_mut(),
+                        arg,
+                        &mut visit,
+                    )
+                    .map_err(VmError::from)?;
+                }
+                return Ok(Value::number(NumberValue::from_f64(new_len as f64)));
+            }
+        }
         let len = length_of_array_like(self, stack, context, &o)?;
         let arg_count = args.len();
         if arg_count == 0 {

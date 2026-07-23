@@ -29,14 +29,15 @@
 use crate::native_abi::{
     CodeRegistryView, NO_SAFEPOINT, RuntimeStubAllocContext, RuntimeStubDescriptor, RuntimeStubId,
     RuntimeStubResult, RuntimeStubResultPair, STUB_ARRAY_POP_LEAF, STUB_ARRAY_PUSH_ALLOC,
-    STUB_COLLECTION_MAP_DELETE_ALLOC, STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF,
-    STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC,
-    STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC,
-    STUB_COLLECTION_SET_HAS_LEAF, STUB_NUMBER_REM_LEAF, STUB_STRICT_EQ_LEAF,
-    STUB_STRING_CHAR_CODE_AT_LEAF, STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC,
-    STUB_STRING_ENDS_WITH_LEAF, STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF,
-    STUB_STRING_STARTS_WITH_LEAF, STUB_TO_BOOLEAN_LEAF, SafepointId, SafepointRecord,
-    TaggedLocationKind, validate_stub_descriptor,
+    STUB_ARRAY_SHIFT_LEAF, STUB_ARRAY_UNSHIFT_ALLOC, STUB_COLLECTION_MAP_DELETE_ALLOC,
+    STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC,
+    STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC,
+    STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
+    STUB_NUMBER_REM_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF,
+    STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_STRING_ENDS_WITH_LEAF,
+    STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF, STUB_STRING_STARTS_WITH_LEAF,
+    STUB_TO_BOOLEAN_LEAF, SafepointId, SafepointRecord, TaggedLocationKind,
+    validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
@@ -558,11 +559,24 @@ pub const ARRAY_PUSH_ALLOC: AllocValueStub = AllocValueStub {
     entry: Some(array_push_alloc),
 };
 
+/// Callable ABI entry for `Array.prototype.shift` over a dense array.
+pub const ARRAY_SHIFT_LEAF: MutatingLeafStub2 = MutatingLeafStub2 {
+    descriptor: STUB_ARRAY_SHIFT_LEAF,
+    entry: array_shift_leaf,
+};
+
+/// ABI descriptor for `Array.prototype.unshift` over a dense array.
+pub const ARRAY_UNSHIFT_ALLOC: AllocValueStub = AllocValueStub {
+    descriptor: STUB_ARRAY_UNSHIFT_ALLOC,
+    entry: Some(array_unshift_alloc),
+};
+
 /// Resolve a two-argument mutating leaf stub by ABI descriptor id.
 #[must_use]
 pub const fn mutating_leaf_stub2_by_id(id: RuntimeStubId) -> Option<MutatingLeafStub2> {
     match id {
         id if id == STUB_ARRAY_POP_LEAF.id => Some(ARRAY_POP_LEAF),
+        id if id == STUB_ARRAY_SHIFT_LEAF.id => Some(ARRAY_SHIFT_LEAF),
         _ => None,
     }
 }
@@ -600,6 +614,7 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
         id if id == STUB_COLLECTION_SET_DELETE_ALLOC.id => Some(COLLECTION_SET_DELETE_ALLOC),
         id if id == STUB_STRING_CONCAT_ALLOC.id => Some(STRING_CONCAT_ALLOC),
         id if id == STUB_ARRAY_PUSH_ALLOC.id => Some(ARRAY_PUSH_ALLOC),
+        id if id == STUB_ARRAY_UNSHIFT_ALLOC.id => Some(ARRAY_UNSHIFT_ALLOC),
         _ => None,
     }
 }
@@ -1734,6 +1749,108 @@ fn array_push_alloc_inner(
         value.trace_value_slots(visitor);
     };
     match crate::array::push_with_roots(arr, &mut interp.gc_heap, value, &mut visit) {
+        Ok(new_len) => {
+            RuntimeStubResult::ok_value(Value::number(crate::NumberValue::from_f64(new_len as f64)))
+        }
+        Err(_) => RuntimeStubResult::out_of_memory(),
+    }
+}
+
+/// Leaf `Array.prototype.shift` over a dense array.
+#[must_use]
+pub extern "C" fn array_shift_leaf(
+    heap: *mut otter_gc::GcHeap,
+    recv_bits: u64,
+    _unused_bits: u64,
+) -> RuntimeStubResultPair {
+    RuntimeStubResultPair::from_result(array_shift_leaf_inner(heap, recv_bits))
+}
+
+fn array_shift_leaf_inner(heap: *mut otter_gc::GcHeap, recv_bits: u64) -> RuntimeStubResult {
+    let Some(heap) = heap_mut(heap) else {
+        return RuntimeStubResult::miss();
+    };
+    let Some(arr) = Value::from_abi_bits(recv_bits).as_array() else {
+        return RuntimeStubResult::miss();
+    };
+    let len = crate::array::len(arr, heap);
+    // Every moved index must be a present own element: a hole anywhere in the
+    // range would make the spec's per-index `Get` read an inherited value.
+    if len == 0
+        || !crate::array::is_fully_dense(arr, heap)
+        || !dense_range_is_fast(arr, heap, 0, len)
+    {
+        return RuntimeStubResult::miss();
+    }
+    RuntimeStubResult::ok_value(crate::array::dense_shift(arr, heap))
+}
+
+/// Allocating `Array.prototype.unshift` over a dense array.
+#[must_use]
+pub extern "C" fn array_unshift_alloc(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    value_bits: u64,
+    unused_bits: u64,
+) -> RuntimeStubResultPair {
+    alloc_value_stub_result_pair(
+        ctx,
+        array_unshift_alloc_inner(ctx, safepoint, recv_bits, value_bits, unused_bits),
+    )
+}
+
+fn array_unshift_alloc_inner(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    value_bits: u64,
+    unused_bits: u64,
+) -> RuntimeStubResult {
+    let Some(ctx) = alloc_context_mut(ctx) else {
+        return RuntimeStubResult::miss();
+    };
+    let Some(interp) = alloc_interpreter_mut(ctx) else {
+        return RuntimeStubResult::miss();
+    };
+    // Head insertion creates a fresh trailing index, so the realm
+    // indexed-accessor protector gates it exactly as it gates `push`.
+    if interp.array_index_accessor_protector {
+        return RuntimeStubResult::miss();
+    }
+    // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
+    // table and frame-slot window must remain live for this call.
+    let Ok(roots) = (unsafe {
+        alloc_value_stub_call_roots(
+            ctx,
+            safepoint,
+            [
+                Value::from_abi_bits(recv_bits),
+                Value::from_abi_bits(value_bits),
+                Value::from_abi_bits(unused_bits),
+            ],
+        )
+    }) else {
+        return RuntimeStubResult::miss();
+    };
+    let _roots_guard = interp
+        .gc_heap
+        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    let Some(arr) = roots.value(0).as_array() else {
+        return RuntimeStubResult::miss();
+    };
+    let len = crate::array::len(arr, &interp.gc_heap);
+    if !crate::array::is_fully_dense(arr, &interp.gc_heap)
+        || !dense_range_is_fast(arr, &interp.gc_heap, len, len + 1)
+    {
+        return RuntimeStubResult::miss();
+    }
+    let value = roots.value(1);
+    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        roots.value(0).trace_value_slots(visitor);
+        value.trace_value_slots(visitor);
+    };
+    match crate::array::dense_unshift_with_roots(arr, &mut interp.gc_heap, value, &mut visit) {
         Ok(new_len) => {
             RuntimeStubResult::ok_value(Value::number(crate::NumberValue::from_f64(new_len as f64)))
         }

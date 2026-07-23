@@ -365,6 +365,28 @@ pub enum JitArrayMethodKind {
     Pop,
     /// `Array.prototype.push` — may grow the backing store.
     Push,
+    /// `Array.prototype.shift` — leaf, no allocation.
+    Shift,
+    /// `Array.prototype.unshift` — may grow the backing store.
+    Unshift,
+}
+
+impl JitArrayMethodKind {
+    /// Argument count the typed entry models. A site with any other arity
+    /// keeps the general method-call path.
+    #[must_use]
+    pub const fn expected_argument_count(self) -> u16 {
+        match self {
+            Self::Pop | Self::Shift => 0,
+            Self::Push | Self::Unshift => 1,
+        }
+    }
+
+    /// Whether the entry may allocate, and therefore needs a safepoint.
+    #[must_use]
+    pub const fn allocates(self) -> bool {
+        matches!(self, Self::Push | Self::Unshift)
+    }
 }
 
 /// JIT-readable dense-array `push` / `pop` method IC entry.

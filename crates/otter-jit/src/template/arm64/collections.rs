@@ -29,8 +29,7 @@ use otter_vm::runtime_stubs::{
     alloc_value_stub_by_id, leaf_no_alloc_stub2_by_id, mutating_leaf_stub2_by_id,
 };
 use otter_vm::{
-    JitArrayMethod, JitArrayMethodKind, JitCollectionAllocMethod, JitCollectionLeafMethod,
-    JitCompileSnapshot,
+    JitArrayMethod, JitCollectionAllocMethod, JitCollectionLeafMethod, JitCompileSnapshot,
 };
 
 use super::values::{
@@ -578,14 +577,11 @@ pub(super) fn emit_array_method_guarded_call(
     if view.cage_base == 0 || view.array_layout.type_tag == 0 {
         return Ok(false);
     }
-    // `pop()` takes no argument and `push(x)` exactly one. A different arity
-    // means multi-append or a stray operand, neither of which the typed entries
-    // model, so the site keeps the general path.
-    let expected_argc = match method.kind {
-        JitArrayMethodKind::Pop => 0,
-        JitArrayMethodKind::Push => 1,
-    };
-    if site.argc != expected_argc {
+    // `pop()` / `shift()` take no argument and `push(x)` / `unshift(x)` exactly
+    // one. A different arity means a multi-element form or a stray operand,
+    // neither of which the typed entries model, so the site keeps the general
+    // path.
+    if site.argc != method.kind.expected_argument_count() {
         return Ok(false);
     }
     emit_dense_array_receiver_guard(ops, relocations, view, site.receiver, miss)?;
@@ -612,69 +608,66 @@ pub(super) fn emit_array_method_guarded_call(
         method.stub_id,
         miss,
     );
-    match method.kind {
-        JitArrayMethodKind::Pop => {
-            let Some(stub) = mutating_leaf_stub2_by_id(method.stub_id) else {
-                return Ok(false);
-            };
-            debug_assert!(stub.is_valid());
-            // Mutating leaf call: `(heap, receiver bits, unused) -> pair`.
-            dynasm!(ops
-                ; .arch aarch64
-                ; ldr x0, [x20, THREAD_OFFSET]
-                ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
-            );
-            emit_load_reg(ops, 1, site.receiver)?;
-            emit_load_u64(ops, 2, VALUE_UNDEFINED);
-            emit_load_runtime_stub(
-                ops,
-                relocations,
-                16,
-                stub.entry_addr() as u64,
-                stub.descriptor,
-            );
-            dynasm!(ops
-                ; .arch aarch64
-                ; blr x16
-                ; and x1, x1, #0xff
-                ; cbnz x1, =>miss
-            );
-        }
-        JitArrayMethodKind::Push => {
-            let Some(stub) = alloc_value_stub_by_id(method.stub_id) else {
-                return Ok(false);
-            };
-            let Some(stub_addr) = stub.entry_addr() else {
-                return Ok(false);
-            };
-            let Some(arg0) = site.arg0 else {
-                return Ok(false);
-            };
-            dynasm!(ops
-                ; .arch aarch64
-                ; sub sp, sp, ALLOC_CTX_STACK_SIZE
-                ; ldr x9, [x20, THREAD_OFFSET]
-                ; str x9, [sp, ALLOC_CTX_THREAD_OFFSET]
-                ; movz w9, method.safepoint_id
-                ; str w9, [sp, ALLOC_CTX_SAFEPOINT_ID_OFFSET]
-                ; strh wzr, [sp, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET]
-                ; str xzr, [sp, ALLOC_CTX_SPILL_SLOTS_OFFSET]
-                ; mov x0, sp
-            );
-            emit_load_u64(ops, 1, u64::from(method.safepoint_id));
-            emit_load_reg(ops, 2, site.receiver)?;
-            emit_load_reg(ops, 3, arg0)?;
-            emit_load_u64(ops, 4, VALUE_UNDEFINED);
-            emit_load_runtime_stub(ops, relocations, 16, stub_addr as u64, stub.descriptor);
-            dynasm!(ops
-                ; .arch aarch64
-                ; blr x16
-                ; and x1, x1, #0xff
-                ; mov x5, x1
-                ; add sp, sp, ALLOC_CTX_STACK_SIZE
-                ; cbnz x5, =>miss
-            );
-        }
+    if method.kind.allocates() {
+        let Some(stub) = alloc_value_stub_by_id(method.stub_id) else {
+            return Ok(false);
+        };
+        let Some(stub_addr) = stub.entry_addr() else {
+            return Ok(false);
+        };
+        let Some(arg0) = site.arg0 else {
+            return Ok(false);
+        };
+        dynasm!(ops
+            ; .arch aarch64
+            ; sub sp, sp, ALLOC_CTX_STACK_SIZE
+            ; ldr x9, [x20, THREAD_OFFSET]
+            ; str x9, [sp, ALLOC_CTX_THREAD_OFFSET]
+            ; movz w9, method.safepoint_id
+            ; str w9, [sp, ALLOC_CTX_SAFEPOINT_ID_OFFSET]
+            ; strh wzr, [sp, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET]
+            ; str xzr, [sp, ALLOC_CTX_SPILL_SLOTS_OFFSET]
+            ; mov x0, sp
+        );
+        emit_load_u64(ops, 1, u64::from(method.safepoint_id));
+        emit_load_reg(ops, 2, site.receiver)?;
+        emit_load_reg(ops, 3, arg0)?;
+        emit_load_u64(ops, 4, VALUE_UNDEFINED);
+        emit_load_runtime_stub(ops, relocations, 16, stub_addr as u64, stub.descriptor);
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; and x1, x1, #0xff
+            ; mov x5, x1
+            ; add sp, sp, ALLOC_CTX_STACK_SIZE
+            ; cbnz x5, =>miss
+        );
+    } else {
+        let Some(stub) = mutating_leaf_stub2_by_id(method.stub_id) else {
+            return Ok(false);
+        };
+        debug_assert!(stub.is_valid());
+        // Mutating leaf call: `(heap, receiver bits, unused) -> pair`.
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x0, [x20, THREAD_OFFSET]
+            ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+        );
+        emit_load_reg(ops, 1, site.receiver)?;
+        emit_load_u64(ops, 2, VALUE_UNDEFINED);
+        emit_load_runtime_stub(
+            ops,
+            relocations,
+            16,
+            stub.entry_addr() as u64,
+            stub.descriptor,
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; and x1, x1, #0xff
+            ; cbnz x1, =>miss
+        );
     }
     emit_store_reg(ops, 0, site.dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done);

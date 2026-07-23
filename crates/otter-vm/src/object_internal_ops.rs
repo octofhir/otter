@@ -1005,6 +1005,9 @@ impl Interpreter {
         if let Some(native) = value.as_native_function() {
             return native.is_extensible(&self.gc_heap);
         }
+        if let Some(class) = value.as_class_constructor() {
+            return object::is_extensible(class.statics(&self.gc_heap), &self.gc_heap);
+        }
         let fid = value.as_function().or_else(|| {
             value
                 .as_closure(&self.gc_heap)
@@ -3514,6 +3517,15 @@ impl Interpreter {
         }
         if let Some(native) = value.as_native_function() {
             native.prevent_extensions(&mut self.gc_heap);
+            return Ok(true);
+        }
+        // A class constructor's own (static) properties live on its statics
+        // object, so that is where [[Extensible]] has to live too — otherwise
+        // `preventExtensions` on a class is silently a no-op and static fields
+        // keep being installed.
+        if let Some(class) = value.as_class_constructor() {
+            let statics = class.statics(&self.gc_heap);
+            object::prevent_extensions(statics, &mut self.gc_heap);
             return Ok(true);
         }
         let fid = value.as_function().or_else(|| {

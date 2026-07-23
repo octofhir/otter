@@ -9,6 +9,43 @@
 use crate::*;
 
 impl Interpreter {
+    /// Deliver one step event to an installed tracer.
+    ///
+    /// Out of line by design: the dispatch loop guards this with a
+    /// loop-invariant bool, and building the event inline would spend hot-loop
+    /// registers and instruction cache on every run that installs no tracer.
+    #[inline(never)]
+    fn emit_step_trace(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &ActivationStack,
+        top_idx: usize,
+        function: &CodeBlock,
+        function_id: u32,
+        idx: usize,
+        instr: &CodeBlockInstruction,
+    ) -> Result<(), VmError> {
+        let function_name = context
+            .function(function_id)
+            .map(|f| f.name.as_str())
+            .unwrap_or("<unknown>");
+        let event = inspect::StepEvent {
+            frame_depth: stack.len(),
+            function_id,
+            function_name,
+            byte_pc: function
+                .instruction_byte_pc(idx)
+                .ok_or(VmError::MissingReturn)?,
+            op: function.op(instr),
+            operands: function.operand_view(instr),
+            register_window: &stack[top_idx].registers,
+        };
+        if let Some(tracer) = self.tracer.as_deref_mut() {
+            tracer.on_step(&event);
+        }
+        Ok(())
+    }
+
     pub(crate) fn dispatch_loop_inner(
         &mut self,
         entry_context: &ExecutionContext,
@@ -36,6 +73,9 @@ impl Interpreter {
         let jit_installed = self.jit_hook.is_some();
         let has_profiler = self.cpu_profiler.is_some();
         let has_tracer = self.tracer.is_some();
+        // Union of the per-instruction hooks, tested once per dispatched
+        // instruction in place of three separate not-taken branches.
+        let has_hooks = enforce_budget || has_profiler || has_tracer;
         // Per-frame dispatch cache. The owning chunk context, the executable
         // function body, and the dense instruction index are invariants of the
         // top frame — they change only when the frame does (call / return /
@@ -177,36 +217,30 @@ impl Interpreter {
             // branch in the default Observe mode).
             self.runtime_budget_stats
                 .record_reductions(instr.reductions());
-            if enforce_budget {
-                self.enforce_runtime_budget_checkpoint()?;
-            }
-
-            if has_profiler && let Some(profiler) = self.cpu_profiler.as_mut() {
-                profiler.maybe_sample(context, stack);
-            }
-
-            // Step-trace hook. The hot path checks one loop-invariant bool
-            // per instruction; the body only runs when an embedder installed
-            // a tracer through `Interpreter::set_tracer`.
-            if has_tracer {
-                let function_name = context
-                    .function(function_id)
-                    .map(|f| f.name.as_str())
-                    .unwrap_or("<unknown>");
-                let register_window: &[Value] = &stack[top_idx].registers;
-                let event = inspect::StepEvent {
-                    frame_depth: stack.len(),
-                    function_id,
-                    function_name,
-                    byte_pc: function
-                        .instruction_byte_pc(idx)
-                        .ok_or(VmError::MissingReturn)?,
-                    op,
-                    operands: function.operand_view(instr),
-                    register_window,
-                };
-                if let Some(tracer) = self.tracer.as_deref_mut() {
-                    tracer.on_step(&event);
+            // Budget enforcement, CPU sampling, and step tracing are each
+            // installed between turns, never mid-loop. Testing their union once
+            // keeps the common no-hook instruction at a single not-taken branch
+            // instead of three; the individual tests only run when some hook is
+            // actually present.
+            if has_hooks {
+                if enforce_budget {
+                    self.enforce_runtime_budget_checkpoint()?;
+                }
+                if has_profiler && let Some(profiler) = self.cpu_profiler.as_mut() {
+                    profiler.maybe_sample(context, stack);
+                }
+                // The body is kept out of line so building the event costs the
+                // hot loop nothing.
+                if has_tracer {
+                    self.emit_step_trace(
+                        context,
+                        stack,
+                        top_idx,
+                        function,
+                        function_id,
+                        idx,
+                        instr,
+                    )?;
                 }
             }
 

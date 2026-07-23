@@ -259,6 +259,10 @@ mod tests {
             .map(|id| Function {
                 id,
                 name: format!("f{id}"),
+                // Tests overwrite `code` with hand-written bodies; give them a
+                // window wide enough that the build-time register verifier
+                // accepts any small register number they use.
+                locals: 16,
                 code: vec![Instruction {
                     pc: 0,
                     op: Op::ReturnUndefined,

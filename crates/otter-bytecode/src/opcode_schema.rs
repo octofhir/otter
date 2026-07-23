@@ -642,6 +642,28 @@ pub const fn operand_kind_at(op: Op, index: usize) -> Option<OperandKind> {
     }
 }
 
+/// Return the schema-declared register data-flow role at one operand position.
+///
+/// `RegisterAccess::None` means the operand does not address the executing
+/// frame's register window. Anything else does, whether it is spelled as a
+/// `Register` operand or as the `Imm32` local index of `LoadLocal` /
+/// `StoreLocal` — a verifier must bound-check both against the frame's
+/// register count, and this is the single declaration of which those are.
+#[must_use]
+pub const fn register_access_at(op: Op, index: usize) -> RegisterAccess {
+    let shape = opcode_schema(op).operand_shape;
+    let Some(prefix) = shape.prefix() else {
+        return RegisterAccess::None;
+    };
+    if index < prefix.len() {
+        return prefix[index].register_access;
+    }
+    match shape.variadic() {
+        Some((_, tail)) => tail.register_access,
+        None => RegisterAccess::None,
+    }
+}
+
 /// Encode one verified operand as an untagged 32-bit CodeBlock word.
 #[must_use]
 pub const fn encode_operand_word(operand: Operand) -> u32 {

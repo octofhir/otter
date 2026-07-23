@@ -319,6 +319,49 @@ pub(crate) fn write_register(frame: &mut Frame, idx: u16, value: Value) -> Resul
     crate::ActiveFrameMut::materialized(frame).write(idx, value)
 }
 
+/// Read a register operand the build-time verifier already proved in range.
+///
+/// `crate::executable` bound-checks every schema-register operand against the
+/// function's register count when the `CodeBlock` is built, and the window has
+/// exactly that many slots, so a schema-register operand on the dispatch path
+/// needs no second check. Use only for operands the schema marks as registers.
+///
+/// # Safety
+/// `idx` must be less than the frame's register-window length. Guaranteed for
+/// any register operand of a verified `CodeBlock` instruction.
+#[inline]
+pub(crate) unsafe fn read_register_unchecked(frame: &Frame, idx: u16) -> Value {
+    debug_assert!(
+        (idx as usize) < frame.registers.len(),
+        "register {idx} out of window {}",
+        frame.registers.len()
+    );
+    // SAFETY: forwarded from this function's contract; the build-time verifier
+    // established the bound and the window length matches the register count.
+    unsafe { *frame.registers.get_unchecked(idx as usize) }
+}
+
+/// Write a register operand the build-time verifier already proved in range.
+///
+/// See [`read_register_unchecked`]. Bypasses the write-barrier bookkeeping in
+/// [`crate::ActiveFrameMut::write`], which the register-stack arena does not
+/// need: register slots are roots scanned in place, not heap fields.
+///
+/// # Safety
+/// `idx` must be less than the frame's register-window length.
+#[inline]
+pub(crate) unsafe fn write_register_unchecked(frame: &mut Frame, idx: u16, value: Value) {
+    debug_assert!(
+        (idx as usize) < frame.registers.len(),
+        "register {idx} out of window {}",
+        frame.registers.len()
+    );
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        *frame.registers.get_unchecked_mut(idx as usize) = value;
+    }
+}
+
 /// Build the native callable that `arr[Symbol.iterator]` evaluates
 /// to. Invoking the returned function (with any `this`) yields a
 /// fresh iterator over the captured array — matching the

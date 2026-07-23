@@ -229,7 +229,7 @@ impl Interpreter {
             // unchanged.
             return Ok(*value);
         };
-        let source = s.to_lossy_string(&self.gc_heap);
+        let source = s.with_utf16(&self.gc_heap, crate::eval_source::encode);
         // §19.2.1.3 — only the caller's OWN variable-environment
         // names block adoption; a passthrough CAPTURE of the same
         // name still receives a fresh caller binding.
@@ -241,7 +241,7 @@ impl Interpreter {
             .filter(|binding| !binding.captured)
             .map(|binding| binding.name.clone())
             .collect();
-        let module = self.compile_eval_source(&source, options)?;
+        let module = self.compile_escaped_source(&source, options)?;
         let context = self.link_module(module);
         let main = context.exec_main();
         let mut upvalues =
@@ -427,11 +427,11 @@ impl Interpreter {
             // unchanged — `eval(42) === 42`.
             return Ok(*value);
         };
-        let source = s.to_lossy_string(&self.gc_heap);
+        let source = s.with_utf16(&self.gc_heap, crate::eval_source::encode);
         if is_v8_native_eval_hint(&source) {
             return Ok(Value::undefined());
         }
-        let module = self.compile_eval_source(&source, options)?;
+        let module = self.compile_escaped_source(&source, options)?;
         // Linking (not a standalone context) keeps the eval chunk's
         // function ids global, so closures and classes escaping the
         // eval stay callable from any later frame.
@@ -627,7 +627,7 @@ impl Interpreter {
         let params_joined = params.join(",");
         let prefix = kind.source_prefix();
         let source = format!("({prefix} anonymous({params_joined}\n) {{\n{body}\n}})");
-        let module = self.compile_eval_source(&source, EvalCompileOptions::default())?;
+        let module = self.compile_escaped_source(&source, EvalCompileOptions::default())?;
         let context = self.link_module(module);
         // Running the synthesised module's `<main>` returns the
         // function value (the parenthesised expression is the
@@ -661,7 +661,10 @@ impl Interpreter {
             *value
         };
         if let Some(s) = primitive.as_string(&self.gc_heap) {
-            return Ok(s.to_lossy_string(&self.gc_heap));
+            // Escaped here rather than after assembly: the surrounding source
+            // the caller builds is ASCII punctuation, so escaping each part
+            // leaves one consistently escaped program.
+            return Ok(s.with_utf16(&self.gc_heap, crate::eval_source::encode));
         }
         if primitive.is_symbol() {
             return Err(
@@ -691,6 +694,18 @@ impl Interpreter {
     /// Helper — invoke the eval hook, mapping its error to a
     /// VmError that the throwable-conversion path will surface as
     /// `SyntaxError`.
+    /// Compile a source that came from a JS string, undoing the WTF-16
+    /// transport escape in the literals the module carries.
+    fn compile_escaped_source(
+        &self,
+        source: &str,
+        options: EvalCompileOptions,
+    ) -> Result<BytecodeModule, VmError> {
+        let mut module = self.compile_eval_source(source, options)?;
+        crate::eval_source::decode_module(&mut module);
+        Ok(module)
+    }
+
     fn compile_eval_source(
         &self,
         source: &str,

@@ -325,6 +325,16 @@ impl Frame {
         crate::ActiveFrameMut::materialized(self).advance_pc()
     }
 
+    /// Advance the canonical PC by one with a direct field write, skipping the
+    /// materialized-frame wrapper and the overflow branch of [`Self::advance_pc`].
+    /// A PC past the end of the instruction stream is caught by the next
+    /// instruction fetch (`instr_at_index` → `MissingReturn`), so the hot path
+    /// needs no explicit overflow check.
+    #[inline]
+    pub(crate) fn advance_pc_fast(&mut self) {
+        self.pc = self.pc.wrapping_add(1);
+    }
+
     /// Shared empty upvalue slice for plain functions without captured
     /// parent cells.
     pub(crate) fn empty_upvalues() -> UpvalueSpine {

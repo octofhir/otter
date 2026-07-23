@@ -289,18 +289,25 @@ impl Interpreter {
         dst: u16,
         lhs: u16,
         rhs: u16,
-        op: fn(NumberValue, NumberValue) -> NumberValue,
+        op: impl Fn(NumberValue, NumberValue) -> NumberValue,
         bigint_op: BigIntBinop,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
-        let (dst, lhs, rhs) = binop_values(&stack[top_idx], dst, lhs, rhs)?;
+        // `top_idx` is the executing (top) frame; access it without the `Index`
+        // bounds check. SAFETY: dispatch runs with a live top frame and passes
+        // `top_idx == stack.len() - 1`.
+        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
         // Number x Number is the dominant shape, needs no conversion, and
         // cannot re-enter JavaScript, so it never releases the frame borrow.
         if let (Some(a), Some(b)) = (lhs.as_number(), rhs.as_number()) {
-            return commit_frame_result(&mut stack[top_idx], dst, Value::number(op(a, b)));
+            return commit_frame_result(
+                unsafe { stack.top_unchecked_mut() },
+                dst,
+                Value::number(op(a, b)),
+            );
         }
         let result = numeric_binary_value(self, stack, context, lhs, rhs, op, bigint_op)?;
         commit_frame_result(&mut stack[top_idx], dst, result)
@@ -316,12 +323,17 @@ impl Interpreter {
         rhs: u16,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
-        let (dst, lhs, rhs) = binop_values(&stack[top_idx], dst, lhs, rhs)?;
+        // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
+        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
         if let (Some(a), Some(b)) = (lhs.as_number(), rhs.as_number()) {
-            return commit_frame_result(&mut stack[top_idx], dst, Value::number(number::add(a, b)));
+            return commit_frame_result(
+                unsafe { stack.top_unchecked_mut() },
+                dst,
+                Value::number(number::add(a, b)),
+            );
         }
         let result = self.add_value(stack, context, lhs, rhs)?;
         commit_frame_result(&mut stack[top_idx], dst, result)
@@ -424,7 +436,8 @@ impl Interpreter {
         op: Op,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
-        let (dst, lhs, rhs) = binop_values(&stack[top_idx], dst, lhs, rhs)?;
+        // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
+        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
@@ -442,7 +455,11 @@ impl Interpreter {
                 Op::GreaterEq => a >= b,
                 _ => return Err(VmError::InvalidOperand),
             };
-            return commit_frame_result(&mut stack[top_idx], dst, Value::boolean(truthy));
+            return commit_frame_result(
+                unsafe { stack.top_unchecked_mut() },
+                dst,
+                Value::boolean(truthy),
+            );
         }
         let result = compare_value(self, stack, context, lhs, rhs, op)?;
         commit_frame_result(&mut stack[top_idx], dst, result)
@@ -458,7 +475,8 @@ impl Interpreter {
         rhs: u16,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
-        let (dst, lhs, rhs) = binop_values(&stack[top_idx], dst, lhs, rhs)?;
+        // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
+        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
@@ -505,7 +523,8 @@ impl Interpreter {
         delta: i32,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
-        let value = *read_register(&stack[top_idx], src)?;
+        // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
+        let value = *read_register(unsafe { stack.top_unchecked() }, src)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(value, Value::number_i32(delta));
         }
@@ -716,7 +735,7 @@ impl Interpreter {
         }
         let eq = abstract_ops::is_strictly_equal(&lhs, &rhs, &self.gc_heap);
         write_register(frame, dst, Value::boolean(eq ^ negate))?;
-        frame.advance_pc()?;
+        frame.advance_pc_fast();
         Ok(())
     }
 
@@ -731,7 +750,8 @@ impl Interpreter {
         negate: bool,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
-        let (dst, lhs, rhs) = binop_values(&stack[top_idx], dst, lhs, rhs)?;
+        // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
+        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
@@ -811,7 +831,7 @@ impl Interpreter {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
         let result = abstract_ops::same_value(&lhs, &rhs, &self.gc_heap);
         write_register(frame, dst, Value::boolean(result))?;
-        frame.advance_pc()?;
+        frame.advance_pc_fast();
         Ok(())
     }
 }
@@ -847,7 +867,7 @@ fn numeric_binary_value(
     context: &crate::execution_context::ExecutionContext,
     lhs: Value,
     rhs: Value,
-    op: fn(NumberValue, NumberValue) -> NumberValue,
+    op: impl Fn(NumberValue, NumberValue) -> NumberValue,
     bigint_op: BigIntBinop,
 ) -> Result<Value, VmError> {
     // Two numbers are already their own `ToNumeric` result; folding them here
@@ -948,7 +968,7 @@ fn commit_frame_result(frame: &mut Frame, dst: u16, result: Value) -> Result<(),
     // `dst` is a schema register; the build-time verifier bounded it.
     // SAFETY: see `write_register_unchecked`.
     unsafe { crate::interp::helpers::write_register_unchecked(frame, dst, result) };
-    frame.advance_pc()?;
+    frame.advance_pc_fast();
     Ok(())
 }
 

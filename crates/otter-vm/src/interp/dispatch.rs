@@ -1643,7 +1643,14 @@ impl Interpreter {
                 }
                 Op::Jump => {
                     let offset = instr.imm(0);
-                    apply_branch(&mut stack[top_idx], offset, &self.interrupt)?;
+                    // `top_idx` is `stack.len() - 1` this tick and no frame was
+                    // pushed, so the top frame is the executing one.
+                    // SAFETY: the `is_at_floor` guard proved a live top frame.
+                    apply_branch(
+                        unsafe { stack.top_unchecked_mut() },
+                        offset,
+                        &self.interrupt,
+                    )?;
                     if jit_installed
                         && offset < 0
                         && let Some(Some(value)) =
@@ -1656,7 +1663,9 @@ impl Interpreter {
                 Op::JumpIfTrue => {
                     let offset = instr.imm(0);
                     let cond = instr.reg(1);
-                    let frame = &mut stack[top_idx];
+                    // SAFETY: live top frame (see the `is_at_floor` guard); it is
+                    // the executing frame this tick.
+                    let frame = unsafe { stack.top_unchecked_mut() };
                     // `cond` is a schema register; SAFETY: see `read_register_unchecked`.
                     let taken =
                         unsafe { read_register_unchecked(frame, cond) }.to_boolean(&self.gc_heap);
@@ -1673,14 +1682,16 @@ impl Interpreter {
                             return Ok(value);
                         }
                     } else {
-                        frame.advance_pc()?;
+                        frame.advance_pc_fast();
                     }
                     continue;
                 }
                 Op::JumpIfFalse => {
                     let offset = instr.imm(0);
                     let cond = instr.reg(1);
-                    let frame = &mut stack[top_idx];
+                    // SAFETY: live top frame (see the `is_at_floor` guard); it is
+                    // the executing frame this tick.
+                    let frame = unsafe { stack.top_unchecked_mut() };
                     // `cond` is a schema register; SAFETY: see `read_register_unchecked`.
                     let taken =
                         !unsafe { read_register_unchecked(frame, cond) }.to_boolean(&self.gc_heap);
@@ -1697,26 +1708,30 @@ impl Interpreter {
                             return Ok(value);
                         }
                     } else {
-                        frame.advance_pc()?;
+                        frame.advance_pc_fast();
                     }
                     continue;
                 }
                 Op::JumpIfNullish => {
                     let offset = instr.imm(0);
                     let cond = instr.reg(1);
-                    let frame = &mut stack[top_idx];
+                    // SAFETY: live top frame (see the `is_at_floor` guard); it is
+                    // the executing frame this tick.
+                    let frame = unsafe { stack.top_unchecked_mut() };
                     // SAFETY: see `read_register_unchecked`.
                     if unsafe { read_register_unchecked(frame, cond) }.is_nullish() {
                         apply_branch(frame, offset, &self.interrupt)?;
                     } else {
-                        frame.advance_pc()?;
+                        frame.advance_pc_fast();
                     }
                     continue;
                 }
                 Op::LoadLocal => {
                     let dst = instr.reg(0);
                     let idx = instr.imm(1) as u16;
-                    let frame = &mut stack[top_idx];
+                    // SAFETY: live top frame (see the `is_at_floor` guard); it is
+                    // the executing frame this tick.
+                    let frame = unsafe { stack.top_unchecked_mut() };
                     // Both operands are schema registers (the `Imm32` is a local
                     // index), bounded by the build-time verifier.
                     // SAFETY: see `read_register_unchecked`.
@@ -1724,19 +1739,21 @@ impl Interpreter {
                         let value = read_register_unchecked(frame, idx);
                         write_register_unchecked(frame, dst, value);
                     }
-                    frame.advance_pc()?;
+                    frame.advance_pc_fast();
                     continue;
                 }
                 Op::StoreLocal => {
                     let src = instr.reg(0);
                     let idx = instr.imm(1) as u16;
-                    let frame = &mut stack[top_idx];
+                    // SAFETY: live top frame (see the `is_at_floor` guard); it is
+                    // the executing frame this tick.
+                    let frame = unsafe { stack.top_unchecked_mut() };
                     // SAFETY: see `Op::LoadLocal`.
                     unsafe {
                         let value = read_register_unchecked(frame, src);
                         write_register_unchecked(frame, idx, value);
                     }
-                    frame.advance_pc()?;
+                    frame.advance_pc_fast();
                     continue;
                 }
                 Op::TdzError => {
@@ -1911,31 +1928,40 @@ impl Interpreter {
                 Op::Neg => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    let frame = &mut stack[top_idx];
+                    // SAFETY: live top frame (see the `is_at_floor` guard).
+                    let frame = unsafe { stack.top_unchecked_mut() };
                     self.run_neg_regs(frame, dst, src, feedback)?;
                     continue;
                 }
                 Op::BitwiseNot => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    let frame = &mut stack[top_idx];
+                    // SAFETY: live top frame (see the `is_at_floor` guard).
+                    let frame = unsafe { stack.top_unchecked_mut() };
                     self.run_bitwise_not_regs(frame, dst, src)?;
                     continue;
                 }
                 Op::Equal | Op::NotEqual | Op::LooseEqual | Op::LooseNotEqual | Op::SameValue => {
                     let (dst, lhs, rhs) = instr.reg3();
                     match op {
+                        // SAFETY (frame-based arms): live top frame (see the
+                        // `is_at_floor` guard); it is the executing frame.
                         Op::Equal => self.run_equal_regs(
-                            &mut stack[top_idx],
+                            unsafe { stack.top_unchecked_mut() },
                             dst,
                             lhs,
                             rhs,
                             false,
                             feedback,
                         )?,
-                        Op::NotEqual => {
-                            self.run_equal_regs(&mut stack[top_idx], dst, lhs, rhs, true, feedback)?
-                        }
+                        Op::NotEqual => self.run_equal_regs(
+                            unsafe { stack.top_unchecked_mut() },
+                            dst,
+                            lhs,
+                            rhs,
+                            true,
+                            feedback,
+                        )?,
                         Op::LooseEqual => {
                             self.run_loose_equal_regs(
                                 stack, context, top_idx, dst, lhs, rhs, false, feedback,
@@ -1946,9 +1972,12 @@ impl Interpreter {
                                 stack, context, top_idx, dst, lhs, rhs, true, feedback,
                             )?;
                         }
-                        Op::SameValue => {
-                            self.run_same_value_regs(&mut stack[top_idx], dst, lhs, rhs)?
-                        }
+                        Op::SameValue => self.run_same_value_regs(
+                            unsafe { stack.top_unchecked_mut() },
+                            dst,
+                            lhs,
+                            rhs,
+                        )?,
                         _ => unreachable!("equality opcode group"),
                     }
                     continue;

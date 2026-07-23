@@ -145,7 +145,7 @@ use crate::{
     },
     ir::{
         cfg::{BlockId, ControlFlowGraph, Terminator},
-        deopt_lower::DeoptLowering,
+        deopt_lower::{DeoptLowering, rematerialized_deopt_slot},
         dom::DominatorTree,
         frame_state::{AbstractFrameState, FrameStateTable},
         inline::{InlineCallKind, InlineFrame, InlineId, InlineTree},
@@ -1835,6 +1835,15 @@ fn build_element_transition_sites(
         let mut tagged_live_across = Vec::new();
         for value in live_after {
             if Some(value) == result || reprs.representation(value) != Representation::Tagged {
+                continue;
+            }
+            // Values the deopt table rematerializes as literals own no machine
+            // home: an `Uninitialized` register and a structurally dead phi are
+            // written by neither the prologue, a block prelude, nor an edge
+            // move. Materializing one would publish uninitialized native-stack
+            // bits into an interpreter register slot the collector traces, and
+            // reloading one would overwrite a home nothing ever established.
+            if rematerialized_deopt_slot(ssa, reprs, Some(value)).is_some() {
                 continue;
             }
             let register =

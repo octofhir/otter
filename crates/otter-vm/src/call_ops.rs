@@ -2975,8 +2975,12 @@ impl Interpreter {
         if let Some(value) = self.dispatch_jit_sync_entry(inner, context)? {
             // The compiled entry frame ran to completion and is terminal
             // (the integer subset cannot suspend or escape its frame), so
-            // return its spilled register window to the pool.
+            // return its spilled register window and its cold record to their
+            // pools. Reclaiming only the window left the cold slot acquired
+            // forever, and the collector traces the whole pool on every
+            // collection — a JIT-heavy run grew it without bound.
             if let Some(mut done) = inner.pop() {
+                self.frame_release_cold(&mut done);
                 self.reclaim_registers(&mut done);
             }
             return Ok(value);
@@ -3119,6 +3123,7 @@ impl Interpreter {
             &mut frame,
             effective_args,
         ) {
+            self.frame_release_cold(&mut frame);
             self.reclaim_registers(&mut frame);
             return Err(error);
         }

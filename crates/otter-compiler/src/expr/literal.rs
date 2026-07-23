@@ -190,6 +190,43 @@ pub(crate) fn compile_numeric_literal(
     compile_numeric_literal_into(cx, lit, span, destination)
 }
 
+/// Emit a compile-time-known number into `destination`.
+///
+/// Shares the Smi fast path with source literals so a value folded by the
+/// compiler (for example the operand of a unary `-`) lowers exactly as the
+/// same number written directly in the source would.
+pub(crate) fn emit_number_constant(
+    cx: &mut Compiler,
+    value: f64,
+    span: (u32, u32),
+    destination: u16,
+) -> u16 {
+    // Smi fast path: integer-valued number in i32 range. `-0` is excluded —
+    // it is not representable as an `Imm32` and must keep its sign.
+    if value.fract() == 0.0
+        && value.is_finite()
+        && (i32::MIN as f64..=i32::MAX as f64).contains(&value)
+        && !(value == 0.0 && value.is_sign_negative())
+    {
+        cx.emit(
+            Op::LoadInt32,
+            [Operand::Register(destination), Operand::Imm32(value as i32)],
+            span,
+        );
+    } else {
+        let const_idx = cx.intern_number_constant(value);
+        cx.emit(
+            Op::LoadNumber,
+            [
+                Operand::Register(destination),
+                Operand::ConstIndex(const_idx),
+            ],
+            span,
+        );
+    }
+    destination
+}
+
 pub(crate) fn compile_numeric_literal_into(
     cx: &mut Compiler,
     lit: &NumericLiteral<'_>,

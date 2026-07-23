@@ -464,20 +464,12 @@ pub(crate) fn compile_statement(
             // §14.6.2 — the completion value is the taken branch's
             // value, or `undefined` when no branch runs (false test
             // with no `else`).
-            let completion_reg = cx.alloc_scratch();
-            cx.emit(Op::LoadUndefined, [Operand::Register(completion_reg)], span);
+            let completion_reg = cx.alloc_completion_reg(span);
             let cond_reg = compile_expr(cx, &s.test, span)?;
             // JUMP_IF_FALSE → after consequent
             let jmp_if_false = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(cond_reg), span);
             if let Some(cons_reg) = compile_if_branch_statement(cx, &s.consequent)? {
-                cx.emit(
-                    Op::StoreLocal,
-                    [
-                        Operand::Register(cons_reg),
-                        Operand::Imm32(completion_reg as i32),
-                    ],
-                    span,
-                );
+                cx.store_completion(completion_reg, cons_reg, span);
             }
             if let Some(alt) = &s.alternate {
                 // After consequent, unconditional JUMP past the
@@ -485,20 +477,13 @@ pub(crate) fn compile_statement(
                 let jmp_end = cx.emit_branch_placeholder(Op::Jump, None, span);
                 cx.patch_branch_to_here(jmp_if_false);
                 if let Some(alt_reg) = compile_if_branch_statement(cx, alt)? {
-                    cx.emit(
-                        Op::StoreLocal,
-                        [
-                            Operand::Register(alt_reg),
-                            Operand::Imm32(completion_reg as i32),
-                        ],
-                        span,
-                    );
+                    cx.store_completion(completion_reg, alt_reg, span);
                 }
                 cx.patch_branch_to_here(jmp_end);
             } else {
                 cx.patch_branch_to_here(jmp_if_false);
             }
-            Ok(Some(completion_reg))
+            Ok(completion_reg)
         }
 
         Statement::WhileStatement(s) => {
@@ -506,21 +491,13 @@ pub(crate) fn compile_statement(
             cx.emit_completion_reset(span);
             // §14.7.3 — the loop's completion value is the last
             // non-empty body completion (undefined if it never runs).
-            let completion_reg = cx.alloc_scratch();
-            cx.emit(Op::LoadUndefined, [Operand::Register(completion_reg)], span);
+            let completion_reg = cx.alloc_completion_reg(span);
             let loop_top = cx.next_pc();
             cx.push_loop_frame(LoopFrame::iteration());
             let cond_reg = compile_expr(cx, &s.test, span)?;
             let exit_jmp = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(cond_reg), span);
             if let Some(body_reg) = compile_statement(cx, &s.body)? {
-                cx.emit(
-                    Op::StoreLocal,
-                    [
-                        Operand::Register(body_reg),
-                        Operand::Imm32(completion_reg as i32),
-                    ],
-                    span,
-                );
+                cx.store_completion(completion_reg, body_reg, span);
             }
             // Back-edge jump to loop top.
             let back_jmp = cx.emit_branch_placeholder(Op::Jump, None, span);
@@ -533,25 +510,17 @@ pub(crate) fn compile_statement(
             for pc in frame.break_patches {
                 cx.patch_branch_to_here(pc);
             }
-            Ok(Some(completion_reg))
+            Ok(completion_reg)
         }
 
         Statement::DoWhileStatement(s) => {
             let span = (s.span.start, s.span.end);
             cx.emit_completion_reset(span);
-            let completion_reg = cx.alloc_scratch();
-            cx.emit(Op::LoadUndefined, [Operand::Register(completion_reg)], span);
+            let completion_reg = cx.alloc_completion_reg(span);
             let body_top = cx.next_pc();
             cx.push_loop_frame(LoopFrame::iteration());
             if let Some(body_reg) = compile_statement(cx, &s.body)? {
-                cx.emit(
-                    Op::StoreLocal,
-                    [
-                        Operand::Register(body_reg),
-                        Operand::Imm32(completion_reg as i32),
-                    ],
-                    span,
-                );
+                cx.store_completion(completion_reg, body_reg, span);
             }
             let continue_target = cx.next_pc();
             let cond_reg = compile_expr(cx, &s.test, span)?;
@@ -564,7 +533,7 @@ pub(crate) fn compile_statement(
             for pc in frame.break_patches {
                 cx.patch_branch_to_here(pc);
             }
-            Ok(Some(completion_reg))
+            Ok(completion_reg)
         }
 
         Statement::ForStatement(s) => {
@@ -615,8 +584,7 @@ pub(crate) fn compile_statement(
             emit_per_iteration_copy(cx, &per_iter_cells, span);
             // §14.7.4 — completion value is the last non-empty body
             // completion (undefined when the body never runs).
-            let completion_reg = cx.alloc_scratch();
-            cx.emit(Op::LoadUndefined, [Operand::Register(completion_reg)], span);
+            let completion_reg = cx.alloc_completion_reg(span);
             cx.push_loop_frame(LoopFrame::iteration());
             let test_top = cx.next_pc();
             // Test.
@@ -628,14 +596,7 @@ pub(crate) fn compile_statement(
             };
             // Body.
             if let Some(body_reg) = compile_statement(cx, &s.body)? {
-                cx.emit(
-                    Op::StoreLocal,
-                    [
-                        Operand::Register(body_reg),
-                        Operand::Imm32(completion_reg as i32),
-                    ],
-                    span,
-                );
+                cx.store_completion(completion_reg, body_reg, span);
             }
             // Continue lands on the update.
             let update_pc = cx.next_pc();
@@ -660,7 +621,7 @@ pub(crate) fn compile_statement(
                 cx.patch_branch_to_here(pc);
             }
             cx.exit_scope();
-            Ok(Some(completion_reg))
+            Ok(completion_reg)
         }
 
         Statement::ForOfStatement(s) => compile_for_of_statement(cx, s),
@@ -1398,8 +1359,7 @@ pub(crate) fn compile_switch_statement(
     // non-empty statement-list value replaces it (`UpdateEmpty`). An
     // empty clause leaves it unchanged. Initialised before the selector
     // jumps so every entry path sees it.
-    let completion_reg = cx.alloc_scratch();
-    cx.emit(Op::LoadUndefined, [Operand::Register(completion_reg)], span);
+    let completion_reg = cx.alloc_completion_reg(span);
 
     // Fresh lexical scope so per-case `let` bindings don't leak.
     cx.enter_scope();
@@ -1472,14 +1432,7 @@ pub(crate) fn compile_switch_statement(
             // overwrites `V`; declarations / empty statements (which
             // return `None`) leave the previous clause value in place.
             if let Some(sub) = compile_statement(cx, inner)? {
-                cx.emit(
-                    Op::StoreLocal,
-                    [
-                        Operand::Register(sub),
-                        Operand::Imm32(completion_reg as i32),
-                    ],
-                    span,
-                );
+                cx.store_completion(completion_reg, sub, span);
             }
         }
     }
@@ -1506,7 +1459,7 @@ pub(crate) fn compile_switch_statement(
     );
     cx.exit_scope();
     cx.hoisted_function_names = saved_hoisted;
-    Ok(Some(completion_reg))
+    Ok(completion_reg)
 }
 
 /// Lower `label: stmt` per ECMA-262 §14.13.

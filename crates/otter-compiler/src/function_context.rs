@@ -758,6 +758,47 @@ impl FunctionContext {
         }
     }
 
+    /// Whether a statement's completion value can still be observed.
+    ///
+    /// Only a script or `eval` program keeps a completion register. Inside a
+    /// function body a statement's value is unobservable — a call's result
+    /// comes from `return` — so the statement forms need neither reserve a
+    /// running `V` nor thread their body completions through one.
+    pub(crate) fn completion_tracking(&self) -> bool {
+        self.completion_reg.is_some() && !self.completion_suppressed
+    }
+
+    /// Reserve the running completion register (`V`) a statement form threads
+    /// its body completions through, initialized to `undefined`. Returns
+    /// `None` when the completion value is unobservable, in which case the
+    /// form emits no completion bookkeeping at all.
+    pub(crate) fn alloc_completion_reg(&mut self, span: (u32, u32)) -> Option<u16> {
+        if !self.completion_tracking() {
+            return None;
+        }
+        let reg = self.alloc_scratch();
+        self.emit(Op::LoadUndefined, [Operand::Register(reg)], span);
+        Some(reg)
+    }
+
+    /// Record one non-empty body completion into a form's running `V`.
+    pub(crate) fn store_completion(
+        &mut self,
+        completion: Option<u16>,
+        value_reg: u16,
+        span: (u32, u32),
+    ) {
+        if let Some(reg) = completion
+            && reg != value_reg
+        {
+            self.emit(
+                Op::StoreLocal,
+                [Operand::Register(value_reg), Operand::Imm32(reg as i32)],
+                span,
+            );
+        }
+    }
+
     /// Statement-list `V` threading — store a non-empty statement
     /// completion value into the program completion register.
     pub(crate) fn emit_completion_value(&mut self, value_reg: u16, span: (u32, u32)) {

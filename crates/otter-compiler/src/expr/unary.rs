@@ -238,6 +238,21 @@ pub(crate) fn compile_unary(
             return Ok(dst);
         }
     }
+    // `-<numeric literal>` is notation for the negated number, not a runtime
+    // operation: the operand needs no coercion and `Neg` cannot be observed.
+    // Folding it here keeps a negative literal to one instruction, matching a
+    // positive one.
+    if matches!(u.operator, UnaryOperator::UnaryNegation)
+        && let oxc_ast::ast::Expression::NumericLiteral(lit) = &u.argument
+    {
+        let dst = cx.alloc_scratch();
+        return Ok(crate::expr::literal::emit_number_constant(
+            cx,
+            -lit.value,
+            (lit.span.start, lit.span.end),
+            dst,
+        ));
+    }
     // The operand (and its ToPrimitive temp) is dead once the unary op
     // has read it, so recycle the range into `dst`. See
     // `FunctionContext::reset_scratch`.

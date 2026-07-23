@@ -646,6 +646,27 @@ pub(crate) fn own_data_element_without_accessors(
     })
 }
 
+/// Own dense data element of a plain array, when reading it is unobservable.
+///
+/// `Some` proves the array carries no exotic sidecar and no indexed accessor
+/// and that `idx` holds a real element, so the value is the complete
+/// `[[Get]]` answer: no hole can escape to the prototype chain and no getter
+/// can run. `None` sends the caller to the ordinary property path.
+#[must_use]
+pub(crate) fn plain_dense_element(
+    arr: JsArray,
+    heap: &otter_gc::GcHeap,
+    idx: usize,
+) -> Option<Value> {
+    heap.read_payload(arr, |body| {
+        if body.exotic.is_some() || body.accessors().is_some() {
+            return None;
+        }
+        let value = *body.elements.get(idx)?;
+        if value.is_hole() { None } else { Some(value) }
+    })
+}
+
 /// Whether `idx` is one plain dense hole with no receiver-local exotic state.
 ///
 /// Prototype observability is deliberately not decided here: callers must

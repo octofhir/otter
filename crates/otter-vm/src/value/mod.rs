@@ -861,6 +861,25 @@ impl Value {
         self.ptr_family() == Some(PtrFamily::Other)
     }
 
+    /// ECMA-262 `Type(value)` is one of Undefined, Null, Boolean, Number,
+    /// String, Symbol, or BigInt.
+    ///
+    /// Immediates answer from the bit pattern alone; every reference type
+    /// resolves from a single body type-tag read, so a String or Symbol never
+    /// pays one tag read per candidate family. The internal hole sentinel is
+    /// not a language value and is not primitive.
+    #[inline]
+    #[must_use]
+    pub fn is_primitive(self) -> bool {
+        if self.is_number() || self.is_undefined() || self.is_null() || self.is_boolean() {
+            return true;
+        }
+        matches!(
+            self.ptr_family(),
+            Some(PtrFamily::String | PtrFamily::Other)
+        )
+    }
+
     // -----------------------------------------------------------------------
     // Per-type predicates (object-family). Each consults the body's
     // `GcHeader::type_tag` so a `Value::array` never reports itself as

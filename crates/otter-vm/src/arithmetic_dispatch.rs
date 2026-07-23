@@ -316,6 +316,22 @@ impl Interpreter {
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
+        // Number vs Number is the dominant shape and needs neither the Symbol
+        // rejection nor the String / BigInt / ToNumeric ladder. IEEE-754
+        // comparison already yields the spec answer for every operator,
+        // including the `false` an unordered NaN operand produces and the
+        // equality of `+0` and `-0`.
+        if let (Some(a), Some(b)) = (lhs.as_number(), rhs.as_number()) {
+            let (a, b) = (a.as_f64(), b.as_f64());
+            let truthy = match op {
+                Op::LessThan => a < b,
+                Op::GreaterThan => a > b,
+                Op::LessEq => a <= b,
+                Op::GreaterEq => a >= b,
+                _ => return Err(VmError::InvalidOperand),
+            };
+            return commit_frame_result(frame, dst, Value::boolean(truthy));
+        }
         let result = compare_value(&self.gc_heap, lhs, rhs, op)?;
         commit_frame_result(frame, dst, result)
     }

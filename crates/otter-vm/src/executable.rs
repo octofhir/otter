@@ -1147,7 +1147,12 @@ pub struct CodeBlockInstruction {
     op: Op,
     /// Number of verified operand words.
     operand_count: u8,
-    reserved: [u8; 2],
+    /// Runtime-budget cost of executing this instruction once. Metering runs on
+    /// every dispatched instruction, so the opcode's fixed weight is resolved
+    /// when the record is built rather than re-derived from the opcode each
+    /// tick.
+    reductions: u8,
+    reserved: u8,
 }
 
 const _: [(); 32] = [(); std::mem::size_of::<CodeBlockInstruction>()];
@@ -1195,8 +1200,16 @@ impl CodeBlockInstruction {
             op: source.op,
             operand_count: u8::try_from(operand_count)
                 .expect("executable operand count exceeds u8"),
-            reserved: [0; 2],
+            reductions: crate::runtime_budget::opcode_reductions(source.op),
+            reserved: 0,
         }
+    }
+
+    /// Runtime-budget cost of one execution of this instruction.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn reductions(&self) -> u64 {
+        self.reductions as u64
     }
 
     /// Owning CodeBlock identity for cold context-resolving helpers.

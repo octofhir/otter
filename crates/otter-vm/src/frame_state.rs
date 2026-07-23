@@ -412,11 +412,18 @@ impl Frame {
         )
     }
 
+    /// A callee that captures nothing of its own inherits the caller's spine
+    /// unchanged and allocates no cell, so the common bytecode call keeps the
+    /// whole cell-building path out of line.
+    #[inline]
     pub(crate) fn build_upvalues_for_exec(
         heap: &mut otter_gc::GcHeap,
         function: &CodeBlock,
         parent_upvalues: UpvalueSpine,
     ) -> Result<UpvalueSpine, otter_gc::OutOfMemory> {
+        if function.own_upvalue_count == 0 {
+            return Ok(parent_upvalues);
+        }
         let mut empty = |_: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
         Self::build_upvalues_for_count(
             heap,

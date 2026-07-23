@@ -447,20 +447,29 @@ impl Interpreter {
             return Err(VmError::InvalidOperand);
         }
         let mut popped = stack.pop().ok_or_else(|| VmError::InvalidOperand)?;
-        let construct_target = self.frame_cold(&popped).and_then(|c| c.construct_target);
-        let is_derived_ctor = self
-            .frame_cold(&popped)
-            .is_some_and(|c| c.is_derived_constructor);
+        // An ordinary synchronous frame owns no cold record, so the whole
+        // construct/derived/async completion vocabulary resolves from one
+        // pool probe rather than from a probe per question.
+        let mut construct_target = None;
+        let mut is_derived_ctor = false;
+        let mut derived_this_cell = None;
+        let mut async_state = None;
+        if let Some(idx) = popped.cold.take() {
+            let cold = self.cold_frames.get_mut(idx);
+            construct_target = cold.construct_target;
+            is_derived_ctor = cold.is_derived_constructor;
+            derived_this_cell = cold.derived_this_cell;
+            async_state = cold.async_state.take();
+            // Release the cold slot now so the pool can reuse it; every
+            // remaining cold-record read already happened.
+            self.cold_frames.release(idx);
+        }
         let mut derived_this = popped.this_value;
         if derived_this.is_hole()
-            && let Some(cell) = self.frame_cold(&popped).and_then(|c| c.derived_this_cell)
+            && let Some(cell) = derived_this_cell
         {
             derived_this = crate::read_upvalue(&self.gc_heap, cell);
         }
-        let async_state = self.frame_take_async_state(&mut popped);
-        // Release the cold slot now so the pool can reuse it; the
-        // remaining cold-record reads above already happened.
-        self.frame_release_cold(&mut popped);
         // The frame is terminal — return its spilled register window to the
         // pool. Nothing below reads `popped.registers`.
         self.reclaim_registers(&mut popped);

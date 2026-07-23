@@ -3831,6 +3831,22 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
         let key_value_raw = *read_register(&stack[top_idx], key_reg)?;
+        // An own dense element of a plain array is the whole `[[Get]]` answer
+        // and is the dominant computed-index shape. Everything below first
+        // spells the index as a fresh heap string through `ToPropertyKey`,
+        // then declines the array receiver to the element path, which coerces
+        // it a second time.
+        if let Some(arr) = receiver.as_array()
+            && let Some(index) = key_value_raw
+                .as_i32()
+                .and_then(|index| usize::try_from(index).ok())
+            && let Some(value) = crate::array::plain_dense_element(arr, &self.gc_heap, index)
+        {
+            let frame = &mut stack[top_idx];
+            write_register(frame, dst, value)?;
+            frame.advance_pc()?;
+            return Ok(true);
+        }
         if receiver.is_nullish() {
             return Err(
                 self.err_type(("Cannot read property of null or undefined".to_string()).into())

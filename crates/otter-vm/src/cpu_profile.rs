@@ -69,6 +69,12 @@ impl CpuProfiler {
     }
 
     /// Tick the sampler and capture a stack when the interval expires.
+    ///
+    /// Kept out of line: the dispatch loop calls this per instruction behind a
+    /// loop-invariant "profiler installed" branch, and inlining the sampling
+    /// body there costs the hot loop registers and instruction cache on every
+    /// run that never installs a profiler.
+    #[inline(never)]
     pub(crate) fn maybe_sample(&mut self, context: &ExecutionContext, stack: &ActivationStack) {
         if self.ticks_until_sample > 1 {
             self.ticks_until_sample -= 1;

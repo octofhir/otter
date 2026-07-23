@@ -207,9 +207,13 @@ impl RuntimeBudgetStats {
         self.current_external_bytes = end.external_reserved_bytes;
     }
 
+    /// Meter one instruction's reduction weight. Wrapping rather than
+    /// saturating: this runs on every dispatched instruction, and exhausting a
+    /// `u64` reduction count is unreachable, so the saturation test is pure hot
+    /// path cost.
     #[inline]
     pub(crate) fn record_reductions(&mut self, units: u64) {
-        self.reductions_executed = self.reductions_executed.saturating_add(units);
+        self.reductions_executed = self.reductions_executed.wrapping_add(units);
     }
 
     pub(crate) fn record_bytecode_calls(&mut self, calls: u64) {

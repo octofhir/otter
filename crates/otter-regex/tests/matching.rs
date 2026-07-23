@@ -409,3 +409,110 @@ fn step_budget_aborts_catastrophic_backtracking() {
     let result = re.find_utf16(&units, 0, cfg).next();
     assert!(matches!(result, Some(Err(_))));
 }
+
+/// §22.2.2.4 — a lookbehind body matches with direction -1: its alternatives
+/// are tried left to right against text ending at the assertion point, so the
+/// shortest listed alternative wins rather than the leftmost start offset.
+#[test]
+fn lookbehind_alternatives_match_right_to_left() {
+    assert_eq!(
+        first_match(r".*(?<=(..|...|....))(.*)", "", "xabcd")
+            .expect("match")
+            .2,
+        vec![Some((3, 5)), Some((5, 5))]
+    );
+    assert_eq!(
+        first_match(r".*(?<=(xx|xxx))(.*)", "", "xxabcd")
+            .expect("match")
+            .2,
+        vec![Some((0, 2)), Some((2, 6))]
+    );
+}
+
+/// A quantifier inside a lookbehind gives back towards the assertion point, and
+/// a backreference to a group captured in the same body resolves against text
+/// ending where the body currently is.
+#[test]
+fn lookbehind_backreference_and_quantifier_run_backwards() {
+    assert_eq!(
+        first_match(r"(?<=\1(\w+))c", "", "ababc").expect("match").2,
+        vec![Some((2, 4))]
+    );
+    assert_eq!(
+        first_match(r"(?<=\1(\w+))c", "", "ababbc")
+            .expect("match")
+            .2,
+        vec![Some((4, 5))]
+    );
+    assert!(first_match(r"(?<=\1(\w+))c", "", "ababdc").is_none());
+}
+
+/// §22.2.2.5.1 RepeatMatcher step 2.b — an optional iteration that consumed
+/// nothing fails, so the captures it wrote are rolled back. A mandatory
+/// iteration has no such guard and keeps them.
+#[test]
+fn zero_length_optional_iteration_discards_its_captures() {
+    assert_eq!(
+        first_match(r"(?:(?=(abc)))a", "", "abc").expect("match").2,
+        vec![Some((0, 3))]
+    );
+    assert_eq!(
+        first_match(r"(?:(?=(abc))){1,1}a", "", "abc")
+            .expect("match")
+            .2,
+        vec![Some((0, 3))]
+    );
+    assert_eq!(
+        first_match(r"(?:(?=(abc)))?a", "", "abc").expect("match").2,
+        vec![None]
+    );
+    assert_eq!(
+        first_match(r"(?:(?=(abc))){0,1}a", "", "abc")
+            .expect("match")
+            .2,
+        vec![None]
+    );
+}
+
+/// §22.2.1 places no ceiling on a counted quantifier's DecimalDigits. A minimum
+/// no subject could supply compiles and never matches; a maximum that large is
+/// simply unbounded.
+#[test]
+fn counted_quantifier_accepts_bounds_beyond_the_engine_width() {
+    let huge = "9007199254740991";
+    assert!(first_match(&format!("b{{{huge}}}"), "u", "").is_none());
+    assert!(first_match(&format!("b{{{huge},}}?"), "", "a").is_none());
+    assert!(first_match(&format!("b{{{huge},{huge}}}"), "", "b").is_none());
+    assert_eq!(
+        matched_text(&format!("b{{1,{huge}}}"), "", "bbb"),
+        Some("bbb".to_string())
+    );
+    // An inverted pair is still a syntax error at any width.
+    assert!(Regex::compile_str(&format!("b{{{huge},5}}"), Flags::default()).is_err());
+}
+
+/// §22.2.2.10 — `\P{...}` is the complement CharSet, not a complemented
+/// membership test, so under `i` the matcher folds its own members.
+#[test]
+fn negated_property_escape_folds_the_complement() {
+    assert!(matched_text(r"(?i:\P{Lu})", "u", "A").is_some());
+    assert!(matched_text(r"(?i:\P{Lu})", "u", "a").is_some());
+    // A negated class still folds the listed members, so it rejects `A`.
+    assert!(matched_text(r"(?i:[^\p{Lu}])", "u", "A").is_none());
+}
+
+/// Annex B §B.1.2 — inside a class, ClassControlLetter also admits the decimal
+/// digits and `_`, so `[\c0]` is U+0010 rather than a literal backslash run.
+#[test]
+fn annex_b_class_control_letter_admits_digits_and_underscore() {
+    assert_eq!(
+        matched_text(r"[\c0]", "", "\u{0f}\u{10}\u{11}"),
+        Some("\u{10}".to_string())
+    );
+    assert_eq!(
+        matched_text(r"[\c_]", "", "\u{1e}\u{1f}\u{20}"),
+        Some("\u{1f}".to_string())
+    );
+    // Outside a class the extension does not apply.
+    assert!(matched_text(r"\c0", "", "\u{0f}\u{10}\u{11}").is_none());
+}

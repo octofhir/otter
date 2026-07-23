@@ -15,8 +15,9 @@
 //! # Invariants
 //! - The parser never recurses deeper than [`MAX_NESTING_DEPTH`] frames.
 //! - Capture-group ids are assigned in source order, 1-based.
-//! - Counted quantifiers above [`MAX_REPEAT`] are rejected, keeping the
-//!   lowering output bounded.
+//! - Counted quantifiers above [`MAX_REPEAT`] saturate rather than expand, so
+//!   lowering output stays bounded while §22.2.1's unbounded DecimalDigits is
+//!   still accepted.
 //!
 //! # Scope
 //! Inline modifier groups `(?ims-ims:...)` (§22.2.1 RegularExpressionModifiers)
@@ -43,11 +44,33 @@ use ast::{Assertion, GroupKind, Node, Quantifier};
 /// patterns raise a clean error instead of overflowing (the failure mode the
 /// forked engine exhibited on ~200 nested groups). Raising this safely is a
 /// later-phase task (an explicit work-stack or a large dedicated parse stack).
-pub(crate) const MAX_NESTING_DEPTH: usize = 200;
+pub(crate) const MAX_NESTING_DEPTH: usize = 1000;
 
 /// Maximum counted-quantifier expansion the lowering accepts, bounding how far
 /// `{n,m}` can inflate the instruction vector.
 pub(crate) const MAX_REPEAT: u32 = 100_000;
+
+/// Compare two normalized decimal-digit strings.
+fn decimal_digits_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+/// Clamp a normalized decimal-digit string into the AST's bound width.
+/// Anything wider saturates: lowering treats a saturated bound as one no
+/// subject can reach.
+fn decimal_digits_to_u32(digits: &[u8]) -> u32 {
+    let mut value: u32 = 0;
+    for &digit in digits {
+        value = match value
+            .checked_mul(10)
+            .and_then(|scaled| scaled.checked_add(u32::from(digit)))
+        {
+            Some(next) => next,
+            None => return u32::MAX,
+        };
+    }
+    value
+}
 
 /// The result of a successful parse: the AST plus capture-group bookkeeping the
 /// lowering and executor need.
@@ -595,18 +618,18 @@ impl<'a> Parser<'a> {
         if self.unicode() && is_assertion_node(&atom) && self.peek_is_quantifier() {
             return Err(self.err("quantifier may not follow an assertion in unicode mode"));
         }
-        let (min, max) = match self.peek() {
+        let (min, max, bounds_inverted) = match self.peek() {
             Some(c) if c == b'*' as u16 => {
                 self.pos += 1;
-                (0, None)
+                (0, None, false)
             }
             Some(c) if c == b'+' as u16 => {
                 self.pos += 1;
-                (1, None)
+                (1, None, false)
             }
             Some(c) if c == b'?' as u16 => {
                 self.pos += 1;
-                (0, Some(1))
+                (0, Some(1), false)
             }
             Some(c) if c == b'{' as u16 && self.looks_like_quantifier() => {
                 self.parse_brace_quantifier()?
@@ -614,13 +637,8 @@ impl<'a> Parser<'a> {
             _ => return Ok(atom),
         };
         let greedy = !self.eat(b'?' as u16);
-        if let Some(m) = max
-            && m < min
-        {
+        if bounds_inverted {
             return Err(self.err("quantifier min exceeds max"));
-        }
-        if min > MAX_REPEAT || max.is_some_and(|m| m > MAX_REPEAT) {
-            return Err(self.err("quantifier bound too large (phase 1 limit)"));
         }
         Ok(Node::Repeat {
             node: Box::new(atom),
@@ -628,23 +646,35 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_brace_quantifier(&mut self) -> Result<(u32, Option<u32>), RegexError> {
+    /// Parse `{n}` / `{n,}` / `{n,m}`.
+    ///
+    /// §22.2.1 puts no ceiling on DecimalDigits, so the bounds are compared as
+    /// exact digit strings before being clamped into the AST's `u32`. Lowering
+    /// treats a clamped bound as unreachable rather than expanding it.
+    fn parse_brace_quantifier(&mut self) -> Result<(u32, Option<u32>, bool), RegexError> {
         debug_assert_eq!(self.peek(), Some(b'{' as u16));
         self.pos += 1; // consume '{'
-        let min = self.read_decimal();
+        let min = self.read_decimal_digits();
         let max = if self.eat(b',' as u16) {
             if self.peek() == Some(b'}' as u16) {
                 None
             } else {
-                Some(self.read_decimal())
+                Some(self.read_decimal_digits())
             }
         } else {
-            Some(min)
+            Some(min.clone())
         };
         if !self.eat(b'}' as u16) {
             return Err(self.err("unterminated quantifier"));
         }
-        Ok((min, max))
+        let inverted = max
+            .as_ref()
+            .is_some_and(|max| decimal_digits_cmp(max, &min) == std::cmp::Ordering::Less);
+        Ok((
+            decimal_digits_to_u32(&min),
+            max.as_ref().map(|max| decimal_digits_to_u32(max)),
+            inverted,
+        ))
     }
 
     /// Read a legacy octal escape (Annex B B.1.2): 1–3 octal digits, where a
@@ -680,6 +710,23 @@ impl<'a> Parser<'a> {
             }
         }
         v.min(u64::from(u32::MAX)) as u32
+    }
+
+    /// Read DecimalDigits as an exact value: the digits with leading zeros
+    /// stripped, so arbitrarily large bounds stay comparable.
+    fn read_decimal_digits(&mut self) -> Vec<u8> {
+        let mut digits: Vec<u8> = Vec::new();
+        while let Some(c) = self.peek() {
+            if (b'0' as u16..=b'9' as u16).contains(&c) {
+                digits.push((c - b'0' as u16) as u8);
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        let first_significant = digits.iter().position(|&d| d != 0).unwrap_or(digits.len());
+        digits.drain(..first_significant);
+        digits
     }
 
     // --- Escapes (atom position) --------------------------------------------
@@ -796,7 +843,14 @@ impl<'a> Parser<'a> {
                 let negate = x == b'P' as u16;
                 self.pos += 1; // consume `p` / `P`
                 let set = self.parse_property_body()?;
-                return Ok(Some((set, negate)));
+                // §22.2.2.10 makes `\P{...}` the complement CharSet itself, not
+                // a complemented membership test. The difference shows under
+                // `i`: the matcher canonicalizes the members of whichever set it
+                // is given, so `(?i:\P{Lu})` must fold the *non*-uppercase
+                // members (and so matches `A`), where `(?i:[^\p{Lu}])` folds the
+                // uppercase ones and does not.
+                let set = if negate { set.negate() } else { set };
+                return Ok(Some((set, false)));
             }
             _ => return Ok(None),
         };
@@ -935,6 +989,15 @@ impl<'a> Parser<'a> {
                     let l = letter;
                     if (b'A' as u16..=b'Z' as u16).contains(&l)
                         || (b'a' as u16..=b'z' as u16).contains(&l)
+                    {
+                        self.pos += 2;
+                        return Ok(u32::from(l % 32));
+                    }
+                    // Annex B §B.1.2 widens ClassControlLetter inside a class to
+                    // the decimal digits and `_`, still taken modulo 32.
+                    if in_class
+                        && !self.unicode()
+                        && ((b'0' as u16..=b'9' as u16).contains(&l) || l == b'_' as u16)
                     {
                         self.pos += 2;
                         return Ok(u32::from(l % 32));
@@ -1617,9 +1680,27 @@ mod tests {
 
     #[test]
     fn nesting_limit_is_enforced() {
-        let deep = "(".repeat(MAX_NESTING_DEPTH + 5);
-        let err = parse_err(&deep, Flags::default());
-        assert!(matches!(err, RegexError::TooDeep { .. }));
+        // Run on a stack the size of the isolate thread's: the limit exists to
+        // bound recursion against *that* stack, and the default test-thread
+        // stack is an order of magnitude smaller.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let deep = "(".repeat(MAX_NESTING_DEPTH + 5);
+                let err = parse_err(&deep, Flags::default());
+                assert!(matches!(err, RegexError::TooDeep { .. }));
+                // One level under the limit still parses, so the guard is what
+                // rejects the pattern above rather than the stack giving out.
+                let ok = format!(
+                    "{}a{}",
+                    "(".repeat(MAX_NESTING_DEPTH - 1),
+                    ")".repeat(MAX_NESTING_DEPTH - 1)
+                );
+                let _ = parse_ok(&ok, Flags::default());
+            })
+            .expect("spawn deep-nesting parser thread")
+            .join()
+            .expect("deep-nesting parse completes");
     }
 
     #[test]

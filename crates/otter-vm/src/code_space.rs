@@ -30,7 +30,8 @@
 //!
 //! - Each chunk is immutable after construction. Its `next` link is published
 //!   exactly once, so reads never lock and old contexts immediately see chunks
-//!   linked later in the same code space.
+//!   linked later in the same code space. Linking takes one lock, purely to
+//!   read and refresh the append hint.
 //! - Chunks are appended with monotonically increasing `function_base` values.
 //! - A linked module's `Function::id`, `Constant::FunctionId`, and
 //!   `ModuleInit::function_id` are all rebased before the executable
@@ -49,7 +50,7 @@
 //! - [`crate::execution_context`]
 //! - [`crate::executable`]
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use otter_bytecode::{BytecodeModule, Constant};
 
@@ -76,6 +77,20 @@ pub(crate) struct ChunkTables {
 #[derive(Debug, Default)]
 pub(crate) struct CodeSpace {
     first: OnceLock<Arc<CodeChunk>>,
+    /// Last chunk this registry published, used as the starting point for the
+    /// next link. Taken only while linking; resolution never touches it.
+    tail: Mutex<Option<Arc<CodeChunk>>>,
+}
+
+/// Function-id and IC-site bases the chunk after `tables` would start at.
+fn next_bases(tables: &ChunkTables) -> (u32, u32) {
+    (
+        tables
+            .function_base
+            .checked_add(tables.function_count)
+            .expect("code space exhausted the u32 function-id range"),
+        tables.executable.property_ic_site_end(),
+    )
 }
 
 /// One immutable registry node. `next` is the sole publication point for a
@@ -97,45 +112,53 @@ impl CodeSpace {
     /// links until one publishes its own module, with no duplicated id range.
     pub(crate) fn link_module(self: &Arc<Self>, module: BytecodeModule) -> ExecutionContext {
         let mut pending = Some(module);
-        let mut next = &self.first;
-        let mut function_base = 0;
-        let mut property_ic_base = 0;
+        // Resume from the last chunk this registry published rather than from
+        // the head: a workload that links thousands of tiny chunks (a loop over
+        // `eval` or `new Function`) would otherwise re-walk the whole chain per
+        // link. The hint is only a starting point — a linker that finds the
+        // link already claimed keeps walking, so a stale hint costs steps, not
+        // correctness.
+        let mut current = self.tail.lock().expect("code-space tail").clone();
+        let (mut function_base, mut property_ic_base) = current
+            .as_ref()
+            .map_or((0, 0), |chunk| next_bases(&chunk.tables));
 
         loop {
-            let chunk = next.get_or_init(|| {
-                let mut module = pending
-                    .take()
-                    .expect("a code-space link publishes its module exactly once");
-                rebase_module(&mut module, function_base);
-                let function_count = u32::try_from(module.functions.len())
-                    .expect("chunk function table exceeds u32 range");
-                let tables = ChunkTables {
-                    function_base,
-                    function_count,
-                    executable: Arc::new(ExecutableModule::from_bytecode_with_ic_base(
-                        &module,
-                        property_ic_base,
-                    )),
-                    atoms: Arc::new(AtomTable::from_constants(&module.constants)),
-                    module: Arc::new(module),
-                };
-                Arc::new(CodeChunk {
-                    tables,
-                    next: OnceLock::new(),
+            let chunk = {
+                let link = current.as_ref().map_or(&self.first, |chunk| &chunk.next);
+                link.get_or_init(|| {
+                    let mut module = pending
+                        .take()
+                        .expect("a code-space link publishes its module exactly once");
+                    rebase_module(&mut module, function_base);
+                    let function_count = u32::try_from(module.functions.len())
+                        .expect("chunk function table exceeds u32 range");
+                    let tables = ChunkTables {
+                        function_base,
+                        function_count,
+                        executable: Arc::new(ExecutableModule::from_bytecode_with_ic_base(
+                            &module,
+                            property_ic_base,
+                        )),
+                        atoms: Arc::new(AtomTable::from_constants(&module.constants)),
+                        module: Arc::new(module),
+                    };
+                    Arc::new(CodeChunk {
+                        tables,
+                        next: OnceLock::new(),
+                    })
                 })
-            });
+                .clone()
+            };
 
             if pending.is_none() {
-                return ExecutionContext::from_chunk_tables(chunk.tables.clone(), Arc::clone(self));
+                let tables = chunk.tables.clone();
+                *self.tail.lock().expect("code-space tail") = Some(chunk);
+                return ExecutionContext::from_chunk_tables(tables, Arc::clone(self));
             }
 
-            function_base = chunk
-                .tables
-                .function_base
-                .checked_add(chunk.tables.function_count)
-                .expect("code space exhausted the u32 function-id range");
-            property_ic_base = chunk.tables.executable.property_ic_site_end();
-            next = &chunk.next;
+            (function_base, property_ic_base) = next_bases(&chunk.tables);
+            current = Some(chunk);
         }
     }
 

@@ -75,6 +75,9 @@ pub(crate) enum Insn {
         /// possessification pass; always `false` for a lazy repeat.
         possessive: bool,
     },
+    /// Never matches. Emitted for a counted quantifier whose minimum exceeds
+    /// what any subject could supply, which §22.2.1 permits to be written.
+    Fail,
     /// Unconditional jump to an instruction index.
     Jump(usize),
     /// Try the first target; on backtrack, resume at the second.

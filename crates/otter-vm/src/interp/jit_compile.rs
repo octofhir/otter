@@ -1339,29 +1339,24 @@ impl Interpreter {
             let Some(feedback) = self.jit_array_method_feedback(site, push_safepoint_id) else {
                 continue;
             };
-            match feedback.kind {
-                jit::JitArrayMethodKind::Pop => {
-                    if !crate::runtime_stubs::mutating_leaf_stub2_by_id(feedback.stub_id)
-                        .is_some_and(crate::runtime_stubs::MutatingLeafStub2::is_valid)
-                    {
-                        continue;
-                    }
+            if feedback.kind.allocates() {
+                if !crate::runtime_stubs::alloc_value_stub_by_id(feedback.stub_id)
+                    .is_some_and(|stub| stub.is_valid_for_safepoint(push_safepoint_id))
+                {
+                    continue;
                 }
-                jit::JitArrayMethodKind::Push => {
-                    if !crate::runtime_stubs::alloc_value_stub_by_id(feedback.stub_id)
-                        .is_some_and(|stub| stub.is_valid_for_safepoint(push_safepoint_id))
-                    {
-                        continue;
-                    }
-                    view.safepoints.insert(
+                view.safepoints.insert(
+                    push_safepoint_id,
+                    native_abi::SafepointRecord::frame_slot_window(
                         push_safepoint_id,
-                        native_abi::SafepointRecord::frame_slot_window(
-                            push_safepoint_id,
-                            native_abi::NO_FRAME_STATE,
-                            view.code_block.register_count,
-                        ),
-                    );
-                }
+                        native_abi::NO_FRAME_STATE,
+                        view.code_block.register_count,
+                    ),
+                );
+            } else if !crate::runtime_stubs::mutating_leaf_stub2_by_id(feedback.stub_id)
+                .is_some_and(crate::runtime_stubs::MutatingLeafStub2::is_valid)
+            {
+                continue;
             }
             view.array_methods.insert(instr.byte_pc, feedback);
         }

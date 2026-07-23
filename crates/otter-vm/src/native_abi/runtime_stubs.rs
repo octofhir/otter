@@ -1200,6 +1200,34 @@ pub const STUB_ARRAY_PUSH_ALLOC: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusPair,
 );
 
+/// Leaf dense-array `Array.prototype.shift` mutation.
+///
+/// Sliding the element buffer down drops one reference and rewrites the cached
+/// length pair without allocating. Like the `pop` entry it re-checks the dense
+/// preconditions and misses instead of falling back internally.
+pub const STUB_ARRAY_SHIFT_LEAF: RuntimeStubDescriptor = descriptor(
+    78,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::MutatingLeafValue2,
+    2,
+    RuntimeStubEffects::leaf(false, true),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::StatusPair,
+);
+/// Allocating dense-array `Array.prototype.unshift` mutation.
+///
+/// Inserting at the head may grow the dense buffer, so the site publishes a
+/// precise safepoint exactly like the `push` entry.
+pub const STUB_ARRAY_UNSHIFT_ALLOC: RuntimeStubDescriptor = descriptor(
+    79,
+    RuntimeStubClass::Alloc,
+    RuntimeStubSignature::AllocValue3,
+    3,
+    RuntimeStubEffects::allocating(false, true),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::StatusPair,
+);
+
 /// Human-readable symbol for a runtime-stub id in the current contract.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -1281,6 +1309,8 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         75 => "string_ends_with_leaf",
         76 => "array_pop_leaf",
         77 => "array_push_alloc",
+        78 => "array_shift_leaf",
+        79 => "array_unshift_alloc",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1364,6 +1394,8 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_STRING_ENDS_WITH_LEAF,
     STUB_ARRAY_POP_LEAF,
     STUB_ARRAY_PUSH_ALLOC,
+    STUB_ARRAY_SHIFT_LEAF,
+    STUB_ARRAY_UNSHIFT_ALLOC,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

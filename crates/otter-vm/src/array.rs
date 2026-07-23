@@ -1204,6 +1204,83 @@ fn array_index_at_or_above(key: &str, limit: usize) -> bool {
     crate::object::array_index_property_name(key).is_some_and(|idx| idx as usize >= limit)
 }
 
+/// Remove the head element of a fully dense array, sliding the rest down.
+///
+/// Callers must have established that the array is dense over its whole
+/// logical length (`dense_shift_applies`); the head is removed from the
+/// element buffer directly, so no per-index `[[Set]]` / `[[Delete]]` protocol
+/// runs. Never allocates: the buffer only shrinks.
+#[must_use]
+pub(crate) fn dense_shift(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
+    heap.with_payload(arr, |body| {
+        debug_assert!(body.exotic.is_none(), "dense shift over an exotic array");
+        if body.elements.is_empty() {
+            return Value::undefined();
+        }
+        let head = body.elements.remove(0);
+        body.length = body.elements.len();
+        body.refresh_element_cache();
+        if head.is_hole() {
+            Value::undefined()
+        } else {
+            head
+        }
+    })
+}
+
+/// Insert `value` at the head of a fully dense array, sliding the rest up.
+///
+/// Mirrors [`dense_shift`]; may grow the element buffer, so the receiver
+/// handle is threaded through the reservation and republished.
+///
+/// # Errors
+///
+/// Returns [`otter_gc::OutOfMemory`] if growing dense storage would exceed the
+/// configured heap cap.
+pub(crate) fn dense_unshift_with_roots(
+    mut arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    value: Value,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<usize, otter_gc::OutOfMemory> {
+    let barrier_value = value;
+    let target_len = len(arr, heap).saturating_add(1);
+    {
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            value.trace_value_slots(visitor);
+        };
+        reserve_for_target_len_with_roots(&mut arr, heap, target_len, &mut reserve_roots)?;
+    }
+    let new_len = heap.with_payload(arr, |body| {
+        debug_assert!(body.exotic.is_none(), "dense unshift over an exotic array");
+        body.elements
+            .reserve_exact(target_len.saturating_sub(body.elements.len()));
+        body.elements.insert(0, value);
+        body.length = body.elements.len();
+        body.refresh_element_cache();
+        body.length
+    });
+    heap.record_write(arr, &barrier_value);
+    Ok(new_len)
+}
+
+/// `true` when the array is dense over its whole logical length with no hole
+/// sentinel — the precondition that makes [`dense_shift`] /
+/// [`dense_unshift_with_roots`] observationally identical to the spec loop.
+///
+/// A hole would make the spec's per-index `Get` read an inherited value off the
+/// prototype chain, and a sparse tail would leave indices the element buffer
+/// does not cover, so both keep the generic path.
+#[must_use]
+pub(crate) fn is_fully_dense(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
+    heap.read_payload(arr, |body| {
+        body.exotic.is_none()
+            && body.length == body.elements.len()
+            && !body.elements.iter().any(|value| value.is_hole())
+    })
+}
+
 /// Pop from the tail. Returns `undefined` for an empty array
 /// and for slots that hold the internal hole sentinel.
 #[must_use]

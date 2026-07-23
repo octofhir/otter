@@ -33,6 +33,7 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
         classes: Vec::new(),
         next_mark: mark_base,
         unicode: flags.is_unicode_mode(),
+        backward: false,
     };
     // The overall-match bounds (slots 0/1) are not emitted as `Save`
     // instructions: the executor seeds slot 0 with the start offset before it
@@ -511,6 +512,12 @@ struct Emitter {
     /// `u`/`v` mode — disables the fused single-unit repeat (atoms are
     /// variable-width under surrogate-pair traversal).
     unicode: bool,
+    /// `true` while lowering the body of a lookbehind. §22.2.2.4 evaluates such
+    /// a body with direction -1: concatenations run right to left and every
+    /// atom consumes the input *before* the current position. Emission mirrors
+    /// that by reversing sequence order; the executor moves the position
+    /// backwards for the whole region.
+    backward: bool,
 }
 
 impl Emitter {
@@ -523,6 +530,12 @@ impl Emitter {
     /// Emit a pending literal run: nothing for an empty run, a single `Char` for
     /// one unit, a fused `CharSeq` for two or more. Clears the run.
     fn flush_char_run(&mut self, run: &mut Vec<u16>) {
+        // A backward concatenation collected the run in reverse; the fused
+        // instruction still compares a forward slice of the subject, so restore
+        // source order before emitting it.
+        if self.backward {
+            run.reverse();
+        }
         match run.len() {
             0 => {}
             1 => {
@@ -648,7 +661,12 @@ impl Emitter {
                 // quantified literal is a `Repeat`/`Split` node, not a bare
                 // `Char`, so only genuine fixed runs collect here.
                 let mut run: Vec<u16> = Vec::new();
-                for n in nodes {
+                let ordered: Vec<&Node> = if self.backward {
+                    nodes.iter().rev().collect()
+                } else {
+                    nodes.iter().collect()
+                };
+                for n in ordered {
                     if let Node::Char {
                         cp,
                         ignore_case: false,
@@ -696,6 +714,17 @@ impl Emitter {
 
     fn compile_repeat(&mut self, node: &Node, quant: Quantifier) {
         let Quantifier { min, max, greedy } = quant;
+        // §22.2.1 puts no ceiling on a counted quantifier's DecimalDigits, and
+        // the parser saturates anything wider than the bound width. A saturated
+        // maximum is unreachable for any subject, so it lowers as unbounded; a
+        // saturated minimum demands more input than a subject can hold whenever
+        // the body always consumes, so the repeat can never match at all.
+        let max = max.filter(|max| *max <= crate::parser::MAX_REPEAT);
+        if min > crate::parser::MAX_REPEAT && consumes_input(node) {
+            self.emit(Insn::Fail);
+            return;
+        }
+        let min = min.min(crate::parser::MAX_REPEAT);
         // Fuse an unbounded repeat of a single one-code-unit atom into one
         // instruction so the matcher consumes it in a tight loop. Only in
         // non-Unicode mode, where every atom is exactly one code unit.
@@ -796,12 +825,27 @@ impl Emitter {
     }
 
     /// `count` optional copies of `node` that may each bail to the end.
+    ///
+    /// §22.2.2.5.1 RepeatMatcher step 2.b fails an iteration whose minimum is
+    /// already zero and which consumed nothing, so an optional copy of a body
+    /// that can match empty carries a progress guard. Backtracking past the
+    /// guard restores the slots the empty attempt wrote, which is how
+    /// `(?:(?=(a))){0,1}` reports its group as unset while `{1,1}` reports it.
     fn compile_bounded(&mut self, node: &Node, count: u32, greedy: bool, captures: &[u32]) {
+        let guard_empty = !consumes_input(node);
         let mut splits = Vec::with_capacity(count as usize);
         for _ in 0..count {
             splits.push(self.emit(Insn::Split(0, 0)));
+            let mark = guard_empty.then(|| {
+                let mark = self.new_mark();
+                self.emit(Insn::SetMark(mark));
+                mark
+            });
             self.clear_captures(captures);
             self.compile(node);
+            if let Some(mark) = mark {
+                self.emit(Insn::CheckProgress(mark));
+            }
         }
         let end = self.here();
         for s in splits {
@@ -818,9 +862,16 @@ impl Emitter {
         match kind {
             GroupKind::Capturing { index, .. } => {
                 let slot = 2 * (*index as usize);
-                self.emit(Insn::Save(slot));
+                // Backward matching reaches the group's end before its start,
+                // so the saves swap to keep `start <= end`.
+                let (first, last) = if self.backward {
+                    (slot + 1, slot)
+                } else {
+                    (slot, slot + 1)
+                };
+                self.emit(Insn::Save(first));
                 self.compile(body);
-                self.emit(Insn::Save(slot + 1));
+                self.emit(Insn::Save(last));
             }
             GroupKind::NonCapturing => self.compile(body),
             GroupKind::Lookahead { negate } => self.compile_look(false, *negate, body),
@@ -842,7 +893,11 @@ impl Emitter {
         });
         let jump = self.emit(Insn::Jump(0));
         let entry = self.here();
+        // The body's direction is the assertion's own, not the enclosing
+        // region's: a lookahead nested in a lookbehind matches forwards again.
+        let outer = std::mem::replace(&mut self.backward, behind);
         self.compile(body);
+        self.backward = outer;
         self.emit(Insn::LookMatch);
         let after = self.here();
         self.insns[look] = Insn::Look {

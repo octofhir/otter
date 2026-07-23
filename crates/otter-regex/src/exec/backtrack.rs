@@ -20,11 +20,12 @@
 //! - Reported positions are UTF-16 code-unit offsets.
 //!
 //! # Lookbehind
-//! Lookbehind is evaluated by scanning candidate start positions and requiring
-//! the body to end exactly at the assertion point. This is boolean-correct and
-//! variable-length-capable; capture slots inside the body keep their first write
-//! so repeated captures report the leftmost text selected by ECMAScript's
-//! right-to-left lookbehind matching semantics.
+//! §22.2.2.4 evaluates a lookbehind body with direction -1. Lowering emits such
+//! a body with its concatenations reversed and its capture saves swapped, and
+//! the executor runs the whole region backwards: every atom consumes the input
+//! immediately *before* the current position. Alternation order, quantifier
+//! priority, and capture updates therefore follow the spec's right-to-left
+//! traversal exactly, with no candidate-start scan.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-pattern-matching>
@@ -93,7 +94,7 @@ pub(crate) fn attempt(
     caps[0] = Some(at);
     let mut stack = core::mem::take(&mut scratch.stack);
     let mut log = core::mem::take(&mut scratch.log);
-    let result = m.run(0, at, None, false, caps, &mut stack, &mut log);
+    let result = m.run(0, at, false, caps, &mut stack, &mut log);
     scratch.stack = stack;
     scratch.log = log;
     match result? {
@@ -137,16 +138,14 @@ enum Resume {
 }
 
 impl Matcher<'_, '_> {
-    /// Run from `entry` at `start`. `end_anchor`, when set, only accepts a
-    /// terminator reached exactly at that offset (used by lookbehind).
-    /// `freeze_capture_saves` preserves the first write to capture slots while
-    /// still allowing internal progress marks to update.
+    /// Run from `entry` at `start`. `backward` runs the region with direction
+    /// -1: every consuming instruction matches the input before the current
+    /// position and moves it left.
     fn run(
         &mut self,
         entry: usize,
         start: usize,
-        end_anchor: Option<usize>,
-        freeze_capture_saves: bool,
+        backward: bool,
         mut caps: Caps,
         stack: &mut Vec<Frame>,
         log: &mut Vec<UndoEntry>,
@@ -192,20 +191,20 @@ impl Matcher<'_, '_> {
             match frame.resume {
                 Resume::At => {}
                 Resume::RepeatGreedy { low } => {
-                    if frame.pos > low {
+                    if frame.pos != low {
                         stack.push(Frame {
                             pc: frame.pc,
-                            pos: frame.pos - 1,
+                            pos: step(frame.pos, 1, !backward),
                             log_mark: frame.log_mark,
                             resume: Resume::RepeatGreedy { low },
                         });
                     }
                 }
                 Resume::RepeatLazy { high } => {
-                    if frame.pos < high {
+                    if frame.pos != high {
                         stack.push(Frame {
                             pc: frame.pc,
-                            pos: frame.pos + 1,
+                            pos: step(frame.pos, 1, backward),
                             log_mark: frame.log_mark,
                             resume: Resume::RepeatLazy { high },
                         });
@@ -222,35 +221,37 @@ impl Matcher<'_, '_> {
                         caps[1] = Some(pos);
                         break Some(pos);
                     }
-                    // Lookaround-body terminator: must land exactly at the
-                    // assertion point when anchored (lookbehind).
-                    Insn::LookMatch => {
-                        if end_anchor.is_none_or(|t| pos == t) {
-                            break Some(pos);
-                        }
-                        break None;
-                    }
-                    Insn::Char { cp: c, ignore_case } => match self.decode(pos) {
+                    // Lookaround-body terminator: the body simply has to have
+                    // matched; where it ended is the assertion's business.
+                    Insn::LookMatch => break Some(pos),
+                    Insn::Char { cp: c, ignore_case } => match self.decode_dir(pos, backward) {
                         Some((cp, w)) if self.char_eq(*c, cp, *ignore_case) => {
                             pc += 1;
-                            pos += w;
+                            pos = step(pos, w, backward);
                         }
                         _ => break None,
                     },
                     Insn::CharSeq(seq) => {
-                        let end = pos + seq.len();
                         let units = self.units();
-                        if end <= units.len() && units[pos..end] == **seq {
+                        let (lo, hi) = if backward {
+                            match pos.checked_sub(seq.len()) {
+                                Some(lo) => (lo, pos),
+                                None => break None,
+                            }
+                        } else {
+                            (pos, pos + seq.len())
+                        };
+                        if hi <= units.len() && units[lo..hi] == **seq {
                             pc += 1;
-                            pos = end;
+                            pos = if backward { lo } else { hi };
                         } else {
                             break None;
                         }
                     }
-                    Insn::AnyChar { dot_all } => match self.decode(pos) {
+                    Insn::AnyChar { dot_all } => match self.decode_dir(pos, backward) {
                         Some((cp, w)) if *dot_all || !is_line_terminator(cp) => {
                             pc += 1;
-                            pos += w;
+                            pos = step(pos, w, backward);
                         }
                         _ => break None,
                     },
@@ -264,22 +265,30 @@ impl Matcher<'_, '_> {
                         // chained give-back frame rather than a split per char.
                         // The atom kind is matched once, outside the per-unit
                         // loop, so each loop is a single specialized test.
+                        // `unit_at` reads the unit the next repetition would
+                        // consume, which is the one before `end` when the region
+                        // runs backwards.
                         let units = self.units();
                         let len = units.len();
+                        let more = |end: usize| {
+                            if backward { end > 0 } else { end < len }
+                        };
+                        let unit_at = |end: usize| units[if backward { end - 1 } else { end }];
+                        let advance = |end: usize| if backward { end - 1 } else { end + 1 };
                         let mut end = pos;
                         match atom {
                             RepeatAtom::Char { cp, ignore_case } => {
                                 let (cp, ic) = (*cp, *ignore_case);
-                                while end < len && self.char_eq(cp, u32::from(units[end]), ic) {
-                                    end += 1;
+                                while more(end) && self.char_eq(cp, u32::from(unit_at(end)), ic) {
+                                    end = advance(end);
                                 }
                             }
                             RepeatAtom::Any { dot_all } => {
                                 let da = *dot_all;
-                                while end < len
-                                    && (da || !is_line_terminator(u32::from(units[end])))
+                                while more(end)
+                                    && (da || !is_line_terminator(u32::from(unit_at(end))))
                                 {
-                                    end += 1;
+                                    end = advance(end);
                                 }
                             }
                             RepeatAtom::Class {
@@ -290,10 +299,15 @@ impl Matcher<'_, '_> {
                                 let set = &prog.classes[*class as usize];
                                 let neg = *negate;
                                 if *ignore_case {
-                                    while end < len
-                                        && self.class_member(set, neg, u32::from(units[end]), true)
+                                    while more(end)
+                                        && self.class_member(
+                                            set,
+                                            neg,
+                                            u32::from(unit_at(end)),
+                                            true,
+                                        )
                                     {
-                                        end += 1;
+                                        end = advance(end);
                                     }
                                 } else {
                                     // Case-sensitive ASCII fast path: split the
@@ -304,8 +318,8 @@ impl Matcher<'_, '_> {
                                     // back to the range set.
                                     let lo = set.ascii_lo as u64;
                                     let hi = (set.ascii_lo >> 64) as u64;
-                                    while end < len {
-                                        let u = units[end];
+                                    while more(end) {
+                                        let u = unit_at(end);
                                         let in_set = if u < 64 {
                                             (lo >> u) & 1 != 0
                                         } else if u < 128 {
@@ -316,33 +330,34 @@ impl Matcher<'_, '_> {
                                         if in_set == neg {
                                             break;
                                         }
-                                        end += 1;
+                                        end = advance(end);
                                     }
                                 }
                             }
                         }
-                        if (end - pos) < *min as usize {
+                        let matched = pos.abs_diff(end);
+                        if matched < *min as usize {
                             break None;
                         }
-                        let low = pos + *min as usize;
+                        let low = step(pos, *min as usize, backward);
                         if *greedy {
                             // A possessive repeat keeps no give-back frame: the
                             // required atom that follows is disjoint from this
                             // atom, so no shorter length could satisfy it.
-                            if !*possessive && end > low {
+                            if !*possessive && end != low {
                                 stack.push(Frame {
                                     pc: pc + 1,
-                                    pos: end - 1,
+                                    pos: step(end, 1, !backward),
                                     log_mark: log.len(),
                                     resume: Resume::RepeatGreedy { low },
                                 });
                             }
                             pos = end;
                         } else {
-                            if end > low {
+                            if end != low {
                                 stack.push(Frame {
                                     pc: pc + 1,
-                                    pos: low + 1,
+                                    pos: step(low, 1, backward),
                                     log_mark: log.len(),
                                     resume: Resume::RepeatLazy { high: end },
                                 });
@@ -355,7 +370,7 @@ impl Matcher<'_, '_> {
                         class,
                         negate,
                         ignore_case,
-                    } => match self.decode(pos) {
+                    } => match self.decode_dir(pos, backward) {
                         Some((cp, w))
                             if self.class_member(
                                 &prog.classes[*class as usize],
@@ -365,10 +380,11 @@ impl Matcher<'_, '_> {
                             ) =>
                         {
                             pc += 1;
-                            pos += w;
+                            pos = step(pos, w, backward);
                         }
                         _ => break None,
                     },
+                    Insn::Fail => break None,
                     Insn::Jump(t) => pc = *t,
                     Insn::Split(a, b) => {
                         // O(1): record where to resume and the undo-log mark to
@@ -383,16 +399,14 @@ impl Matcher<'_, '_> {
                     }
                     Insn::Save(slot) => {
                         let slot = *slot;
-                        if !freeze_capture_saves || caps[slot].is_none() {
-                            // Slots 0/1 (the overall match bounds) are written
-                            // once by the outermost saves bracketing the whole
-                            // pattern — never inside a loop or alternation — so
-                            // they are never restored and need no undo entry.
-                            if slot > 1 {
-                                log.push((slot, caps[slot]));
-                            }
-                            caps[slot] = Some(pos);
+                        // Slots 0/1 (the overall match bounds) are written once
+                        // by the outermost saves bracketing the whole pattern —
+                        // never inside a loop or alternation — so they are never
+                        // restored and need no undo entry.
+                        if slot > 1 {
+                            log.push((slot, caps[slot]));
                         }
+                        caps[slot] = Some(pos);
                         pc += 1;
                     }
                     Insn::SetMark(slot) => {
@@ -403,14 +417,10 @@ impl Matcher<'_, '_> {
                     }
                     Insn::ClearCapture(index) => {
                         let g = *index as usize;
-                        if !freeze_capture_saves
-                            || (caps[2 * g].is_none() && caps[2 * g + 1].is_none())
-                        {
-                            log.push((2 * g, caps[2 * g]));
-                            caps[2 * g] = None;
-                            log.push((2 * g + 1, caps[2 * g + 1]));
-                            caps[2 * g + 1] = None;
-                        }
+                        log.push((2 * g, caps[2 * g]));
+                        caps[2 * g] = None;
+                        log.push((2 * g + 1, caps[2 * g + 1]));
+                        caps[2 * g + 1] = None;
                         pc += 1;
                     }
                     Insn::CheckProgress(slot) => {
@@ -446,7 +456,7 @@ impl Matcher<'_, '_> {
                     Insn::BackRef {
                         indices,
                         ignore_case,
-                    } => match self.match_backref(indices, pos, &caps, *ignore_case) {
+                    } => match self.match_backref(indices, pos, &caps, *ignore_case, backward) {
                         Some(next) => {
                             pc += 1;
                             pos = next;
@@ -498,35 +508,19 @@ impl Matcher<'_, '_> {
         // log are live, so they evaluate on their own transient buffers.
         let mut look_stack = Vec::new();
         let mut look_log = Vec::new();
-        let found = if behind {
-            let mut hit = None;
-            for s in 0..=pos {
-                if let Some((_, updated)) = self.run(
-                    entry,
-                    s,
-                    Some(pos),
-                    true,
-                    caps.clone(),
-                    &mut look_stack,
-                    &mut look_log,
-                )? {
-                    hit = Some(updated);
-                    break;
-                }
-            }
-            hit
-        } else {
-            self.run(
+        // Both directions start at the assertion point; a lookbehind body was
+        // lowered to run backwards from there, so neither needs a search over
+        // candidate start offsets.
+        let found = self
+            .run(
                 entry,
                 pos,
-                None,
-                false,
+                behind,
                 caps.clone(),
                 &mut look_stack,
                 &mut look_log,
             )?
-            .map(|(_, c)| c)
-        };
+            .map(|(_, c)| c);
 
         Ok(match (negate, found) {
             (false, Some(updated)) => Some(updated),
@@ -540,6 +534,22 @@ impl Matcher<'_, '_> {
 
     fn units(&self) -> &[u16] {
         self.input.units()
+    }
+
+    /// Decode the code point the next atom consumes at `pos`: the one starting
+    /// there when running forwards, the one ending there when running backwards.
+    fn decode_dir(&self, pos: usize, backward: bool) -> Option<(u32, usize)> {
+        if backward {
+            self.decode_back(pos)
+        } else {
+            self.decode(pos)
+        }
+    }
+
+    /// Decode the code point ending just before `pos`, with its code-unit width.
+    fn decode_back(&self, pos: usize) -> Option<(u32, usize)> {
+        let cp = self.prev_codepoint(pos)?;
+        Some((cp, if cp > 0xFFFF { 2 } else { 1 }))
     }
 
     /// Decode the code point at `pos`, returning it and its code-unit width.
@@ -647,6 +657,7 @@ impl Matcher<'_, '_> {
         pos: usize,
         caps: &Caps,
         ignore_case: bool,
+        backward: bool,
     ) -> Option<usize> {
         let Some((start, end)) = groups.iter().find_map(|group| {
             let g = *group as usize;
@@ -665,19 +676,27 @@ impl Matcher<'_, '_> {
             return Some(pos);
         }
         let units = self.units();
-        if pos + len > units.len() {
+        // Backwards, the referenced text must end at `pos` rather than start
+        // there.
+        let at = if backward { pos.checked_sub(len)? } else { pos };
+        if at + len > units.len() {
             return None;
         }
         for k in 0..len {
             let a = u32::from(units[start + k]);
-            let b = u32::from(units[pos + k]);
+            let b = u32::from(units[at + k]);
             let eq = a == b || (ignore_case && self.canon(a) == self.canon(b));
             if !eq {
                 return None;
             }
         }
-        Some(pos + len)
+        Some(if backward { at } else { at + len })
     }
+}
+
+/// Move `pos` by `width` units in the region's direction.
+fn step(pos: usize, width: usize, backward: bool) -> usize {
+    if backward { pos - width } else { pos + width }
 }
 
 fn is_line_terminator(cp: u32) -> bool {

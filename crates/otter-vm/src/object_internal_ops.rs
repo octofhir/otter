@@ -980,19 +980,30 @@ impl Interpreter {
                 None => self.is_extensible_value(stack, context, &proxy.target(&self.gc_heap)),
             };
         }
+        Ok(self.is_extensible_non_proxy(value))
+    }
+
+    /// The `[[IsExtensible]]` family dispatch for every receiver kind except
+    /// Proxy, whose trap needs a reentrant call.
+    ///
+    /// Shared with `Object.isExtensible` for the same reason as
+    /// [`Self::prevent_extensions_non_proxy`]: a second list here silently
+    /// diverges from the kinds that keep the flag on a lazy expando bag.
+    #[must_use]
+    pub(crate) fn is_extensible_non_proxy(&self, value: &Value) -> bool {
         if let Some(obj) = value.as_object() {
-            return Ok(object::is_extensible(obj, &self.gc_heap));
+            return object::is_extensible(obj, &self.gc_heap);
         }
         if let Some(t) = value.as_typed_array(&self.gc_heap) {
-            return Ok(t
+            return t
                 .expando(&self.gc_heap)
-                .is_none_or(|bag| object::is_extensible(bag, &self.gc_heap)));
+                .is_none_or(|bag| object::is_extensible(bag, &self.gc_heap));
         }
         if let Some(arr) = value.as_array() {
-            return Ok(array::is_extensible(arr, &self.gc_heap));
+            return array::is_extensible(arr, &self.gc_heap);
         }
         if let Some(native) = value.as_native_function() {
-            return Ok(native.is_extensible(&self.gc_heap));
+            return native.is_extensible(&self.gc_heap);
         }
         let fid = value.as_function().or_else(|| {
             value
@@ -1000,17 +1011,22 @@ impl Interpreter {
                 .map(|c| c.cached_function_id)
         });
         if let Some(function_id) = fid {
-            return Ok(self.ordinary_function_is_extensible(function_id));
+            return self.ordinary_function_is_extensible(function_id);
         }
         if let Some(regexp) = value.as_regexp() {
-            return Ok(regexp.is_extensible(&self.gc_heap));
+            return regexp.is_extensible(&self.gc_heap);
         }
         if let Some(bag) = self.collection_expando(value) {
-            return Ok(object::is_extensible(bag, &self.gc_heap));
+            return object::is_extensible(bag, &self.gc_heap);
+        }
+        if let Some(promise) = value.as_promise()
+            && let Some(bag) = promise.expando(&self.gc_heap)
+        {
+            return object::is_extensible(bag, &self.gc_heap);
         }
         // Per §10.1.3 every other ordinary heap value is extensible
         // by default.
-        Ok(true)
+        true
     }
 
     /// Read the lazily-allocated expando bag carrying user-defined
@@ -3457,6 +3473,15 @@ impl Interpreter {
                 None => self.prevent_extensions_value(stack, context, &proxy.target(&self.gc_heap)),
             };
         }
+        self.prevent_extensions_non_proxy(value)
+    }
+
+    /// The `[[PreventExtensions]]` family dispatch for every receiver kind
+    /// except Proxy, whose trap needs a reentrant call.
+    ///
+    /// Shared with `Object.preventExtensions`, which has no reentry state and
+    /// would otherwise carry a second, silently diverging list of families.
+    pub(crate) fn prevent_extensions_non_proxy(&mut self, value: &Value) -> Result<bool, VmError> {
         if let Some(obj) = value.as_object() {
             object::prevent_extensions(obj, &mut self.gc_heap);
             return Ok(true);
@@ -3509,6 +3534,15 @@ impl Interpreter {
             // collection reports [[IsExtensible]] = false and rejects
             // further own-property additions.
             let bag = self.collection_ensure_expando(value)?;
+            object::prevent_extensions(bag, &mut self.gc_heap);
+            return Ok(true);
+        }
+        if let Some(promise) = value.as_promise() {
+            // Same shape as the collections above: a promise's own properties
+            // live on a lazy bag, and [[IsExtensible]] reads that bag, so the
+            // flag has nowhere to live until the bag exists.
+            let bag =
+                crate::property_dispatch::promise_ensure_expando_pub(&mut self.gc_heap, &promise)?;
             object::prevent_extensions(bag, &mut self.gc_heap);
             return Ok(true);
         }

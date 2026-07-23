@@ -1949,24 +1949,11 @@ pub fn call(
         // §20.1.2.18 Object.preventExtensions(O)
         M::PreventExtensions => {
             let arg = args.first().cloned().unwrap_or(Value::undefined());
-            if let Some(o) = arg.as_object() {
-                crate::object::prevent_extensions(o, gc_heap);
-            } else if let Some(a) = arg.as_array() {
-                crate::array::prevent_extensions(a, gc_heap);
-            } else if let Some(native) = arg.as_native_function() {
-                native.prevent_extensions(gc_heap);
-            } else if let Some(r) = arg.as_regexp() {
-                r.prevent_extensions(gc_heap);
-            } else if let Some(t) = arg.as_typed_array(gc_heap) {
-                // §10.4.5 — TypedArray extensibility lives on the lazy
-                // expando bag; elements are exempt.
-                let bag = crate::property_dispatch::typed_array_ensure_expando_pub(gc_heap, &t)?;
-                crate::object::prevent_extensions(bag, gc_heap);
-            } else if let Some(c) = arg.as_class_constructor() {
-                // Class constructor extensibility lives on its
-                // statics object.
-                crate::object::prevent_extensions(c.statics(gc_heap), gc_heap);
-            }
+            // One family dispatch, shared with the internal method. A second
+            // list here silently diverged: Map, Set, Generator, and Promise
+            // keep `[[Extensible]]` on a lazy expando bag that only the
+            // internal method materialises.
+            interp.prevent_extensions_non_proxy(&arg)?;
             Ok(arg)
         }
         // §20.1.2.15 Object.isFrozen(O)
@@ -2018,32 +2005,11 @@ pub fn call(
         // §20.1.2.14 Object.isExtensible(O)
         M::IsExtensible => {
             let arg = args.first().cloned().unwrap_or(Value::undefined());
-            // §20.1.2.14 — `Object.isExtensible(non_object) === false`.
-            // Every heap-allocated value kind is an Object, so they
-            // all default to extensible until a `preventExtensions`
-            // / `seal` / `freeze` toggle landed. Primitives and the
-            // null / undefined sentinels return false.
-            let result = if let Some(o) = arg.as_object() {
-                crate::object::is_extensible(o, gc_heap)
-            } else if let Some(arr) = arg.as_array() {
-                crate::array::is_extensible(arr, gc_heap)
-            } else if let Some(native) = arg.as_native_function() {
-                native.is_extensible(gc_heap)
-            } else if let Some(r) = arg.as_regexp() {
-                r.is_extensible(gc_heap)
-            } else if let Some(t) = arg.as_typed_array(gc_heap) {
-                t.expando(gc_heap)
-                    .is_none_or(|bag| crate::object::is_extensible(bag, gc_heap))
-            } else if let Some(c) = arg.as_class_constructor() {
-                crate::object::is_extensible(c.statics(gc_heap), gc_heap)
-            } else {
-                // §20.1.2.14 step 2 — non-Object returns false; every
-                // spec-Object kind reaches here only when none of the
-                // dedicated wrappers above matched, in which case
-                // `is_object_type` widens to callable / exotic
-                // payloads that default to extensible.
-                arg.is_object_type()
-            };
+            // §20.1.2.14 step 2 — a non-Object returns false. Every
+            // heap-allocated value kind is a spec Object, so the shared family
+            // dispatch decides the rest; keeping a second list here let the
+            // kinds that hold `[[Extensible]]` on a lazy expando bag drift.
+            let result = arg.is_object_type() && interp.is_extensible_non_proxy(&arg);
             Ok(Value::boolean(result))
         }
         // §20.1.2.17 Object.keys(O) — enumerable own string keys.

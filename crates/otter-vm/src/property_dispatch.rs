@@ -2264,6 +2264,25 @@ impl Interpreter {
             );
         }
         idx_value = self.coerce_property_key_value(stack, context, idx_value_raw)?;
+        // Exotic receivers that keep their own-property bag on an expando —
+        // RegExp, Map, Set, class constructors, boxed primitives — dispatch on
+        // a string or symbol key only. A numeric index reaches them still
+        // spelled as a Number, so give them the `ToPropertyKey` string here
+        // instead of leaving the family match to fail. Arrays, typed arrays,
+        // strings, and ordinary objects keep the raw numeric key for their
+        // integer fast paths.
+        if let Some(number) = idx_value.as_number()
+            && recv.as_object().is_none()
+            && recv.as_array().is_none()
+            && recv.as_typed_array(&self.gc_heap).is_none()
+            && recv.as_string(&self.gc_heap).is_none()
+        {
+            let spelled = number.to_display_string();
+            idx_value = Value::string(
+                crate::string::JsString::from_str(&spelled, &mut self.gc_heap)
+                    .map_err(|_| VmError::TypeMismatch)?,
+            );
+        }
         let value = if let Some(obj) = recv.as_object() {
             let key = if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 VmPropertyKey::Symbol(sym)
@@ -5113,6 +5132,13 @@ pub(crate) fn regexp_ensure_expando_pub(
         recv.trace_value_slots(visitor);
     };
     let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    // A RegExp keeps its own `[[Extensible]]` slot, so a bag created after
+    // `Object.preventExtensions` must be born non-extensible — otherwise the
+    // first own-property store materialises a fresh extensible bag and slips
+    // past the frozen receiver.
+    if !r.is_extensible(heap) {
+        crate::object::prevent_extensions(bag, heap);
+    }
     r.set_expando(heap, bag);
     Ok(bag)
 }

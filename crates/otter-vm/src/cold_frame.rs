@@ -112,6 +112,12 @@ impl ColdFrameIdx {
 /// control-flow state instead of inflating every hot [`crate::Frame`].
 #[derive(Debug, Default, Clone)]
 pub struct ColdFrame {
+    /// Whether the pool currently hands this slot to a frame.
+    ///
+    /// Released slots reset to `Default`, so tracing one visits nothing — but
+    /// proving that costs a walk of every field, and the collector pays it for
+    /// the whole pool on every collection. One flag turns that into a branch.
+    acquired: bool,
     /// Result promise owned by a regular async-function invocation. Return and
     /// uncaught-throw paths settle it instead of writing into a caller window.
     pub async_state: Option<AsyncFrameState>,
@@ -321,11 +327,15 @@ impl ColdFramePool {
     /// Acquire a fresh, zeroed slot and return its handle.
     pub fn acquire(&mut self) -> ColdFrameIdx {
         if let Some(slot) = self.free.pop() {
-            // Slot was reset on release; nothing to do here.
+            // Slot was reset on release; only the acquired flag is restored.
+            self.slots[slot as usize].acquired = true;
             return ColdFrameIdx::from_slot(slot);
         }
         let slot = u32::try_from(self.slots.len()).expect("cold-frame pool fits in u32");
-        self.slots.push(ColdFrame::default());
+        self.slots.push(ColdFrame {
+            acquired: true,
+            ..ColdFrame::default()
+        });
         ColdFrameIdx::from_slot(slot)
     }
 
@@ -352,6 +362,8 @@ impl ColdFramePool {
     pub fn attach(&mut self, cold: ColdFrame) -> ColdFrameIdx {
         let idx = self.acquire();
         self.slots[idx.slot()] = cold;
+        // The re-attached record travels without pool bookkeeping.
+        self.slots[idx.slot()].acquired = true;
         idx
     }
 
@@ -384,7 +396,9 @@ impl ColdFramePool {
     /// across a collection.
     pub fn trace_all(&self, visitor: &mut SlotVisitor<'_>) {
         for slot in &self.slots {
-            slot.trace_cold_slots(visitor);
+            if slot.acquired {
+                slot.trace_cold_slots(visitor);
+            }
         }
     }
 }

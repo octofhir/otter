@@ -960,7 +960,11 @@ fn arg_to_civil_inner(
                 Ok(Civil::new(1972, month, pmd.day(), 0, 0, 0, 0))
             }
             TemporalPayload::Instant(inst) => {
-                Ok(epoch_millis_to_civil_for_payload(inst.epoch_milliseconds(), payload))
+                Ok(epoch_millis_to_civil_for_payload(
+                    &mut ctx.interp_mut().local_time_zone,
+                    inst.epoch_milliseconds(),
+                    payload,
+                ))
             }
             TemporalPayload::Duration(_) => Err(NativeError::TypeError {
                 name,
@@ -970,13 +974,21 @@ fn arg_to_civil_inner(
     } else if let Some(value) = first.filter(|v| !v.is_undefined()) {
         let ms = coerce_to_number(ctx, value, name)?;
         let ms = time_clip(ms, name)?;
-        Ok(epoch_millis_to_civil_for_payload(ms as i64, payload))
+        Ok(epoch_millis_to_civil_for_payload(
+            &mut ctx.interp_mut().local_time_zone,
+            ms as i64,
+            payload,
+        ))
     } else {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        Ok(epoch_millis_to_civil_for_payload(now, payload))
+        Ok(epoch_millis_to_civil_for_payload(
+            &mut ctx.interp_mut().local_time_zone,
+            now,
+            payload,
+        ))
     }
 }
 
@@ -1927,9 +1939,13 @@ fn epoch_millis_to_civil(epoch_millis: i64) -> Civil {
     civil
 }
 
-fn epoch_millis_to_civil_for_payload(epoch_millis: i64, payload: &DateTimeFormatPayload) -> Civil {
+fn epoch_millis_to_civil_for_payload(
+    zone: &mut crate::date::LocalTimeZone,
+    epoch_millis: i64,
+    payload: &DateTimeFormatPayload,
+) -> Civil {
     match payload.time_zone.as_deref() {
-        None => crate::date::local_broken_down(epoch_millis as f64)
+        None => crate::date::local_broken_down(zone, epoch_millis as f64)
             .map(civil_from_broken_down)
             .unwrap_or_else(|| epoch_millis_to_civil(epoch_millis)),
         Some("UTC" | "Etc/UTC" | "Etc/GMT") => epoch_millis_to_civil(epoch_millis),

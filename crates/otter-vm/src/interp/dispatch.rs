@@ -623,11 +623,44 @@ impl Interpreter {
                 Op::IteratorClose => {
                     let iter_reg = instr.reg(0);
                     let iterator = *read_register(&stack[top_idx], iter_reg)?;
+                    // §7.4.9 — the handler depth this iterator's region opened
+                    // at, recorded by `Op::IteratorCloseStart`.
+                    let region_depth = self.frame_cold(&stack[top_idx]).and_then(|cold| {
+                        cold.active_iterator_closers
+                            .iter()
+                            .rfind(|(value, _)| *value == iterator)
+                            .map(|(_, depth)| *depth as usize)
+                    });
                     // §7.4.9 — mark the iterator done *before* running its
                     // `[[return]]`: if `return` throws, the unwind must
                     // not close it again (it is already closing).
                     self.deregister_frame_iterator_closer(&mut stack[top_idx], iterator);
-                    self.iterator_close_value_sync(stack, context, iterator)?;
+                    match self.iterator_close_value_sync(stack, context, iterator) {
+                        Ok(()) => {}
+                        Err(err) => {
+                            // The abrupt `break` / `continue` / `return` that
+                            // reached this close has already left every `try`
+                            // scope inside the loop body, so `[[return]]` throws
+                            // from outside them: a `catch` in the body cannot see
+                            // it. Their `finally` blocks still run — leaving the
+                            // try is what triggers them — so disarm the catch
+                            // arms rather than dropping the handlers.
+                            if let Some(depth) = region_depth
+                                && let Some(cold) = self.frame_cold_mut(&mut stack[top_idx])
+                            {
+                                let mut index = cold.handlers.len();
+                                while index > depth {
+                                    index -= 1;
+                                    if cold.handlers[index].finally_pc.is_some() {
+                                        cold.handlers[index].catch_pc = None;
+                                    } else {
+                                        cold.handlers.remove(index);
+                                    }
+                                }
+                            }
+                            return Err(err);
+                        }
+                    }
                     stack[top_idx].advance_pc()?;
                     continue;
                 }

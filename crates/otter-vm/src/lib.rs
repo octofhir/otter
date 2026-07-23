@@ -766,6 +766,9 @@ pub(crate) struct MethodSite {
 /// later switch to threaded dispatch after benchmark-driven review
 /// (foundation plan §"Interpreter requirements").
 pub struct Interpreter {
+    /// Host local time zone for `Date`'s local-time getters, resolved on first
+    /// use and kept for this isolate. See [`date::LocalTimeZone`].
+    pub(crate) local_time_zone: date::LocalTimeZone,
     /// §13.2.8.4 GetTemplateObject realm cache — one frozen
     /// template-strings object per tagged-template site, keyed by
     /// `(chunk function_base, site index)`.
@@ -1370,6 +1373,15 @@ impl Drop for Interpreter {
 }
 
 impl Interpreter {
+    /// The isolate's local-time-zone cache alongside the heap, borrowed
+    /// disjointly so a `Date` entry point can resolve local time and read GC
+    /// values in one expression.
+    pub(crate) fn local_time_zone_and_heap(
+        &mut self,
+    ) -> (&mut date::LocalTimeZone, &otter_gc::GcHeap) {
+        (&mut self.local_time_zone, &self.gc_heap)
+    }
+
     /// Root-tracing view of the template-object cache.
     pub(crate) fn template_objects_for_trace(&self) -> impl Iterator<Item = &Value> {
         self.template_objects.values()

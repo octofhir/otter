@@ -36,7 +36,7 @@ fn weakmap_dead_key_entry_is_pruned_and_value_reaped() {
     collect_with_roots(&mut heap, &mut [&mut wm_root]);
 
     assert_eq!(
-        weak_map_get(wm, &heap, &Value::object(key)).expect("weak map get"),
+        weak_map_get(wm, &mut heap, &Value::object(key)).expect("weak map get"),
         None
     );
     assert_eq!(
@@ -58,7 +58,7 @@ fn weakmap_live_key_marks_value_through_fixpoint() {
     let mut key_root = key.raw();
     collect_with_roots(&mut heap, &mut [&mut wm_root, &mut key_root]);
 
-    assert!(weak_map_has(wm, &heap, &Value::object(key)).expect("weak map has"));
+    assert!(weak_map_has(wm, &mut heap, &Value::object(key)).expect("weak map has"));
     assert!(
         heap.gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes > 0,
         "live weak-map key must mark its value"
@@ -79,7 +79,7 @@ fn weakmap_ephemeron_chain_reaches_fixpoint() {
     let mut k1_root = k1.raw();
     collect_with_roots(&mut heap, &mut [&mut wm_root, &mut k1_root]);
 
-    assert!(weak_map_has(wm, &heap, &Value::object(k2)).expect("weak map has k2"));
+    assert!(weak_map_has(wm, &mut heap, &Value::object(k2)).expect("weak map has k2"));
     assert!(
         heap.gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes > 0,
         "ephemeron chain must mark through k1 -> k2 -> value"
@@ -99,8 +99,8 @@ fn weakmap_dead_ephemeron_chain_is_reaped() {
     let mut wm_root = wm.raw();
     collect_with_roots(&mut heap, &mut [&mut wm_root]);
 
-    assert!(!weak_map_has(wm, &heap, &Value::object(k1)).expect("weak map has k1"));
-    assert!(!weak_map_has(wm, &heap, &Value::object(k2)).expect("weak map has k2"));
+    assert!(!weak_map_has(wm, &mut heap, &Value::object(k1)).expect("weak map has k1"));
+    assert!(!weak_map_has(wm, &mut heap, &Value::object(k2)).expect("weak map has k2"));
     assert_eq!(
         heap.gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes,
         0,
@@ -118,7 +118,7 @@ fn weakmap_self_reference_does_not_keep_key_alive() {
     let mut wm_root = wm.raw();
     collect_with_roots(&mut heap, &mut [&mut wm_root]);
 
-    assert!(!weak_map_has(wm, &heap, &Value::object(obj)).expect("weak map has"));
+    assert!(!weak_map_has(wm, &mut heap, &Value::object(obj)).expect("weak map has"));
     assert_eq!(
         heap.gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes,
         0,
@@ -228,7 +228,7 @@ fn weakset_dead_key_entry_is_pruned() {
     let mut ws_root = ws.raw();
     collect_with_roots(&mut heap, &mut [&mut ws_root]);
 
-    assert!(!weak_set_has(ws, &heap, &Value::object(key)).expect("weak set has"));
+    assert!(!weak_set_has(ws, &mut heap, &Value::object(key)).expect("weak set has"));
     assert_eq!(
         heap.gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes,
         0,

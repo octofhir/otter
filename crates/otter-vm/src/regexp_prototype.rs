@@ -2043,8 +2043,24 @@ fn get_substitution(
 ) -> Result<Vec<u16>, crate::NativeError> {
     let anchor_base = ctx.interp_mut().iteration_anchors_for_trace().len();
     ctx.interp_mut().push_iteration_anchor(Value::undefined());
+    // A template can expand far past anything that could ever become a
+    // `String`: `"$1".repeat(1 << 15)` against a one-megabyte capture projects
+    // tens of gigabytes. Growing the buffer until the final allocation fails
+    // spends minutes to reach the same `RangeError`, so the expansion stops as
+    // soon as it passes what the heap could hold.
+    let unit_budget = (ctx.heap().max_heap_bytes() / 2).max(1) as usize;
     let result = (|| -> Result<Vec<u16>, crate::NativeError> {
         let mut out: Vec<u16> = Vec::with_capacity(template.len());
+        macro_rules! guard_budget {
+            ($extra:expr) => {
+                if out.len().saturating_add($extra) > unit_budget {
+                    return Err(crate::NativeError::RangeError {
+                        name,
+                        reason: "replacement string is too long".to_string(),
+                    });
+                }
+            };
+        }
         let match_length = matched.len();
         let str_length = str_units.len();
         let tail_position = (position + match_length).min(str_length);
@@ -2064,14 +2080,17 @@ fn get_substitution(
                     i += 2;
                 }
                 n if n == b'&' as u16 => {
+                    guard_budget!(matched.len());
                     out.extend_from_slice(matched);
                     i += 2;
                 }
                 n if n == b'`' as u16 => {
+                    guard_budget!(position);
                     out.extend_from_slice(&str_units[..position]);
                     i += 2;
                 }
                 n if n == b'\'' as u16 => {
+                    guard_budget!(str_units.len() - tail_position);
                     out.extend_from_slice(&str_units[tail_position..]);
                     i += 2;
                 }
@@ -2119,7 +2138,9 @@ fn get_substitution(
                                     reason: "replace capture root is not a string".to_string(),
                                 }
                             })?;
-                            out.extend_from_slice(&capture.to_utf16_vec(ctx.heap()));
+                            let units = capture.to_utf16_vec(ctx.heap());
+                            guard_budget!(units.len());
+                            out.extend_from_slice(&units);
                         }
                         // Undefined capture group → emit nothing.
                     } else {
@@ -2170,7 +2191,9 @@ fn get_substitution(
                                     reason: "named replacement root is not a string".to_string(),
                                 }
                             })?;
-                            out.extend_from_slice(&coerced.to_utf16_vec(ctx.heap()));
+                            let units = coerced.to_utf16_vec(ctx.heap());
+                            guard_budget!(units.len());
+                            out.extend_from_slice(&units);
                         }
                         i = end + 1;
                     }

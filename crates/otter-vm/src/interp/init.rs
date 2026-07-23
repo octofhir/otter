@@ -177,6 +177,7 @@ impl Interpreter {
         drop(error_scope);
         drop(well_known_scope);
         let mut interp = Self {
+            local_time_zone: crate::date::LocalTimeZone::default(),
             template_objects: rustc_hash::FxHashMap::default(),
             string_constant_cache: rustc_hash::FxHashMap::default(),
             small_int_string_cache: vec![None; Self::SMALL_INT_STRING_CACHE as usize]

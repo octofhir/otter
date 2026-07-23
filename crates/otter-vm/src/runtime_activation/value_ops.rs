@@ -201,12 +201,14 @@ impl RuntimeCall<'_> {
         // SAFETY: RuntimeCall brands exclusive mutator access for this exact
         // operation; neither reference is retained by the raw frame view.
         let vm = unsafe { &mut *self.vm.as_ptr() };
+        let stack = unsafe { &mut *self.stack.as_ptr() };
+        let context = unsafe { self.context.as_ref() };
         let frame = self.frame.as_ptr();
         // SAFETY: RuntimeCall construction validated and exclusively owns the
         // published descriptor; ActiveFrame stores no borrowed register slice.
         let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
-        vm.jit_runtime_add(&mut frame, dst, lhs, rhs)
+        vm.jit_runtime_add(stack, context, &mut frame, dst, lhs, rhs)
     }
 
     /// Complete generic unary negation.

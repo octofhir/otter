@@ -1657,7 +1657,9 @@ impl Interpreter {
                     let offset = instr.imm(0);
                     let cond = instr.reg(1);
                     let frame = &mut stack[top_idx];
-                    let taken = read_register(frame, cond)?.to_boolean(&self.gc_heap);
+                    // `cond` is a schema register; SAFETY: see `read_register_unchecked`.
+                    let taken =
+                        unsafe { read_register_unchecked(frame, cond) }.to_boolean(&self.gc_heap);
                     if jit_installed && let Some(cell) = feedback {
                         cell.record_branch(taken);
                     }
@@ -1679,7 +1681,9 @@ impl Interpreter {
                     let offset = instr.imm(0);
                     let cond = instr.reg(1);
                     let frame = &mut stack[top_idx];
-                    let taken = !read_register(frame, cond)?.to_boolean(&self.gc_heap);
+                    // `cond` is a schema register; SAFETY: see `read_register_unchecked`.
+                    let taken =
+                        !unsafe { read_register_unchecked(frame, cond) }.to_boolean(&self.gc_heap);
                     if jit_installed && let Some(cell) = feedback {
                         cell.record_branch(taken);
                     }
@@ -1701,7 +1705,8 @@ impl Interpreter {
                     let offset = instr.imm(0);
                     let cond = instr.reg(1);
                     let frame = &mut stack[top_idx];
-                    if read_register(frame, cond)?.is_nullish() {
+                    // SAFETY: see `read_register_unchecked`.
+                    if unsafe { read_register_unchecked(frame, cond) }.is_nullish() {
                         apply_branch(frame, offset, &self.interrupt)?;
                     } else {
                         frame.advance_pc()?;
@@ -1710,19 +1715,27 @@ impl Interpreter {
                 }
                 Op::LoadLocal => {
                     let dst = instr.reg(0);
-                    let idx = instr.imm(1);
+                    let idx = instr.imm(1) as u16;
                     let frame = &mut stack[top_idx];
-                    let value = *read_register(frame, idx as u16)?;
-                    write_register(frame, dst, value)?;
+                    // Both operands are schema registers (the `Imm32` is a local
+                    // index), bounded by the build-time verifier.
+                    // SAFETY: see `read_register_unchecked`.
+                    unsafe {
+                        let value = read_register_unchecked(frame, idx);
+                        write_register_unchecked(frame, dst, value);
+                    }
                     frame.advance_pc()?;
                     continue;
                 }
                 Op::StoreLocal => {
                     let src = instr.reg(0);
-                    let idx = instr.imm(1);
+                    let idx = instr.imm(1) as u16;
                     let frame = &mut stack[top_idx];
-                    let value = *read_register(frame, src)?;
-                    write_register(frame, idx as u16, value)?;
+                    // SAFETY: see `Op::LoadLocal`.
+                    unsafe {
+                        let value = read_register_unchecked(frame, src);
+                        write_register_unchecked(frame, idx, value);
+                    }
                     frame.advance_pc()?;
                     continue;
                 }

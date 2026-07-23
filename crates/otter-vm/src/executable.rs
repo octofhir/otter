@@ -932,6 +932,50 @@ impl Clone for CodeBlock {
     }
 }
 
+/// Prove that every operand addressing the frame register window is inside it.
+///
+/// Dispatch reads and writes the window without re-checking each access, so
+/// this is the one place the bound is established. The schema declares which
+/// operands carry a register number — both the `Register`-encoded ones and the
+/// `Imm32` local indices of `LoadLocal` / `StoreLocal` — so the set is derived
+/// rather than enumerated here and cannot drift as opcodes are added.
+///
+/// A violation is a compiler defect, not input, and is rejected exactly like a
+/// schema violation.
+fn verify_register_operands(function: &Function, register_count: u16) {
+    for instruction in function.code.iter() {
+        let operand_count = instruction.operand_count();
+        for index in 0..operand_count {
+            if otter_bytecode::opcode_schema::register_access_at(instruction.op, index)
+                == otter_bytecode::opcode_schema::RegisterAccess::None
+            {
+                continue;
+            }
+            let operand = function
+                .code
+                .operand(instruction, index)
+                .expect("verified wordcode operand must decode");
+            let register = match operand {
+                Operand::Register(value) => u32::from(value),
+                Operand::Imm32(value) => u32::try_from(value).unwrap_or_else(|_| {
+                    panic!(
+                        "compiler emitted a negative register index: function={} id={} op={:?} operand={index} value={value}",
+                        function.name, function.id, instruction.op
+                    )
+                }),
+                Operand::ConstIndex(value) => value,
+            };
+            assert!(
+                register < u32::from(register_count),
+                "compiler emitted an out-of-range register: function={} id={} op={:?} operand={index} register={register} register_count={register_count}",
+                function.name,
+                function.id,
+                instruction.op
+            );
+        }
+    }
+}
+
 impl CodeBlock {
     fn from_bytecode(
         function: &Function,
@@ -951,6 +995,7 @@ impl CodeBlock {
                 function.name, function.id
             )
         });
+        verify_register_operands(function, register_count);
         let control_flow = CodeBlockControlFlow::from_verified_wordcode(&function.code);
         let mut overflow_operand_words = Vec::new();
         let code = function
@@ -1290,9 +1335,28 @@ mod tests {
     use otter_bytecode::{BytecodeModule, Instruction, SourceKind};
 
     fn function(code: Vec<Instruction>) -> Function {
+        // Size the register window to the operands the test actually uses, so
+        // the build-time register verifier accepts these hand-written bodies.
+        let mut max_register = 0u32;
+        for instruction in &code {
+            for index in 0..instruction.operands.len() {
+                if otter_bytecode::opcode_schema::register_access_at(instruction.op, index)
+                    == otter_bytecode::opcode_schema::RegisterAccess::None
+                {
+                    continue;
+                }
+                let register = match instruction.operands[index] {
+                    Operand::Register(value) => u32::from(value),
+                    Operand::Imm32(value) => u32::try_from(value).unwrap_or(0),
+                    Operand::ConstIndex(value) => value,
+                };
+                max_register = max_register.max(register + 1);
+            }
+        }
         Function {
             id: 0,
             name: "exec-test".to_string(),
+            locals: u16::try_from(max_register).expect("test register index fits the window"),
             code: code.into(),
             ..Function::default()
         }
@@ -1423,7 +1487,7 @@ mod tests {
             Instruction {
                 pc: 0,
                 op: Op::LoadInt32,
-                operands: vec![Operand::Register(u16::MAX), Operand::Imm32(i32::MIN)],
+                operands: vec![Operand::Register(60000), Operand::Imm32(i32::MIN)],
             },
             Instruction {
                 pc: 1,
@@ -1434,7 +1498,7 @@ mod tests {
         let executable = ExecutableModule::from_bytecode(&module(function));
         let function = executable.function(0).unwrap();
 
-        assert_eq!(function.register(&function.code[0], 0), Some(u16::MAX));
+        assert_eq!(function.register(&function.code[0], 0), Some(60000));
         assert_eq!(function.imm32(&function.code[0], 1), Some(i32::MIN));
         assert_eq!(function.register(&function.code[1], 0), Some(7));
         assert_eq!(function.const_index(&function.code[1], 1), Some(u32::MAX));

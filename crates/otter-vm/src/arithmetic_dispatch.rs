@@ -822,8 +822,15 @@ fn binop_values(
     lhs: u16,
     rhs: u16,
 ) -> Result<(u16, Value, Value), VmError> {
-    let l = *read_register(frame, lhs)?;
-    let r = *read_register(frame, rhs)?;
+    // Binary-op operands are schema registers, so the build-time verifier
+    // already proved them in range against this frame's window.
+    // SAFETY: see `read_register_unchecked`.
+    let (l, r) = unsafe {
+        (
+            crate::interp::helpers::read_register_unchecked(frame, lhs),
+            crate::interp::helpers::read_register_unchecked(frame, rhs),
+        )
+    };
     Ok((dst, l, r))
 }
 
@@ -938,7 +945,9 @@ fn compare_value(
 }
 
 fn commit_frame_result(frame: &mut Frame, dst: u16, result: Value) -> Result<(), VmError> {
-    write_register(frame, dst, result)?;
+    // `dst` is a schema register; the build-time verifier bounded it.
+    // SAFETY: see `write_register_unchecked`.
+    unsafe { crate::interp::helpers::write_register_unchecked(frame, dst, result) };
     frame.advance_pc()?;
     Ok(())
 }

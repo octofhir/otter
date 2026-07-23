@@ -1,9 +1,9 @@
 ; otter step trace
 frame=1 fn=<main> pc=000000 op=VALIDATE_GLOBAL_DECL  k[0] i32:2
 frame=1 fn=<main> pc=000012 op=VALIDATE_GLOBAL_DECL  k[1] i32:2
-frame=1 fn=<main> pc=000024 op=MAKE_FUNCTION  r0 k[3]
+frame=1 fn=<main> pc=000024 op=MAKE_FUNCTION  r0 k[2]
 frame=1 fn=<main> pc=000034 op=DEFINE_GLOBAL_FUNCTION  k[0] r0 i32:0
-frame=1 fn=<main> pc=000049 op=MAKE_FUNCTION  r1 k[4]
+frame=1 fn=<main> pc=000049 op=MAKE_FUNCTION  r1 k[3]
 frame=1 fn=<main> pc=000059 op=DEFINE_GLOBAL_FUNCTION  k[1] r1 i32:0
 frame=1 fn=<main> pc=000074 op=LOAD_UNDEFINED  r2
 frame=1 fn=<main> pc=000079 op=LOAD_GLOBAL_OR_THROW  r3 k[1]
@@ -14,10 +14,8 @@ frame=2 fn=outer pc=000020 op=LOAD_INT32  r2 i32:3
 frame=2 fn=outer pc=000030 op=CALL  r0 r0 k[2] r1 r2
 frame=3 fn=add pc=000000 op=LOAD_LOCAL  r2 i32:0
 frame=3 fn=add pc=000010 op=LOAD_LOCAL  r3 i32:1
-frame=3 fn=add pc=000020 op=TO_PRIMITIVE  r4 r2 k[2]
-frame=3 fn=add pc=000033 op=TO_PRIMITIVE  r5 r3 k[2]
-frame=3 fn=add pc=000046 op=ADD  r2 r4 r5
-frame=3 fn=add pc=000057 op=RETURN_VALUE  r2
+frame=3 fn=add pc=000020 op=ADD  r4 r2 r3
+frame=3 fn=add pc=000031 op=RETURN_VALUE  r4
 frame=2 fn=outer pc=000049 op=RETURN_VALUE  r0
 frame=1 fn=<main> pc=000102 op=STORE_LOCAL  r3 i32:2
 frame=1 fn=<main> pc=000112 op=RETURN  r2

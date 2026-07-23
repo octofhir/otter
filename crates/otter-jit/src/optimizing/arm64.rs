@@ -1459,10 +1459,11 @@ fn check_eligibility(
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("comparison result"))?;
-                    if reprs.representation(result) != Representation::Tagged
-                        || instruction.inputs.len() != 2
-                    {
-                        return Err(Unsupported::Opcode(instruction.op));
+                    if reprs.representation(result) != Representation::Tagged {
+                        return Err(Unsupported::OperandShape("comparison result repr"));
+                    }
+                    if instruction.inputs.len() != 2 {
+                        return Err(Unsupported::OperandShape("comparison input count"));
                     }
                     let feedback = frame_feedback(tree, instruction);
                     if feedback.is_int32_only() {
@@ -1488,7 +1489,7 @@ fn check_eligibility(
                         // values, so it lowers inline whatever the feedback.
                         check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     } else {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::OperandShape("comparison feedback kind"));
                     }
                 }
                 // A plain call uses only a VM-baked monomorphic native target.
@@ -1986,12 +1987,21 @@ fn check_numeric_inputs(
             return Err(Unsupported::Opcode(instruction.op));
         }
         if may_deopt {
+            // A checked tagged->numeric conversion guards the value and can
+            // deoptimize, so the value must be reconstructible: a parameter
+            // reconstructs from the incoming argument, and every bytecode
+            // operation result reconstructs from the destination register the
+            // operation writes. A phi, an inline result, an exception input, or
+            // an `Uninitialized` register owns no such home and stays out.
+            //
+            // Enumerating producer opcodes here instead used to work only
+            // because a coercion opcode always sat between the producer and the
+            // arithmetic that consumed it. The operators now run their own
+            // ToPrimitive / ToNumeric, so operands arrive straight from a local,
+            // a call, or a property load.
             let parameter_index = match ssa.values[input.0 as usize].def {
                 ValueDef::Param { index, .. } => Some(index),
-                ValueDef::Op {
-                    op: Op::LoadElement | Op::ToPrimitive | Op::ToNumeric,
-                    ..
-                } => None,
+                ValueDef::Op { .. } => None,
                 _ => return Err(Unsupported::Opcode(instruction.op)),
             };
             guarded_uses.insert((instruction.pc, input), parameter_index);

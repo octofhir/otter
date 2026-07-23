@@ -103,6 +103,8 @@ impl Interpreter {
     /// Execute generic ECMAScript addition against the canonical activation.
     pub fn jit_runtime_add(
         &mut self,
+        stack: &mut crate::ActivationStack,
+        context: &ExecutionContext,
         frame: &mut ActiveFrameMut<'_>,
         dst: u16,
         lhs: u16,
@@ -111,7 +113,7 @@ impl Interpreter {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         let lhs = frame.read(lhs)?;
         let rhs = frame.read(rhs)?;
-        let result = self.add_value(lhs, rhs)?;
+        let result = self.add_value(stack, context, lhs, rhs)?;
         frame.write(dst, result)
     }
 
@@ -467,7 +469,7 @@ mod tests {
                 )
                 .expect("native numeric runtime op");
             interp
-                .jit_runtime_add(&mut frame, 3, 0, 1)
+                .jit_runtime_add(&mut stack, &context, &mut frame, 3, 0, 1)
                 .expect("native add runtime op");
             interp
                 .jit_runtime_neg(&mut frame, 4, 1)

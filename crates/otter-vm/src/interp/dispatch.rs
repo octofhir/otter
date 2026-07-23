@@ -1699,15 +1699,15 @@ impl Interpreter {
                 }
                 Op::Add => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    let frame = &mut stack[top_idx];
-                    self.run_add_regs(frame, dst, lhs, rhs, feedback)?;
+                    self.run_add_regs(stack, context, top_idx, dst, lhs, rhs, feedback)?;
                     continue;
                 }
                 Op::Sub => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    let frame = &mut stack[top_idx];
                     self.run_numeric_regs(
-                        frame,
+                        stack,
+                        context,
+                        top_idx,
                         dst,
                         lhs,
                         rhs,
@@ -1719,9 +1719,10 @@ impl Interpreter {
                 }
                 Op::Mul => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    let frame = &mut stack[top_idx];
                     self.run_numeric_regs(
-                        frame,
+                        stack,
+                        context,
+                        top_idx,
                         dst,
                         lhs,
                         rhs,
@@ -1733,9 +1734,10 @@ impl Interpreter {
                 }
                 Op::Div => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    let frame = &mut stack[top_idx];
                     self.run_numeric_regs(
-                        frame,
+                        stack,
+                        context,
+                        top_idx,
                         dst,
                         lhs,
                         rhs,
@@ -1747,9 +1749,10 @@ impl Interpreter {
                 }
                 Op::Rem => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    let frame = &mut stack[top_idx];
                     self.run_numeric_regs(
-                        frame,
+                        stack,
+                        context,
+                        top_idx,
                         dst,
                         lhs,
                         rhs,
@@ -1761,9 +1764,10 @@ impl Interpreter {
                 }
                 Op::Pow => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    let frame = &mut stack[top_idx];
                     self.run_numeric_regs(
-                        frame,
+                        stack,
+                        context,
+                        top_idx,
                         dst,
                         lhs,
                         rhs,
@@ -1775,9 +1779,10 @@ impl Interpreter {
                 }
                 Op::BitwiseAnd => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    let frame = &mut stack[top_idx];
                     self.run_numeric_regs(
-                        frame,
+                        stack,
+                        context,
+                        top_idx,
                         dst,
                         lhs,
                         rhs,
@@ -1789,9 +1794,10 @@ impl Interpreter {
                 }
                 Op::BitwiseOr => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    let frame = &mut stack[top_idx];
                     self.run_numeric_regs(
-                        frame,
+                        stack,
+                        context,
+                        top_idx,
                         dst,
                         lhs,
                         rhs,
@@ -1803,9 +1809,10 @@ impl Interpreter {
                 }
                 Op::BitwiseXor => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    let frame = &mut stack[top_idx];
                     self.run_numeric_regs(
-                        frame,
+                        stack,
+                        context,
+                        top_idx,
                         dst,
                         lhs,
                         rhs,
@@ -1817,9 +1824,10 @@ impl Interpreter {
                 }
                 Op::Shl => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    let frame = &mut stack[top_idx];
                     self.run_numeric_regs(
-                        frame,
+                        stack,
+                        context,
+                        top_idx,
                         dst,
                         lhs,
                         rhs,
@@ -1831,9 +1839,10 @@ impl Interpreter {
                 }
                 Op::Shr => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    let frame = &mut stack[top_idx];
                     self.run_numeric_regs(
-                        frame,
+                        stack,
+                        context,
+                        top_idx,
                         dst,
                         lhs,
                         rhs,
@@ -1845,14 +1854,12 @@ impl Interpreter {
                 }
                 Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    let frame = &mut stack[top_idx];
-                    self.run_compare_regs(frame, dst, lhs, rhs, op, feedback)?;
+                    self.run_compare_regs(stack, context, top_idx, dst, lhs, rhs, op, feedback)?;
                     continue;
                 }
                 Op::Ushr => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    let frame = &mut stack[top_idx];
-                    self.run_ushr_regs(frame, dst, lhs, rhs, feedback)?;
+                    self.run_ushr_regs(stack, context, top_idx, dst, lhs, rhs, feedback)?;
                     continue;
                 }
                 Op::Neg => {

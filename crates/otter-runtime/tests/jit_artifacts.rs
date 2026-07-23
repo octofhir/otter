@@ -372,7 +372,10 @@ fn template_method_inline_artifact_exposes_compact_scratch_and_deopt_ranges() {
         .expect("inline scratch setup");
     let layout = &scratch["inlineScratchLayout"];
     assert_eq!(layout["parameterCount"], 1);
-    assert_eq!(layout["virtualRegisterCount"], 6);
+    // The inlined body reaches its operands straight from locals: the arithmetic
+    // opcodes own their ToPrimitive / ToNumeric steps, so no coercion temporaries
+    // are materialized.
+    assert_eq!(layout["virtualRegisterCount"], 5);
     assert_eq!(layout["scratchSlotCount"], 2);
     assert_eq!(layout["slotBytes"], 8);
     assert_eq!(layout["stackAlignmentBytes"], 16);
@@ -405,10 +408,11 @@ fn template_method_inline_artifact_exposes_compact_scratch_and_deopt_ranges() {
     for slot in register_slots.iter().filter_map(serde_json::Value::as_u64) {
         assert!(slot < scratch_slot_count, "register slot out of range");
     }
-    assert!(register_slots[5].is_null(), "unused r5 stays unmapped");
+    assert!(register_slots[4].is_null(), "unused r4 stays unmapped");
+    // The parameter, the local read of it, and the sum are one live chain and
+    // compact onto one slot; the receiver's property load keeps its own.
     assert_eq!(register_slots[0], register_slots[1]);
     assert_eq!(register_slots[1], register_slots[3]);
-    assert_eq!(register_slots[2], register_slots[4]);
     assert_ne!(register_slots[0], register_slots[2]);
     assert_eq!(layout["receiverSlot"], register_slots[2]);
     assert!(
@@ -455,7 +459,9 @@ fn template_method_inline_artifact_exposes_compact_scratch_and_deopt_ranges() {
         .iter()
         .filter(|region| region["kind"] == "inlineInstruction")
         .collect::<Vec<_>>();
-    assert_eq!(inline_instructions.len(), 7);
+    // `apply` is five bytecodes now that `+` owns its own coercion; the inline
+    // region stream covers the callee body plus its return.
+    assert_eq!(inline_instructions.len(), 5);
     assert!(inline_instructions.iter().all(|region| {
         region["functionId"].is_u64()
             && region["logicalPc"].is_u64()
@@ -468,7 +474,7 @@ fn template_method_inline_artifact_exposes_compact_scratch_and_deopt_ranges() {
             .iter()
             .map(|region| region["operationIndex"].as_u64().unwrap())
             .collect::<Vec<_>>(),
-        (0..7).collect::<Vec<_>>()
+        (0..5).collect::<Vec<_>>()
     );
 
     let find_region = |kind: &str| {
@@ -534,7 +540,7 @@ fn template_method_inline_artifact_exposes_compact_scratch_and_deopt_ranges() {
     assert!(assembly.contains("inline-site=caller:"));
     assert!(assembly.contains("receiver-property=true"));
     assert!(assembly.contains(
-        "parameters=1 virtual-registers=6 scratch-slots=2 slot-bytes=8 stack-alignment=16 scratch-bytes=16 offset-basis=postAllocationSp"
+        "parameters=1 virtual-registers=5 scratch-slots=2 slot-bytes=8 stack-alignment=16 scratch-bytes=16 offset-basis=postAllocationSp"
     ));
     assert!(assembly.contains("register-slots=["));
     assert!(assembly.contains("entry-values=[arg0->r0:s"));

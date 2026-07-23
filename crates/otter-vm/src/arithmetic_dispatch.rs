@@ -201,9 +201,91 @@ impl NumericRuntimeOp {
 }
 
 impl Interpreter {
+    /// Convert both operands of a binary operator through `ToPrimitive`, left
+    /// operand first.
+    ///
+    /// The conversions can run arbitrary user code, so both operands are held
+    /// in the handle arena across them: a `valueOf` on the left operand may
+    /// trigger a moving collection that relocates the right one.
+    pub(crate) fn coerce_operand_pair(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &crate::execution_context::ExecutionContext,
+        lhs: Value,
+        rhs: Value,
+        hint: abstract_ops::ToPrimitiveHint,
+    ) -> Result<(Value, Value), VmError> {
+        if lhs.is_primitive() && rhs.is_primitive() {
+            return Ok((lhs, rhs));
+        }
+        self.with_handle_scope(|interp, scope| {
+            let lhs_handle = interp.scoped_value(scope, lhs);
+            let rhs_handle = interp.scoped_value(scope, rhs);
+            let left = interp.escape_scoped(lhs_handle);
+            let left = interp.evaluate_to_primitive(stack, context, &left, hint)?;
+            let left_handle = interp.scoped_value(scope, left);
+            let right = interp.escape_scoped(rhs_handle);
+            let right = interp.evaluate_to_primitive(stack, context, &right, hint)?;
+            let right_handle = interp.scoped_value(scope, right);
+            Ok((
+                interp.escape_scoped(left_handle),
+                interp.escape_scoped(right_handle),
+            ))
+        })
+    }
+
+    /// §13.15.3 steps 3-4 — `ToNumeric` over both operands of a non-additive
+    /// numeric, bitwise, or shift operator, left operand first.
+    ///
+    /// The whole of `ToNumeric(lval)` — its `ToPrimitive(number)` ladder, its
+    /// Symbol rejection, and its numeric conversion — completes before the
+    /// right operand is touched at all. Splitting it into "both `ToPrimitive`,
+    /// then both `ToNumber`" is observably wrong: a left operand whose
+    /// `valueOf` yields a Symbol must throw before the right operand's
+    /// `valueOf` ever runs.
+    pub(crate) fn coerce_numeric_operands(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &crate::execution_context::ExecutionContext,
+        lhs: Value,
+        rhs: Value,
+    ) -> Result<(Value, Value), VmError> {
+        // A Number or BigInt is its own `ToNumeric` result and runs no user
+        // code, so the common shape never opens a scope.
+        if (lhs.is_number() || lhs.is_big_int()) && (rhs.is_number() || rhs.is_big_int()) {
+            return Ok((lhs, rhs));
+        }
+        self.with_handle_scope(|interp, scope| {
+            let lhs_handle = interp.scoped_value(scope, lhs);
+            let rhs_handle = interp.scoped_value(scope, rhs);
+            let left = interp.escape_scoped(lhs_handle);
+            let left = interp.coerce_unary_value(
+                stack,
+                context,
+                left,
+                crate::jit_runtime_ops::UnaryCoercionOp::ToNumeric,
+            )?;
+            let left_handle = interp.scoped_value(scope, left);
+            let right = interp.escape_scoped(rhs_handle);
+            let right = interp.coerce_unary_value(
+                stack,
+                context,
+                right,
+                crate::jit_runtime_ops::UnaryCoercionOp::ToNumeric,
+            )?;
+            let right_handle = interp.scoped_value(scope, right);
+            Ok((
+                interp.escape_scoped(left_handle),
+                interp.escape_scoped(right_handle),
+            ))
+        })
+    }
+
     pub(crate) fn run_numeric_regs(
         &mut self,
-        frame: &mut Frame,
+        stack: &mut ActivationStack,
+        context: &crate::execution_context::ExecutionContext,
+        top_idx: usize,
         dst: u16,
         lhs: u16,
         rhs: u16,
@@ -211,38 +293,66 @@ impl Interpreter {
         bigint_op: BigIntBinop,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
-        let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
+        let (dst, lhs, rhs) = binop_values(&stack[top_idx], dst, lhs, rhs)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
-        let result = numeric_binary_value(self, lhs, rhs, op, bigint_op)?;
-        commit_frame_result(frame, dst, result)
+        // Number x Number is the dominant shape, needs no conversion, and
+        // cannot re-enter JavaScript, so it never releases the frame borrow.
+        if let (Some(a), Some(b)) = (lhs.as_number(), rhs.as_number()) {
+            return commit_frame_result(&mut stack[top_idx], dst, Value::number(op(a, b)));
+        }
+        let result = numeric_binary_value(self, stack, context, lhs, rhs, op, bigint_op)?;
+        commit_frame_result(&mut stack[top_idx], dst, result)
     }
 
     pub(crate) fn run_add_regs(
         &mut self,
-        frame: &mut Frame,
+        stack: &mut ActivationStack,
+        context: &crate::execution_context::ExecutionContext,
+        top_idx: usize,
         dst: u16,
         lhs: u16,
         rhs: u16,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
-        let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
+        let (dst, lhs, rhs) = binop_values(&stack[top_idx], dst, lhs, rhs)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
-        let result = self.add_value(lhs, rhs)?;
-        commit_frame_result(frame, dst, result)
+        if let (Some(a), Some(b)) = (lhs.as_number(), rhs.as_number()) {
+            return commit_frame_result(&mut stack[top_idx], dst, Value::number(number::add(a, b)));
+        }
+        let result = self.add_value(stack, context, lhs, rhs)?;
+        commit_frame_result(&mut stack[top_idx], dst, result)
     }
 
     /// Evaluate `+` without coupling its observable semantics to frame storage.
-    pub(crate) fn add_value(&mut self, lhs: Value, rhs: Value) -> Result<Value, VmError> {
+    /// §13.15.3 ApplyStringOrNumericBinaryOperator for `+`.
+    ///
+    /// Step 1 sends both operands through `ToPrimitive(default)`, left first,
+    /// before the String-concatenation test decides between concatenation and
+    /// numeric addition.
+    pub(crate) fn add_value(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &crate::execution_context::ExecutionContext,
+        lhs: Value,
+        rhs: Value,
+    ) -> Result<Value, VmError> {
         // Number + Number is the dominant shape and allocates nothing, so it
         // needs neither the handle scope nor the `ToNumeric` ladder: both
         // operands are already the `Num`/`Num` case below.
         if let (Some(a), Some(b)) = (lhs.as_number(), rhs.as_number()) {
             return Ok(Value::number(number::add(a, b)));
         }
+        let (lhs, rhs) = self.coerce_operand_pair(
+            stack,
+            context,
+            lhs,
+            rhs,
+            abstract_ops::ToPrimitiveHint::Default,
+        )?;
         self.with_handle_scope(|interp, scope| {
             let lhs = interp.scoped_value(scope, lhs);
             let rhs = interp.scoped_value(scope, rhs);
@@ -305,14 +415,16 @@ impl Interpreter {
 
     pub(crate) fn run_compare_regs(
         &mut self,
-        frame: &mut Frame,
+        stack: &mut ActivationStack,
+        context: &crate::execution_context::ExecutionContext,
+        top_idx: usize,
         dst: u16,
         lhs: u16,
         rhs: u16,
         op: Op,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
-        let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
+        let (dst, lhs, rhs) = binop_values(&stack[top_idx], dst, lhs, rhs)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
@@ -330,26 +442,28 @@ impl Interpreter {
                 Op::GreaterEq => a >= b,
                 _ => return Err(VmError::InvalidOperand),
             };
-            return commit_frame_result(frame, dst, Value::boolean(truthy));
+            return commit_frame_result(&mut stack[top_idx], dst, Value::boolean(truthy));
         }
-        let result = compare_value(&self.gc_heap, lhs, rhs, op)?;
-        commit_frame_result(frame, dst, result)
+        let result = compare_value(self, stack, context, lhs, rhs, op)?;
+        commit_frame_result(&mut stack[top_idx], dst, result)
     }
 
     pub(crate) fn run_ushr_regs(
         &mut self,
-        frame: &mut Frame,
+        stack: &mut ActivationStack,
+        context: &crate::execution_context::ExecutionContext,
+        top_idx: usize,
         dst: u16,
         lhs: u16,
         rhs: u16,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
-        let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
+        let (dst, lhs, rhs) = binop_values(&stack[top_idx], dst, lhs, rhs)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
-        let result = ushr_value(&self.gc_heap, lhs, rhs)?;
-        commit_frame_result(frame, dst, result)
+        let result = ushr_value(self, stack, context, lhs, rhs)?;
+        commit_frame_result(&mut stack[top_idx], dst, result)
     }
 
     pub(crate) fn run_neg_regs(
@@ -414,52 +528,108 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         let binary_rhs = || rhs.ok_or(VmError::InvalidOperand);
         match operation {
-            NumericRuntimeOp::Sub { .. } => {
-                numeric_binary_value(self, lhs, binary_rhs()?, number::sub, bigint_sub_op)
-            }
-            NumericRuntimeOp::Mul { .. } => {
-                numeric_binary_value(self, lhs, binary_rhs()?, number::mul, bigint_mul_op)
-            }
-            NumericRuntimeOp::Div { .. } => {
-                numeric_binary_value(self, lhs, binary_rhs()?, number::div, bigint::ops::div)
-            }
-            NumericRuntimeOp::Rem { .. } => {
-                numeric_binary_value(self, lhs, binary_rhs()?, number::rem, bigint::ops::rem)
-            }
-            NumericRuntimeOp::Pow { .. } => {
-                numeric_binary_value(self, lhs, binary_rhs()?, number::pow, bigint::ops::pow)
-            }
-            NumericRuntimeOp::BitwiseAnd { .. } => {
-                numeric_binary_value(self, lhs, binary_rhs()?, number::bitwise_and, bigint_and_op)
-            }
-            NumericRuntimeOp::BitwiseOr { .. } => {
-                numeric_binary_value(self, lhs, binary_rhs()?, number::bitwise_or, bigint_or_op)
-            }
-            NumericRuntimeOp::BitwiseXor { .. } => {
-                numeric_binary_value(self, lhs, binary_rhs()?, number::bitwise_xor, bigint_xor_op)
-            }
-            NumericRuntimeOp::Shl { .. } => {
-                numeric_binary_value(self, lhs, binary_rhs()?, number::shl, bigint::ops::shl)
-            }
+            NumericRuntimeOp::Sub { .. } => numeric_binary_value(
+                self,
+                stack,
+                context,
+                lhs,
+                binary_rhs()?,
+                number::sub,
+                bigint_sub_op,
+            ),
+            NumericRuntimeOp::Mul { .. } => numeric_binary_value(
+                self,
+                stack,
+                context,
+                lhs,
+                binary_rhs()?,
+                number::mul,
+                bigint_mul_op,
+            ),
+            NumericRuntimeOp::Div { .. } => numeric_binary_value(
+                self,
+                stack,
+                context,
+                lhs,
+                binary_rhs()?,
+                number::div,
+                bigint::ops::div,
+            ),
+            NumericRuntimeOp::Rem { .. } => numeric_binary_value(
+                self,
+                stack,
+                context,
+                lhs,
+                binary_rhs()?,
+                number::rem,
+                bigint::ops::rem,
+            ),
+            NumericRuntimeOp::Pow { .. } => numeric_binary_value(
+                self,
+                stack,
+                context,
+                lhs,
+                binary_rhs()?,
+                number::pow,
+                bigint::ops::pow,
+            ),
+            NumericRuntimeOp::BitwiseAnd { .. } => numeric_binary_value(
+                self,
+                stack,
+                context,
+                lhs,
+                binary_rhs()?,
+                number::bitwise_and,
+                bigint_and_op,
+            ),
+            NumericRuntimeOp::BitwiseOr { .. } => numeric_binary_value(
+                self,
+                stack,
+                context,
+                lhs,
+                binary_rhs()?,
+                number::bitwise_or,
+                bigint_or_op,
+            ),
+            NumericRuntimeOp::BitwiseXor { .. } => numeric_binary_value(
+                self,
+                stack,
+                context,
+                lhs,
+                binary_rhs()?,
+                number::bitwise_xor,
+                bigint_xor_op,
+            ),
+            NumericRuntimeOp::Shl { .. } => numeric_binary_value(
+                self,
+                stack,
+                context,
+                lhs,
+                binary_rhs()?,
+                number::shl,
+                bigint::ops::shl,
+            ),
             NumericRuntimeOp::Shr { .. } => numeric_binary_value(
                 self,
+                stack,
+                context,
                 lhs,
                 binary_rhs()?,
                 number::shr_arith,
                 bigint::ops::shr,
             ),
-            NumericRuntimeOp::Ushr { .. } => ushr_value(&self.gc_heap, lhs, binary_rhs()?),
+            NumericRuntimeOp::Ushr { .. } => ushr_value(self, stack, context, lhs, binary_rhs()?),
             NumericRuntimeOp::LessThan { .. } => {
-                compare_value(&self.gc_heap, lhs, binary_rhs()?, Op::LessThan)
+                compare_value(self, stack, context, lhs, binary_rhs()?, Op::LessThan)
             }
             NumericRuntimeOp::LessEq { .. } => {
-                compare_value(&self.gc_heap, lhs, binary_rhs()?, Op::LessEq)
+                compare_value(self, stack, context, lhs, binary_rhs()?, Op::LessEq)
             }
             NumericRuntimeOp::GreaterThan { .. } => {
-                compare_value(&self.gc_heap, lhs, binary_rhs()?, Op::GreaterThan)
+                compare_value(self, stack, context, lhs, binary_rhs()?, Op::GreaterThan)
             }
             NumericRuntimeOp::GreaterEq { .. } => {
-                compare_value(&self.gc_heap, lhs, binary_rhs()?, Op::GreaterEq)
+                compare_value(self, stack, context, lhs, binary_rhs()?, Op::GreaterEq)
             }
             NumericRuntimeOp::Neg => self.neg_value(lhs),
             NumericRuntimeOp::BitwiseNot => self.bitwise_not_value(lhs),
@@ -657,8 +827,17 @@ fn binop_values(
     Ok((dst, l, r))
 }
 
+/// §13.15.3 ApplyStringOrNumericBinaryOperator steps 3-4 for the non-additive
+/// numeric, bitwise, and shift operators.
+///
+/// The operands arrive exactly as the expression produced them. `ToNumeric`
+/// over the left operand completes — including any `valueOf` /
+/// `[Symbol.toPrimitive]` it runs — before the right operand's begins, so the
+/// observable conversion order is the spec's.
 fn numeric_binary_value(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
+    context: &crate::execution_context::ExecutionContext,
     lhs: Value,
     rhs: Value,
     op: fn(NumberValue, NumberValue) -> NumberValue,
@@ -670,6 +849,7 @@ fn numeric_binary_value(
     if let (Some(a), Some(b)) = (lhs.as_number(), rhs.as_number()) {
         return Ok(Value::number(op(a, b)));
     }
+    let (lhs, rhs) = interp.coerce_numeric_operands(stack, context, lhs, rhs)?;
     let lnum =
         abstract_ops::to_numeric_kind(&lhs, interp.gc_heap()).ok_or(VmError::TypeMismatch)?;
     let rnum =
@@ -688,7 +868,15 @@ fn numeric_binary_value(
     }
 }
 
-fn ushr_value(heap: &otter_gc::GcHeap, lhs: Value, rhs: Value) -> Result<Value, VmError> {
+fn ushr_value(
+    interp: &mut Interpreter,
+    stack: &mut ActivationStack,
+    context: &crate::execution_context::ExecutionContext,
+    lhs: Value,
+    rhs: Value,
+) -> Result<Value, VmError> {
+    let (lhs, rhs) = interp.coerce_numeric_operands(stack, context, lhs, rhs)?;
+    let heap = &interp.gc_heap;
     let lhs = abstract_ops::to_numeric_kind(&lhs, heap).ok_or(VmError::TypeMismatch)?;
     let rhs = abstract_ops::to_numeric_kind(&rhs, heap).ok_or(VmError::TypeMismatch)?;
     match (lhs, rhs) {
@@ -699,12 +887,28 @@ fn ushr_value(heap: &otter_gc::GcHeap, lhs: Value, rhs: Value) -> Result<Value, 
     }
 }
 
+/// §7.2.14 IsLessThan — the relational operators, including their
+/// `ToPrimitive(number)` step over each operand.
+///
+/// Step 1 orders the two conversions left-to-right, and a `valueOf` /
+/// `[Symbol.toPrimitive]` on the left operand is fully observed before the
+/// right operand is touched.
 fn compare_value(
-    heap: &otter_gc::GcHeap,
+    interp: &mut Interpreter,
+    stack: &mut ActivationStack,
+    context: &crate::execution_context::ExecutionContext,
     lhs: Value,
     rhs: Value,
     op: Op,
 ) -> Result<Value, VmError> {
+    let (lhs, rhs) = interp.coerce_operand_pair(
+        stack,
+        context,
+        lhs,
+        rhs,
+        abstract_ops::ToPrimitiveHint::Number,
+    )?;
+    let heap = &interp.gc_heap;
     // §7.2.14 step 3.b — relational comparison applies ToNumeric
     // after ToPrimitive(number). Symbols cannot be converted to a
     // numeric value, so all four relational operators throw.
@@ -878,8 +1082,19 @@ mod tests {
         let lhs = Value::string(
             JsString::from_str(lhs_text, interp.gc_heap_mut()).expect("left string allocation"),
         );
+        let mut stack = crate::ActivationStack::new();
+        let context =
+            crate::execution_context::ExecutionContext::from_module(crate::BytecodeModule {
+                module: "add-kernel-rooting-test.js".to_string(),
+                template_sites: Vec::new(),
+                source_kind: otter_bytecode::SourceKind::TypeScript,
+                functions: Vec::new(),
+                constants: Vec::new(),
+                module_resolutions: Vec::new(),
+                module_inits: Vec::new(),
+            });
         let result = interp
-            .add_value(lhs, Value::number_i32(7))
+            .add_value(&mut stack, &context, lhs, Value::number_i32(7))
             .expect("string addition");
         let text = result
             .as_string(interp.gc_heap())

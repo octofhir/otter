@@ -2338,7 +2338,10 @@ fn static_all_generic(
                         return reject_capability_error(interp, stack, &mut cap, native);
                     }
                 };
-            interp.with_handle_scope(|interp, iteration_scope| {
+            // An abrupt completion inside the per-element step already closed the
+            // iterator and settled the capability; it must also end the combinator
+            // loop, which an infinite iterator otherwise spins in forever.
+            if let Some(settled) = interp.with_handle_scope(|interp, iteration_scope| {
                 let next_value = interp.scoped_value(iteration_scope, next_value);
                 let i = slots.reserve_slot_scoped(interp, slots_handle)?;
                 let promise_resolve_raw = interp.escape_scoped(promise_resolve);
@@ -2357,7 +2360,7 @@ fn static_all_generic(
                         let iterator_raw = interp.escape_scoped(iterator);
                         let _ = interp.iterator_close_sync(stack, &exec, &iterator_raw);
                         let mut cap = cap_handles.current(interp, context.clone());
-                        return reject_capability_error(interp, stack, &mut cap, err).map(drop);
+                        return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                     }
                 };
                 slots.refresh_scoped(interp, slots_handle, None);
@@ -2403,10 +2406,12 @@ fn static_all_generic(
                     let iterator_raw = interp.escape_scoped(iterator);
                     let _ = interp.iterator_close_sync(stack, &exec, &iterator_raw);
                     let mut cap = cap_handles.current(interp, context.clone());
-                    return reject_capability_error(interp, stack, &mut cap, err).map(drop);
+                    return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                 }
-                Ok(())
-            })?;
+                Ok(None)
+            })? {
+                return Ok(settled);
+            }
         }
         slots.refresh_scoped(interp, slots_handle, None);
         if slots.finish_iteration() {
@@ -2478,7 +2483,10 @@ fn static_race_generic(
                         return reject_capability_error(interp, stack, &mut cap, native);
                     }
                 };
-            interp.with_handle_scope(|interp, iteration_scope| {
+            // An abrupt completion inside the per-element step already closed the
+            // iterator and settled the capability; it must also end the combinator
+            // loop, which an infinite iterator otherwise spins in forever.
+            if let Some(settled) = interp.with_handle_scope(|interp, iteration_scope| {
                 let next_value = interp.scoped_value(iteration_scope, next_value);
                 let promise_resolve_raw = interp.escape_scoped(promise_resolve);
                 let constructor_raw = interp.escape_scoped(constructor);
@@ -2496,7 +2504,7 @@ fn static_race_generic(
                         let iterator_raw = interp.escape_scoped(iterator);
                         let _ = interp.iterator_close_sync(stack, &exec, &iterator_raw);
                         let mut cap = cap_handles.current(interp, context.clone());
-                        return reject_capability_error(interp, stack, &mut cap, err).map(drop);
+                        return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                     }
                 };
                 let entry_promise = interp.escape_scoped(entry_promise);
@@ -2513,10 +2521,12 @@ fn static_race_generic(
                     let iterator_raw = interp.escape_scoped(iterator);
                     let _ = interp.iterator_close_sync(stack, &exec, &iterator_raw);
                     let mut cap = cap_handles.current(interp, context.clone());
-                    return reject_capability_error(interp, stack, &mut cap, err).map(drop);
+                    return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                 }
-                Ok(())
-            })?;
+                Ok(None)
+            })? {
+                return Ok(settled);
+            }
         }
         Ok(cap_handles.current(interp, context).promise)
     })
@@ -2579,7 +2589,10 @@ fn static_all_settled_generic(
                         return reject_capability_error(interp, stack, &mut cap, native);
                     }
                 };
-            interp.with_handle_scope(|interp, iteration_scope| {
+            // An abrupt completion inside the per-element step already closed the
+            // iterator and settled the capability; it must also end the combinator
+            // loop, which an infinite iterator otherwise spins in forever.
+            if let Some(settled) = interp.with_handle_scope(|interp, iteration_scope| {
                 let next_value = interp.scoped_value(iteration_scope, next_value);
                 let i = slots.reserve_slot_scoped(interp, slots_handle)?;
                 let promise_resolve_raw = interp.escape_scoped(promise_resolve);
@@ -2598,7 +2611,7 @@ fn static_all_settled_generic(
                         let iterator_raw = interp.escape_scoped(iterator);
                         let _ = interp.iterator_close_sync(stack, &exec, &iterator_raw);
                         let mut cap = cap_handles.current(interp, context.clone());
-                        return reject_capability_error(interp, stack, &mut cap, err).map(drop);
+                        return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                     }
                 };
                 slots.refresh_scoped(interp, slots_handle, None);
@@ -2619,10 +2632,12 @@ fn static_all_settled_generic(
                     let iterator_raw = interp.escape_scoped(iterator);
                     let _ = interp.iterator_close_sync(stack, &exec, &iterator_raw);
                     let mut cap = cap_handles.current(interp, context.clone());
-                    return reject_capability_error(interp, stack, &mut cap, err).map(drop);
+                    return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                 }
-                Ok(())
-            })?;
+                Ok(None)
+            })? {
+                return Ok(settled);
+            }
         }
         slots.refresh_scoped(interp, slots_handle, None);
         if slots.finish_iteration() {
@@ -2848,7 +2863,10 @@ fn static_any_generic(
                         return reject_capability_error(interp, stack, &mut cap, native);
                     }
                 };
-            interp.with_handle_scope(|interp, iteration_scope| {
+            // An abrupt completion inside the per-element step already closed the
+            // iterator and settled the capability; it must also end the combinator
+            // loop, which an infinite iterator otherwise spins in forever.
+            if let Some(settled) = interp.with_handle_scope(|interp, iteration_scope| {
                 let next_value = interp.scoped_value(iteration_scope, next_value);
                 let i = errors.reserve_slot_scoped(interp, errors_handle)?;
                 let promise_resolve_raw = interp.escape_scoped(promise_resolve);
@@ -2867,7 +2885,7 @@ fn static_any_generic(
                         let iterator_raw = interp.escape_scoped(iterator);
                         let _ = interp.iterator_close_sync(stack, &exec, &iterator_raw);
                         let mut cap = cap_handles.current(interp, context.clone());
-                        return reject_capability_error(interp, stack, &mut cap, err).map(drop);
+                        return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                     }
                 };
                 errors.refresh_scoped(interp, errors_handle, None);
@@ -2916,10 +2934,12 @@ fn static_any_generic(
                     let iterator_raw = interp.escape_scoped(iterator);
                     let _ = interp.iterator_close_sync(stack, &exec, &iterator_raw);
                     let mut cap = cap_handles.current(interp, context.clone());
-                    return reject_capability_error(interp, stack, &mut cap, err).map(drop);
+                    return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                 }
-                Ok(())
-            })?;
+                Ok(None)
+            })? {
+                return Ok(settled);
+            }
         }
         errors.refresh_scoped(interp, errors_handle, None);
         if errors.finish_iteration() {

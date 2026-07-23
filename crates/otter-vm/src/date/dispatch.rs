@@ -42,6 +42,7 @@ use crate::{Value, VmError};
 /// # Spec
 /// - <https://tc39.es/ecma262/#sec-date-constructor>
 pub fn call(
+    zone: &mut crate::date::LocalTimeZone,
     method: otter_bytecode::method_id::DateMethod,
     args: &[Value],
     heap: &mut GcHeap,
@@ -58,7 +59,7 @@ pub fn call(
         //     ordinary objects.
         //   - 2+ args: (year, month, day?, hr?, min?, sec?, ms?).
         M::Construct => {
-            let time = construct_time_value(args, heap);
+            let time = construct_time_value(zone, args, heap);
             let obj = object::alloc_object_with_roots(heap, external_visit).map_err(|err| {
                 VmError::OutOfMemory {
                     requested_bytes: err.requested_bytes(),
@@ -71,7 +72,7 @@ pub fn call(
             }
             Ok(Value::object(obj))
         }
-        M::Now | M::Parse | M::UTC => call_static(method, args, heap),
+        M::Now | M::Parse | M::UTC => call_static(zone, method, args, heap),
     }
 }
 
@@ -85,6 +86,7 @@ pub fn call(
 /// - <https://tc39.es/ecma262/#sec-date.parse>
 /// - <https://tc39.es/ecma262/#sec-date.utc>
 pub fn call_static(
+    zone: &mut crate::date::LocalTimeZone,
     method: otter_bytecode::method_id::DateMethod,
     args: &[Value],
     heap: &otter_gc::GcHeap,
@@ -98,7 +100,10 @@ pub fn call_static(
             let Some(s) = args.first().and_then(|v| v.as_string(heap)) else {
                 return Ok(Value::number_f64(f64::NAN));
             };
-            Ok(Value::number_f64(parse_date(&s.to_lossy_string(heap))))
+            Ok(Value::number_f64(parse_date(
+                zone,
+                &s.to_lossy_string(heap),
+            )))
         }
         // §21.4.3.4 Date.UTC(year, month, day?, …).
         M::UTC => {
@@ -128,13 +133,17 @@ pub fn call_static(
 ///
 /// # Spec
 /// - <https://tc39.es/ecma262/#sec-date>
-pub fn construct_time_value(args: &[Value], heap: &GcHeap) -> f64 {
+pub fn construct_time_value(
+    zone: &mut crate::date::LocalTimeZone,
+    args: &[Value],
+    heap: &GcHeap,
+) -> f64 {
     match args.len() {
         0 => now_ms(),
         1 => {
             let v = &args[0];
             if let Some(s) = v.as_string(heap) {
-                parse_date(&s.to_lossy_string(heap))
+                parse_date(zone, &s.to_lossy_string(heap))
             } else if let Some(n) = v.as_number() {
                 n.as_f64()
             } else if let Some(o) = v.as_object() {
@@ -159,7 +168,7 @@ pub fn construct_time_value(args: &[Value], heap: &GcHeap) -> f64 {
             let minutes = number_or(args, 4, 0.0);
             let seconds = number_or(args, 5, 0.0);
             let ms = number_or(args, 6, 0.0);
-            super::make_local_date(year, month, day, hours, minutes, seconds, ms)
+            super::make_local_date(zone, year, month, day, hours, minutes, seconds, ms)
         }
     }
 }
@@ -203,7 +212,7 @@ fn number_or(args: &[Value], idx: usize, default: f64) -> f64 {
 /// Parse an ISO 8601 / RFC 3339 date string per §21.4.1.18 — covers
 /// the common `YYYY-MM-DDTHH:MM:SS[.sss][Z|±HH:MM]` shape and the
 /// date-only form `YYYY-MM-DD`. Returns `NaN` for malformed input.
-fn parse_date(input: &str) -> f64 {
+fn parse_date(zone: &mut crate::date::LocalTimeZone, input: &str) -> f64 {
     let s = input.trim();
     if s.is_empty() {
         return f64::NAN;
@@ -251,7 +260,7 @@ fn parse_date(input: &str) -> f64 {
         }
     }
     let utc_ms = if rest.is_some() && offset_minutes == 0 && !has_explicit_zero_offset(rest) {
-        super::make_local_date(year, month - 1.0, day, hour, minute, second, ms)
+        super::make_local_date(zone, year, month - 1.0, day, hour, minute, second, ms)
     } else {
         make_date(year, month - 1.0, day, hour, minute, second, ms)
     };

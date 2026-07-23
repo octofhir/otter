@@ -18,17 +18,20 @@ use crate::{Value, VmError};
 // `[[Call]]` slot still handles the `Date(...)` and `new Date(...)`
 // shapes via `date_ctor_call`.
 fn date_now_call(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    crate::date::dispatch::call_static(otter_bytecode::method_id::DateMethod::Now, &[], ctx.heap())
+    let (zone, heap) = ctx.interp_mut().local_time_zone_and_heap();
+    crate::date::dispatch::call_static(zone, otter_bytecode::method_id::DateMethod::Now, &[], heap)
         .map_err(|err| NativeError::TypeError {
             name: "Date.now",
             reason: err.to_string(),
         })
 }
 fn date_parse_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let (zone, heap) = ctx.interp_mut().local_time_zone_and_heap();
     crate::date::dispatch::call_static(
+        zone,
         otter_bytecode::method_id::DateMethod::Parse,
         args,
-        ctx.heap(),
+        heap,
     )
     .map_err(|err| NativeError::TypeError {
         name: "Date.parse",
@@ -43,10 +46,12 @@ fn date_utc_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
         coerced = coerce_number_args(ctx, "Date.UTC", args)?;
         &coerced
     };
+    let (zone, heap) = ctx.interp_mut().local_time_zone_and_heap();
     crate::date::dispatch::call_static(
+        zone,
         otter_bytecode::method_id::DateMethod::UTC,
         date_args,
-        ctx.heap(),
+        heap,
     )
     .map_err(|err| NativeError::TypeError {
         name: "Date.UTC",
@@ -58,8 +63,11 @@ fn date_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     if !ctx.is_construct_call() {
         // §21.4.2.1 — `Date(...)` as a function ignores its arguments
         // and returns the current time rendered as a string.
-        let text = crate::date::prototype::local_date_time_string(now_ms())
-            .unwrap_or_else(|| "Invalid Date".to_string());
+        let text = crate::date::prototype::local_date_time_string(
+            &mut ctx.interp_mut().local_time_zone,
+            now_ms(),
+        )
+        .unwrap_or_else(|| "Invalid Date".to_string());
         let value =
             JsString::from_str(&text, ctx.heap_mut()).map_err(|err| NativeError::TypeError {
                 name: "Date",
@@ -84,17 +92,17 @@ fn date_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
 
 fn date_construct_time_value(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<f64, NativeError> {
     if args.is_empty() {
+        let (zone, heap) = ctx.interp_mut().local_time_zone_and_heap();
         return Ok(crate::date::dispatch::construct_time_value(
-            args,
-            ctx.heap(),
+            zone, args, heap,
         ));
     }
 
     if args.len() > 1 {
         let coerced = coerce_number_args(ctx, "Date", args)?;
+        let (zone, heap) = ctx.interp_mut().local_time_zone_and_heap();
         return Ok(crate::date::dispatch::construct_time_value(
-            &coerced,
-            ctx.heap(),
+            zone, &coerced, heap,
         ));
     }
 
@@ -125,9 +133,11 @@ fn date_construct_time_value(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<
     };
 
     if primitive.as_string(ctx.heap()).is_some() {
+        let (zone, heap) = ctx.interp_mut().local_time_zone_and_heap();
         return Ok(crate::date::dispatch::construct_time_value(
+            zone,
             &[primitive],
-            ctx.heap(),
+            heap,
         ));
     }
 

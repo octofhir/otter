@@ -59,11 +59,36 @@ pub fn now_ms() -> f64 {
 /// Uses the same `temporal_rs` host time-zone hook and compiled tzdb
 /// that power `Temporal.Now` / `Temporal.ZonedDateTime`.
 #[must_use]
-pub fn local_utc_offset_minutes(time_ms: f64) -> f64 {
+/// Host local time zone, resolved once per isolate.
+///
+/// Resolving it walks the host time-zone configuration and costs roughly a
+/// hundred microseconds — orders of magnitude more than the offset lookup it
+/// precedes, which is plain arithmetic over an already-parsed zone. A `Date`
+/// getter that re-resolved it per call made DST-heavy loops unusable.
+///
+/// The zone is deliberately per-isolate rather than process-global: a shared
+/// cache would let one isolate observe another's resolution.
+#[derive(Debug, Default)]
+pub struct LocalTimeZone {
+    /// `None` until first use. The inner `Option` records a host that offers
+    /// no usable zone, so the failure is resolved once too.
+    resolved: Option<Option<temporal_rs::TimeZone>>,
+}
+
+impl LocalTimeZone {
+    fn zone(&mut self) -> Option<&temporal_rs::TimeZone> {
+        self.resolved
+            .get_or_insert_with(|| temporal_rs::Temporal::local_now().time_zone().ok())
+            .as_ref()
+    }
+}
+
+/// Minutes the host local time zone sits ahead of UTC at `time_ms`.
+pub fn local_utc_offset_minutes(zone: &mut LocalTimeZone, time_ms: f64) -> f64 {
     if !time_ms.is_finite() {
         return f64::NAN;
     }
-    let Ok(time_zone) = temporal_rs::Temporal::local_now().time_zone() else {
+    let Some(time_zone) = zone.zone().cloned() else {
         return 0.0;
     };
     let lookup_ms = time_ms
@@ -81,8 +106,8 @@ pub fn local_utc_offset_minutes(time_ms: f64) -> f64 {
 /// ECMA-262 TimeZoneString shape (`GMT+HHMM` / `GMT-HHMM`) for the
 /// host local time zone at `time_ms`.
 #[must_use]
-pub fn local_timezone_string(time_ms: f64) -> String {
-    let offset = local_utc_offset_minutes(time_ms).trunc() as i32;
+pub fn local_timezone_string(zone: &mut LocalTimeZone, time_ms: f64) -> String {
+    let offset = local_utc_offset_minutes(zone, time_ms).trunc() as i32;
     let sign = if offset >= 0 { '+' } else { '-' };
     let abs = offset.abs();
     format!("GMT{sign}{:02}{:02}", abs / 60, abs % 60)
@@ -90,8 +115,8 @@ pub fn local_timezone_string(time_ms: f64) -> String {
 
 /// Convert an epoch millisecond value to host-local broken-down time.
 #[must_use]
-pub fn local_broken_down(time_ms: f64) -> Option<BrokenDown> {
-    let offset_ms = local_utc_offset_minutes(time_ms) * 60_000.0;
+pub fn local_broken_down(zone: &mut LocalTimeZone, time_ms: f64) -> Option<BrokenDown> {
+    let offset_ms = local_utc_offset_minutes(zone, time_ms) * 60_000.0;
     broken_down(time_ms + offset_ms)
 }
 
@@ -300,6 +325,7 @@ fn time_clip(ms: f64) -> f64 {
 /// components in the host local time zone.
 #[must_use]
 pub fn make_local_date(
+    zone: &mut LocalTimeZone,
     year: f64,
     month: f64,
     day: f64,
@@ -314,7 +340,7 @@ pub fn make_local_date(
     }
     let mut utc_ms = local_ms;
     for _ in 0..3 {
-        let offset_ms = local_utc_offset_minutes(utc_ms) * 60_000.0;
+        let offset_ms = local_utc_offset_minutes(zone, utc_ms) * 60_000.0;
         if !offset_ms.is_finite() {
             return f64::NAN;
         }

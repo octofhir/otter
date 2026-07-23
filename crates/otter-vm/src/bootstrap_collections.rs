@@ -1504,7 +1504,7 @@ fn set_size_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
 fn weak_map_proto_get(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let m = receiver_weak_map(ctx, "WeakMap.prototype.get")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
-    match collections::weak_map_get(m, ctx.heap(), &key) {
+    match collections::weak_map_get(m, ctx.heap_mut(), &key) {
         Ok(Some(v)) => Ok(v),
         _ => Ok(Value::undefined()),
     }
@@ -1522,7 +1522,7 @@ fn weak_map_proto_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 fn weak_map_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let m = receiver_weak_map(ctx, "WeakMap.prototype.has")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
-    match collections::weak_map_has(m, ctx.heap(), &key) {
+    match collections::weak_map_has(m, ctx.heap_mut(), &key) {
         Ok(b) => Ok(Value::boolean(b)),
         Err(_) => Ok(Value::boolean(false)),
     }
@@ -1546,7 +1546,7 @@ fn weak_map_proto_get_or_insert(
     let mut m = receiver_weak_map(ctx, "WeakMap.prototype.getOrInsert")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
     let value = args.get(1).cloned().unwrap_or(Value::undefined());
-    match collections::weak_map_get(m, ctx.heap(), &key) {
+    match collections::weak_map_get(m, ctx.heap_mut(), &key) {
         Ok(Some(existing)) => return Ok(existing),
         Ok(None) => {}
         Err(e) => return Err(collection_to_native(e, "WeakMap.prototype.getOrInsert")),
@@ -1566,7 +1566,7 @@ fn weak_map_proto_get_or_insert_computed(
     let key = args.first().cloned().unwrap_or(Value::undefined());
     let callback = args.get(1).cloned().unwrap_or(Value::undefined());
     // step 2 — the key must be able to be held weakly.
-    let present = collections::weak_map_get(m, ctx.heap(), &key)
+    let present = collections::weak_map_get(m, ctx.heap_mut(), &key)
         .map_err(|e| collection_to_native(e, "WeakMap.prototype.getOrInsertComputed"))?;
     // step 3 — callbackfn must be callable (checked even when present).
     if !ctx.interp_mut().is_callable_runtime(&callback) {
@@ -1619,7 +1619,7 @@ fn weak_set_proto_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 fn weak_set_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let s = receiver_weak_set(ctx, "WeakSet.prototype.has")?;
     let v = args.first().cloned().unwrap_or(Value::undefined());
-    match collections::weak_set_has(s, ctx.heap(), &v) {
+    match collections::weak_set_has(s, ctx.heap_mut(), &v) {
         Ok(b) => Ok(Value::boolean(b)),
         Err(_) => Ok(Value::boolean(false)),
     }

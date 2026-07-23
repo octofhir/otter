@@ -63,11 +63,15 @@ fn smi(n: i32) -> Value {
     Value::number_i32(n)
 }
 
-fn broken_down_for_method(time: f64, name: &str) -> Option<super::BrokenDown> {
+fn broken_down_for_method(
+    zone: &mut crate::date::LocalTimeZone,
+    time: f64,
+    name: &str,
+) -> Option<super::BrokenDown> {
     if name.contains("UTC") {
         broken_down(time)
     } else {
-        local_broken_down(time)
+        local_broken_down(zone, time)
     }
 }
 
@@ -86,9 +90,11 @@ fn get_full_year_impl(
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
-    Ok(broken_down_for_method(time, name)
-        .map(|bd| smi(bd.year))
-        .unwrap_or_else(nan))
+    Ok(
+        broken_down_for_method(&mut ctx.interp_mut().local_time_zone, time, name)
+            .map(|bd| smi(bd.year))
+            .unwrap_or_else(nan),
+    )
 }
 
 fn get_month_impl(
@@ -97,9 +103,11 @@ fn get_month_impl(
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
-    Ok(broken_down_for_method(time, name)
-        .map(|bd| smi(bd.month as i32))
-        .unwrap_or_else(nan))
+    Ok(
+        broken_down_for_method(&mut ctx.interp_mut().local_time_zone, time, name)
+            .map(|bd| smi(bd.month as i32))
+            .unwrap_or_else(nan),
+    )
 }
 
 fn get_date_impl(
@@ -108,9 +116,11 @@ fn get_date_impl(
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
-    Ok(broken_down_for_method(time, name)
-        .map(|bd| smi(bd.day as i32))
-        .unwrap_or_else(nan))
+    Ok(
+        broken_down_for_method(&mut ctx.interp_mut().local_time_zone, time, name)
+            .map(|bd| smi(bd.day as i32))
+            .unwrap_or_else(nan),
+    )
 }
 
 fn get_day_impl(
@@ -119,9 +129,11 @@ fn get_day_impl(
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
-    Ok(broken_down_for_method(time, name)
-        .map(|bd| smi(bd.weekday as i32))
-        .unwrap_or_else(nan))
+    Ok(
+        broken_down_for_method(&mut ctx.interp_mut().local_time_zone, time, name)
+            .map(|bd| smi(bd.weekday as i32))
+            .unwrap_or_else(nan),
+    )
 }
 
 fn get_hours_impl(
@@ -130,9 +142,11 @@ fn get_hours_impl(
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
-    Ok(broken_down_for_method(time, name)
-        .map(|bd| smi(bd.hour as i32))
-        .unwrap_or_else(nan))
+    Ok(
+        broken_down_for_method(&mut ctx.interp_mut().local_time_zone, time, name)
+            .map(|bd| smi(bd.hour as i32))
+            .unwrap_or_else(nan),
+    )
 }
 
 fn get_minutes_impl(
@@ -141,9 +155,11 @@ fn get_minutes_impl(
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
-    Ok(broken_down_for_method(time, name)
-        .map(|bd| smi(bd.minute as i32))
-        .unwrap_or_else(nan))
+    Ok(
+        broken_down_for_method(&mut ctx.interp_mut().local_time_zone, time, name)
+            .map(|bd| smi(bd.minute as i32))
+            .unwrap_or_else(nan),
+    )
 }
 
 fn get_seconds_impl(
@@ -152,9 +168,11 @@ fn get_seconds_impl(
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
-    Ok(broken_down_for_method(time, name)
-        .map(|bd| smi(bd.second as i32))
-        .unwrap_or_else(nan))
+    Ok(
+        broken_down_for_method(&mut ctx.interp_mut().local_time_zone, time, name)
+            .map(|bd| smi(bd.second as i32))
+            .unwrap_or_else(nan),
+    )
 }
 
 fn get_milliseconds_impl(
@@ -163,9 +181,11 @@ fn get_milliseconds_impl(
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
-    Ok(broken_down_for_method(time, name)
-        .map(|bd| smi(bd.millisecond as i32))
-        .unwrap_or_else(nan))
+    Ok(
+        broken_down_for_method(&mut ctx.interp_mut().local_time_zone, time, name)
+            .map(|bd| smi(bd.millisecond as i32))
+            .unwrap_or_else(nan),
+    )
 }
 
 /// §21.4.4.21 — `getTimezoneOffset()`.
@@ -175,7 +195,10 @@ fn get_timezone_offset_impl(
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
-    Ok(Value::number_f64(-local_utc_offset_minutes(time)))
+    Ok(Value::number_f64(-local_utc_offset_minutes(
+        &mut ctx.interp_mut().local_time_zone,
+        time,
+    )))
 }
 
 /// §B.2.4 (Temporal proposal) — `Date.prototype.toTemporalInstant()`.
@@ -229,7 +252,7 @@ fn to_string_impl(
     let time = this_time(ctx, name)?;
     let s = match name {
         "toUTCString" | "toGMTString" => utc_date_time_string(time),
-        _ => local_date_time_string(time),
+        _ => local_date_time_string(&mut ctx.interp_mut().local_time_zone, time),
     }
     .unwrap_or_else(|| "Invalid Date".to_string());
     Ok(Value::string(JsString::from_str(&s, ctx.heap_mut())?))
@@ -242,7 +265,8 @@ fn to_date_string_impl(
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
-    let s = date_string(time).unwrap_or_else(|| "Invalid Date".to_string());
+    let s = date_string(&mut ctx.interp_mut().local_time_zone, time)
+        .unwrap_or_else(|| "Invalid Date".to_string());
     Ok(Value::string(JsString::from_str(&s, ctx.heap_mut())?))
 }
 
@@ -253,8 +277,9 @@ fn to_time_string_impl(
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
-    let s = time_string(time)
-        .map(|clock| format!("{clock} {}", local_timezone_string(time)))
+    let zone = &mut ctx.interp_mut().local_time_zone;
+    let s = time_string(zone, time)
+        .map(|clock| format!("{clock} {}", local_timezone_string(zone, time)))
         .unwrap_or_else(|| "Invalid Date".to_string());
     Ok(Value::string(JsString::from_str(&s, ctx.heap_mut())?))
 }
@@ -346,8 +371,8 @@ fn year_string(year: i32) -> String {
     }
 }
 
-fn date_string(time: f64) -> Option<String> {
-    let bd = local_broken_down(time)?;
+fn date_string(zone: &mut crate::date::LocalTimeZone, time: f64) -> Option<String> {
+    let bd = local_broken_down(zone, time)?;
     Some(format!(
         "{} {} {:02} {}",
         WEEKDAY_ABBREVIATIONS[bd.weekday as usize],
@@ -368,17 +393,20 @@ fn utc_date_string(time: f64) -> Option<String> {
     ))
 }
 
-fn time_string(time: f64) -> Option<String> {
-    let bd = local_broken_down(time)?;
+fn time_string(zone: &mut crate::date::LocalTimeZone, time: f64) -> Option<String> {
+    let bd = local_broken_down(zone, time)?;
     Some(format!("{:02}:{:02}:{:02}", bd.hour, bd.minute, bd.second))
 }
 
-pub(crate) fn local_date_time_string(time: f64) -> Option<String> {
+pub(crate) fn local_date_time_string(
+    zone: &mut crate::date::LocalTimeZone,
+    time: f64,
+) -> Option<String> {
     Some(format!(
         "{} {} {}",
-        date_string(time)?,
-        time_string(time)?,
-        local_timezone_string(time)
+        date_string(zone, time)?,
+        time_string(zone, time)?,
+        local_timezone_string(zone, time)
     ))
 }
 
@@ -396,11 +424,15 @@ fn utc_date_time_string(time: f64) -> Option<String> {
 /// Broken-down components packaged as a 7-tuple for the setter pattern.
 type Components = (f64, f64, f64, f64, f64, f64, f64);
 
-fn current_components(time: f64, use_utc: bool) -> Components {
+fn current_components(
+    zone: &mut crate::date::LocalTimeZone,
+    time: f64,
+    use_utc: bool,
+) -> Components {
     let parts = if use_utc {
         broken_down(time)
     } else {
-        local_broken_down(time)
+        local_broken_down(zone, time)
     };
     match parts {
         Some(b) => (
@@ -416,11 +448,15 @@ fn current_components(time: f64, use_utc: bool) -> Components {
     }
 }
 
-fn set_full_year_base_components(time: f64, use_utc: bool) -> Components {
+fn set_full_year_base_components(
+    zone: &mut crate::date::LocalTimeZone,
+    time: f64,
+    use_utc: bool,
+) -> Components {
     if !use_utc && time.is_nan() {
-        current_components(0.0, true)
+        current_components(zone, 0.0, true)
     } else {
-        current_components(if time.is_nan() { 0.0 } else { time }, use_utc)
+        current_components(zone, if time.is_nan() { 0.0 } else { time }, use_utc)
     }
 }
 
@@ -434,7 +470,16 @@ fn finish_set(
     let new_ms = if use_utc {
         super::make_date(year, month, day, hour, minute, second, ms)
     } else {
-        super::make_local_date(year, month, day, hour, minute, second, ms)
+        super::make_local_date(
+            &mut ctx.interp_mut().local_time_zone,
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            ms,
+        )
     };
     // Argument coercion can synchronously re-enter JavaScript and move the
     // receiver. Re-read the exact native-call root instead of retaining the
@@ -470,7 +515,7 @@ fn set_full_year_impl(
     let (_, time) = this_handle(ctx, name)?;
     let coerced = coerce_set_args(ctx, name, args)?;
     let use_utc = name.contains("UTC");
-    let mut c = set_full_year_base_components(time, use_utc);
+    let mut c = set_full_year_base_components(&mut ctx.interp_mut().local_time_zone, time, use_utc);
     c.0 = read_primary_arg_number(&coerced);
     if coerced.len() >= 2 {
         c.1 = read_arg_number(&coerced, 1, c.1);
@@ -494,7 +539,7 @@ fn set_month_impl(
         return Ok(nan());
     }
     let use_utc = name.contains("UTC");
-    let mut c = current_components(time, use_utc);
+    let mut c = current_components(&mut ctx.interp_mut().local_time_zone, time, use_utc);
     c.1 = read_primary_arg_number(&coerced);
     if coerced.len() >= 2 {
         c.2 = read_arg_number(&coerced, 1, c.2);
@@ -513,7 +558,7 @@ fn set_date_impl(
         return Ok(nan());
     }
     let use_utc = name.contains("UTC");
-    let mut c = current_components(time, use_utc);
+    let mut c = current_components(&mut ctx.interp_mut().local_time_zone, time, use_utc);
     c.2 = read_primary_arg_number(&coerced);
     finish_set(ctx, name, c, use_utc)
 }
@@ -529,7 +574,7 @@ fn set_hours_impl(
         return Ok(nan());
     }
     let use_utc = name.contains("UTC");
-    let mut c = current_components(time, use_utc);
+    let mut c = current_components(&mut ctx.interp_mut().local_time_zone, time, use_utc);
     c.3 = read_primary_arg_number(&coerced);
     if coerced.len() >= 2 {
         c.4 = read_arg_number(&coerced, 1, c.4);
@@ -554,7 +599,7 @@ fn set_minutes_impl(
         return Ok(nan());
     }
     let use_utc = name.contains("UTC");
-    let mut c = current_components(time, use_utc);
+    let mut c = current_components(&mut ctx.interp_mut().local_time_zone, time, use_utc);
     c.4 = read_primary_arg_number(&coerced);
     if coerced.len() >= 2 {
         c.5 = read_arg_number(&coerced, 1, c.5);
@@ -576,7 +621,7 @@ fn set_seconds_impl(
         return Ok(nan());
     }
     let use_utc = name.contains("UTC");
-    let mut c = current_components(time, use_utc);
+    let mut c = current_components(&mut ctx.interp_mut().local_time_zone, time, use_utc);
     c.5 = read_primary_arg_number(&coerced);
     if coerced.len() >= 2 {
         c.6 = read_arg_number(&coerced, 1, c.6);
@@ -595,7 +640,7 @@ fn set_milliseconds_impl(
         return Ok(nan());
     }
     let use_utc = name.contains("UTC");
-    let mut c = current_components(time, use_utc);
+    let mut c = current_components(&mut ctx.interp_mut().local_time_zone, time, use_utc);
     c.6 = read_primary_arg_number(&coerced);
     finish_set(ctx, name, c, use_utc)
 }
@@ -607,9 +652,11 @@ fn get_year_impl(
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
-    Ok(local_broken_down(time)
-        .map(|bd| smi(bd.year - 1900))
-        .unwrap_or_else(nan))
+    Ok(
+        local_broken_down(&mut ctx.interp_mut().local_time_zone, time)
+            .map(|bd| smi(bd.year - 1900))
+            .unwrap_or_else(nan),
+    )
 }
 
 /// §B.2.4.2 — `Date.prototype.setYear(year)`.
@@ -632,7 +679,7 @@ fn set_year_impl(
     } else {
         y
     };
-    let mut c = set_full_year_base_components(time, false);
+    let mut c = set_full_year_base_components(&mut ctx.interp_mut().local_time_zone, time, false);
     c.0 = yyyy;
     finish_set(ctx, name, c, false)
 }

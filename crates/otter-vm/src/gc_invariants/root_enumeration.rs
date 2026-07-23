@@ -351,11 +351,11 @@ fn weak_collections_root_survives_force_gc() {
     match (rooted_map.as_weak_map(), rooted_set.as_weak_set()) {
         (Some(map), Some(set)) => {
             assert!(
-                crate::collections::weak_map_has(map, interp.gc_heap(), &rooted_key)
+                crate::collections::weak_map_has(map, interp.gc_heap_mut(), &rooted_key)
                     .expect("weak map has")
             );
             assert!(
-                crate::collections::weak_set_has(set, interp.gc_heap(), &rooted_key)
+                crate::collections::weak_set_has(set, interp.gc_heap_mut(), &rooted_key)
                     .expect("weak set has")
             );
         }

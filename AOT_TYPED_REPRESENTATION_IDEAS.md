@@ -42,10 +42,20 @@ Measured: a hot function with a cold arithmetic branch takes 998 optimizing-tier
 unannotated, 0 annotated. Steady-state wall time is unchanged — the win is warmup, as
 the item predicts.
 
-The method-IC half is **not** done and is not obviously doable the same way: a class
-annotation cannot be resolved to a `ShapeId` at compile-snapshot time, since shapes are
-runtime identities. It would need a compile-time class → shape registry, which is a
-separate design.
+The method-IC half is **not** done, but it is more tractable than first assumed. The
+blocker was stated as "a class annotation cannot be resolved to a `ShapeId`, since
+shapes are runtime identities" — true at *compile* time, but the seed is applied at
+*snapshot* time, which runs against a live interpreter. `Interpreter` already keeps
+`simple_constructor_shape_cache: FxHashMap<function_id, ShapeHandle>`, so the missing
+pieces are only:
+
+1. the compiler resolving a class-typed annotation to the declaring class's function
+   id (locally declared `class` only — interfaces and aliases have no runtime identity),
+2. carrying that id on the site the way `number_hint_sites` carries the numeric one,
+3. a bake step that looks the id up in that cache and seeds the property IC with the
+   resulting shape plus the slot resolved from it.
+
+Roughly the size of the numeric half plus the class-resolution step.
 
 ## 2. Self-hosted builtins in a compiled JS/TS subset
 
@@ -90,7 +100,7 @@ native getter frame is a rooting hazard.
 
 The second half of this item — letting the JIT see through native builtins instead of
 crossing the bridge — has landed for the string probe family, collection leaf reads,
-and now dense Array `push` / `pop`. The blocker named here was real and is now gone: a
+and now dense Array `push` / `pop` / `shift` / `unshift`. The blocker named here was real and is now gone: a
 `MutatingLeafValue2` signature (`*mut GcHeap`, class still `LeafNoAlloc`) carries `pop`,
 and `push` reuses the existing `AllocValue3` entry because appending may grow the
 buffer. Machine code guards the receiver as an `ArrayBody` with no exotic sidecar and
@@ -143,6 +153,15 @@ Current numbers on this machine: otter 20 ms / 38 MB, node 20 ms / 44 MB, bun 10
    see the measured breakdown above before starting it.
 4. ~~RSS as a tracked benchmark metric~~ — landed as `benchmarks/run-startup.sh`.
 
-The next builtin worth seeing through the bridge, now that the mutating-leaf ABI exists,
-is the dense `shift` / `unshift` pair — same guard chain, same entry shapes, and the
-element move is already a VM helper.
+`shift` / `unshift` followed, and needed more than an entry: neither had a dense path at
+all, so both ran the generic per-index protocol. On identical work a dense receiver now
+takes 8.9 ms where the generic path takes 4617 ms.
+
+Wiring those fast paths surfaced four real defects, all fixed alongside: an in-bounds
+hole not consulting the prototype chain for an inherited *data* property (the protector
+only latched on accessors); a numeric index reaching the exotic arms of the element-load
+path still spelled as a Number and failing the family match; `Object.preventExtensions`
+/ `isExtensible` carrying a second receiver-family list that had diverged from the
+internal methods; and the promise combinators continuing to iterate after an abrupt
+per-element step, which hung on an infinite iterable. Suite effect: `built-ins/Array`
+and `built-ins/Object` to 100 %, `built-ins/Promise` 656 -> 676 with 20 timeouts gone.

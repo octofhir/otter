@@ -74,8 +74,7 @@ pub(crate) fn compile_for_of_statement(
     // value `V`, updated to each non-empty body completion and
     // returned as the statement's value. Initialise to `undefined`
     // (the result when the body runs zero times or produces no value).
-    let completion_reg = cx.alloc_scratch();
-    cx.emit(Op::LoadUndefined, [Operand::Register(completion_reg)], span);
+    let completion_reg = cx.alloc_completion_reg(span);
 
     cx.push_loop_frame(LoopFrame::iteration());
     // §7.4.9 — register this iterator so abrupt completions (`break`,
@@ -157,14 +156,7 @@ pub(crate) fn compile_for_of_statement(
         // Record this iteration's non-empty completion as `V`. A
         // `break` / `continue` jumps out of the body before reaching
         // here, so `V` keeps the prior iteration's value per spec.
-        cx.emit(
-            Op::StoreLocal,
-            [
-                Operand::Register(body_reg),
-                Operand::Imm32(completion_reg as i32),
-            ],
-            span,
-        );
+        cx.store_completion(completion_reg, body_reg, span);
     }
     cx.exit_scope();
 
@@ -206,7 +198,7 @@ pub(crate) fn compile_for_of_statement(
     if !per_iter_upvalues.is_empty() {
         cx.exit_scope();
     }
-    Ok(Some(completion_reg))
+    Ok(completion_reg)
 }
 
 /// If `head` is a `for (let x of …)` / `for (const x of …)` single

@@ -99,6 +99,7 @@ pub mod dynamic_import;
 pub mod error_classes;
 mod error_ops;
 mod eval_ops;
+mod eval_source;
 mod executable;
 pub mod execution_context;
 #[path = "jit_feedback.rs"]

@@ -542,6 +542,13 @@ fn compile_class_strict(
         }
     };
 
+    // Give the class name a runtime identity that a `p: C` annotation can be
+    // resolved against. A second class of the same name makes the name
+    // ambiguous and drops every site that referenced it.
+    if let Some(class_name) = class_name {
+        cx.declare_class(class_name, ctor_id);
+    }
+
     // §20.2.3.5 — a class's `toString` reports the entire class
     // definition, so the constructor's [[SourceText]] spans the whole
     // `class … {}` rather than just the (possibly synthesized)

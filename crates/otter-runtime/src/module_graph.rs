@@ -1454,6 +1454,9 @@ fn link(nodes: &BTreeMap<String, ModuleNode>, order: &[String], entry_url: &str)
             if new_fn.module_url.is_empty() {
                 new_fn.module_url = url.clone();
             }
+            for site in &mut new_fn.class_hint_sites {
+                site.class_function_id += fn_offset;
+            }
             new_fn.code = rewrite_const_indices(&f.code, const_offset);
             functions.push(new_fn);
         }

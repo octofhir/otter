@@ -117,6 +117,7 @@ pub(crate) fn compile_static_member(
     let name_idx = cx.intern_string_constant(m.property.name.as_str());
     cx.reset_scratch(mark);
     let dst = cx.alloc_scratch();
+    crate::type_hints::mark_class_receiver(cx, &m.object);
     cx.emit(
         Op::LoadProperty,
         vec![

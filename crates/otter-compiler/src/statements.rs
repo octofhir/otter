@@ -418,10 +418,8 @@ pub(crate) fn compile_statement(
                         Some(info) => info.storage,
                         None => cx.declare_binding(&name, is_const, span)?,
                     };
-                    cx.annotate_binding(
-                        &name,
-                        annotation_hint(declarator.type_annotation.as_deref()),
-                    );
+                    let hint = annotation_hint(cx, declarator.type_annotation.as_deref());
+                    cx.annotate_binding(&name, hint);
                     let init_reg = match &declarator.init {
                         // §14.3.1.2 — NamedEvaluation infers the binding name
                         // for an anonymous function initializer.
@@ -1331,10 +1329,8 @@ pub(crate) fn compile_for_init_decl(
                 } else {
                     cx.declare_binding(&name, is_const, span)?
                 };
-                cx.annotate_binding(
-                    &name,
-                    annotation_hint(declarator.type_annotation.as_deref()),
-                );
+                let hint = annotation_hint(cx, declarator.type_annotation.as_deref());
+                cx.annotate_binding(&name, hint);
                 let init_reg = match &declarator.init {
                     Some(init) => compile_expr(cx, init, span)?,
                     None => {

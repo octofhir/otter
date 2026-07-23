@@ -5,6 +5,10 @@
 //! - [`annotation_hint`] — read a hint out of a `TSTypeAnnotation`.
 //! - [`expr_number_typed`] — decide whether an expression is statically
 //!   `number` under the current binding table.
+//! - [`mark_class_receiver`] — mark a property site whose receiver is a
+//!   class-annotated binding.
+//! - [`resolve_class_hint_sites`] — turn interned annotation names into the
+//!   declaring class's function id once the whole module is compiled.
 //!
 //! # Invariants
 //! - Hints are **advisory and unsound**: TypeScript annotations are not
@@ -15,12 +19,16 @@
 //!   produces [`TypeHint::Number`]; `any`, unions, aliases, and `bigint` all
 //!   stay [`TypeHint::Unknown`], because a wrong hint is paid for with a
 //!   deoptimization and there is no gain in guessing.
+//! - A [`TypeHint::Class`] survives to bytecode only when its name resolves to
+//!   exactly one `class` declaration in the module. Interfaces, type aliases,
+//!   and repeated class names have no single runtime identity to seed with.
 //!
 //! # See also
-//! - `otter_bytecode::Function::number_hint_sites` — the emitted site list.
+//! - `otter_bytecode::Function::number_hint_sites` — the emitted numeric sites.
+//! - `otter_bytecode::Function::class_hint_sites` — the emitted class sites.
 
 use crate::*;
-use oxc_ast::ast::{TSType, TSTypeAnnotation};
+use oxc_ast::ast::{TSType, TSTypeAnnotation, TSTypeName};
 
 /// Static type known for a binding from its TypeScript annotation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -30,13 +38,43 @@ pub(crate) enum TypeHint {
     Unknown,
     /// Annotated `number` — an IEEE-754 double, never a BigInt.
     Number,
+    /// Annotated with a bare type reference, held as an interned annotation
+    /// name. The declaring class is resolved after the module is compiled: a
+    /// class may be declared textually after the function that takes it.
+    Class(u32),
 }
 
 /// Hint implied by a type annotation, if any.
-pub(crate) fn annotation_hint(annotation: Option<&TSTypeAnnotation<'_>>) -> TypeHint {
+pub(crate) fn annotation_hint(
+    cx: &mut Compiler,
+    annotation: Option<&TSTypeAnnotation<'_>>,
+) -> TypeHint {
     match annotation.map(|annotation| &annotation.type_annotation) {
         Some(TSType::TSNumberKeyword(_)) => TypeHint::Number,
+        // A generic reference (`Box<T>`) says nothing about the instance shape
+        // of the value, so only bare `C` is carried.
+        Some(TSType::TSTypeReference(reference)) if reference.type_arguments.is_none() => {
+            match &reference.type_name {
+                TSTypeName::IdentifierReference(id) => {
+                    TypeHint::Class(cx.intern_class_hint_name(id.name.as_str()))
+                }
+                _ => TypeHint::Unknown,
+            }
+        }
         _ => TypeHint::Unknown,
+    }
+}
+
+/// Mark the next emitted property instruction when `object` is an identifier
+/// whose binding carries a class annotation. Call immediately before the
+/// `LoadProperty` / `StoreProperty` emit it describes.
+pub(crate) fn mark_class_receiver(cx: &mut Compiler, object: &Expression<'_>) {
+    if let Expression::Identifier(id) = object
+        && let Some(TypeHint::Class(name)) = cx
+            .lookup_binding(id.name.as_str())
+            .map(|info| info.type_hint)
+    {
+        cx.mark_class_hint_site(name);
     }
 }
 
@@ -50,9 +88,35 @@ pub(crate) fn annotate_formal_parameters(
 ) {
     for param in &params.items {
         if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &param.pattern {
-            let hint = annotation_hint(param.type_annotation.as_deref());
+            let hint = annotation_hint(cx, param.type_annotation.as_deref());
             cx.annotate_binding(id.name.as_str(), hint);
         }
+    }
+}
+
+/// Resolve every recorded class-annotated property site against the module's
+/// class declarations and publish the survivors onto their functions.
+///
+/// A name that never named a `class`, or that named more than one, is dropped:
+/// there is no single constructor whose instance shape the site could be
+/// seeded with.
+pub(crate) fn resolve_class_hint_sites(cx: &Compiler, functions: &mut [otter_bytecode::Function]) {
+    for site in &cx.pending_class_hint_sites {
+        let Some(name) = cx.class_hint_names.get(site.name as usize) else {
+            continue;
+        };
+        let Some(&Some(class_function_id)) = cx.declared_classes.get(name.as_str()) else {
+            continue;
+        };
+        let Some(function) = functions.get_mut(site.function_id as usize) else {
+            continue;
+        };
+        function
+            .class_hint_sites
+            .push(otter_bytecode::ClassHintSite {
+                pc: site.pc,
+                class_function_id,
+            });
     }
 }
 
@@ -148,6 +212,84 @@ mod tests {
             .unwrap_or_else(|| panic!("function `{function_name}` is compiled"))
             .number_hint_sites
             .clone()
+    }
+
+    /// `(pc, class function id)` pairs recorded in the named function.
+    fn class_sites(source: &str, function_name: &str) -> Vec<(u32, u32)> {
+        let module = compile_script_source(source, SyntaxSourceKind::TypeScript, "file:///t.ts")
+            .expect("test source compiles");
+        module
+            .functions
+            .iter()
+            .find(|function| function.name == function_name)
+            .unwrap_or_else(|| panic!("function `{function_name}` is compiled"))
+            .class_hint_sites
+            .iter()
+            .map(|site| (site.pc, site.class_function_id))
+            .collect()
+    }
+
+    /// Function id of the named class's constructor.
+    fn class_ctor_id(source: &str, class_name: &str) -> u32 {
+        let module = compile_script_source(source, SyntaxSourceKind::TypeScript, "file:///t.ts")
+            .expect("test source compiles");
+        module
+            .functions
+            .iter()
+            .find(|function| function.name == class_name)
+            .expect("class constructor is compiled")
+            .id
+    }
+
+    #[test]
+    fn class_annotated_receivers_mark_their_property_sites() {
+        let source = "class C { constructor(v) { this.v = v; } }\n\
+                      function f(c: C) { return c.v; }";
+        let sites = class_sites(source, "f");
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].1, class_ctor_id(source, "C"));
+        // A store through the same annotation is marked too.
+        let store = "class C { constructor(v) { this.v = v; } }\n\
+                     function f(c: C) { c.v = 1; }";
+        assert_eq!(class_sites(store, "f").len(), 1);
+    }
+
+    #[test]
+    fn class_hints_need_one_unambiguous_local_class() {
+        // A name that never declared a class has no runtime identity.
+        assert!(
+            class_sites(
+                "interface I { v: number }\nfunction f(i: I) { return i.v; }",
+                "f"
+            )
+            .is_empty()
+        );
+        // Two classes of the same name: no single instance shape to seed with.
+        assert!(
+            class_sites(
+                "function f(c: C) { return c.v; }\n\
+                 { class C { constructor(v) { this.v = v; } } }\n\
+                 { class C { constructor(w) { this.w = w; } } }",
+                "f"
+            )
+            .is_empty()
+        );
+        // A generic reference says nothing about the instance shape.
+        assert!(
+            class_sites(
+                "class C<T> { constructor(v) { this.v = v; } }\n\
+                 function f(c: C<number>) { return c.v; }",
+                "f"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn class_declared_after_its_use_still_resolves() {
+        let source = "function f(c: C) { return c.v; }\n\
+                      class C { constructor(v) { this.v = v; } }";
+        assert_eq!(class_sites(source, "f").len(), 1);
     }
 
     #[test]

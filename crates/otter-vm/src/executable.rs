@@ -398,6 +398,7 @@ impl CodeBlock {
             byte_pcs: byte_pcs.into_boxed_slice(),
             byte_spans: Box::new([]),
             number_hints: Box::new([]),
+            class_hints: Box::new([]),
         })
     }
 
@@ -883,6 +884,15 @@ pub struct CodeBlock {
     /// lower it under its ordinary numeric guard instead of refusing it for
     /// lack of a profile; a wrong annotation trips that guard once.
     pub(crate) number_hints: Box<[u64]>,
+    /// Property sites whose receiver is annotated with a locally declared
+    /// class, as `(instruction index, class constructor function id)` sorted by
+    /// index. Empty when the body carries no such annotation.
+    ///
+    /// Read only when the site's inline cache is still empty, so a recorded
+    /// shape always wins. Seeding lets a tier resolve the access on first
+    /// compile instead of refusing it for lack of a profile; a wrong annotation
+    /// misses the guard the site already emits.
+    pub(crate) class_hints: Box<[(u32, u32)]>,
 }
 
 impl Clone for CodeBlock {
@@ -917,6 +927,7 @@ impl Clone for CodeBlock {
             byte_pcs: self.byte_pcs.clone(),
             byte_spans: self.byte_spans.clone(),
             number_hints: self.number_hints.clone(),
+            class_hints: self.class_hints.clone(),
         }
     }
 }
@@ -989,6 +1000,15 @@ impl CodeBlock {
             }
             bits.into_boxed_slice()
         };
+        let mut class_hints: Vec<(u32, u32)> = function
+            .class_hint_sites
+            .iter()
+            .filter(|site| (site.pc as usize) < code.len())
+            .map(|site| (site.pc, site.class_function_id))
+            .collect();
+        class_hints.sort_unstable_by_key(|&(pc, _)| pc);
+        class_hints.dedup_by_key(|&mut (pc, _)| pc);
+        let class_hints = class_hints.into_boxed_slice();
         let mapped_argument_bindings = function
             .mapped_argument_bindings
             .iter()
@@ -1056,11 +1076,22 @@ impl CodeBlock {
             byte_pcs: instr_to_byte_pc,
             byte_spans,
             number_hints,
+            class_hints,
         }
     }
 
     /// `true` when the compiler marked this instruction's operands as
     /// statically `number`. Advisory — see [`Self::number_hints`].
+    /// Constructor function id of the class annotated on this instruction's
+    /// receiver. Advisory — see [`Self::class_hints`].
+    pub(crate) fn class_hint(&self, instruction_index: usize) -> Option<u32> {
+        let index = u32::try_from(instruction_index).ok()?;
+        self.class_hints
+            .binary_search_by_key(&index, |&(pc, _)| pc)
+            .ok()
+            .map(|found| self.class_hints[found].1)
+    }
+
     fn has_number_hint(&self, instruction_index: usize) -> bool {
         let word = instruction_index / 64;
         self.number_hints

@@ -136,6 +136,7 @@ pub(crate) fn compile_assignment(
             }
         };
         let store_scratch = cx.alloc_scratch();
+        crate::type_hints::mark_class_receiver(cx, &member.object);
         cx.emit(
             Op::StoreProperty,
             vec![

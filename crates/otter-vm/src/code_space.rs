@@ -199,6 +199,12 @@ fn rebase_module(module: &mut BytecodeModule, base: u32) {
             .id
             .checked_add(base)
             .expect("rebased function id exceeds u32 range");
+        for site in &mut function.class_hint_sites {
+            site.class_function_id = site
+                .class_function_id
+                .checked_add(base)
+                .expect("rebased class-hint function id exceeds u32 range");
+        }
     }
     for constant in &mut module.constants {
         if let Constant::FunctionId { index } = constant {

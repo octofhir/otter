@@ -52,6 +52,7 @@ fn test_function(
         code: code.into(),
         spans,
         number_hint_sites: Vec::new(),
+        class_hint_sites: Vec::new(),
     }
 }
 
@@ -4450,6 +4451,7 @@ fn unwind_throw_pops_frames_until_handler_or_uncaught() {
             span: (0, 0),
         }],
         number_hint_sites: Vec::new(),
+        class_hint_sites: Vec::new(),
     };
     let mut interp = Interpreter::new();
     let mut stack: ActivationStack = ActivationStack::new();
@@ -4518,6 +4520,7 @@ fn unwind_throw_lands_in_catch_handler() {
             span: (0, 0),
         }],
         number_hint_sites: Vec::new(),
+        class_hint_sites: Vec::new(),
     };
     let mut interp = Interpreter::new();
     let mut stack: ActivationStack = ActivationStack::new();
@@ -5049,6 +5052,7 @@ fn arrow_closure_overrides_call_site_this() {
             span: (0, 0),
         }],
         number_hint_sites: Vec::new(),
+        class_hint_sites: Vec::new(),
     };
     let arrow = Function {
         id: 1,
@@ -5095,6 +5099,7 @@ fn arrow_closure_overrides_call_site_this() {
             span: (0, 0),
         }],
         number_hint_sites: Vec::new(),
+        class_hint_sites: Vec::new(),
     };
     let module = BytecodeModule {
         module: "arrow.ts".to_string(),

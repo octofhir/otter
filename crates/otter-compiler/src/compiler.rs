@@ -119,6 +119,30 @@ pub(crate) struct Compiler {
     /// addresses are stable keys. Purely a compile-time cache; dropping an
     /// entry would only cost time.
     pub(crate) number_typed_cache: RefCell<HashMap<usize, bool>>,
+    /// Interned annotation names referenced by [`TypeHint::Class`].
+    pub(crate) class_hint_names: Vec<String>,
+    /// Reverse index into [`Self::class_hint_names`].
+    pub(crate) class_hint_name_ids: HashMap<String, u32>,
+    /// Module-wide `class` declarations: name → constructor function id, or
+    /// `None` once a second class of the same name is seen. An ambiguous name
+    /// has no single instance shape, so its sites are dropped.
+    pub(crate) declared_classes: HashMap<String, Option<u32>>,
+    /// Class-annotated property sites awaiting name resolution. Resolution is
+    /// deferred to the end of the module because a class may be declared after
+    /// the function whose parameters name it.
+    pub(crate) pending_class_hint_sites: Vec<PendingClassHintSite>,
+}
+
+/// One class-annotated property site, still holding the interned annotation
+/// name rather than a resolved class.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingClassHintSite {
+    /// Function whose code contains the site.
+    pub(crate) function_id: u32,
+    /// Instruction PC of the property access.
+    pub(crate) pc: u32,
+    /// Index into [`Compiler::class_hint_names`].
+    pub(crate) name: u32,
 }
 
 impl Compiler {
@@ -141,7 +165,45 @@ impl Compiler {
             in_field_initializer: false,
             eval_new_target_allowed: false,
             number_typed_cache: RefCell::new(HashMap::new()),
+            class_hint_names: Vec::new(),
+            class_hint_name_ids: HashMap::new(),
+            declared_classes: HashMap::new(),
+            pending_class_hint_sites: Vec::new(),
         }
+    }
+
+    /// Intern one annotation name, returning its stable index.
+    pub(crate) fn intern_class_hint_name(&mut self, name: &str) -> u32 {
+        if let Some(&id) = self.class_hint_name_ids.get(name) {
+            return id;
+        }
+        let id = self.class_hint_names.len() as u32;
+        self.class_hint_names.push(name.to_string());
+        self.class_hint_name_ids.insert(name.to_string(), id);
+        id
+    }
+
+    /// Record that `name` names the class whose constructor is `function_id`.
+    /// A repeated name becomes ambiguous and stops seeding anything.
+    pub(crate) fn declare_class(&mut self, name: &str, function_id: u32) {
+        match self.declared_classes.get_mut(name) {
+            Some(slot) => *slot = None,
+            None => {
+                self.declared_classes
+                    .insert(name.to_string(), Some(function_id));
+            }
+        }
+    }
+
+    /// Move a finished function's class-annotated property sites onto the
+    /// module-wide list, where they wait for name resolution.
+    pub(crate) fn take_class_hint_sites(&mut self, function_id: u32, sites: Vec<(u32, u32)>) {
+        self.pending_class_hint_sites
+            .extend(sites.into_iter().map(|(pc, name)| PendingClassHintSite {
+                function_id,
+                pc,
+                name,
+            }));
     }
 
     /// `true` when ANY function on the compile stack contains a

@@ -4830,6 +4830,7 @@ mod tests {
             code: code.into(),
             spans,
             number_hint_sites: Vec::new(),
+            class_hint_sites: Vec::new(),
         }
     }
 
@@ -4876,6 +4877,7 @@ mod tests {
             code: code.into(),
             spans,
             number_hint_sites: Vec::new(),
+            class_hint_sites: Vec::new(),
         }
     }
 

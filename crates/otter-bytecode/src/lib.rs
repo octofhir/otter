@@ -2025,6 +2025,25 @@ pub struct Function {
     /// feedback supersedes the seed permanently.
     #[serde(default)]
     pub number_hint_sites: Vec<u32>,
+    /// Property sites whose receiver is a binding annotated with a locally
+    /// declared TypeScript `class`.
+    ///
+    /// Advisory on exactly the same terms as [`Self::number_hint_sites`]: the
+    /// annotation is unchecked, so the entry only seeds an empty inline-cache
+    /// cell behind a shape guard that already exists. A wrong annotation misses
+    /// that guard once and the recorded shape supersedes the seed.
+    #[serde(default)]
+    pub class_hint_sites: Vec<ClassHintSite>,
+}
+
+/// One property site whose receiver carries a class-typed annotation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClassHintSite {
+    /// Instruction PC of the property access.
+    pub pc: u32,
+    /// Bytecode function id of the annotated class's constructor. Instances of
+    /// that class are the shape the site is expected to see.
+    pub class_function_id: u32,
 }
 
 /// One tagged-template call site (§13.2.8.4): cooked strings

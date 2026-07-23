@@ -649,6 +649,7 @@ mod tests {
                 code: code.into(),
                 spans: Vec::new(),
                 number_hint_sites: Vec::new(),
+                class_hint_sites: Vec::new(),
             }],
             constants,
             module_resolutions: Vec::new(),

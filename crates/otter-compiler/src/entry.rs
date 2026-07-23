@@ -930,6 +930,9 @@ pub(crate) fn compile_program_with_mode_impl_super(
             cx.own_upvalue_count,
         );
         m.functions[0].number_hint_sites = std::mem::take(&mut cx.number_hint_sites);
+        let main_class_hint_sites = std::mem::take(&mut cx.class_hint_sites);
+        cx.take_class_hint_sites(0, main_class_hint_sites);
+        crate::type_hints::resolve_class_hint_sites(&cx, &mut m.functions);
         m.functions[0].code = code.finish();
         m.functions[0].spans = std::mem::take(&mut cx.spans);
     }
@@ -1562,6 +1565,9 @@ pub fn compile_module_program(
             cx.own_upvalue_count,
         );
         m.functions[0].number_hint_sites = std::mem::take(&mut cx.number_hint_sites);
+        let main_class_hint_sites = std::mem::take(&mut cx.class_hint_sites);
+        cx.take_class_hint_sites(0, main_class_hint_sites);
+        crate::type_hints::resolve_class_hint_sites(&cx, &mut m.functions);
         m.functions[0].code = code.finish();
         m.functions[0].spans = std::mem::take(&mut cx.spans);
     }

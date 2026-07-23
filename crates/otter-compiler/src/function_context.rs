@@ -168,6 +168,10 @@ pub(crate) struct FunctionContext {
     /// [`Function::number_hint_sites`] and consumed as an advisory seed for an
     /// empty feedback cell — never as a proof.
     pub(crate) number_hint_sites: Vec<u32>,
+    /// Property sites whose receiver is a class-annotated binding, as
+    /// `(instruction pc, interned annotation name)`. The name is resolved to a
+    /// class function id once the whole module is compiled.
+    pub(crate) class_hint_sites: Vec<(u32, u32)>,
 }
 
 impl FunctionContext {
@@ -208,6 +212,7 @@ impl FunctionContext {
             completion_suppressed: false,
             finally_body_depth: 0,
             number_hint_sites: Vec::new(),
+            class_hint_sites: Vec::new(),
         }
     }
 
@@ -488,6 +493,14 @@ impl FunctionContext {
     pub(crate) fn mark_number_hint_site(&mut self) {
         let pc = self.next_pc();
         self.number_hint_sites.push(pc);
+    }
+
+    /// Mark the next emitted instruction as a property access on a receiver
+    /// annotated with the interned class name `name`. Call immediately before
+    /// the [`Self::emit`] it describes.
+    pub(crate) fn mark_class_hint_site(&mut self, name: u32) {
+        let pc = self.next_pc();
+        self.class_hint_sites.push((pc, name));
     }
 
     pub(crate) fn lookup_binding(&self, name: &str) -> Option<BindingInfo> {

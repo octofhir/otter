@@ -326,8 +326,11 @@ pub(crate) fn compile_function_full(
     slot.direct_eval_bindings = direct_eval_meta;
     slot.contains_direct_eval = contains_direct_eval;
     slot.number_hint_sites = child.number_hint_sites;
+    let class_hint_sites = child.class_hint_sites;
     slot.code = child.code.finish();
     slot.spans = child.spans;
+    drop(module_mut);
+    parent.take_class_hint_sites(function_id, class_hint_sites);
     Ok((function_id, captures))
 }
 
@@ -606,8 +609,11 @@ pub(crate) fn compile_arrow_function(
     slot.direct_eval_bindings = direct_eval_meta;
     slot.contains_direct_eval = contains_direct_eval;
     slot.number_hint_sites = child.number_hint_sites;
+    let class_hint_sites = child.class_hint_sites;
     slot.code = child.code.finish();
     slot.spans = child.spans;
+    drop(module_mut);
+    parent.take_class_hint_sites(function_id, class_hint_sites);
     Ok((function_id, captures))
 }
 

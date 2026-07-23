@@ -98,6 +98,7 @@ pub(crate) use key_order::array_index_property_name;
 pub use lookup::{PropertyLookup, SetOutcome, SetRejectReason};
 pub(crate) use shape_body::ShapeBody;
 pub(crate) use shape_body::ShapeHandle;
+pub(crate) use shape_body::shape_offset_of_str;
 pub(crate) use shape_cache::{ShapeCacheInvalidation, ShapeCacheMode};
 pub(crate) use shape_runtime::ShapeRuntime;
 #[cfg(test)]

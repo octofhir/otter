@@ -2609,6 +2609,12 @@ mod tests {
                     crate::native_abi::RuntimeStubSignature::LeafValue2 => {
                         assert!(leaf_no_alloc_stub2_by_id(descriptor.id).is_some());
                     }
+                    crate::native_abi::RuntimeStubSignature::MutatingLeafValue2 => {
+                        assert!(
+                            mutating_leaf_stub2_by_id(descriptor.id)
+                                .is_some_and(MutatingLeafStub2::is_valid)
+                        );
+                    }
                     crate::native_abi::RuntimeStubSignature::AllocValue3 => {
                         assert!(
                             alloc_value_stub_by_id(descriptor.id)

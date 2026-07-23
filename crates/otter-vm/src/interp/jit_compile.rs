@@ -560,22 +560,69 @@ impl Interpreter {
     }
 
     /// Read a monomorphic own-data case directly from the shared interpreter PIC.
-    fn monomorphic_own_property_feedback(&self, op: Op, site: usize) -> Option<(u32, u32)> {
+    ///
+    /// A site whose cache is still empty falls back to the compiler's
+    /// TypeScript class annotation, which resolves against the live instance
+    /// shape of the annotated class. Any recorded observation supersedes it.
+    fn monomorphic_own_property_feedback(
+        &self,
+        context: &ExecutionContext,
+        code_block: &CodeBlock,
+        instruction: &jit::JitInstructionMetadata,
+        site: usize,
+    ) -> Option<(u32, u32)> {
         const SLOT_BYTES: u32 =
             std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
+        let op = instruction.op(code_block);
         let kind = match op {
             Op::LoadProperty => crate::property_ic::PropertyIcKind::Load,
             Op::StoreProperty => crate::property_ic::PropertyIcKind::Store,
             _ => return None,
         };
         self.publish_property_feedback(site, kind);
-        let crate::feedback::PropertyFeedbackState::MonomorphicOwnData { shape_id, slot } =
-            self.property_feedback_state(site, kind)?
+        match self.property_feedback_state(site, kind)? {
+            crate::feedback::PropertyFeedbackState::MonomorphicOwnData { shape_id, slot } => {
+                let shape = self.shape_runtime.handle_for_id(shape_id)?;
+                Some((shape.offset(), u32::from(slot) * SLOT_BYTES))
+            }
+            crate::feedback::PropertyFeedbackState::Empty => {
+                let slot = self.class_annotation_property_slot(context, code_block, instruction)?;
+                Some(slot)
+            }
+            _ => None,
+        }
+    }
+
+    /// Own-data slot a class-annotated property site is expected to hit.
+    ///
+    /// The annotation names a locally declared class; the interpreter's
+    /// simple-constructor cache holds the instance shape that class builds, so
+    /// the property resolves to a concrete shape and slot without the site
+    /// having run. Unsound by construction — the caller must only use this
+    /// where the site already guards the shape it was given.
+    fn class_annotation_property_slot(
+        &self,
+        context: &ExecutionContext,
+        code_block: &CodeBlock,
+        instruction: &jit::JitInstructionMetadata,
+    ) -> Option<(u32, u32)> {
+        const SLOT_BYTES: u32 =
+            std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
+        let name_operand = match instruction.op(code_block) {
+            Op::LoadProperty => 2,
+            Op::StoreProperty => 1,
+            _ => return None,
+        };
+        let class_fid = code_block.class_hint(instruction.instruction_pc(code_block) as usize)?;
+        let shape = *self.simple_constructor_shape_cache.get(&class_fid)?;
+        let otter_bytecode::Operand::ConstIndex(name_idx) =
+            instruction.operand(code_block, name_operand)?
         else {
             return None;
         };
-        let shape = self.shape_runtime.handle_for_id(shape_id)?;
-        Some((shape.offset(), u32::from(slot) * SLOT_BYTES))
+        let key = context.property_atom(name_idx)?;
+        let slot = crate::object::shape_offset_of_str(&self.gc_heap, shape, key.name())?;
+        Some((shape.offset(), slot * SLOT_BYTES))
     }
 
     /// Whether a method-call site's feedback has already saturated to
@@ -1255,8 +1302,12 @@ impl Interpreter {
             // feedback (shape offset, slot byte). Anything else — polymorphic,
             // prototype, accessor, or unobserved — is not inlinable.
             let site = instr.property_ic_site(&method_view.code_block)?;
-            let (shape_off, value_byte) =
-                self.monomorphic_own_property_feedback(instr.op(&method_view.code_block), site)?;
+            let (shape_off, value_byte) = self.monomorphic_own_property_feedback(
+                context,
+                &method_view.code_block,
+                instr,
+                site,
+            )?;
             prop_offsets.insert(instr.byte_pc, value_byte);
             prop_shapes.insert(instr.byte_pc, shape_off);
         }

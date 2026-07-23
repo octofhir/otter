@@ -207,6 +207,7 @@ mod tests {
                 code: code.into(),
                 spans: Vec::new(),
                 number_hint_sites: Vec::new(),
+                class_hint_sites: Vec::new(),
             }],
             constants: vec![
                 string_constant("x"),

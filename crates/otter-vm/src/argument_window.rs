@@ -186,6 +186,25 @@ impl<'frame, 'code> BytecodeArgumentWindow<'frame, 'code> {
             // Ordinary callee: parameters are the only destination, so arguments
             // past the last parameter are dropped without visiting them and no
             // side-record vector is built.
+            //
+            // Verified execution records expose the argument registers as one
+            // word slice, so the whole bind resolves both the source and the
+            // destination ranges once instead of re-checking each index against
+            // the window length and the callee's register count.
+            if let Some(words) = self.arg_words {
+                let source = &self.caller.registers;
+                let destination = frame
+                    .registers
+                    .get_mut(..bind_count)
+                    .ok_or(VmError::InvalidOperand)?;
+                for (slot, &word) in destination.iter_mut().zip(&words[..bind_count]) {
+                    *slot = *source.get(word as usize).ok_or(VmError::InvalidOperand)?;
+                }
+                return Ok(BoundExtras {
+                    rest_args: SmallVec::new(),
+                    incoming_args: SmallVec::new(),
+                });
+            }
             for index in 0..bind_count {
                 let value = *self.get(index)?;
                 let slot = frame

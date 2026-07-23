@@ -176,7 +176,7 @@ impl Interpreter {
             // budget checkpoint below stays gated on `enforce_budget` (a not-taken
             // branch in the default Observe mode).
             self.runtime_budget_stats
-                .record_reductions(runtime_budget::opcode_reductions(op));
+                .record_reductions(instr.reductions());
             if enforce_budget {
                 self.enforce_runtime_budget_checkpoint()?;
             }
@@ -559,7 +559,7 @@ impl Interpreter {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
                     let recv = *read_register(&stack[top_idx], src)?;
-                    if abstract_ops::is_primitive(&recv) {
+                    if recv.is_primitive() {
                         write_register(&mut stack[top_idx], dst, recv)?;
                         stack[top_idx].advance_pc()?;
                         continue;
@@ -1611,7 +1611,8 @@ impl Interpreter {
                 Op::Jump => {
                     let offset = instr.imm(0);
                     apply_branch(&mut stack[top_idx], offset, &self.interrupt)?;
-                    if offset < 0
+                    if jit_installed
+                        && offset < 0
                         && let Some(Some(value)) =
                             self.note_backedge_and_maybe_osr(stack, context, top_idx, floor)?
                     {
@@ -1629,7 +1630,8 @@ impl Interpreter {
                     }
                     if taken {
                         apply_branch(frame, offset, &self.interrupt)?;
-                        if offset < 0
+                        if jit_installed
+                            && offset < 0
                             && let Some(Some(value)) =
                                 self.note_backedge_and_maybe_osr(stack, context, top_idx, floor)?
                         {
@@ -1650,7 +1652,8 @@ impl Interpreter {
                     }
                     if taken {
                         apply_branch(frame, offset, &self.interrupt)?;
-                        if offset < 0
+                        if jit_installed
+                            && offset < 0
                             && let Some(Some(value)) =
                                 self.note_backedge_and_maybe_osr(stack, context, top_idx, floor)?
                         {

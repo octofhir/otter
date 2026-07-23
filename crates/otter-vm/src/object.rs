@@ -2200,12 +2200,16 @@ pub(crate) fn load_own_data_slot_atom(
         // baked data slot straight from the slab — the matching shape fixes the
         // slot kind and bounds, so neither the per-slot attributes nor the
         // property count need consulting.
-        if shaped
-            && hit.is_data
-            && !body.slot_attrs_overridden
-            && body.exotic.is_none()
-            && !body.slot_attrs(heap, offset).1
-        {
+        //
+        // Accessor-ness is part of the shape, and `hit.is_data` was recorded
+        // against this very shape handle, so a matched shape with unoverridden
+        // attributes cannot have turned the slot into an accessor. Asserting
+        // that keeps the release hit off the shape body entirely.
+        if shaped && hit.is_data && !body.slot_attrs_overridden && body.exotic.is_none() {
+            debug_assert!(
+                !body.slot_attrs(heap, offset).1,
+                "shape-matched data hit resolved to an accessor slot"
+            );
             debug_assert!(offset < body_property_count(heap, body));
             return Some(body.data_value(heap, offset));
         }

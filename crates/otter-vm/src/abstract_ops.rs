@@ -113,14 +113,9 @@ impl ToPrimitiveHint {
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-toprimitive>
 #[must_use]
+#[inline]
 pub fn is_primitive(value: &Value) -> bool {
-    value.is_undefined()
-        || value.is_null()
-        || value.is_boolean()
-        || value.is_number()
-        || value.is_big_int()
-        || value.is_string()
-        || value.is_symbol()
+    value.is_primitive()
 }
 
 /// Return `true` when `x` and `y` are identical under ECMA-262

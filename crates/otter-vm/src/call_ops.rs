@@ -285,22 +285,6 @@ fn invoke_native_call_with_roots(
     }
 }
 
-struct PreparedBytecodeFrame {
-    frame: Frame,
-    is_generator: bool,
-    is_async_generator: bool,
-    /// Callee function id — needed to resolve the generator
-    /// `[[Prototype]]` AFTER the prologue runs (§27.5.1 step 3:
-    /// FunctionDeclarationInstantiation precedes
-    /// OrdinaryCreateFromConstructor, so parameter side effects on
-    /// `fn.prototype` are observable).
-    generator_function_id: u32,
-    /// Invoked closure instance — generator `[[Prototype]]` resolution
-    /// must read `fn.prototype` through the per-closure bag, not the
-    /// template bag, so identity matches later user reads.
-    callee_closure: Option<crate::closure::JsClosure>,
-}
-
 /// `(function_id, upvalues, this, new_target, derived_this_cell,
 /// eval_env, closure)` resolved from a callable value for a bytecode call.
 pub(crate) type BytecodeCallTargetParts = (
@@ -435,7 +419,24 @@ impl Interpreter {
     /// to the closure's captured one (so probe closures created
     /// before the eval observe later bindings); other closures just
     /// re-expose the captured record for the dynamic walkers.
+    #[inline]
     pub(crate) fn stash_frame_eval_env(
+        &mut self,
+        function: &crate::executable::CodeBlock,
+        frame: &mut Frame,
+        inherited: Option<crate::eval_env::EvalEnvHandle>,
+    ) -> Result<(), VmError> {
+        // A body with no direct `eval` and no inherited record installs
+        // nothing, which is every ordinary call; keep the record allocation
+        // itself out of line.
+        if !function.contains_direct_eval && inherited.is_none() {
+            return Ok(());
+        }
+        self.stash_frame_eval_env_slow(function, frame, inherited)
+    }
+
+    #[cold]
+    fn stash_frame_eval_env_slow(
         &mut self,
         function: &crate::executable::CodeBlock,
         frame: &mut Frame,
@@ -1001,7 +1002,7 @@ impl Interpreter {
         args: &BytecodeArgumentWindow<'_, '_>,
         return_register: Option<u16>,
         async_state: Option<AsyncFrameState>,
-    ) -> Result<PreparedBytecodeFrame, VmError> {
+    ) -> Result<Frame, VmError> {
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
         let this_for_callee =
@@ -1033,15 +1034,8 @@ impl Interpreter {
             cold.derived_this_cell = Some(cell);
         }
         self.stash_frame_eval_env(function, &mut frame, callee_eval_env)?;
-        let prepared = PreparedBytecodeFrame {
-            frame,
-            is_generator: function.is_generator,
-            is_async_generator: function.is_async_generator,
-            generator_function_id: function.id,
-            callee_closure: None,
-        };
         window_rollback.commit();
-        Ok(prepared)
+        Ok(frame)
     }
 
     /// §27.5.1 step 3 / §9.1.14 — resolve a fresh generator's
@@ -1072,21 +1066,26 @@ impl Interpreter {
         Ok(())
     }
 
-    fn push_prepared_bytecode_call_frame(
+    /// Suspend a freshly prepared generator body into a generator object,
+    /// run its prologue, and leave the generator in `dst`.
+    ///
+    /// `generator_function_id` and `callee_closure` resolve the generator's
+    /// [[Prototype]] AFTER the prologue runs (§27.5.1 step 3:
+    /// FunctionDeclarationInstantiation precedes OrdinaryCreateFromConstructor,
+    /// so parameter side effects on `fn.prototype` are observable). The
+    /// prototype must be read through the invoked closure instance rather than
+    /// the template bag, or `Object.getPrototypeOf(gen) === fn.prototype` fails.
+    fn push_generator_bytecode_call_frame(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         dst: u16,
-        prepared: PreparedBytecodeFrame,
+        mut frame: Frame,
+        is_async_generator: bool,
+        generator_function_id: u32,
+        callee_closure: Option<crate::closure::JsClosure>,
     ) -> Result<(), VmError> {
-        let PreparedBytecodeFrame {
-            mut frame,
-            is_generator,
-            is_async_generator,
-            generator_function_id,
-            callee_closure,
-        } = prepared;
-        if is_generator {
+        {
             frame.return_register = None;
             let cold = self.frame_detach_cold(&mut frame);
             let frame = self.park_active_frame(frame);
@@ -1128,10 +1127,8 @@ impl Interpreter {
                 write_register(&mut stack[top_idx], dst, generator)
             })();
             self.pop_iteration_anchors_to(generator_anchor);
-            return result;
+            result
         }
-        stack.push(frame);
-        Ok(())
     }
 
     fn try_push_bytecode_call_frame_from_window(
@@ -1185,7 +1182,7 @@ impl Interpreter {
         } else {
             (Some(dst), None)
         };
-        let mut prepared = {
+        let mut frame = {
             let caller = &stack[top_idx];
             let args =
                 BytecodeArgumentWindow::from_operands(caller, operands, first_arg_operand, argc);
@@ -1205,9 +1202,20 @@ impl Interpreter {
         // SELF is canonical hot frame state for both interpreter and native
         // activations. It records the exact invoked closure even when this
         // particular body never executes a named-SELF opcode.
-        prepared.frame.self_value = current;
-        prepared.callee_closure = callee_closure;
-        self.push_prepared_bytecode_call_frame(stack, context, dst, prepared)?;
+        frame.self_value = current;
+        if function.is_generator {
+            self.push_generator_bytecode_call_frame(
+                stack,
+                context,
+                dst,
+                frame,
+                function.is_async_generator,
+                function.id,
+                callee_closure,
+            )?;
+        } else {
+            stack.push(frame);
+        }
         Ok(true)
     }
 

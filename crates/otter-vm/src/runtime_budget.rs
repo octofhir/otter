@@ -275,8 +275,11 @@ impl RuntimeHeapSnapshot {
 }
 
 /// Reduction charge for one executed opcode.
+///
+/// The interpreter never evaluates this at dispatch time: the charge is baked
+/// into every execution record when its owning `CodeBlock` is built.
 #[must_use]
-pub(crate) const fn opcode_reductions(op: Op) -> u64 {
+pub(crate) const fn opcode_reductions(op: Op) -> u8 {
     match op {
         Op::Call
         | Op::CallWithThis

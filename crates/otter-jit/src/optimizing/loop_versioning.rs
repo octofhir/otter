@@ -96,6 +96,12 @@ fn safe_instruction(instruction: &SsaInstr) -> bool {
             | Op::Rem
             | Op::Neg
             | Op::Increment
+            | Op::AddImm
+            | Op::SubImm
+            | Op::BitwiseAndImm
+            | Op::LessThanImm
+            | Op::EqualImm
+            | Op::NotEqualImm
             | Op::LogicalNot
             | Op::BitwiseAnd
             | Op::BitwiseOr

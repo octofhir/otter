@@ -618,6 +618,12 @@ opcode_schema! {
     (Op::PopParkedFinally, 0xA9),
     (Op::GlobalBindingExists, 0xAA),
     (Op::StoreGlobalChecked, 0xAB),
+    (Op::AddImm, 0xAC),
+    (Op::SubImm, 0xAD),
+    (Op::BitwiseAndImm, 0xAE),
+    (Op::LessThanImm, 0xAF),
+    (Op::EqualImm, 0xB0),
+    (Op::NotEqualImm, 0xB1),
 }
 
 /// Return the authoritative schema row for `op`.
@@ -974,6 +980,12 @@ const fn operand_shape(op: Op) -> OperandShape {
         | Op::LessEq
         | Op::GreaterThan
         | Op::GreaterEq => OperandShape::Fixed(WRITE_READ_READ),
+        Op::AddImm
+        | Op::SubImm
+        | Op::BitwiseAndImm
+        | Op::LessThanImm
+        | Op::EqualImm
+        | Op::NotEqualImm => OperandShape::Fixed(WRITE_READ_IMM),
     }
 }
 

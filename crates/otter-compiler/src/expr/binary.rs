@@ -52,12 +52,53 @@ pub(crate) fn expr_is_primitive(expr: &Expression<'_>) -> bool {
     )
 }
 
-/// `true` when evaluating `expr` cannot run user code or write a binding.
-///
-/// Distinct from [`expr_is_primitive`], which describes the *result* type and
-/// admits shapes that do have effects (`a++`, a nested call). This is about
-/// evaluation order: a sibling operand may only be read straight out of its
-/// frame slot when nothing evaluated beside it can reassign that slot.
+/// The immediate-right opcode for a binary operator whose right operand is an
+/// integer literal, or `None` when no immediate form exists.
+const fn immediate_variant(op: Op) -> Option<Op> {
+    Some(match op {
+        Op::Add => Op::AddImm,
+        Op::Sub => Op::SubImm,
+        Op::BitwiseAnd => Op::BitwiseAndImm,
+        Op::LessThan => Op::LessThanImm,
+        Op::Equal => Op::EqualImm,
+        Op::NotEqual => Op::NotEqualImm,
+        _ => return None,
+    })
+}
+
+/// The signed 32-bit value of an integer-valued numeric literal operand,
+/// including a negated one (`x - 1`, `x + -14`), or `None` when the operand is
+/// not a compile-time integer in `i32` range. `-0` is rejected: as a right
+/// operand of `+`/`-` it is indistinguishable from `0`, but excluding it keeps
+/// the fold from having to reason about signed zero.
+fn integer_immediate(expr: &Expression<'_>) -> Option<i32> {
+    match expr {
+        Expression::ParenthesizedExpression(p) => integer_immediate(&p.expression),
+        Expression::NumericLiteral(lit) => i32_from_f64(lit.value),
+        Expression::UnaryExpression(u)
+            if matches!(u.operator, oxc_ast::ast::UnaryOperator::UnaryNegation) =>
+        {
+            match &u.argument {
+                Expression::NumericLiteral(lit) => i32_from_f64(-lit.value),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn i32_from_f64(value: f64) -> Option<i32> {
+    if value.fract() == 0.0
+        && value.is_finite()
+        && (i32::MIN as f64..=i32::MAX as f64).contains(&value)
+        && !(value == 0.0 && value.is_sign_negative())
+    {
+        Some(value as i32)
+    } else {
+        None
+    }
+}
+
 /// The frame register a binary operand already lives in, when reading it needs
 /// no emitted instruction. See [`crate::expr::identifier::borrowed_local_register`].
 fn borrowed_operand(cx: &Compiler, expr: &Expression<'_>) -> Option<u16> {
@@ -290,6 +331,40 @@ fn compile_binary_to(
         // <https://tc39.es/ecma262/#sec-relational-operators-runtime-semantics-evaluation>
         BinaryOperator::In => Op::HasProperty,
     };
+    // Fold an integer-literal right operand into an immediate-right opcode,
+    // dropping the separate `LoadInt32` the register form would emit. The left
+    // operand keeps full operator semantics; the literal right operand has no
+    // side effect, so the left may still be read from its binding slot in
+    // place, and evaluation order is preserved (the literal cannot reassign it).
+    if let Some(imm_op) = immediate_variant(op)
+        && let Some(imm) = integer_immediate(&b.right)
+    {
+        let lhs = match borrowed_operand(cx, &b.left) {
+            Some(reg) => reg,
+            None => compile_expr(cx, &b.left, span)?,
+        };
+        cx.reset_scratch(mark);
+        if number_typed_operands && op_takes_number_hint(op) {
+            cx.mark_number_hint_site();
+        }
+        let dst = destination.unwrap_or_else(|| {
+            let mut candidate = cx.alloc_scratch();
+            while candidate == lhs {
+                candidate = cx.alloc_scratch();
+            }
+            candidate
+        });
+        cx.emit(
+            imm_op,
+            vec![
+                Operand::Register(dst),
+                Operand::Register(lhs),
+                Operand::Imm32(imm),
+            ],
+            span,
+        );
+        return Ok(dst);
+    }
     // A `BindingStorage::Register` binding *is* its frame slot, so lowering an
     // operand that names one to a `LoadLocal` copies a slot the operator could
     // have addressed directly. The copy used to be load-bearing: it snapshotted

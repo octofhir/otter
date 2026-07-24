@@ -206,6 +206,25 @@ pub enum Op {
     /// `r<dst> = (r<lhs> >= r<rhs>)`.
     GreaterEq,
 
+    // Immediate-right binary operators. Operands: `dst, lhs, imm`, where `imm`
+    // is a signed 32-bit integer standing for the `Number` right operand. The
+    // compiler folds a right operand that is an integer-valued literal into
+    // these, saving the separate `LoadInt32` the register form would need. The
+    // left operand keeps full operator semantics (a `String` left operand of
+    // `+` still concatenates, an object still coerces through `valueOf`).
+    /// `r<dst> = r<lhs> + imm`.
+    AddImm,
+    /// `r<dst> = r<lhs> - imm`.
+    SubImm,
+    /// `r<dst> = r<lhs> & imm` after `ToInt32` on the left operand.
+    BitwiseAndImm,
+    /// `r<dst> = (r<lhs> < imm)`. Returns Boolean.
+    LessThanImm,
+    /// `r<dst> = (r<lhs> === imm)`. Returns Boolean.
+    EqualImm,
+    /// `r<dst> = (r<lhs> !== imm)`. Returns Boolean.
+    NotEqualImm,
+
     /// `r<dst> = null`.
     LoadNull,
     /// `r<dst> = !ToBoolean(r<src>)`.
@@ -1304,6 +1323,12 @@ impl Op {
     #[must_use]
     pub const fn mnemonic(self) -> &'static str {
         match self {
+            Op::AddImm => "ADD_IMM",
+            Op::SubImm => "SUB_IMM",
+            Op::BitwiseAndImm => "BIT_AND_IMM",
+            Op::LessThanImm => "LT_IMM",
+            Op::EqualImm => "EQ_IMM",
+            Op::NotEqualImm => "NE_IMM",
             Op::Nop => "NOP",
             Op::LoadUndefined => "LOAD_UNDEFINED",
             Op::LoadHole => "LOAD_HOLE",
@@ -1607,7 +1632,13 @@ impl Op {
             | Op::YieldDelegate
             | Op::DefineDataProperty
             | Op::SetFunctionName
-            | Op::StoreGlobalBinding => 3,
+            | Op::StoreGlobalBinding
+            | Op::AddImm
+            | Op::SubImm
+            | Op::BitwiseAndImm
+            | Op::LessThanImm
+            | Op::EqualImm
+            | Op::NotEqualImm => 3,
             Op::GetPrototype
             | Op::SetPrototype
             | Op::ArrayLength

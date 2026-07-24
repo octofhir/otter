@@ -619,6 +619,84 @@ impl TemplatePlan {
         let mut osr_only = false;
         for (meta, lowered) in view.instructions.iter().zip(&lowering.instructions) {
             let pc = lowered.instruction_pc;
+            // The immediate-right binary operators carry no tier opcode: expand
+            // each into a constant materialization plus the register operator
+            // it fuses. The destination doubles as the constant's register (the
+            // compiler guarantees it differs from the left operand), so no
+            // extra register or logical PC is needed — both emitted operations
+            // share this instruction's PC, and only the first receives the
+            // branch label.
+            if matches!(
+                lowered.op,
+                Op::AddImm
+                    | Op::SubImm
+                    | Op::BitwiseAndImm
+                    | Op::LessThanImm
+                    | Op::EqualImm
+                    | Op::NotEqualImm
+            ) {
+                let ops = lowered.increment_operands()?;
+                let (dst, lhs, imm) = (ops.dst, ops.src, ops.delta);
+                instructions.push(TemplateInstr {
+                    pc,
+                    byte_pc: lowered.byte_pc,
+                    op: TemplateOp::LoadImmediate {
+                        dst,
+                        bits: value_tag::box_int32(imm),
+                    },
+                });
+                let op = match lowered.op {
+                    Op::AddImm => {
+                        let concat_safepoint = lowering
+                            .add_alloc_safepoints
+                            .get(&lowered.byte_pc)
+                            .copied()
+                            .ok_or(Unsupported::OperandShape("AddImm without a safepoint"))?;
+                        TemplateOp::AddGeneric {
+                            dst,
+                            lhs,
+                            rhs: dst,
+                            concat_safepoint,
+                        }
+                    }
+                    Op::SubImm => TemplateOp::BinaryArith {
+                        dst,
+                        lhs,
+                        rhs: dst,
+                        kind: ArithKind::Sub,
+                    },
+                    Op::BitwiseAndImm => TemplateOp::IntBitwise {
+                        dst,
+                        lhs,
+                        rhs: dst,
+                        kind: BitwiseKind::And,
+                    },
+                    Op::LessThanImm => TemplateOp::Compare {
+                        dst,
+                        lhs,
+                        rhs: dst,
+                        kind: CompareKind::Lt,
+                    },
+                    Op::EqualImm => TemplateOp::Compare {
+                        dst,
+                        lhs,
+                        rhs: dst,
+                        kind: CompareKind::Eq,
+                    },
+                    _ => TemplateOp::Compare {
+                        dst,
+                        lhs,
+                        rhs: dst,
+                        kind: CompareKind::Ne,
+                    },
+                };
+                instructions.push(TemplateInstr {
+                    pc,
+                    byte_pc: lowered.byte_pc,
+                    op,
+                });
+                continue;
+            }
             let op = match lowered.op {
                 Op::LoadInt32 => {
                     let operands = lowered.load_int32_operands()?;

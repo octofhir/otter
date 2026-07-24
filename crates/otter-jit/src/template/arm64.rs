@@ -241,10 +241,17 @@ pub(super) fn compile(
             ops.offset().0,
         ));
     }
+    // One logical PC can lower to several operations (an immediate-right
+    // operator expands to a constant load plus the register operator). The
+    // branch label belongs at the first operation for that PC; a later
+    // operation sharing the PC must not redefine it.
+    let mut labelled_pcs: BTreeSet<u32> = BTreeSet::new();
     for (operation_index, instr) in plan.instructions.iter().enumerate() {
         let instruction_start = ops.offset().0;
-        let label = labels[&instr.pc];
-        dynasm!(ops ; .arch aarch64 ; =>label);
+        if labelled_pcs.insert(instr.pc) {
+            let label = labels[&instr.pc];
+            dynasm!(ops ; .arch aarch64 ; =>label);
+        }
         let canonical_boolean_branch = match instr.op {
             TemplateOp::Branch { condition, .. } => branch_condition_is_canonical_boolean(
                 &plan,

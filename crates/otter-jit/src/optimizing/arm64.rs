@@ -582,6 +582,12 @@ fn splice_lowerable(callee: &otter_vm::JitInlineCallee) -> bool {
                 | Op::Rem
                 | Op::Neg
                 | Op::Increment
+                | Op::AddImm
+                | Op::SubImm
+                | Op::BitwiseAndImm
+                | Op::LessThanImm
+                | Op::EqualImm
+                | Op::NotEqualImm
                 | Op::LogicalNot
                 | Op::BitwiseAnd
                 | Op::BitwiseOr
@@ -636,6 +642,12 @@ fn splice_lowerable_method(method: &otter_vm::JitInlineMethod) -> bool {
                 | Op::Rem
                 | Op::Neg
                 | Op::Increment
+                | Op::AddImm
+                | Op::SubImm
+                | Op::BitwiseAndImm
+                | Op::LessThanImm
+                | Op::EqualImm
+                | Op::NotEqualImm
                 | Op::LogicalNot
                 | Op::BitwiseAnd
                 | Op::BitwiseOr
@@ -817,6 +829,12 @@ fn guard_cache_safe_instruction(
         | Op::Rem
         | Op::Neg
         | Op::Increment
+        | Op::AddImm
+        | Op::SubImm
+        | Op::BitwiseAndImm
+        | Op::LessThanImm
+        | Op::EqualImm
+        | Op::NotEqualImm
         | Op::LogicalNot
         | Op::BitwiseAnd
         | Op::BitwiseOr
@@ -1028,6 +1046,12 @@ fn check_eligibility(
                     | Op::Rem
                     | Op::Neg
                     | Op::Increment
+                    | Op::AddImm
+                    | Op::SubImm
+                    | Op::BitwiseAndImm
+                    | Op::LessThanImm
+                    | Op::EqualImm
+                    | Op::NotEqualImm
                     | Op::LessThan
                     | Op::LessEq
                     | Op::GreaterThan
@@ -1364,6 +1388,49 @@ fn check_eligibility(
                         || instruction.inputs.len() != 1
                     {
                         return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_numeric_inputs(
+                        instruction,
+                        ssa,
+                        reprs,
+                        Representation::Int32,
+                        &mut guarded_uses,
+                        &mut allowed_conversions,
+                    )?;
+                }
+                // Immediate-right int32 operators: one register input (the left
+                // operand); the right operand is the baked constant. Same int32
+                // discipline as `Op::Increment` / the register bitwise family.
+                Op::AddImm | Op::SubImm | Op::BitwiseAndImm => {
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("immediate int32 result"))?;
+                    if reprs.representation(result) != Representation::Int32
+                        || instruction.inputs.len() != 1
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_numeric_inputs(
+                        instruction,
+                        ssa,
+                        reprs,
+                        Representation::Int32,
+                        &mut guarded_uses,
+                        &mut allowed_conversions,
+                    )?;
+                }
+                // Immediate-right comparisons: one register input, boolean
+                // result. Restricted to int32 operand feedback (the counting-loop
+                // shape); any other feedback declines to the template tier.
+                Op::LessThanImm | Op::EqualImm | Op::NotEqualImm => {
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("immediate comparison result"))?;
+                    if reprs.representation(result) != Representation::Tagged
+                        || instruction.inputs.len() != 1
+                        || !frame_feedback(tree, instruction).is_int32_only()
+                    {
+                        return Err(Unsupported::OperandShape("immediate comparison shape"));
                     }
                     check_numeric_inputs(
                         instruction,
@@ -4216,6 +4283,88 @@ fn emit(
                         deopt_exit_at(frame_states, instruction)?,
                         instruction.pc,
                     ));
+                }
+                // Immediate-right int32 add/subtract — the register-plus-constant
+                // form of `Op::Add` / `Op::Sub` with an overflow deopt, mirroring
+                // `Op::Increment`.
+                Op::AddImm | Op::SubImm => {
+                    let result = instruction
+                        .result
+                        .expect("eligibility checked immediate result");
+                    let imm = view.instructions[instruction.pc as usize]
+                        .imm32(view.code_block.as_ref(), 2)
+                        .ok_or(Unsupported::OperandShape("immediate operand"))?;
+                    emit_load_int_operand(
+                        &mut ops,
+                        reprs,
+                        allocation,
+                        instruction,
+                        0,
+                        9,
+                        guard_deopt,
+                    )?;
+                    emit_load_u32(&mut ops, 10, imm as u32);
+                    let deopt = ops.new_dynamic_label();
+                    if instruction.op == Op::AddImm {
+                        dynasm!(ops ; .arch aarch64 ; adds w11, w9, w10 ; b.vs =>deopt);
+                    } else {
+                        dynasm!(ops ; .arch aarch64 ; subs w11, w9, w10 ; b.vs =>deopt);
+                    }
+                    emit_store_location(&mut ops, allocation.location(result), 11)?;
+                    deopt_exits.push((
+                        deopt,
+                        deopt_exit_at(frame_states, instruction)?,
+                        instruction.pc,
+                    ));
+                }
+                // Immediate-right int32 bitwise AND. No overflow, so no deopt.
+                Op::BitwiseAndImm => {
+                    let result = instruction
+                        .result
+                        .expect("eligibility checked immediate result");
+                    let imm = view.instructions[instruction.pc as usize]
+                        .imm32(view.code_block.as_ref(), 2)
+                        .ok_or(Unsupported::OperandShape("immediate operand"))?;
+                    emit_load_int_operand(
+                        &mut ops,
+                        reprs,
+                        allocation,
+                        instruction,
+                        0,
+                        9,
+                        guard_deopt,
+                    )?;
+                    emit_load_u32(&mut ops, 10, imm as u32);
+                    dynasm!(ops ; .arch aarch64 ; and w11, w9, w10);
+                    emit_store_location(&mut ops, allocation.location(result), 11)?;
+                }
+                // Immediate-right int32 comparison, boxed to a boolean (never
+                // fused with a following branch — `fused_numeric_compare_at`
+                // matches only the register forms).
+                Op::LessThanImm | Op::EqualImm | Op::NotEqualImm => {
+                    let result = instruction
+                        .result
+                        .expect("eligibility checked immediate result");
+                    let imm = view.instructions[instruction.pc as usize]
+                        .imm32(view.code_block.as_ref(), 2)
+                        .ok_or(Unsupported::OperandShape("immediate operand"))?;
+                    emit_load_int_operand(
+                        &mut ops,
+                        reprs,
+                        allocation,
+                        instruction,
+                        0,
+                        9,
+                        guard_deopt,
+                    )?;
+                    emit_load_u32(&mut ops, 10, imm as u32);
+                    let register_op = match instruction.op {
+                        Op::LessThanImm => Op::LessThan,
+                        Op::EqualImm => Op::Equal,
+                        _ => Op::NotEqual,
+                    };
+                    emit_int_comparison(&mut ops, register_op);
+                    emit_store_tagged_location(&mut ops, allocation.location(result), 11)?;
                 }
                 Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem => {
                     let result = instruction.result.expect("eligibility checked result");

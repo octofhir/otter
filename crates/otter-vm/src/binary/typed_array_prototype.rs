@@ -362,13 +362,17 @@ fn impl_fill(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
     let end = to_integer_or_infinity_arg(ctx, args.get(2), len, name)?;
     let s = clamp_relative_index(start, len) as usize;
     let e = clamp_relative_index(end, len) as usize;
-    if s >= e {
-        return Ok(Value::typed_array(t));
-    }
+    // §23.2.3.9 steps 13-16: the buffer witness is re-taken after every
+    // coercion and validated unconditionally, so an empty fill range still
+    // reports a buffer that a `valueOf` hook detached or shrank.
     if t.buffer(ctx.heap()).is_detached(ctx.heap())
         || (!t.is_length_tracking(ctx.heap()) && t.is_out_of_bounds(ctx.heap()))
     {
         return Err(type_error("typedarray is detached or out of bounds"));
+    }
+    let e = e.min(t.length(ctx.heap_mut()));
+    if s >= e {
+        return Ok(Value::typed_array(t));
     }
     for i in s..e {
         t.set(ctx.heap_mut(), i, &value);
@@ -618,6 +622,21 @@ fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
     Ok(Value::string(JsString::from_str(&joined, ctx.heap_mut())?))
 }
 
+/// §23.2.3.26.1 steps 11-12 / §23.2.3.26.2 steps 6-7 — reject an
+/// infinite or overrunning `targetOffset`, then narrow it to a usable
+/// index. Both bounds are compared in `f64` so a `1e300` offset never
+/// reaches the `usize` cast.
+fn ta_set_target_offset(
+    offset_f: f64,
+    src_len: usize,
+    target_len: usize,
+) -> Result<usize, NativeError> {
+    if offset_f.is_infinite() || src_len as f64 + offset_f > target_len as f64 {
+        return Err(range_error("Start offset is out of bounds"));
+    }
+    Ok(offset_f as usize)
+}
+
 fn impl_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     // §23.2.3.26 step 5 — `targetOffset = ToIntegerOrInfinity(offset)`
@@ -629,13 +648,6 @@ fn impl_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
         return Err(range_error("Start offset is out of bounds"));
     }
     validate_typed_array(&t, ctx.heap())?;
-    // A `+Infinity` or past-the-end offset overruns any source; reject
-    // before the `usize` cast so the per-source bound checks stay
-    // overflow-free.
-    if offset_f > t.length(ctx.heap_mut()) as f64 {
-        return Err(range_error("Start offset is out of bounds"));
-    }
-    let off = offset_f as usize;
     let target_len = t.length(ctx.heap_mut());
     let source = args.first().cloned().unwrap_or(Value::undefined());
     let kind = t.kind();
@@ -656,9 +668,14 @@ fn impl_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
             ));
         }
         let src_len = src.length(ctx.heap_mut());
-        if src_len > target_len.saturating_sub(off) {
-            return Err(range_error("source overruns destination"));
+        // §23.2.3.26.1 steps 9-10 — a BigInt / Number element-type
+        // mismatch is a TypeError, ahead of the offset range checks.
+        if src.kind().is_bigint() != kind.is_bigint() {
+            return Err(type_error(
+                "Cannot set a BigInt TypedArray from a Number TypedArray",
+            ));
         }
+        let off = ta_set_target_offset(offset_f, src_len, target_len)?;
         // Snapshot first to handle aliasing of the same buffer.
         let snapshot: Vec<Value> = {
             let mut tmp = Vec::with_capacity(src_len);
@@ -681,9 +698,7 @@ fn impl_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
             return Err(type_error("cannot set a TypedArray from null or undefined"));
         }
         let src_len = ta_array_like_length(ctx, source)?;
-        if src_len > target_len.saturating_sub(off) {
-            return Err(range_error("source overruns destination"));
-        }
+        let off = ta_set_target_offset(offset_f, src_len, target_len)?;
         for i in 0..src_len {
             let v = ta_get(
                 ctx,
@@ -929,9 +944,10 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
     // re-checked against the CURRENT state: the value's coercion can
     // detach or resize the backing buffer, so a once-valid index may
     // now be out of range. `actualIndex` itself stays relative to the
-    // original length (step 5/6).
+    // original length (step 5/6). A detached buffer makes
+    // IsValidIntegerIndex false for every index, so it surfaces as the
+    // same RangeError rather than a TypeError.
     let t = receiver(ctx)?;
-    check_not_detached(&t, ctx.heap())?;
     let cur_len = t.length(ctx.heap_mut()) as i64;
     if resolved < 0 || resolved >= cur_len {
         return Err(range_error("index out of range"));

@@ -292,6 +292,24 @@ pub fn is_callable(value: &Value) -> bool {
         || value.is_proxy()
 }
 
+/// §7.2.3 IsCallable with the heap in hand, so the two shapes
+/// [`is_callable`] can only guess at answer exactly: an ordinary
+/// object carrying a native `[[Call]]` slot is callable, and a Proxy
+/// reports the `[[Call]]` it captured from its target at creation
+/// (§10.5.15 step 7) instead of being assumed callable.
+#[must_use]
+pub fn is_callable_in_heap(value: &Value, heap: &otter_gc::GcHeap) -> bool {
+    if let Some(proxy) = value.as_proxy() {
+        return proxy.is_callable(heap);
+    }
+    if is_callable(value) {
+        return true;
+    }
+    value.as_object().is_some_and(|obj| {
+        crate::object::call_native(obj, heap).is_some_and(|v| v.is_native_function())
+    })
+}
+
 /// Return `true` when `value` carries an internal `[[Construct]]`
 /// slot — i.e. it is admissible as the callee of `new` or
 /// `Reflect.construct`.

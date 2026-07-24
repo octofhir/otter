@@ -728,15 +728,27 @@ fn native_prototype_property_is_enumerable(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
-    if this_value.is_nullish() {
-        return Err(NativeError::TypeError {
-            name: "propertyIsEnumerable",
-            reason: "cannot convert null or undefined to object".to_string(),
-        });
-    }
     if let Some(context) = ctx.execution_context().cloned() {
+        // §20.1.3.4 step 1 — ToPropertyKey(V) precedes ToObject(this),
+        // so the argument's `toString` / `valueOf` runs (and its abrupt
+        // completion wins) even for a nullish receiver.
+        let key_result = ctx.with_turn_parts(|interp, stack| {
+            interp.to_property_key_sync(
+                stack,
+                &context,
+                args.first().cloned().unwrap_or(Value::undefined()),
+            )
+        });
+        let key = key_result
+            .map_err(|err| object_native_error(ctx.cx.interp, "propertyIsEnumerable", err))?;
+        if this_value.is_nullish() {
+            return Err(NativeError::TypeError {
+                name: "propertyIsEnumerable",
+                reason: "cannot convert null or undefined to object".to_string(),
+            });
+        }
         let desc_result = ctx.with_turn_parts(|interp, stack| {
-            interp.get_own_property_descriptor_for_value(stack, &context, this_value, args.first())
+            interp.ordinary_get_own_property_descriptor_value(stack, &context, this_value, &key, 0)
         });
         let desc = desc_result
             .map_err(|err| object_native_error(ctx.cx.interp, "propertyIsEnumerable", err))?;
@@ -745,6 +757,12 @@ fn native_prototype_property_is_enumerable(
         ));
     }
     let this_clone = *ctx.this_value();
+    if this_clone.is_nullish() {
+        return Err(NativeError::TypeError {
+            name: "propertyIsEnumerable",
+            reason: "cannot convert null or undefined to object".to_string(),
+        });
+    }
     let enumerable = if let Some(obj) = this_clone.as_object() {
         let key_result = expect_property_key(args.first(), ctx.heap());
         let key = key_result
@@ -1014,7 +1032,7 @@ fn define_accessor_helper(
         });
     }
     let callable = args.get(1).cloned().unwrap_or(Value::undefined());
-    if !crate::is_callable_value(&callable) {
+    if !crate::abstract_ops::is_callable_in_heap(&callable, ctx.heap()) {
         return Err(NativeError::TypeError {
             name: method_name,
             reason: "argument is not a function".to_string(),

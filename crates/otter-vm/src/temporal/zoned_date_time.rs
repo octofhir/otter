@@ -16,7 +16,6 @@ use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::string::JsString;
 use crate::temporal::duration::partial_from_object;
-use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::helpers::read_calendar_field;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, js_string_value, make_temporal, parse_calendar_fields,
@@ -314,14 +313,33 @@ fn duration_arg(ctx: &mut NativeCtx<'_>, v: &Value) -> Result<temporal_rs::Durat
 }
 
 fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    use crate::temporal::helpers::{
+        read_display_calendar_name, read_display_offset, read_display_time_zone_name,
+        read_fractional_second_digits, read_rounding_mode_option, read_smallest_unit_option,
+    };
     let zdt = require_zoned_date_time(ctx)?;
-    // §Temporal.ZonedDateTime.prototype.toString reads the rounding
-    // options (smallestUnit / roundingMode / fractionalSecondDigits)
-    // first, then the three display options.
-    let rounding = parse_to_string_rounding_options(args, 0, ctx, CLASS)?;
-    let calendar = crate::temporal::helpers::parse_display_calendar(args, 0, ctx, CLASS)?;
-    let offset = crate::temporal::helpers::parse_display_offset(args, 0, ctx, CLASS)?;
-    let time_zone = crate::temporal::helpers::parse_display_time_zone(args, 0, ctx, CLASS)?;
+    // §Temporal.ZonedDateTime.prototype.toString reads every option
+    // through an observable [[Get]] in alphabetical key order —
+    // calendarName, fractionalSecondDigits, offset, roundingMode,
+    // smallestUnit, timeZoneName — before any algorithmic validation.
+    let opts = crate::temporal::helpers::arg_or_undef(args, 0);
+    let mut rounding = temporal_rs::options::ToStringRoundingOptions::default();
+    let (calendar, offset, time_zone) = if opts.is_undefined() {
+        Default::default()
+    } else if opts.is_object_type() {
+        let calendar = read_display_calendar_name(ctx, opts, CLASS)?;
+        rounding.precision = read_fractional_second_digits(ctx, opts, CLASS)?;
+        let offset = read_display_offset(ctx, opts, CLASS)?;
+        rounding.rounding_mode = read_rounding_mode_option(ctx, opts, CLASS)?;
+        rounding.smallest_unit = read_smallest_unit_option(ctx, opts, CLASS)?;
+        let time_zone = read_display_time_zone_name(ctx, opts, CLASS)?;
+        (calendar, offset, time_zone)
+    } else {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "options must be an object or undefined".to_string(),
+        });
+    };
     let s = zdt
         .to_ixdtf_string(offset, time_zone, calendar, rounding)
         .map_err(|e| temporal_err(e, CLASS))?;

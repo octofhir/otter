@@ -122,6 +122,12 @@ impl CollectionFastTarget {
 pub(crate) enum MethodCallIc {
     Array(ArrayMethodCallIc),
     Collection(CollectionMethodCallIc),
+    /// Monomorphic ordinary-object method call: the callee is an own data
+    /// property of the receiver. Holds the recorded own-property hit (shape +
+    /// slot, no GC pointer); the hot guard confirms the receiver shape and reads
+    /// the slot directly, skipping the property-atom resolution and the load-IC
+    /// stub walk the first resolution needed.
+    Ordinary(crate::object::AtomOwnPropertyHit),
 }
 
 /// Monomorphic method-call inline cache entry for a dense-array builtin site.

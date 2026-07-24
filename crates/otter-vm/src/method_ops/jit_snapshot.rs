@@ -36,6 +36,7 @@ impl Interpreter {
         let ic = match self.feedback_directory.method_ic(site)? {
             MethodCallIc::Array(ic) => ic,
             MethodCallIc::Collection(_) => return None,
+            MethodCallIc::Ordinary(_) => return None,
         };
         // `pop` / `shift` only rewrite the dense buffer, so they run as mutating
         // leaves with no safepoint; `push` / `unshift` may grow it and need the
@@ -124,6 +125,7 @@ impl Interpreter {
         let ic = match self.feedback_directory.method_ic(site)? {
             MethodCallIc::Collection(ic) => ic,
             MethodCallIc::Array(_) => return None,
+            MethodCallIc::Ordinary(_) => return None,
         };
         let stub_id = ic.leaf_stub_id?;
         let (proto, receiver_type_tag) = if ic.op.is_map() {
@@ -172,6 +174,7 @@ impl Interpreter {
         let ic = match self.feedback_directory.method_ic(site)? {
             MethodCallIc::Collection(ic) => ic,
             MethodCallIc::Array(_) => return None,
+            MethodCallIc::Ordinary(_) => return None,
         };
         let stub_id = ic.alloc_stub_id?;
         let (proto, receiver_type_tag) = if ic.op.is_map() {

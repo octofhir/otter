@@ -290,6 +290,23 @@ impl FeedbackDirectory {
         self.method_ics.get(site).copied().flatten()
     }
 
+    /// The monomorphic own-data hit recorded by the property-load IC at `site`,
+    /// if the just-resolved method was an own data property. Used to seed the
+    /// ordinary method-call IC so later calls skip atom resolution and the stub
+    /// walk. Returns `None` when the site is polymorphic or the method lives on
+    /// the prototype (no own-data stub).
+    #[must_use]
+    pub(crate) fn method_own_data_hit(
+        &self,
+        site: usize,
+    ) -> Option<crate::object::AtomOwnPropertyHit> {
+        let stubs = self.property_stubs(site, PropertyIcKind::Load)?;
+        if stubs.len() != 1 {
+            return None;
+        }
+        stubs.iter().find_map(|stub| stub.own_data_hit())
+    }
+
     pub(crate) fn install_method_ic(&mut self, site: usize, ic: MethodCallIc) -> bool {
         let Some(slot) = self.method_ics.get_mut(site) else {
             return false;

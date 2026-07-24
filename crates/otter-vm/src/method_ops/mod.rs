@@ -600,15 +600,32 @@ impl Interpreter {
             };
             return Err(self.err_type((format!("Cannot read properties of {label}")).into()));
         }
-        // Ordinary dense array whose `%Array.prototype%` slot is untouched —
-        // dispatch the builtin directly (see `try_fast_array_proto_method`).
-        // Resolving the call-site IC id here installs the same cache the JIT
-        // method-call stub reads (shared site space).
         // Resolving the call-site IC id here installs the same cache the JIT
         // method-call stub reads (shared site space).
         let method_site = context
             .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
             .unwrap_or(usize::MAX);
+        // Fast monomorphic ordinary-method call: the callee is an own data slot
+        // whose receiver shape was cached on the first resolution below. The hot
+        // guard is a single shape compare plus a slab read — no property-atom
+        // resolution, no load-IC stub walk, no `is_callable` string dispatch.
+        if method_site != usize::MAX
+            && let Some(MethodCallIc::Ordinary(hit)) =
+                self.feedback_directory.method_ic(method_site)
+        {
+            if let Some(obj) = recv_value.as_object()
+                && let Some(method) =
+                    crate::object::load_own_data_slot_by_shape(obj, &self.gc_heap, hit)
+                && self.is_callable_runtime(&method)
+            {
+                stack[top_idx].advance_pc()?;
+                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            }
+            // The receiver shape moved on or the slot is no longer a callable
+            // data property; drop the cache and fall back to full resolution,
+            // which reinstalls only while the site stays monomorphic.
+            self.feedback_directory.clear_method_ic(method_site);
+        }
         // Method-resolution inline cache. An ordinary object's method is a data
         // slot on its own object or its prototype, so the receiver shape keys
         // the resolved method exactly like a `LoadProperty`. On a hit (or a
@@ -628,6 +645,14 @@ impl Interpreter {
             && let Some(method) = self.resolve_method_ic(obj, atomized_key, method_site)
             && self.is_callable_runtime(&method)
         {
+            // Seed the ordinary method-call IC so later monomorphic calls take
+            // the shape-guarded fast path above. Only installed while the
+            // property load site is monomorphic and the method is an own data
+            // slot; prototype methods and polymorphic sites leave it empty.
+            if let Some(hit) = self.feedback_directory.method_own_data_hit(method_site) {
+                self.feedback_directory
+                    .install_method_ic(method_site, MethodCallIc::Ordinary(hit));
+            }
             stack[top_idx].advance_pc()?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
@@ -1421,6 +1446,7 @@ impl Interpreter {
         let ic = match self.feedback_directory.method_ic(site)? {
             MethodCallIc::Array(ic) => ic,
             MethodCallIc::Collection(_) => return None,
+            MethodCallIc::Ordinary(_) => return None,
         };
         let Some(arr) = recv.as_array() else {
             // The receiver is no longer an array: drop the cache so the direct
@@ -1467,6 +1493,7 @@ impl Interpreter {
         let ic = match self.feedback_directory.method_ic(site)? {
             MethodCallIc::Collection(ic) => ic,
             MethodCallIc::Array(_) => return None,
+            MethodCallIc::Ordinary(_) => return None,
         };
         let proto = if let Some(map) = recv.as_map() {
             if !ic.op.is_map() {

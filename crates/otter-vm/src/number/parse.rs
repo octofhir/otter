@@ -25,6 +25,22 @@
 use super::NumberValue;
 use crate::Value;
 
+/// Spec `StrWhiteSpace` = `WhiteSpace` ∪ `LineTerminator` (§7.1.4.1).
+///
+/// This is the set `ToNumber(string)`, `parseInt`, and `parseFloat`
+/// trim. It differs from Rust's [`char::is_whitespace`] in two code
+/// points: U+FEFF (ZWNBSP) counts as whitespace here but not in Rust,
+/// and U+0085 (NEL) counts in Rust but is not `StrWhiteSpace`. The set
+/// mirrors `is_ws_code_unit` in `string::prototype`.
+pub(crate) fn is_str_whitespace(c: char) -> bool {
+    matches!(c,
+        '\u{0009}' | '\u{000A}' | '\u{000B}' | '\u{000C}' | '\u{000D}'
+        | '\u{0020}' | '\u{00A0}' | '\u{1680}'
+        | '\u{2000}'..='\u{200A}'
+        | '\u{2028}' | '\u{2029}' | '\u{202F}' | '\u{205F}'
+        | '\u{3000}' | '\u{FEFF}')
+}
+
 /// Foundation subset of `ToNumber(string)`.
 ///
 /// Accepts:
@@ -39,7 +55,7 @@ use crate::Value;
 /// (`+/-`, integer/fraction/exponent). Unparseable strings → `NaN`.
 #[must_use]
 pub fn to_number_from_string(text: &str) -> NumberValue {
-    let trimmed = text.trim();
+    let trimmed = text.trim_matches(is_str_whitespace);
     if trimmed.is_empty() {
         return NumberValue::Smi(0);
     }
@@ -188,7 +204,7 @@ pub fn to_integer_or_infinity_strict(value: &Value, heap: &otter_gc::GcHeap) -> 
 /// - <https://tc39.es/ecma262/#sec-parseint-string-radix>
 #[must_use]
 pub fn parse_int(input: &str, mut radix: i32) -> NumberValue {
-    let s = input.trim_start();
+    let s = input.trim_start_matches(is_str_whitespace);
     let mut chars = s.chars().peekable();
     let mut negative = false;
     match chars.peek().copied() {
@@ -252,7 +268,7 @@ pub fn parse_int(input: &str, mut radix: i32) -> NumberValue {
 /// §19.2.4 ParseFloat(string).
 #[must_use]
 pub fn parse_float(input: &str) -> NumberValue {
-    let s = input.trim_start();
+    let s = input.trim_start_matches(is_str_whitespace);
     if s.starts_with("Infinity") || s.starts_with("+Infinity") {
         return NumberValue::Double(f64::INFINITY);
     }

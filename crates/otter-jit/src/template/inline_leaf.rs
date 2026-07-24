@@ -35,7 +35,7 @@ use std::cmp::Reverse;
 use otter_vm::{JitInlineCallee, JitInlineMethod};
 
 use super::plan::TemplateInstr;
-use super::{ArithKind, TemplateOp, TemplatePlan};
+use super::{ArithKind, FusedChainStep, TemplateOp, TemplatePlan, TemplateTail};
 
 pub(crate) const INLINE_LEAF_MAX_REGISTERS: u16 = 24;
 pub(crate) const INLINE_LEAF_MAX_INSTRUCTIONS: usize = 48;
@@ -237,11 +237,18 @@ impl<'a> InlineLeafPlan<'a> {
                     has_receiver_property = true;
                     InlineAccess::read_write(&[object], dst, register_count)?
                 }
-                TemplateOp::ToPrimitive { dst, src, .. } | TemplateOp::ToNumeric { dst, src } => {
+                TemplateOp::ToPrimitive { dst, src, .. }
+                | TemplateOp::ToNumeric { dst, src }
+                | TemplateOp::Negate { dst, src } => {
                     read_kind(&kinds, src)?;
                     write_kind(&mut kinds, dst, InlineValueKind::Unknown)?;
                     InlineAccess::read_write(&[src], dst, register_count)?
                 }
+                // The fused numeric chain is a fast-path header over the
+                // per-operation stream that follows it; the inline emitter
+                // re-emits that stream operation by operation, so the header
+                // itself has no inline data flow.
+                TemplateOp::FusedNumericChain { .. } => InlineAccess::none(),
                 TemplateOp::AddGeneric { dst, lhs, rhs, .. } => {
                     read_kind(&kinds, lhs)?;
                     read_kind(&kinds, rhs)?;
@@ -306,6 +313,18 @@ impl<'a> InlineLeafPlan<'a> {
     #[must_use]
     pub(crate) fn register_slot(&self, register: u16) -> Option<InlineScratchSlot> {
         self.scratch.register_slot(register)
+    }
+
+    /// Steps of a fused chain in the analyzed callee body.
+    #[must_use]
+    pub(crate) fn chain_steps(&self, tail: TemplateTail) -> &[FusedChainStep] {
+        self.template.chain_step_tail(tail)
+    }
+
+    /// Distinct leaf registers of a fused chain in the analyzed callee body.
+    #[must_use]
+    pub(crate) fn chain_leaves(&self, tail: TemplateTail) -> &[u16] {
+        self.template.chain_leaf_tail(tail)
     }
 
     #[must_use]

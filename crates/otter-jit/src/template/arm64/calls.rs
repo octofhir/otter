@@ -49,8 +49,9 @@ use super::collections::{
 };
 use super::transitions::TransitionTable;
 use super::values::{
-    emit_box_double, emit_box_int32, emit_decompress_slot, emit_load_reg, emit_load_runtime_stub,
-    emit_load_symbol_u64, emit_load_u64, emit_num_to_double, emit_slab_base, emit_store_reg,
+    emit_box_double, emit_box_int32, emit_box_number, emit_decompress_slot, emit_load_reg,
+    emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64, emit_num_to_double,
+    emit_slab_base, emit_store_reg,
 };
 use crate::arm64::{
     DirectCallForm, DirectCallSite, MethodGuardSite, StaticNativeCallSite, direct_call_artifact,
@@ -68,8 +69,8 @@ use crate::entry::{
     MAX_METHOD_ARGS, NUMBER_TAG_HI16, Unsupported, VALUE_UNDEFINED, pack_method_arg_regs,
 };
 use crate::template::{
-    ArithKind, InlineEntryValue, InlineLeafPlan, InlineScratchSlot, TemplateOp, TemplatePlan,
-    TemplateTail,
+    ACCUMULATOR_DREG, ArithKind, FusedArithKind, FusedChainStep, InlineEntryValue, InlineLeafPlan,
+    InlineScratchSlot, TemplateOp, TemplatePlan, TemplateTail,
 };
 
 fn inline_scratch_artifact(
@@ -249,6 +250,69 @@ fn emit_inline_numeric_binary(
     Ok(())
 }
 
+/// Emit a fused unboxed-double chain inside an inline leaf body.
+///
+/// Each leaf is loaded once from its compact scratch slot, number-guarded, and
+/// unboxed into a vector register; a non-number leaf deopts to the real call
+/// (which owns the full coercion). The chain then runs entirely in
+/// floating-point through [`ACCUMULATOR_DREG`], and only the results that
+/// outlive the chain are boxed representation-preservingly and written back to
+/// their scratch slots. This keeps the inline body's arithmetic as cheap as the
+/// standalone fused callee while eliminating the call frame.
+fn emit_inline_fused_chain(
+    ops: &mut Assembler,
+    plan: &InlineLeafPlan<'_>,
+    steps: &[FusedChainStep],
+    leaves: &[u16],
+    miss: DynamicLabel,
+) -> Result<(), Unsupported> {
+    for (index, &leaf) in leaves.iter().enumerate() {
+        let dst_d = ACCUMULATOR_DREG + 1 + u8::try_from(index).expect("leaf count is bounded");
+        let slot = plan
+            .register_slot(leaf)
+            .ok_or(Unsupported::OperandShape("inline fused chain leaf"))?;
+        emit_load_inline_slot(ops, 9, slot);
+        emit_num_to_double(ops, 9, dst_d, miss);
+    }
+    for step in steps {
+        let acc = ACCUMULATOR_DREG;
+        let (a, b) = (step.a_dreg, step.b_dreg);
+        match step.kind {
+            FusedArithKind::Add => dynasm!(ops ; .arch aarch64 ; fadd D(acc), D(a), D(b)),
+            FusedArithKind::Sub => dynasm!(ops ; .arch aarch64 ; fsub D(acc), D(a), D(b)),
+            FusedArithKind::Mul => dynasm!(ops ; .arch aarch64 ; fmul D(acc), D(a), D(b)),
+            FusedArithKind::Div => dynasm!(ops ; .arch aarch64 ; fdiv D(acc), D(a), D(b)),
+        }
+        if step.store_result {
+            emit_box_number(ops, acc, 13);
+            let slot = plan
+                .register_slot(step.dst)
+                .ok_or(Unsupported::OperandShape("inline fused chain result"))?;
+            emit_store_inline_slot(ops, 13, slot);
+        }
+    }
+    Ok(())
+}
+
+/// Emit inline unary negation over compact scratch storage.
+///
+/// A non-number operand deopts to the real call, which owns the full
+/// `ToNumeric` (object `valueOf`, BigInt). For a Number, `-x` is computed in
+/// f64 and boxed as a double: this reproduces the standalone negate exactly,
+/// including `-0` (from `+0`) and `2147483648` (from `-i32::MIN`).
+fn emit_inline_negate(
+    ops: &mut Assembler,
+    dst: InlineScratchSlot,
+    src: InlineScratchSlot,
+    miss: DynamicLabel,
+) {
+    emit_load_inline_slot(ops, 9, src);
+    emit_num_to_double(ops, 9, 0, miss);
+    dynasm!(ops ; .arch aarch64 ; fneg d1, d0);
+    emit_box_double(ops, 1, 13);
+    emit_store_inline_slot(ops, 13, dst);
+}
+
 fn emit_inline_receiver_property(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -352,7 +416,16 @@ fn emit_inline_leaf_body(
     }
 
     let body_start = ops.offset().0;
+    // A fused chain replaces the per-operation stream up to its jump target; the
+    // inline body emits the fused computation once and skips those operations.
+    let mut skip_until: Option<u32> = None;
     for (operation_index, instruction) in plan.instructions().iter().enumerate() {
+        if let Some(limit) = skip_until {
+            if instruction.pc < limit {
+                continue;
+            }
+            skip_until = None;
+        }
         let instruction_start = ops.offset().0;
         match instruction.op {
             TemplateOp::LoadImmediate { dst, bits } => {
@@ -407,6 +480,31 @@ fn emit_inline_leaf_body(
                     .register_slot(src)
                     .ok_or(Unsupported::OperandShape("inline scratch source"))?;
                 emit_inline_number_identity(ops, dst, src, body_deopt);
+            }
+            TemplateOp::Negate { dst, src } => {
+                let dst = plan
+                    .register_slot(dst)
+                    .ok_or(Unsupported::OperandShape("inline scratch destination"))?;
+                let src = plan
+                    .register_slot(src)
+                    .ok_or(Unsupported::OperandShape("inline scratch source"))?;
+                emit_inline_negate(ops, dst, src, body_deopt);
+            }
+            // Emit the fused chain once, then skip the per-operation stream it
+            // stands in for (up to its jump target).
+            TemplateOp::FusedNumericChain {
+                steps,
+                leaves,
+                jump_target,
+            } => {
+                emit_inline_fused_chain(
+                    ops,
+                    plan,
+                    plan.chain_steps(steps),
+                    plan.chain_leaves(leaves),
+                    body_deopt,
+                )?;
+                skip_until = Some(jump_target);
             }
             TemplateOp::AddGeneric { dst, lhs, rhs, .. } => {
                 let dst = plan

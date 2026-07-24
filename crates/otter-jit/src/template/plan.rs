@@ -2076,7 +2076,10 @@ mod tests {
         ]);
         let plan = TemplatePlan::build(&v).expect("plan");
         assert!(
-            !matches!(plan.instructions[0].op, TemplateOp::FusedNumericChain { .. }),
+            !matches!(
+                plan.instructions[0].op,
+                TemplateOp::FusedNumericChain { .. }
+            ),
             "empty feedback must not fuse"
         );
     }

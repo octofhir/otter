@@ -3511,6 +3511,20 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
         if let Some(obj) = receiver.as_object() {
+            // Fast monomorphic own-data load: one shape-handle compare plus a
+            // direct slab read, skipping the megamorphic query, the stub walk,
+            // and its per-stub atom compare / receiver re-decompress. The shape
+            // match fixes both the slot and the key. Falls through to the full
+            // probe on a shape miss (polymorphic / prototype / dictionary).
+            if let Some(hit) = self.feedback_directory.mono_load_own_data_hit(site)
+                && let Some(value) =
+                    crate::object::load_own_data_slot_by_shape(obj, &self.gc_heap, hit)
+            {
+                self.feedback_directory
+                    .record_property_hit(PropertyIcKind::Load);
+                Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)?;
+                return Ok(true);
+            }
             let mut site_disabled = self
                 .feedback_directory
                 .property_is_megamorphic(site, PropertyIcKind::Load)

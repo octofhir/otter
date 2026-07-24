@@ -1,0 +1,673 @@
+Analysis of sampling otter-engine-benchmark (pid 44117) every 1 millisecond
+Process:         otter-engine-benchmark [44117]
+Path:            /Users/USER/*/otter-engine-benchmark
+Load Address:    0x100d9c000
+Identifier:      otter-engine-benchmark
+Version:         0
+Code Type:       ARM64
+Platform:        macOS
+Parent Process:  zsh [44115]
+Target Type:     live task
+
+Date/Time:       2026-07-24 11:36:05.849 +0300
+Launch Time:     2026-07-24 11:36:04.767 +0300
+OS Version:      macOS 26.5 (25F71)
+Report Version:  7
+Analysis Tool:   /usr/bin/sample
+
+Physical footprint:         4945K
+Physical footprint (peak):  4945K
+Idle exit:                  untracked
+----
+
+Call graph:
+    4102 Thread_163338305   DispatchQueue_1: com.apple.main-thread  (serial)
+      4102 start  (in dyld) + 6992  [0x1877f7e00]
+        4102 main  (in otter-engine-benchmark) + 52  [0x1011435c8]
+          4102 _RNvNtCsaLOjE9VYtxK_3std2rt19lang_start_internal  (in otter-engine-benchmark) + 952  [0x1016c03b0]  rt.rs:171
+            4102 std::rt::lang_start::_$u7b$$u7b$closure$u7d$$u7d$::h8bad421f94150227  (in otter-engine-benchmark) + 16  [0x101121aec]  rt.rs:206
+              4102 std::sys::backtrace::__rust_begin_short_backtrace::h527f049a5aeb26c3  (in otter-engine-benchmark) + 12  [0x101121b04]  backtrace.rs:166
+                4102 otter_engine_benchmark::main::h73405c66afc7c53e  (in otter-engine-benchmark) + 2864  [0x10174ac84]  engine.rs:2489
+                  4102 otter_engine_benchmark::run_kernel::h257c7f1a9a89b2c7  (in otter-engine-benchmark) + 4240  [0x10110d8c4]  engine.rs:1136
+                    4102 otter_vm::activation_stack::_$LT$impl$u20$otter_vm..Interpreter$GT$::with_runtime_turn::h8228cace623d026e  (in otter-engine-benchmark) + 288  [0x10140a6d0]
+                      4102 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_callable_sync_rooted::h429ba13fc24a55a0  (in otter-engine-benchmark) + 1436  [0x1015a7088]  call_ops.rs:2558
+                        4102 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_bytecode_callable_committed_rooted::h72af3d9aaa5bb08c  (in otter-engine-benchmark) + 2288  [0x1015af888]  call_ops.rs:2988
+                          4102 otter_vm::interp::exec::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_above_rooted::haad07b189329cdab  (in otter-engine-benchmark) + 156  [0x101532ff4]  exec.rs:849
+                            4102 otter_vm::interp::exec::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_rooted::_$u7b$$u7b$closure$u7d$$u7d$::h8c0c0d071892835b  (in otter-engine-benchmark) + 64  [0x101532bd0]  exec.rs:878
+                              1450 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 16940  [0x101550fac]  dispatch.rs:374
+                              + 884 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 1364  [0x101380530]  active_frame.rs:0
+                              + ! 609 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::invoke::hc7d00ed01322834c  (in otter-engine-benchmark) + 1468  [0x1015b28e0]  call_ops.rs:0
+                              + ! : 196 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 556  [0x1015a5dd4]  call_ops.rs:911
+                              + ! : | 115 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::alloc_reg_window::hb325b2c6782fe4de  (in otter-engine-benchmark) + 724  [0x10154126c]  frames.rs:116
+                              + ! : | + 101 _platform_memset_pattern16  (in libsystem_platform.dylib) + 300,272,...  [0x187bbd24c,0x187bbd230,...]
+                              + ! : | + 14 DYLD-STUB$$memset_pattern16  (in otter-engine-benchmark) + 4  [0x101784bb4]
+                              + ! : | 76 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::alloc_reg_window::hb325b2c6782fe4de  (in otter-engine-benchmark) + 732,496,...  [0x101541274,0x101541188,...]  frames.rs:116
+                              + ! : | 5 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::alloc_reg_window::hb325b2c6782fe4de  (in otter-engine-benchmark) + 8  [0x101540fa0]  frames.rs:115
+                              + ! : 94 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 1400  [0x1015a6120]  call_ops.rs:934
+                              + ! : | 20 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bind_bytecode_call_arguments::h154cf07df039b0bc  (in otter-engine-benchmark) + 80  [0x1015aa468]  call_ops.rs:470
+                              + ! : | 20 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bind_bytecode_call_arguments::h154cf07df039b0bc  (in otter-engine-benchmark) + 192,148  [0x1015aa4d8,0x1015aa4ac]  call_ops.rs:475
+                              + ! : | 14 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bind_bytecode_call_arguments::h154cf07df039b0bc  (in otter-engine-benchmark) + 56,52,...  [0x1015aa450,0x1015aa44c,...]  call_ops.rs:468
+                              + ! : | 11 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bind_bytecode_call_arguments::h154cf07df039b0bc  (in otter-engine-benchmark) + 260  [0x1015aa51c]  call_ops.rs:476
+                              + ! : | 9 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bind_bytecode_call_arguments::h154cf07df039b0bc  (in otter-engine-benchmark) + 564,648  [0x1015aa64c,0x1015aa6a0]  call_ops.rs:497
+                              + ! : | 8 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bind_bytecode_call_arguments::h154cf07df039b0bc  (in otter-engine-benchmark) + 344  [0x1015aa570]  call_ops.rs:487
+                              + ! : | 7 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bind_bytecode_call_arguments::h154cf07df039b0bc  (in otter-engine-benchmark) + 220,200  [0x1015aa4f4,0x1015aa4e0]  range.rs:0
+                              + ! : | 2 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bind_bytecode_call_arguments::h154cf07df039b0bc  (in otter-engine-benchmark) + 0,8  [0x1015aa418,0x1015aa420]  call_ops.rs:462
+                              + ! : | 2 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bind_bytecode_call_arguments::h154cf07df039b0bc  (in otter-engine-benchmark) + 244  [0x1015aa50c]  call_ops.rs:477
+                              + ! : | 1 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bind_bytecode_call_arguments::h154cf07df039b0bc  (in otter-engine-benchmark) + 596  [0x1015aa66c]  unix.rs:0
+                              + ! : 34 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 120,80,...  [0x1015a5c20,0x1015a5bf8,...]  call_ops.rs:873
+                              + ! : 34 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::alloc_reg_window::hb325b2c6782fe4de  (in otter-engine-benchmark) + 804,792,...  [0x1015412bc,0x1015412b0,...]  frames.rs:117
+                              + ! : 30 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 496,1140,...  [0x1015a5d98,0x1015a601c,...]  call_ops.rs:904
+                              + ! : 26 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 1400,1368,...  [0x1015a6120,0x1015a6100,...]  call_ops.rs:934
+                              + ! : 20 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bind_bytecode_call_arguments::h154cf07df039b0bc  (in otter-engine-benchmark) + 668,664  [0x1015aa6b4,0x1015aa6b0]  call_ops.rs:497
+                              + ! : 20 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 2032  [0x1015a6398]  call_ops.rs:987
+                              + ! : | 12 otter_vm::activation_stack::ActivationStack::push::he51289c184663e2b  (in otter-engine-benchmark) + 76,28,...  [0x10140a578,0x10140a548,...]  activation_stack.rs:177
+                              + ! : | 8 otter_vm::activation_stack::ActivationStack::push::he51289c184663e2b  (in otter-engine-benchmark) + 0  [0x10140a52c]  activation_stack.rs:176
+                              + ! : 15 otter_vm::activation_stack::ActivationStack::push::he51289c184663e2b  (in otter-engine-benchmark) + 96,92  [0x10140a58c,0x10140a588]  activation_stack.rs:178
+                              + ! : 15 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 44,0,...  [0x1015a5bd4,0x1015a5ba8,...]  call_ops.rs:858
+                              + ! : 14 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 132,148,...  [0x1015a5c2c,0x1015a5c3c,...]  call_ops.rs:879
+                              + ! : 13 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 1332,1340  [0x1015a60dc,0x1015a60e4]  call_ops.rs:933
+                              + ! : 12 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 64,76  [0x1015a5be8,0x1015a5bf4]  call_ops.rs:872
+                              + ! : 12 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 640,604,...  [0x1015a5e28,0x1015a5e04,...]  call_ops.rs:912
+                              + ! : 11 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 668,660,...  [0x1015a5e44,0x1015a5e3c,...]  call_ops.rs:920
+                              + ! : 11 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 2016,2004  [0x1015a6388,0x1015a637c]  call_ops.rs:987
+                              + ! : 10 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 404  [0x1015a5d3c]  call_ops.rs:903
+                              + ! : 9 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 96  [0x1015a5c08]  call_ops.rs:873
+                              + ! : | 5 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::jit_generated_call_depth::habb4dabbef57dc84  (in otter-engine-benchmark) + 228,232  [0x101541f74,0x101541f78]  frames.rs:274
+                              + ! : | 4 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::jit_generated_call_depth::habb4dabbef57dc84  (in otter-engine-benchmark) + 12  [0x101541e9c]  frames.rs:255
+                              + ! : 7 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 1412  [0x1015a612c]  call_ops.rs:939
+                              + ! : 5 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 388  [0x1015a5d2c]  call_ops.rs:900
+                              + ! : 5 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 1228,1224  [0x1015a6074,0x1015a6070]  call_ops.rs:919
+                              + ! : 5 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 248  [0x1015a5ca0]  call_ops.rs:990
+                              + ! : 4 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 352  [0x1015a5d08]  call_ops.rs:887
+                              + ! : 2 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 1264  [0x1015a6098]  call_ops.rs:925
+                              + ! : 2 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 1128  [0x1015a6010]  sync.rs:0
+                              + ! : 1 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 368  [0x1015a5d18]  call_ops.rs:0
+                              + ! : 1 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 472  [0x1015a5d80]  call_ops.rs:908
+                              + ! : 1 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 568  [0x1015a5de0]  call_ops.rs:911
+                              + ! 67 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::invoke::hc7d00ed01322834c  (in otter-engine-benchmark) + 1460,120,...  [0x1015b28d8,0x1015b239c,...]  call_ops.rs:0
+                              + ! 52 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::invoke::hc7d00ed01322834c  (in otter-engine-benchmark) + 680  [0x1015b25cc]  call_ops.rs:1511
+                              + ! : 15 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bytecode_call_target_parts::h5866fa6aaa509860  (in otter-engine-benchmark) + 132,124,...  [0x1015a9670,0x1015a9668,...]  call_ops.rs:582
+                              + ! : 12 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bytecode_call_target_parts::h5866fa6aaa509860  (in otter-engine-benchmark) + 16,0,...  [0x1015a95fc,0x1015a95ec,...]  call_ops.rs:561
+                              + ! : 9 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bytecode_call_target_parts::h5866fa6aaa509860  (in otter-engine-benchmark) + 420,408,...  [0x1015a9790,0x1015a9784,...]  call_ops.rs:596
+                              + ! : 8 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bytecode_call_target_parts::h5866fa6aaa509860  (in otter-engine-benchmark) + 112,92  [0x1015a965c,0x1015a9648]  call_ops.rs:579
+                              + ! : 6 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bytecode_call_target_parts::h5866fa6aaa509860  (in otter-engine-benchmark) + 76  [0x1015a9638]  call_ops.rs:578
+                              + ! : 2 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bytecode_call_target_parts::h5866fa6aaa509860  (in otter-engine-benchmark) + 244  [0x1015a96e0]  call_ops.rs:607
+                              + ! 29 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::invoke::hc7d00ed01322834c  (in otter-engine-benchmark) + 756  [0x1015b2618]  call_ops.rs:1512
+                              + ! 25 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::invoke::hc7d00ed01322834c  (in otter-engine-benchmark) + 664,688,...  [0x1015b25bc,0x1015b25d4,...]  call_ops.rs:1511
+                              + ! 19 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::invoke::hc7d00ed01322834c  (in otter-engine-benchmark) + 732,736,...  [0x1015b2600,0x1015b2604,...]  call_ops.rs:1522
+                              + ! 18 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::invoke::hc7d00ed01322834c  (in otter-engine-benchmark) + 64  [0x1015b2364]  call_ops.rs:1474
+                              + ! 15 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark) + 272  [0x1015a5cb8]  call_ops.rs:990
+                              + ! 14 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::invoke::hc7d00ed01322834c  (in otter-engine-benchmark) + 648,804  [0x1015b25ac,0x1015b2648]  call_ops.rs:1502
+                              + ! 10 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bytecode_call_target_parts::h5866fa6aaa509860  (in otter-engine-benchmark) + 260  [0x1015a96f0]  call_ops.rs:607
+                              + ! 8 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::invoke::hc7d00ed01322834c  (in otter-engine-benchmark) + 148  [0x1015b23b8]  call_ops.rs:1479
+                              + ! 8 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::invoke::hc7d00ed01322834c  (in otter-engine-benchmark) + 484  [0x1015b2508]  call_ops.rs:1491
+                              + ! 7 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::invoke::hc7d00ed01322834c  (in otter-engine-benchmark) + 0,12,...  [0x1015b2324,0x1015b2330,...]  call_ops.rs:1454
+                              + ! 3 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::invoke::hc7d00ed01322834c  (in otter-engine-benchmark) + 40  [0x1015b234c]  call_ops.rs:1471
+                              + 62 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 1460  [0x101380590]  mod.rs:618
+                              + ! 51 otter_vm::object::load_own_data_slot_by_shape::h040a7b316c4ad92a  (in otter-engine-benchmark) + 36,64,...  [0x101571bdc,0x101571bf8,...]  object.rs:2244
+                              + ! 10 otter_vm::object::load_own_data_slot_by_shape::h040a7b316c4ad92a  (in otter-engine-benchmark) + 84  [0x101571c0c]  object.rs:2261
+                              + ! 1 otter_vm::object::load_own_data_slot_by_shape::h040a7b316c4ad92a  (in otter-engine-benchmark) + 0  [0x101571bb8]  object.rs:2239
+                              + 53 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 1484  [0x1013805a8]  mod.rs:619
+                              + ! 27 otter_vm::interp::protos::_$LT$impl$u20$otter_vm..Interpreter$GT$::is_callable_runtime::hdeb3f2498c8e746d  (in otter-engine-benchmark) + 80,104,...  [0x101542170,0x101542188,...]  protos.rs:345
+                              + ! 19 otter_vm::interp::protos::_$LT$impl$u20$otter_vm..Interpreter$GT$::is_callable_runtime::hdeb3f2498c8e746d  (in otter-engine-benchmark) + 36,12,...  [0x101542144,0x10154212c,...]  protos.rs:342
+                              + ! 7 otter_vm::interp::protos::_$LT$impl$u20$otter_vm..Interpreter$GT$::is_callable_runtime::hdeb3f2498c8e746d  (in otter-engine-benchmark) + 92  [0x10154217c]  tag.rs:0
+                              + 41 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 908  [0x101380368]  mod.rs:606
+                              + ! 18 otter_vm::execution_context::ExecutionContext::property_ic_site::h48a350bda550dbfc  (in otter-engine-benchmark) + 16,12,...  [0x101444324,0x101444320,...]  execution_context.rs:427
+                              + ! 14 otter_vm::execution_context::ExecutionContext::property_ic_site::h48a350bda550dbfc  (in otter-engine-benchmark) + 156,144  [0x1014443b0,0x1014443a4]  execution_context.rs:428
+                              + ! 9 otter_vm::execution_context::ExecutionContext::property_ic_site::h48a350bda550dbfc  (in otter-engine-benchmark) + 164,176  [0x1014443b8,0x1014443c4]  execution_context.rs:429
+                              + 40 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 616,548,...  [0x101380244,0x101380200,...]  mod.rs:593
+                              + 32 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 408,380,...  [0x101380174,0x101380158,...]  mod.rs:589
+                              + 29 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 364  [0x101380148]  mod.rs:586
+                              + ! 14 otter_vm::function_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::continue_pending_bind_function::hd758b0e875d77f13  (in otter-engine-benchmark) + 56  [0x1013ad854]  function_ops.rs:452
+                              + ! 9 otter_vm::function_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::continue_pending_bind_function::hd758b0e875d77f13  (in otter-engine-benchmark) + 32  [0x1013ad83c]  function_ops.rs:449
+                              + ! 4 otter_vm::function_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::continue_pending_bind_function::hd758b0e875d77f13  (in otter-engine-benchmark) + 408  [0x1013ad9b4]  function_ops.rs:0
+                              + ! 2 otter_vm::function_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::continue_pending_bind_function::hd758b0e875d77f13  (in otter-engine-benchmark) + 0  [0x1013ad81c]  function_ops.rs:443
+                              + 24 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 1436,1404,...  [0x101380578,0x101380558,...]  mod.rs:616
+                              + 23 otter_vm::function_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::continue_pending_bind_function::hd758b0e875d77f13  (in otter-engine-benchmark) + 436,440,...  [0x1013ad9d0,0x1013ad9d4,...]  function_ops.rs:489
+                              + 22 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 36,108,...  [0x101380000,0x101380048,...]  mod.rs:581
+                              + 22 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 168,120,...  [0x101380084,0x101380054,...]  mod.rs:582
+                              + 22 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 928,948  [0x10138037c,0x101380390]  mod.rs:614
+                              + 22 smallvec::SmallVec$LT$A$GT$::with_capacity::hca60f8b428502bb3  (in otter-engine-benchmark) + 88  [0x1015f1a24]  lib.rs:834
+                              + 21 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 444  [0x101380198]  mod.rs:590
+                              + ! 15 smallvec::SmallVec$LT$A$GT$::with_capacity::hca60f8b428502bb3  (in otter-engine-benchmark) + 76,60,...  [0x1015f1a18,0x1015f1a08,...]  lib.rs:833
+                              + ! 3 smallvec::SmallVec$LT$A$GT$::with_capacity::hca60f8b428502bb3  (in otter-engine-benchmark) + 20  [0x1015f19e0]  lib.rs:831
+                              + ! 2 smallvec::SmallVec$LT$A$GT$::with_capacity::hca60f8b428502bb3  (in otter-engine-benchmark) + 84  [0x1015f1a20]  lib.rs:834
+                              + ! 1 smallvec::SmallVec$LT$A$GT$::with_capacity::hca60f8b428502bb3  (in otter-engine-benchmark) + 4  [0x1015f19d0]  lib.rs:830
+                              + 18 otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::invoke::hc7d00ed01322834c  (in otter-engine-benchmark) + 1492  [0x1015b28f8]  call_ops.rs:1621
+                              + 18 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 484,444  [0x1013801c0,0x101380198]  mod.rs:591
+                              + 15 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 708,1284,...  [0x1013802a0,0x1013804e0,...]  mod.rs:0
+                              + 14 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 296  [0x101380104]  mod.rs:584
+                              + 10 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 1320,1364,...  [0x101380504,0x101380530,...]  active_frame.rs:0
+                              + 10 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 920  [0x101380374]  mod.rs:612
+                              + 10 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 1448  [0x101380584]  mod.rs:618
+                              + 9 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 244,236,...  [0x1013800d0,0x1013800c8,...]  mod.rs:583
+                              + 9 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 1472  [0x10138059c]  mod.rs:617
+                              + 8 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 344,348,...  [0x101380134,0x101380138,...]  mod.rs:586
+                              + 8 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 896,856  [0x10138035c,0x101380334]  mod.rs:606
+                              + 7 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 492,508,...  [0x1013801c8,0x1013801d8,...]  mod.rs:592
+                              + 5 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 1384  [0x101380544]  mod.rs:613
+                              + 4 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 20,0,...  [0x10137fff0,0x10137ffdc,...]  mod.rs:575
+                              + 4 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 1484  [0x1013805a8]  mod.rs:619
+                              + 4 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 1492  [0x1013805b0]  mod.rs:621
+                              327 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 5260  [0x10154e20c]  dispatch.rs:747
+                              + 199 otter_vm::property_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::drive_load_property::hf55fe081cf210003  (in otter-engine-benchmark) + 1352  [0x10144c8b4]  property_dispatch.rs:3520
+                              + ! 84 otter_vm::interp::feedback::FeedbackDirectory::probe_load::h4c5f46b3c95645a1  (in otter-engine-benchmark) + 476  [0x101552b78]  feedback.rs:123
+                              + ! : 62 otter_vm::object::load_own_data_slot_atom::h3a43b51099196f2e  (in otter-engine-benchmark) + 100,52,...  [0x10156f6c8,0x10156f698,...]  object.rs:2174
+                              + ! : 13 otter_vm::object::load_own_data_slot_atom::h3a43b51099196f2e  (in otter-engine-benchmark) + 712  [0x10156f92c]  object.rs:2174
+                              + ! : | 9 otter_vm::object::ObjectBody::slot_word::h0e72d4b96a492523  (in otter-engine-benchmark) + 32,40  [0x1015669b4,0x1015669bc]  object.rs:888
+                              + ! : | 3 otter_vm::object::ObjectBody::slot_word::h0e72d4b96a492523  (in otter-engine-benchmark) + 48  [0x1015669c4]  object.rs:892
+                              + ! : | 1 otter_vm::object::ObjectBody::slot_word::h0e72d4b96a492523  (in otter-engine-benchmark) + 0  [0x101566994]  object.rs:878
+                              + ! : 9 otter_vm::object::load_own_data_slot_atom::h3a43b51099196f2e  (in otter-engine-benchmark) + 716  [0x10156f930]  object.rs:2174
+                              + ! :   5 otter_vm::value::compressed::decompress::hdf1e68d2a8dc3f95  (in otter-engine-benchmark) + 0  [0x10150d98c]  compressed.rs:180
+                              + ! :   4 otter_vm::value::compressed::decompress::hdf1e68d2a8dc3f95  (in otter-engine-benchmark) + 48  [0x10150d9bc]  compressed.rs:181
+                              + ! 56 otter_vm::interp::feedback::FeedbackDirectory::probe_load::h4c5f46b3c95645a1  (in otter-engine-benchmark) + 140,456,...  [0x101552a28,0x101552b64,...]  feedback.rs:123
+                              + ! 29 otter_vm::object::load_own_data_slot_atom::h3a43b51099196f2e  (in otter-engine-benchmark) + 368,360,...  [0x10156f7d4,0x10156f7cc,...]  object.rs:2228
+                              + ! 20 otter_vm::interp::feedback::FeedbackDirectory::probe_load::h4c5f46b3c95645a1  (in otter-engine-benchmark) + 492,48  [0x101552b88,0x1015529cc]  feedback.rs:121
+                              + ! 9 otter_vm::interp::feedback::FeedbackDirectory::probe_load::h4c5f46b3c95645a1  (in otter-engine-benchmark) + 24  [0x1015529b4]  feedback.rs:114
+                              + ! 1 otter_vm::interp::feedback::FeedbackDirectory::probe_load::h4c5f46b3c95645a1  (in otter-engine-benchmark) + 508  [0x101552b98]  feedback.rs:124
+                              + 35 otter_vm::property_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::drive_load_property::hf55fe081cf210003  (in otter-engine-benchmark) + 120,64  [0x10144c3e4,0x10144c3ac]  property_dispatch.rs:3512
+                              + 27 otter_vm::property_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::drive_load_property::hf55fe081cf210003  (in otter-engine-benchmark) + 1420,1368,...  [0x10144c8f8,0x10144c8c4,...]  property_dispatch.rs:3524
+                              + 19 otter_vm::interp::feedback::FeedbackDirectory::probe_load::h4c5f46b3c95645a1  (in otter-engine-benchmark) + 528  [0x101552bac]  feedback.rs:124
+                              + 18 otter_vm::property_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::drive_load_property::hf55fe081cf210003  (in otter-engine-benchmark) + 344,328  [0x10144c4c4,0x10144c4b4]  property_dispatch.rs:3513
+                              + 15 otter_vm::property_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::drive_load_property::hf55fe081cf210003  (in otter-engine-benchmark) + 1340,1328  [0x10144c8a8,0x10144c89c]  property_dispatch.rs:3520
+                              + 6 otter_vm::property_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::drive_load_property::hf55fe081cf210003  (in otter-engine-benchmark) + 356  [0x10144c4d0]  property_dispatch.rs:3516
+                              + 2 otter_vm::property_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::drive_load_property::hf55fe081cf210003  (in otter-engine-benchmark) + 80  [0x10144c3bc]  index.rs:0
+                              + 2 otter_vm::property_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::drive_load_property::hf55fe081cf210003  (in otter-engine-benchmark) + 0  [0x10144c36c]  property_dispatch.rs:3501
+                              + 1 otter_vm::property_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::drive_load_property::hf55fe081cf210003  (in otter-engine-benchmark) + 36  [0x10144c390]  property_dispatch.rs:3511
+                              + 1 otter_vm::property_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::drive_load_property::hf55fe081cf210003  (in otter-engine-benchmark) + 1312  [0x10144c88c]  property_dispatch.rs:3517
+                              + 1 otter_vm::property_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::drive_load_property::hf55fe081cf210003  (in otter-engine-benchmark) + 1352  [0x10144c8b4]  property_dispatch.rs:3518
+                              + 1 otter_vm::property_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::drive_load_property::hf55fe081cf210003  (in otter-engine-benchmark) + 5672  [0x10144d994]  property_dispatch.rs:3791
+                              279 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 16868,16852,...  [0x101550f64,0x101550f54,...]  dispatch.rs:114
+                              243 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 268,12568,...  [0x10154ce8c,0x10154fe98,...]  dispatch.rs:0
+                              222 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 1336,1324  [0x10154d2b8,0x10154d2ac]  dispatch.rs:249
+                              158 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 1860  [0x10154d4c4]  dispatch.rs:257
+                              + 33 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::pop_frame_above::h0d20f9e1dcfebc33  (in otter-engine-benchmark) + 308,524,...  [0x10153fecc,0x10153ffa4,...]  frames.rs:475
+                              + 28 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::pop_frame_above::h0d20f9e1dcfebc33  (in otter-engine-benchmark) + 152,400,...  [0x10153fe30,0x10153ff28,...]  frames.rs:0
+                              + 22 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::pop_frame_above::h0d20f9e1dcfebc33  (in otter-engine-benchmark) + 36  [0x10153fdbc]  frames.rs:446
+                              + 11 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::pop_frame_above::h0d20f9e1dcfebc33  (in otter-engine-benchmark) + 20,4  [0x10153fdac,0x10153fd9c]  frames.rs:440
+                              + 11 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::pop_frame_above::h0d20f9e1dcfebc33  (in otter-engine-benchmark) + 2180  [0x10154061c]  frames.rs:523
+                              + 11 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::return_running_finally_above::h6cfa1ef995738c69  (in otter-engine-benchmark) + 20  [0x101541fd8]  frames.rs:621
+                              + 10 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::pop_frame_above::h0d20f9e1dcfebc33  (in otter-engine-benchmark) + 76  [0x10153fde4]  frames.rs:449
+                              + 9 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::return_running_finally_above::h6cfa1ef995738c69  (in otter-engine-benchmark) + 44,32  [0x101541ff0,0x101541fe4]  frames.rs:626
+                              + 7 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::pop_frame_above::h0d20f9e1dcfebc33  (in otter-engine-benchmark) + 2108  [0x1015405d4]  frames.rs:513
+                              + 4 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::return_running_finally_above::h6cfa1ef995738c69  (in otter-engine-benchmark) + 0  [0x101541fc4]  frames.rs:615
+                              + 4 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::return_running_finally_above::h6cfa1ef995738c69  (in otter-engine-benchmark) + 264  [0x1015420cc]  frames.rs:636
+                              + 3 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::pop_frame_above::h0d20f9e1dcfebc33  (in otter-engine-benchmark) + 2124  [0x1015405e4]  frames.rs:519
+                              + 2 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::pop_frame_above::h0d20f9e1dcfebc33  (in otter-engine-benchmark) + 864  [0x1015400f8]  frames.rs:501
+                              + 2 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::pop_frame_above::h0d20f9e1dcfebc33  (in otter-engine-benchmark) + 2148,2160  [0x1015405fc,0x101540608]  frames.rs:520
+                              + 1 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::pop_frame_above::h0d20f9e1dcfebc33  (in otter-engine-benchmark) + 2112  [0x1015405d8]  frames.rs:516
+                              148 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 252  [0x10154ce7c]  dispatch.rs:131
+                              145 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 12620  [0x10154fecc]  dispatch.rs:1799
+                              + 58 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_regs::hf3ef0566bd1f4dea  (in otter-engine-benchmark) + 524,540,...  [0x101466600,0x101466610,...]  arithmetic_dispatch.rs:331
+                              + 20 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_regs::hf3ef0566bd1f4dea  (in otter-engine-benchmark) + 68,40  [0x101466438,0x10146641c]  arithmetic_dispatch.rs:327
+                              + 19 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_regs::hf3ef0566bd1f4dea  (in otter-engine-benchmark) + 72  [0x10146643c]  arithmetic_dispatch.rs:328
+                              + 12 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_regs::hf3ef0566bd1f4dea  (in otter-engine-benchmark) + 700,728,...  [0x1014666b0,0x1014666cc,...]  arithmetic_dispatch.rs:335
+                              + 11 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_regs::hf3ef0566bd1f4dea  (in otter-engine-benchmark) + 548  [0x101466618]  mod.rs:0
+                              + 10 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_regs::hf3ef0566bd1f4dea  (in otter-engine-benchmark) + 764,776,...  [0x1014666f0,0x1014666fc,...]  arithmetic_dispatch.rs:332
+                              + 7 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_regs::hf3ef0566bd1f4dea  (in otter-engine-benchmark) + 36,0  [0x101466418,0x1014663f4]  arithmetic_dispatch.rs:316
+                              + 5 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_regs::hf3ef0566bd1f4dea  (in otter-engine-benchmark) + 484  [0x1014665d8]  atomic.rs:0
+                              + 1 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_regs::hf3ef0566bd1f4dea  (in otter-engine-benchmark) + 792  [0x10146670c]  arithmetic_dispatch.rs:0
+                              + 1 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_regs::hf3ef0566bd1f4dea  (in otter-engine-benchmark) + 684  [0x1014666a0]  arithmetic_dispatch.rs:333
+                              + 1 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_regs::hf3ef0566bd1f4dea  (in otter-engine-benchmark) + 796  [0x101466710]  arithmetic_dispatch.rs:340
+                              134 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 1164,1148  [0x10154d20c,0x10154d1fc]  dispatch.rs:219
+                              109 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 456,1080,...  [0x10154cf48,0x10154d1b8,...]  dispatch.rs:204
+                              54 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 1092  [0x10154d1c4]  dispatch.rs:208
+                              43 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 16832,1788,...  [0x101550f40,0x10154d47c,...]  result.rs:0
+                              38 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 1008,904,...  [0x10154d170,0x10154d108,...]  dispatch.rs:181
+                              36 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 7324  [0x10154ea1c]  dispatch.rs:1731
+                              + 25 otter_vm::value::Value::to_boolean::h3e222d4e9c984231  (in otter-engine-benchmark) + 136,164,...  [0x10150db0c,0x10150db28,...]  mod.rs:1181
+                              + 11 otter_vm::value::Value::to_boolean::h3e222d4e9c984231  (in otter-engine-benchmark) + 0,8,...  [0x10150da84,0x10150da8c,...]  mod.rs:1178
+                              35 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 12992,13020,...  [0x101550040,0x10155005c,...]  dispatch.rs:1137
+                              35 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 13084  [0x10155009c]  dispatch.rs:1805
+                              + 21 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_imm::h672714b56b58d14d  (in otter-engine-benchmark) + 48  [0x1014661c0]  arithmetic_dispatch.rs:360
+                              + 8 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_imm::h672714b56b58d14d  (in otter-engine-benchmark) + 296  [0x1014662b8]  arithmetic_dispatch.rs:364
+                              + 2 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_imm::h672714b56b58d14d  (in otter-engine-benchmark) + 0  [0x101466190]  arithmetic_dispatch.rs:348
+                              + 2 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_imm::h672714b56b58d14d  (in otter-engine-benchmark) + 288  [0x1014662b0]  atomic.rs:0
+                              + 1 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_imm::h672714b56b58d14d  (in otter-engine-benchmark) + 52  [0x1014661c4]  arithmetic_dispatch.rs:361
+                              + 1 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_imm::h672714b56b58d14d  (in otter-engine-benchmark) + 416  [0x101466330]  arithmetic_dispatch.rs:366
+                              34 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 260,264,...  [0x10154ce84,0x10154ce88,...]  dispatch.rs:141
+                              32 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 6756  [0x10154e7e4]  dispatch.rs:1843
+                              + 12 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_less_than_imm::h8dcfb1cde08eda81  (in otter-engine-benchmark) + 48,28  [0x10146a124,0x10146a110]  arithmetic_dispatch.rs:424
+                              + 8 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_less_than_imm::h8dcfb1cde08eda81  (in otter-engine-benchmark) + 288,292  [0x10146a214,0x10146a218]  arithmetic_dispatch.rs:428
+                              + 8 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_less_than_imm::h8dcfb1cde08eda81  (in otter-engine-benchmark) + 360,376,...  [0x10146a25c,0x10146a26c,...]  arithmetic_dispatch.rs:430
+                              + 3 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_less_than_imm::h8dcfb1cde08eda81  (in otter-engine-benchmark) + 24  [0x10146a10c]  arithmetic_dispatch.rs:412
+                              + 1 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_less_than_imm::h8dcfb1cde08eda81  (in otter-engine-benchmark) + 344  [0x10146a24c]  arithmetic_dispatch.rs:433
+                              30 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_less_than_imm::h8dcfb1cde08eda81  (in otter-engine-benchmark) + 388,384  [0x10146a278,0x10146a274]  arithmetic_dispatch.rs:445
+                              28 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 12932  [0x101550004]  dispatch.rs:1134
+                              + 10 otter_vm::frame_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::materialized_this_binding::h3c7f718961e29c3b  (in otter-engine-benchmark) + 128  [0x1015ed380]  frame_ops.rs:165
+                              + 9 otter_vm::frame_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::materialized_this_binding::h3c7f718961e29c3b  (in otter-engine-benchmark) + 0  [0x1015ed300]  frame_ops.rs:143
+                              + 6 otter_vm::frame_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::materialized_this_binding::h3c7f718961e29c3b  (in otter-engine-benchmark) + 108  [0x1015ed36c]  frame_ops.rs:164
+                              + 2 otter_vm::frame_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::materialized_this_binding::h3c7f718961e29c3b  (in otter-engine-benchmark) + 124  [0x1015ed37c]  frame_ops.rs:0
+                              + 1 otter_vm::frame_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::materialized_this_binding::h3c7f718961e29c3b  (in otter-engine-benchmark) + 24  [0x1015ed318]  frame_ops.rs:148
+                              27 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 1048  [0x10154d198]  dispatch.rs:193
+                              26 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_regs::hf3ef0566bd1f4dea  (in otter-engine-benchmark) + 800,804  [0x101466714,0x101466718]  arithmetic_dispatch.rs:340
+                              24 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 13012  [0x101550054]  dispatch.rs:1137
+                              + 13 otter_vm::frame_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::frame_load_this::hd0b5de3e801c576c  (in otter-engine-benchmark) + 44,24  [0x1015eca20,0x1015eca0c]  frame_ops.rs:45
+                              + 8 otter_vm::frame_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::frame_load_this::hd0b5de3e801c576c  (in otter-engine-benchmark) + 192,216  [0x1015ecab4,0x1015ecacc]  frame_ops.rs:52
+                              + 3 otter_vm::frame_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::frame_load_this::hd0b5de3e801c576c  (in otter-engine-benchmark) + 0  [0x1015ec9f4]  frame_ops.rs:40
+                              24 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 12584  [0x10154fea8]  dispatch.rs:1798
+                              23 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 1020  [0x10154d17c]  dispatch.rs:192
+                              + 12 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::jit_generated_call_depth::habb4dabbef57dc84  (in otter-engine-benchmark) + 232,228  [0x101541f78,0x101541f74]  frames.rs:274
+                              + 10 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::jit_generated_call_depth::habb4dabbef57dc84  (in otter-engine-benchmark) + 12  [0x101541e9c]  frames.rs:255
+                              + 1 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::jit_generated_call_depth::habb4dabbef57dc84  (in otter-engine-benchmark) + 4  [0x101541e94]  frames.rs:251
+                              22 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 2604,2572,...  [0x10154d7ac,0x10154d78c,...]  dispatch.rs:1683
+                              22 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 1792,1824,...  [0x10154d480,0x10154d4a0,...]  dispatch.rs:252
+                              22 otter_vm::property_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::drive_load_property::hf55fe081cf210003  (in otter-engine-benchmark) + 5684,5692  [0x10144d9a0,0x10144d9a8]  property_dispatch.rs:3791
+                              21 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 13072,13076  [0x101550090,0x101550094]  dispatch.rs:1805
+                              21 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 5220  [0x10154e1e4]  dispatch.rs:746
+                              20 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 5176,5140,...  [0x10154e1b8,0x10154e194,...]  dispatch.rs:742
+                              19 otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_imm::h672714b56b58d14d  (in otter-engine-benchmark) + 548,544  [0x1014663b4,0x1014663b0]  arithmetic_dispatch.rs:373
+                              19 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 1144,324,...  [0x10154d1f8,0x10154cec4,...]  index.rs:0
+                              18 otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark) + 160,152  [0x10138007c,0x101380074]  mod.rs:1319
+                              17 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 336,340  [0x10154ced0,0x10154ced4]  dispatch.rs:157
+                              17 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 16928,16940  [0x101550fa0,0x101550fac]  dispatch.rs:374
+                              16 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 5264,5240,...  [0x10154e210,0x10154e1f8,...]  dispatch.rs:747
+                              13 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 248  [0x10154ce78]  dispatch.rs:133
+                              12 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 12608  [0x10154fec0]  dispatch.rs:1799
+                              11 otter_vm::frame_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::frame_load_this::hd0b5de3e801c576c  (in otter-engine-benchmark) + 392  [0x1015ecb7c]  frame_ops.rs:53
+                              11 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 12932,12916  [0x101550004,0x10154fff4]  dispatch.rs:1134
+                              11 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 7316,7328  [0x10154ea14,0x10154ea20]  dispatch.rs:1731
+                              10 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 5112  [0x10154e178]  dispatch.rs:740
+                              9 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 6744  [0x10154e7d8]  dispatch.rs:1843
+                              9 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 3404  [0x10154dacc]  dispatch.rs:341
+                              8 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 2548  [0x10154d774]  dispatch.rs:1679
+                              8 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 7356  [0x10154ea3c]  dispatch.rs:1735
+                              8 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 12280,12276,...  [0x10154fd78,0x10154fd74,...]  dispatch.rs:1787
+                              7 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 3392  [0x10154dac0]  active_frame.rs:0
+                              7 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 12988  [0x10155003c]  dispatch.rs:1136
+                              7 otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::pop_frame_above::h0d20f9e1dcfebc33  (in otter-engine-benchmark) + 112,104  [0x10153fe08,0x10153fe00]  frames.rs:524
+                              6 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 12896  [0x10154ffe0]  dispatch.rs:1129
+                              5 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 13048  [0x101550078]  dispatch.rs:1803
+                              4 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 13024,13036  [0x101550060,0x10155006c]  dispatch.rs:1138
+                              4 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 6720  [0x10154e7c0]  dispatch.rs:1841
+                              3 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 7284  [0x10154e9f4]  dispatch.rs:1724
+                              3 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 5216  [0x10154e1e0]  dispatch.rs:745
+                              2 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 12552  [0x10154fe88]  dispatch.rs:1773
+                              2 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 448  [0x10154cf40]  mod.rs:0
+                              1 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 236  [0x10154ce6c]  dispatch.rs:132
+                              1 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 284  [0x10154ce9c]  dispatch.rs:142
+                              1 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 7300  [0x10154ea04]  dispatch.rs:1728
+                              1 otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark) + 1852  [0x10154d4bc]  dispatch.rs:257
+
+Total number in stack (recursive counted multiple, when >=5):
+
+Sort by top of stack, same collapsed (when >= 5):
+        otter_vm::interp::dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::dispatch_loop_inner::h406aeff5872718b3  (in otter-engine-benchmark)        1711
+        otter_vm::method_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::do_call_method_value_inner::hebfcb9310591cb06  (in otter-engine-benchmark)        315
+        otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::push_bytecode_call_frame::h08cf999e6b114fa2  (in otter-engine-benchmark)        236
+        otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::invoke::hc7d00ed01322834c  (in otter-engine-benchmark)        216
+        otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_regs::hf3ef0566bd1f4dea  (in otter-engine-benchmark)        171
+        otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::pop_frame_above::h0d20f9e1dcfebc33  (in otter-engine-benchmark)        137
+        otter_vm::property_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::drive_load_property::hf55fe081cf210003  (in otter-engine-benchmark)        131
+        otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::alloc_reg_window::hb325b2c6782fe4de  (in otter-engine-benchmark)        115
+        otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bind_bytecode_call_arguments::h154cf07df039b0bc  (in otter-engine-benchmark)        114
+        otter_vm::interp::feedback::FeedbackDirectory::probe_load::h4c5f46b3c95645a1  (in otter-engine-benchmark)        105
+        _platform_memset_pattern16  (in libsystem_platform.dylib)        101
+        otter_vm::object::load_own_data_slot_atom::h3a43b51099196f2e  (in otter-engine-benchmark)        91
+        otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_less_than_imm::h8dcfb1cde08eda81  (in otter-engine-benchmark)        62
+        otter_vm::call_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::bytecode_call_target_parts::h5866fa6aaa509860  (in otter-engine-benchmark)        62
+        otter_vm::object::load_own_data_slot_by_shape::h040a7b316c4ad92a  (in otter-engine-benchmark)        62
+        otter_vm::arithmetic_dispatch::_$LT$impl$u20$otter_vm..Interpreter$GT$::run_add_imm::h672714b56b58d14d  (in otter-engine-benchmark)        54
+        otter_vm::interp::protos::_$LT$impl$u20$otter_vm..Interpreter$GT$::is_callable_runtime::hdeb3f2498c8e746d  (in otter-engine-benchmark)        53
+        otter_vm::function_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::continue_pending_bind_function::hd758b0e875d77f13  (in otter-engine-benchmark)        52
+        smallvec::SmallVec$LT$A$GT$::with_capacity::hca60f8b428502bb3  (in otter-engine-benchmark)        43
+        otter_vm::execution_context::ExecutionContext::property_ic_site::h48a350bda550dbfc  (in otter-engine-benchmark)        41
+        otter_vm::value::Value::to_boolean::h3e222d4e9c984231  (in otter-engine-benchmark)        36
+        otter_vm::activation_stack::ActivationStack::push::he51289c184663e2b  (in otter-engine-benchmark)        35
+        otter_vm::frame_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::frame_load_this::hd0b5de3e801c576c  (in otter-engine-benchmark)        35
+        otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::jit_generated_call_depth::habb4dabbef57dc84  (in otter-engine-benchmark)        32
+        otter_vm::frame_ops::_$LT$impl$u20$otter_vm..Interpreter$GT$::materialized_this_binding::h3c7f718961e29c3b  (in otter-engine-benchmark)        28
+        otter_vm::interp::frames::_$LT$impl$u20$otter_vm..Interpreter$GT$::return_running_finally_above::h6cfa1ef995738c69  (in otter-engine-benchmark)        28
+        DYLD-STUB$$memset_pattern16  (in otter-engine-benchmark)        14
+        otter_vm::object::ObjectBody::slot_word::h0e72d4b96a492523  (in otter-engine-benchmark)        13
+        otter_vm::value::compressed::decompress::hdf1e68d2a8dc3f95  (in otter-engine-benchmark)        9
+
+Binary Images:
+       0x100d9c000 -        0x101d54437 +otter-engine-benchmark (0) <7BA77BD3-E531-3B73-94C8-B327856C4EC6> /Users/*/otter-engine-benchmark
+       0x187750000 -        0x1877a2b4b  libobjc.A.dylib (951.7) <FF1D8AE4-ABEF-35F1-A30A-1183B9CB414F> /usr/lib/libobjc.A.dylib
+       0x1877a3000 -        0x1877d7d07  libdyld.dylib (1378) <B147D877-D0C2-388F-B38D-D3132E39905F> /usr/lib/system/libdyld.dylib
+       0x1877d8000 -        0x18787e217  dyld (1.0.0 - 1378) <A237EF81-B68B-37BA-A165-92C965529534> /usr/lib/dyld
+       0x18787f000 -        0x187882228  libsystem_blocks.dylib (96) <CC947089-488D-316B-A9C7-46DEC0F73145> /usr/lib/system/libsystem_blocks.dylib
+       0x187883000 -        0x1878d755f  libxpc.dylib (3102.120.13) <C40FCAE8-7A17-3D82-87CB-3DA4802ADEF1> /usr/lib/system/libxpc.dylib
+       0x1878d8000 -        0x1878f89ff  libsystem_trace.dylib (1861.120.4) <D0FABAB3-5AE7-3F10-8C62-60CBF5D70850> /usr/lib/system/libsystem_trace.dylib
+       0x1878f9000 -        0x1879a75f7  libcorecrypto.dylib (1922.121.1) <A01A158D-6FE7-3B1C-A2C4-6BCB90D7314A> /usr/lib/system/libcorecrypto.dylib
+       0x1879a8000 -        0x1879f81d7  libsystem_malloc.dylib (812.100.31) <5FAE4807-4D2B-3A95-A63A-DD96D3DA11B4> /usr/lib/system/libsystem_malloc.dylib
+       0x1879f9000 -        0x187a4023f  libdispatch.dylib (1542.100.32) <F071EFE4-299F-3089-ACC4-0025B8FFB52A> /usr/lib/system/libdispatch.dylib
+       0x187a41000 -        0x187a43ffb  libsystem_featureflags.dylib (103) <71FCFFBD-85F8-3365-AFE0-BECEA4369122> /usr/lib/system/libsystem_featureflags.dylib
+       0x187a44000 -        0x187ac4d9f  libsystem_c.dylib (1752.120.2) <694B7881-1BF3-3D0F-8F19-B50AE4E8EF8A> /usr/lib/system/libsystem_c.dylib
+       0x187ac5000 -        0x187b55ae7  libc++.1.dylib (2100.43) <5013C0F8-84A9-3B56-9FEB-C353816A750F> /usr/lib/libc++.1.dylib
+       0x187b56000 -        0x187b7075f  libc++abi.dylib (2100.43) <E482D257-E5A0-3816-BD97-7B39342958DA> /usr/lib/libc++abi.dylib
+       0x187b71000 -        0x187bae2af  libsystem_kernel.dylib (12377.121.6) <CC1CF985-BC65-3725-809F-4C1E36B8F4BA> /usr/lib/system/libsystem_kernel.dylib
+       0x187baf000 -        0x187bbbb3b  libsystem_pthread.dylib (539.100.4) <4F33683C-18C8-39A1-800B-2E3BD43BCC13> /usr/lib/system/libsystem_pthread.dylib
+       0x187bbc000 -        0x187bc4963  libsystem_platform.dylib (375.120.2) <160FD864-8D15-36FC-9E97-9725388CFAFE> /usr/lib/system/libsystem_platform.dylib
+       0x187bc5000 -        0x187bf46eb  libsystem_info.dylib (600) <3D62F2D9-F516-31BF-83C7-E203D872300B> /usr/lib/system/libsystem_info.dylib
+       0x187bf5000 -        0x18815331f  com.apple.CoreFoundation (6.9 - 5026.5.4) <04E3598B-F226-3250-B3B2-CE938DD4DB7E> /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
+       0x188154000 -        0x18846ebff  com.apple.LaunchServices (1141.1 - 1141.1) <F32798D4-CA63-3935-B694-F45DAFFE5655> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/LaunchServices
+       0x18846f000 -        0x1886579bf  com.apple.gpusw.MetalTools (1.0 - 1) <2C2180C9-E027-3712-BED5-73645D651BFD> /System/Library/PrivateFrameworks/MetalTools.framework/Versions/A/MetalTools
+       0x188658000 -        0x188e524bf  libBLAS.dylib (1551.100.26) <F078C775-D8DC-3C4D-879F-A9BB228DBE06> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBLAS.dylib
+       0x188e53000 -        0x188f6235f  com.apple.Lexicon-framework (1.0 - 195.12) <16E3C45A-3C24-33D7-AD1C-1F6A215E57E7> /System/Library/PrivateFrameworks/Lexicon.framework/Versions/A/Lexicon
+       0x188f63000 -        0x1890d0417  libSparse.dylib (184.80.2) <C479DB8D-CF22-336C-B455-0CF900D96647> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libSparse.dylib
+       0x1890d1000 -        0x1891640ff  com.apple.SystemConfiguration (1.21 - 1.21) <3E3C91CD-C9CE-3186-B49F-FBF3E6F1696B> /System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration
+       0x189165000 -        0x18919957b  libCRFSuite.dylib (55) <5220F98F-4B63-31DF-B1BA-F507F9441C35> /usr/lib/libCRFSuite.dylib
+       0x189462000 -        0x18a44441f  com.apple.Foundation (6.9 - 5026.5.4) <49DD529F-1708-3767-997B-1A4639A07536> /System/Library/Frameworks/Foundation.framework/Versions/C/Foundation
+       0x18a5f4000 -        0x18a714cbf  com.apple.CoreDisplay (291.4 - 291.4) <C5ACFCC5-A8E3-3DA5-BEB8-F3F3B932BD63> /System/Library/Frameworks/CoreDisplay.framework/Versions/A/CoreDisplay
+       0x18a715000 -        0x18aad7c1f  com.apple.audio.AudioToolboxCore (1.0 - 1556.604) <868DF717-7563-39D0-95EB-19AB37629A5A> /System/Library/PrivateFrameworks/AudioToolboxCore.framework/Versions/A/AudioToolboxCore
+       0x18aad8000 -        0x18ad00f1f  com.apple.CoreText (877.4.0.7 - 877.4.0.7) <F7410CD3-EF38-3134-868D-C8633BD5D7F7> /System/Library/Frameworks/CoreText.framework/Versions/A/CoreText
+       0x18ad01000 -        0x18b496e7f  com.apple.audio.CoreAudio (5.0 - 5.0) <242B3E7E-7A94-33DA-9D5B-C6739557CEB9> /System/Library/Frameworks/CoreAudio.framework/Versions/A/CoreAudio
+       0x18b497000 -        0x18b8b5aff  com.apple.security (7.0 - 61901.120.67) <8FDCF5BF-61B9-3D69-BF9E-D134D220B8D9> /System/Library/Frameworks/Security.framework/Versions/A/Security
+       0x18b8b6000 -        0x18bb8bd53  libicucore.A.dylib (76142.5.1.200) <EB0C6EA9-E934-3776-9FD1-AF5E473552AA> /usr/lib/libicucore.A.dylib
+       0x18bb8c000 -        0x18bb95e5f  libsystem_darwin.dylib (1752.120.2) <8858F025-745A-388E-9544-080781CC9A69> /usr/lib/system/libsystem_darwin.dylib
+       0x18bb96000 -        0x18be8dcbf  com.apple.CoreServices.CarbonCore (1333 - 1333) <D5517285-3BB1-37C7-9ECA-B9E6D99DF7CF> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/CarbonCore.framework/Versions/A/CarbonCore
+       0x18be8e000 -        0x18becdc1b  com.apple.CoreServicesInternal (505 - 505) <0FBC8F4C-B825-381C-8728-762844E11392> /System/Library/PrivateFrameworks/CoreServicesInternal.framework/Versions/A/CoreServicesInternal
+       0x18bece000 -        0x18bf0d1bf  com.apple.CSStore (1141.1 - 1141.1) <1E543EF0-6C96-389F-9B2A-9614B625D198> /System/Library/PrivateFrameworks/CoreServicesStore.framework/Versions/A/CoreServicesStore
+       0x18bf0e000 -        0x18bff625f  com.apple.framework.IOKit (2.0.2 - 100231.120.3) <13C5D661-B23A-3AD8-88BB-2DE56023B840> /System/Library/Frameworks/IOKit.framework/Versions/A/IOKit
+       0x18bff7000 -        0x18c0091b6  libsystem_notify.dylib (348.120.4) <64D76451-1E0C-369B-A631-54DA3140E083> /usr/lib/system/libsystem_notify.dylib
+       0x18d943000 -        0x18d9593ff  com.apple.UniformTypeIdentifiers (709 - 709) <D24AEC54-C332-3707-A7CC-BB0710F6D193> /System/Library/Frameworks/UniformTypeIdentifiers.framework/Versions/A/UniformTypeIdentifiers
+       0x18de35000 -        0x18df0d95f  libboringssl.dylib (532.120.8) <611779E1-4B3F-310E-B070-1062D4707AA4> /usr/lib/libboringssl.dylib
+       0x18df0e000 -        0x18e2c31df  com.apple.CFNetwork (1.0 - 3860.600.21) <96293549-E281-3713-8ABF-886F0F966951> /System/Library/Frameworks/CFNetwork.framework/Versions/A/CFNetwork
+       0x18e2c4000 -        0x18e2def7b  libsystem_networkextension.dylib (2226.120.19) <3A1DAD41-F14F-3595-B9BB-058A84308BE7> /usr/lib/system/libsystem_networkextension.dylib
+       0x18e2df000 -        0x18e2e0067  libenergytrace.dylib (23) <E59503ED-FB38-3FBC-8999-83124D31645B> /usr/lib/libenergytrace.dylib
+       0x18e2e1000 -        0x18e360f3f  libMobileGestalt.dylib (1484.120.3) <FA923504-DDCB-3138-ACC5-FB1D38183C78> /usr/lib/libMobileGestalt.dylib
+       0x18e361000 -        0x18e378fdf  libsystem_asl.dylib (406) <F40838DF-2F15-3F62-970F-DEE25706BF1B> /usr/lib/system/libsystem_asl.dylib
+       0x18e379000 -        0x18e39c797  com.apple.TCC (1.0 - 1) <46AC4453-DB23-3C07-A0EB-A68277A24098> /System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC
+       0x18e39d000 -        0x18e953bbf  com.apple.SkyLight (1.600.0 - 922.7) <6F1978A2-1B8A-3A44-903D-532EED7106EB> /System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/SkyLight
+       0x18e954000 -        0x18f0a903f  com.apple.CoreGraphics (2.0 - 1965.5.1) <3B96EADF-571C-3690-B5CE-7672B45CE859> /System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics
+       0x18f0aa000 -        0x18f251b8b  com.apple.ColorSync (4.13.0 - 3813.5.1) <24C07C0F-03C6-302B-9E54-5ED3A01B730E> /System/Library/Frameworks/ColorSync.framework/Versions/A/ColorSync
+       0x18f6a6000 -        0x18fa93f5f  com.apple.CoreData (120 - 1526) <0A6EBD87-B6D8-3CFB-88A9-A091CE155610> /System/Library/Frameworks/CoreData.framework/Versions/A/CoreData
+       0x18fa94000 -        0x18faafd5f  com.apple.ProtocolBuffer (1 - 310.25.2.9.2) <52A2B4A4-4DB3-3FC3-B3F1-21E64D2F2003> /System/Library/PrivateFrameworks/ProtocolBuffer.framework/Versions/A/ProtocolBuffer
+       0x18fab0000 -        0x18fc98a2f  libsqlite3.dylib (382) <2197AD4A-E0F8-38FF-924C-D9A97343680F> /usr/lib/libsqlite3.dylib
+       0x18fd3b000 -        0x18fe2c49f  com.apple.BaseBoard (732.1.1 - 732.1.1) <03F3FD64-6BF3-326A-8004-C4EE9563571A> /System/Library/PrivateFrameworks/BaseBoard.framework/Versions/A/BaseBoard
+       0x18fe2d000 -        0x18fe9893f  com.apple.RunningBoardServices (1.0 - 1015.100.16) <0E844E62-6BFB-3446-85DC-61C0A6488511> /System/Library/PrivateFrameworks/RunningBoardServices.framework/Versions/A/RunningBoardServices
+       0x18fe99000 -        0x18ff0cc37  com.apple.AE (944 - 944) <0B347618-0BCF-3104-84B4-C0C0909E9C80> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/AE.framework/Versions/A/AE
+       0x18ff0d000 -        0x18ff1ed87  libdns_services.dylib (2881.120.11) <E8717AA2-B706-36BB-A8FF-7EB3E64E58D5> /usr/lib/libdns_services.dylib
+       0x18ff1f000 -        0x18ff27387  libsystem_symptoms.dylib (2169.120.7) <F5029F5C-1BF3-31C7-892E-BC8606AC829E> /usr/lib/system/libsystem_symptoms.dylib
+       0x18ff28000 -        0x19174575f  com.apple.Network (1.0 - 5812.121.1) <C901F589-30E9-3847-B8FD-0DA14F3E8A09> /System/Library/Frameworks/Network.framework/Versions/A/Network
+       0x191746000 -        0x191775ddf  com.apple.analyticsd (1.0 - 1) <5F3582B5-C44E-3B5A-8C3D-E4DA63B8C6D8> /System/Library/PrivateFrameworks/CoreAnalytics.framework/Versions/A/CoreAnalytics
+       0x191776000 -        0x1917778bb  libDiagnosticMessagesClient.dylib (113) <0770F750-6155-3991-9FDE-968CB42647DF> /usr/lib/libDiagnosticMessagesClient.dylib
+       0x191778000 -        0x1917e433f  com.apple.spotlight.metadata.utilities (1.0 - 2418.5.9.101) <B4AB943C-5D50-3ADF-8175-4B56301C6DC3> /System/Library/PrivateFrameworks/MetadataUtilities.framework/Versions/A/MetadataUtilities
+       0x1917e5000 -        0x191870b5f  com.apple.Metadata (26.5 - 2418.5.9.101) <E968E783-21CF-32A8-9C69-6C6870C36CDC> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Metadata
+       0x191871000 -        0x19187a1eb  com.apple.DiskArbitration (2.7 - 2.7) <18127B89-B783-3D13-882D-4F601449EA8A> /System/Library/Frameworks/DiskArbitration.framework/Versions/A/DiskArbitration
+       0x19187b000 -        0x191c9f063  com.apple.vImage (8.1 - 632.120.2) <F2338A5A-848F-3745-9C95-92835FED69BC> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vImage.framework/Versions/A/vImage
+       0x191ca0000 -        0x1920b5cdf  com.apple.QuartzCore (1195.14.4 - 1195.14.4) <C57B87A6-283C-3588-87EF-145BBEE8E257> /System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore
+       0x1920b6000 -        0x1921074ff  libFontRegistry.dylib (408.4.0.1) <3480BBE1-4AE8-3066-BCB7-EAA15F37C64E> /System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/ATS.framework/Versions/A/Resources/libFontRegistry.dylib
+       0x1923ce000 -        0x1923dbaff  com.apple.OpenDirectory (26.5 - 666.100.1) <96F04359-D02E-3990-B798-4FE4448067BE> /System/Library/Frameworks/OpenDirectory.framework/Versions/A/OpenDirectory
+       0x1923dc000 -        0x19240527f  com.apple.CFOpenDirectory (26.5 - 666.100.1) <270997B5-219E-3253-AFDD-619027EFDC6B> /System/Library/Frameworks/OpenDirectory.framework/Versions/A/Frameworks/CFOpenDirectory.framework/Versions/A/CFOpenDirectory
+       0x192406000 -        0x19241291b  com.apple.CoreServices.FSEvents (1413.100.6 - 1413.100.6) <7AA0D80A-3240-37B5-94D2-0C9B14103993> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/FSEvents
+       0x192413000 -        0x19243c0df  com.apple.coreservices.SharedFileList (225 - 225) <997A2621-7998-38C3-B92C-7BD5A2A2B066> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/SharedFileList.framework/Versions/A/SharedFileList
+       0x19243d000 -        0x19244008f  libapp_launch_measurement.dylib (17) <7760B2FE-B4E6-3244-B941-0A5277879853> /usr/lib/libapp_launch_measurement.dylib
+       0x192441000 -        0x1924899bf  com.apple.CoreAutoLayout (1.0 - 34) <A53A5066-0626-325A-BADA-9F438AE63BB2> /System/Library/PrivateFrameworks/CoreAutoLayout.framework/Versions/A/CoreAutoLayout
+       0x19248a000 -        0x19257013b  libxml2.2.dylib (39.10) <F9320B7C-5B95-3777-B991-646318D41D0C> /usr/lib/libxml2.2.dylib
+       0x192571000 -        0x1925f185f  com.apple.CoreVideo (1.8 - 734.4) <8A36CB95-D65E-3838-8837-22FD9A7E3D9C> /System/Library/Frameworks/CoreVideo.framework/Versions/A/CoreVideo
+       0x1925f2000 -        0x1925f4f5f  com.apple.loginsupport (3.0 - 264.4.1) <867D855C-0CD1-32D3-9345-83E99EC84CB6> /System/Library/PrivateFrameworks/login.framework/Versions/A/Frameworks/loginsupport.framework/Versions/A/loginsupport
+       0x192633000 -        0x19265f65f  com.apple.UserManagement (1.0 - 1) <20A5542F-F968-33E9-ABEE-DF2829C727ED> /System/Library/PrivateFrameworks/UserManagement.framework/Versions/A/UserManagement
+       0x1941c3000 -        0x1941fb257  libsystem_containermanager.dylib (725.120.2) <518BE44D-AA31-31E6-B44B-A37AD5E47040> /usr/lib/system/libsystem_containermanager.dylib
+       0x1941fc000 -        0x19421825f  com.apple.IOSurface (393.5.7 - 393.5.7) <B572C01C-59C9-3A03-9EA2-899DE87F3702> /System/Library/Frameworks/IOSurface.framework/Versions/A/IOSurface
+       0x194219000 -        0x19422305f  com.apple.IOAccelerator (487.4.3 - 487.4.3) <1A671DA5-99DE-3CFC-83BF-2563BFA4E32F> /System/Library/PrivateFrameworks/IOAccelerator.framework/Versions/A/IOAccelerator
+       0x194224000 -        0x1944fdd5f  com.apple.Metal (373.2 - 373.2) <A5124C88-37B2-3F0D-94AC-B9A984420F0C> /System/Library/Frameworks/Metal.framework/Versions/A/Metal
+       0x1944fe000 -        0x19452705f  com.apple.audio.caulk (1.0 - 214.600.10) <47E71130-9608-3D99-ACEB-DF5638BC08DF> /System/Library/PrivateFrameworks/caulk.framework/Versions/A/caulk
+       0x194528000 -        0x1946c929f  com.apple.CoreMedia (1.0 - 3320.8.5.1) <A762A5D3-6049-3849-891B-5805936DAC48> /System/Library/Frameworks/CoreMedia.framework/Versions/A/CoreMedia
+       0x1946ca000 -        0x19499925f  libFontParser.dylib (435.4.0.2) <56AE3539-AFDA-3C4B-A32F-D6470E9C877B> /System/Library/PrivateFrameworks/FontServices.framework/libFontParser.dylib
+       0x194cef000 -        0x19502e8df  com.apple.ImageIO (3.3.0 - 2784.5.4) <6018F9E4-A50C-31EC-A4D4-3591A6BA11EE> /System/Library/Frameworks/ImageIO.framework/Versions/A/ImageIO
+       0x19502f000 -        0x195519f9f  com.apple.CoreImage (19.0.0 - 1592.120.2) <49179CFD-DE4F-3C89-9139-1FFCCABD1AC2> /System/Library/Frameworks/CoreImage.framework/Versions/A/CoreImage
+       0x19551a000 -        0x1955d3ddf  com.apple.MetalPerformanceShaders.MPSCore (1.0 - 1) <5ECFEA4E-D0ED-3809-AE36-F6A226913EC1> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSCore.framework/Versions/A/MPSCore
+       0x1955d4000 -        0x1955d85d7  libsystem_configuration.dylib (1405.120.5) <0F7BBC1C-3D50-3E59-A31F-E4672A80BCEB> /usr/lib/system/libsystem_configuration.dylib
+       0x1955d9000 -        0x1955df8cf  libsystem_sandbox.dylib (2680.120.12) <EC3A75EA-44C0-3A0B-9BF7-71C117B0A9C6> /usr/lib/system/libsystem_sandbox.dylib
+       0x1955e0000 -        0x1955e117f  com.apple.AggregateDictionary (1.0 - 1) <9526ACB3-9F77-3C63-94E3-1F7FF9FFD848> /System/Library/PrivateFrameworks/AggregateDictionary.framework/Versions/A/AggregateDictionary
+       0x1955e2000 -        0x1955e64d3  com.apple.AppleSystemInfo (3.1.5 - 3.1.5) <1AF0471A-7CA4-363A-A88C-878F918559C3> /System/Library/PrivateFrameworks/AppleSystemInfo.framework/Versions/A/AppleSystemInfo
+       0x1955e7000 -        0x1955e846b  liblangid.dylib (140) <150F6708-1CA6-341A-A2A0-46CB1BA1A23C> /usr/lib/liblangid.dylib
+       0x1955e9000 -        0x19570845f  com.apple.CoreNLP (1.0 - 313) <50C546E9-E6E0-3E9F-9E7A-9473578D7433> /System/Library/PrivateFrameworks/CoreNLP.framework/Versions/A/CoreNLP
+       0x195709000 -        0x19570f91f  com.apple.LinguisticData (1.0 - 483.10) <88A7B02D-D5D3-3120-9D38-BCD3B8A1BC08> /System/Library/PrivateFrameworks/LinguisticData.framework/Versions/A/LinguisticData
+       0x195710000 -        0x196797bcf  libBNNS.dylib (1961.120.8) <27D26BDE-14F4-3EBC-9A1F-195C0F69EFB7> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBNNS.dylib
+       0x196798000 -        0x1968d546f  libvDSP.dylib (1126.100.7) <81359684-F2CB-3A26-A032-265A85B354EB> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libvDSP.dylib
+       0x19690a000 -        0x196943267  com.apple.IOMobileFramebuffer (343.0.0 - 343.0.0) <AD6AF1CD-4106-32CB-9512-A51BD8DAC459> /System/Library/PrivateFrameworks/IOMobileFramebuffer.framework/Versions/A/IOMobileFramebuffer
+       0x196b3c000 -        0x196b536df  com.apple.MobileKeyBag (2.0 - 1.0) <DD679B3D-7C31-3A73-AA3F-E38AE71F6082> /System/Library/PrivateFrameworks/MobileKeyBag.framework/Versions/A/MobileKeyBag
+       0x196b54000 -        0x196b620ff  com.apple.AssertionServices (1.0 - 1015.100.16) <2AFED4E5-1BEF-3620-A118-13C2487C5E8A> /System/Library/PrivateFrameworks/AssertionServices.framework/Versions/A/AssertionServices
+       0x196b63000 -        0x196bf5a9f  com.apple.securityfoundation (6.0 - 55293) <B186B3B6-62A5-3680-8FB4-1CC6DFB3D551> /System/Library/Frameworks/SecurityFoundation.framework/Versions/A/SecurityFoundation
+       0x196bf6000 -        0x196c272ff  com.apple.coreservices.BackgroundTaskManagement (1.0 - 104) <C8C301D5-8180-31EF-ACC6-F754D14E23AC> /System/Library/PrivateFrameworks/BackgroundTaskManagement.framework/Versions/A/BackgroundTaskManagement
+       0x196c33000 -        0x196c361fb  libquarantine.dylib (196.120.2) <5849009B-ACA3-3796-94C4-BBDF8D300EBA> /usr/lib/system/libquarantine.dylib
+       0x196c37000 -        0x196c422bf  libCheckFix.dylib (33) <60BF3A9B-F3E5-3AF0-ADE5-F86DEBD5CC5C> /usr/lib/libCheckFix.dylib
+       0x196c43000 -        0x196c5a7ab  libcoretls.dylib (187.100.3) <888DACFD-0135-3166-83EE-4E14D9A4A98B> /usr/lib/libcoretls.dylib
+       0x196c5b000 -        0x196c6c273  libbsm.0.dylib (90) <D82537E0-FE06-3158-BC46-D1073D1D4384> /usr/lib/libbsm.0.dylib
+       0x196c6d000 -        0x196ccbc6b  libmecab.dylib (1121.5.1) <B8A7C8DB-0176-3E90-929C-238A56EF45B8> /usr/lib/libmecab.dylib
+       0x196ccc000 -        0x196cce41b  libgermantok.dylib (31) <55193FF8-D101-3B4B-B6FB-01EA87FC3D37> /usr/lib/libgermantok.dylib
+       0x196ccf000 -        0x196ce2e3f  libLinearAlgebra.dylib (1551.100.26) <3849C130-9327-3672-88E1-B0E548F4EB82> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libLinearAlgebra.dylib
+       0x196ce3000 -        0x196f3917f  com.apple.MetalPerformanceShaders.MPSNeuralNetwork (1.0 - 1) <A8E8C36C-8F11-3ED5-B9B3-2810EDDD4D77> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSNeuralNetwork.framework/Versions/A/MPSNeuralNetwork
+       0x196f3a000 -        0x196f8e19f  com.apple.MetalPerformanceShaders.MPSRayIntersector (1.0 - 1) <FCB4E780-9954-345D-B82F-9D319958448E> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSRayIntersector.framework/Versions/A/MPSRayIntersector
+       0x197122000 -        0x19715357f  com.apple.MetalPerformanceShaders.MPSMatrix (1.0 - 1) <21591139-CD3C-36AB-8191-28193ACD17A7> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSMatrix.framework/Versions/A/MPSMatrix
+       0x197154000 -        0x197323cdf  com.apple.MetalPerformanceShaders.MPSNDArray (1.0 - 1) <1CBC037E-8038-32F6-880A-6F3825544713> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSNDArray.framework/Versions/A/MPSNDArray
+       0x197324000 -        0x1973b81df  com.apple.MetalPerformanceShaders.MPSImage (1.0 - 1) <35130CF5-F99D-3CED-9993-48AEE13ECA36> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSImage.framework/Versions/A/MPSImage
+       0x1973b9000 -        0x1973c44b3  com.apple.AppleFSCompression (174.100.2 - 1.0) <1B79BCD7-4B46-302B-8008-86CBD62FEB0A> /System/Library/PrivateFrameworks/AppleFSCompression.framework/Versions/A/AppleFSCompression
+       0x1973c5000 -        0x1973d10a3  libbz2.1.0.dylib (49) <928515D6-6108-3757-97F4-256F9F9CFBC8> /usr/lib/libbz2.1.0.dylib
+       0x1973d2000 -        0x1973d8d03  libsystem_coreservices.dylib (191.4.5) <9576143B-C303-35A3-BA63-1FD06EDA2BB1> /usr/lib/system/libsystem_coreservices.dylib
+       0x1973d9000 -        0x19740aadf  com.apple.CoreServices.OSServices (1141.1 - 1141.1) <F42F7727-9C73-3148-B41C-186607715B54> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/OSServices.framework/Versions/A/OSServices
+       0x19794e000 -        0x19795cd97  libz.1.dylib (100.120.1) <863BB312-F115-32B0-889F-D3B42857A7A6> /usr/lib/libz.1.dylib
+       0x19795d000 -        0x19799aa77  libsystem_m.dylib (3312.100.1) <A7E0863C-101A-31A0-922B-ED9B02626151> /usr/lib/system/libsystem_m.dylib
+       0x19799b000 -        0x19799bc9b  libcharset.1.dylib (115.120.2) <338A5252-594A-3AC5-B274-5AB3CE5820C6> /usr/lib/libcharset.1.dylib
+       0x19799c000 -        0x19799f527  libmacho.dylib (1378) <755441B4-C034-3E3A-8E3C-F424FBB28261> /usr/lib/system/libmacho.dylib
+       0x1979a0000 -        0x1979b8dc3  libkxld.dylib (12377.121.6) <AC5F4062-6A0E-36D2-B06E-D6192FC77B7D> /usr/lib/system/libkxld.dylib
+       0x1979b9000 -        0x1979c63a7  libcommonCrypto.dylib (600035) <CE357BB1-2D49-37CC-9FFE-D093936B1475> /usr/lib/system/libcommonCrypto.dylib
+       0x1979c7000 -        0x1979d0ca3  libunwind.dylib (2100.2) <FC8F0C4E-6FB0-3E27-ABEF-B0FA720CD5E4> /usr/lib/system/libunwind.dylib
+       0x1979d1000 -        0x1979d8349  liboah.dylib (367.9) <8651ED4F-6506-3788-B56B-32EE414A85CA> /usr/lib/liboah.dylib
+       0x1979d9000 -        0x1979e37ff  libcopyfile.dylib (240) <8ACFAC7A-88E9-3EF4-853F-A9140FF110E5> /usr/lib/system/libcopyfile.dylib
+       0x1979e4000 -        0x1979e7987  libcompiler_rt.dylib (103.3) <AA79151F-C19D-3C7C-92F8-B10F04D82C1C> /usr/lib/system/libcompiler_rt.dylib
+       0x1979e8000 -        0x1979ec78b  libsystem_collections.dylib (1752.120.2) <72DB5BE7-EF78-37D0-8AAD-53E37CFE4287> /usr/lib/system/libsystem_collections.dylib
+       0x1979ed000 -        0x1979f04cf  libsystem_secinit.dylib (168.100.7) <E525C566-CDA4-3D99-B12B-1615FD54A1F3> /usr/lib/system/libsystem_secinit.dylib
+       0x1979f1000 -        0x1979f3bf7  libremovefile.dylib (85.100.6) <635E661D-80A7-340D-A165-3F7D318FDFC9> /usr/lib/system/libremovefile.dylib
+       0x1979f4000 -        0x1979f4f27  libkeymgr.dylib (31) <8C08891A-DF1C-3DCC-AB64-4742FD6BE9BA> /usr/lib/system/libkeymgr.dylib
+       0x1979f5000 -        0x1979fde37  libsystem_dnssd.dylib (2881.120.11) <6F45DF3F-233B-3BC3-BA8C-B43E7DA884BF> /usr/lib/system/libsystem_dnssd.dylib
+       0x1979fe000 -        0x197a0309b  libcache.dylib (95) <189B576E-6176-3F82-8FA4-5914B0BEAEE7> /usr/lib/system/libcache.dylib
+       0x197a04000 -        0x197a05ce3  libSystem.B.dylib (1356) <D65E4112-C151-3FF8-BEB7-4841436012D6> /usr/lib/libSystem.B.dylib
+       0x197a06000 -        0x197a07fcf  libfakelink.dylib (5) <C7FBDAB2-BA25-3B1B-924B-6CD5EB501D3D> /usr/lib/libfakelink.dylib
+       0x197a08000 -        0x197a08a33  com.apple.SoftLinking (1.0 - 71) <B47F8999-CDB3-308F-9129-E690590605D8> /System/Library/PrivateFrameworks/SoftLinking.framework/Versions/A/SoftLinking
+       0x197a3e000 -        0x197a452bb  libiconv.2.dylib (115.120.2) <7C02D8F4-1921-323C-9D3D-A5D9B0ACDD78> /usr/lib/libiconv.2.dylib
+       0x197a59000 -        0x197b50edf  libarchive.2.dylib (167.120.3) <98ED60D0-2C5C-31A2-81BA-17C9C2312B7E> /usr/lib/libarchive.2.dylib
+       0x197b51000 -        0x197bb685b  com.apple.SearchKit (1.4.2 - 1.4.2) <B73B7F8E-666B-33EA-AC89-9DE4F7C25835> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/SearchKit.framework/Versions/A/SearchKit
+       0x197bb7000 -        0x197bbf18f  libThaiTokenizer.dylib (28) <43BAB012-1CCE-3DDC-9832-3A93EF0BAD9C> /usr/lib/libThaiTokenizer.dylib
+       0x197bc0000 -        0x197be3f37  com.apple.applesauce (1.0 - 17.7) <9F8F8959-64E3-3B88-BC05-20ACA5436052> /System/Library/PrivateFrameworks/AppleSauce.framework/Versions/A/AppleSauce
+       0x197be4000 -        0x197bfc4ab  libapple_nghttp2.dylib (37.120.3) <7C8B8B14-EC40-3F5B-8265-8975D4D4E83B> /usr/lib/libapple_nghttp2.dylib
+       0x197bfd000 -        0x197c23ac3  libSparseBLAS.dylib (1551.100.26) <EF675037-43BA-3616-8BEF-662BA272F3D7> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libSparseBLAS.dylib
+       0x197c24000 -        0x197c2563f  com.apple.MetalPerformanceShaders.MetalPerformanceShaders (1.0 - 1) <1FC17E05-127E-3222-B3A2-72912C49821C> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/MetalPerformanceShaders
+       0x197c26000 -        0x197c2bff7  libpam.2.dylib (35) <24C42EB6-FC23-3D66-A260-CAD78EF8637B> /usr/lib/libpam.2.dylib
+       0x197c2c000 -        0x197d00d97  libcompression.dylib (193.120.2) <F9FEA7C5-8DE1-3EE6-BFD3-E8B5698D73A6> /usr/lib/libcompression.dylib
+       0x197d01000 -        0x197d05267  libQuadrature.dylib (8) <A285FC62-DE15-317B-8451-619953D3660A> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libQuadrature.dylib
+       0x197d06000 -        0x198ed694f  libLAPACK.dylib (1551.100.26) <7275296D-74F2-3020-B2C5-E2EA0E7A6F7A> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libLAPACK.dylib
+       0x198ed7000 -        0x198f2d43f  com.apple.DictionaryServices (1.2 - 382) <1C33980B-2B1B-3374-8DFF-C0589BDA8D37> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/DictionaryServices.framework/Versions/A/DictionaryServices
+       0x198f2e000 -        0x198f4c4f7  liblzma.5.dylib (21) <9F5AA0F6-7C29-3699-8AA3-C7B56284D3F4> /usr/lib/liblzma.5.dylib
+       0x198f4d000 -        0x198f4e85f  libcoretls_cfhelpers.dylib (187.100.3) <236BD946-7627-367C-8150-FCC9297471E1> /usr/lib/libcoretls_cfhelpers.dylib
+       0x198f4f000 -        0x198fc25c3  com.apple.APFS (2811.120.14 - 2811.120.14) <37C876CB-358E-3900-A8EF-93D70E577B7C> /System/Library/PrivateFrameworks/APFS.framework/Versions/A/APFS
+       0x198fc3000 -        0x198fd1693  libxar.1.dylib (503) <689E5ED9-2D46-3B4C-8942-B5A6D7495445> /usr/lib/libxar.1.dylib
+       0x198fd2000 -        0x198fd579b  libutil.dylib (73) <93D2F3FE-6001-3A87-BF89-3ECABFF334CE> /usr/lib/libutil.dylib
+       0x198fd6000 -        0x199000cdf  libxslt.1.dylib (21.13) <EABDBD76-C455-3D16-A1EE-4370F95E8D3E> /usr/lib/libxslt.1.dylib
+       0x199009000 -        0x199082587  libvMisc.dylib (1126.100.7) <73154851-2341-34B7-8214-625C9219A676> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libvMisc.dylib
+       0x199083000 -        0x19911245f  libate.dylib (3.0.9) <30643AB8-BA08-3222-9AD2-64248E503B89> /usr/lib/libate.dylib
+       0x19911c000 -        0x19912f1bf  com.apple.CrashReporterSupport (10.13 - 15140) <482F92F1-D855-36EC-8E3D-C084CFA61B27> /System/Library/PrivateFrameworks/CrashReporterSupport.framework/Versions/A/CrashReporterSupport
+       0x199273000 -        0x1992b3f9f  com.apple.pluginkit.framework (1.0 - 1) <6A017CC8-84D1-36E5-ADE4-2A2EDC08D67F> /System/Library/PrivateFrameworks/PlugInKit.framework/Versions/A/PlugInKit
+       0x19932a000 -        0x1993729ff  com.apple.AppleVAFramework (6.2.10 - 6.2.10) <6CFBB631-D1EF-3D92-AE69-6758E7BDE4C5> /System/Library/PrivateFrameworks/AppleVA.framework/Versions/A/AppleVA
+       0x199373000 -        0x19938dccf  libexpat.1.dylib (47) <B7EE1C84-0D24-3B3F-8A1F-94ADDCFE777C> /usr/lib/libexpat.1.dylib
+       0x19938e000 -        0x199397bd3  libheimdal-asn1.dylib (710.100.4) <AF872616-7404-3D91-BA6B-A723D4269665> /usr/lib/libheimdal-asn1.dylib
+       0x1994b7000 -        0x199578edf  com.apple.MediaExperience (1.0 - 1) <507B3FE7-C5C1-30DB-935C-C478FF7B4096> /System/Library/PrivateFrameworks/MediaExperience.framework/Versions/A/MediaExperience
+       0x1995a6000 -        0x1995b57ff  com.apple.GraphVisualizer (1.0 - 307) <6F1E4885-F5B7-3B50-9C33-044B6925A07F> /System/Library/PrivateFrameworks/GraphVisualizer.framework/Versions/A/GraphVisualizer
+       0x1995b6000 -        0x1995f551f  com.apple.OTSVG (1.0 - 877.4.0.7) <666515E5-7CF8-349D-952E-EDD2210CF63D> /System/Library/PrivateFrameworks/OTSVG.framework/Versions/A/OTSVG
+       0x1995f6000 -        0x199602c7f  com.apple.xpc.AppServerSupport (1.0 - 3102.120.13) <AB36D838-16DB-3974-ABEC-220B5026013E> /System/Library/PrivateFrameworks/AppServerSupport.framework/Versions/A/AppServerSupport
+       0x199603000 -        0x199609abf  libspindump.dylib (419.10) <5EAE94A8-4A96-3DBD-8FC6-DA684427813F> /usr/lib/libspindump.dylib
+       0x19960a000 -        0x1996cadff  com.apple.Heimdal (4.0 - 2.0) <29B023E7-2213-362C-80BD-8A463A229936> /System/Library/PrivateFrameworks/Heimdal.framework/Versions/A/Heimdal
+       0x199999000 -        0x1999dd6ef  com.apple.AppleJPEG (1.0 - 1) <63F815E9-899E-3F5E-8837-43C168F606C6> /System/Library/PrivateFrameworks/AppleJPEG.framework/Versions/A/AppleJPEG
+       0x1999de000 -        0x199b9e92f  libJP2.dylib (2784.5.4) <A3392AA7-53EF-3B19-9A87-505CBACE40C2> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libJP2.dylib
+       0x199b9f000 -        0x199ba0e1f  com.apple.WatchdogClient.framework (1.0 - 333) <05DDF467-0A3F-3F3F-821F-3063D15BDDF6> /System/Library/PrivateFrameworks/WatchdogClient.framework/Versions/A/WatchdogClient
+       0x199ba1000 -        0x199be6c1f  com.apple.MultitouchSupport.framework (9450.2 - 9450.2) <20C49E65-4FDC-3FA2-ADD2-8BD540F8849B> /System/Library/PrivateFrameworks/MultitouchSupport.framework/Versions/A/MultitouchSupport
+       0x199be7000 -        0x19a13d29f  com.apple.VideoToolbox (1.0 - 3320.8.5.1) <0B641B4E-092B-3EC7-A20E-B99157F4DDB7> /System/Library/Frameworks/VideoToolbox.framework/Versions/A/VideoToolbox
+       0x19a13e000 -        0x19a16320f  libAudioToolboxUtility.dylib (1556.604) <8679E444-23B4-3B9F-8D0A-18ACEED541C5> /usr/lib/libAudioToolboxUtility.dylib
+       0x19a164000 -        0x19a18e01f  libPng.dylib (2784.5.4) <42EE7A25-5004-3435-A453-0158C53A6C93> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libPng.dylib
+       0x19a18f000 -        0x19a1efa77  libTIFF.dylib (2784.5.4) <FC3ACF96-0841-360F-B36A-50A3B08AF198> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libTIFF.dylib
+       0x19a1f0000 -        0x19a20f257  com.apple.IOPresentment (67 - 67) <C9C0A630-F275-3ABE-BFE2-86ECE91F83CA> /System/Library/PrivateFrameworks/IOPresentment.framework/Versions/A/IOPresentment
+       0x19a210000 -        0x19a2147d3  com.apple.GPUWrangler (8.1.12 - 8.1.12) <1644240B-3D71-35E7-AC5B-2A69E6B29535> /System/Library/PrivateFrameworks/GPUWrangler.framework/Versions/A/GPUWrangler
+       0x19a215000 -        0x19a217913  libRadiance.dylib (2784.5.4) <86335ED6-B791-37F5-B57E-B6F9C50652D8> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libRadiance.dylib
+       0x19a218000 -        0x19a21d2f3  com.apple.DSExternalDisplay (3.1 - 380) <DDF7A5A5-72F8-3580-9FF6-2A02E4ADE864> /System/Library/PrivateFrameworks/DSExternalDisplay.framework/Versions/A/DSExternalDisplay
+       0x19a21e000 -        0x19a248baf  libJPEG.dylib (2784.5.4) <5B4F384D-EC75-3A03-BA74-A644FDF3F722> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libJPEG.dylib
+       0x19a277000 -        0x19a27c9fb  libGIF.dylib (2784.5.4) <D054410B-09D0-3856-B7CB-EEF320362B0B> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libGIF.dylib
+       0x19a27d000 -        0x19a28d19f  com.apple.CMCaptureCore (1.0 - 665.120.8) <95190CD1-3456-355B-9369-5604AA49C1F3> /System/Library/PrivateFrameworks/CMCaptureCore.framework/Versions/A/CMCaptureCore
+       0x19b205000 -        0x19b27386f  libusrtcp.dylib (5812.121.1) <54F1B848-D6B1-3DB0-B640-FA6A86262C1D> /usr/lib/libusrtcp.dylib
+       0x19b274000 -        0x19b8157bf  libswiftCore.dylib (6.3.2 - 6.3.2.1.3) <7669D858-D332-36C7-9C6C-4564FFBEA8D2> /usr/lib/swift/libswiftCore.dylib
+       0x19b8c9000 -        0x19b91e17f  libSessionUtility.dylib (398.601) <3D82E6A1-1D29-3274-84DD-BDF36B6F7962> /System/Library/PrivateFrameworks/AudioSession.framework/libSessionUtility.dylib
+       0x19b91f000 -        0x19baf3c3f  com.apple.audio.toolbox.AudioToolbox (1.14 - 1.14) <B0ED86EE-4A99-3D39-AFC1-BC3361F630D8> /System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox
+       0x19baf4000 -        0x19bb74b7f  com.apple.audio.AudioSession (1.0 - 398.601) <23137B46-437B-382A-BF06-17C82F58149B> /System/Library/PrivateFrameworks/AudioSession.framework/Versions/A/AudioSession
+       0x19bb75000 -        0x19bb8e39f  libAudioStatistics.dylib (262.601) <9AD96BE7-444B-3641-9B75-8F4EE1A686BF> /usr/lib/libAudioStatistics.dylib
+       0x19bc05000 -        0x19bc2119b  libresolv.9.dylib (96) <90D545B0-52B4-335D-A075-4A7B83C01FC8> /usr/lib/libresolv.9.dylib
+       0x19bc22000 -        0x19bc347e7  libsasl2.2.dylib (215) <28BFB13B-08D2-3705-A634-B4E888613489> /usr/lib/libsasl2.2.dylib
+       0x19be1d000 -        0x19befd337  libSMC.dylib (38) <CD66132B-7D67-36D2-82BC-FFFACBAAF05A> /usr/lib/libSMC.dylib
+       0x19bf5d000 -        0x19bf69c17  com.apple.NetAuth (6.2 - 6.2) <F039515C-B344-37B5-B705-E58B48AD3C5D> /System/Library/PrivateFrameworks/NetAuth.framework/Versions/A/NetAuth
+       0x19bf78000 -        0x19bf85b1f  com.apple.perfdata (1.0 - 130) <63F6F6B4-A2A8-3647-BDEB-50508AE91B8F> /System/Library/PrivateFrameworks/perfdata.framework/Versions/A/perfdata
+       0x19bf86000 -        0x19bf93c9f  libperfcheck.dylib (46) <F900A796-0FF7-3195-85CF-80D62DF5C477> /usr/lib/libperfcheck.dylib
+       0x19bf94000 -        0x19bfa5187  com.apple.Kerberos (3.0 - 1) <D81F4821-8D01-394B-812B-657C3114A356> /System/Library/Frameworks/Kerberos.framework/Versions/A/Kerberos
+       0x19bfa6000 -        0x19bff7aaf  com.apple.GSS (4.0 - 2.0) <9149B4E1-8502-3A93-9944-61323F4725E1> /System/Library/Frameworks/GSS.framework/Versions/A/GSS
+       0x19bff8000 -        0x19c008d6f  com.apple.CommonAuth (4.0 - 2.0) <B703DB83-34E2-3728-89DF-41421EC67747> /System/Library/PrivateFrameworks/CommonAuth.framework/Versions/A/CommonAuth
+       0x19c009000 -        0x19c0ed01f  com.apple.MobileAssets (1.0 - 1837.121.1) <95D9C5B8-40A8-3F25-B1FC-C4468D133923> /System/Library/PrivateFrameworks/MobileAsset.framework/Versions/A/MobileAsset
+       0x19c180000 -        0x19c18f160  com.apple.CorePhoneNumbers (1.0 - 1) <CF1CBC2C-A525-3C79-B709-D5C23B2CB33A> /System/Library/PrivateFrameworks/CorePhoneNumbers.framework/Versions/A/CorePhoneNumbers
+       0x19dd6b000 -        0x19de5ea36  com.apple.combine (1.0 - 3023) <D757C287-429D-3F70-B903-C942A00F2DAA> /System/Library/Frameworks/Combine.framework/Versions/A/Combine
+       0x1a00ac000 -        0x1a00ac86f  com.apple.Accelerate.vecLib (3.11 - vecLib 3.11) <46556F2E-DD6B-3A4A-B2A3-4F844ED123EC> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/vecLib
+       0x1a00d1000 -        0x1a00d198f  com.apple.CoreServices (1226 - 1226) <FF182FDE-8926-3DFB-8D12-C1258443F67F> /System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices
+       0x1a0350000 -        0x1a0350417  com.apple.Accelerate (1.11 - Accelerate 1.11) <1DF31AEA-3D8E-382D-9493-D74635AA1CD4> /System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate
+       0x1a124c000 -        0x1a125b5df  com.apple.SymptomDiagnosticReporter (1.0 - 411.120.4) <FF9F1A47-EE31-3182-9AA1-4D325D6DA8A0> /System/Library/PrivateFrameworks/SymptomDiagnosticReporter.framework/Versions/A/SymptomDiagnosticReporter
+       0x1a125c000 -        0x1a128a25f  com.apple.PowerLog (1.0 - 1) <BE05FF5C-4DE3-3B2C-B20F-BC5D46938816> /System/Library/PrivateFrameworks/PowerLog.framework/Versions/A/PowerLog
+       0x1a1298000 -        0x1a13496df  com.apple.DiscRecording (9.0.3 - 9030.4.5) <BCE71519-708B-3376-B013-2B691BD174AC> /System/Library/Frameworks/DiscRecording.framework/Versions/A/DiscRecording
+       0x1a134a000 -        0x1a137b137  com.apple.MediaKit (16 - 938) <A01852D0-D4E4-30EC-A47C-3B0AB6711F2F> /System/Library/PrivateFrameworks/MediaKit.framework/Versions/A/MediaKit
+       0x1a1e3d000 -        0x1a1e53950  libswiftDispatch.dylib (1542.100.32) <460CFC58-0973-3A20-B504-A0A294C1E16D> /usr/lib/swift/libswiftDispatch.dylib
+       0x1a219e000 -        0x1a222ac3f  com.apple.BoardServices (1.0 - 732.1.1) <B4561AEC-EE52-3447-960B-4D2F2F3EF720> /System/Library/PrivateFrameworks/BoardServices.framework/Versions/A/BoardServices
+       0x1a226b000 -        0x1a227853f  com.apple.GraphicsServices (1.0 - 1.0) <4236E533-C3F8-340F-A462-F15D599395A8> /System/Library/PrivateFrameworks/GraphicsServices.framework/Versions/A/GraphicsServices
+       0x1a2594000 -        0x1a25b5e9f  com.apple.DebugSymbols (216 - 217) <13499229-A245-3C95-AC94-1DB8B274CF09> /System/Library/PrivateFrameworks/DebugSymbols.framework/Versions/A/DebugSymbols
+       0x1a25b6000 -        0x1a2712ddf  com.apple.CoreSymbolication (16.0 - 64575.53.2) <C2CC83D4-7E1C-3E78-AEC8-1ABDE74F9FAD> /System/Library/PrivateFrameworks/CoreSymbolication.framework/Versions/A/CoreSymbolication
+       0x1a2713000 -        0x1a271d09f  com.apple.CoreTime (334.0.16.3 - 334.0.16.3) <FD342B51-EA5D-388C-9BAB-29F7670FE3FB> /System/Library/PrivateFrameworks/CoreTime.framework/Versions/A/CoreTime
+       0x1a406b000 -        0x1a40dd59f  com.apple.BackBoardServices (1.0 - 1.0) <DDC32AF8-8864-3DE0-A855-5283510925B9> /System/Library/PrivateFrameworks/BackBoardServices.framework/Versions/A/BackBoardServices
+       0x1a40de000 -        0x1a41194ef  com.apple.LDAPFramework (2.4.28 - 194.5) <53F32E19-D2E6-3256-9206-75B92E519199> /System/Library/Frameworks/LDAP.framework/Versions/A/LDAP
+       0x1a411a000 -        0x1a411b7b7  com.apple.TrustEvaluationAgent (2.0 - 38) <B2593AAA-A99A-30C1-A0FC-3315ACC16951> /System/Library/PrivateFrameworks/TrustEvaluationAgent.framework/Versions/A/TrustEvaluationAgent
+       0x1a4249000 -        0x1a430257f  com.apple.DiskImagesFramework (683.100.3 - 683.100.3) <C8288C8D-4483-3393-B249-E952FFAF1EBE> /System/Library/PrivateFrameworks/DiskImages.framework/Versions/A/DiskImages
+       0x1a4343000 -        0x1a43595bf  com.apple.RemoteServiceDiscovery (1.0 - 219.120.2) <CA4D9399-0E89-3014-92DD-B722678ED9F6> /System/Library/PrivateFrameworks/RemoteServiceDiscovery.framework/Versions/A/RemoteServiceDiscovery
+       0x1a435a000 -        0x1a436fc3f  com.apple.xpc.RemoteXPC (1.0 - 3102.120.13) <8CA8360A-FE67-33A5-AEE4-097AEE5B945C> /System/Library/PrivateFrameworks/RemoteXPC.framework/Versions/A/RemoteXPC
+       0x1a4404000 -        0x1a4484f43  libcurl.4.dylib (166.0.0.0.1) <2F97CC24-F631-37B1-83CA-54632BF597FE> /usr/lib/libcurl.4.dylib
+       0x1a448b000 -        0x1a44ce25f  com.apple.AppSupport (1.0.0 - 29) <7410CCEF-077F-37FF-B0B0-5D65B0D2F66C> /System/Library/PrivateFrameworks/AppSupport.framework/Versions/A/AppSupport
+       0x1a479f000 -        0x1a47a1f3f  com.apple.InternationalTextSearch (1.0 - 1) <F227A966-D677-379F-BAEF-89DC18A81AB7> /System/Library/PrivateFrameworks/InternationalTextSearch.framework/Versions/A/InternationalTextSearch
+       0x1a4d72000 -        0x1a4d723f7  libHeimdalProxy.dylib (88) <A963CA1C-050B-3E90-B2FF-D7989435DB5D> /System/Library/Frameworks/Kerberos.framework/Versions/A/Libraries/libHeimdalProxy.dylib
+       0x1a4d9d000 -        0x1a4dbbb9f  com.apple.StreamingZip (1.0 - 1) <F297C9A4-AEDF-3553-B20E-CD7DFC54CC0B> /System/Library/PrivateFrameworks/StreamingZip.framework/Versions/A/StreamingZip
+       0x1a4e15000 -        0x1a4e186bf  libswiftObjectiveC.dylib (951.7) <32C98979-0F18-3513-AFAB-2F5D2B9ED0B9> /usr/lib/swift/libswiftObjectiveC.dylib
+       0x1a4e19000 -        0x1a4e366ff  libswiftos.dylib (1082) <49255E53-3F00-3F06-A64A-76A63C798956> /usr/lib/swift/libswiftos.dylib
+       0x1a5d80000 -        0x1a5e0e85f  com.apple.proactive.support.ProactiveSupport (1.0 - 418.1) <29BBA828-5852-3A0C-94D9-C03990CB86CA> /System/Library/PrivateFrameworks/ProactiveSupport.framework/Versions/A/ProactiveSupport
+       0x1a5f0b000 -        0x1a5f2f29f  com.apple.ASEProcessing (1.55.0 - 1.55.0) <9271A817-7C78-3210-8B0C-91A552667200> /System/Library/PrivateFrameworks/ASEProcessing.framework/Versions/A/ASEProcessing
+       0x1a718e000 -        0x1a725cc1f  com.apple.audio.midi.CoreMIDI (2.0 - 88) <F649A68B-864A-3F02-959A-69FD9980B29C> /System/Library/Frameworks/CoreMIDI.framework/Versions/A/CoreMIDI
+       0x1a7e9c000 -        0x1a7ea075f  com.apple.IOSurfaceAccelerator (1.0.0 - 1.0.0) <70103161-0443-3F67-85D7-BD25455F271F> /System/Library/PrivateFrameworks/IOSurfaceAccelerator.framework/Versions/A/IOSurfaceAccelerator
+       0x1acd44000 -        0x1acd579ff  com.apple.HID (1.0 - 1) <E5C2582B-2B2A-3B7E-A473-DF40A707C4C8> /System/Library/PrivateFrameworks/HID.framework/Versions/A/HID
+       0x1b17ff000 -        0x1b180e1ff  com.apple.NetFS (6.0 - 4.0) <EC590F25-F5DD-35D6-A594-4BE577637264> /System/Library/Frameworks/NetFS.framework/Versions/A/NetFS
+       0x1b1d5a000 -        0x1b1d5c707  libswiftDarwin.dylib (377.120.8) <F2EED553-64EC-398C-98BA-32EFDFAE0FC3> /usr/lib/swift/libswiftDarwin.dylib
+       0x1b3dba000 -        0x1b3ea34bf  libquic.dylib (5812.121.1) <18372066-7FBC-34AD-AD6B-A7D31A879F8D> /usr/lib/libquic.dylib
+       0x1b3eaf000 -        0x1b3ed7eff  com.apple.private.SystemPolicy (1.0 - 1) <3B04FCE5-C2EF-3F95-94B5-C2E838F8F8F1> /System/Library/PrivateFrameworks/SystemPolicy.framework/Versions/A/SystemPolicy
+       0x1b4d84000 -        0x1b4e12bff  com.apple.LoggingSupport (1.0 - 1861.120.4) <2619A5F3-D97D-3946-B49A-5FA3164FB197> /System/Library/PrivateFrameworks/LoggingSupport.framework/Versions/A/LoggingSupport
+       0x1b4e13000 -        0x1b4e1facb  com.apple.MallocStackLogging (1.0 - 65000) <782A39D3-C9FD-3E0B-B8FB-26E5D749BE57> /System/Library/PrivateFrameworks/MallocStackLogging.framework/Versions/A/MallocStackLogging
+       0x1b4e45000 -        0x1b4e9db3f  libmis.dylib (463.100.17) <B0F26447-E3DF-33C0-AF33-1109BD0701EA> /usr/lib/libmis.dylib
+       0x1b4e9e000 -        0x1b4ea1c5f  com.apple.gpusw.GPURawCounter (34 - 34) <A0191D2E-4C57-30F7-A206-78FB4188D01E> /System/Library/PrivateFrameworks/GPURawCounter.framework/Versions/A/GPURawCounter
+       0x1b4ea2000 -        0x1b4ec187f  libswiftCoreAudio.dylib (411.601) <23AF0BE1-B688-3E32-90BB-920D0C00036A> /usr/lib/swift/libswiftCoreAudio.dylib
+       0x1b4ec2000 -        0x1b4ec8327  libswiftCoreFoundation.dylib (2411) <4C233FFB-F11A-34AA-9515-74C21E8EE968> /usr/lib/swift/libswiftCoreFoundation.dylib
+       0x1b4ed5000 -        0x1b4f21843  libswiftXPC.dylib (128.120.2) <0AA69D52-271B-38E0-A156-8BD7F73A4C9C> /usr/lib/swift/libswiftXPC.dylib
+       0x1b4f23000 -        0x1b4f238a3  libswiftIOKit.dylib (1) <D47B9CC1-B622-31ED-8957-FA79ED1718CE> /usr/lib/swift/libswiftIOKit.dylib
+       0x1b6f50000 -        0x1b6f892c7  libbootpolicy.dylib (289.100.5) <53AF23CF-CBCF-35E7-A3D6-1C4742A617AD> /usr/lib/libbootpolicy.dylib
+       0x1b8a14000 -        0x1b8a2b88b  libswiftsimd.dylib (23) <C949C0B7-988E-3352-9778-3568FC2BC4EA> /usr/lib/swift/libswiftsimd.dylib
+       0x1ba139000 -        0x1ba14237f  com.apple.IOAccelMemoryInfo (1.0 - 1) <3DFF5F1E-C080-3C9D-A8C5-3C56854BD24D> /System/Library/PrivateFrameworks/IOAccelMemoryInfo.framework/Versions/A/IOAccelMemoryInfo
+       0x1bb7fc000 -        0x1bb8050be  libswiftCoreMIDI.dylib (6) <68160211-1089-3958-A8A1-3E8B3C389499> /usr/lib/swift/libswiftCoreMIDI.dylib
+       0x1bbfe8000 -        0x1bbfeebbf  com.apple.MSUDataAccessor (1.0 - 1) <B73070EE-3FE8-354E-A3BB-84894636D3BA> /System/Library/PrivateFrameworks/MSUDataAccessor.framework/Versions/A/MSUDataAccessor
+       0x1bc410000 -        0x1bc472a5f  com.apple.SoftwareUpdateCoreSupport (1.0 - 1) <34E714DF-AC10-3E52-862E-7FD8AE96EFA7> /System/Library/PrivateFrameworks/SoftwareUpdateCoreSupport.framework/Versions/A/SoftwareUpdateCoreSupport
+       0x1bff34000 -        0x1bff8b23f  com.apple.biome.BiomeFoundation (1.0 - 209.18) <6F0943D8-345B-328C-8A5E-8D10B3BC3CC3> /System/Library/PrivateFrameworks/BiomeFoundation.framework/Versions/A/BiomeFoundation
+       0x1c2e63000 -        0x1c2e70a1f  libswiftMetal.dylib (373.2) <16B01E1B-6BDD-3C6B-9A8B-495C3B661B9B> /usr/lib/swift/libswiftMetal.dylib
+       0x1c2e71000 -        0x1c2e77e05  libswiftCompression.dylib (11) <5EA10BB9-2198-33D7-811A-BE5EAE0A2EED> /usr/lib/swift/libswiftCompression.dylib
+       0x1c3da2000 -        0x1c3e4cd5f  libFDR.dylib (1499.100.48) <62340EBF-17DB-3393-9653-003A30263E5D> /usr/lib/libFDR.dylib
+       0x1c3ece000 -        0x1c4498e9f  com.apple.biome.BiomeStreams (1.0 - 209.18) <B05E6A84-BC87-3977-B790-2391073FF393> /System/Library/PrivateFrameworks/BiomeStreams.framework/Versions/A/BiomeStreams
+       0x1c496c000 -        0x1c49808ff  com.apple.SoftwareUpdateCoreConnect (1.0 - 1) <8B5F0FE6-EFC0-32B3-8414-6E67E97CCD87> /System/Library/PrivateFrameworks/SoftwareUpdateCoreConnect.framework/Versions/A/SoftwareUpdateCoreConnect
+       0x1c6dbd000 -        0x1c6e27c1f  com.apple.osanalytics.OSAnalytics (1.0 - 1) <D3398082-B264-37E9-B546-1BB0DE974E81> /System/Library/PrivateFrameworks/OSAnalytics.framework/Versions/A/OSAnalytics
+       0x1c8257000 -        0x1c8258f9f  libswiftQuartzCore.dylib (5) <481AAE69-579E-3DF4-B1F0-113E54B8EAA9> /usr/lib/swift/libswiftQuartzCore.dylib
+       0x1c864a000 -        0x1c864f8e7  com.apple.kperf (1.0 - 1) <23264FF1-B323-3B46-893D-42378F45FE8A> /System/Library/PrivateFrameworks/kperf.framework/Versions/A/kperf
+       0x1c8761000 -        0x1c876663f  com.apple.MobileSystemServices (1.0 - 1) <05D57959-6BE2-3FFE-A842-09A3FA930624> /System/Library/PrivateFrameworks/MobileSystemServices.framework/Versions/A/MobileSystemServices
+       0x1c9d52000 -        0x1c9d7429f  libamsupport.dylib (434.120.4) <C01C56CE-81B4-308E-A1BE-07C445941133> /usr/lib/libamsupport.dylib
+       0x1ca150000 -        0x1ca1b00bf  com.apple.biome.BiomePubSub (1.0 - 209.18) <5BA2374F-9154-3DC4-A761-D3C6E167F148> /System/Library/PrivateFrameworks/BiomePubSub.framework/Versions/A/BiomePubSub
+       0x1ca1b1000 -        0x1ca1f3fff  com.apple.biome.BiomeStorage (1.0 - 209.18) <A69679B4-A9DF-39B0-B361-F116246BB7D7> /System/Library/PrivateFrameworks/BiomeStorage.framework/Versions/A/BiomeStorage
+       0x1cccea000 -        0x1cccf913f  libswiftUniformTypeIdentifiers.dylib (877.5.1) <BD304D00-8CE3-3528-914A-DBAD4831A95E> /usr/lib/swift/libswiftUniformTypeIdentifiers.dylib
+       0x1cccfa000 -        0x1ccdbfa9b  libswiftAccelerate.dylib (77.100.2) <4A2ADA9C-22FB-307F-AA1E-1D85F1579BCF> /usr/lib/swift/libswiftAccelerate.dylib
+       0x1ccf14000 -        0x1ccf2511f  libpartition2_dynamic.dylib (3476.120.8.0.2) <B57303C4-A549-35C8-9857-DEAC6891A79D> /usr/lib/libpartition2_dynamic.dylib
+       0x1cd481000 -        0x1cd48bfdf  com.apple.AFKUser (1.0 - 1) <51F853F3-E890-3D4D-A00D-12C7869B9B22> /System/Library/PrivateFrameworks/AFKUser.framework/Versions/A/AFKUser
+       0x1d0e75000 -        0x1d0ed675f  libswiftCoreMedia.dylib (3320.8.5.1) <1FA37857-B3AE-320D-A11A-675B3739BA08> /usr/lib/swift/libswiftCoreMedia.dylib
+       0x1d2628000 -        0x1d2629bbf  libswiftOSLog.dylib (10) <964AB4ED-4361-33BF-949F-C7DE591C5EBE> /usr/lib/swift/libswiftOSLog.dylib
+       0x1d66f7000 -        0x1d6803d5f  com.apple.Symbolication (16.0 - 64575.70.1) <1BAEF090-27B4-316B-8C9F-E891180781AE> /System/Library/PrivateFrameworks/Symbolication.framework/Versions/A/Symbolication
+       0x1dad39000 -        0x1dad493df  com.apple.OSLog (1.0 - 1861.120.4) <68746C62-44B2-377E-BB29-B0B4A6A92B5F> /System/Library/Frameworks/OSLog.framework/Versions/A/OSLog
+       0x1db04b000 -        0x1db15c75f  com.apple.InternalSwiftProtobuf (1.0 - 1.26.0) <41595ABE-4110-3482-8DA3-839277732E08> /System/Library/PrivateFrameworks/InternalSwiftProtobuf.framework/Versions/A/InternalSwiftProtobuf
+       0x1db222000 -        0x1db22d0bf  com.apple.HIDDisplay (1.0 - 1) <E74DCF87-47C7-326B-A77B-1CBB94583B79> /System/Library/PrivateFrameworks/HIDDisplay.framework/Versions/A/HIDDisplay
+       0x1e3214000 -        0x1e3214af3  com.apple.FeatureFlags (1.0 - 103) <9F17EE22-3F47-3F98-A9B9-1C46372AEE83> /System/Library/PrivateFrameworks/FeatureFlags.framework/Versions/A/FeatureFlags
+       0x1ec927000 -        0x1ec9295bf  com.apple.ConfigProfileHelper (18.0 - 1800) <097D7995-F903-3DA6-91D6-31952FBB2D32> /System/Library/PrivateFrameworks/ConfigProfileHelper.framework/Versions/A/ConfigProfileHelper
+       0x22d08e000 -        0x22d0952a3  libCoreFSCache.dylib (352.1) <6B2BF8F5-A992-3C28-9BCE-CDC8E4D40E78> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libCoreFSCache.dylib
+       0x22d096000 -        0x22d09b947  libCoreVMClient.dylib (352.1) <5E0DFF0A-81BA-36FB-9AD5-E3494D15B2CA> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libCoreVMClient.dylib
+       0x22d09c000 -        0x22d0ac2b7  com.apple.opengl (23.1.1 - 23.1.1) <E473AA13-611E-32CB-A676-213173E3AA9E> /System/Library/Frameworks/OpenGL.framework/Versions/A/OpenGL
+       0x22d0ad000 -        0x22d0af7bf  libCVMSPluginSupport.dylib (23.1.1) <B2CF6AE8-6BAA-3374-BF7E-311343B0104D> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libCVMSPluginSupport.dylib
+       0x22d0b0000 -        0x22d0b84ff  libGFXShared.dylib (23.1.1) <C699C599-0DD8-302A-A96F-3C50B9BD5BC7> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGFXShared.dylib
+       0x22d0b9000 -        0x22d0ec54b  libGLImage.dylib (23.1.1) <FC8B70C2-0EAE-303D-AF43-459CA7FB4B15> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGLImage.dylib
+       0x22d0ed000 -        0x22d1265bf  libGLU.dylib (23.1.1) <04FFC1B1-DD4D-3355-8EBD-FEA62D339822> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGLU.dylib
+       0x22d27d000 -        0x22d286bc7  libGL.dylib (23.1.1) <110554B2-60B8-39FE-B33B-27CE9F4E5F05> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.dylib
+       0x22f118000 -        0x22f28bf1f  com.apple.ExtensionFoundation (97 - 97) <A3567BE3-4AA2-3554-81AE-FE7EF41E535B> /System/Library/Frameworks/ExtensionFoundation.framework/Versions/A/ExtensionFoundation
+       0x2304fc000 -        0x23053ea1f  com.apple.LightweightCodeRequirements (1.0 - 1) <DB4F053F-0498-30C7-B2B9-697925B9F03B> /System/Library/Frameworks/LightweightCodeRequirements.framework/Versions/A/LightweightCodeRequirements
+       0x231362000 -        0x2313801ff  com.apple.MPSBenchmarkLoop (1.0 - 1) <A8171300-A2FE-39A3-8166-5ED347A9CD56> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSBenchmarkLoop.framework/Versions/A/MPSBenchmarkLoop
+       0x231381000 -        0x231394e7f  com.apple.MPSFunctions (1.0 - 1) <C50883F0-037D-3888-BC83-5DC5EEE82345> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSFunctions.framework/Versions/A/MPSFunctions
+       0x231395000 -        0x23139a53f  com.apple.MPSHost (1.0 - 1) <7A6AC05D-88B2-31A8-A0A7-F876BF0451B1> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSHost.framework/Versions/A/MPSHost
+       0x234642000 -        0x2347ae4bf  com.apple.SwiftData (1.0 - 135) <69089200-C33B-348E-8E66-8C5954BCF335> /System/Library/Frameworks/SwiftData.framework/Versions/A/SwiftData
+       0x23b28f000 -        0x23b2a3abf  com.apple.AppleDeviceQuerySupport (1.0 - 408.120.3) <B517FF44-3D3C-333E-BA06-5BF7F91B6D7E> /System/Library/PrivateFrameworks/AppleDeviceQuerySupport.framework/Versions/A/AppleDeviceQuerySupport
+       0x23ba1f000 -        0x23ba9a1d6  com.apple.AppleKeyStore (1.0 - 1.0) <0DE316FC-3C90-3738-8C19-A74D6E247698> /System/Library/PrivateFrameworks/AppleKeyStore.framework/Versions/A/AppleKeyStore
+       0x23c3c6000 -        0x23c3de9df  com.apple.private.AppleMobileFileIntegrity-fmk (1.0 - 1) <9B11DD7D-75DD-3784-945A-411BAED10953> /System/Library/PrivateFrameworks/AppleMobileFileIntegrity.framework/Versions/A/AppleMobileFileIntegrity
+       0x23c8d8000 -        0x23c8ea799  com.apple.AtomicsInternal (1.1.0 - 5026.5.5) <5BFF8B6A-704D-3822-804F-ED870A72A295> /System/Library/PrivateFrameworks/AtomicsInternal.framework/Versions/A/AtomicsInternal
+       0x23c9a7000 -        0x23c9c9dff  com.apple.imgaudio.AudioAnalytics (1.0 - 1) <8B4F7F16-1296-3152-A4E2-A360ACAE9622> /System/Library/PrivateFrameworks/AudioAnalytics.framework/Versions/A/AudioAnalytics
+       0x23d00b000 -        0x23d0537df  com.apple.BackBoardHIDEventFoundation (1.0 - 1) <0F0C872C-C531-3898-95BF-3BF1817C87FC> /System/Library/PrivateFrameworks/BackBoardHIDEventFoundation.framework/Versions/A/BackBoardHIDEventFoundation
+       0x23d0ec000 -        0x23d1058df  com.apple.biome.BiomeDSL (1.0 - 209.18) <F43D5A2A-4470-3827-8CCD-3E7AAA76242E> /System/Library/PrivateFrameworks/BiomeDSL.framework/Versions/A/BiomeDSL
+       0x23d106000 -        0x23d9b819f  com.apple.BiomeLibrary (274.57) <9C4145CD-3C99-35D4-930E-8F0BA4D34596> /System/Library/PrivateFrameworks/BiomeLibrary.framework/Versions/A/BiomeLibrary
+       0x23d9b9000 -        0x23d9beb5f  com.apple.biome.BiomeSync (1.0 - 209.18) <BD7C9096-8861-331A-BBD3-FC18BE64D611> /System/Library/PrivateFrameworks/BiomeSync.framework/Versions/A/BiomeSync
+       0x23efef000 -        0x23f0878bf  com.apple.biome.CascadeSets (1.0 - 209.18) <137A490E-E366-31C3-A126-FDB5550738F7> /System/Library/PrivateFrameworks/CascadeSets.framework/Versions/A/CascadeSets
+       0x24043f000 -        0x24057d4ee  com.apple.CollectionsInternal (1.2.0 - 5026.5.5) <9691DBE8-E342-36B5-8BC3-65954843303A> /System/Library/PrivateFrameworks/CollectionsInternal.framework/Versions/A/CollectionsInternal
+       0x247ae8000 -        0x247afb49f  com.apple.DeviceRecovery (1.0 - 1) <785D04A0-C0D8-3364-BDA5-560381C6553E> /System/Library/PrivateFrameworks/DeviceRecovery.framework/Versions/A/DeviceRecovery
+       0x249d86000 -        0x249d892ff  com.apple.FontServices (1.0 - 1) <A46AB82E-AF94-37A8-A8D8-48B6689934EB> /System/Library/PrivateFrameworks/FontServices.framework/Versions/A/FontServices
+       0x249d8a000 -        0x249e79e2f  libXTFontStaticRegistryData.dylib (335.4.0.6) <9092FEA3-2DFB-32A9-BEFB-01B43E166C48> /System/Library/PrivateFrameworks/FontServices.framework/libXTFontStaticRegistryData.dylib
+       0x249e7b000 -        0x249e87c9f  com.apple.FramePacing (1.0 - 1) <0CEB865C-17EB-3C26-B9C0-CE3689942DB2> /System/Library/PrivateFrameworks/FramePacing.framework/Versions/A/FramePacing
+       0x24afa9000 -        0x24afaef07  libGPUCompilerUtils.dylib (32023.884) <C4FEB8D0-1E65-3664-8CBE-0FFAB464AABC> /System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/libGPUCompilerUtils.dylib
+       0x24f41c000 -        0x24f45b797  libllvm-flatbuffers.dylib (32023.884) <DA37B086-97F7-3DC1-AA07-442AECCB1666> /System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/libllvm-flatbuffers.dylib
+       0x256d3a000 -        0x256e432df  com.apple.InstalledContentLibrary (1.0 - 1.0) <AEEEDDBF-FCD1-3251-B0E9-940CE296B1E1> /System/Library/PrivateFrameworks/InstalledContentLibrary.framework/Versions/A/InstalledContentLibrary
+       0x259765000 -        0x259f33cbf  com.apple.IntelligencePlatformLibrary (274.57) <A1865439-B63E-3211-A2C4-DAE7F7D25698> /System/Library/PrivateFrameworks/IntelligencePlatformLibrary.framework/Versions/A/IntelligencePlatformLibrary
+       0x25b815000 -        0x25beab923  com.apple.MIL (3520.4 - 3520.4.1) <43AB1D6B-D19B-3115-A2C0-25DF31A5786E> /System/Library/PrivateFrameworks/MIL.framework/Versions/A/MIL
+       0x260a21000 -        0x260a82abf  com.apple.MessageSecurity (1.0 - 195.121.2) <0BAED8A7-51DE-39EE-9686-893CE0916B1B> /System/Library/PrivateFrameworks/MessageSecurity.framework/Versions/A/MessageSecurity
+       0x265a82000 -        0x265aabb1f  com.apple.OSEligibility (319.121.1) <5C282C8D-F611-3A3F-B0C2-A9F376FE029F> /System/Library/PrivateFrameworks/OSEligibility.framework/Versions/A/OSEligibility
+       0x26670e000 -        0x26682685f  com.apple.ParsingInternal (0.0.1 - 5026.5.5) <7FD0C201-E1CC-3F69-AD54-681B3CD37313> /System/Library/PrivateFrameworks/ParsingInternal.framework/Versions/A/ParsingInternal
+       0x269bbb000 -        0x269bdce1f  com.apple.accessibility.PhotosensitivityProcessing (1.0 - 1) <EA136E97-3E2F-371B-A65D-A0BD5E1898D8> /System/Library/PrivateFrameworks/PhotosensitivityProcessing.framework/Versions/A/PhotosensitivityProcessing
+       0x269fcf000 -        0x26a00ba3c  com.apple.PoirotSQLite (1.0 - 1) <F6CD54D6-1342-3624-9949-5690E8135D66> /System/Library/PrivateFrameworks/PoirotSQLite.framework/Versions/A/PoirotSQLite
+       0x26a00c000 -        0x26a07925f  com.apple.PoirotSchematizer (1.0 - 1) <31B04A5B-1569-37D6-B5E3-22CA260A9A41> /System/Library/PrivateFrameworks/PoirotSchematizer.framework/Versions/A/PoirotSchematizer
+       0x26a07a000 -        0x26a0afbff  com.apple.PoirotUDFs (1.0 - 1) <257AE39F-8DAA-36F7-A806-1A38920A0131> /System/Library/PrivateFrameworks/PoirotUDFs.framework/Versions/A/PoirotUDFs
+       0x26b248000 -        0x26b38411f  com.apple.ProDisplayLibrary (10.4.28 - 10.4.28) <C91E3E87-39F7-3515-8D68-33537486959D> /System/Library/PrivateFrameworks/ProDisplayLibrary.framework/Versions/A/ProDisplayLibrary
+       0x26c33e000 -        0x26c3464df  com.apple.ReflectionInternal (1.0.0 - 5026.5.5) <EA5C8DB0-0187-3AB8-80B0-5AC888E8CDB1> /System/Library/PrivateFrameworks/ReflectionInternal.framework/Versions/A/ReflectionInternal
+       0x26d291000 -        0x26d2a49d7  com.apple.RuntimeInternal (1.0.0 - 5026.5.5) <04ADBC99-92B0-32EE-98A8-A4D73DCCCE6C> /System/Library/PrivateFrameworks/RuntimeInternal.framework/Versions/A/RuntimeInternal
+       0x26d4e3000 -        0x26d550abf  com.apple.SILManager (53.19 - 53.19) <4D5E48C2-F64C-3E12-B831-9D3BAE05317F> /System/Library/PrivateFrameworks/SILManager.framework/Versions/A/SILManager
+       0x2789be000 -        0x2789ea4a1  com.apple.security.SwiftASN1Internal (1.0 - 1) <B9F3D5F5-9880-3CFB-B799-1A2DE78AD70B> /System/Library/PrivateFrameworks/SwiftASN1Internal.framework/Versions/A/SwiftASN1Internal
+       0x27be11000 -        0x27be4d1df  com.apple.tightbeam (1.0 - 483.100.88) <AC90942B-457E-3814-959B-85EFAACBCA58> /System/Library/PrivateFrameworks/Tightbeam.framework/Versions/A/Tightbeam
+       0x280581000 -        0x2805822cf  com.apple.VideoToolboxParavirtualizationSupport (64.4.7 - 64.4.7) <C881C3D9-A5B6-36D5-B11A-4EE6D037DD24> /System/Library/PrivateFrameworks/VideoToolboxParavirtualizationSupport.framework/Versions/A/VideoToolboxParavirtualizationSupport
+       0x28a7e8000 -        0x28a88235f  libAppleArchive.dylib (450.100.4) <0FBEE8ED-BE69-3AC5-AC4E-6C28EEC29CF6> /usr/lib/libAppleArchive.dylib
+       0x28a93d000 -        0x28a94745f  libCoreEntitlements.dylib (80.100.6) <C9580199-FB51-35A3-AFCE-D4B3464E6E23> /usr/lib/libCoreEntitlements.dylib
+       0x28ac33000 -        0x28ac3a87f  libReverseProxyDevice.dylib (104.120.1.0.1) <37A5DD0C-9615-3BBD-8A88-0451A406D25F> /usr/lib/libReverseProxyDevice.dylib
+       0x28ac3b000 -        0x28ac42349  libRosetta.dylib (367.9) <8651ED4F-6506-3788-B56B-32EE414A85CA> /usr/lib/libRosetta.dylib
+       0x28acaa000 -        0x28acb33ff  libTLE.dylib (80.100.6) <207A2987-1BD0-3E47-B72C-E81934A6C74C> /usr/lib/libTLE.dylib
+       0x28b4af000 -        0x28b5c0b17  libcrypto.46.dylib (109.100.2) <F9685724-6622-3592-8336-B3811B583E83> /usr/lib/libcrypto.46.dylib
+       0x28b6fb000 -        0x28b717762  libhvf.dylib (11) <43426C58-BE90-3643-9103-B9EE4A06A18A> /usr/lib/libhvf.dylib
+       0x28c04e000 -        0x28c086527  libssl.48.dylib (109.100.2) <83762FDF-B375-3BB1-B568-854F8F11CF89> /usr/lib/libssl.48.dylib
+       0x28c0c1000 -        0x28c0ef16f  libswiftPrespecialized.dylib (0) <1CC9F48A-BC65-37E0-88A5-260C70D14A8F> /usr/lib/libswiftPrespecialized.dylib
+       0x28c38b000 -        0x28c39d043  libswiftDistributed.dylib (6.3.2 - 6.3.2.1.3) <67A11C98-0E0D-3DF8-846F-34276C54ECF3> /usr/lib/swift/libswiftDistributed.dylib
+       0x28c3b4000 -        0x28c3c3ebc  libswiftObservation.dylib (6.3.2 - 6.3.2.1.3) <CE9EF53F-E72B-32EC-A1F9-8EBE59A4F1BA> /usr/lib/swift/libswiftObservation.dylib
+       0x28c4f0000 -        0x28c5038ef  libswiftSynchronization.dylib (6.3.2 - 6.3.2.1.3) <1A965373-0DB6-3B50-BE38-52C30D67A090> /usr/lib/swift/libswiftSynchronization.dylib
+       0x28c504000 -        0x28c51ce60  libswiftSystem.dylib (75) <A4F80949-97A7-3A1A-A340-45D2D7A5AB89> /usr/lib/swift/libswiftSystem.dylib
+       0x28c51e000 -        0x28c53479f  libswiftVideoToolbox.dylib (3320.8.5.1) <3C381F76-0925-338E-BEDA-2ECB42333EBC> /usr/lib/swift/libswiftVideoToolbox.dylib
+       0x28c536000 -        0x28c536669  libswift_Builtin_float.dylib (6.3.2.1.3) <15ED1E36-16BC-327E-8FAA-9130DE11923C> /usr/lib/swift/libswift_Builtin_float.dylib
+       0x28c537000 -        0x28c5c2095  libswift_Concurrency.dylib (6.3.2 - 6.3.2.1.3) <E3545AA1-FF13-3698-8657-91BB23002DF9> /usr/lib/swift/libswift_Concurrency.dylib
+       0x28c5c3000 -        0x28c5c5f83  libswift_DarwinFoundation1.dylib (377.120.8) <2601FA08-2913-3370-89B6-C67DC05AC892> /usr/lib/swift/libswift_DarwinFoundation1.dylib
+       0x28c5c6000 -        0x28c5c6eeb  libswift_DarwinFoundation2.dylib (377.120.8) <38242BFE-54C8-3838-AE88-0083F7328580> /usr/lib/swift/libswift_DarwinFoundation2.dylib
+       0x28c5c7000 -        0x28c5c77a7  libswift_DarwinFoundation3.dylib (377.120.8) <6CFBAAE9-7293-3A51-83B9-E3988230EAC2> /usr/lib/swift/libswift_DarwinFoundation3.dylib
+       0x28c5c8000 -        0x28c66649f  libswift_RegexParser.dylib (6.3.2 - 6.3.2.1.3) <2FED4499-861B-37B8-8C94-5ABC7FD49726> /usr/lib/swift/libswift_RegexParser.dylib
+       0x28c667000 -        0x28c6f30cd  libswift_StringProcessing.dylib (6.3.2 - 6.3.2.1.3) <13999576-EB4F-3A0D-874F-A95AD5D7F296> /usr/lib/swift/libswift_StringProcessing.dylib
+       0x28c858000 -        0x28c85ba4b  libsystem_darwindirectory.dylib (122) <CF277A2C-C818-3F16-8B3F-3C7B39FCD164> /usr/lib/system/libsystem_darwindirectory.dylib
+       0x28c85c000 -        0x28c8655d3  libsystem_eligibility.dylib (319.121.1) <DDAC0531-0262-3DDC-8EC8-80EB9438847A> /usr/lib/system/libsystem_eligibility.dylib
+       0x28c866000 -        0x28c86d88b  libsystem_sanitizers.dylib (26.1) <44C4234F-8B2D-38D3-A774-B4B3C75AF3A7> /usr/lib/system/libsystem_sanitizers.dylib
+       0x28c86e000 -        0x28c86ebb7  libsystem_trial.dylib (474.2.18.2) <68C583BA-AFF5-3916-86AE-6E38BFEF98D6> /usr/lib/system/libsystem_trial.dylib

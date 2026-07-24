@@ -77,6 +77,40 @@ fn compile_identifier_with_envs(
     Ok(dst)
 }
 
+/// The frame register a plain identifier already lives in, when reading it
+/// needs no emitted instruction at all.
+///
+/// A [`BindingStorage::Register`] binding *is* the frame slot, so
+/// `compile_identifier` would lower a read of it to a single `LoadLocal`
+/// copying that slot into a temporary. An operator that reads its operands out
+/// of the register file before it coerces either one can address the slot
+/// directly instead, making the copy dead.
+///
+/// Returns `None` for every shape that needs real lowering: a `with` scope in
+/// effect, the `NaN` / `Infinity` pseudo-globals, a module import, a captured
+/// upvalue, a global, or a binding still in its temporal dead zone. Callers
+/// must additionally ensure no user code can run between this read and the
+/// operator, or the slot could be reassigned before the operator reads it.
+pub(crate) fn borrowed_local_register(cx: &Compiler, name: &str) -> Option<u16> {
+    if !cx.active_with_envs.is_empty() {
+        return None;
+    }
+    if matches!(name, "NaN" | "Infinity") {
+        return None;
+    }
+    if crate::module_state::find_module_import_binding(cx, name).is_some() {
+        return None;
+    }
+    let info = cx.lookup_binding(name)?;
+    if !info.initialized {
+        return None;
+    }
+    match info.storage {
+        BindingStorage::Register { reg } => Some(reg),
+        BindingStorage::Upvalue { .. } => None,
+    }
+}
+
 pub(crate) fn compile_identifier_without_with(
     cx: &mut Compiler,
     name: &str,

@@ -52,6 +52,72 @@ pub(crate) fn expr_is_primitive(expr: &Expression<'_>) -> bool {
     )
 }
 
+/// `true` when evaluating `expr` cannot run user code or write a binding.
+///
+/// Distinct from [`expr_is_primitive`], which describes the *result* type and
+/// admits shapes that do have effects (`a++`, a nested call). This is about
+/// evaluation order: a sibling operand may only be read straight out of its
+/// frame slot when nothing evaluated beside it can reassign that slot.
+/// The frame register a binary operand already lives in, when reading it needs
+/// no emitted instruction. See [`crate::expr::identifier::borrowed_local_register`].
+fn borrowed_operand(cx: &Compiler, expr: &Expression<'_>) -> Option<u16> {
+    match expr {
+        Expression::ParenthesizedExpression(p) => borrowed_operand(cx, &p.expression),
+        Expression::Identifier(id) => {
+            crate::expr::identifier::borrowed_local_register(cx, id.name.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn operand_is_effect_free(expr: &Expression<'_>) -> bool {
+    match expr {
+        Expression::ParenthesizedExpression(p) => operand_is_effect_free(&p.expression),
+        Expression::NumericLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::BigIntLiteral(_) => true,
+        // A negated numeric literal folds to a single constant load.
+        Expression::UnaryExpression(u) => {
+            matches!(u.operator, oxc_ast::ast::UnaryOperator::UnaryNegation)
+                && matches!(&u.argument, Expression::NumericLiteral(_))
+        }
+        _ => false,
+    }
+}
+
+/// `true` for the operators whose interpreter arms read *both* operand
+/// registers before performing any coercion, so an operand may name a live
+/// binding slot rather than a private copy of it. `instanceof` and `in` are
+/// excluded: they take the object-protocol path rather than the shared
+/// operand-pair read.
+const fn op_reads_operands_up_front(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Rem
+            | Op::Pow
+            | Op::BitwiseAnd
+            | Op::BitwiseOr
+            | Op::BitwiseXor
+            | Op::Shl
+            | Op::Shr
+            | Op::Ushr
+            | Op::Equal
+            | Op::NotEqual
+            | Op::LooseEqual
+            | Op::LooseNotEqual
+            | Op::LessThan
+            | Op::LessEq
+            | Op::GreaterThan
+            | Op::GreaterEq
+    )
+}
+
 /// `true` for opcodes whose optimizing-tier lowering is selected from the
 /// arithmetic feedback cell, and which therefore already emit a
 /// representation guard with a deoptimization exit. Only these may consume an
@@ -198,8 +264,6 @@ fn compile_binary_to(
     // result opcode below has read them, so recycle the whole range
     // into the destination register. See `FunctionContext::reset_scratch`.
     let mark = cx.scratch;
-    let lhs = compile_expr(cx, &b.left, span)?;
-    let rhs = compile_expr(cx, &b.right, span)?;
     let op = match b.operator {
         BinaryOperator::Addition => Op::Add,
         BinaryOperator::Subtraction => Op::Sub,
@@ -225,6 +289,31 @@ fn compile_binary_to(
         // §13.10.1 `RelationalExpression in ShiftExpression`.
         // <https://tc39.es/ecma262/#sec-relational-operators-runtime-semantics-evaluation>
         BinaryOperator::In => Op::HasProperty,
+    };
+    // A `BindingStorage::Register` binding *is* its frame slot, so lowering an
+    // operand that names one to a `LoadLocal` copies a slot the operator could
+    // have addressed directly. The copy used to be load-bearing: it snapshotted
+    // the operand before a *separate* coercion opcode could re-enter JavaScript
+    // and reassign the binding. Now that each operator runs its own ladder, its
+    // arm reads both operand registers up front, so the snapshot is redundant.
+    //
+    // The remaining hazard is evaluation order between the operands: the spec
+    // reads both before either is coerced, so a borrowed slot is only correct
+    // when the sibling operand cannot run code that reassigns it. Requiring
+    // every operand to be either a borrowable name or an effect-free literal
+    // removes that hazard entirely.
+    let borrow_left = borrowed_operand(cx, &b.left);
+    let borrow_right = borrowed_operand(cx, &b.right);
+    let borrowable = op_reads_operands_up_front(op)
+        && (borrow_left.is_some() || operand_is_effect_free(&b.left))
+        && (borrow_right.is_some() || operand_is_effect_free(&b.right));
+    let lhs = match borrow_left {
+        Some(reg) if borrowable => reg,
+        _ => compile_expr(cx, &b.left, span)?,
+    };
+    let rhs = match borrow_right {
+        Some(reg) if borrowable => reg,
+        _ => compile_expr(cx, &b.right, span)?,
     };
     // Coercion is the operator's own job. `Op::Add`, the relational
     // comparisons, and the non-additive numeric / bitwise / shift opcodes each

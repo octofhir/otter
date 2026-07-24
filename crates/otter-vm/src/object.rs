@@ -2227,6 +2227,39 @@ pub(crate) fn load_own_data_slot_atom(
     })
 }
 
+/// Read a cached own data slot guarded by shape identity alone.
+///
+/// A shape-handle match fixes both the slot and its key, so the atom compare
+/// [`load_own_data_slot_atom`] performs is redundant here. Used by the
+/// monomorphic method-call IC, whose cached `hit` was recorded against this same
+/// shape: the hot path is a single offset compare plus a slab read, with no atom
+/// resolution and no stub walk. Only the shaped, non-overridden, non-exotic data
+/// fast path is served; anything else returns `None` so the caller falls back to
+/// full method resolution.
+pub(crate) fn load_own_data_slot_by_shape(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    hit: AtomOwnPropertyHit,
+) -> Option<Value> {
+    heap.read_payload(obj, |body| {
+        if body.shape.is_null()
+            || body.shape != hit.shape
+            || !hit.is_data
+            || body.slot_attrs_overridden
+            || body.exotic.is_some()
+        {
+            return None;
+        }
+        let offset = hit.slot as usize;
+        debug_assert!(offset < body_property_count(heap, body));
+        debug_assert!(
+            !body.slot_attrs(heap, offset).1,
+            "shape-matched data hit resolved to an accessor slot"
+        );
+        Some(body.data_value(heap, offset))
+    })
+}
+
 /// Store through a cached own data slot after validating shape and atom guards.
 ///
 /// Returns `Some(())` only when the write was completed. `None` means the

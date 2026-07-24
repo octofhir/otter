@@ -552,10 +552,20 @@ pub fn parse_disambiguation(
 ) -> Result<temporal_rs::options::Disambiguation, NativeError> {
     use core::str::FromStr;
     let v = arg_or_undef(args, index);
-    let Some(obj) = options_object(&v, class)? else {
+    // GetOptionsObject: undefined → defaults; a non-object is a
+    // TypeError. Guard on the type directly — `options_object`'s
+    // `as_object()` collapse drops a Proxy option bag, which must still
+    // route through the observable [[Get]] in `read_option_string`.
+    if v.is_undefined() {
         return Ok(temporal_rs::options::Disambiguation::Compatible);
-    };
-    match read_option_string(ctx, Value::object(obj), "disambiguation", class)? {
+    }
+    if !v.is_object_type() {
+        return Err(NativeError::TypeError {
+            name: class,
+            reason: "options must be an object or undefined".to_string(),
+        });
+    }
+    match read_option_string(ctx, v, "disambiguation", class)? {
         Some(name) => temporal_rs::options::Disambiguation::from_str(&name).map_err(|_| {
             NativeError::RangeError {
                 name: class,

@@ -1585,6 +1585,11 @@ pub fn own_symbol_keys(arr: JsArray, heap: &otter_gc::GcHeap) -> Vec<crate::symb
 /// Set a string-keyed own property. Numeric strings route into dense
 /// indexed storage.
 ///
+/// Returns the `[[Set]]` completion: `false` when the write was
+/// rejected — a non-writable `length` or named property, or a fresh key
+/// on a non-extensible array — which strict-mode callers must surface
+/// as a TypeError.
+///
 /// # Errors
 ///
 /// Returns [`otter_gc::OutOfMemory`] if numeric-index growth would
@@ -1594,25 +1599,25 @@ pub fn set_named_property(
     heap: &mut otter_gc::GcHeap,
     key: &str,
     value: Value,
-) -> Result<(), otter_gc::OutOfMemory> {
+) -> Result<bool, otter_gc::OutOfMemory> {
     if key == "length" {
         if !length_writable(arr, heap) {
-            return Ok(());
+            return Ok(false);
         }
         let number_len =
             crate::number::NumberValue::from_f64(crate::number::to_number_value(&value, heap));
         let new_len = crate::number::bitwise::to_uint32(number_len);
         if (new_len as f64) != number_len.as_f64() {
-            return Ok(());
+            return Ok(false);
         }
         let _ = set_length_checked(arr, heap, new_len as usize)?;
-        return Ok(());
+        return Ok(true);
     }
     if let Some(idx) = crate::object::array_index_property_name(key) {
-        return set(arr, heap, idx as usize, value);
+        return set(arr, heap, idx as usize, value).map(|()| true);
     }
     if !can_write_array_property(arr, heap, key) {
-        return Ok(());
+        return Ok(false);
     }
     // §10.4.2 — non-extensible Array exotic rejects fresh keys.
     // Updating an existing key still succeeds (the spec routes
@@ -1622,7 +1627,7 @@ pub fn set_named_property(
         body.named_properties().is_none_or(|m| !m.contains_key(key))
     });
     if absent && !is_extensible(arr, heap) {
-        return Ok(());
+        return Ok(false);
     }
     let barrier_value = value;
     heap.with_payload(arr, |body| {
@@ -1634,7 +1639,7 @@ pub fn set_named_property(
         body.mark_dirty();
     });
     heap.record_write(arr, &barrier_value);
-    Ok(())
+    Ok(true)
 }
 
 /// Install the three fixed own properties every RegExp match-result array

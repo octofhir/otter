@@ -1810,7 +1810,9 @@ impl Interpreter {
                         }
                     }
                 }
-                crate::array::set_named_property(a, &mut self.gc_heap, name, value)?;
+                if !crate::array::set_named_property(a, &mut self.gc_heap, name, value)? {
+                    self.failed_set_result(strict, format!("Cannot assign to property '{name}'"))?;
+                }
             }
             None
         } else if let Some(t) = receiver.as_typed_array(&self.gc_heap) {
@@ -1834,9 +1836,12 @@ impl Interpreter {
                 // (accessors on %TypedArray.prototype% must fire),
                 // receiver-phase define on a fully-absent chain.
                 let vm_key = VmPropertyKey::OwnedString(name.to_string());
-                self.ordinary_set_data_value(
+                let ok = self.ordinary_set_data_value(
                     stack, context, receiver, &vm_key, value, receiver, 0,
                 )?;
+                if !ok {
+                    self.failed_set_result(strict, format!("Cannot assign to property '{name}'"))?;
+                }
             }
             None
         } else if let Some(fid) = receiver.as_function().or_else(|| {

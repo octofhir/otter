@@ -810,7 +810,17 @@ impl BaselinePlan {
                     dst: reg(operands, 0)?,
                     src: reg(operands, 1)?,
                 }),
-                Op::Increment => LoweredOperands::Increment(IncrementOperands {
+                // The immediate-right binary operators share the increment
+                // operand shape `(dst, lhs, imm)`; the JIT tiers re-expand them
+                // to a materialized constant plus the register operator, so no
+                // tier needs a dedicated immediate opcode.
+                Op::Increment
+                | Op::AddImm
+                | Op::SubImm
+                | Op::BitwiseAndImm
+                | Op::LessThanImm
+                | Op::EqualImm
+                | Op::NotEqualImm => LoweredOperands::Increment(IncrementOperands {
                     dst: reg(operands, 0)?,
                     src: reg(operands, 1)?,
                     delta: imm32(operands, 2)?,
@@ -1165,7 +1175,7 @@ impl BaselinePlan {
             .max(1);
         let mut add_alloc_safepoints = BTreeMap::new();
         for lowered in &instructions {
-            if lowered.op == Op::Add {
+            if lowered.op == Op::Add || lowered.op == Op::AddImm {
                 let safepoint = next_safepoint;
                 next_safepoint = next_safepoint.saturating_add(1);
                 add_alloc_safepoints.insert(lowered.byte_pc, safepoint);

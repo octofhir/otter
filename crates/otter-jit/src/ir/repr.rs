@@ -519,6 +519,9 @@ fn selected_result_representation(op: Op, feedback: ArithFeedback) -> Representa
         | Op::Sub
         | Op::Mul
         | Op::Increment
+        | Op::AddImm
+        | Op::SubImm
+        | Op::BitwiseAndImm
         | Op::Neg
         | Op::BitwiseOr
         | Op::BitwiseAnd
@@ -533,6 +536,9 @@ fn selected_result_representation(op: Op, feedback: ArithFeedback) -> Representa
         | Op::Sub
         | Op::Mul
         | Op::Increment
+        | Op::AddImm
+        | Op::SubImm
+        | Op::BitwiseAndImm
         | Op::Neg
         | Op::BitwiseOr
         | Op::BitwiseAnd
@@ -555,6 +561,9 @@ fn verified_result_representation(op: Op, feedback: ArithFeedback) -> Representa
             | Op::Sub
             | Op::Mul
             | Op::Increment
+            | Op::AddImm
+            | Op::SubImm
+            | Op::BitwiseAndImm
             | Op::Neg
             | Op::BitwiseOr
             | Op::BitwiseAnd
@@ -582,6 +591,9 @@ fn selected_input_representation(op: Op, feedback: ArithFeedback) -> Representat
         | Op::Sub
         | Op::Mul
         | Op::Increment
+        | Op::AddImm
+        | Op::SubImm
+        | Op::BitwiseAndImm
         | Op::Neg
         | Op::BitwiseOr
         | Op::BitwiseAnd
@@ -592,7 +604,15 @@ fn selected_input_representation(op: Op, feedback: ArithFeedback) -> Representat
         {
             Representation::Int32
         }
-        Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq | Op::Equal | Op::NotEqual
+        Op::LessThan
+        | Op::LessEq
+        | Op::GreaterThan
+        | Op::GreaterEq
+        | Op::Equal
+        | Op::NotEqual
+        | Op::LessThanImm
+        | Op::EqualImm
+        | Op::NotEqualImm
             if feedback.is_int32_only() =>
         {
             Representation::Int32
@@ -601,6 +621,9 @@ fn selected_input_representation(op: Op, feedback: ArithFeedback) -> Representat
         | Op::Sub
         | Op::Mul
         | Op::Increment
+        | Op::AddImm
+        | Op::SubImm
+        | Op::BitwiseAndImm
         | Op::Neg
         | Op::BitwiseOr
         | Op::BitwiseAnd
@@ -616,6 +639,9 @@ fn selected_input_representation(op: Op, feedback: ArithFeedback) -> Representat
         | Op::GreaterEq
         | Op::Equal
         | Op::NotEqual
+        | Op::LessThanImm
+        | Op::EqualImm
+        | Op::NotEqualImm
             if feedback.is_numeric_only() =>
         {
             Representation::Float64
@@ -631,6 +657,9 @@ fn verified_input_representation(op: Op, feedback: ArithFeedback) -> Representat
             | Op::Sub
             | Op::Mul
             | Op::Increment
+            | Op::AddImm
+            | Op::SubImm
+            | Op::BitwiseAndImm
             | Op::Neg
             | Op::BitwiseOr
             | Op::BitwiseAnd
@@ -640,7 +669,15 @@ fn verified_input_representation(op: Op, feedback: ArithFeedback) -> Representat
     );
     let comparison = matches!(
         op,
-        Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq | Op::Equal | Op::NotEqual
+        Op::LessThan
+            | Op::LessEq
+            | Op::GreaterThan
+            | Op::GreaterEq
+            | Op::Equal
+            | Op::NotEqual
+            | Op::LessThanImm
+            | Op::EqualImm
+            | Op::NotEqualImm
     );
     let numeric = int32_closed || comparison || matches!(op, Op::Div | Op::Rem | Op::Pow);
     if feedback.is_int32_only() && (int32_closed || comparison) {

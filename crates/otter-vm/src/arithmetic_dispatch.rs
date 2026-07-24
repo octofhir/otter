@@ -339,6 +339,132 @@ impl Interpreter {
         commit_frame_result(&mut stack[top_idx], dst, result)
     }
 
+    /// Immediate-right binary operators. The right operand is the `Number`
+    /// `imm`, so the operator's own coercion ladder still governs the left
+    /// operand (`String` left of `+` concatenates, an object coerces through
+    /// `valueOf`), but no right register is read and no separate constant load
+    /// runs. The number-vs-number fast path is the same one the register forms
+    /// take. `top_idx` is the live top frame (see `run_numeric_regs`).
+    pub(crate) fn run_add_imm(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &crate::execution_context::ExecutionContext,
+        top_idx: usize,
+        dst: u16,
+        lhs: u16,
+        imm: i32,
+        feedback: Option<InstructionFeedbackRecorder<'_>>,
+    ) -> Result<(), VmError> {
+        // SAFETY: `top_idx` is the live top frame; `lhs` is a verified register.
+        let lval =
+            unsafe { crate::interp::helpers::read_register_unchecked(stack.top_unchecked(), lhs) };
+        if let Some(feedback) = feedback {
+            feedback.record_arith(lval, Value::number_i32(imm));
+        }
+        if let Some(a) = lval.as_number() {
+            return commit_frame_result(
+                unsafe { stack.top_unchecked_mut() },
+                dst,
+                Value::number(number::add(a, NumberValue::from_i32(imm))),
+            );
+        }
+        let result = self.add_value(stack, context, lval, Value::number_i32(imm))?;
+        commit_frame_result(&mut stack[top_idx], dst, result)
+    }
+
+    pub(crate) fn run_numeric_imm(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &crate::execution_context::ExecutionContext,
+        top_idx: usize,
+        dst: u16,
+        lhs: u16,
+        imm: i32,
+        op: impl Fn(NumberValue, NumberValue) -> NumberValue,
+        bigint_op: BigIntBinop,
+        feedback: Option<InstructionFeedbackRecorder<'_>>,
+    ) -> Result<(), VmError> {
+        // SAFETY: see `run_add_imm`.
+        let lval =
+            unsafe { crate::interp::helpers::read_register_unchecked(stack.top_unchecked(), lhs) };
+        if let Some(feedback) = feedback {
+            feedback.record_arith(lval, Value::number_i32(imm));
+        }
+        if let Some(a) = lval.as_number() {
+            return commit_frame_result(
+                unsafe { stack.top_unchecked_mut() },
+                dst,
+                Value::number(op(a, NumberValue::from_i32(imm))),
+            );
+        }
+        let result = numeric_binary_value(
+            self,
+            stack,
+            context,
+            lval,
+            Value::number_i32(imm),
+            op,
+            bigint_op,
+        )?;
+        commit_frame_result(&mut stack[top_idx], dst, result)
+    }
+
+    pub(crate) fn run_less_than_imm(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &crate::execution_context::ExecutionContext,
+        top_idx: usize,
+        dst: u16,
+        lhs: u16,
+        imm: i32,
+        feedback: Option<InstructionFeedbackRecorder<'_>>,
+    ) -> Result<(), VmError> {
+        // SAFETY: see `run_add_imm`.
+        let lval =
+            unsafe { crate::interp::helpers::read_register_unchecked(stack.top_unchecked(), lhs) };
+        if let Some(feedback) = feedback {
+            feedback.record_arith(lval, Value::number_i32(imm));
+        }
+        if let Some(a) = lval.as_number() {
+            let truthy = a.as_f64() < f64::from(imm);
+            return commit_frame_result(
+                unsafe { stack.top_unchecked_mut() },
+                dst,
+                Value::boolean(truthy),
+            );
+        }
+        let result = compare_value(
+            self,
+            stack,
+            context,
+            lval,
+            Value::number_i32(imm),
+            Op::LessThan,
+        )?;
+        commit_frame_result(&mut stack[top_idx], dst, result)
+    }
+
+    pub(crate) fn run_equal_imm(
+        &mut self,
+        frame: &mut Frame,
+        dst: u16,
+        lhs: u16,
+        imm: i32,
+        negate: bool,
+        feedback: Option<InstructionFeedbackRecorder<'_>>,
+    ) -> Result<(), VmError> {
+        // SAFETY: `lhs` is a verified register; the caller passes the top frame.
+        let lval = unsafe { crate::interp::helpers::read_register_unchecked(frame, lhs) };
+        let rhs = Value::number_i32(imm);
+        if let Some(feedback) = feedback {
+            feedback.record_arith(lval, rhs);
+        }
+        let eq = abstract_ops::is_strictly_equal(&lval, &rhs, &self.gc_heap);
+        write_register(frame, dst, Value::boolean(eq ^ negate))?;
+        frame.advance_pc_fast();
+        Ok(())
+    }
+
     /// Evaluate `+` without coupling its observable semantics to frame storage.
     /// §13.15.3 ApplyStringOrNumericBinaryOperator for `+`.
     ///

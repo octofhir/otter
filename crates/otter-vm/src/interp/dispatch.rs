@@ -1799,6 +1799,78 @@ impl Interpreter {
                     self.run_add_regs(stack, context, top_idx, dst, lhs, rhs, feedback)?;
                     continue;
                 }
+                Op::AddImm => {
+                    let (dst, lhs) = (instr.reg(0), instr.reg(1));
+                    let imm = instr.imm(2);
+                    self.run_add_imm(stack, context, top_idx, dst, lhs, imm, feedback)?;
+                    continue;
+                }
+                Op::SubImm => {
+                    let (dst, lhs) = (instr.reg(0), instr.reg(1));
+                    let imm = instr.imm(2);
+                    self.run_numeric_imm(
+                        stack,
+                        context,
+                        top_idx,
+                        dst,
+                        lhs,
+                        imm,
+                        number::sub,
+                        bigint_sub_op,
+                        feedback,
+                    )?;
+                    continue;
+                }
+                Op::BitwiseAndImm => {
+                    let (dst, lhs) = (instr.reg(0), instr.reg(1));
+                    let imm = instr.imm(2);
+                    self.run_numeric_imm(
+                        stack,
+                        context,
+                        top_idx,
+                        dst,
+                        lhs,
+                        imm,
+                        number::bitwise_and,
+                        bigint_and_op,
+                        feedback,
+                    )?;
+                    continue;
+                }
+                Op::LessThanImm => {
+                    let (dst, lhs) = (instr.reg(0), instr.reg(1));
+                    let imm = instr.imm(2);
+                    self.run_less_than_imm(stack, context, top_idx, dst, lhs, imm, feedback)?;
+                    continue;
+                }
+                Op::EqualImm => {
+                    let (dst, lhs) = (instr.reg(0), instr.reg(1));
+                    let imm = instr.imm(2);
+                    // SAFETY: live top frame (see the `is_at_floor` guard).
+                    self.run_equal_imm(
+                        unsafe { stack.top_unchecked_mut() },
+                        dst,
+                        lhs,
+                        imm,
+                        false,
+                        feedback,
+                    )?;
+                    continue;
+                }
+                Op::NotEqualImm => {
+                    let (dst, lhs) = (instr.reg(0), instr.reg(1));
+                    let imm = instr.imm(2);
+                    // SAFETY: live top frame (see the `is_at_floor` guard).
+                    self.run_equal_imm(
+                        unsafe { stack.top_unchecked_mut() },
+                        dst,
+                        lhs,
+                        imm,
+                        true,
+                        feedback,
+                    )?;
+                    continue;
+                }
                 Op::Sub => {
                     let (dst, lhs, rhs) = instr.reg3();
                     self.run_numeric_regs(

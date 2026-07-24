@@ -562,7 +562,10 @@ mod tests {
         let module = compile_script_src("5 & 3; 5 | 3; 5 ^ 3; 1 << 3; -1 >> 1; -1 >>> 0;");
         let main = module.main();
         for op in [
-            Op::BitwiseAnd,
+            // `5 & 3` folds its integer-literal right operand into the
+            // immediate form; the operators without an immediate variant keep
+            // their register lowering.
+            Op::BitwiseAndImm,
             Op::BitwiseOr,
             Op::BitwiseXor,
             Op::Shl,

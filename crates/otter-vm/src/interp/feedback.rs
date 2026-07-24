@@ -291,12 +291,12 @@ impl FeedbackDirectory {
     }
 
     /// The monomorphic own-data hit recorded by the property-load IC at `site`,
-    /// if the just-resolved method was an own data property. Used to seed the
-    /// ordinary method-call IC so later calls skip atom resolution and the stub
-    /// walk. Returns `None` when the site is polymorphic or the method lives on
-    /// the prototype (no own-data stub).
+    /// if the site holds exactly one stub resolving to an own data property.
+    /// Lets a load or method call take a shape-guarded direct slab read instead
+    /// of walking the stub list and re-comparing the atom. Returns `None` when
+    /// the site is polymorphic or the property lives on the prototype.
     #[must_use]
-    pub(crate) fn method_own_data_hit(
+    pub(crate) fn mono_load_own_data_hit(
         &self,
         site: usize,
     ) -> Option<crate::object::AtomOwnPropertyHit> {

@@ -649,7 +649,7 @@ impl Interpreter {
             // the shape-guarded fast path above. Only installed while the
             // property load site is monomorphic and the method is an own data
             // slot; prototype methods and polymorphic sites leave it empty.
-            if let Some(hit) = self.feedback_directory.method_own_data_hit(method_site) {
+            if let Some(hit) = self.feedback_directory.mono_load_own_data_hit(method_site) {
                 self.feedback_directory
                     .install_method_ic(method_site, MethodCallIc::Ordinary(hit));
             }

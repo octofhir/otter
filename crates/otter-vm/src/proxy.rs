@@ -119,15 +119,7 @@ pub fn alloc_proxy_with_roots(
 /// shapes, ordinary objects carrying a native [[Call]] slot, and
 /// nested proxies (which answer from their own creation-time slot).
 fn proxy_target_callable(heap: &otter_gc::GcHeap, target: &Value) -> bool {
-    if let Some(p) = target.as_proxy() {
-        return heap.read_payload(p.handle(), |body| body.callable);
-    }
-    if crate::abstract_ops::is_callable(target) {
-        return true;
-    }
-    target.as_object().is_some_and(|obj| {
-        crate::object::call_native(obj, heap).is_some_and(|v| v.is_native_function())
-    })
+    crate::abstract_ops::is_callable_in_heap(target, heap)
 }
 
 /// Cheap-to-copy Proxy wrapper carrying a [`ProxyHandle`].

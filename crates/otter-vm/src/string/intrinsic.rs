@@ -130,9 +130,20 @@ fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
                 crate::abstract_ops::ToPrimitiveHint::String,
             )
         });
-        primitive.map_err(|error| {
+        let primitive = primitive.map_err(|error| {
             crate::native_function::vm_to_native_error(ctx.interp_mut(), error, "String")
-        })?
+        })?;
+        // The step-2.a shortcut covers only a Symbol passed directly.
+        // A Symbol *object* reaches step 2.b, where its
+        // `@@toPrimitive` hands back the wrapped Symbol and ToString
+        // rejects it.
+        if primitive.is_symbol() {
+            return Err(NativeError::TypeError {
+                name: "String",
+                reason: "Cannot convert a Symbol value to a string".to_string(),
+            });
+        }
+        primitive
     };
     let value = crate::string::dispatch::call(
         otter_bytecode::method_id::StringMethod::Construct,

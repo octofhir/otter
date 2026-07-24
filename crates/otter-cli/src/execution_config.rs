@@ -8,8 +8,10 @@
 //! # Invariants
 //! - Runtime-backed command paths receive this value explicitly. No timeout,
 //!   trace, or tier setting travels through process-global mutable state.
-//! - Normal CLI execution always uses the production tier policy; `--jitless`
-//!   selects the same interpreter-only runtime path used by the semantic oracle.
+//! - Normal CLI execution uses the production tier policy; `--jitless` selects
+//!   the template baseline compiler (interpreter plus the template tier, no
+//!   optimizing compilation) — the jitless engine, analogous to running with a
+//!   bytecode baseline instead of an optimizing JIT.
 //! - `None` keeps the runtime timeout default while `Some(Duration::ZERO)`
 //!   explicitly disables it.
 //! - Engine crates only return owned JIT reports. This outer configuration
@@ -58,7 +60,7 @@ impl CliExecutionConfig {
         jit_artifacts_target: Option<String>,
     ) -> Self {
         let jit_selection = if jitless {
-            JitSelection::InterpreterOnly
+            JitSelection::Template
         } else {
             JitSelection::ProductionTiered
         };

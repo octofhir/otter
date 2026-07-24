@@ -120,7 +120,7 @@ fn to_bigint_strict(interp: &crate::Interpreter, value: &Value) -> Result<BigInt
 }
 
 fn string_to_bigint(interp: &crate::Interpreter, text: &str) -> Result<BigInt, VmError> {
-    let trimmed = text.trim();
+    let trimmed = text.trim_matches(crate::number::parse::is_str_whitespace);
     // §7.1.14.1 StringToBigInt — empty string is 0n, accept decimal
     // / `0x` / `0o` / `0b` prefixes with optional leading sign on
     // the decimal form. Otherwise spec §21.2.1.1 step 3.b raises

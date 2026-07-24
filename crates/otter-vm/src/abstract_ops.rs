@@ -505,7 +505,7 @@ fn same_value_non_numeric_or_strict_numeric(x: &Value, y: &Value, heap: &otter_g
 /// Returns `None` when `str` does not match the grammar — callers
 /// surface that as the spec's `undefined` outcome.
 pub fn string_to_big_int(text: &str) -> Option<num_bigint::BigInt> {
-    let s = text.trim();
+    let s = text.trim_matches(crate::number::parse::is_str_whitespace);
     if s.is_empty() {
         return Some(num_bigint::BigInt::from(0));
     }

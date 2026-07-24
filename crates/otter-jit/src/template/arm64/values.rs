@@ -177,6 +177,52 @@ pub(crate) fn emit_box_double(ops: &mut Assembler, src_d: u8, dst_x: u8) {
     );
 }
 
+/// Box the f64 in `src_d` into `dst_x` with the exact tag the per-op
+/// arithmetic path would produce for that value.
+///
+/// A value that is integral, inside the signed 32-bit range, and not `-0`
+/// boxes as an `int32` (matching the no-overflow integer fast path so
+/// downstream `int32`-guarded sites stay hot); every other number — a
+/// fractional value, one outside `i32` range, `-0`, `NaN`, or `±Inf` — boxes
+/// as a double, `NaN`-canonicalised exactly like [`emit_box_double`]. This is
+/// the representation linchpin for fusing a chain of double operations: the
+/// fused result carries the same tag the unfused per-op sequence left behind.
+///
+/// `fcvtzs` saturates out-of-range and non-finite inputs, so the
+/// round-trip compare (`fcvtzs` then `scvtf` then `fcmp`) is `true` only for a
+/// value already representable as its truncated `i32` — folding the integral
+/// and in-range checks into one compare. `-0` truncates to `0` and would pass
+/// that compare, so it is excluded explicitly by its sign bit.
+///
+/// Reads `src_d`; writes `dst_x`. Clobbers `d0`, `x14`, `x15`. `src_d` must
+/// not be `d0`.
+pub(crate) fn emit_box_number(ops: &mut Assembler, src_d: u8, dst_x: u8) {
+    debug_assert_ne!(src_d, 0, "d0 is this helper's scratch register");
+    let double_path = ops.new_dynamic_label();
+    let box_int = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; fcvtzs w14, D(src_d)              // trunc toward zero, saturating
+        ; scvtf d0, w14                     // back to f64
+        ; fcmp D(src_d), d0
+        ; b.ne =>double_path                // non-integral / out of range / NaN
+        // Integral and in range. Exclude -0: it truncates to 0 but must box as
+        // a double so `1 / -0 === -Infinity` is preserved.
+        ; cbnz w14, =>box_int               // non-zero payload cannot be -0
+        ; fmov x15, D(src_d)
+        ; tbnz x15, #63, =>double_path       // sign bit set with zero magnitude → -0
+        ; =>box_int
+        ; mov W(dst_x), w14                  // zero-extends bits [63:32]
+        ; movz x15, NUMBER_TAG_HI16, lsl #48
+        ; orr X(dst_x), X(dst_x), x15
+        ; b =>done
+        ; =>double_path
+    );
+    emit_box_double(ops, src_d, dst_x);
+    dynasm!(ops ; .arch aarch64 ; =>done);
+}
+
 /// Fast-path `ToInt32` for bitwise operators.
 ///
 /// Int32-tagged values are unboxed directly. Any finite double is truncated
@@ -497,4 +543,75 @@ pub(crate) fn emit_compress_slot_or_bail(ops: &mut Assembler, bail: DynamicLabel
         ; movz w10, #0x24                           // (4 << 3) | 0b100
         ; =>done
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dynasmrt::{AssemblyOffset, ExecutableBuffer};
+    use otter_vm::value::tag;
+
+    /// Finalize a leaf function `fn(f64) -> u64` that boxes its argument
+    /// through [`emit_box_number`], exercising the real emitted machine code.
+    /// The argument arrives in `d0`; it is moved to `d16` so the helper's `d0`
+    /// scratch does not alias the source, mirroring how the chain emitter keeps
+    /// its accumulator in a high vector register.
+    fn box_number_program() -> (ExecutableBuffer, AssemblyOffset) {
+        let mut ops = Assembler::new().expect("assembler");
+        let entry = ops.offset();
+        dynasm!(ops ; .arch aarch64 ; fmov d16, d0);
+        emit_box_number(&mut ops, 16, 0);
+        dynasm!(ops ; .arch aarch64 ; ret);
+        let buffer = ops.finalize().expect("finalize");
+        (buffer, entry)
+    }
+
+    fn run_box_number(input: f64) -> u64 {
+        let (buffer, entry) = box_number_program();
+        // SAFETY: the emitted leaf matches `extern "C" fn(f64) -> u64` (arg in
+        // d0, result in x0) and is invoked while `buffer` is alive.
+        let boxed: extern "C" fn(f64) -> u64 = unsafe { std::mem::transmute(buffer.ptr(entry)) };
+        boxed(input)
+    }
+
+    #[test]
+    fn box_number_matches_per_op_representation() {
+        // Small integral value → int32 tag, exactly the no-overflow int path.
+        assert_eq!(run_box_number(5.0), tag::box_int32(5));
+        assert_eq!(run_box_number(-7.0), tag::box_int32(-7));
+        assert_eq!(run_box_number(0.0), tag::box_int32(0));
+        assert_eq!(run_box_number(i32::MIN as f64), tag::box_int32(i32::MIN));
+        assert_eq!(run_box_number(i32::MAX as f64), tag::box_int32(i32::MAX));
+
+        // One past the signed 32-bit range → double, not a wrapped int32.
+        assert_eq!(
+            run_box_number(i32::MAX as f64 + 1.0),
+            tag::box_double((i32::MAX as f64 + 1.0).to_bits())
+        );
+        assert_eq!(
+            run_box_number(i32::MIN as f64 - 1.0),
+            tag::box_double((i32::MIN as f64 - 1.0).to_bits())
+        );
+
+        // -0 must stay a double so `1 / -0 === -Infinity` survives.
+        assert_eq!(run_box_number(-0.0), tag::box_double((-0.0f64).to_bits()));
+
+        // Fractional, infinities → double.
+        assert_eq!(run_box_number(3.5), tag::box_double(3.5f64.to_bits()));
+        assert_eq!(
+            run_box_number(f64::INFINITY),
+            tag::box_double(f64::INFINITY.to_bits())
+        );
+        assert_eq!(
+            run_box_number(f64::NEG_INFINITY),
+            tag::box_double(f64::NEG_INFINITY.to_bits())
+        );
+
+        // NaN → the single canonical quiet-NaN pattern, like `emit_box_double`.
+        let nan = run_box_number(f64::from_bits(0x7ff8_0000_0000_0001));
+        assert!(!tag::is_int32_bits(nan), "NaN must not box as int32");
+        assert!(tag::is_number_bits(nan), "NaN must box as a number");
+        let decoded = f64::from_bits(nan.wrapping_sub(tag::DOUBLE_ENCODE_OFFSET));
+        assert!(decoded.is_nan(), "boxed NaN decodes to NaN");
+    }
 }

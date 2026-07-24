@@ -2172,7 +2172,7 @@ impl Interpreter {
             return Ok(());
         }
 
-        if let Some(native) = self.native_promise_constructor(&roots.target()) {
+        if let Some(native) = self.native_receiverless_constructor(&roots.target()) {
             let new_target = roots.new_target.get();
             let args = roots.take_args();
             let constructed = self.invoke_native_construct_rooted(
@@ -2402,7 +2402,14 @@ impl Interpreter {
         result
     }
 
-    fn native_promise_constructor(&self, callee: &Value) -> Option<NativeFunction> {
+    /// Native constructors that must NOT receive a pre-allocated
+    /// receiver whose prototype is read from `new.target` before the
+    /// constructor body runs. `Promise` builds its own object, and the
+    /// dynamic-function constructors (`Function` and friends) parse
+    /// their source and only then run `GetPrototypeFromConstructor`
+    /// (§20.2.1.1.1) — an eager `new.target.prototype` read here would
+    /// be observable before the SyntaxError a bad body must throw.
+    fn native_receiverless_constructor(&self, callee: &Value) -> Option<NativeFunction> {
         let native = if let Some(native) = callee.as_native_function() {
             native
         } else if let Some(obj) = callee.as_object() {
@@ -2411,7 +2418,15 @@ impl Interpreter {
         } else {
             return None;
         };
-        (native.name(&self.gc_heap) == "Promise").then_some(native)
+        matches!(
+            native.name(&self.gc_heap),
+            "Promise"
+                | "Function"
+                | "GeneratorFunction"
+                | "AsyncFunction"
+                | "AsyncGeneratorFunction"
+        )
+        .then_some(native)
     }
 
     /// Handle `Op::CallSpread`: read the args array, fan it out
@@ -3438,7 +3453,7 @@ impl Interpreter {
             }
         }
 
-        if let Some(native) = self.native_promise_constructor(&roots.current.get()) {
+        if let Some(native) = self.native_receiverless_constructor(&roots.current.get()) {
             let effective_args = roots.take_args();
             let new_target = roots.new_target.get();
             return self.invoke_native_construct_rooted(

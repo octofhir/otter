@@ -80,7 +80,6 @@ fn dynamic_function_ctor_call(
     args: &[Value],
     kind: crate::eval_ops::DynamicFunctionKind,
 ) -> Result<Value, NativeError> {
-    let new_target_proto = crate::bootstrap::native_new_target_prototype(ctx, "Function")?;
     let Some(context) = ctx.execution_context().cloned() else {
         return Err(NativeError::TypeError {
             name: "Function",
@@ -88,7 +87,10 @@ fn dynamic_function_ctor_call(
         });
     };
     ctx.scope(|mut scope| {
-        let new_target_proto = new_target_proto.map(|prototype| scope.value(prototype));
+        // §20.2.1.1.1 CreateDynamicFunction parses the source (step 15,
+        // throwing SyntaxError on a malformed body) BEFORE the observable
+        // GetPrototypeFromConstructor read (step 20). The parsed function
+        // stays rooted through `result_handle` across the getter call.
         let result = scope.with_turn_parts(|interp, stack| {
             interp.build_dynamic_function(stack, &context, args, kind)
         });
@@ -106,6 +108,9 @@ fn dynamic_function_ctor_call(
             }
         })?;
         let result_handle = scope.value(result);
+        let new_target_proto =
+            crate::bootstrap::native_new_target_prototype(scope.context(), "Function")?;
+        let new_target_proto = new_target_proto.map(|prototype| scope.value(prototype));
         let result = scope.raw(result_handle);
         let new_target_proto = new_target_proto.map(|prototype| scope.raw(prototype));
         scope.with_turn_parts(|interp, _| {

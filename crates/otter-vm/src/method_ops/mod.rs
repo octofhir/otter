@@ -604,9 +604,35 @@ impl Interpreter {
         // dispatch the builtin directly (see `try_fast_array_proto_method`).
         // Resolving the call-site IC id here installs the same cache the JIT
         // method-call stub reads (shared site space).
+        // Resolving the call-site IC id here installs the same cache the JIT
+        // method-call stub reads (shared site space).
         let method_site = context
             .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
             .unwrap_or(usize::MAX);
+        // Method-resolution inline cache. An ordinary object's method is a data
+        // slot on its own object or its prototype, so the receiver shape keys
+        // the resolved method exactly like a `LoadProperty`. On a hit (or a
+        // freshly installed monomorphic candidate) the per-call string `[[Get]]`
+        // walk — `has_plain_builtin_method` + `ordinary_get_value` + atom
+        // comparison up the chain — is skipped entirely. A non-cacheable
+        // shape (accessor method, deep prototype, absent) returns `None` and
+        // falls through to the full resolution below. Only an `ObjectBody`
+        // receiver reaches here (`as_object` is `None` for arrays / Map / Set),
+        // so this probes ahead of the array/collection call ICs: an ordinary
+        // object never keys those, and arrays / Map / Set skip this block, so
+        // the common ordinary-method call avoids both miss probes entirely.
+        if let Some(obj) = recv_value.as_object()
+            && method_site != usize::MAX
+            && let Some(atomized_key) =
+                context.property_atom_for_function(stack[top_idx].function_id, name_idx)
+            && let Some(method) = self.resolve_method_ic(obj, atomized_key, method_site)
+            && self.is_callable_runtime(&method)
+        {
+            stack[top_idx].advance_pc()?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+        }
+        // Ordinary dense array whose `%Array.prototype%` slot is untouched —
+        // dispatch the builtin directly (see `try_fast_array_proto_method`).
         if let Some(result) = self.try_array_method_call_ic(
             stack,
             context,
@@ -626,28 +652,6 @@ impl Interpreter {
             stack[top_idx].advance_pc()?;
             write_register(&mut stack[top_idx], dst, value)?;
             return Ok(());
-        }
-        // Method-resolution inline cache. An ordinary object's method is a data
-        // slot on its own object or its prototype, so the receiver shape keys
-        // the resolved method exactly like a `LoadProperty`. On a hit (or a
-        // freshly installed monomorphic candidate) the per-call string `[[Get]]`
-        // walk — `has_plain_builtin_method` + `ordinary_get_value` + atom
-        // comparison up the chain — is skipped entirely. A non-cacheable
-        // shape (accessor method, deep prototype, absent) returns `None` and
-        // falls through to the full resolution below. Only an `ObjectBody`
-        // receiver reaches here (`as_object` is `None` for arrays / Map / Set),
-        // so this runs ahead of the array/collection prototype probes without
-        // stealing their dispatch — and skips the method-name string resolution
-        // those probes need for the common ordinary-method call.
-        if let Some(obj) = recv_value.as_object()
-            && method_site != usize::MAX
-            && let Some(atomized_key) =
-                context.property_atom_for_function(stack[top_idx].function_id, name_idx)
-            && let Some(method) = self.resolve_method_ic(obj, atomized_key, method_site)
-            && self.is_callable_runtime(&method)
-        {
-            stack[top_idx].advance_pc()?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
         let name = context
             .string_constant_str_for_function(stack[top_idx].function_id, name_idx)

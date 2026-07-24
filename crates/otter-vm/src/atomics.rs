@@ -22,7 +22,8 @@
 //! - `Uint8ClampedArray`, `Float32Array`, `Float64Array` are never
 //!   accepted as a `typedArray` argument to any atomic op.
 //! - Detached TypedArray buffers are rejected before `index` or
-//!   value coercion.
+//!   value coercion, and the witness is re-taken afterwards so a
+//!   coercion hook that detaches the buffer cannot reach an element.
 //! - `wait` / `waitAsync` require a `SharedArrayBuffer`-backed view
 //!   of `Int32Array` or `BigInt64Array`.
 //! - Out-of-range indices surface as `RangeError`, **not**
@@ -154,6 +155,37 @@ fn validate_atomic_access(
         ));
     }
     Ok(idx)
+}
+
+/// §25.4.3.3 RevalidateAtomicAccess ( typedArray, byteIndexInBuffer ).
+/// Every argument coercion can run user code that detaches or shrinks
+/// the backing buffer, so the witness is re-taken once all coercions
+/// have completed and before the element is touched. A detached or
+/// out-of-bounds view is a TypeError; a surviving view that no longer
+/// covers the index is a RangeError.
+fn revalidate_atomic_access(
+    ta: &JsTypedArray,
+    heap: &otter_gc::GcHeap,
+    idx: usize,
+    method_name: &'static str,
+) -> Result<(), NativeError> {
+    if ta.is_out_of_bounds(heap) {
+        return Err(type_err(
+            method_name,
+            "TypedArray buffer is detached".to_string(),
+        ));
+    }
+    if idx >= ta.length(heap) {
+        return Err(range_err(
+            method_name,
+            format!(
+                "index {idx} is out of range for {} of length {}",
+                ta.kind().name(),
+                ta.length(heap)
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// §7.1.22 ToIndex with full coercion (Object → primitive →
@@ -354,6 +386,7 @@ fn native_load(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
         args.get(1).unwrap_or(&Value::UNDEFINED),
         "Atomics.load",
     )?;
+    revalidate_atomic_access(&ta, ctx.heap(), idx, "Atomics.load")?;
     let heap = ctx.interp_mut().gc_heap_mut();
     ta.get(heap, idx).map_err(|e| {
         type_err(
@@ -387,6 +420,7 @@ fn native_store(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
         args.get(2).unwrap_or(&Value::UNDEFINED),
         "Atomics.store",
     )?;
+    revalidate_atomic_access(&ta, ctx.heap(), idx, "Atomics.store")?;
     ta.set(ctx.interp_mut().gc_heap_mut(), idx, &value);
     Ok(value)
 }
@@ -417,6 +451,7 @@ fn modify_op(
         args.get(2).unwrap_or(&Value::UNDEFINED),
         method_name,
     )?;
+    revalidate_atomic_access(&ta, ctx.heap(), idx, method_name)?;
     let heap = ctx.interp_mut().gc_heap_mut();
     let oom_to_err = |err: otter_gc::OutOfMemory| {
         type_err(
@@ -509,6 +544,7 @@ fn native_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
         args.get(2).unwrap_or(&Value::UNDEFINED),
         "Atomics.exchange",
     )?;
+    revalidate_atomic_access(&ta, ctx.heap(), idx, "Atomics.exchange")?;
     let heap = ctx.interp_mut().gc_heap_mut();
     let _atomic_guard = ATOMICS_RMW_LOCK
         .lock()
@@ -553,6 +589,7 @@ fn native_compare_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
         args.get(3).unwrap_or(&Value::UNDEFINED),
         "Atomics.compareExchange",
     )?;
+    revalidate_atomic_access(&ta, ctx.heap(), idx, "Atomics.compareExchange")?;
     // §25.4.3.5 step 8 — expected must be narrowed through the
     // element-type's RawBytes round-trip before the comparison
     // against the raw current value (e.g. an Int16 view stores

@@ -11,7 +11,7 @@ use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::helpers::{
-    arg_or_undef, js_string_value, make_temporal, parse_difference_settings,
+    arg_or_undef, get_option_value, js_string_value, make_temporal, parse_difference_settings,
     parse_rounding_options, parse_time_zone, require_construct, require_instant, temporal_err,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
@@ -187,11 +187,15 @@ fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     // (rejecting e.g. a `-000000` extended year), and the instant is
     // rendered in that zone.
     let time_zone = match args.first() {
-        Some(opts) if opts.as_object().is_some() => {
-            let tz_value = crate::object::get(opts.as_object().unwrap(), ctx.heap(), "timeZone");
-            match tz_value {
-                Some(v) if !v.is_undefined() => Some(parse_time_zone(&v, ctx.heap(), CLASS)?),
-                _ => None,
+        Some(opts) if opts.is_object_type() => {
+            // §sec-temporal.instant.prototype.tostring step 7 reads
+            // `timeZone` through an observable [[Get]] (firing accessor
+            // getters / Proxy traps), after the rounding options above.
+            let tz_value = get_option_value(ctx, *opts, "timeZone", CLASS)?;
+            if tz_value.is_undefined() {
+                None
+            } else {
+                Some(parse_time_zone(&tz_value, ctx.heap(), CLASS)?)
             }
         }
         _ => None,

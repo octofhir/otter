@@ -7,10 +7,9 @@
 
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
-use crate::object;
 use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
-    arg_or_undef, arg_to_calendar, clamp_to_u8, js_string_value, make_temporal,
+    arg_or_undef, arg_to_calendar, clamp_to_u8, get_option_value, js_string_value, make_temporal,
     parse_calendar_fields, parse_difference_settings, parse_display_calendar, parse_overflow,
     parse_partial_time, parse_time_zone, read_calendar_field, require_construct,
     require_plain_date, str_or_undef, temporal_err, to_integer_with_truncation,
@@ -325,19 +324,21 @@ fn impl_to_zoned_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     // §ToZonedDateTime: an object with a `timeZone` property supplies
     // {timeZone, plainTime}; any other value is itself the time-zone
     // identifier (string or ZonedDateTime).
-    let (tz, time) = if let Some(obj) = item.as_object() {
-        match object::get(obj, ctx.heap(), "timeZone").filter(|v| !v.is_undefined()) {
-            Some(tz_v) => {
-                let tz = parse_time_zone(&tz_v, ctx.heap(), CLASS)?;
-                let time = match object::get(obj, ctx.heap(), "plainTime") {
-                    Some(v) if !v.is_undefined() => {
-                        Some(crate::temporal::plain_time::parse_plain_time_arg(ctx, &v)?)
-                    }
-                    _ => None,
-                };
-                (tz, time)
-            }
-            None => (parse_time_zone(&item, ctx.heap(), CLASS)?, None),
+    let (tz, time) = if item.is_object_type() {
+        // §ToZonedDateTime reads `timeZone` then `plainTime` through
+        // observable [[Get]]s (accessor getters / Proxy traps fire).
+        let tz_v = get_option_value(ctx, item, "timeZone", CLASS)?;
+        if tz_v.is_undefined() {
+            (parse_time_zone(&item, ctx.heap(), CLASS)?, None)
+        } else {
+            let tz = parse_time_zone(&tz_v, ctx.heap(), CLASS)?;
+            let time_v = get_option_value(ctx, item, "plainTime", CLASS)?;
+            let time = if time_v.is_undefined() {
+                None
+            } else {
+                Some(crate::temporal::plain_time::parse_plain_time_arg(ctx, &time_v)?)
+            };
+            (tz, time)
         }
     } else {
         (parse_time_zone(&item, ctx.heap(), CLASS)?, None)

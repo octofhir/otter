@@ -600,7 +600,6 @@ pub fn parse_to_string_rounding_options(
     ctx: &mut NativeCtx<'_>,
     class: &'static str,
 ) -> Result<temporal_rs::options::ToStringRoundingOptions, NativeError> {
-    use core::str::FromStr;
     let mut opts = temporal_rs::options::ToStringRoundingOptions::default();
     let v = arg_or_undef(args, index);
     if v.is_undefined() {
@@ -615,63 +614,100 @@ pub fn parse_to_string_rounding_options(
     // §ToSecondsStringPrecisionRecord / GetRoundingModeOption read the
     // keys in the order fractionalSecondDigits, roundingMode,
     // smallestUnit through getter/Proxy-aware [[Get]]s.
+    opts.precision = read_fractional_second_digits(ctx, v, class)?;
+    opts.rounding_mode = read_rounding_mode_option(ctx, v, class)?;
+    opts.smallest_unit = read_smallest_unit_option(ctx, v, class)?;
+    Ok(opts)
+}
+
+/// Read the `fractionalSecondDigits` toString option through an
+/// observable [[Get]], returning the resolved [`Precision`]. The caller
+/// has already validated that `v` is an object. Absent → the default
+/// [`Precision`] (`Auto`).
+pub fn read_fractional_second_digits(
+    ctx: &mut NativeCtx<'_>,
+    v: Value,
+    class: &'static str,
+) -> Result<temporal_rs::parsers::Precision, NativeError> {
+    let default = temporal_rs::options::ToStringRoundingOptions::default().precision;
     let frac = get_option_value(ctx, v, "fractionalSecondDigits", class)?;
-    if !frac.is_undefined() {
-        // §GetStringOrNumberOption(« Number, String »): a Number-typed
-        // value is ToNumber'd (floored to a 0-9 digit); ANY other value
-        // (string / boolean / null / object) is ToString'd and must be
-        // the literal "auto". So `null`/`true` coerce to "null"/"true"
-        // → RangeError, not ToNumber.
-        if frac.is_number() {
-            let raw = to_number_field(ctx, &frac, class, "fractionalSecondDigits")?;
-            let d = raw.floor();
-            if raw.is_nan() || !(0.0..=9.0).contains(&d) {
-                return Err(NativeError::RangeError {
-                    name: class,
-                    reason: "`fractionalSecondDigits` must be an integer 0-9".to_string(),
-                });
-            }
-            opts.precision = temporal_rs::parsers::Precision::Digit(d as u8);
+    if frac.is_undefined() {
+        return Ok(default);
+    }
+    // §GetStringOrNumberOption(« Number, String »): a Number-typed
+    // value is ToNumber'd (floored to a 0-9 digit); ANY other value
+    // (string / boolean / null / object) is ToString'd and must be
+    // the literal "auto". So `null`/`true` coerce to "null"/"true"
+    // → RangeError, not ToNumber.
+    if frac.is_number() {
+        let raw = to_number_field(ctx, &frac, class, "fractionalSecondDigits")?;
+        let d = raw.floor();
+        if raw.is_nan() || !(0.0..=9.0).contains(&d) {
+            return Err(NativeError::RangeError {
+                name: class,
+                reason: "`fractionalSecondDigits` must be an integer 0-9".to_string(),
+            });
+        }
+        Ok(temporal_rs::parsers::Precision::Digit(d as u8))
+    } else {
+        let exec = ctx
+            .execution_context()
+            .cloned()
+            .ok_or_else(|| NativeError::TypeError {
+                name: class,
+                reason: "missing execution context".to_string(),
+            })?;
+        let coerced =
+            ctx.with_turn_parts(|interp, stack| interp.coerce_to_string(stack, &exec, &frac));
+        let s = coerced
+            .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))?;
+        if s == "auto" {
+            Ok(temporal_rs::parsers::Precision::Auto)
         } else {
-            let exec = ctx
-                .execution_context()
-                .cloned()
-                .ok_or_else(|| NativeError::TypeError {
-                    name: class,
-                    reason: "missing execution context".to_string(),
-                })?;
-            let coerced =
-                ctx.with_turn_parts(|interp, stack| interp.coerce_to_string(stack, &exec, &frac));
-            let s = coerced
-                .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))?;
-            if s == "auto" {
-                opts.precision = temporal_rs::parsers::Precision::Auto;
-            } else {
-                return Err(NativeError::RangeError {
-                    name: class,
-                    reason: "`fractionalSecondDigits` must be \"auto\" or an integer 0-9"
-                        .to_string(),
-                });
-            }
+            Err(NativeError::RangeError {
+                name: class,
+                reason: "`fractionalSecondDigits` must be \"auto\" or an integer 0-9".to_string(),
+            })
         }
     }
-    if let Some(name) = read_option_string(ctx, v, "roundingMode", class)? {
-        opts.rounding_mode = Some(temporal_rs::options::RoundingMode::from_str(&name).map_err(
+}
+
+/// Read the `roundingMode` toString option through an observable
+/// [[Get]]. The caller has already validated that `v` is an object.
+pub fn read_rounding_mode_option(
+    ctx: &mut NativeCtx<'_>,
+    v: Value,
+    class: &'static str,
+) -> Result<Option<temporal_rs::options::RoundingMode>, NativeError> {
+    use core::str::FromStr;
+    match read_option_string(ctx, v, "roundingMode", class)? {
+        Some(name) => Ok(Some(temporal_rs::options::RoundingMode::from_str(&name).map_err(
             |_| NativeError::RangeError {
                 name: class,
                 reason: "invalid `roundingMode`".to_string(),
             },
-        )?);
+        )?)),
+        None => Ok(None),
     }
-    if let Some(name) = read_option_string(ctx, v, "smallestUnit", class)? {
-        opts.smallest_unit = Some(temporal_rs::options::Unit::from_str(&name).map_err(|_| {
+}
+
+/// Read the `smallestUnit` toString option through an observable
+/// [[Get]]. The caller has already validated that `v` is an object.
+pub fn read_smallest_unit_option(
+    ctx: &mut NativeCtx<'_>,
+    v: Value,
+    class: &'static str,
+) -> Result<Option<temporal_rs::options::Unit>, NativeError> {
+    use core::str::FromStr;
+    match read_option_string(ctx, v, "smallestUnit", class)? {
+        Some(name) => Ok(Some(temporal_rs::options::Unit::from_str(&name).map_err(|_| {
             NativeError::RangeError {
                 name: class,
                 reason: "invalid `smallestUnit`".to_string(),
             }
-        })?);
+        })?)),
+        None => Ok(None),
     }
-    Ok(opts)
 }
 
 /// Parse the `calendarName` option (`"auto"`/`"always"`/`"never"`/
@@ -684,7 +720,6 @@ pub fn parse_display_calendar(
     ctx: &mut NativeCtx<'_>,
     class: &'static str,
 ) -> Result<temporal_rs::options::DisplayCalendar, NativeError> {
-    use core::str::FromStr;
     let v = arg_or_undef(args, index);
     if v.is_undefined() {
         return Ok(temporal_rs::options::DisplayCalendar::Auto);
@@ -695,6 +730,17 @@ pub fn parse_display_calendar(
             reason: "options must be an object or undefined".to_string(),
         });
     }
+    read_display_calendar_name(ctx, v, class)
+}
+
+/// Read the `calendarName` toString option through an observable
+/// [[Get]]. The caller has already validated that `v` is an object.
+pub fn read_display_calendar_name(
+    ctx: &mut NativeCtx<'_>,
+    v: Value,
+    class: &'static str,
+) -> Result<temporal_rs::options::DisplayCalendar, NativeError> {
+    use core::str::FromStr;
     match read_option_string(ctx, v, "calendarName", class)? {
         Some(name) => temporal_rs::options::DisplayCalendar::from_str(&name).map_err(|_| {
             NativeError::RangeError {
@@ -715,7 +761,6 @@ pub fn parse_display_offset(
     ctx: &mut NativeCtx<'_>,
     class: &'static str,
 ) -> Result<temporal_rs::options::DisplayOffset, NativeError> {
-    use core::str::FromStr;
     let v = arg_or_undef(args, index);
     if v.is_undefined() {
         return Ok(temporal_rs::options::DisplayOffset::Auto);
@@ -726,6 +771,17 @@ pub fn parse_display_offset(
             reason: "options must be an object or undefined".to_string(),
         });
     }
+    read_display_offset(ctx, v, class)
+}
+
+/// Read the `offset` toString option through an observable [[Get]].
+/// The caller has already validated that `v` is an object.
+pub fn read_display_offset(
+    ctx: &mut NativeCtx<'_>,
+    v: Value,
+    class: &'static str,
+) -> Result<temporal_rs::options::DisplayOffset, NativeError> {
+    use core::str::FromStr;
     match read_option_string(ctx, v, "offset", class)? {
         Some(name) => temporal_rs::options::DisplayOffset::from_str(&name).map_err(|_| {
             NativeError::RangeError {
@@ -747,7 +803,6 @@ pub fn parse_display_time_zone(
     ctx: &mut NativeCtx<'_>,
     class: &'static str,
 ) -> Result<temporal_rs::options::DisplayTimeZone, NativeError> {
-    use core::str::FromStr;
     let v = arg_or_undef(args, index);
     if v.is_undefined() {
         return Ok(temporal_rs::options::DisplayTimeZone::Auto);
@@ -758,6 +813,17 @@ pub fn parse_display_time_zone(
             reason: "options must be an object or undefined".to_string(),
         });
     }
+    read_display_time_zone_name(ctx, v, class)
+}
+
+/// Read the `timeZoneName` toString option through an observable
+/// [[Get]]. The caller has already validated that `v` is an object.
+pub fn read_display_time_zone_name(
+    ctx: &mut NativeCtx<'_>,
+    v: Value,
+    class: &'static str,
+) -> Result<temporal_rs::options::DisplayTimeZone, NativeError> {
+    use core::str::FromStr;
     match read_option_string(ctx, v, "timeZoneName", class)? {
         Some(name) => temporal_rs::options::DisplayTimeZone::from_str(&name).map_err(|_| {
             NativeError::RangeError {

@@ -1974,6 +1974,7 @@ mod tests {
     use super::*;
     use otter_bytecode::Operand;
     use otter_vm::jit::JitTestInstruction;
+    use otter_vm::jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ArithFeedback};
 
     const STRIDE: u32 = 4;
 
@@ -1986,6 +1987,121 @@ mod tests {
             })
             .collect();
         JitCompileSnapshot::without_feedback(0, 1, 8, instructions)
+    }
+
+    /// A `Sub`/`Mul` run whose intermediate is dead fuses; the intermediate's
+    /// box+store is elided while the live result is stored, and the
+    /// per-operation instructions are retained as the fallback.
+    #[test]
+    fn numeric_only_run_fuses_into_a_chain() {
+        let mut v = view(&[
+            (
+                Op::Sub,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (
+                Op::Mul,
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(2),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(3)]),
+        ]);
+        let numeric = ArithFeedback::from_bits(ARITH_INT32 | ARITH_FLOAT64);
+        v.seed_arith_feedback_for_test(0, numeric);
+        v.seed_arith_feedback_for_test(1, numeric);
+        let plan = TemplatePlan::build(&v).expect("plan");
+
+        let TemplateOp::FusedNumericChain {
+            steps,
+            leaves,
+            jump_target,
+        } = plan.instructions[0].op
+        else {
+            panic!("expected a fused chain, got {:?}", plan.instructions[0].op);
+        };
+        assert_eq!(jump_target, 2, "resume at the instruction after the chain");
+        let steps = plan.chain_step_tail(steps);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].kind, FusedArithKind::Sub);
+        assert!(!steps[0].store_result, "dead intermediate is not stored");
+        assert_eq!(steps[1].kind, FusedArithKind::Mul);
+        assert!(steps[1].store_result, "live result is stored");
+        assert_eq!(steps[1].dst, 3);
+        // Leaves are r0 and r1 (r1 reused), each unboxed once.
+        let leaves = plan.chain_leaf_tail(leaves);
+        assert_eq!(leaves, &[0, 1]);
+        assert_eq!(steps[0].a_dreg, ACCUMULATOR_DREG + 1); // r0
+        assert_eq!(steps[0].b_dreg, ACCUMULATOR_DREG + 2); // r1
+        assert_eq!(steps[1].a_dreg, ACCUMULATOR_DREG); // accumulator (r2)
+        assert_eq!(steps[1].b_dreg, ACCUMULATOR_DREG + 2); // r1
+        // The per-operation fallback stream is retained after the chain header.
+        assert!(matches!(
+            plan.instructions[1].op,
+            TemplateOp::BinaryArith {
+                kind: ArithKind::Sub,
+                ..
+            }
+        ));
+    }
+
+    /// Without numeric feedback a run is not proven number-only, so it never
+    /// speculates the unboxed double path.
+    #[test]
+    fn a_run_without_numeric_feedback_is_not_fused() {
+        let v = view(&[
+            (
+                Op::Sub,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (
+                Op::Mul,
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(2),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(3)]),
+        ]);
+        let plan = TemplatePlan::build(&v).expect("plan");
+        assert!(
+            !matches!(plan.instructions[0].op, TemplateOp::FusedNumericChain { .. }),
+            "empty feedback must not fuse"
+        );
+    }
+
+    /// A single arithmetic operation has no box/unbox roundtrip to remove and
+    /// keeps its per-operation int32 fast path.
+    #[test]
+    fn a_lone_operation_is_not_fused() {
+        let mut v = view(&[
+            (
+                Op::Sub,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
+        ]);
+        v.seed_arith_feedback_for_test(0, ArithFeedback::from_bits(ARITH_INT32));
+        let plan = TemplatePlan::build(&v).expect("plan");
+        assert!(!matches!(
+            plan.instructions[0].op,
+            TemplateOp::FusedNumericChain { .. }
+        ));
     }
 
     #[test]

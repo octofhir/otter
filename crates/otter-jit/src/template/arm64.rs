@@ -80,8 +80,8 @@ use otter_vm::JitCompileSnapshot;
 
 use self::arith::{
     emit_add_generic, emit_binary_arith, emit_bitwise_not, emit_coercion_slow_paths, emit_compare,
-    emit_increment, emit_int_bitwise, emit_loose_compare, emit_negate, emit_numeric_slow_paths,
-    emit_to_numeric, emit_to_primitive, emit_unsigned_shift_right,
+    emit_fused_numeric_chain, emit_increment, emit_int_bitwise, emit_loose_compare, emit_negate,
+    emit_numeric_slow_paths, emit_to_numeric, emit_to_primitive, emit_unsigned_shift_right,
 };
 use self::values::{
     BoxedSlotSlowPath, emit_boxed_slot_slow_paths, emit_load_reg, emit_load_runtime_stub,
@@ -342,6 +342,18 @@ pub(super) fn compile(
                     dynasm!(ops ; .arch aarch64 ; eor x9, x9, #1);
                 }
                 emit_store_reg(&mut ops, 9, dst)?;
+            }
+            TemplateOp::FusedNumericChain {
+                steps,
+                leaves,
+                jump_target,
+            } => {
+                emit_fused_numeric_chain(
+                    &mut ops,
+                    plan.chain_step_tail(steps),
+                    plan.chain_leaf_tail(leaves),
+                    labels[&jump_target],
+                )?;
             }
             TemplateOp::BinaryArith {
                 dst,
@@ -1488,6 +1500,10 @@ fn operation_requires_pc_stamp(op: TemplateOp, canonical_boolean_branch: bool) -
         TemplateOp::LoadImmediate { .. }
         | TemplateOp::Move { .. }
         | TemplateOp::LoadSelfClosure { .. }
+        // The fused chain performs no observable effect on its fast path — only
+        // register-window stores and a branch — and its per-operation fallback
+        // stamps each PC itself; the success target stamps its own on arrival.
+        | TemplateOp::FusedNumericChain { .. }
         | TemplateOp::Return { .. }
         | TemplateOp::ReturnUndefined
         | TemplateOp::Jump {

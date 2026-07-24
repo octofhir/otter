@@ -28,9 +28,9 @@ use otter_bytecode::Op;
 
 use super::transitions::{TransitionTable, emit_add_delegate, emit_string_concat_alloc_call};
 use super::values::{
-    emit_box_bool, emit_box_double, emit_box_int32, emit_guard_int32, emit_load_reg,
-    emit_load_runtime_stub, emit_load_u64, emit_num_to_double, emit_store_reg, emit_to_int32_fast,
-    emit_to_uint32_fast,
+    emit_box_bool, emit_box_double, emit_box_int32, emit_box_number, emit_guard_int32,
+    emit_load_reg, emit_load_runtime_stub, emit_load_u64, emit_num_to_double, emit_store_reg,
+    emit_to_int32_fast, emit_to_uint32_fast,
 };
 use crate::artifact::relocation::RelocationCapture;
 use crate::entry::{
@@ -88,7 +88,9 @@ fn numeric_slow_path(
 
 /// Function-id immediate low tag as a 32-bit `dynasm` operand.
 const FUNCTION_ID_TAG_IMM: u32 = FUNCTION_ID_TAG as u32;
-use crate::template::{ArithKind, BitwiseKind, CompareKind};
+use crate::template::{
+    ACCUMULATOR_DREG, ArithKind, BitwiseKind, CompareKind, FusedArithKind, FusedChainStep,
+};
 
 /// Emit `Add`/`Sub`/`Mul`/`Div`/`Rem` over tagged numbers.
 ///
@@ -216,6 +218,50 @@ pub(super) fn emit_binary_arith(
     emit_box_double(ops, 2, 13);
     emit_store_reg(ops, 13, dst)?;
     dynasm!(ops ; .arch aarch64 ; =>done ; =>resume);
+    Ok(())
+}
+
+/// Emit a fused unboxed-double chain: every leaf is number-guarded and
+/// unboxed once into its vector register, the chain computes entirely in
+/// hardware floating-point through the accumulator [`ACCUMULATOR_DREG`], and
+/// only the results that outlive the chain are boxed (representation-
+/// preservingly) and stored. On all-number leaves the emitted code branches to
+/// `jump_target`, skipping the per-operation fallback still present in the
+/// plan; any non-number leaf branches to `fallback`, which is placed at the
+/// end so control falls through into that fallback stream.
+///
+/// The fast path performs no allocation, call, or observable effect, so it
+/// needs no published PC: its only stores are register-window writes of the
+/// live results, and its only exits are the success jump and the fall-through.
+pub(super) fn emit_fused_numeric_chain(
+    ops: &mut Assembler,
+    steps: &[FusedChainStep],
+    leaves: &[u16],
+    jump_target: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let fallback = ops.new_dynamic_label();
+    // Guard every leaf is a Number and unbox it once; a non-number leaf takes
+    // the whole chain to its per-operation fallback.
+    for (index, &leaf) in leaves.iter().enumerate() {
+        let dst_d = ACCUMULATOR_DREG + 1 + u8::try_from(index).expect("leaf count is bounded");
+        emit_load_reg(ops, 9, leaf)?;
+        emit_num_to_double(ops, 9, dst_d, fallback);
+    }
+    for step in steps {
+        let acc = ACCUMULATOR_DREG;
+        let (a, b) = (step.a_dreg, step.b_dreg);
+        match step.kind {
+            FusedArithKind::Add => dynasm!(ops ; .arch aarch64 ; fadd D(acc), D(a), D(b)),
+            FusedArithKind::Sub => dynasm!(ops ; .arch aarch64 ; fsub D(acc), D(a), D(b)),
+            FusedArithKind::Mul => dynasm!(ops ; .arch aarch64 ; fmul D(acc), D(a), D(b)),
+            FusedArithKind::Div => dynasm!(ops ; .arch aarch64 ; fdiv D(acc), D(a), D(b)),
+        }
+        if step.store_result {
+            emit_box_number(ops, acc, 13);
+            emit_store_reg(ops, 13, step.dst)?;
+        }
+    }
+    dynasm!(ops ; .arch aarch64 ; b =>jump_target ; =>fallback);
     Ok(())
 }
 

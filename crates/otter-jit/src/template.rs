@@ -45,7 +45,8 @@ mod plan;
 pub use code::TemplateCode;
 pub(crate) use inline_leaf::{InlineEntryValue, InlineLeafPlan, InlineScratchSlot};
 pub(crate) use plan::{
-    ArithKind, BitwiseKind, CompareKind, TemplateOp, TemplatePlan, TemplateTail,
+    ACCUMULATOR_DREG, ArithKind, BitwiseKind, CompareKind, FusedArithKind, FusedChainStep,
+    TemplateOp, TemplatePlan, TemplateTail,
 };
 
 use crate::entry::{TransitionTable, Unsupported};

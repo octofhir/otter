@@ -23,9 +23,21 @@
 //! # See also
 //! - [`super::arm64`] — the first machine-code consumer of these operations.
 
-use otter_bytecode::Op;
+use otter_bytecode::opcode_schema::{RegisterAccess, register_access_at};
+use otter_bytecode::{Op, Operand};
 use otter_vm::{JitCompileSnapshot, SafepointId, SafepointRecord, Value};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
+
+/// First vector register a fused numeric chain uses for its running
+/// accumulator. Leaves take `d(ACCUMULATOR_DREG + 1 + leaf_index)`; every
+/// register in the range is caller-saved on AArch64, so no save/restore is
+/// needed, and `box_number`'s `d0` scratch never aliases them.
+pub(crate) const ACCUMULATOR_DREG: u8 = 16;
+
+/// Largest number of distinct leaf operands a fused chain can cache in vector
+/// registers (`d17`..`d31`). A chain that reads more leaves is left unfused.
+const MAX_CHAIN_LEAVES: usize = 15;
 
 use crate::entry::{
     BaselinePlan, MAX_METHOD_ARGS, Unsupported, pack_method_arg_regs, unpack_method_arg_regs,
@@ -65,6 +77,36 @@ pub(crate) enum BitwiseKind {
     Shr,
 }
 
+/// Numeric operator lowered inside a fused unboxed-double chain. Only the
+/// operators that compute directly with a single AArch64 floating-point
+/// instruction participate; `Rem`/`Pow` (no hardware `frem`, runtime `pow`)
+/// break a chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FusedArithKind {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// One operation inside a [`TemplateOp::FusedNumericChain`].
+///
+/// Operands name vector registers already holding unboxed doubles:
+/// [`ACCUMULATOR_DREG`] is the previous step's result, and a leaf register is
+/// `ACCUMULATOR_DREG + 1 + leaf_index`. The result always lands back in the
+/// accumulator so the next step reads it with no memory traffic; only a
+/// `store_result` step boxes it (representation-preservingly) and writes it to
+/// `dst` in the register window, because that value is observed after the
+/// chain. Dead intermediates never touch memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FusedChainStep {
+    pub(crate) kind: FusedArithKind,
+    pub(crate) dst: u16,
+    pub(crate) a_dreg: u8,
+    pub(crate) b_dreg: u8,
+    pub(crate) store_result: bool,
+}
+
 /// One machine-independent template operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TemplateOp {
@@ -91,6 +133,19 @@ pub(crate) enum TemplateOp {
     },
     /// `r<dst> = ToBoolean(r<src>)`, inverted when `negate` is set.
     Truthiness { dst: u16, src: u16, negate: bool },
+    /// A maximal run of numeric-only arithmetic whose intermediates are dead,
+    /// executed as one unboxed-double computation. Every leaf operand is
+    /// number-guarded and unboxed once into a vector register; the chain
+    /// computes with hardware floating-point and boxes only the results that
+    /// outlive it. On success it branches to `jump_target`, skipping the
+    /// per-operation instructions that remain in the plan; a non-number leaf
+    /// falls through into those instructions, which reproduce the exact
+    /// coercion/`+`-concat semantics operator by operator.
+    FusedNumericChain {
+        steps: TemplateTail,
+        leaves: TemplateTail,
+        jump_target: u32,
+    },
     /// `r<dst> = r<lhs> <op> r<rhs>` over tagged numbers: int32 fast path with
     /// overflow promotion to double, full double path, exact side exit on a
     /// non-number operand.
@@ -515,6 +570,11 @@ pub(crate) struct TemplatePlan {
     pub(crate) register_count: u16,
     pub(crate) register_operands: Box<[u16]>,
     pub(crate) index_operands: Box<[u32]>,
+    /// Steps of every [`TemplateOp::FusedNumericChain`], addressed by tail.
+    pub(crate) chain_steps: Box<[FusedChainStep]>,
+    /// Distinct leaf window registers of every fused chain, addressed by tail;
+    /// leaf at tail offset `i` is unboxed into `d(ACCUMULATOR_DREG + 1 + i)`.
+    pub(crate) chain_leaves: Box<[u16]>,
     pub(crate) safepoint_records: Vec<SafepointRecord>,
     pub(crate) load_property_count: usize,
     pub(crate) store_property_count: usize,
@@ -607,6 +667,14 @@ impl TemplatePlan {
 
     pub(crate) fn index_tail(&self, tail: TemplateTail) -> &[u32] {
         &self.index_operands[tail.start..tail.start + tail.len]
+    }
+
+    pub(crate) fn chain_step_tail(&self, tail: TemplateTail) -> &[FusedChainStep] {
+        &self.chain_steps[tail.start..tail.start + tail.len]
+    }
+
+    pub(crate) fn chain_leaf_tail(&self, tail: TemplateTail) -> &[u16] {
+        &self.chain_leaves[tail.start..tail.start + tail.len]
     }
 }
 
@@ -1647,17 +1715,258 @@ impl TemplatePlan {
                 op,
             });
         }
+        let (instructions, chain_steps, chain_leaves) = fuse_numeric_chains(view, instructions);
         Ok(Self {
             instructions,
             register_count: view.code_block.register_count,
             register_operands: register_operands.into_boxed_slice(),
             index_operands: index_operands.into_boxed_slice(),
+            chain_steps: chain_steps.into_boxed_slice(),
+            chain_leaves: chain_leaves.into_boxed_slice(),
             load_property_count: lowering.load_property_count,
             store_property_count: lowering.store_property_count,
             safepoint_records: lowering.safepoint_records,
             osr_only,
         })
     }
+}
+
+/// A fused numeric chain discovered over the built per-operation stream.
+struct DetectedChain {
+    /// One past the last per-operation instruction of the chain.
+    end: usize,
+    steps: Vec<FusedChainStep>,
+    leaves: Vec<u16>,
+    jump_target: u32,
+}
+
+/// Classify one template operation as a fusable double-arithmetic step,
+/// returning its `(kind, dst, lhs, rhs)`. Only the operators computable by a
+/// single hardware floating-point instruction qualify; `Rem`/`Pow` do not.
+fn fusable_arith(op: &TemplateOp) -> Option<(FusedArithKind, u16, u16, u16)> {
+    match *op {
+        TemplateOp::BinaryArith {
+            dst,
+            lhs,
+            rhs,
+            kind,
+        } => match kind {
+            ArithKind::Sub => Some((FusedArithKind::Sub, dst, lhs, rhs)),
+            ArithKind::Mul => Some((FusedArithKind::Mul, dst, lhs, rhs)),
+            ArithKind::Div => Some((FusedArithKind::Div, dst, lhs, rhs)),
+            ArithKind::Rem | ArithKind::Pow => None,
+        },
+        TemplateOp::AddGeneric { dst, lhs, rhs, .. } => Some((FusedArithKind::Add, dst, lhs, rhs)),
+        _ => None,
+    }
+}
+
+/// Register numbers one instruction reads, decoded from the authoritative
+/// CodeBlock via the operand-access schema. A `LoadLocal`-style local index
+/// (an `Imm32` operand with a read role) names a register exactly like a
+/// `Register` operand, so both are reported.
+fn read_registers_at(view: &JitCompileSnapshot, instruction_pc: u32, out: &mut Vec<u16>) {
+    out.clear();
+    let Some(meta) = view.instructions.get(instruction_pc as usize) else {
+        return;
+    };
+    let code_block = &view.code_block;
+    let op = meta.op(code_block);
+    let operands = meta.operand_view(code_block);
+    for index in 0..operands.len() {
+        if register_access_at(op, index) != RegisterAccess::Read {
+            continue;
+        }
+        let register = match operands.get(index) {
+            Some(Operand::Register(value)) => value,
+            Some(Operand::Imm32(value)) => match u16::try_from(value) {
+                Ok(register) => register,
+                Err(_) => continue,
+            },
+            _ => continue,
+        };
+        out.push(register);
+    }
+}
+
+/// Discover maximal linear runs of numeric-only arithmetic whose intermediate
+/// results are single-use and dead, and prepend a [`TemplateOp::FusedNumericChain`]
+/// before each. The per-operation instructions are retained unchanged as the
+/// exact fallback the fused fast path falls through to on a non-number leaf.
+fn fuse_numeric_chains(
+    view: &JitCompileSnapshot,
+    instructions: Vec<TemplateInstr>,
+) -> (Vec<TemplateInstr>, Vec<FusedChainStep>, Vec<u16>) {
+    let register_count = usize::from(view.code_block.register_count);
+    // reads[register] = sorted distinct instruction PCs that read the register.
+    let mut reads: Vec<Vec<u32>> = vec![Vec::new(); register_count];
+    let mut scratch = Vec::new();
+    for instruction_pc in 0..view.instructions.len() as u32 {
+        read_registers_at(view, instruction_pc, &mut scratch);
+        for &register in &scratch {
+            if let Some(slot) = reads.get_mut(usize::from(register))
+                && slot.last() != Some(&instruction_pc)
+            {
+                slot.push(instruction_pc);
+            }
+        }
+    }
+    // Instruction PCs that some branch reaches; a chain cannot fuse across a
+    // join into its interior (the first operation may still be a target).
+    let mut branch_targets: BTreeSet<u32> = BTreeSet::new();
+    for instruction in &instructions {
+        match instruction.op {
+            TemplateOp::Jump { target, .. }
+            | TemplateOp::Branch { target, .. }
+            | TemplateOp::BranchNullish { target, .. } => {
+                branch_targets.insert(target);
+            }
+            _ => {}
+        }
+    }
+
+    let dead_after = |register: u16, reader_pc: u32| {
+        reads
+            .get(usize::from(register))
+            .is_some_and(|slot| slot.as_slice() == [reader_pc])
+    };
+
+    let mut result = Vec::with_capacity(instructions.len());
+    let mut chain_steps = Vec::new();
+    let mut chain_leaves = Vec::new();
+    let mut position = 0usize;
+    while position < instructions.len() {
+        if let Some(chain) =
+            detect_chain(view, &instructions, &branch_targets, &dead_after, position)
+        {
+            let steps_tail = TemplateTail {
+                start: chain_steps.len(),
+                len: chain.steps.len(),
+            };
+            chain_steps.extend_from_slice(&chain.steps);
+            let leaves_tail = TemplateTail {
+                start: chain_leaves.len(),
+                len: chain.leaves.len(),
+            };
+            chain_leaves.extend_from_slice(&chain.leaves);
+            let first = instructions[position];
+            result.push(TemplateInstr {
+                pc: first.pc,
+                byte_pc: first.byte_pc,
+                op: TemplateOp::FusedNumericChain {
+                    steps: steps_tail,
+                    leaves: leaves_tail,
+                    jump_target: chain.jump_target,
+                },
+            });
+            result.extend_from_slice(&instructions[position..chain.end]);
+            position = chain.end;
+        } else {
+            result.push(instructions[position]);
+            position += 1;
+        }
+    }
+    (result, chain_steps, chain_leaves)
+}
+
+/// Attempt to grow a fused chain starting at `start`. Returns `None` when the
+/// run is shorter than two operations, reads more than [`MAX_CHAIN_LEAVES`]
+/// distinct leaves, or has no successor instruction to resume at.
+fn detect_chain(
+    view: &JitCompileSnapshot,
+    instructions: &[TemplateInstr],
+    branch_targets: &BTreeSet<u32>,
+    dead_after: &impl Fn(u16, u32) -> bool,
+    start: usize,
+) -> Option<DetectedChain> {
+    let numeric_only = |pc: u32| view.feedback_at(pc).is_numeric_only();
+
+    let (kind0, dst0, lhs0, rhs0) = fusable_arith(&instructions[start].op)?;
+    if !numeric_only(instructions[start].pc) {
+        return None;
+    }
+    // (kind, dst, lhs, rhs) per operation in the run.
+    let mut ops = vec![(kind0, dst0, lhs0, rhs0)];
+    let mut end = start + 1;
+    let mut prev_dst = dst0;
+    while end < instructions.len() {
+        let candidate = instructions[end];
+        if branch_targets.contains(&candidate.pc) {
+            break;
+        }
+        let Some((kind, dst, lhs, rhs)) = fusable_arith(&candidate.op) else {
+            break;
+        };
+        if !numeric_only(candidate.pc) {
+            break;
+        }
+        // The previous result must be this operation's only reader (single-use
+        // and dead) for its box+store to be safe to elide.
+        if lhs != prev_dst && rhs != prev_dst {
+            break;
+        }
+        if !dead_after(prev_dst, candidate.pc) {
+            break;
+        }
+        ops.push((kind, dst, lhs, rhs));
+        prev_dst = dst;
+        end += 1;
+    }
+    if ops.len() < 2 || end >= instructions.len() {
+        return None;
+    }
+    let jump_target = instructions[end].pc;
+
+    // Assign each distinct leaf a vector register in first-seen order.
+    let mut leaves: Vec<u16> = Vec::new();
+    let leaf_dreg = |leaves: &mut Vec<u16>, register: u16| -> Option<u8> {
+        let index = match leaves.iter().position(|&leaf| leaf == register) {
+            Some(index) => index,
+            None => {
+                if leaves.len() >= MAX_CHAIN_LEAVES {
+                    return None;
+                }
+                leaves.push(register);
+                leaves.len() - 1
+            }
+        };
+        Some(ACCUMULATOR_DREG + 1 + index as u8)
+    };
+
+    let last = ops.len() - 1;
+    let mut steps = Vec::with_capacity(ops.len());
+    for (position, &(kind, dst, lhs, rhs)) in ops.iter().enumerate() {
+        let (a_dreg, b_dreg) = if position == 0 {
+            (leaf_dreg(&mut leaves, lhs)?, leaf_dreg(&mut leaves, rhs)?)
+        } else {
+            let accumulator = ops[position - 1].1;
+            let a = if lhs == accumulator {
+                ACCUMULATOR_DREG
+            } else {
+                leaf_dreg(&mut leaves, lhs)?
+            };
+            let b = if rhs == accumulator {
+                ACCUMULATOR_DREG
+            } else {
+                leaf_dreg(&mut leaves, rhs)?
+            };
+            (a, b)
+        };
+        steps.push(FusedChainStep {
+            kind,
+            dst,
+            a_dreg,
+            b_dreg,
+            store_result: position == last,
+        });
+    }
+
+    Some(DetectedChain {
+        end,
+        steps,
+        leaves,
+        jump_target,
+    })
 }
 
 #[cfg(test)]

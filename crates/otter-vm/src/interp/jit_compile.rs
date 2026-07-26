@@ -310,9 +310,7 @@ impl Interpreter {
             jit_debug::JitDebugTier::Optimizing,
             false,
         );
-        self.bake_method_native_leaf_calls(&mut snapshot);
-        self.bake_collection_alloc_methods(&mut snapshot);
-        self.bake_array_methods(&mut snapshot);
+        self.bake_guarded_method_calls(&mut snapshot);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
         });
@@ -464,9 +462,7 @@ impl Interpreter {
             jit_debug::JitDebugTier::Template,
             eager_direct_targets,
         );
-        self.bake_method_native_leaf_calls(&mut view);
-        self.bake_collection_alloc_methods(&mut view);
-        self.bake_array_methods(&mut view);
+        self.bake_guarded_method_calls(&mut view);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
         });
@@ -676,13 +672,15 @@ impl Interpreter {
         (argc == usize::from(declaration.argument_count)).then_some(declaration.leaf_stub_id)
     }
 
-    /// Bake every `Op::CallMethodValue` site whose callee is a declared leaf
+    /// Bake every `Op::CallMethodValue` site whose callee is a declared native
     /// entry into the compile snapshot.
     ///
     /// The receiver layout comes from the same feedback a property site
     /// records, so generated code guards it with the shared way walk and
-    /// prototype hop rather than a second description of the same access.
-    pub(crate) fn bake_method_native_leaf_calls(&mut self, view: &mut jit::JitCompileSnapshot) {
+    /// prototype hop rather than a second description of the same access. An
+    /// entry that may collect reserves its safepoint here, at the site that
+    /// will publish it.
+    pub(crate) fn bake_guarded_method_calls(&mut self, view: &mut jit::JitCompileSnapshot) {
         let sites: Vec<_> = view
             .instructions
             .iter()
@@ -696,14 +694,20 @@ impl Interpreter {
             })
             .collect();
         for (byte_pc, site, method_hint) in sites {
-            // An exotic receiver — a collection body or a primitive — reaches
-            // its builtin through a pinned realm prototype rather than a shape,
-            // so its feedback names the call directly.
+            let alloc_safepoint_id = view.safepoints.len() as native_abi::SafepointId;
+            // An exotic receiver — a collection body, a dense array or a
+            // primitive — reaches its builtin through a pinned realm prototype
+            // rather than a shape, so its feedback names the call directly.
             if let Some(call) = site
-                .and_then(|site| self.jit_collection_leaf_call(site))
+                .and_then(|site| self.jit_collection_method_call(site, alloc_safepoint_id))
+                .or_else(|| {
+                    site.and_then(|site| self.jit_array_method_call(site, alloc_safepoint_id))
+                })
                 .or_else(|| self.jit_primitive_method_call(method_hint))
             {
-                view.method_native_leaf_calls.insert(byte_pc, call);
+                if reserve_guarded_entry_safepoint(view, &call) {
+                    view.guarded_method_calls.insert(byte_pc, call);
+                }
                 continue;
             }
             let Some(site) = site else {
@@ -727,16 +731,17 @@ impl Interpreter {
             let Some(declaration) = crate::math::jit_leaf_builtin(stub_id) else {
                 continue;
             };
-            view.method_native_leaf_calls.insert(
+            view.guarded_method_calls.insert(
                 byte_pc,
-                jit::JitMethodNativeLeafCall {
+                jit::JitGuardedMethodCall {
                     receiver: jit::JitGuardedReceiver::Shape {
                         shape: recv_shape_offset,
                     },
                     holder_shape: holder_shape_offset,
                     method_value_byte,
                     builtin_fn_addr: crate::math::jit_static_call_address(stub_id),
-                    leaf_stub_id: stub_id,
+                    entry_stub_id: stub_id,
+                    safepoint_id: native_abi::NO_SAFEPOINT,
                     argument_count: declaration.argument_count,
                 },
             );
@@ -1474,90 +1479,40 @@ impl Interpreter {
             nested_methods,
         })
     }
+}
 
-    /// Bake JIT-readable collection leaf method IC metadata.
-    ///
-    /// The emitted baseline guard still validates receiver type, no
-    /// prototype/expando override, prototype shape, and builtin identity at the
-    /// slot. Baking only makes those fields machine-readable so the hot path no
-    /// longer crosses into Rust just to resolve a `RuntimeStubId`.
-    /// Bake dense-array `push` / `pop` method-call guard metadata so the
-    /// baseline can splice an inline fast path for the site. Guard misses
-    /// side-exit before method effects.
-    ///
-    /// `pop` runs as a mutating leaf and needs no root map. `push` may grow the
-    /// dense buffer, so its site reserves a frame-slot safepoint the same way
-    /// the allocating collection writes do.
-    pub(crate) fn bake_array_methods(&self, view: &mut jit::JitCompileSnapshot) {
-        for instr in &view.instructions {
-            if instr.op(&view.code_block) != Op::CallMethodValue {
-                continue;
-            }
-            let Some(site) = instr.property_ic_site(&view.code_block) else {
-                continue;
-            };
-            let push_safepoint_id = view.safepoints.len() as native_abi::SafepointId;
-            let Some(feedback) = self.jit_array_method_feedback(site, push_safepoint_id) else {
-                continue;
-            };
-            if feedback.kind.allocates() {
-                if !crate::runtime_stubs::alloc_value_stub_by_id(feedback.stub_id)
-                    .is_some_and(|stub| stub.is_valid_for_safepoint(push_safepoint_id))
-                {
-                    continue;
-                }
-                view.safepoints.insert(
-                    push_safepoint_id,
-                    native_abi::SafepointRecord::frame_slot_window(
-                        push_safepoint_id,
-                        native_abi::NO_FRAME_STATE,
-                        view.code_block.register_count,
-                    ),
-                );
-            } else if !crate::runtime_stubs::mutating_leaf_stub2_by_id(feedback.stub_id)
-                .is_some_and(crate::runtime_stubs::MutatingLeafStub2::is_valid)
-            {
-                continue;
-            }
-            view.array_methods.insert(instr.byte_pc, feedback);
-        }
+/// Admit a guarded method call only when its declared entry has machine-callable
+/// code, reserving the frame-slot root window an allocating entry needs.
+///
+/// The family the entry id resolves in is the whole decision: a leaf or
+/// mutating-leaf entry cannot collect and publishes nothing, while an
+/// allocating one must name a precise map covering the caller's full register
+/// window before generated code may call it.
+fn reserve_guarded_entry_safepoint(
+    view: &mut jit::JitCompileSnapshot,
+    call: &jit::JitGuardedMethodCall,
+) -> bool {
+    let stub_id = call.entry_stub_id;
+    if call.safepoint_id == native_abi::NO_SAFEPOINT {
+        return crate::runtime_stubs::leaf_no_alloc_stub2_by_id(stub_id)
+            .is_some_and(crate::runtime_stubs::LeafNoAllocStub2::is_valid)
+            || crate::runtime_stubs::mutating_leaf_stub2_by_id(stub_id)
+                .is_some_and(crate::runtime_stubs::MutatingLeafStub2::is_valid);
     }
-
-    /// Bake JIT-readable collection allocating method IC metadata.
-    ///
-    /// This only publishes guard metadata and the target `AllocStub` descriptor
-    /// id. Baseline codegen must continue using the rooted fallback until it can
-    /// attach exact safepoint maps to the machine call site.
-    pub(crate) fn bake_collection_alloc_methods(&self, view: &mut jit::JitCompileSnapshot) {
-        for instr in &view.instructions {
-            if instr.op(&view.code_block) != Op::CallMethodValue {
-                continue;
-            }
-            let Some(site) = instr.property_ic_site(&view.code_block) else {
-                continue;
-            };
-            let safepoint_id = view.safepoints.len() as native_abi::SafepointId;
-            let Some(feedback) = self.jit_collection_alloc_method_feedback(site, safepoint_id)
-            else {
-                continue;
-            };
-            if !crate::runtime_stubs::alloc_value_stub_by_id(feedback.alloc_stub_id)
-                .is_some_and(|stub| stub.is_valid_for_safepoint(safepoint_id))
-            {
-                continue;
-            }
-            view.safepoints.insert(
-                safepoint_id,
-                native_abi::SafepointRecord::frame_slot_window(
-                    safepoint_id,
-                    native_abi::NO_FRAME_STATE,
-                    view.code_block.register_count,
-                ),
-            );
-            view.collection_alloc_methods
-                .insert(instr.byte_pc, feedback);
-        }
+    if !crate::runtime_stubs::alloc_value_stub_by_id(stub_id)
+        .is_some_and(|stub| stub.is_valid_for_safepoint(call.safepoint_id) && stub.has_entry())
+    {
+        return false;
     }
+    view.safepoints.insert(
+        call.safepoint_id,
+        native_abi::SafepointRecord::frame_slot_window(
+            call.safepoint_id,
+            native_abi::NO_FRAME_STATE,
+            view.code_block.register_count,
+        ),
+    );
+    true
 }
 
 #[cfg(test)]

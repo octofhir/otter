@@ -84,18 +84,6 @@ pub(crate) enum GuardedHeapComponent {
     PrototypeShape,
 }
 
-/// Which guarded builtin family a relocation belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum GuardedBuiltinKind {
-    /// Non-allocating collection read.
-    Leaf,
-    /// Allocating collection write.
-    Alloc,
-    /// Dense-array `push` / `pop` builtin reached through a typed entry.
-    Array,
-}
-
 /// Semantic identity for one address materialized in native code.
 ///
 /// None of these variants accepts a process-local pointer. Text fields name
@@ -130,12 +118,10 @@ pub(crate) enum RelocationTarget {
     },
     GuardedHeapReference {
         component: GuardedHeapComponent,
-        feedback_kind: GuardedBuiltinKind,
         byte_pc: u32,
         runtime_stub_id: u32,
     },
     GuardedBuiltinFunction {
-        feedback_kind: GuardedBuiltinKind,
         byte_pc: u32,
         runtime_stub_id: u32,
     },
@@ -1028,7 +1014,6 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
         }
         RelocationTarget::GuardedHeapReference {
             component,
-            feedback_kind,
             byte_pc,
             runtime_stub_id,
         } => {
@@ -1037,25 +1022,14 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
                 GuardedHeapComponent::Prototype => 0,
                 GuardedHeapComponent::PrototypeShape => 1,
             });
-            output.push(match feedback_kind {
-                GuardedBuiltinKind::Leaf => 0,
-                GuardedBuiltinKind::Alloc => 1,
-                GuardedBuiltinKind::Array => 3,
-            });
             put_u32(output, *byte_pc);
             put_u32(output, *runtime_stub_id);
         }
         RelocationTarget::GuardedBuiltinFunction {
-            feedback_kind,
             byte_pc,
             runtime_stub_id,
         } => {
             output.push(TARGET_GUARDED_BUILTIN_FUNCTION);
-            output.push(match feedback_kind {
-                GuardedBuiltinKind::Leaf => 0,
-                GuardedBuiltinKind::Alloc => 1,
-                GuardedBuiltinKind::Array => 3,
-            });
             put_u32(output, *byte_pc);
             put_u32(output, *runtime_stub_id);
         }
@@ -1390,12 +1364,10 @@ mod tests {
             },
             RelocationTarget::GuardedHeapReference {
                 component: GuardedHeapComponent::Prototype,
-                feedback_kind: GuardedBuiltinKind::Leaf,
                 byte_pc: 8,
                 runtime_stub_id: 9,
             },
             RelocationTarget::GuardedBuiltinFunction {
-                feedback_kind: GuardedBuiltinKind::Alloc,
                 byte_pc: 10,
                 runtime_stub_id: 11,
             },

@@ -105,9 +105,6 @@ use otter_vm::native_abi::{
 };
 use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG};
 
-use crate::template::arm64::collections::{
-    MethodSite, emit_alloc_method_guarded_call, emit_array_method_guarded_call,
-};
 use crate::template::arm64::ic_probe;
 
 use super::{
@@ -156,8 +153,8 @@ use crate::{
         ssa::{SsaFunction, SsaInstr, ValueDef, ValueId},
     },
     template::arm64::ic_probe::{
-        emit_native_leaf_call, emit_native_leaf_method_call, native_leaf_call_is_supported,
-        native_leaf_call_name,
+        emit_guarded_method_call, emit_native_leaf_call, guarded_method_call_is_supported,
+        native_leaf_call_is_supported, native_leaf_call_name,
     },
 };
 
@@ -3815,21 +3812,24 @@ fn emit(
                     let succeeded = ops.new_dynamic_label();
                     let bail = ops.new_dynamic_label();
                     let native_leaf = (instruction.inline == InlineId::ROOT)
-                        .then(|| view.method_native_leaf_calls.get(&byte_pc))
+                        .then(|| view.guarded_method_calls.get(&byte_pc))
                         .flatten()
-                        .filter(|call| arg_regs.len() == usize::from(call.argument_count));
+                        .filter(|call| arg_regs.len() == usize::from(call.argument_count))
+                        .filter(|call| guarded_method_call_is_supported(view, call));
                     if let Some(call) = native_leaf {
                         let leaf_miss = ops.new_dynamic_label();
-                        emit_native_leaf_method_call(
+                        emit_guarded_method_call(
                             &mut ops,
                             &mut relocations,
                             view,
                             call,
                             receiver,
+                            byte_pc,
                             |ops, index, register| {
-                                let source = arg_regs.get(usize::from(index)).copied().ok_or(
-                                    Unsupported::OperandShape("native leaf method argument"),
-                                )?;
+                                let source = arg_regs
+                                    .get(usize::from(index))
+                                    .copied()
+                                    .ok_or(Unsupported::OperandShape("guarded method argument"))?;
                                 crate::template::arm64::values::emit_load_reg(ops, register, source)
                             },
                             leaf_miss,
@@ -3943,48 +3943,6 @@ fn emit(
                             );
                         }
                         dynasm!(ops ; .arch aarch64 ; =>next_target);
-                    }
-                    if let Some(alloc) = view.collection_alloc_methods.get(&byte_pc) {
-                        let after_alloc = ops.new_dynamic_label();
-                        if emit_alloc_method_guarded_call(
-                            &mut ops,
-                            &mut relocations,
-                            view,
-                            alloc,
-                            byte_pc,
-                            &MethodSite {
-                                dst,
-                                receiver,
-                                argc: arg_regs.len() as u16,
-                                arg0: arg_regs.first().copied(),
-                                arg1: arg_regs.get(1).copied(),
-                            },
-                            after_alloc,
-                            succeeded,
-                        )? {
-                            dynasm!(ops ; .arch aarch64 ; =>after_alloc);
-                        }
-                    }
-                    if let Some(array_method) = view.array_methods.get(&byte_pc) {
-                        let after_array = ops.new_dynamic_label();
-                        if emit_array_method_guarded_call(
-                            &mut ops,
-                            &mut relocations,
-                            view,
-                            array_method,
-                            byte_pc,
-                            &MethodSite {
-                                dst,
-                                receiver,
-                                argc: arg_regs.len() as u16,
-                                arg0: arg_regs.first().copied(),
-                                arg1: arg_regs.get(1).copied(),
-                            },
-                            after_array,
-                            succeeded,
-                        )? {
-                            dynasm!(ops ; .arch aarch64 ; =>after_array);
-                        }
                     }
                     let packed_meta = u64::from(dst)
                         | (u64::from(receiver) << 16)

@@ -50,7 +50,6 @@ pub(crate) mod arith;
 mod calls;
 mod class_ops;
 mod class_value;
-pub(crate) mod collections;
 mod construct;
 mod control;
 mod delete;

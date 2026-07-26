@@ -2999,6 +2999,13 @@ impl Interpreter {
             self.feedback_directory
                 .record_property_uncached_miss(site, PropertyIcKind::Load);
         }
+        // A dictionary-mode receiver has no hidden class for a guard to name, so
+        // no cache program can describe an access on it. Bootstrap namespace
+        // objects are built that way; migrate the receiver onto the shaped path,
+        // then re-read it — the migration allocates and may relocate it.
+        let mut migrating = obj;
+        self.migrate_slow_to_fast(&mut migrating);
+        let obj = migrating;
         if self
             .feedback_directory
             .property_is_megamorphic(site, PropertyIcKind::Load)

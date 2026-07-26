@@ -282,6 +282,8 @@ pub struct JitCompileSnapshot {
     /// generated code can validate the receiver/prototype/builtin guards and
     /// call the VM-native leaf stub without runtime method resolution.
     pub collection_leaf_methods: rustc_hash::FxHashMap<u32, JitCollectionLeafMethod>,
+    /// Guarded native-leaf method calls, keyed by call byte PC.
+    pub method_native_leaf_calls: rustc_hash::FxHashMap<u32, JitMethodNativeLeafCall>,
     /// Allocating collection method-call feedback keyed by the caller's
     /// `Op::CallMethodValue` byte-PC. These entries carry the same
     /// receiver/prototype/builtin guards as leaf feedback plus the target
@@ -333,6 +335,31 @@ pub struct JitCollectionLeafMethod {
     pub builtin_fn_addr: usize,
     /// VM-native leaf stub descriptor id to call after guards pass.
     pub leaf_stub_id: crate::native_abi::RuntimeStubId,
+}
+
+/// One `Op::CallMethodValue` site whose callee is a declared leaf entry.
+///
+/// The layout fields are the same lowered cache program a property site
+/// caches — guarded receiver shape, an optional guarded prototype holder, and
+/// the slot byte — so generated code reuses the way walk and the prototype hop
+/// rather than describing this access a second time. The entry id then selects
+/// the call, exactly as it does at an ordinary call site.
+#[derive(Debug, Clone, Copy)]
+pub struct JitMethodNativeLeafCall {
+    /// Guarded receiver shape handle offset.
+    pub receiver_shape: u32,
+    /// Guarded holder shape handle offset, or `0` when the receiver owns the
+    /// method slot and no hop is performed.
+    pub holder_shape: u32,
+    /// Byte offset of the method slot inside the holder's value slab.
+    pub method_value_byte: u32,
+    /// Exact process-local bootstrap function address guarded before the entry
+    /// runs. Never serialized into diagnostics or normalized artifacts.
+    pub builtin_fn_addr: usize,
+    /// Declared entry invoked once every guard passes.
+    pub leaf_stub_id: crate::native_abi::RuntimeStubId,
+    /// Exact JavaScript argument count the entry implements.
+    pub argument_count: u8,
 }
 
 /// JIT-readable allocating collection method IC entry.
@@ -893,6 +920,7 @@ impl JitCompileSnapshot {
             inline_methods: rustc_hash::FxHashMap::default(),
             inline_poly_methods: rustc_hash::FxHashMap::default(),
             collection_leaf_methods: rustc_hash::FxHashMap::default(),
+            method_native_leaf_calls: rustc_hash::FxHashMap::default(),
             collection_alloc_methods: rustc_hash::FxHashMap::default(),
             array_methods: rustc_hash::FxHashMap::default(),
             primitive_method_guards: rustc_hash::FxHashMap::default(),

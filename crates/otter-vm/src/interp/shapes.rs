@@ -312,6 +312,49 @@ impl Interpreter {
         ))
     }
 
+    /// Give a dictionary-mode object — and every dictionary-mode object on its
+    /// prototype chain — the hidden class describing the slots it already has.
+    ///
+    /// Bootstrap installers build namespace objects (`Math`, `JSON`, `Reflect`,
+    /// `Atomics`, `Intl`, …) through the heap-only define path, which has no
+    /// shape runtime to take a transition from and so leaves them in dictionary
+    /// storage for life. Nothing can be cached on such an object: an inline
+    /// cache names its receiver by hidden class, and a dictionary object has
+    /// none. Migrating on the first cache attach puts them back on the ordinary
+    /// shaped path, where the way walk, the prototype hop and the method-call
+    /// guards all already work.
+    ///
+    /// `obj` is rooted across every transition allocation and refreshed through
+    /// it, and each prototype is re-read from the refreshed receiver, so a
+    /// scavenge during migration cannot leave the walk on a vacated cell.
+    pub(crate) fn migrate_slow_to_fast(&mut self, obj: &mut object::JsObject) {
+        /// Prototype depth the migration walks. Deeper holders are out of reach
+        /// of the guard chains that consume the result anyway.
+        const MAX_MIGRATED_CHAIN: usize = 8;
+        for depth in 0..MAX_MIGRATED_CHAIN {
+            let mut current = *obj;
+            for _ in 0..depth {
+                let Some(proto) = object::prototype(current, &self.gc_heap) else {
+                    return;
+                };
+                current = proto;
+            }
+            let Some(ordered) = object::dictionary_ordered_slot_attrs(current, &self.gc_heap)
+            else {
+                continue;
+            };
+            let mut root_receiver = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                visitor((obj as *mut object::JsObject).cast::<RawGc>());
+            };
+            let Ok(shape) =
+                self.rebuild_shape_from_slots(&mut current, &ordered, &mut root_receiver)
+            else {
+                return;
+            };
+            object::adopt_fast_shape(current, &mut self.gc_heap, shape);
+        }
+    }
+
     /// Replay `ordered` `(key, flags, is_accessor)` slots from the empty root,
     /// returning the attribute-encoding hidden class they describe. The replay
     /// reuses shared transitions, so objects modified the same way (frozen,

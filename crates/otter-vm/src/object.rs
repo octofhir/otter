@@ -4311,6 +4311,68 @@ pub(crate) fn redefine_merged_attrs(
     Some((merged.flags, !merged.kind.is_data(), offset))
 }
 
+/// Ordered `(key, flags, is_accessor)` for every own string-keyed slot of a
+/// dictionary-mode object, in slot order, when its storage can be described by
+/// a hidden class instead.
+///
+/// `None` when the object already has one, when it left fast-shape mode (a
+/// delete makes the append-only key history a lie), or when it holds more slots
+/// than fast storage keeps. The caller replays the returned slots from the
+/// empty root to obtain the class, then installs it with [`adopt_fast_shape`].
+#[must_use]
+pub(crate) fn dictionary_ordered_slot_attrs(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+) -> Option<Vec<(String, PropertyFlags, bool)>> {
+    heap.read_payload(obj, |body| {
+        if !body.shape.is_null() || !shape_cache::supports_fast_property_ic(body) {
+            return None;
+        }
+        let count = body.dictionary_keys().len();
+        if count > MAX_FAST_PROPERTIES as usize || body.slots().len() != count {
+            return None;
+        }
+        Some(
+            body.dictionary_keys()
+                .iter()
+                .enumerate()
+                .map(|(offset, key)| {
+                    let (flags, is_accessor) = body.slot_attrs(heap, offset);
+                    (key.clone(), flags, is_accessor)
+                })
+                .collect(),
+        )
+    })
+}
+
+/// Re-point a dictionary-mode object at `shape`, which must record exactly its
+/// current slots, in order, with their current attributes.
+///
+/// The object leaves dictionary storage entirely: the key vector, the key index
+/// and the materialized per-slot metadata are dropped and the hidden class
+/// becomes the sole source of slot offsets and attributes. That is what lets an
+/// inline cache name the receiver — a guard identifies a receiver by its shape,
+/// and a dictionary object has none.
+pub(crate) fn adopt_fast_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, shape: ShapeHandle) {
+    debug_assert_object_shape_handle(shape, "slow-to-fast migration");
+    debug_assert_eq!(
+        heap.read_payload(obj, |body| body.dictionary_keys().len()),
+        shape_body::shape_property_count(heap, shape) as usize,
+        "migrated hidden class must record every dictionary slot"
+    );
+    heap.with_payload(obj, |body| {
+        body.shape = shape;
+        body.slot_attrs_overridden = false;
+        body.dictionary_shape_id = ShapeId::UNASSIGNED;
+        if let Some(exotic) = body.exotic.as_deref_mut() {
+            exotic.dictionary_keys.clear();
+            exotic.dictionary_index.clear();
+            exotic.slots.clear();
+        }
+    });
+    heap.record_write(obj, &shape);
+}
+
 #[must_use]
 pub(crate) fn shape_ordered_slot_attrs(
     heap: &otter_gc::GcHeap,

@@ -215,23 +215,16 @@ pub(crate) fn emit_native_leaf_call<F>(
     stub_id: RuntimeStubId,
     builtin_fn_addr: usize,
     callee_x: u8,
-    mut load_argument: F,
+    load_argument: F,
     bail: DynamicLabel,
 ) -> Result<(), Unsupported>
 where
     F: FnMut(&mut Assembler, u8, u8) -> Result<(), Unsupported>,
 {
-    let (Some(declaration), Some(stub)) = (
-        otter_vm::math::jit_leaf_builtin(stub_id),
-        leaf_no_alloc_stub2_by_id(stub_id),
-    ) else {
-        return Err(Unsupported::OperandShape("native leaf entry"));
-    };
     debug_assert!(
         !(12..=16).contains(&callee_x),
         "the callee must survive the guard, which owns x12..x16"
     );
-    debug_assert!(stub.is_valid());
 
     let native_type_tag = u32::from(view.collection_layout.native_function_type_tag);
     dynasm!(ops
@@ -259,9 +252,31 @@ where
         ; b.ne =>bail
     );
 
-    // Guards are done; nothing below is live across a miss. `(heap, arg0, arg1)
-    // -> pair`, with no safepoint: a leaf entry cannot allocate, collect, or
-    // re-enter JS.
+    emit_native_leaf_entry_call(ops, relocations, stub_id, load_argument, bail)
+}
+
+/// Call a declared leaf entry whose identity a caller has already guarded.
+///
+/// Runs only once every guard has passed, so nothing it writes is live across a
+/// miss and `load_argument` may freely use `x10`–`x15`. `(heap, arg0, arg1) ->
+/// pair`, with no safepoint: a leaf entry cannot allocate, collect, or re-enter
+/// JS. The boxed result is left in `x0`; a miss branches to `bail`.
+pub(crate) fn emit_native_leaf_entry_call<F>(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    stub_id: RuntimeStubId,
+    mut load_argument: F,
+    bail: DynamicLabel,
+) -> Result<(), Unsupported>
+where
+    F: FnMut(&mut Assembler, u8, u8) -> Result<(), Unsupported>,
+{
+    let (Some(declaration), Some(stub)) = (
+        otter_vm::math::jit_leaf_builtin(stub_id),
+        leaf_no_alloc_stub2_by_id(stub_id),
+    ) else {
+        return Err(Unsupported::OperandShape("native leaf entry"));
+    };
     dynasm!(ops
         ; .arch aarch64
         ; ldr x0, [x20, THREAD_OFFSET]
@@ -294,4 +309,86 @@ where
 /// Process-independent: the id names a declaration, never an address.
 pub(crate) fn native_leaf_call_name(stub_id: RuntimeStubId) -> &'static str {
     runtime_stub_name(stub_id)
+}
+
+/// Emit `dst = receiver.method(args…)` where the method is a declared leaf
+/// entry, guarding the receiver shape, the method slot's identity, and nothing
+/// else.
+///
+/// The receiver layout is baked rather than probed: the site's feedback already
+/// resolved the guarded shape, the optional prototype holder and the slot byte,
+/// so this needs no cache cell and no way walk. `holder_shape == 0` is the
+/// own-slot case a namespace object such as `Math` takes, and skips the hop.
+///
+/// `load_argument(ops, index, register)` runs only after every guard, matching
+/// [`emit_native_leaf_entry_call`]. The boxed result is left in `x0`; every miss
+/// branches to `miss`.
+pub(crate) fn emit_native_leaf_method_call<F>(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    call: &otter_vm::JitMethodNativeLeafCall,
+    receiver: u16,
+    load_argument: F,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported>
+where
+    F: FnMut(&mut Assembler, u8, u8) -> Result<(), Unsupported>,
+{
+    if view.cage_base == 0 || view.native_static_fn_byte == 0 {
+        return Err(Unsupported::OperandShape("native leaf method layout"));
+    }
+    let shape_byte = view.object_shape_byte;
+    let guarded_shape = call.receiver_shape;
+
+    // Receiver: a cell carrying an ordinary object body whose shape is the one
+    // the site recorded. The shape pins the slot offset; the identity guard
+    // below still pins which function occupies it, since assigning over an
+    // existing property leaves the shape alone.
+    super::collections::emit_receiver_type_guard(
+        ops,
+        relocations,
+        view,
+        receiver,
+        OBJECT_BODY_TYPE_TAG,
+        miss,
+    )?;
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr w14, [x13, shape_byte]
+        ; cbz w14, =>miss
+    );
+    emit_load_u64(ops, 12, u64::from(guarded_shape));
+    dynasm!(ops
+        ; .arch aarch64
+        ; cmp w14, w12
+        ; b.ne =>miss
+    );
+
+    // Holder: `0` means the receiver owns the slot. Otherwise the way's guarded
+    // prototype hop runs, which reads `[[Prototype]]` at run time because
+    // `setPrototypeOf` moves it while the shape stays put.
+    if call.holder_shape != 0 {
+        emit_load_u64(ops, 7, u64::from(call.holder_shape));
+        emit_resolve_holder(ops, relocations, view, miss);
+    }
+    super::values::emit_slab_base(ops, view, 13, 14);
+    dynasm!(ops
+        ; .arch aarch64
+        ; cbz x13, =>miss
+        ; mov x15, x13
+    );
+    super::collections::emit_builtin_identity_guard(
+        ops,
+        relocations,
+        view,
+        call.method_value_byte,
+        call.builtin_fn_addr,
+        false,
+        crate::artifact::relocation::GuardedBuiltinKind::Leaf,
+        0,
+        call.leaf_stub_id,
+        miss,
+    );
+    emit_native_leaf_entry_call(ops, relocations, call.leaf_stub_id, load_argument, miss)
 }

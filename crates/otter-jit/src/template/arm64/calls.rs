@@ -48,7 +48,8 @@ use super::collections::{
     emit_leaf_method_guarded_call, emit_primitive_method_guarded_call,
 };
 use super::ic_probe::{
-    emit_native_leaf_call, native_leaf_call_is_supported, native_leaf_call_name,
+    emit_native_leaf_call, emit_native_leaf_method_call, native_leaf_call_is_supported,
+    native_leaf_call_name,
 };
 use super::transitions::TransitionTable;
 use super::values::{
@@ -1225,6 +1226,37 @@ pub(super) fn emit_method_call(
         arg0,
         arg1,
     };
+    if let Some(call) = view.method_native_leaf_calls.get(&byte_pc)
+        && usize::from(argc) == usize::from(call.argument_count)
+    {
+        let leaf_miss = ops.new_dynamic_label();
+        let method_arguments = [arg0, arg1];
+        emit_native_leaf_method_call(
+            ops,
+            relocations,
+            view,
+            call,
+            receiver,
+            |ops, index, register| {
+                let source = method_arguments
+                    .get(usize::from(index))
+                    .copied()
+                    .flatten()
+                    .ok_or(Unsupported::OperandShape("native leaf method argument"))?;
+                emit_load_reg(ops, register, source)
+            },
+            leaf_miss,
+        )?;
+        emit_store_reg(ops, 0, dst)?;
+        dynasm!(ops
+            ; .arch aarch64
+            ; b =>done
+            ; =>leaf_miss
+            ; b =>bail
+            ; =>done
+        );
+        return Ok(());
+    }
     let planned_methods = view.direct_methods.get(&byte_pc);
     if planned_methods.is_none_or(|methods| methods.len() == 1 && methods[0].target_count == 1)
         && let Some(method) = view.inline_methods.get(&byte_pc)

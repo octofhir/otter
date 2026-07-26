@@ -383,6 +383,51 @@ impl FeedbackDirectory {
             )
     }
 
+    fn record_method_native_leaf(
+        &mut self,
+        site: usize,
+        stub_id: crate::native_abi::RuntimeStubId,
+        method_site: MethodSite,
+    ) {
+        if !self
+            .address(site)
+            .is_some_and(FeedbackSlotAddress::is_method)
+        {
+            return;
+        }
+        let Some(feedback) = self.method_targets.get_mut(site) else {
+            return;
+        };
+        match feedback {
+            None => {
+                *feedback = Some(MethodCallFeedback::MonoNativeLeaf {
+                    stub_id,
+                    recv_shape: method_site.recv_shape,
+                    proto_chain: method_site.proto_chain,
+                    method_value_byte: method_site.method_value_byte,
+                    recv_shape_offset: method_site.recv_shape_offset,
+                    holder_shape_offset: method_site.holder_shape_offset,
+                });
+            }
+            Some(MethodCallFeedback::MonoNativeLeaf {
+                stub_id: seen_stub,
+                recv_shape,
+                proto_chain,
+                method_value_byte,
+                ..
+            }) => {
+                if *seen_stub != stub_id
+                    || *recv_shape != method_site.recv_shape
+                    || !proto_chain.same(&method_site.proto_chain)
+                    || *method_value_byte != method_site.method_value_byte
+                {
+                    *feedback = Some(MethodCallFeedback::Megamorphic);
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
     fn record_method_target(&mut self, site: usize, method_fid: u32, method_site: MethodSite) {
         if !self
             .address(site)
@@ -457,6 +502,12 @@ fn record_method_distribution(
             }
         }
         Some(MethodCallFeedback::Megamorphic) => {}
+        // A site that already resolved to a declared native leaf cannot also
+        // carry a bytecode inline chain: the two need different guard
+        // lowerings, so the second shape gives up rather than mixing them.
+        Some(MethodCallFeedback::MonoNativeLeaf { .. }) => {
+            *feedback = Some(MethodCallFeedback::Megamorphic);
+        }
     }
 }
 
@@ -510,6 +561,22 @@ impl Interpreter {
         self.feedback_directory.method_targets_saturated(site)
     }
 
+    /// Record that one `Op::CallMethodValue` site resolved to a declared native
+    /// leaf entry, with the receiver layout captured before the call.
+    ///
+    /// A site that has already observed a bytecode target keeps it: mixing the
+    /// two would need a guard chain that can dispatch both, which no consumer
+    /// builds. The first shape wins and any other receiver misses to the stub.
+    pub(crate) fn record_method_native_leaf_feedback(
+        &mut self,
+        site: usize,
+        stub_id: crate::native_abi::RuntimeStubId,
+        method_site: MethodSite,
+    ) {
+        self.feedback_directory
+            .record_method_native_leaf(site, stub_id, method_site);
+    }
+
     pub(crate) fn record_method_target_feedback(
         &mut self,
         site: usize,
@@ -531,6 +598,8 @@ mod tests {
             recv_shape: ShapeId::for_test(raw),
             proto_chain: MethodProtoChain::own(),
             method_value_byte: raw as u32 * 8,
+            recv_shape_offset: raw as u32,
+            holder_shape_offset: 0,
         }
     }
 

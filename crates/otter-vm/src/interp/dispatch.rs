@@ -348,31 +348,45 @@ impl Interpreter {
                     // under the new callee frame; the receiver handle may move
                     // during the call, so the prototype shape and method slot are
                     // resolved here while it is still valid).
-                    let method_site = if jit_installed
+                    let capture = jit_installed
                         && feedback_site
-                            .is_some_and(|site| !self.method_site_feedback_saturated(site))
-                    {
-                        register_operand(function.operand(instr, 1))
-                            .ok()
-                            .and_then(|r| {
-                                stack
-                                    .get(top_idx)
-                                    .and_then(|f| f.registers.get(r as usize).copied())
-                            })
-                            .and_then(|recv| {
-                                const_operand(function.operand(instr, 2)).ok().and_then(
-                                    |name_idx| {
-                                        self.method_site_for_receiver(
-                                            context,
-                                            function_id,
-                                            name_idx,
-                                            recv,
-                                        )
-                                    },
-                                )
-                            })
-                    } else {
-                        None
+                            .is_some_and(|site| !self.method_site_feedback_saturated(site));
+                    let mut receiver = capture
+                        .then(|| register_operand(function.operand(instr, 1)).ok())
+                        .flatten()
+                        .and_then(|r| {
+                            stack
+                                .get(top_idx)
+                                .and_then(|f| f.registers.get(r as usize).copied())
+                        });
+                    let name_idx = const_operand(function.operand(instr, 2)).ok();
+                    // The receiver is refreshed in place: resolving the site can
+                    // migrate a dictionary-mode receiver onto the shaped path,
+                    // and that allocation may relocate it.
+                    let method_site = match (receiver.as_mut(), name_idx) {
+                        (Some(recv), Some(name_idx)) => {
+                            self.method_site_for_receiver(context, function_id, name_idx, recv)
+                        }
+                        _ => None,
+                    };
+                    // A declared native leaf completes synchronously and pushes
+                    // no frame, so its identity has to be classified here, while
+                    // the receiver is still live, or the site records nothing.
+                    let native_leaf = match (receiver, name_idx, method_site) {
+                        (Some(recv), Some(name_idx), Some(_)) => {
+                            const_operand(function.operand(instr, 3))
+                                .ok()
+                                .and_then(|argc| {
+                                    self.method_slot_native_leaf(
+                                        context,
+                                        function_id,
+                                        name_idx,
+                                        argc as usize,
+                                        recv,
+                                    )
+                                })
+                        }
+                        _ => None,
                     };
                     self.do_call_method_value_exec(stack, context, function, instr)?;
                     // Tier-up hook, mirroring `Op::Call`: a bytecode method
@@ -385,6 +399,11 @@ impl Interpreter {
                         if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)? {
                             return Ok(value);
                         }
+                    } else if jit_installed
+                        && let (Some(feedback_site), Some(site), Some(stub_id)) =
+                            (feedback_site, method_site, native_leaf)
+                    {
+                        self.record_method_native_leaf_feedback(feedback_site, stub_id, site);
                     }
                     continue;
                 }

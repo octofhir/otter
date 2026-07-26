@@ -264,8 +264,8 @@ pub use jit::{
     JitCollectionLeafMethod, JitCompileError, JitCompileRequest, JitCompileSnapshot,
     JitCompileStatus, JitCompilerHook, JitDirectCallKind, JitDirectCallThisMode, JitDirectCallee,
     JitExecOutcome, JitFunctionCode, JitInlineCallee, JitInlineMethod, JitInstructionMetadata,
-    JitPrimitiveMethodGuard, JitPropertyIcWay, JitRuntimeStubBinding, JitStaticNativeCall,
-    JitStringLayout, VmRuntimeActivation,
+    JitMethodNativeLeafCall, JitPrimitiveMethodGuard, JitPropertyIcWay, JitRuntimeStubBinding,
+    JitStaticNativeCall, JitStringLayout, VmRuntimeActivation,
 };
 pub use jit_artifact::{
     JIT_ARTIFACT_BUNDLE_LIMIT, JIT_ARTIFACT_BYTE_LIMIT, JitArtifactBatch, JitArtifactBuildError,
@@ -741,6 +741,22 @@ pub(crate) enum MethodCallFeedback {
     /// sites stay monomorphic, so keeping it out of line keeps every
     /// feedback-map entry `Mono`-sized.
     Poly(Box<SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]>>),
+    /// One declared native leaf entry observed at this site, with the receiver
+    /// layout that reached it.
+    ///
+    /// A native leaf completes without pushing a frame, so it can never be a
+    /// bytecode inline target and never joins a `Poly` chain; a site that calls
+    /// one builtin is monomorphic by construction. The layout fields carry the
+    /// same meaning as [`MethodCallFeedback::Mono`]'s, so the same guard
+    /// lowering serves both.
+    MonoNativeLeaf {
+        stub_id: native_abi::RuntimeStubId,
+        recv_shape: object::ShapeId,
+        proto_chain: MethodProtoChain,
+        method_value_byte: u32,
+        recv_shape_offset: u32,
+        holder_shape_offset: u32,
+    },
     /// More than [`MAX_POLY_METHOD_TARGETS`] distinct targets observed; the
     /// site is too polymorphic to inline profitably and always side-exits.
     Megamorphic,
@@ -760,6 +776,13 @@ pub(crate) struct MethodSite {
     proto_chain: MethodProtoChain,
     /// Byte offset of the method slot within the holder's value slab.
     method_value_byte: u32,
+    /// Receiver shape as the compressed handle offset generated code compares,
+    /// captured here because the live receiver is only available at record
+    /// time. Shapes are interned and pinned, so the token stays valid.
+    pub(crate) recv_shape_offset: u32,
+    /// Compressed handle offset of the object owning the method slot, or `0`
+    /// when the receiver owns it and no prototype hop is performed.
+    pub(crate) holder_shape_offset: u32,
 }
 
 /// Match-based dispatch loop. The harness baseline; slice tasks may

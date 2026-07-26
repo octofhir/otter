@@ -15,6 +15,7 @@ time is a sanity check only). Kernels are a thermometer, never a target.
 | 0 | `just cost`, `just gate`, this ledger | 0 | — | — | tooling, nothing replaced |
 | 1 | CacheIR lowered generically; one probe emitter; megamorphic re-probation | +366 / −322 | 87.7% | 4.2 | engine code net **−57 lines** |
 | 2a | Collection method slot byte; optimizing tier bakes and emits allocating collection + array calls | +46 / −4 | 26.6% | 1.7 | `Map.set` 24.80ms → 6.94ms |
+| 2b | Shared exotic-`length` emitter, both tiers | +101 / −37 | 7.1% | 14.2 | string `.length` 4.42ms → 1.24ms |
 
 ## Slice 1 result — 2026-07-26
 
@@ -266,9 +267,25 @@ fell through to the generic runtime path. Both now use `compressed_slot_byte`.
 | native-boundary vs bun | 26.10x | **19.13x** |
 | native-boundary retired | 38 299 538 507 | 29 597 938 475 |
 
-The remaining 398 000 property stubs per invocation are all string `.length`,
-which is the next target: its receiver is a primitive, so no cache program is
-built for it at all.
+**String `.length` fixed too.** `Op::LoadLength` exists in the bytecode and
+has an inline emitter, but the compiler never emits it — a dead opcode with
+live code behind it. Every `.length` goes through `LoadProperty`, and a
+primitive string receiver fails `supports_fast_property_ic`, so no cache
+program is ever built. The template tier had an inline arm for the *array*
+exotic length only; the optimizing tier had no length arm at all.
+
+Both now call one shared `emit_exotic_length_fast` covering the array and the
+string case, next to the way walk and the prototype hop — the same
+one-lowering-many-consumers shape as Slice 1.
+
+| | before | after |
+| --- | ---: | ---: |
+| `W[i & 7].length` template | 4.42 ms | 1.83 ms |
+| `W[i & 7].length` tiered | 4.42 ms | **1.24 ms** |
+| property stubs per iteration | 1.00 | **0.00** |
+
+Cumulative on `native-boundary`: 82.22 ms -> 56.08 ms, **21.44x -> 14.60x**
+node and **26.10x -> 17.06x** bun.
 
 Original investigation, kept because the ruled-out list is still the map of
 this area:

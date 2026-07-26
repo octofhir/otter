@@ -33,8 +33,8 @@ use otter_vm::native_abi as abi;
 use super::ic_probe;
 use super::transitions::TransitionTable;
 use super::values::{
-    BoxedSlotSlowPath, emit_box_int32, emit_compress_slot_or_bail, emit_decompress_slot,
-    emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64, emit_slab_base,
+    BoxedSlotSlowPath, emit_compress_slot_or_bail, emit_decompress_slot, emit_load_runtime_stub,
+    emit_load_symbol_u64, emit_load_u64, emit_slab_base,
 };
 use crate::artifact::relocation::{PropertyIcAccess, RelocationCapture, RelocationTarget};
 use crate::entry::{NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, Unsupported, reg_offset};
@@ -63,43 +63,16 @@ pub(super) fn emit_load_property(
     if cage_base != 0 && array_length {
         let obj_off = reg_offset(object)?;
         let dst_off = reg_offset(dst)?;
-        let array_tag = u32::from(view.array_layout.type_tag);
-        let length_byte = view.array_layout.length_byte;
+        let have_length = ops.new_dynamic_label();
+        let not_length = ops.new_dynamic_label();
+        dynasm!(ops ; .arch aarch64 ; ldr x9, [x19, obj_off]);
+        ic_probe::emit_exotic_length_fast(ops, relocations, view, have_length, not_length);
         dynasm!(ops
             ; .arch aarch64
-            ; ldr x9, [x19, obj_off]   // receiver Value
-            ; movz x11, NUMBER_TAG_HI16, lsl #48
-            ; orr x11, x11, #0x2       // NOT_CELL_MASK
-            ; tst x9, x11
-            ; b.ne =>miss
-            ; mov w12, w9              // low-32 Gc offset
-        );
-        emit_load_symbol_u64(
-            ops,
-            relocations,
-            13,
-            cage_base as u64,
-            RelocationTarget::GcCageBase,
-        );
-        dynasm!(ops
-            ; .arch aarch64
-            ; add x13, x13, x12        // x13 = GcHeader ptr
-            ; ldrb w14, [x13]
-            ; cmp w14, array_tag
-            ; b.ne =>miss
-            ; ldr x9, [x13, length_byte]
-        );
-        emit_load_u64(ops, 12, i32::MAX as u64);
-        dynasm!(ops
-            ; .arch aarch64
-            ; cmp x9, x12
-            ; b.hi =>miss
-        );
-        emit_box_int32(ops, 9, 12);
-        dynasm!(ops
-            ; .arch aarch64
+            ; =>have_length
             ; str x9, [x19, dst_off]
             ; b =>done
+            ; =>not_length
         );
     }
 

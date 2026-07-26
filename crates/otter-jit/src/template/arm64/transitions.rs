@@ -33,8 +33,8 @@ use otter_vm::native_abi::{self as abi};
 use otter_vm::runtime_stubs::alloc_value_stub_by_id;
 
 use super::ic_probe::{
-    DenseIndexForm, emit_dense_element_address, emit_dense_element_read, emit_dense_element_write,
-    emit_guard_value_is_not_cell,
+    DenseIndexForm, element_access_is_supported, emit_dense_element_read, emit_dense_element_write,
+    emit_element_address, emit_guard_value_is_not_cell,
 };
 use super::values::{
     emit_decompress_slot, emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64,
@@ -453,8 +453,8 @@ pub(super) fn emit_load_element(
     // Dense fast path: read the element straight from the buffer. A hole is an
     // absent property — the prototype chain answers — so it misses like every
     // other failed guard.
-    if view.cage_base != 0 {
-        emit_dense_element_address(
+    if element_access_is_supported(view) {
+        emit_element_address(
             ops,
             relocations,
             view,
@@ -502,8 +502,8 @@ pub(super) fn emit_store_element(
     // non-hole element with a non-cell value owes no generational write
     // barrier and cannot allocate. A cell value takes the stub (barrier), a
     // hole takes the stub (a prototype setter may observe the store).
-    if view.cage_base != 0 {
-        emit_dense_element_address(
+    if element_access_is_supported(view) {
+        emit_element_address(
             ops,
             relocations,
             view,

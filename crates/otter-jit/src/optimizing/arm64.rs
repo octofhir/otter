@@ -153,9 +153,10 @@ use crate::{
         ssa::{SsaFunction, SsaInstr, ValueDef, ValueId},
     },
     template::arm64::ic_probe::{
-        DenseIndexForm, emit_dense_element_address, emit_dense_element_read,
-        emit_dense_element_write, emit_guarded_method_call, emit_native_leaf_call,
-        guarded_method_call_is_supported, native_leaf_call_is_supported, native_leaf_call_name,
+        DenseIndexForm, element_access_is_supported, emit_dense_element_read,
+        emit_dense_element_write, emit_element_address, emit_guarded_method_call,
+        emit_native_leaf_call, guarded_method_call_is_supported, native_leaf_call_is_supported,
+        native_leaf_call_name,
     },
 };
 
@@ -2708,7 +2709,7 @@ fn emit(
                     // so it takes the generic path like every other miss.
                     let miss = ops.new_dynamic_label();
                     let done = ops.new_dynamic_label();
-                    emit_dense_element_address(
+                    emit_element_address(
                         &mut ops,
                         &mut relocations,
                         view,
@@ -2803,12 +2804,12 @@ fn emit(
                     // observe the store — and a tagged value may be a cell that
                     // needs the generational barrier, so both take the stub.
                     let value_repr = reprs.representation(instruction.inputs[2]);
-                    let store_fast =
-                        matches!(value_repr, Representation::Int32 | Representation::Float64);
+                    let store_fast = element_access_is_supported(view)
+                        && matches!(value_repr, Representation::Int32 | Representation::Float64);
                     let miss = ops.new_dynamic_label();
                     let done = ops.new_dynamic_label();
                     if store_fast {
-                        emit_dense_element_address(
+                        emit_element_address(
                             &mut ops,
                             &mut relocations,
                             view,

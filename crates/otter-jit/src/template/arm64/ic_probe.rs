@@ -9,8 +9,8 @@
 //!   that cannot execute them.
 //! - [`emit_exotic_length_fast`] — the `.length` reads no cache program can
 //!   describe.
-//! - [`emit_dense_element_address`] / [`emit_dense_element_read`] /
-//!   [`emit_dense_element_write`] — the dense element access program.
+//! - [`emit_element_address`] / [`emit_dense_element_read`] /
+//!   [`emit_dense_element_write`] — the indexed element access program.
 //! - [`emit_native_leaf_call`] — guard a callee's bootstrap identity and run
 //!   its declared leaf entry without materializing a frame.
 //! - [`emit_guarded_method_call`] — the same for `receiver.method(args…)`, over
@@ -214,21 +214,31 @@ pub(crate) enum DenseIndexForm {
     Int32,
 }
 
-/// Prove an ordinary in-bounds dense element access, leaving the element's
-/// address in `x16`.
+/// Whether a family is baked for the indexed-element program.
 ///
-/// The guard is one program: the receiver is a heap cell carrying an array
-/// body with no exotic sidecar, the index is a non-negative int32 below the
-/// VM-maintained dense length, and the address comes from the body's
-/// `(elements_ptr, dense_len)` cache so the backing `Vec`'s layout stays
-/// unobserved. Nothing here allocates, so no safepoint is owed.
+/// The declaration is the whole gate: without a cage base the guard cannot
+/// reach a body at all, and a zero cell tag means no element-bearing family was
+/// described, so the site keeps the runtime path.
+pub(crate) fn element_access_is_supported(view: &JitCompileSnapshot) -> bool {
+    view.cage_base != 0 && view.element_access.type_tag != 0
+}
+
+/// Prove an in-bounds indexed element access, leaving the element's address in
+/// `x16`.
+///
+/// The guard is one program over the declared family: the receiver is a heap
+/// cell carrying that cell tag, its latch reads clean, the index is a
+/// non-negative int32 below the body's live element count, and the address
+/// comes from the body's element base pointer so the backing container's
+/// layout stays unobserved. Nothing here allocates, so no safepoint is owed.
 ///
 /// `load_receiver` and `load_index` materialize their operand into the register
 /// they are handed and run inside the guard sequence, so they must touch no
 /// other register. That is the only thing a tier supplies: the guard itself is
-/// written once. Clobbers `x9`, `x11`–`x16`.
+/// written once, and the family is [`JitElementAccess`] data. Clobbers `x9`,
+/// `x11`–`x16`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_dense_element_address<R, I>(
+pub(crate) fn emit_element_address<R, I>(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
@@ -241,7 +251,7 @@ where
     R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
     I: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
 {
-    let layout = view.array_layout;
+    let access = view.element_access;
     load_receiver(ops, 9)?;
     dynasm!(ops
         ; .arch aarch64
@@ -262,11 +272,10 @@ where
         ; .arch aarch64
         ; add x13, x13, x12        // x13 = GcHeader ptr
         ; ldrb w14, [x13]
-        ; cmp w14, layout.type_tag as u32
+        ; cmp w14, access.type_tag as u32
         ; b.ne =>miss
-        ; ldr x14, [x13, layout.exotic_byte]
-        ; cbnz x14, =>miss         // exotic sidecar: the stub owns semantics
     );
+    emit_receiver_latch_guard(ops, access.latch, miss);
     load_index(ops, 15)?;
     if index_form == DenseIndexForm::Tagged {
         dynasm!(ops
@@ -279,16 +288,16 @@ where
     }
     dynasm!(ops
         ; .arch aarch64
-        ; ldr w16, [x13, layout.dense_len_byte]
+        ; ldr w16, [x13, access.length_byte]
         ; cmp w15, w16
         ; b.hs =>miss              // unsigned: negative indices miss too
-        ; ldr x16, [x13, layout.elements_ptr_byte]
+        ; ldr x16, [x13, access.data_ptr_byte]
         ; add x16, x16, w15, uxtw #3
     );
     Ok(())
 }
 
-/// Read the element whose address [`emit_dense_element_address`] left in `x16`
+/// Read the element whose address [`emit_element_address`] left in `x16`
 /// into `x9`, branching to `miss` on a hole.
 ///
 /// A hole is an absent property — the prototype chain answers a read, and a
@@ -304,8 +313,8 @@ pub(crate) fn emit_dense_element_read(ops: &mut Assembler, miss: DynamicLabel) {
     );
 }
 
-/// Overwrite the element whose address [`emit_dense_element_address`] left in
-/// `x16` with the boxed value in `x9`.
+/// Overwrite the element whose address [`emit_element_address`] left in `x16`
+/// with the boxed value in `x9`.
 pub(crate) fn emit_dense_element_write(ops: &mut Assembler) {
     dynasm!(ops ; .arch aarch64 ; str x9, [x16]);
 }

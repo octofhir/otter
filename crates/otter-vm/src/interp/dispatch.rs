@@ -774,24 +774,6 @@ impl Interpreter {
                 }
                 Op::LoadElement => {
                     let operands = function.operand_view(instr);
-                    if let Some(recv_reg) = function.register(instr, 1)
-                        && let Ok(recv) = read_register(&stack[top_idx], recv_reg)
-                    {
-                        let recv = *recv;
-                        let observed = match recv.as_typed_array(&self.gc_heap).map(|t| t.kind()) {
-                            Some(crate::binary::TypedArrayKind::Float64) => {
-                                Some(jit::JitElementLoadKind::Float64)
-                            }
-                            Some(crate::binary::TypedArrayKind::Int32) => {
-                                Some(jit::JitElementLoadKind::Int32)
-                            }
-                            Some(_) => Some(jit::JitElementLoadKind::Any),
-                            None => None,
-                        };
-                        if let Some(feedback) = feedback {
-                            feedback.record_element_load(observed);
-                        }
-                    }
                     if self.drive_load_element(stack, context, operands)? {
                         continue;
                     }

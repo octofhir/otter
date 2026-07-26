@@ -261,10 +261,10 @@ pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
     JitArrayLayout, JitClosureCallLayout, JitCodeGenerationSnapshot, JitCodeResidency,
     JitCollectionLayout, JitCompileError, JitCompileRequest, JitCompileSnapshot, JitCompileStatus,
-    JitCompilerHook, JitDirectCallKind, JitDirectCallThisMode, JitDirectCallee, JitExecOutcome,
-    JitFunctionCode, JitGuardedMethodCall, JitGuardedReceiver, JitInlineCallee, JitInlineMethod,
-    JitInstructionMetadata, JitPropertyIcWay, JitReceiverLatch, JitRuntimeStubBinding,
-    JitStaticNativeCall, JitStringLayout, VmRuntimeActivation,
+    JitCompilerHook, JitDirectCallKind, JitDirectCallThisMode, JitDirectCallee, JitElementAccess,
+    JitExecOutcome, JitFunctionCode, JitGuardedMethodCall, JitGuardedReceiver, JitInlineCallee,
+    JitInlineMethod, JitInstructionMetadata, JitPropertyIcWay, JitReceiverLatch,
+    JitRuntimeStubBinding, JitStaticNativeCall, JitStringLayout, VmRuntimeActivation,
 };
 pub use jit_artifact::{
     JIT_ARTIFACT_BUNDLE_LIMIT, JIT_ARTIFACT_BYTE_LIMIT, JitArtifactBatch, JitArtifactBuildError,

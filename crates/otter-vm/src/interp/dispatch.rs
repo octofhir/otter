@@ -280,7 +280,7 @@ impl Interpreter {
                             })
                             .and_then(Value::as_native_function)
                             .and_then(|native| {
-                                crate::math::jit_static_call_kind(native, &self.gc_heap)
+                                crate::math::jit_static_call_target(native, &self.gc_heap)
                             })
                     } else {
                         None
@@ -297,8 +297,9 @@ impl Interpreter {
                                 stack[stack.len() - 1].function_id,
                             ))
                         } else {
-                            static_native_target
-                                .map(crate::feedback::OrdinaryCallTarget::StaticNative)
+                            static_native_target.map(|(kind, _)| {
+                                crate::feedback::OrdinaryCallTarget::StaticNative(kind)
+                            })
                         }
                     {
                         let transition = self.record_ordinary_call_feedback(

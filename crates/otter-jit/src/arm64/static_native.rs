@@ -13,15 +13,17 @@
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 
-use otter_vm::{JitCompileSnapshot, JitStaticNativeCall, JitStaticNativeCallKind};
+use otter_vm::runtime_stubs::leaf_no_alloc_stub2_by_id;
+use otter_vm::{JitCompileSnapshot, JitStaticNativeCall};
 
 use crate::{
     artifact::{
         CodeMapCapture, CodeRegion,
         relocation::{RelocationCapture, RelocationTarget},
     },
-    entry::{NUMBER_TAG_HI16, Unsupported},
-    template::arm64::values::{emit_box_double, emit_box_int32, emit_num_to_double},
+    entry::{
+        NUMBER_TAG_HI16, THREAD_OFFSET, Unsupported, VALUE_UNDEFINED, VM_THREAD_GC_HEAP_OFFSET,
+    },
 };
 
 /// Static metadata naming one emitted ordinary-call leaf.
@@ -39,9 +41,11 @@ pub(crate) fn target_is_supported(
     view: &JitCompileSnapshot,
     site: StaticNativeCallSite<'_>,
 ) -> bool {
+    // Support follows the declaration: a target is lowerable exactly when it
+    // names a leaf entry. No builtin is named here.
     view.native_static_fn_byte != 0
         && site.argc >= 1
-        && matches!(site.target.kind, JitStaticNativeCallKind::MathAbs)
+        && leaf_no_alloc_stub2_by_id(site.target.leaf_stub_id).is_some()
 }
 
 /// Emit an identity-guarded leaf.
@@ -55,6 +59,7 @@ pub(crate) fn emit_static_native_call(
     site: StaticNativeCallSite<'_>,
     callee_x: u8,
     argument_x: u8,
+    second_argument_x: Option<u8>,
     mut code_map: Option<&mut CodeMapCapture>,
     bail: DynamicLabel,
 ) -> Result<(), Unsupported> {
@@ -110,37 +115,39 @@ pub(crate) fn emit_static_native_call(
     }
 
     let body_start = ops.offset().0;
-    match site.target.kind {
-        JitStaticNativeCallKind::MathAbs => {
-            let double_path = ops.new_dynamic_label();
-            let nonnegative = ops.new_dynamic_label();
-            let done = ops.new_dynamic_label();
-            dynasm!(ops
-                ; .arch aarch64
-                ; movz x15, NUMBER_TAG_HI16, lsl #48
-                ; and x14, X(argument_x), x15
-                ; cmp x14, x15
-                ; b.ne =>double_path
-                ; cmp W(argument_x), wzr
-                ; b.ge =>nonnegative
-                ; negs w9, W(argument_x)
-                ; b.vs =>double_path
-            );
-            emit_box_int32(ops, 9, 14);
-            dynasm!(ops
-                ; .arch aarch64
-                ; b =>done
-                ; =>nonnegative
-                ; mov x9, X(argument_x)
-                ; b =>done
-                ; =>double_path
-            );
-            emit_num_to_double(ops, argument_x, 0, bail);
-            dynasm!(ops ; .arch aarch64 ; fabs d0, d0);
-            emit_box_double(ops, 0, 9);
-            dynasm!(ops ; .arch aarch64 ; =>done);
-        }
+    // The operation itself lives in the declared leaf entry, so a new builtin
+    // costs a descriptor and a Rust body rather than a machine-code arm here.
+    // `(heap, arg0, arg1) -> pair`, with no safepoint: a leaf entry cannot
+    // allocate, collect, or re-enter JS.
+    let Some(stub) = leaf_no_alloc_stub2_by_id(site.target.leaf_stub_id) else {
+        return Err(Unsupported::OperandShape("static-native leaf entry"));
+    };
+    dynasm!(ops
+        ; .arch aarch64
+        ; mov x10, X(argument_x)
+        ; ldr x0, [x20, THREAD_OFFSET]
+        ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+        ; mov x1, x10
+    );
+    if let Some(second) = second_argument_x {
+        dynasm!(ops ; .arch aarch64 ; mov x2, X(second));
+    } else {
+        emit_load_u64(ops, 2, VALUE_UNDEFINED);
     }
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        16,
+        stub.entry_addr() as u64,
+        RelocationTarget::runtime_stub(stub.descriptor),
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; and x1, x1, #0xff
+        ; cbnz x1, =>bail
+        ; mov x9, x0
+    );
     if let Some(code_map) = code_map {
         code_map.record(CodeRegion::static_native_structural(
             "staticNativeCallBody",

@@ -865,6 +865,7 @@ impl Interpreter {
                         jit::JitStaticNativeCall {
                             kind,
                             builtin_fn_addr: crate::math::jit_static_call_address(kind),
+                            leaf_stub_id: crate::math::jit_leaf_stub_id(kind),
                         },
                     );
                     self.record_jit_inline_candidate(

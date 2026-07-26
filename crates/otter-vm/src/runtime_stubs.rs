@@ -33,7 +33,7 @@ use crate::native_abi::{
     STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC,
     STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC,
     STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
-    STUB_NUMBER_REM_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF,
+    STUB_MATH_ABS_LEAF, STUB_NUMBER_REM_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF,
     STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_STRING_ENDS_WITH_LEAF,
     STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF, STUB_STRING_STARTS_WITH_LEAF,
     STUB_TO_BOOLEAN_LEAF, SafepointId, SafepointRecord, TaggedLocationKind,
@@ -433,6 +433,12 @@ pub const COLLECTION_MAP_GET_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     entry: collection_map_get_leaf,
 };
 
+/// Callable ABI entry for `Math.abs`.
+pub const MATH_ABS_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_MATH_ABS_LEAF,
+    entry: math_abs_leaf,
+};
+
 /// Callable ABI entry for `String.prototype.charCodeAt`.
 pub const STRING_CHAR_CODE_AT_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: STUB_STRING_CHAR_CODE_AT_LEAF,
@@ -586,6 +592,7 @@ pub const fn mutating_leaf_stub2_by_id(id: RuntimeStubId) -> Option<MutatingLeaf
 pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocStub2> {
     match id {
         id if id == STUB_COLLECTION_MAP_GET_LEAF.id => Some(COLLECTION_MAP_GET_LEAF),
+        id if id == STUB_MATH_ABS_LEAF.id => Some(MATH_ABS_LEAF),
         id if id == STUB_COLLECTION_MAP_HAS_LEAF.id => Some(COLLECTION_MAP_HAS_LEAF),
         id if id == STUB_COLLECTION_SET_HAS_LEAF.id => Some(COLLECTION_SET_HAS_LEAF),
         id if id == STUB_STRICT_EQ_LEAF.id => Some(STRICT_EQ_LEAF),
@@ -1112,6 +1119,28 @@ pub extern "C" fn strict_eq_leaf(
     let rhs = Value::from_abi_bits(rhs_bits);
     let eq = crate::abstract_ops::is_strictly_equal(&lhs, &rhs, heap);
     RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::boolean(eq)))
+}
+
+/// One numeric unary builtin, reached through the declared leaf ABI.
+///
+/// The argument arrives already boxed; a non-numeric argument misses so the
+/// call site falls through to ordinary dispatch rather than performing
+/// coercion here, which could observe user code and is not a leaf operation.
+fn math_unary_leaf(arg_bits: u64, op: fn(f64) -> f64) -> RuntimeStubResult {
+    let Some(value) = Value::from_abi_bits(arg_bits).as_f64() else {
+        return RuntimeStubResult::miss();
+    };
+    RuntimeStubResult::ok_value(Value::number_f64(op(value)))
+}
+
+/// Leaf ABI entry for `Math.abs`.
+pub extern "C" fn math_abs_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> RuntimeStubResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    RuntimeStubResultPair::from_result(math_unary_leaf(arg_bits, f64::abs))
 }
 
 /// Leaf `Map.prototype.get` probe.

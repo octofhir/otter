@@ -613,6 +613,9 @@ pub struct JitStaticNativeCall {
     /// executes. This address is never serialized into diagnostics or
     /// normalized artifacts.
     pub builtin_fn_addr: usize,
+    /// Declared leaf entry the call site invokes once its guards pass. The
+    /// operation lives in that entry, so a new builtin needs no generated code.
+    pub leaf_stub_id: crate::native_abi::RuntimeStubId,
 }
 
 /// VM-resolved direct-call target for one eligible compiled callee.

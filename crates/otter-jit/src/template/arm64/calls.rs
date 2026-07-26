@@ -955,6 +955,13 @@ pub(super) fn emit_call(
         {
             emit_load_reg(ops, 9, callee)?;
             emit_load_reg(ops, 10, argument)?;
+            let second = match argument_registers.get(1) {
+                Some(&register) => {
+                    emit_load_reg(ops, 11, register)?;
+                    Some(11)
+                }
+                None => None,
+            };
             emit_static_native_call(
                 ops,
                 relocations,
@@ -962,6 +969,7 @@ pub(super) fn emit_call(
                 site,
                 9,
                 10,
+                second,
                 code_map.as_deref_mut(),
                 bail,
             )?;

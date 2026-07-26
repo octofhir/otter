@@ -19,6 +19,7 @@ time is a sanity check only). Kernels are a thermometer, never a target.
 | 2c | Native leaf calls lower from one emitter; `JitStaticNativeCallKind` deleted | +118 / −208 | — | — | 5 builtins, 0 machine-code arms; engine code net **−90 lines** |
 | 2d | Dictionary→fast migration + `CallMethodValue` native-leaf attach | +588 / −84 | 90.8% | 5.5 | `m.abs` 21.82ms → 2.02ms; 0 new lines of assembly |
 | 2e | `Op::MathCall` and its opcode/stub/emitter chain deleted | +258 / −976 | 83.1% | — | `Math.abs(x)` 12.81ms → 2.14ms; engine code net **−718 lines** |
+| 2f | Collection + primitive method calls fold into the one leaf-method emitter | +246 / −426 | 0% | — | parity by design; 2 hand-written emitters + 2 feedback structs deleted |
 
 ## Slice 1 result — 2026-07-26
 

@@ -310,11 +310,9 @@ impl Interpreter {
             jit_debug::JitDebugTier::Optimizing,
             false,
         );
-        self.bake_collection_leaf_methods(&mut snapshot);
         self.bake_method_native_leaf_calls(&mut snapshot);
         self.bake_collection_alloc_methods(&mut snapshot);
         self.bake_array_methods(&mut snapshot);
-        self.bake_primitive_method_guards(&mut snapshot);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
         });
@@ -466,11 +464,9 @@ impl Interpreter {
             jit_debug::JitDebugTier::Template,
             eager_direct_targets,
         );
-        self.bake_collection_leaf_methods(&mut view);
         self.bake_method_native_leaf_calls(&mut view);
         self.bake_collection_alloc_methods(&mut view);
         self.bake_array_methods(&mut view);
-        self.bake_primitive_method_guards(&mut view);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
         });
@@ -690,12 +686,29 @@ impl Interpreter {
         let sites: Vec<_> = view
             .instructions
             .iter()
-            .filter_map(|instr| {
-                let site = instr.property_ic_site(&view.code_block)?;
-                Some((instr.byte_pc, site))
+            .filter(|instr| instr.op(&view.code_block) == Op::CallMethodValue)
+            .map(|instr| {
+                (
+                    instr.byte_pc,
+                    instr.property_ic_site(&view.code_block),
+                    instr.method_hint,
+                )
             })
             .collect();
-        for (byte_pc, site) in sites {
+        for (byte_pc, site, method_hint) in sites {
+            // An exotic receiver — a collection body or a primitive — reaches
+            // its builtin through a pinned realm prototype rather than a shape,
+            // so its feedback names the call directly.
+            if let Some(call) = site
+                .and_then(|site| self.jit_collection_leaf_call(site))
+                .or_else(|| self.jit_primitive_method_call(method_hint))
+            {
+                view.method_native_leaf_calls.insert(byte_pc, call);
+                continue;
+            }
+            let Some(site) = site else {
+                continue;
+            };
             let Some(MethodCallFeedback::MonoNativeLeaf {
                 stub_id,
                 method_value_byte,
@@ -717,7 +730,9 @@ impl Interpreter {
             view.method_native_leaf_calls.insert(
                 byte_pc,
                 jit::JitMethodNativeLeafCall {
-                    receiver_shape: recv_shape_offset,
+                    receiver: jit::JitGuardedReceiver::Shape {
+                        shape: recv_shape_offset,
+                    },
                     holder_shape: holder_shape_offset,
                     method_value_byte,
                     builtin_fn_addr: crate::math::jit_static_call_address(stub_id),
@@ -1505,33 +1520,6 @@ impl Interpreter {
                 continue;
             }
             view.array_methods.insert(instr.byte_pc, feedback);
-        }
-    }
-
-    pub(crate) fn bake_primitive_method_guards(&self, view: &mut jit::JitCompileSnapshot) {
-        for instr in &view.instructions {
-            if instr.op(&view.code_block) != Op::CallMethodValue {
-                continue;
-            }
-            let Some(feedback) = self.jit_primitive_method_guard(instr.method_hint) else {
-                continue;
-            };
-            view.primitive_method_guards.insert(instr.byte_pc, feedback);
-        }
-    }
-
-    pub(crate) fn bake_collection_leaf_methods(&self, view: &mut jit::JitCompileSnapshot) {
-        for instr in &view.instructions {
-            if instr.op(&view.code_block) != Op::CallMethodValue {
-                continue;
-            }
-            let Some(site) = instr.property_ic_site(&view.code_block) else {
-                continue;
-            };
-            let Some(feedback) = self.jit_collection_leaf_method_feedback(site) else {
-                continue;
-            };
-            view.collection_leaf_methods.insert(instr.byte_pc, feedback);
         }
     }
 

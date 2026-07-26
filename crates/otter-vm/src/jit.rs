@@ -277,11 +277,6 @@ pub struct JitCompileSnapshot {
     /// method lookup. Baked by `Interpreter::bake_inline_callees`. The optimizing
     /// tier ignores polymorphic inline bodies.
     pub inline_poly_methods: rustc_hash::FxHashMap<u32, Vec<JitInlineMethod>>,
-    /// Leaf collection method-call feedback keyed by the caller's
-    /// `Op::CallMethodValue` byte-PC. These entries are fully JIT-readable:
-    /// generated code can validate the receiver/prototype/builtin guards and
-    /// call the VM-native leaf stub without runtime method resolution.
-    pub collection_leaf_methods: rustc_hash::FxHashMap<u32, JitCollectionLeafMethod>,
     /// Guarded native-leaf method calls, keyed by call byte PC.
     pub method_native_leaf_calls: rustc_hash::FxHashMap<u32, JitMethodNativeLeafCall>,
     /// Allocating collection method-call feedback keyed by the caller's
@@ -296,10 +291,6 @@ pub struct JitCompileSnapshot {
     /// fast path (length bump + element move) under a guard; misses side-exit
     /// before method lookup.
     pub array_methods: rustc_hash::FxHashMap<u32, JitArrayMethod>,
-    /// Primitive builtin method guard metadata keyed by the caller's
-    /// `Op::CallMethodValue` byte-PC. Each entry validates the realm prototype
-    /// shape and method slot before a primitive-specific leaf stub runs.
-    pub primitive_method_guards: rustc_hash::FxHashMap<u32, JitPrimitiveMethodGuard>,
     /// Safepoint records baked for allocating runtime-stub call sites, keyed by
     /// `SafepointId`. Baseline uses frame-slot roots for the full register
     /// window, so allocating stubs can trigger moving GC without keeping raw
@@ -320,21 +311,35 @@ pub struct JitCollectionLayout {
     pub native_function_type_tag: u8,
 }
 
-/// JIT-readable leaf collection method IC entry.
+/// How a guarded method site proves the receiver it recorded.
+///
+/// Both forms end the same way — a value slab holding the method slot — so one
+/// emitter lowers them; they differ only in what identifies the receiver and
+/// where the method lives.
 #[derive(Debug, Clone, Copy)]
-pub struct JitCollectionLeafMethod {
-    /// Expected receiver body type tag (`Map` or `Set`).
-    pub receiver_type_tag: u8,
-    /// Compressed offset of the realm prototype object holding the builtin.
-    pub proto_offset: u32,
-    /// Expected prototype shape handle compressed offset.
-    pub proto_shape: u32,
-    /// Byte offset inside the prototype object's value slab for the method.
-    pub method_value_byte: u32,
-    /// Raw static native builtin function address expected in the method slot.
-    pub builtin_fn_addr: usize,
-    /// VM-native leaf stub descriptor id to call after guards pass.
-    pub leaf_stub_id: crate::native_abi::RuntimeStubId,
+pub enum JitGuardedReceiver {
+    /// An ordinary object named by its hidden class. The method is in the
+    /// receiver's own slab, or in a prototype resolved at run time when
+    /// [`JitMethodNativeLeafCall::holder_shape`] is set, because
+    /// `setPrototypeOf` moves the holder while the shape stays put. The entry
+    /// reads only the call's arguments.
+    Shape {
+        /// Guarded receiver shape handle offset.
+        shape: u32,
+    },
+    /// An exotic body named by its cell type tag, whose method always lives on
+    /// a pinned realm prototype. The entry reads the receiver as its first
+    /// argument, since the operation is *on* that body.
+    Exotic {
+        /// Expected receiver `GcHeader::type_tag`.
+        type_tag: u8,
+        /// Whether the body carries an expando/override latch word that must
+        /// read clean before the prototype's method may be trusted. Collections
+        /// have one; primitive bodies hold no such state.
+        latched: bool,
+        /// Compressed offset of the pinned realm prototype holding the builtin.
+        proto_offset: u32,
+    },
 }
 
 /// One `Op::CallMethodValue` site whose callee is a declared leaf entry.
@@ -346,10 +351,11 @@ pub struct JitCollectionLeafMethod {
 /// the call, exactly as it does at an ordinary call site.
 #[derive(Debug, Clone, Copy)]
 pub struct JitMethodNativeLeafCall {
-    /// Guarded receiver shape handle offset.
-    pub receiver_shape: u32,
-    /// Guarded holder shape handle offset, or `0` when the receiver owns the
-    /// method slot and no hop is performed.
+    /// How the receiver is proven before the method slot is read.
+    pub receiver: JitGuardedReceiver,
+    /// Guarded holder shape handle offset: the hopped prototype's shape for a
+    /// [`JitGuardedReceiver::Shape`] receiver (`0` when it owns the slot), or
+    /// the pinned prototype's shape for an exotic one.
     pub holder_shape: u32,
     /// Byte offset of the method slot inside the holder's value slab.
     pub method_value_byte: u32,
@@ -442,27 +448,6 @@ pub struct JitArrayMethod {
     /// Safepoint to publish for the allocating `push` entry.
     /// [`crate::native_abi::NO_SAFEPOINT`] for the non-allocating `pop` leaf.
     pub safepoint_id: crate::native_abi::SafepointId,
-}
-
-/// JIT-readable guard for primitive prototype builtin calls.
-///
-/// Holds only stable compressed offsets, shape handles, and a native entry
-/// address. Generated code still reloads the prototype slot from the heap and
-/// validates the native function identity before using any primitive leaf stub.
-#[derive(Debug, Clone, Copy)]
-pub struct JitPrimitiveMethodGuard {
-    /// Compressed offset of the realm primitive prototype object.
-    pub proto_offset: u32,
-    /// Expected prototype shape handle compressed offset.
-    pub proto_shape: u32,
-    /// Byte offset inside the prototype object's value slab for the method.
-    pub method_value_byte: u32,
-    /// Raw static native builtin function address expected in the method slot.
-    pub builtin_fn_addr: usize,
-    /// Typed leaf entry generated code calls once every guard holds.
-    pub leaf_stub_id: crate::native_abi::RuntimeStubId,
-    /// `GcHeader::type_tag` the receiver cell must carry.
-    pub receiver_type_tag: u8,
 }
 
 /// A callee the baseline may splice into a caller's `Op::Call` site.
@@ -919,11 +904,9 @@ impl JitCompileSnapshot {
             inline_callees: rustc_hash::FxHashMap::default(),
             inline_methods: rustc_hash::FxHashMap::default(),
             inline_poly_methods: rustc_hash::FxHashMap::default(),
-            collection_leaf_methods: rustc_hash::FxHashMap::default(),
             method_native_leaf_calls: rustc_hash::FxHashMap::default(),
             collection_alloc_methods: rustc_hash::FxHashMap::default(),
             array_methods: rustc_hash::FxHashMap::default(),
-            primitive_method_guards: rustc_hash::FxHashMap::default(),
             safepoints: rustc_hash::FxHashMap::default(),
         }
     }

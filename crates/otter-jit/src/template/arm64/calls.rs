@@ -45,11 +45,10 @@ use otter_vm::{
 
 use super::collections::{
     MethodSite, emit_alloc_method_guarded_call, emit_array_method_guarded_call,
-    emit_leaf_method_guarded_call, emit_primitive_method_guarded_call,
 };
 use super::ic_probe::{
     emit_native_leaf_call, emit_native_leaf_method_call, native_leaf_call_is_supported,
-    native_leaf_call_name,
+    native_leaf_call_name, native_leaf_method_call_is_supported,
 };
 use super::transitions::TransitionTable;
 use super::values::{
@@ -140,10 +139,8 @@ fn inline_leaf_template_plan(
     leaf_view.direct_methods.clear();
     leaf_view.inline_methods.clear();
     leaf_view.inline_poly_methods.clear();
-    leaf_view.collection_leaf_methods.clear();
     leaf_view.collection_alloc_methods.clear();
     leaf_view.array_methods.clear();
-    leaf_view.primitive_method_guards.clear();
     TemplatePlan::build(&leaf_view)
 }
 
@@ -1226,8 +1223,13 @@ pub(super) fn emit_method_call(
         arg0,
         arg1,
     };
-    if let Some(call) = view.method_native_leaf_calls.get(&byte_pc)
-        && usize::from(argc) == usize::from(call.argument_count)
+    // A guarded call straight into a declared leaf entry precedes every other
+    // layer; its guard miss lands on the next one.
+    if let Some(call) = view
+        .method_native_leaf_calls
+        .get(&byte_pc)
+        .filter(|call| usize::from(argc) == usize::from(call.argument_count))
+        .filter(|call| native_leaf_method_call_is_supported(view, call))
     {
         let leaf_miss = ops.new_dynamic_label();
         let method_arguments = [arg0, arg1];
@@ -1252,10 +1254,7 @@ pub(super) fn emit_method_call(
             ; .arch aarch64
             ; b =>done
             ; =>leaf_miss
-            ; b =>bail
-            ; =>done
         );
-        return Ok(());
     }
     let planned_methods = view.direct_methods.get(&byte_pc);
     if planned_methods.is_none_or(|methods| methods.len() == 1 && methods[0].target_count == 1)
@@ -1323,38 +1322,6 @@ pub(super) fn emit_method_call(
             bail,
         )? {
             dynasm!(ops ; .arch aarch64 ; =>next_candidate);
-        }
-    }
-    // Guarded monomorphic collection fast paths precede existing dispatch;
-    // every guard miss lands on the next layer.
-    if let Some(leaf) = view.collection_leaf_methods.get(&byte_pc) {
-        let after_leaf = ops.new_dynamic_label();
-        if emit_leaf_method_guarded_call(
-            ops,
-            relocations,
-            view,
-            leaf,
-            byte_pc,
-            &method_site,
-            after_leaf,
-            done,
-        )? {
-            dynasm!(ops ; .arch aarch64 ; =>after_leaf);
-        }
-    }
-    if let Some(guard) = view.primitive_method_guards.get(&byte_pc) {
-        let after_primitive = ops.new_dynamic_label();
-        if emit_primitive_method_guarded_call(
-            ops,
-            relocations,
-            view,
-            guard,
-            byte_pc,
-            &method_site,
-            after_primitive,
-            done,
-        )? {
-            dynasm!(ops ; .arch aarch64 ; =>after_primitive);
         }
     }
     if let Some(array_method) = view.array_methods.get(&byte_pc) {

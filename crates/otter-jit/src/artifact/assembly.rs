@@ -36,9 +36,9 @@ use yaxpeax_arch::{Arch, Decoder, U8Reader};
 use yaxpeax_arm::armv8::a64::ARMv8;
 
 use super::relocation::{
-    DirectBranch, DirectBranchKind, GuardedBuiltinKind, GuardedHeapComponent, PropertyIcAccess,
-    RelocationTarget, TemplateOperandArena, TemplateOperandRole, ValidatedRelocation,
-    ValidatedRelocations, decode_direct_branch,
+    DirectBranch, DirectBranchKind, GuardedHeapComponent, PropertyIcAccess, RelocationTarget,
+    TemplateOperandArena, TemplateOperandRole, ValidatedRelocation, ValidatedRelocations,
+    decode_direct_branch,
 };
 use super::{
     CodeMapCapture, CodeRegion, InlineScratchEntryArtifact, InlineScratchLayoutArtifact,
@@ -507,22 +507,16 @@ fn symbolic_target(target: &RelocationTarget) -> String {
         ),
         RelocationTarget::GuardedHeapReference {
             component,
-            feedback_kind,
             byte_pc,
             runtime_stub_id,
         } => format!(
-            "guardedHeapReference(component={},feedback={},bytePc={byte_pc},runtimeStubId={runtime_stub_id})",
-            heap_component_name(*component),
-            feedback_kind_name(*feedback_kind)
+            "guardedHeapReference(component={},bytePc={byte_pc},runtimeStubId={runtime_stub_id})",
+            heap_component_name(*component)
         ),
         RelocationTarget::GuardedBuiltinFunction {
-            feedback_kind,
             byte_pc,
             runtime_stub_id,
-        } => format!(
-            "guardedBuiltinFunction(feedback={},bytePc={byte_pc},runtimeStubId={runtime_stub_id})",
-            feedback_kind_name(*feedback_kind)
-        ),
+        } => format!("guardedBuiltinFunction(bytePc={byte_pc},runtimeStubId={runtime_stub_id})"),
         RelocationTarget::NativeLeafBuiltinFunction { stub_id } => format!(
             "nativeLeafBuiltinFunction(entry={})",
             otter_vm::native_abi::runtime_stub_name(*stub_id)
@@ -564,14 +558,6 @@ fn heap_component_name(component: GuardedHeapComponent) -> &'static str {
     match component {
         GuardedHeapComponent::Prototype => "prototype",
         GuardedHeapComponent::PrototypeShape => "prototypeShape",
-    }
-}
-
-fn feedback_kind_name(kind: GuardedBuiltinKind) -> &'static str {
-    match kind {
-        GuardedBuiltinKind::Leaf => "leaf",
-        GuardedBuiltinKind::Alloc => "alloc",
-        GuardedBuiltinKind::Array => "array",
     }
 }
 

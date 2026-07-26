@@ -259,13 +259,12 @@ pub use handles::{HandleArena, Local};
 pub use host_strings::{HostAtom, HostAtomId, HostAtomInterner};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
-    JitArrayLayout, JitArrayMethod, JitArrayMethodKind, JitClosureCallLayout,
-    JitCodeGenerationSnapshot, JitCodeResidency, JitCollectionAllocMethod, JitCollectionLayout,
-    JitCompileError, JitCompileRequest, JitCompileSnapshot, JitCompileStatus, JitCompilerHook,
-    JitDirectCallKind, JitDirectCallThisMode, JitDirectCallee, JitExecOutcome, JitFunctionCode,
-    JitGuardedReceiver, JitInlineCallee, JitInlineMethod, JitInstructionMetadata,
-    JitMethodNativeLeafCall, JitPropertyIcWay, JitRuntimeStubBinding, JitStaticNativeCall,
-    JitStringLayout, VmRuntimeActivation,
+    JitArrayLayout, JitClosureCallLayout, JitCodeGenerationSnapshot, JitCodeResidency,
+    JitCollectionLayout, JitCompileError, JitCompileRequest, JitCompileSnapshot, JitCompileStatus,
+    JitCompilerHook, JitDirectCallKind, JitDirectCallThisMode, JitDirectCallee, JitExecOutcome,
+    JitFunctionCode, JitGuardedMethodCall, JitGuardedReceiver, JitInlineCallee, JitInlineMethod,
+    JitInstructionMetadata, JitPropertyIcWay, JitReceiverLatch, JitRuntimeStubBinding,
+    JitStaticNativeCall, JitStringLayout, VmRuntimeActivation,
 };
 pub use jit_artifact::{
     JIT_ARTIFACT_BUNDLE_LIMIT, JIT_ARTIFACT_BYTE_LIMIT, JitArtifactBatch, JitArtifactBuildError,

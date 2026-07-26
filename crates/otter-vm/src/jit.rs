@@ -277,20 +277,8 @@ pub struct JitCompileSnapshot {
     /// method lookup. Baked by `Interpreter::bake_inline_callees`. The optimizing
     /// tier ignores polymorphic inline bodies.
     pub inline_poly_methods: rustc_hash::FxHashMap<u32, Vec<JitInlineMethod>>,
-    /// Guarded native-leaf method calls, keyed by call byte PC.
-    pub method_native_leaf_calls: rustc_hash::FxHashMap<u32, JitMethodNativeLeafCall>,
-    /// Allocating collection method-call feedback keyed by the caller's
-    /// `Op::CallMethodValue` byte-PC. These entries carry the same
-    /// receiver/prototype/builtin guards as leaf feedback plus the target
-    /// allocating stub id. Generated code must still attach an exact safepoint
-    /// for the call site before it may invoke the stub.
-    pub collection_alloc_methods: rustc_hash::FxHashMap<u32, JitCollectionAllocMethod>,
-    /// Dense-array `push` / `pop` method-call feedback keyed by the caller's
-    /// `Op::CallMethodValue` byte-PC. Each entry carries the receiver guard's
-    /// prototype/shape/builtin metadata so the baseline can splice an inline
-    /// fast path (length bump + element move) under a guard; misses side-exit
-    /// before method lookup.
-    pub array_methods: rustc_hash::FxHashMap<u32, JitArrayMethod>,
+    /// Guarded method calls into a declared native entry, keyed by call byte PC.
+    pub guarded_method_calls: rustc_hash::FxHashMap<u32, JitGuardedMethodCall>,
     /// Safepoint records baked for allocating runtime-stub call sites, keyed by
     /// `SafepointId`. Baseline uses frame-slot roots for the full register
     /// window, so allocating stubs can trigger moving GC without keeping raw
@@ -311,6 +299,31 @@ pub struct JitCollectionLayout {
     pub native_function_type_tag: u8,
 }
 
+/// Instance state that can invalidate a pinned prototype's method before the
+/// prototype itself changes.
+///
+/// A receiver body may carry a word saying "something on this instance is no
+/// longer canonical" — an expando, an overridden method, a custom descriptor.
+/// While that word reads clean the prototype's slot is the whole answer, so the
+/// guard is one load and one branch; its width and offset are the only thing
+/// that differs between body families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitReceiverLatch {
+    /// The body holds no such state; proving its type tag is the whole guard.
+    None,
+    /// A 32-bit flags word that must read zero, as `Map` and `Set` bodies keep.
+    Flags {
+        /// Byte offset of the flags word from the body's `GcHeader`.
+        byte: u32,
+    },
+    /// A pointer-width sidecar that must read null, as an array body keeps for
+    /// custom prototype/accessor/descriptor state.
+    Sidecar {
+        /// Byte offset of the sidecar pointer from the body's `GcHeader`.
+        byte: u32,
+    },
+}
+
 /// How a guarded method site proves the receiver it recorded.
 ///
 /// Both forms end the same way — a value slab holding the method slot — so one
@@ -320,9 +333,9 @@ pub struct JitCollectionLayout {
 pub enum JitGuardedReceiver {
     /// An ordinary object named by its hidden class. The method is in the
     /// receiver's own slab, or in a prototype resolved at run time when
-    /// [`JitMethodNativeLeafCall::holder_shape`] is set, because
-    /// `setPrototypeOf` moves the holder while the shape stays put. The entry
-    /// reads only the call's arguments.
+    /// [`JitGuardedMethodCall::holder_shape`] is set, because `setPrototypeOf`
+    /// moves the holder while the shape stays put. The entry reads only the
+    /// call's arguments.
     Shape {
         /// Guarded receiver shape handle offset.
         shape: u32,
@@ -333,24 +346,25 @@ pub enum JitGuardedReceiver {
     Exotic {
         /// Expected receiver `GcHeader::type_tag`.
         type_tag: u8,
-        /// Whether the body carries an expando/override latch word that must
-        /// read clean before the prototype's method may be trusted. Collections
-        /// have one; primitive bodies hold no such state.
-        latched: bool,
+        /// Instance state that must read clean before the prototype's method
+        /// may be trusted.
+        latch: JitReceiverLatch,
         /// Compressed offset of the pinned realm prototype holding the builtin.
         proto_offset: u32,
     },
 }
 
-/// One `Op::CallMethodValue` site whose callee is a declared leaf entry.
+/// One `Op::CallMethodValue` site whose callee is a declared native entry.
 ///
 /// The layout fields are the same lowered cache program a property site
 /// caches — guarded receiver shape, an optional guarded prototype holder, and
 /// the slot byte — so generated code reuses the way walk and the prototype hop
 /// rather than describing this access a second time. The entry id then selects
-/// the call, exactly as it does at an ordinary call site.
+/// the call, exactly as it does at an ordinary call site: the family the id
+/// resolves in is what decides the call protocol, so a read, an in-place
+/// mutation and an allocating write are one description.
 #[derive(Debug, Clone, Copy)]
-pub struct JitMethodNativeLeafCall {
+pub struct JitGuardedMethodCall {
     /// How the receiver is proven before the method slot is read.
     pub receiver: JitGuardedReceiver,
     /// Guarded holder shape handle offset: the hopped prototype's shape for a
@@ -363,91 +377,12 @@ pub struct JitMethodNativeLeafCall {
     /// runs. Never serialized into diagnostics or normalized artifacts.
     pub builtin_fn_addr: usize,
     /// Declared entry invoked once every guard passes.
-    pub leaf_stub_id: crate::native_abi::RuntimeStubId,
+    pub entry_stub_id: crate::native_abi::RuntimeStubId,
+    /// Safepoint published for an entry that may collect.
+    /// [`crate::native_abi::NO_SAFEPOINT`] for one that cannot.
+    pub safepoint_id: crate::native_abi::SafepointId,
     /// Exact JavaScript argument count the entry implements.
     pub argument_count: u8,
-}
-
-/// JIT-readable allocating collection method IC entry.
-#[derive(Debug, Clone, Copy)]
-pub struct JitCollectionAllocMethod {
-    /// Expected receiver body type tag (`Map` or `Set`).
-    pub receiver_type_tag: u8,
-    /// Compressed offset of the realm prototype object holding the builtin.
-    pub proto_offset: u32,
-    /// Expected prototype shape handle compressed offset.
-    pub proto_shape: u32,
-    /// Byte offset inside the prototype object's value slab for the method.
-    pub method_value_byte: u32,
-    /// Raw static native builtin function address expected in the method slot.
-    pub builtin_fn_addr: usize,
-    /// VM-native allocating stub descriptor id to call after guards pass and a
-    /// precise safepoint is published for the current frame.
-    pub alloc_stub_id: crate::native_abi::RuntimeStubId,
-    /// Safepoint record to publish when calling the allocating stub.
-    pub safepoint_id: crate::native_abi::SafepointId,
-    /// Number of raw boxed `Value` arguments in the uniform mutation ABI. The
-    /// current collection mutation shape is `(receiver, arg0, arg1_or_undefined)`.
-    pub value_arg_count: u8,
-}
-
-/// Which dense-array builtin a [`JitArrayMethod`] guards.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JitArrayMethodKind {
-    /// `Array.prototype.pop` — leaf, no allocation.
-    Pop,
-    /// `Array.prototype.push` — may grow the backing store.
-    Push,
-    /// `Array.prototype.shift` — leaf, no allocation.
-    Shift,
-    /// `Array.prototype.unshift` — may grow the backing store.
-    Unshift,
-}
-
-impl JitArrayMethodKind {
-    /// Argument count the typed entry models. A site with any other arity
-    /// keeps the general method-call path.
-    #[must_use]
-    pub const fn expected_argument_count(self) -> u16 {
-        match self {
-            Self::Pop | Self::Shift => 0,
-            Self::Push | Self::Unshift => 1,
-        }
-    }
-
-    /// Whether the entry may allocate, and therefore needs a safepoint.
-    #[must_use]
-    pub const fn allocates(self) -> bool {
-        matches!(self, Self::Push | Self::Unshift)
-    }
-}
-
-/// JIT-readable dense-array `push` / `pop` method IC entry.
-///
-/// Holds no GC pointer: `proto_offset` is a stable compressed offset of the
-/// realm `%Array.prototype%`, `proto_shape` is a plain shape-handle offset, and
-/// the builtin is checked against a stable native `fn` address. The inline fast
-/// path validates the receiver is an ordinary dense array (no exotic sidecar)
-/// and the prototype still carries the original builtin at the cached slot;
-/// any miss side-exits before method effects.
-#[derive(Debug, Clone, Copy)]
-pub struct JitArrayMethod {
-    /// Compressed offset of the realm `%Array.prototype%` object.
-    pub proto_offset: u32,
-    /// Expected prototype shape handle compressed offset.
-    pub proto_shape: u32,
-    /// Byte offset inside the prototype object's value slab for the method.
-    pub method_value_byte: u32,
-    /// Raw static native builtin function address expected in the method slot.
-    pub builtin_fn_addr: usize,
-    /// Which builtin this site resolved to.
-    pub kind: JitArrayMethodKind,
-    /// Typed VM entry generated code calls once every guard holds: a mutating
-    /// leaf for `pop`, an allocating entry for `push`.
-    pub stub_id: crate::native_abi::RuntimeStubId,
-    /// Safepoint to publish for the allocating `push` entry.
-    /// [`crate::native_abi::NO_SAFEPOINT`] for the non-allocating `pop` leaf.
-    pub safepoint_id: crate::native_abi::SafepointId,
 }
 
 /// A callee the baseline may splice into a caller's `Op::Call` site.
@@ -904,9 +839,7 @@ impl JitCompileSnapshot {
             inline_callees: rustc_hash::FxHashMap::default(),
             inline_methods: rustc_hash::FxHashMap::default(),
             inline_poly_methods: rustc_hash::FxHashMap::default(),
-            method_native_leaf_calls: rustc_hash::FxHashMap::default(),
-            collection_alloc_methods: rustc_hash::FxHashMap::default(),
-            array_methods: rustc_hash::FxHashMap::default(),
+            guarded_method_calls: rustc_hash::FxHashMap::default(),
             safepoints: rustc_hash::FxHashMap::default(),
         }
     }

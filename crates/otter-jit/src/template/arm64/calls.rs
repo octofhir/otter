@@ -43,12 +43,9 @@ use otter_vm::{
     value::tag as value_tag,
 };
 
-use super::collections::{
-    MethodSite, emit_alloc_method_guarded_call, emit_array_method_guarded_call,
-};
 use super::ic_probe::{
-    emit_native_leaf_call, emit_native_leaf_method_call, native_leaf_call_is_supported,
-    native_leaf_call_name, native_leaf_method_call_is_supported,
+    emit_guarded_method_call, emit_native_leaf_call, guarded_method_call_is_supported,
+    native_leaf_call_is_supported, native_leaf_call_name,
 };
 use super::transitions::TransitionTable;
 use super::values::{
@@ -139,8 +136,6 @@ fn inline_leaf_template_plan(
     leaf_view.direct_methods.clear();
     leaf_view.inline_methods.clear();
     leaf_view.inline_poly_methods.clear();
-    leaf_view.collection_alloc_methods.clear();
-    leaf_view.array_methods.clear();
     TemplatePlan::build(&leaf_view)
 }
 
@@ -1216,35 +1211,29 @@ pub(super) fn emit_method_call(
     threw: DynamicLabel,
 ) -> Result<(), crate::entry::Unsupported> {
     let done = ops.new_dynamic_label();
-    let method_site = MethodSite {
-        dst,
-        receiver,
-        argc,
-        arg0,
-        arg1,
-    };
-    // A guarded call straight into a declared leaf entry precedes every other
+    // A guarded call straight into a declared entry precedes every other
     // layer; its guard miss lands on the next one.
     if let Some(call) = view
-        .method_native_leaf_calls
+        .guarded_method_calls
         .get(&byte_pc)
         .filter(|call| usize::from(argc) == usize::from(call.argument_count))
-        .filter(|call| native_leaf_method_call_is_supported(view, call))
+        .filter(|call| guarded_method_call_is_supported(view, call))
     {
         let leaf_miss = ops.new_dynamic_label();
         let method_arguments = [arg0, arg1];
-        emit_native_leaf_method_call(
+        emit_guarded_method_call(
             ops,
             relocations,
             view,
             call,
             receiver,
+            byte_pc,
             |ops, index, register| {
                 let source = method_arguments
                     .get(usize::from(index))
                     .copied()
                     .flatten()
-                    .ok_or(Unsupported::OperandShape("native leaf method argument"))?;
+                    .ok_or(Unsupported::OperandShape("guarded method argument"))?;
                 emit_load_reg(ops, register, source)
             },
             leaf_miss,
@@ -1322,36 +1311,6 @@ pub(super) fn emit_method_call(
             bail,
         )? {
             dynasm!(ops ; .arch aarch64 ; =>next_candidate);
-        }
-    }
-    if let Some(array_method) = view.array_methods.get(&byte_pc) {
-        let after_array = ops.new_dynamic_label();
-        if emit_array_method_guarded_call(
-            ops,
-            relocations,
-            view,
-            array_method,
-            byte_pc,
-            &method_site,
-            after_array,
-            done,
-        )? {
-            dynasm!(ops ; .arch aarch64 ; =>after_array);
-        }
-    }
-    if let Some(alloc) = view.collection_alloc_methods.get(&byte_pc) {
-        let after_alloc = ops.new_dynamic_label();
-        if emit_alloc_method_guarded_call(
-            ops,
-            relocations,
-            view,
-            alloc,
-            byte_pc,
-            &method_site,
-            after_alloc,
-            done,
-        )? {
-            dynasm!(ops ; .arch aarch64 ; =>after_alloc);
         }
     }
     for method in planned_methods.into_iter().flatten() {

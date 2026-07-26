@@ -75,6 +75,20 @@ impl CollectionFastOp {
         }
     }
 
+    /// Exact JavaScript argument count the typed entries implement. A site
+    /// with any other arity keeps the general method-call path.
+    pub(crate) fn argument_count(self) -> u8 {
+        match self {
+            Self::MapSet => 2,
+            Self::MapGet
+            | Self::MapHas
+            | Self::MapDelete
+            | Self::SetAdd
+            | Self::SetHas
+            | Self::SetDelete => 1,
+        }
+    }
+
     pub(crate) fn leaf_stub_id(self) -> Option<RuntimeStubId> {
         match self {
             Self::MapGet => Some(crate::native_abi::STUB_COLLECTION_MAP_GET_LEAF.id),

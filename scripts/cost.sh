@@ -29,6 +29,7 @@ KERNELS=(
   "branch-phi             -6000000"
   "dense-array            5234688"
   "boxed-double-property  4000000"
+  "property-polymorphic   80011800000"
 )
 
 if [[ ! -x "$BIN" ]]; then
@@ -40,10 +41,14 @@ fi
 filter="${1:-}"
 
 parse_record() {
-  python3 - "$1" <<'PY'
+  python3 - "$1" "$2" <<'PY'
 import json, statistics, sys
 
 record = json.load(open(sys.argv[1]))
+# Counter diagnostics are captured once around the whole run, so they cover
+# warmup plus sampled invocations. Normalize to one invocation or the numbers
+# stop being comparable the moment SAMPLES changes.
+invocations = max(1, int(sys.argv[2]))
 if record.get("failure"):
     print("FAIL " + json.dumps(record["failure"]), file=sys.stderr)
     sys.exit(1)
@@ -54,7 +59,7 @@ for metric in record["metrics"]:
     by_name[metric["name"]] = statistics.median(samples) if samples else 0.0
 
 def total(*names):
-    return sum(by_name.get(name, 0.0) for name in names)
+    return sum(by_name.get(name, 0.0) for name in names) / invocations
 
 # Axes. Each is a count of events the engine chose to perform, not a time
 # share: the point is to see which axis dominates and then attack it, not to
@@ -75,15 +80,18 @@ axes = {
         "property-ic-load-disables",
         "property-ic-store-disables",
     ),
+    # jit-runtime-stub-transitions is the aggregate of the leaf/alloc/
+    # reentrant families, so summing it with its members would count the
+    # same transition several times.
     "native": total(
+        "jit-runtime-stub-transitions",
         "jit-to-rust-call-transitions",
         "jit-runtime-calls",
         "jit-runtime-constructs",
-        "jit-leaf-stub-transitions",
-        "jit-alloc-stub-transitions",
-        "jit-reentrant-stub-transitions",
-        "jit-runtime-property-stubs",
     ),
+    # Broken out because it is the metric Slice 1 must drive to zero: a
+    # property access that leaves generated code to ask the runtime.
+    "prop_stub": total("jit-runtime-property-stubs"),
     "deopt": total(
         "jit-optimized-deopts",
         "jit-generated-call-deopts",
@@ -99,8 +107,8 @@ PY
 
 for tier in $TIERS; do
   printf '\n=== tier: %s  samples=%s warmup=%s ===\n' "$tier" "$SAMPLES" "$WARMUP"
-  printf '%-24s %14s %10s %10s %8s %8s %8s %8s %8s %6s\n' \
-    kernel retired wall_ms reductions instr/red ic_miss ic_inst ic_disa native deopt
+  printf '%-24s %14s %9s %11s %9s %7s %7s %7s %9s %11s %6s\n' \
+    kernel retired wall_ms reductions instr/red ic_miss ic_inst ic_disa native prop_stub deopt
   for entry in "${KERNELS[@]}"; do
     read -r name expected <<<"$entry"
     if [[ -n "$filter" && "$name" != *"$filter"* ]]; then continue; fi
@@ -125,19 +133,19 @@ for tier in $TIERS; do
     fi
 
     retired=$(awk '/instructions retired/{print $1}' "$timing")
-    if ! axes=$(parse_record "$record"); then
+    if ! axes=$(parse_record "$record" "$((SAMPLES + WARMUP))"); then
       printf '%-24s %14s\n' "$name" "PARSE-FAILED"
       rm -f "$record" "$timing"
       continue
     fi
-    read -r wall reductions ic_miss ic_install ic_disable native deopt gc <<<"$axes"
+    read -r wall reductions ic_miss ic_install ic_disable native prop_stub deopt gc <<<"$axes"
 
     per_reduction=$(python3 -c \
       "r=${retired:-0}; d=${reductions:-0}; print(f'{r/d:.1f}' if d else '-')")
 
-    printf '%-24s %14s %10s %10s %8s %8s %8s %8s %8s %6s\n' \
+    printf '%-24s %14s %9s %11s %9s %7s %7s %7s %9s %11s %6s\n' \
       "$name" "${retired:-?}" "$wall" "$reductions" "$per_reduction" \
-      "$ic_miss" "$ic_install" "$ic_disable" "$native" "$deopt"
+      "$ic_miss" "$ic_install" "$ic_disable" "$native" "$prop_stub" "$deopt"
 
     if [[ "${gc:-0}" != "0" ]]; then
       printf '%-24s %14s gc-cycles=%s\n' "" "" "$gc"

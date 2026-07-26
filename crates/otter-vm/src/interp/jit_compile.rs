@@ -542,9 +542,13 @@ impl Interpreter {
         // descriptor state can make a plain indexed access observable.
         view.element_access = jit::JitElementAccess {
             type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
-            latch: jit::JitReceiverLatch::Sidecar {
-                byte: header + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
-            },
+            guards: [
+                Some(jit::JitBodyGuard::clear(
+                    header + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
+                    jit::JitGuardWidth::Word64,
+                )),
+                None,
+            ],
             length_byte: header + crate::array::ARRAY_BODY_DENSE_LEN_OFFSET as u32,
             data_ptr_byte: header + crate::array::ARRAY_BODY_ELEMENTS_PTR_OFFSET as u32,
         };

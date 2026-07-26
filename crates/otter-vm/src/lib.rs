@@ -259,11 +259,11 @@ pub use handles::{HandleArena, Local};
 pub use host_strings::{HostAtom, HostAtomId, HostAtomInterner};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
-    JitArrayLayout, JitClosureCallLayout, JitCodeGenerationSnapshot, JitCodeResidency,
-    JitCollectionLayout, JitCompileError, JitCompileRequest, JitCompileSnapshot, JitCompileStatus,
-    JitCompilerHook, JitDirectCallKind, JitDirectCallThisMode, JitDirectCallee, JitElementAccess,
-    JitExecOutcome, JitFunctionCode, JitGuardedMethodCall, JitGuardedReceiver, JitInlineCallee,
-    JitInlineMethod, JitInstructionMetadata, JitPropertyIcWay, JitReceiverLatch,
+    JitArrayLayout, JitBodyGuard, JitClosureCallLayout, JitCodeGenerationSnapshot,
+    JitCodeResidency, JitCollectionLayout, JitCompileError, JitCompileRequest, JitCompileSnapshot,
+    JitCompileStatus, JitCompilerHook, JitDirectCallKind, JitDirectCallThisMode, JitDirectCallee,
+    JitElementAccess, JitExecOutcome, JitFunctionCode, JitGuardWidth, JitGuardedMethodCall,
+    JitGuardedReceiver, JitInlineCallee, JitInlineMethod, JitInstructionMetadata, JitPropertyIcWay,
     JitRuntimeStubBinding, JitStaticNativeCall, JitStringLayout, VmRuntimeActivation,
 };
 pub use jit_artifact::{

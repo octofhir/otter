@@ -16,29 +16,31 @@
 
 use super::MethodCallIc;
 use crate::Interpreter;
-use crate::jit::{JitGuardedMethodCall, JitGuardedReceiver, JitReceiverLatch};
+use crate::jit::{JitBodyGuard, JitGuardWidth, JitGuardedMethodCall, JitGuardedReceiver};
 
 fn compressed_slot_byte(slot: u16) -> u32 {
     u32::from(slot) * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32
 }
 
 /// The 32-bit no-expando/no-override word every `Map` and `Set` body carries.
-fn collection_latch() -> JitReceiverLatch {
-    JitReceiverLatch::Flags {
-        byte: otter_gc::header::HEADER_SIZE as u32
+fn collection_guard() -> JitBodyGuard {
+    JitBodyGuard::clear(
+        otter_gc::header::HEADER_SIZE as u32
             + crate::collections::MAP_BODY_JIT_GUARD_FLAGS_OFFSET as u32,
-    }
+        JitGuardWidth::Word32,
+    )
 }
 
 /// An array body's exotic sidecar. A null sidecar means the realm
 /// `%Array.prototype%` is still the receiver's `[[Prototype]]` and nothing on
 /// the instance can shadow the method or override an element's attributes,
 /// which is what makes the prototype-slot guard sufficient.
-fn dense_array_latch() -> JitReceiverLatch {
-    JitReceiverLatch::Sidecar {
-        byte: otter_gc::header::HEADER_SIZE as u32
+fn dense_array_guard() -> JitBodyGuard {
+    JitBodyGuard::clear(
+        otter_gc::header::HEADER_SIZE as u32
             + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
-    }
+        JitGuardWidth::Word64,
+    )
 }
 
 impl Interpreter {
@@ -83,7 +85,7 @@ impl Interpreter {
         Some(JitGuardedMethodCall {
             receiver: JitGuardedReceiver::Exotic {
                 type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
-                latch: dense_array_latch(),
+                guard: Some(dense_array_guard()),
                 proto_offset: proto.offset(),
             },
             holder_shape: crate::object::shape(proto, &self.gc_heap).offset(),
@@ -139,7 +141,7 @@ impl Interpreter {
         Some(JitGuardedMethodCall {
             receiver: JitGuardedReceiver::Exotic {
                 type_tag: crate::string::JS_STRING_BODY_TYPE_TAG,
-                latch: JitReceiverLatch::None,
+                guard: None,
                 proto_offset: proto.offset(),
             },
             holder_shape: crate::object::shape(proto, &self.gc_heap).offset(),
@@ -200,7 +202,7 @@ impl Interpreter {
         Some(JitGuardedMethodCall {
             receiver: JitGuardedReceiver::Exotic {
                 type_tag: receiver_type_tag,
-                latch: collection_latch(),
+                guard: Some(collection_guard()),
                 proto_offset: proto.offset(),
             },
             holder_shape: crate::object::shape(proto, &self.gc_heap).offset(),

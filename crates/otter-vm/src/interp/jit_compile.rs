@@ -535,9 +535,18 @@ impl Interpreter {
         view.array_layout = jit::JitArrayLayout {
             type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
             length_byte: header + crate::array::ARRAY_BODY_LENGTH_OFFSET as u32,
-            exotic_byte: header + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
-            elements_ptr_byte: header + crate::array::ARRAY_BODY_ELEMENTS_PTR_OFFSET as u32,
-            dense_len_byte: header + crate::array::ARRAY_BODY_DENSE_LEN_OFFSET as u32,
+        };
+        // A dense array's elements are boxed `Value`s behind the body's
+        // element cache, and its exotic sidecar is what invalidates that
+        // layout: a non-null sidecar means custom prototype, accessor or
+        // descriptor state can make a plain indexed access observable.
+        view.element_access = jit::JitElementAccess {
+            type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
+            latch: jit::JitReceiverLatch::Sidecar {
+                byte: header + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
+            },
+            length_byte: header + crate::array::ARRAY_BODY_DENSE_LEN_OFFSET as u32,
+            data_ptr_byte: header + crate::array::ARRAY_BODY_ELEMENTS_PTR_OFFSET as u32,
         };
         view.cage_base = otter_gc::cage_base() as usize;
     }

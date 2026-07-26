@@ -47,7 +47,6 @@ use smallvec::SmallVec;
 
 use crate::Value;
 use crate::cache_ir::CacheStub;
-use crate::jit::JitElementLoadKind;
 use crate::property_ic::{PropertyIcEntry, PropertyIcKind};
 
 /// At least one operand was an `int32` fast-path number.
@@ -68,12 +67,6 @@ pub const ARITH_OTHER: u8 = 1 << 4;
 /// speculated as a pure numeric operation.
 const NON_NUMERIC: u8 = ARITH_STRING | ARITH_BIGINT | ARITH_OTHER;
 const ARITH_WIDEN_FLOAT: u8 = 1 << 7;
-
-const ELEMENT_UNSEEN: u8 = 0;
-const ELEMENT_FLOAT64: u8 = 1;
-const ELEMENT_INT32: u8 = 2;
-const ELEMENT_GENERIC: u8 = 3;
-const ELEMENT_MASK: u8 = 0b0000_0011;
 
 const BRANCH_TAKEN_SEEN: u8 = 1 << 4;
 const BRANCH_NOT_TAKEN_SEEN: u8 = 1 << 5;
@@ -693,69 +686,6 @@ impl InstructionFeedback {
             bits & !ARITH_WIDEN_FLOAT
         }
     }
-
-    /// Record the receiver family observed at one `LoadElement` instruction.
-    /// `None` preserves an unseen cell for an ordinary non-typed receiver;
-    /// mixed or unsupported typed-array kinds become permanently generic.
-    /// Returns `true` when the bounded element kind changes.
-    pub fn record_element_load(&self, observed: Option<JitElementLoadKind>) -> bool {
-        let Some(observed) = observed else {
-            let mut states = self.states.load(Ordering::Relaxed);
-            loop {
-                let current = states & ELEMENT_MASK;
-                if matches!(current, ELEMENT_UNSEEN | ELEMENT_GENERIC) {
-                    return false;
-                }
-                let next = (states & !ELEMENT_MASK) | ELEMENT_GENERIC;
-                match self.states.compare_exchange_weak(
-                    states,
-                    next,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return true,
-                    Err(actual) => states = actual,
-                }
-            }
-        };
-        let observed = match observed {
-            JitElementLoadKind::Any => ELEMENT_GENERIC,
-            JitElementLoadKind::Float64 => ELEMENT_FLOAT64,
-            JitElementLoadKind::Int32 => ELEMENT_INT32,
-        };
-        let mut states = self.states.load(Ordering::Relaxed);
-        loop {
-            let current = states & ELEMENT_MASK;
-            let next_element = match current {
-                ELEMENT_UNSEEN => observed,
-                value if value == observed => value,
-                _ => ELEMENT_GENERIC,
-            };
-            if next_element == current {
-                return false;
-            }
-            let next = (states & !ELEMENT_MASK) | next_element;
-            match self.states.compare_exchange_weak(
-                states,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => states = actual,
-            }
-        }
-    }
-
-    /// Element-load specialization consumed by a compile snapshot.
-    #[must_use]
-    pub fn element_load_kind(&self) -> JitElementLoadKind {
-        match self.states.load(Ordering::Relaxed) & ELEMENT_MASK {
-            ELEMENT_FLOAT64 => JitElementLoadKind::Float64,
-            ELEMENT_INT32 => JitElementLoadKind::Int32,
-            _ => JitElementLoadKind::Any,
-        }
-    }
 }
 
 /// Dense feedback cells and their single material-transition epoch.
@@ -922,11 +852,6 @@ impl<'a> InstructionFeedbackRecorder<'a> {
         self.note_transition(self.cell.record_arith(lhs, rhs))
     }
 
-    /// Record an element kind and advance the epoch on widening.
-    pub(crate) fn record_element_load(self, observed: Option<JitElementLoadKind>) -> bool {
-        self.note_transition(self.cell.record_element_load(observed))
-    }
-
     /// Record a branch sample and advance the epoch on a newly seen direction.
     pub(crate) fn record_branch(self, taken: bool) -> bool {
         self.note_transition(self.cell.record_branch(taken))
@@ -978,33 +903,13 @@ mod tests {
     }
 
     #[test]
-    fn dense_cell_widens_once_and_keeps_element_demotion_sticky() {
+    fn dense_cell_widens_arith_to_float_once() {
         let cell = InstructionFeedback::default();
         cell.record_arith(Value::number_i32(1), Value::number_i32(2));
         assert_eq!(cell.arith_bits(), ARITH_INT32);
         assert!(cell.widen_arith_to_float());
         assert!(!cell.widen_arith_to_float());
         assert_eq!(cell.arith_bits(), ARITH_INT32 | ARITH_FLOAT64);
-
-        cell.record_element_load(Some(JitElementLoadKind::Float64));
-        assert_eq!(cell.element_load_kind(), JitElementLoadKind::Float64);
-        cell.record_element_load(Some(JitElementLoadKind::Int32));
-        assert_eq!(cell.element_load_kind(), JitElementLoadKind::Any);
-        cell.record_element_load(Some(JitElementLoadKind::Float64));
-        assert_eq!(cell.element_load_kind(), JitElementLoadKind::Any);
-
-        let ordinary_then_typed = InstructionFeedback::default();
-        ordinary_then_typed.record_element_load(None);
-        ordinary_then_typed.record_element_load(Some(JitElementLoadKind::Int32));
-        assert_eq!(
-            ordinary_then_typed.element_load_kind(),
-            JitElementLoadKind::Int32
-        );
-        ordinary_then_typed.record_element_load(None);
-        assert_eq!(
-            ordinary_then_typed.element_load_kind(),
-            JitElementLoadKind::Any
-        );
     }
 
     #[test]
@@ -1035,42 +940,33 @@ mod tests {
         assert!(feedback.record_arith(Value::number_f64(1.5), Value::number_i32(4)));
         assert_eq!(vector.epoch(), 2);
 
-        assert!(feedback.record_element_load(Some(JitElementLoadKind::Float64)));
-        assert_eq!(vector.epoch(), 3);
-        assert!(!feedback.record_element_load(Some(JitElementLoadKind::Float64)));
-        assert_eq!(vector.epoch(), 3);
-        assert!(feedback.record_element_load(Some(JitElementLoadKind::Int32)));
-        assert_eq!(vector.epoch(), 4);
-        assert!(!feedback.record_element_load(None));
-        assert_eq!(vector.epoch(), 4);
-
         assert!(feedback.record_branch(true));
-        assert_eq!(vector.epoch(), 5);
+        assert_eq!(vector.epoch(), 3);
         assert!(!feedback.record_branch(true));
-        assert_eq!(vector.epoch(), 5);
+        assert_eq!(vector.epoch(), 3);
         assert!(feedback.record_branch(false));
-        assert_eq!(vector.epoch(), 6);
+        assert_eq!(vector.epoch(), 4);
 
         assert_eq!(
             vector.record_call(0, OrdinaryCallTarget::Bytecode(7)),
             CallTargetTransition::BecameMonomorphic
         );
-        assert_eq!(vector.epoch(), 7);
+        assert_eq!(vector.epoch(), 5);
         assert_eq!(
             vector.record_call(0, OrdinaryCallTarget::Bytecode(7)),
             CallTargetTransition::Unchanged
         );
-        assert_eq!(vector.epoch(), 7);
+        assert_eq!(vector.epoch(), 5);
         assert_eq!(
             vector.record_call(0, OrdinaryCallTarget::Bytecode(8)),
             CallTargetTransition::BecamePolymorphic
         );
-        assert_eq!(vector.epoch(), 8);
+        assert_eq!(vector.epoch(), 6);
 
         assert!(feedback.widen_arith_to_float());
-        assert_eq!(vector.epoch(), 9);
+        assert_eq!(vector.epoch(), 7);
         assert!(!feedback.widen_arith_to_float());
-        assert_eq!(vector.epoch(), 9);
+        assert_eq!(vector.epoch(), 7);
         assert_eq!(std::mem::size_of::<InstructionFeedback>(), 4);
     }
 

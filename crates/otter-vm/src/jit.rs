@@ -156,10 +156,12 @@ pub struct JitCompileSnapshot {
     pub cage_base: usize,
     /// Static heap-layout offsets for inline typed-array element access. Baked
     /// once at compile time from `otter-vm`'s `#[repr(C)]` body layouts so the
-    /// emitter stays layout-agnostic. The emitter inlines `LoadElement` /
-    /// `StoreElement` for monomorphic `Float64Array` / `Int32Array` receivers
-    /// only when [`cage_base`](Self::cage_base) is non-zero (baked).
+    /// emitter stays layout-agnostic.
     pub array_layout: JitArrayLayout,
+    /// How the indexed-element program addresses a receiver's elements.
+    /// Generated code reads only this; the family's body layout never reaches
+    /// the emitter, so a second element-bearing family costs a declaration.
+    pub element_access: JitElementAccess,
     /// Static heap-layout offsets for inline primitive string `.length`.
     pub string_layout: JitStringLayout,
     /// Byte offset from a decompressed upvalue-cell pointer to its captured
@@ -307,9 +309,10 @@ pub struct JitCollectionLayout {
 /// While that word reads clean the prototype's slot is the whole answer, so the
 /// guard is one load and one branch; its width and offset are the only thing
 /// that differs between body families.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum JitReceiverLatch {
     /// The body holds no such state; proving its type tag is the whole guard.
+    #[default]
     None,
     /// A 32-bit flags word that must read zero, as `Map` and `Set` bodies keep.
     Flags {
@@ -664,17 +667,28 @@ pub struct JitArrayLayout {
     pub type_tag: u8,
     /// Offset to `ArrayBody.length`, the logical `length` property.
     pub length_byte: u32,
-    /// Offset to `ArrayBody.exotic`; a non-null sidecar means custom
-    /// prototype/accessor/descriptor/source-text state may make dense stores
-    /// observable, so inline stores must miss to the runtime path.
-    pub exotic_byte: u32,
-    /// Offset to the VM-maintained dense-element base pointer. The buffer is
-    /// a plain host allocation, so it survives a moving collection of the
-    /// body; every dense mutation refreshes it.
-    pub elements_ptr_byte: u32,
-    /// Offset to the VM-maintained mirror of `elements.len()`, read by the
-    /// inline bounds check as one 32-bit load.
-    pub dense_len_byte: u32,
+}
+
+/// One receiver family's indexed-element storage, as the guard program reads it.
+///
+/// Every element-bearing body answers the same four questions — which cell tag
+/// it carries, what instance state invalidates the layout, where its live
+/// element count lives, and where its element base pointer lives — so the
+/// address program is written once and the family is data.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JitElementAccess {
+    /// Expected receiver `GcHeader::type_tag`. `0` means no family is baked and
+    /// the site keeps the runtime path.
+    pub type_tag: u8,
+    /// Instance state that must read clean before the offsets below are
+    /// trusted.
+    pub latch: JitReceiverLatch,
+    /// Byte offset of the VM-maintained live element count, read as 32 bits.
+    pub length_byte: u32,
+    /// Byte offset of the VM-maintained element base pointer. The buffer is a
+    /// plain host allocation, so it survives a moving collection of the body;
+    /// every mutation refreshes it.
+    pub data_ptr_byte: u32,
 }
 
 /// Ready-to-use byte offsets and tags for inline primitive string fast paths.
@@ -815,6 +829,7 @@ impl JitCompileSnapshot {
             derived_constructor: false,
             cage_base: 0,
             array_layout: JitArrayLayout::default(),
+            element_access: JitElementAccess::default(),
             string_layout: JitStringLayout::default(),
             object_shape_byte: 0,
             object_dictionary_shape_id_byte: 0,
@@ -944,23 +959,6 @@ impl JitInstructionMetadata {
             exception_register: region.exception_register,
         })
     }
-}
-
-/// Native representation an observed `LoadElement` site can produce unboxed.
-///
-/// Recorded during warmup: a site that only ever reads from a `Float64Array`
-/// bakes `Float64`, one that only reads from an `Int32Array` bakes `Int32`, and
-/// a site that sees any other receiver (dense array, mixed typed-array kinds,
-/// object) stays `Any` and keeps the boxed load.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum JitElementLoadKind {
-    /// Generic boxed element load (no specialization).
-    #[default]
-    Any,
-    /// The site only observed `Float64Array` receivers.
-    Float64,
-    /// The site only observed `Int32Array` receivers.
-    Int32,
 }
 
 /// Common method names the external JIT can specialize without reading VM

@@ -496,6 +496,58 @@ Only the second is the CacheIR attach. The way's `_reserved` word is free and
 the 16-byte stride already holds, so the lowered program needs no layout
 change; `emit_native_leaf_call` is already the lowering it would call.
 
+## The remaining two call forms, measured
+
+`Math.abs` reached three ways, 200 000 iterations, `production-tiered`, against
+the same builtin and the same work:
+
+| form | opcode | otter | node | available |
+| --- | --- | ---: | ---: | ---: |
+| `a(i & 15)`, `a = Math.abs` | `Op::Call` | **1.26 ms** | 0.130 | landed |
+| `Math.abs(i & 15)` | `Op::MathCall` | 12.90 ms | 0.148 | **10.2x** |
+| `m.abs(i & 15)`, `m = Math` | `CallMethodValue` | 21.82 ms | 0.158 | **17.3x** |
+| `m.max(i & 3, 2)`, `m = Math` | `CallMethodValue` | 27.21 ms | 0.255 | **21.6x** |
+
+The 12.91 ms this plan attributed to a method call is `Op::MathCall`, the
+compiler's dedicated direct-`Math.<name>(...)` opcode — a different mechanism
+from the one item 2 describes, and the form real code actually writes. Its
+runtime guard runs on **every** call through `STUB_JIT_MATH_CALL`: no lexical
+`Math` shadow, the slot still holds the original bootstrap native, and the
+arguments need no observable `ToPrimitive`. Then the full variadic `math::call`
+with `coerce_all`. Correctness is intact — reassigning `Math.abs` is honoured
+through both forms — but every guard is re-derived per call.
+
+`CallMethodValue` is the general one and the plan's actual item 2. Its gap is
+exactly where the plan said: `note_method_target` runs only under
+`stack.len() > depth_before`, so a synchronously-completing native records
+nothing.
+
+**The plan's prohibition on recording it is now void.** Item 2 refused to teach
+the method arm to record a static-native target because `JitStaticNativeCallKind`
+was on the deletion list and feeding it would add a second bespoke path. That
+enum is deleted; the declared entry id that replaced it *is* the declaration the
+shared emitter already consumes. Recording it from the method arm now converges
+the two paths instead of forking them.
+
+The pieces are in place and none needs inventing:
+
+- `MethodSite` already carries `recv_shape`, `proto_chain` and
+  `method_value_byte`, and `method_site_for_receiver` computes it *before* the
+  call — including the own-slot case a namespace object like `Math` needs.
+- `emit_way_walk` and `emit_resolve_holder` already lower that triple.
+- `emit_native_leaf_call` already lowers the identity guard and the entry call.
+
+What is missing is one feedback channel: the method-target record keys on a
+`method_fid: u32`, and a native leaf has no function id, so the target needs the
+same widening `OrdinaryCallTarget` got — a declared entry id beside the bytecode
+fid. Then the bake and both tiers consume the existing lowerings.
+
+`JitCollectionLeafMethod` is the same program written out by hand — receiver tag
+guard, prototype hop, slot byte, identity address, entry id — so that table and
+`emit_leaf_method_guarded_call` collapse into this once it exists, which is the
+"method-call IC stops being a separate mechanism and becomes attachers" the
+plan calls for.
+
 ## Callable identity as cache-program ops — design, grounded in the code
 
 `CacheStub::lower_jit_way` already lowers a whole op program to the fixed

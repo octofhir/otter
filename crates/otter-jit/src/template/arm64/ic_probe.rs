@@ -35,7 +35,9 @@
 //!   `setPrototypeOf` changes it while the shape stays put.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
-use otter_vm::{JitCompileSnapshot, JitGuardedMethodCall, JitGuardedReceiver, JitReceiverLatch};
+use otter_vm::{
+    JitBodyGuard, JitCompileSnapshot, JitGuardWidth, JitGuardedMethodCall, JitGuardedReceiver,
+};
 
 use otter_vm::native_abi::{NO_SAFEPOINT, RuntimeStubId, SafepointId, runtime_stub_name};
 use otter_vm::runtime_stubs::{
@@ -275,7 +277,9 @@ where
         ; cmp w14, access.type_tag as u32
         ; b.ne =>miss
     );
-    emit_receiver_latch_guard(ops, access.latch, miss);
+    for guard in access.guards.iter().flatten() {
+        emit_body_guard(ops, *guard, miss);
+    }
     load_index(ops, 15)?;
     if index_form == DenseIndexForm::Tagged {
         dynasm!(ops
@@ -633,11 +637,13 @@ where
         // unchanged.
         JitGuardedReceiver::Exotic {
             type_tag,
-            latch,
+            guard,
             proto_offset,
         } => {
             emit_receiver_type_guard(ops, relocations, view, receiver, u32::from(type_tag), miss)?;
-            emit_receiver_latch_guard(ops, latch, miss);
+            if let Some(guard) = guard {
+                emit_body_guard(ops, guard, miss);
+            }
             emit_prototype_guard(
                 ops,
                 relocations,
@@ -716,21 +722,24 @@ pub(crate) fn emit_receiver_type_guard(
     Ok(())
 }
 
-/// Prove the receiver body carries no instance state that would make the pinned
-/// prototype's method the wrong answer. Expects the body header in `x13`.
-fn emit_receiver_latch_guard(ops: &mut Assembler, latch: JitReceiverLatch, miss: DynamicLabel) {
-    match latch {
-        JitReceiverLatch::None => {}
-        JitReceiverLatch::Flags { byte } => dynasm!(ops
-            ; .arch aarch64
-            ; ldr w14, [x13, byte]
-            ; cbnz w14, =>miss
-        ),
-        JitReceiverLatch::Sidecar { byte } => dynasm!(ops
-            ; .arch aarch64
-            ; ldr x14, [x13, byte]
-            ; cbnz x14, =>miss
-        ),
+/// Prove one declared body word still holds the value the layout depends on.
+///
+/// Expects the body header in `x13`. There is one sequence per declared
+/// *width*, never one per receiver family: a collection's flags word, an
+/// array's exotic sidecar and a typed view's kind discriminant are the same
+/// two instructions at different offsets. Clobbers `x14`.
+fn emit_body_guard(ops: &mut Assembler, guard: JitBodyGuard, miss: DynamicLabel) {
+    let byte = guard.byte;
+    match guard.width {
+        JitGuardWidth::Byte => dynasm!(ops ; .arch aarch64 ; ldrb w14, [x13, byte]),
+        JitGuardWidth::Word32 => dynasm!(ops ; .arch aarch64 ; ldr w14, [x13, byte]),
+        JitGuardWidth::Word64 => dynasm!(ops ; .arch aarch64 ; ldr x14, [x13, byte]),
+    }
+    if guard.expect == 0 {
+        dynasm!(ops ; .arch aarch64 ; cbnz x14, =>miss);
+    } else {
+        emit_load_u64(ops, 12, u64::from(guard.expect));
+        dynasm!(ops ; .arch aarch64 ; cmp x14, x12 ; b.ne =>miss);
     }
 }
 

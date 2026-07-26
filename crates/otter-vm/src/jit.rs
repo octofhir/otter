@@ -301,30 +301,47 @@ pub struct JitCollectionLayout {
     pub native_function_type_tag: u8,
 }
 
-/// Instance state that can invalidate a pinned prototype's method before the
-/// prototype itself changes.
-///
-/// A receiver body may carry a word saying "something on this instance is no
-/// longer canonical" — an expando, an overridden method, a custom descriptor.
-/// While that word reads clean the prototype's slot is the whole answer, so the
-/// guard is one load and one branch; its width and offset are the only thing
-/// that differs between body families.
+/// Width of one body word a declared layout guards.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum JitReceiverLatch {
-    /// The body holds no such state; proving its type tag is the whole guard.
+pub enum JitGuardWidth {
+    /// One byte, as a `bool` flag occupies.
+    Byte,
+    /// A 32-bit word, as a flags word or a `#[repr(u32)]` discriminant.
     #[default]
-    None,
-    /// A 32-bit flags word that must read zero, as `Map` and `Set` bodies keep.
-    Flags {
-        /// Byte offset of the flags word from the body's `GcHeader`.
-        byte: u32,
-    },
-    /// A pointer-width sidecar that must read null, as an array body keeps for
-    /// custom prototype/accessor/descriptor state.
-    Sidecar {
-        /// Byte offset of the sidecar pointer from the body's `GcHeader`.
-        byte: u32,
-    },
+    Word32,
+    /// A pointer-width word, as an optional sidecar handle.
+    Word64,
+}
+
+/// One body word whose value a declared layout depends on.
+///
+/// Body state that can make a layout the wrong answer is all the same shape —
+/// read a word at a fixed offset, require an exact value, otherwise leave the
+/// fast path. A collection's no-expando flags word, an array's exotic sidecar,
+/// a typed array's element kind and its length-tracking flag are that one guard
+/// with different offsets, widths and expected values, so generated code has
+/// one lowering per *width* and never one per family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitBodyGuard {
+    /// Byte offset of the word from the body's `GcHeader`.
+    pub byte: u32,
+    /// How much of it to read.
+    pub width: JitGuardWidth,
+    /// Value the word must hold for the layout to apply.
+    pub expect: u32,
+}
+
+impl JitBodyGuard {
+    /// A word that must read zero: an absent expando, a null sidecar, a clear
+    /// flag.
+    #[must_use]
+    pub const fn clear(byte: u32, width: JitGuardWidth) -> Self {
+        Self {
+            byte,
+            width,
+            expect: 0,
+        }
+    }
 }
 
 /// How a guarded method site proves the receiver it recorded.
@@ -349,9 +366,9 @@ pub enum JitGuardedReceiver {
     Exotic {
         /// Expected receiver `GcHeader::type_tag`.
         type_tag: u8,
-        /// Instance state that must read clean before the prototype's method
-        /// may be trusted.
-        latch: JitReceiverLatch,
+        /// Instance state that must hold before the prototype's method may be
+        /// trusted. `None` for a body that carries no such state.
+        guard: Option<JitBodyGuard>,
         /// Compressed offset of the pinned realm prototype holding the builtin.
         proto_offset: u32,
     },
@@ -680,9 +697,9 @@ pub struct JitElementAccess {
     /// Expected receiver `GcHeader::type_tag`. `0` means no family is baked and
     /// the site keeps the runtime path.
     pub type_tag: u8,
-    /// Instance state that must read clean before the offsets below are
-    /// trusted.
-    pub latch: JitReceiverLatch,
+    /// Instance state that must hold before the offsets below are trusted.
+    /// Read in order; an absent entry ends the list.
+    pub guards: [Option<JitBodyGuard>; 2],
     /// Byte offset of the VM-maintained live element count, read as 32 bits.
     pub length_byte: u32,
     /// Byte offset of the VM-maintained element base pointer. The buffer is a

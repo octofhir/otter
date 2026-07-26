@@ -57,6 +57,7 @@ mod delete;
 mod exceptions;
 mod functions;
 mod globals;
+pub(crate) mod ic_probe;
 mod iterators;
 mod module_op;
 mod private_access;

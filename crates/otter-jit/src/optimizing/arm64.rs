@@ -108,6 +108,7 @@ use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG};
 use crate::template::arm64::collections::{
     MethodSite, emit_leaf_method_guarded_call, emit_primitive_method_guarded_call,
 };
+use crate::template::arm64::ic_probe;
 
 use super::{
     OptimizedCode, OptimizedMetadata,
@@ -133,13 +134,12 @@ use crate::{
         relocation::{PropertyIcAccess, RelocationCapture, RelocationTarget},
     },
     entry::{
-        CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, GLOBAL_THIS_OFFSET_PTR_OFFSET, IC_WAYS,
-        MAX_METHOD_ARGS, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
-        NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_THIS_OFFSET,
-        NATIVE_FRAME_UPVALUE_BASE_OFFSET, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, STATUS_BAILED,
-        STATUS_RETURNED, STATUS_THREW, THREAD_OFFSET, TransitionTable, Unsupported, VALUE_FALSE,
-        VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED,
-        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
+        CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, GLOBAL_THIS_OFFSET_PTR_OFFSET, MAX_METHOD_ARGS,
+        NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
+        NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET, NUMBER_TAG_HI16,
+        OBJECT_BODY_TYPE_TAG, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THREAD_OFFSET,
+        TransitionTable, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL,
+        VALUE_TRUE, VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
         VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET, WhiskerIcCell,
         pack_method_arg_regs,
     },
@@ -3084,21 +3084,8 @@ fn emit(
                             },
                         );
                         let do_load = ops.new_dynamic_label();
-                        for way in 0..IC_WAYS as u32 {
-                            let shape_off = way * 8;
-                            let value_byte_off = shape_off + 4;
-                            let next = ops.new_dynamic_label();
-                            dynasm!(ops
-                                ; .arch aarch64
-                                ; ldr w16, [x15, shape_off]
-                                ; cmp w14, w16
-                                ; b.ne =>next
-                                ; ldr w17, [x15, value_byte_off]
-                                ; b =>do_load
-                                ; =>next
-                            );
-                        }
-                        dynasm!(ops ; .arch aarch64 ; b =>miss ; =>do_load);
+                        ic_probe::emit_way_walk(&mut ops, do_load, miss);
+                        ic_probe::emit_resolve_holder(&mut ops, &mut relocations, view, miss);
                         crate::template::arm64::values::emit_slab_base(&mut ops, view, 13, 14);
                         dynasm!(ops
                             ; .arch aarch64
@@ -3280,21 +3267,8 @@ fn emit(
                             },
                         );
                         let do_store = ops.new_dynamic_label();
-                        for way in 0..IC_WAYS as u32 {
-                            let shape_off = way * 8;
-                            let value_byte_off = shape_off + 4;
-                            let next = ops.new_dynamic_label();
-                            dynasm!(ops
-                                ; .arch aarch64
-                                ; ldr w16, [x15, shape_off]
-                                ; cmp w14, w16
-                                ; b.ne =>next
-                                ; ldr w17, [x15, value_byte_off]
-                                ; b =>do_store
-                                ; =>next
-                            );
-                        }
-                        dynasm!(ops ; .arch aarch64 ; b =>miss ; =>do_store);
+                        ic_probe::emit_way_walk(&mut ops, do_store, miss);
+                        ic_probe::emit_refuse_prototype_hop(&mut ops, miss);
                         crate::template::arm64::values::emit_slab_base(&mut ops, view, 13, 14);
                         dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);
                         // Boxed value bits into x9, whatever its representation.

@@ -13,6 +13,57 @@ time is a sanity check only). Kernels are a thermometer, never a target.
 | Slice | What landed | Hand LOC | Won % | LOC/% | Note |
 | --- | --- | ---: | ---: | ---: | --- |
 | 0 | `just cost`, `just gate`, this ledger | 0 | — | — | tooling, nothing replaced |
+| 1 | CacheIR lowered generically; one probe emitter; megamorphic re-probation | +366 / −322 | 87.7% | 4.2 | engine code net **−57 lines** |
+
+## Slice 1 result — 2026-07-26
+
+Retired instructions on `property-polymorphic`, the kernel the change targets:
+
+| Tier | Before | After | Factor |
+| --- | ---: | ---: | ---: |
+| template | 34 571 627 516 | 6 672 884 852 | **5.18x** |
+| production-tiered | 33 862 438 798 | 4 247 663 895 | **7.97x** |
+
+Runtime property stubs per invocation — the metric Slice 1 named as its target:
+
+| Tier | Before | After |
+| --- | ---: | ---: |
+| template | 1 197 000 | 42 751 |
+| production-tiered | 1 199 786 | 6 912 |
+
+Against the bar (`just vs`, ms per `engineKernel()`):
+
+| | Before | After |
+| --- | ---: | ---: |
+| otter | 60.66 | 8.12 |
+| vs node | 25.39x | **3.34x** |
+| vs bun | 42.07x | **5.46x** |
+
+The polymorphic kernel went from the worst gap in the suite to the smallest.
+Isolated, a pure prototype-load kernel went from 15 561 008 runtime property
+stubs to **4** — one install per shape, everything after it inline.
+
+No other kernel moved: retired instructions for `numeric-leaf` are
+763M/866M before and after. A 2.83ms wall-clock reading for it during the
+run was thermal noise, which is exactly why retired instructions is the
+metric and wall time is only a sanity check.
+
+Two defects were behind the 25x, both structural rather than local:
+
+1. **The inline cell could not express a prototype hop.** It stored
+   `shape → slot byte`, so `whisker_load_cell_fill` filtered stubs through an
+   `own_data_hit()` recognizer and a prototype stub could never produce a
+   fill. Every `o.bias` read left generated code for the runtime, forever.
+   Fixed by lowering the CacheIR op program itself — the way now carries the
+   guarded holder shape, and one shared emitter performs the guarded hop.
+2. **Megamorphic was a death sentence.** A store that adds a property gives
+   each receiver a new shape, so a site reading four objects across one
+   `o.acc = v` sees eight shapes, exhausts the four-way PIC, and was then
+   "never re-populated for the interpreter lifetime" — taking every tier's
+   inline probe down with it, since generated code can only cache what the
+   site still describes. Fixed by re-probation: a megamorphic site absorbs a
+   miss budget, then tries again. Settled sites re-cache; genuinely
+   megamorphic ones pay one re-probation per budget.
 
 ## The bar — otter vs node and bun, 2026-07-26, before Slice 1
 

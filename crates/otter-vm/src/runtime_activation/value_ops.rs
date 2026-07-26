@@ -391,7 +391,7 @@ impl RuntimeCall<'_> {
         object: u16,
         name_index: u32,
         site: usize,
-    ) -> Result<u64, VmError> {
+    ) -> Result<Option<crate::jit::JitPropertyIcWay>, VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = unsafe { self.context.as_ref() };
@@ -421,7 +421,7 @@ impl RuntimeCall<'_> {
         name_index: u32,
         source: u16,
         site: usize,
-    ) -> Result<u64, VmError> {
+    ) -> Result<Option<crate::jit::JitPropertyIcWay>, VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = unsafe { self.context.as_ref() };

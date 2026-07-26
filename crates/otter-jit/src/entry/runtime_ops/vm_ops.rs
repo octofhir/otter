@@ -24,15 +24,32 @@ use super::park_jit_error;
 /// thrashing a single cell.
 pub(crate) const IC_WAYS: usize = 4;
 
-/// One cached `(shape → slot)` mapping in a [`WhiskerIcCell`].
+/// One lowered cache program in a [`WhiskerIcCell`].
+///
+/// This is [`otter_vm::JitPropertyIcWay`] as generated code sees it, plus the
+/// padding that keeps ways 16-byte strided so the inline probe indexes them
+/// with a shift.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct WhiskerIcWay {
-    /// Cached receiver shape-handle compressed offset; `0` == empty.
+    /// Guarded receiver shape-handle compressed offset; `0` == empty.
     shape: u32,
-    /// Byte offset from the value slab pointer to the value slot.
+    /// Guarded holder shape when the program hops to the receiver's
+    /// prototype; `0` when the receiver owns the slot.
+    holder_shape: u32,
+    /// Byte offset from the holder's value slab pointer to the value slot.
     value_byte: u32,
+    /// Padding to a 16-byte stride.
+    _reserved: u32,
 }
+
+/// Byte stride between ways, shared by the cell and the emitted probes.
+pub(crate) const WHISKER_IC_WAY_BYTES: u32 = 16;
+
+const _: () = assert!(
+    std::mem::size_of::<WhiskerIcWay>() == WHISKER_IC_WAY_BYTES as usize,
+    "emitted probes index ways by a baked stride"
+);
 
 /// WhiskerIC self-patching cell for one named-property site (one per
 /// `LoadProperty` / `StoreProperty` op in the compiled function). Emitted code
@@ -49,23 +66,24 @@ pub(crate) struct WhiskerIcCell {
     ways: [WhiskerIcWay; IC_WAYS],
 }
 
-/// Self-patch one IC cell with a resolved `(shape, value_byte)` mapping: fill
-/// the first empty way, or evict way 0 when all are full (the site is more
-/// polymorphic than the cache is wide). Writes `value_byte` before `shape` so a
-/// concurrent inline guard never reads a live shape against a stale offset.
+/// Self-patch one IC cell with a lowered cache program: fill the first empty
+/// way, or evict way 0 when all are full (the site is more polymorphic than the
+/// cache is wide). The guard token is written last so a concurrent inline probe
+/// never reads a live shape against a stale offset or holder.
 ///
 /// # Safety
 /// `cell` must be a valid, stable [`WhiskerIcCell`] pointer (a site's cell from
 /// the owning code object's backing slice).
-unsafe fn whisker_ic_fill(cell: *mut WhiskerIcCell, shape: u32, value_byte: u32) {
+unsafe fn whisker_ic_fill(cell: *mut WhiskerIcCell, way: otter_vm::JitPropertyIcWay) {
     unsafe {
         let ways = &mut (*cell).ways;
         let slot = ways
             .iter()
-            .position(|w| w.shape == 0 || w.shape == shape)
+            .position(|w| w.shape == 0 || w.shape == way.receiver_shape)
             .unwrap_or(0);
-        ways[slot].value_byte = value_byte;
-        ways[slot].shape = shape;
+        ways[slot].value_byte = way.value_byte;
+        ways[slot].holder_shape = way.holder_shape;
+        ways[slot].shape = way.receiver_shape;
     }
 }
 
@@ -101,11 +119,11 @@ pub(crate) extern "C" fn jit_load_property_stub(
     );
     match result {
         Ok(fill) => {
-            if cell != 0 && fill != 0 {
+            if let (true, Some(way)) = (cell != 0, fill) {
                 let cell = cell as *mut WhiskerIcCell;
                 // SAFETY: stable per-site cell address baked into this code.
                 unsafe {
-                    whisker_ic_fill(cell, fill as u32, (fill >> 32) as u32);
+                    whisker_ic_fill(cell, way);
                 }
             }
             0
@@ -148,11 +166,11 @@ pub(crate) extern "C" fn jit_store_property_stub(
     );
     match result {
         Ok(fill) => {
-            if cell != 0 && fill != 0 {
+            if let (true, Some(way)) = (cell != 0, fill) {
                 let cell = cell as *mut WhiskerIcCell;
                 // SAFETY: stable per-site cell address baked into this code.
                 unsafe {
-                    whisker_ic_fill(cell, fill as u32, (fill >> 32) as u32);
+                    whisker_ic_fill(cell, way);
                 }
             }
             0

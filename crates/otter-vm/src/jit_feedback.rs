@@ -482,7 +482,7 @@ impl PropertyFeedbackSlot<'_> {
     pub(crate) fn publish(self, entry: &PropertyIcEntry<CacheStub>) {
         let state = match entry {
             PropertyIcEntry::Empty => PropertyFeedbackState::Empty,
-            PropertyIcEntry::Megamorphic => PropertyFeedbackState::Megamorphic,
+            PropertyIcEntry::Megamorphic { .. } => PropertyFeedbackState::Megamorphic,
             PropertyIcEntry::Polymorphic { entries, .. } => match entries.as_slice() {
                 [stub] => {
                     let hit = match self.feedback.kind {

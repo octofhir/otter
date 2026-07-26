@@ -30,13 +30,14 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dyna
 use otter_vm::JitCompileSnapshot;
 use otter_vm::native_abi as abi;
 
+use super::ic_probe;
 use super::transitions::TransitionTable;
 use super::values::{
     BoxedSlotSlowPath, emit_box_int32, emit_compress_slot_or_bail, emit_decompress_slot,
     emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64, emit_slab_base,
 };
 use crate::artifact::relocation::{PropertyIcAccess, RelocationCapture, RelocationTarget};
-use crate::entry::{IC_WAYS, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, Unsupported, reg_offset};
+use crate::entry::{NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, Unsupported, reg_offset};
 
 /// Emit `dst = obj.name` with the inline WhiskerIC probe.
 #[allow(clippy::too_many_arguments)]
@@ -146,21 +147,8 @@ pub(super) fn emit_load_property(
             },
         );
         let do_load = ops.new_dynamic_label();
-        for way in 0..IC_WAYS as u32 {
-            let shape_off = way * 8;
-            let vbyte_off = shape_off + 4;
-            let next = ops.new_dynamic_label();
-            dynasm!(ops
-                ; .arch aarch64
-                ; ldr w16, [x15, shape_off]
-                ; cmp w14, w16
-                ; b.ne =>next
-                ; ldr w17, [x15, vbyte_off]
-                ; b =>do_load
-                ; =>next
-            );
-        }
-        dynasm!(ops ; .arch aarch64 ; b =>miss ; =>do_load);
+        ic_probe::emit_way_walk(ops, do_load, miss);
+        ic_probe::emit_resolve_holder(ops, relocations, view, miss);
         emit_slab_base(ops, view, 13, 14);
         dynasm!(ops
             ; .arch aarch64
@@ -283,25 +271,11 @@ pub(super) fn emit_store_property(
             },
         );
         let do_store = ops.new_dynamic_label();
-        for way in 0..IC_WAYS as u32 {
-            let shape_off = way * 8;
-            let vbyte_off = shape_off + 4;
-            let next = ops.new_dynamic_label();
-            dynasm!(ops
-                ; .arch aarch64
-                ; ldr w16, [x15, shape_off]
-                ; cmp w14, w16
-                ; b.ne =>next
-                ; ldr w17, [x15, vbyte_off]
-                ; b =>do_store
-                ; =>next
-            );
-        }
+        ic_probe::emit_way_walk(ops, do_store, miss);
+        ic_probe::emit_refuse_prototype_hop(ops, miss);
         let store_prim = ops.new_dynamic_label();
         dynasm!(ops
             ; .arch aarch64
-            ; b =>miss
-            ; =>do_store
             ; ldr x9, [x19, src_off]   // value to store
         );
         emit_slab_base(ops, view, 13, 14);

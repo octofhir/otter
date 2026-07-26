@@ -548,6 +548,38 @@ pub enum JitDirectCallThisMode {
     MethodReceiver,
 }
 
+/// One cache program lowered to the form generated code executes inline.
+///
+/// This is the single description of a property fast path: the interpreter's
+/// [`crate::cache_ir::CacheStub`] lowers its op sequence to this, and every
+/// tier's emitted probe consumes exactly this. Nothing re-derives a slot or a
+/// guard on its own, so the tiers cannot disagree about what a site caches.
+///
+/// Shape fields are compressed shape-handle offsets — stable tokens, since
+/// shapes are interned, immortal, and pinned in non-moving old space, so a way
+/// holds no GC pointer and needs no tracing.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct JitPropertyIcWay {
+    /// Guarded receiver shape. `0` marks an empty way and never matches a live
+    /// receiver, so empty ways are skipped without a branch of their own.
+    pub receiver_shape: u32,
+    /// Guarded shape of the object that owns the slot when the program hops to
+    /// the receiver's prototype. `0` means the receiver owns the slot and the
+    /// probe performs no hop.
+    pub holder_shape: u32,
+    /// Byte offset of the slot inside the holder's value slab.
+    pub value_byte: u32,
+}
+
+impl JitPropertyIcWay {
+    /// Whether the program reaches the slot through the receiver's prototype.
+    #[must_use]
+    pub const fn hops_to_prototype(&self) -> bool {
+        self.holder_shape != 0
+    }
+}
+
 /// Static native operation that a backend may lower without entering Rust.
 ///
 /// Variants are semantic operations rather than raw function addresses. The

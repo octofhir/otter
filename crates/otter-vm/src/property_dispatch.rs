@@ -2942,7 +2942,7 @@ impl Interpreter {
         obj_reg: u16,
         name_idx: u32,
         site: usize,
-    ) -> Result<u64, VmError> {
+    ) -> Result<Option<crate::jit::JitPropertyIcWay>, VmError> {
         self.record_jit_runtime_property_stub();
         let atomized_key = context
             .property_atom_for_function(function_id, name_idx)
@@ -2954,14 +2954,14 @@ impl Interpreter {
         let full_get = |vm: &mut Self,
                         frame: &mut crate::ActiveFrameMut<'_>,
                         stack: &mut ActivationStack|
-         -> Result<u64, VmError> {
+         -> Result<Option<crate::jit::JitPropertyIcWay>, VmError> {
             // Re-read the receiver from the traced activation: the IC probes
             // above may have allocated (cache-stub install) and moved the
             // handle read at entry.
             let receiver = frame.read(obj_reg)?;
             let value = vm.load_property_value(context, stack, receiver, atomized_key.name())?;
             frame.write(dst, value)?;
-            Ok(0)
+            Ok(None)
         };
         let Some(obj) = receiver.as_object() else {
             return full_get(self, frame, stack);
@@ -3039,7 +3039,7 @@ impl Interpreter {
         name_idx: u32,
         src: u16,
         site: usize,
-    ) -> Result<u64, VmError> {
+    ) -> Result<Option<crate::jit::JitPropertyIcWay>, VmError> {
         self.record_jit_runtime_property_stub();
         let atomized_key = context
             .property_atom_for_function(function_id, name_idx)
@@ -3049,7 +3049,7 @@ impl Interpreter {
         let full_set = |vm: &mut Self,
                         frame: &mut crate::ActiveFrameMut<'_>,
                         stack: &mut ActivationStack|
-         -> Result<u64, VmError> {
+         -> Result<Option<crate::jit::JitPropertyIcWay>, VmError> {
             // Re-read both values from the published, traced window. IC setup
             // and property-key materialisation may allocate and move either
             // operand before the semantic slow path begins.
@@ -3057,7 +3057,7 @@ impl Interpreter {
             let value = frame.read(src)?;
             let strict = context.function_is_strict(function_id);
             vm.store_property_value(context, stack, receiver, atomized_key.name(), value, strict)?;
-            Ok(0)
+            Ok(None)
         };
         let Some(obj) = receiver.as_object() else {
             return full_set(self, frame, stack);
@@ -3092,7 +3092,9 @@ impl Interpreter {
                     .ok_or(VmError::InvalidOperand)?;
                 return Ok(self.whisker_store_cell_fill(
                     site,
-                    object::shape(current_obj, &self.gc_heap).offset(),
+                    current_obj,
+                    &self.gc_heap,
+                    atomized_key,
                 ));
             }
             if entries_len > 0 {
@@ -3120,7 +3122,9 @@ impl Interpreter {
                     .ok_or(VmError::InvalidOperand)?;
                 return Ok(self.whisker_store_cell_fill(
                     site,
-                    object::shape(current_obj, &self.gc_heap).offset(),
+                    current_obj,
+                    &self.gc_heap,
+                    atomized_key,
                 ));
             }
         }
@@ -3131,23 +3135,17 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let current_value = frame.read(src)?;
         self.set_property(current_obj, atomized_key.name(), current_value)?;
-        Ok(0)
+        Ok(None)
     }
 
-    /// Packed WhiskerIC inline-load cell fill for `site`, or `0` for "no inline".
-    ///
-    /// Low 32 bits = the cached shape-handle compressed offset (a stable guard
-    /// token — shapes are immortal and pinned in old space, and a fast-mode
-    /// shape is never the null offset `0`). High 32 bits = the byte offset
-    /// inside the object's contiguous value slab. Only a warm, single-entry
-    /// `OwnData` IC qualifies; everything else returns `0`, leaving the emitted
-    /// site on the stub.
+    /// This load site's cache program lowered for inline execution, or `None`
+    /// to leave the access on the stub.
     fn whisker_load_cell_fill(
         &self,
         site: usize,
         obj: JsObject,
         atomized_key: AtomizedPropertyKey<'_>,
-    ) -> u64 {
+    ) -> Option<crate::jit::JitPropertyIcWay> {
         self.feedback_directory
             .whisker_load_cell_fill(site, obj, &self.gc_heap, atomized_key)
     }
@@ -3447,17 +3445,23 @@ impl Interpreter {
         Ok(())
     }
 
-    /// Packed WhiskerIC inline-store cell fill for `site`, or `0` for "no
-    /// inline". Same encoding as [`Self::whisker_load_cell_fill`]: low 32 =
-    /// cached shape-handle offset (non-zero validity token), high 32 = value
-    /// slab byte offset. Only a warm, single-entry `ExistingOwnDataStore` IC
-    /// qualifies — an add-transition store mutates the shape and grows the
-    /// value slab, so it stays on the stub. The shape guard the emitted site
-    /// keeps also guarantees the slot is the writable data slot the IC captured
-    /// (a shape encodes per-slot flags and key), so the inline write is sound.
-    fn whisker_store_cell_fill(&self, site: usize, recv_shape: u32) -> u64 {
+    /// This store site's cache program lowered for inline execution, or `None`
+    /// to leave the access on the stub.
+    ///
+    /// An add-transition store mutates the shape and grows the value slab, so
+    /// its program has no inline form and stays on the stub. The shape guard
+    /// the emitted site keeps also guarantees the slot is the writable data
+    /// slot the cache captured (a shape encodes per-slot flags and key), so the
+    /// inline write is sound.
+    fn whisker_store_cell_fill(
+        &self,
+        site: usize,
+        obj: JsObject,
+        heap: &otter_gc::GcHeap,
+        atomized_key: AtomizedPropertyKey<'_>,
+    ) -> Option<crate::jit::JitPropertyIcWay> {
         self.feedback_directory
-            .whisker_store_cell_fill(site, recv_shape)
+            .whisker_store_cell_fill(site, obj, heap, atomized_key)
     }
 
     /// Run the GC write barrier after an inline pointer-valued property store.

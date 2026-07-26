@@ -44,6 +44,22 @@ pub(crate) const MAX_PIC_ENTRIES: usize = 4;
 /// threshold so single-shape micro-benchmarks behave identically.
 const PIC_GUARD_MISS_THRESHOLD: u8 = 4;
 
+/// Misses a megamorphic site absorbs before it is offered back to the cache.
+///
+/// A site goes megamorphic for two very different reasons. It may genuinely see
+/// unbounded shapes, or its receivers may simply have been *transitioning*: an
+/// object that gains a property gets a new shape, so a site reading four
+/// objects across one `o.x = v` sees eight shapes and exhausts a four-way PIC
+/// while the steady state it settles into is perfectly cacheable. Permanent
+/// megamorphism cannot tell those apart and condemns the second kind for the
+/// process lifetime — and with it every tier's inline probe, since generated
+/// code can only cache what this site still describes.
+///
+/// Re-probation resolves it empirically instead of guessing: absorb this many
+/// misses, then let the site try again. A truly megamorphic site pays one
+/// re-probation per budget and returns here; a settled one re-caches and stays.
+const PIC_REPROBATION_MISSES: u16 = 1024;
+
 /// Aggregate inline-cache counters for named property bytecodes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PropertyIcStats {
@@ -141,8 +157,12 @@ pub(crate) enum PropertyIcEntry<T> {
         misses: u8,
     },
     /// Site saw more shape diversity than the PIC could absorb and is
-    /// permanently bypassed for the interpreter lifetime.
-    Megamorphic,
+    /// bypassed until its re-probation budget runs out, at which point it
+    /// returns to [`Self::Empty`] and caches again.
+    Megamorphic {
+        /// Misses absorbed since the site went megamorphic.
+        absorbed: u16,
+    },
 }
 
 impl<T> PropertyIcEntry<T> {
@@ -156,7 +176,7 @@ impl<T> PropertyIcEntry<T> {
     /// `true` when this site should not install any further IC entries.
     #[must_use]
     pub(crate) const fn is_megamorphic(&self) -> bool {
-        matches!(self, Self::Megamorphic)
+        matches!(self, Self::Megamorphic { .. })
     }
 
     /// Number of installed PIC entries (0 for `Empty` / `Megamorphic`).
@@ -164,7 +184,7 @@ impl<T> PropertyIcEntry<T> {
     pub(crate) fn entry_count(&self) -> usize {
         match self {
             Self::Polymorphic { entries, .. } => entries.len(),
-            Self::Empty | Self::Megamorphic => 0,
+            Self::Empty | Self::Megamorphic { .. } => 0,
         }
     }
 
@@ -174,7 +194,7 @@ impl<T> PropertyIcEntry<T> {
     pub(crate) fn entries(&self) -> &[T] {
         match self {
             Self::Polymorphic { entries, .. } => entries.as_slice(),
-            Self::Empty | Self::Megamorphic => &[],
+            Self::Empty | Self::Megamorphic { .. } => &[],
         }
     }
 
@@ -183,7 +203,7 @@ impl<T> PropertyIcEntry<T> {
     /// transitions to `Megamorphic` instead of evicting.
     pub(crate) fn install(&mut self, ic: T) {
         match self {
-            Self::Megamorphic => {}
+            Self::Megamorphic { .. } => {}
             Self::Empty => {
                 let mut entries = SmallVec::new();
                 entries.push(ic);
@@ -194,7 +214,7 @@ impl<T> PropertyIcEntry<T> {
                     entries.push(ic);
                     *misses = 0;
                 } else {
-                    *self = Self::Megamorphic;
+                    *self = Self::Megamorphic { absorbed: 0 };
                 }
             }
         }
@@ -202,13 +222,20 @@ impl<T> PropertyIcEntry<T> {
 
     /// Permanently bypass this site for the interpreter lifetime.
     pub(crate) fn disable(&mut self) {
-        *self = Self::Megamorphic;
+        *self = Self::Megamorphic { absorbed: 0 };
     }
 
     /// Record one guard miss. Returns `true` when this miss promoted
     /// the site to `Megamorphic` (PIC was full and miss budget tipped
     /// over).
     pub(crate) fn record_guard_miss(&mut self) -> bool {
+        if let Self::Megamorphic { absorbed } = self {
+            *absorbed = absorbed.saturating_add(1);
+            if *absorbed >= PIC_REPROBATION_MISSES {
+                *self = Self::Empty;
+            }
+            return false;
+        }
         let Self::Polymorphic { entries, misses } = self else {
             return false;
         };
@@ -216,7 +243,7 @@ impl<T> PropertyIcEntry<T> {
         if *misses < PIC_GUARD_MISS_THRESHOLD || entries.len() < MAX_PIC_ENTRIES {
             return false;
         }
-        *self = Self::Megamorphic;
+        *self = Self::Megamorphic { absorbed: 0 };
         true
     }
 
@@ -232,17 +259,18 @@ impl<T> PropertyIcEntry<T> {
         }
     }
 
-    /// Record a miss when the site has no PIC entries yet (Empty).
-    /// Megamorphic sites do not contribute further miss counts since
-    /// they no longer try the IC fast path.
+    /// Record a miss when the site has no PIC entries yet (Empty), or absorb
+    /// one against a megamorphic site's re-probation budget.
     pub(crate) fn record_uncached_miss_with_stats(
-        &self,
+        &mut self,
         stats: &mut PropertyIcStats,
         kind: PropertyIcKind,
     ) {
-        if !self.is_megamorphic() {
-            stats.record_miss(kind);
+        if self.is_megamorphic() {
+            self.record_guard_miss();
+            return;
         }
+        stats.record_miss(kind);
     }
 
     /// Append a new entry to the site's PIC and update counters. No-op

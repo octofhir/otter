@@ -47,6 +47,20 @@ run *args:
 clean:
     cargo clean
 
+# === Engine work loop ===
+
+# Cost attribution for the engine kernels: retired instructions plus the axis
+# counters (dispatch, IC misses, native boundary, deopt, GC) that explain
+# them. Take the top line into the next change. Optional kernel-name filter.
+cost *args:
+    bash scripts/cost.sh {{args}}
+
+# Iteration gate: fmt, clippy, vm/jit/bytecode tests, difftest across tiers,
+# kernel ledger. Deliberately excludes test262 — that is the closing gate,
+# compared as failing sets.
+gate *args:
+    bash scripts/gate.sh {{args}}
+
 # === Standard JavaScript benchmark suites ===
 
 # Fast baseline: V8 v7 + a small Octane smoke selection.

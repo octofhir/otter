@@ -691,12 +691,14 @@ pub fn read_rounding_mode_option(
 ) -> Result<Option<temporal_rs::options::RoundingMode>, NativeError> {
     use core::str::FromStr;
     match read_option_string(ctx, v, "roundingMode", class)? {
-        Some(name) => Ok(Some(temporal_rs::options::RoundingMode::from_str(&name).map_err(
-            |_| NativeError::RangeError {
-                name: class,
-                reason: "invalid `roundingMode`".to_string(),
-            },
-        )?)),
+        Some(name) => Ok(Some(
+            temporal_rs::options::RoundingMode::from_str(&name).map_err(|_| {
+                NativeError::RangeError {
+                    name: class,
+                    reason: "invalid `roundingMode`".to_string(),
+                }
+            })?,
+        )),
         None => Ok(None),
     }
 }
@@ -710,12 +712,12 @@ pub fn read_smallest_unit_option(
 ) -> Result<Option<temporal_rs::options::Unit>, NativeError> {
     use core::str::FromStr;
     match read_option_string(ctx, v, "smallestUnit", class)? {
-        Some(name) => Ok(Some(temporal_rs::options::Unit::from_str(&name).map_err(|_| {
-            NativeError::RangeError {
+        Some(name) => Ok(Some(temporal_rs::options::Unit::from_str(&name).map_err(
+            |_| NativeError::RangeError {
                 name: class,
                 reason: "invalid `smallestUnit`".to_string(),
-            }
-        })?)),
+            },
+        )?)),
         None => Ok(None),
     }
 }

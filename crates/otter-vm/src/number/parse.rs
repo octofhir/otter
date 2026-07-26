@@ -33,12 +33,25 @@ use crate::Value;
 /// and U+0085 (NEL) counts in Rust but is not `StrWhiteSpace`. The set
 /// mirrors `is_ws_code_unit` in `string::prototype`.
 pub(crate) fn is_str_whitespace(c: char) -> bool {
-    matches!(c,
-        '\u{0009}' | '\u{000A}' | '\u{000B}' | '\u{000C}' | '\u{000D}'
-        | '\u{0020}' | '\u{00A0}' | '\u{1680}'
-        | '\u{2000}'..='\u{200A}'
-        | '\u{2028}' | '\u{2029}' | '\u{202F}' | '\u{205F}'
-        | '\u{3000}' | '\u{FEFF}')
+    matches!(
+        c,
+        '\u{0009}'
+            | '\u{000A}'
+            | '\u{000B}'
+            | '\u{000C}'
+            | '\u{000D}'
+            | '\u{0020}'
+            | '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'
+            ..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
+    )
 }
 
 /// Foundation subset of `ToNumber(string)`.

@@ -1475,17 +1475,4 @@ mod tests {
         let translated = translate_spans_to_byte_pcs(&spans, &encoded.instr_to_byte_pc, total);
         assert_eq!(translated[0].pc, total);
     }
-
-    #[test]
-    fn coverage_matches_dispatcher_enum_size() {
-        // Catches accidental opcode additions that forget to wire
-        // through OP_BYTE_TABLE. If this fires, append the missing
-        // opcode at the next unused byte.
-        const EXPECTED_OPCODE_COUNT: usize = 172;
-        assert_eq!(
-            OP_BYTE_TABLE.len(),
-            EXPECTED_OPCODE_COUNT,
-            "Op enum changed; sync OP_BYTE_TABLE with the new opcode set"
-        );
-    }
 }

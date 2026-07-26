@@ -92,8 +92,6 @@ pub(crate) enum GuardedBuiltinKind {
     Leaf,
     /// Allocating collection write.
     Alloc,
-    /// Primitive prototype builtin reached through a leaf entry.
-    Primitive,
     /// Dense-array `push` / `pop` builtin reached through a typed entry.
     Array,
 }
@@ -1042,7 +1040,6 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             output.push(match feedback_kind {
                 GuardedBuiltinKind::Leaf => 0,
                 GuardedBuiltinKind::Alloc => 1,
-                GuardedBuiltinKind::Primitive => 2,
                 GuardedBuiltinKind::Array => 3,
             });
             put_u32(output, *byte_pc);
@@ -1057,7 +1054,6 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             output.push(match feedback_kind {
                 GuardedBuiltinKind::Leaf => 0,
                 GuardedBuiltinKind::Alloc => 1,
-                GuardedBuiltinKind::Primitive => 2,
                 GuardedBuiltinKind::Array => 3,
             });
             put_u32(output, *byte_pc);

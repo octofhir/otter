@@ -73,10 +73,17 @@ impl Interpreter {
         })
     }
 
-    pub(crate) fn jit_primitive_method_guard(
+    /// One primitive-receiver builtin call (`"…".charCodeAt(i)`) as a guarded
+    /// leaf method call.
+    ///
+    /// The receiver's cell type tag stands in for a collection's latch word: a
+    /// primitive body carries no expando or override state, so proving the tag
+    /// plus the realm prototype's shape and method-slot identity is the whole
+    /// guard.
+    pub(crate) fn jit_primitive_method_call(
         &self,
         hint: crate::jit::JitMethodHint,
-    ) -> Option<crate::jit::JitPrimitiveMethodGuard> {
+    ) -> Option<crate::jit::JitMethodNativeLeafCall> {
         use crate::jit::JitMethodHint;
         use crate::native_abi::{
             STUB_STRING_CHAR_CODE_AT_LEAF, STUB_STRING_CODE_POINT_AT_LEAF,
@@ -108,20 +115,26 @@ impl Interpreter {
         let builtin_fn_addr = method
             .as_native_function()
             .and_then(|native| native.jit_static_fn_addr(&self.gc_heap))?;
-        Some(crate::jit::JitPrimitiveMethodGuard {
-            proto_offset: proto.offset(),
-            proto_shape: crate::object::shape(proto, &self.gc_heap).offset(),
+        Some(crate::jit::JitMethodNativeLeafCall {
+            receiver: crate::jit::JitGuardedReceiver::Exotic {
+                type_tag: receiver_type_tag,
+                latched: false,
+                proto_offset: proto.offset(),
+            },
+            holder_shape: crate::object::shape(proto, &self.gc_heap).offset(),
             method_value_byte: compressed_slot_byte(hit.slot),
             builtin_fn_addr,
             leaf_stub_id,
-            receiver_type_tag,
+            argument_count: 1,
         })
     }
 
-    pub(crate) fn jit_collection_leaf_method_feedback(
+    /// One non-allocating collection read (`map.get` / `map.has` / `set.has`)
+    /// as a guarded leaf method call.
+    pub(crate) fn jit_collection_leaf_call(
         &self,
         site: usize,
-    ) -> Option<crate::jit::JitCollectionLeafMethod> {
+    ) -> Option<crate::jit::JitMethodNativeLeafCall> {
         let ic = match self.feedback_directory.method_ic(site)? {
             MethodCallIc::Collection(ic) => ic,
             MethodCallIc::Array(_) => return None,
@@ -149,13 +162,17 @@ impl Interpreter {
         let builtin_fn_addr = method
             .as_native_function()
             .and_then(|native| native.jit_static_fn_addr(&self.gc_heap))?;
-        Some(crate::jit::JitCollectionLeafMethod {
-            receiver_type_tag,
-            proto_offset: proto.offset(),
-            proto_shape: crate::object::shape(proto, &self.gc_heap).offset(),
+        Some(crate::jit::JitMethodNativeLeafCall {
+            receiver: crate::jit::JitGuardedReceiver::Exotic {
+                type_tag: receiver_type_tag,
+                latched: true,
+                proto_offset: proto.offset(),
+            },
+            holder_shape: crate::object::shape(proto, &self.gc_heap).offset(),
             method_value_byte: compressed_slot_byte(ic.proto_slot),
             builtin_fn_addr,
             leaf_stub_id: stub_id,
+            argument_count: 1,
         })
     }
 

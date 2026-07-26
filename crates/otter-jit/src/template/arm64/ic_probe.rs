@@ -27,12 +27,12 @@
 //!   `setPrototypeOf` changes it while the shape stays put.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
-use otter_vm::JitCompileSnapshot;
+use otter_vm::{JitCompileSnapshot, JitGuardedReceiver};
 
 use otter_vm::native_abi::{RuntimeStubId, runtime_stub_name};
 use otter_vm::runtime_stubs::leaf_no_alloc_stub2_by_id;
 
-use super::values::{emit_box_int32, emit_load_symbol_u64, emit_load_u64};
+use super::values::{emit_box_int32, emit_load_reg, emit_load_symbol_u64, emit_load_u64};
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::entry::{
     IC_WAYS, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, THREAD_OFFSET, Unsupported, VALUE_UNDEFINED,
@@ -196,6 +196,19 @@ pub(crate) fn native_leaf_call_is_supported(
         && leaf_no_alloc_stub2_by_id(stub_id).is_some()
 }
 
+/// Whether a guarded leaf method call can be lowered at all.
+///
+/// The layout words the guards read come from the compile snapshot; without
+/// them the site keeps the ordinary path instead of failing the whole compile.
+pub(crate) fn native_leaf_method_call_is_supported(
+    view: &JitCompileSnapshot,
+    call: &otter_vm::JitMethodNativeLeafCall,
+) -> bool {
+    view.cage_base != 0
+        && view.native_static_fn_byte != 0
+        && leaf_no_alloc_stub2_by_id(call.leaf_stub_id).is_some()
+}
+
 /// Guard a callee's exact bootstrap identity, then run its declared leaf entry.
 ///
 /// Every guard runs *before* any argument is materialized, and arguments are
@@ -252,29 +265,39 @@ where
         ; b.ne =>bail
     );
 
-    emit_native_leaf_entry_call(ops, relocations, stub_id, load_argument, bail)
+    let Some(declaration) = otter_vm::math::jit_leaf_builtin(stub_id) else {
+        return Err(Unsupported::OperandShape("native leaf entry"));
+    };
+    emit_native_leaf_entry_call(
+        ops,
+        relocations,
+        stub_id,
+        declaration.argument_count,
+        load_argument,
+        bail,
+    )
 }
 
 /// Call a declared leaf entry whose identity a caller has already guarded.
 ///
 /// Runs only once every guard has passed, so nothing it writes is live across a
-/// miss and `load_argument` may freely use `x10`–`x15`. `(heap, arg0, arg1) ->
+/// miss and `load_value` may freely use `x10`–`x15`. `(heap, value0, value1) ->
 /// pair`, with no safepoint: a leaf entry cannot allocate, collect, or re-enter
-/// JS. The boxed result is left in `x0`; a miss branches to `bail`.
+/// JS. `value_count` is how many of the two operand words the entry reads; the
+/// rest are `undefined`. The boxed result is left in `x0`; a miss branches to
+/// `bail`.
 pub(crate) fn emit_native_leaf_entry_call<F>(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     stub_id: RuntimeStubId,
-    mut load_argument: F,
+    value_count: u8,
+    mut load_value: F,
     bail: DynamicLabel,
 ) -> Result<(), Unsupported>
 where
     F: FnMut(&mut Assembler, u8, u8) -> Result<(), Unsupported>,
 {
-    let (Some(declaration), Some(stub)) = (
-        otter_vm::math::jit_leaf_builtin(stub_id),
-        leaf_no_alloc_stub2_by_id(stub_id),
-    ) else {
+    let Some(stub) = leaf_no_alloc_stub2_by_id(stub_id) else {
         return Err(Unsupported::OperandShape("native leaf entry"));
     };
     dynasm!(ops
@@ -282,9 +305,9 @@ where
         ; ldr x0, [x20, THREAD_OFFSET]
         ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
     );
-    load_argument(ops, 0, 1)?;
-    if declaration.argument_count >= 2 {
-        load_argument(ops, 1, 2)?;
+    load_value(ops, 0, 1)?;
+    if value_count >= 2 {
+        load_value(ops, 1, 2)?;
     } else {
         emit_load_u64(ops, 2, VALUE_UNDEFINED);
     }
@@ -312,24 +335,25 @@ pub(crate) fn native_leaf_call_name(stub_id: RuntimeStubId) -> &'static str {
 }
 
 /// Emit `dst = receiver.method(args…)` where the method is a declared leaf
-/// entry, guarding the receiver shape, the method slot's identity, and nothing
-/// else.
+/// entry, guarding the receiver, the method slot's identity, and nothing else.
 ///
 /// The receiver layout is baked rather than probed: the site's feedback already
-/// resolved the guarded shape, the optional prototype holder and the slot byte,
-/// so this needs no cache cell and no way walk. `holder_shape == 0` is the
-/// own-slot case a namespace object such as `Math` takes, and skips the hop.
+/// resolved how the receiver is named, where the method lives and at which slot
+/// byte, so this needs no cache cell and no way walk. Both receiver forms —
+/// an ordinary object named by its hidden class, and an exotic body named by
+/// its cell type tag — end at the same value slab, so one sequence lowers them.
 ///
-/// `load_argument(ops, index, register)` runs only after every guard, matching
-/// [`emit_native_leaf_entry_call`]. The boxed result is left in `x0`; every miss
-/// branches to `miss`.
+/// `load_argument(ops, index, register)` materializes one JavaScript argument
+/// and runs only after every guard. An exotic receiver is passed to the entry
+/// ahead of those arguments, because the operation is on that body. The boxed
+/// result is left in `x0`; every miss branches to `miss`.
 pub(crate) fn emit_native_leaf_method_call<F>(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     call: &otter_vm::JitMethodNativeLeafCall,
     receiver: u16,
-    load_argument: F,
+    mut load_argument: F,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported>
 where
@@ -338,57 +362,115 @@ where
     if view.cage_base == 0 || view.native_static_fn_byte == 0 {
         return Err(Unsupported::OperandShape("native leaf method layout"));
     }
-    let shape_byte = view.object_shape_byte;
-    let guarded_shape = call.receiver_shape;
-
-    // Receiver: a cell carrying an ordinary object body whose shape is the one
-    // the site recorded. The shape pins the slot offset; the identity guard
-    // below still pins which function occupies it, since assigning over an
-    // existing property leaves the shape alone.
-    super::collections::emit_receiver_type_guard(
-        ops,
-        relocations,
-        view,
-        receiver,
-        OBJECT_BODY_TYPE_TAG,
-        miss,
-    )?;
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr w14, [x13, shape_byte]
-        ; cbz w14, =>miss
-    );
-    emit_load_u64(ops, 12, u64::from(guarded_shape));
-    dynasm!(ops
-        ; .arch aarch64
-        ; cmp w14, w12
-        ; b.ne =>miss
-    );
-
-    // Holder: `0` means the receiver owns the slot. Otherwise the way's guarded
-    // prototype hop runs, which reads `[[Prototype]]` at run time because
-    // `setPrototypeOf` moves it while the shape stays put.
-    if call.holder_shape != 0 {
-        emit_load_u64(ops, 7, u64::from(call.holder_shape));
-        emit_resolve_holder(ops, relocations, view, miss);
+    // The identity guard reads a pinned prototype's slot word through the
+    // decompressing path and an ordinary receiver's through the bare cage
+    // offset, matching how each holder's slab was reached.
+    let decompress_via_slot = matches!(call.receiver, JitGuardedReceiver::Exotic { .. });
+    match call.receiver {
+        // A cell carrying an ordinary object body whose shape is the one the
+        // site recorded. The shape pins the slot offset; the identity guard
+        // below still pins which function occupies it, since assigning over an
+        // existing property leaves the shape alone.
+        JitGuardedReceiver::Shape { shape } => {
+            let shape_byte = view.object_shape_byte;
+            super::collections::emit_receiver_type_guard(
+                ops,
+                relocations,
+                view,
+                receiver,
+                OBJECT_BODY_TYPE_TAG,
+                miss,
+            )?;
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr w14, [x13, shape_byte]
+                ; cbz w14, =>miss
+            );
+            emit_load_u64(ops, 12, u64::from(shape));
+            dynasm!(ops
+                ; .arch aarch64
+                ; cmp w14, w12
+                ; b.ne =>miss
+            );
+            // `0` means the receiver owns the slot. Otherwise the way's guarded
+            // prototype hop runs, which reads `[[Prototype]]` at run time
+            // because `setPrototypeOf` moves it while the shape stays put.
+            if call.holder_shape != 0 {
+                emit_load_u64(ops, 7, u64::from(call.holder_shape));
+                emit_resolve_holder(ops, relocations, view, miss);
+            }
+            super::values::emit_slab_base(ops, view, 13, 14);
+            dynasm!(ops
+                ; .arch aarch64
+                ; cbz x13, =>miss
+                ; mov x15, x13
+            );
+        }
+        // A cell carrying the recorded exotic body, whose builtin lives on a
+        // pinned realm prototype. A latched body must additionally read clean:
+        // an expando or an overridden method makes the prototype's slot the
+        // wrong answer even though the prototype itself is unchanged.
+        JitGuardedReceiver::Exotic {
+            type_tag,
+            latched,
+            proto_offset,
+        } => {
+            super::collections::emit_receiver_type_guard(
+                ops,
+                relocations,
+                view,
+                receiver,
+                u32::from(type_tag),
+                miss,
+            )?;
+            if latched {
+                let guard_flags_byte = view.collection_layout.guard_flags_byte;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr w14, [x13, guard_flags_byte]
+                    ; cbnz w14, =>miss
+                );
+            }
+            super::collections::emit_prototype_guard(
+                ops,
+                relocations,
+                view,
+                proto_offset,
+                call.holder_shape,
+                crate::artifact::relocation::GuardedBuiltinKind::Leaf,
+                0,
+                call.leaf_stub_id,
+                miss,
+            );
+        }
     }
-    super::values::emit_slab_base(ops, view, 13, 14);
-    dynasm!(ops
-        ; .arch aarch64
-        ; cbz x13, =>miss
-        ; mov x15, x13
-    );
     super::collections::emit_builtin_identity_guard(
         ops,
         relocations,
         view,
         call.method_value_byte,
         call.builtin_fn_addr,
-        false,
+        decompress_via_slot,
         crate::artifact::relocation::GuardedBuiltinKind::Leaf,
         0,
         call.leaf_stub_id,
         miss,
     );
-    emit_native_leaf_entry_call(ops, relocations, call.leaf_stub_id, load_argument, miss)
+    // An exotic receiver occupies the entry's first operand word, so the call's
+    // own arguments shift one place along.
+    let receiver_word = u8::from(decompress_via_slot);
+    let value_count = receiver_word + call.argument_count;
+    emit_native_leaf_entry_call(
+        ops,
+        relocations,
+        call.leaf_stub_id,
+        value_count.min(2),
+        |ops, index, register| {
+            if decompress_via_slot && index == 0 {
+                return emit_load_reg(ops, register, receiver);
+            }
+            load_argument(ops, index - receiver_word, register)
+        },
+        miss,
+    )
 }

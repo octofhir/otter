@@ -571,7 +571,6 @@ fn feedback_kind_name(kind: GuardedBuiltinKind) -> &'static str {
     match kind {
         GuardedBuiltinKind::Leaf => "leaf",
         GuardedBuiltinKind::Alloc => "alloc",
-        GuardedBuiltinKind::Primitive => "primitive",
         GuardedBuiltinKind::Array => "array",
     }
 }

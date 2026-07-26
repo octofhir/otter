@@ -336,7 +336,9 @@ fn impl_to_zoned_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
             let time = if time_v.is_undefined() {
                 None
             } else {
-                Some(crate::temporal::plain_time::parse_plain_time_arg(ctx, &time_v)?)
+                Some(crate::temporal::plain_time::parse_plain_time_arg(
+                    ctx, &time_v,
+                )?)
             };
             (tz, time)
         }

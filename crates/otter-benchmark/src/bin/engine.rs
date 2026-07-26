@@ -1210,6 +1210,55 @@ fn run_kernel(
                 .saturating_sub(property_before.load_installs),
         ),
         (
+            "property-ic-load-disables",
+            MetricUnit::Count,
+            property_after
+                .load_disables
+                .saturating_sub(property_before.load_disables),
+        ),
+        (
+            "property-ic-store-hits",
+            MetricUnit::Count,
+            property_after
+                .store_hits
+                .saturating_sub(property_before.store_hits),
+        ),
+        (
+            "property-ic-store-misses",
+            MetricUnit::Count,
+            property_after
+                .store_misses
+                .saturating_sub(property_before.store_misses),
+        ),
+        (
+            "property-ic-store-installs",
+            MetricUnit::Count,
+            property_after
+                .store_installs
+                .saturating_sub(property_before.store_installs),
+        ),
+        (
+            "property-ic-store-disables",
+            MetricUnit::Count,
+            property_after
+                .store_disables
+                .saturating_sub(property_before.store_disables),
+        ),
+        (
+            "property-ic-has-hits",
+            MetricUnit::Count,
+            property_after
+                .has_hits
+                .saturating_sub(property_before.has_hits),
+        ),
+        (
+            "property-ic-has-misses",
+            MetricUnit::Count,
+            property_after
+                .has_misses
+                .saturating_sub(property_before.has_misses),
+        ),
+        (
             "call-feedback-retained-observations",
             MetricUnit::Count,
             call_after

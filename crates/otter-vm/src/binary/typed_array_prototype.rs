@@ -43,13 +43,6 @@ fn receiver(ctx: &NativeCtx<'_>) -> Result<JsTypedArray, NativeError> {
         .ok_or_else(|| type_error("expected typedarray"))
 }
 
-fn check_not_detached(t: &JsTypedArray, heap: &otter_gc::GcHeap) -> Result<(), NativeError> {
-    if t.buffer(heap).is_detached(heap) {
-        return Err(type_error("expected non-detached typedarray"));
-    }
-    Ok(())
-}
-
 /// ValidateTypedArray(O, seq-cst) — most `%TypedArray%.prototype`
 /// methods begin here: a detached or out-of-bounds view (a fixed-length
 /// view whose backing resizable buffer shrank past its end) is a

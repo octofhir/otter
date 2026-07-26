@@ -157,7 +157,8 @@ use crate::{
         ssa::{SsaFunction, SsaInstr, ValueDef, ValueId},
     },
     template::arm64::ic_probe::{
-        emit_native_leaf_call, native_leaf_call_is_supported, native_leaf_call_name,
+        emit_native_leaf_call, emit_native_leaf_method_call, native_leaf_call_is_supported,
+        native_leaf_call_name,
     },
 };
 
@@ -3929,8 +3930,41 @@ fn emit(
 
                     let succeeded = ops.new_dynamic_label();
                     let bail = ops.new_dynamic_label();
-                    let planned_methods = (instruction.inline == InlineId::ROOT)
-                        .then(|| view.direct_methods.get(&byte_pc))
+                    let native_leaf = (instruction.inline == InlineId::ROOT)
+                        .then(|| view.method_native_leaf_calls.get(&byte_pc))
+                        .flatten()
+                        .filter(|call| arg_regs.len() == usize::from(call.argument_count));
+                    if let Some(call) = native_leaf {
+                        let leaf_miss = ops.new_dynamic_label();
+                        emit_native_leaf_method_call(
+                            &mut ops,
+                            &mut relocations,
+                            view,
+                            call,
+                            receiver,
+                            |ops, index, register| {
+                                let source = arg_regs.get(usize::from(index)).copied().ok_or(
+                                    Unsupported::OperandShape("native leaf method argument"),
+                                )?;
+                                crate::template::arm64::values::emit_load_reg(ops, register, source)
+                            },
+                            leaf_miss,
+                        )?;
+                        emit_store_frame_register(&mut ops, u32::from(dst), 0)?;
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; b =>succeeded
+                            ; =>leaf_miss
+                            ; b =>bail
+                        );
+                    }
+                    let planned_methods = native_leaf
+                        .is_none()
+                        .then(|| {
+                            (instruction.inline == InlineId::ROOT)
+                                .then(|| view.direct_methods.get(&byte_pc))
+                                .flatten()
+                        })
                         .flatten();
                     for method in planned_methods.into_iter().flatten() {
                         if !direct_call_target_is_supported(&method.callee) {

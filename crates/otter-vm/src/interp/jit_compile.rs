@@ -311,6 +311,7 @@ impl Interpreter {
             false,
         );
         self.bake_collection_leaf_methods(&mut snapshot);
+        self.bake_method_native_leaf_calls(&mut snapshot);
         self.bake_collection_alloc_methods(&mut snapshot);
         self.bake_array_methods(&mut snapshot);
         self.bake_primitive_method_guards(&mut snapshot);
@@ -466,6 +467,7 @@ impl Interpreter {
             eager_direct_targets,
         );
         self.bake_collection_leaf_methods(&mut view);
+        self.bake_method_native_leaf_calls(&mut view);
         self.bake_collection_alloc_methods(&mut view);
         self.bake_array_methods(&mut view);
         self.bake_primitive_method_guards(&mut view);
@@ -654,15 +656,94 @@ impl Interpreter {
         self.record_method_target_feedback(feedback_site, method_fid, site);
     }
 
+    /// Classify the method a `CallMethodValue` site is about to invoke against
+    /// the declared leaf-callable builtin table.
+    ///
+    /// Runs only on the feedback-capture path, which is already gated on an
+    /// unsaturated site, and reads the method through the non-observable own /
+    /// prototype data lookup. `None` whenever the callee is not a declared
+    /// entry or the site's argument count is not the one that entry implements
+    /// — the same declaration gate the backend applies, checked once here so a
+    /// mismatched site never records.
+    pub(crate) fn method_slot_native_leaf(
+        &self,
+        context: &ExecutionContext,
+        caller_fid: u32,
+        name_idx: u32,
+        argc: usize,
+        recv: Value,
+    ) -> Option<crate::native_abi::RuntimeStubId> {
+        let name = context.property_atom_for_function(caller_fid, name_idx)?;
+        let method = crate::object::get(recv.as_object()?, &self.gc_heap, name.name())?;
+        let declaration =
+            crate::math::jit_static_call_target(method.as_native_function()?, &self.gc_heap)?;
+        (argc == usize::from(declaration.argument_count)).then_some(declaration.leaf_stub_id)
+    }
+
+    /// Bake every `Op::CallMethodValue` site whose callee is a declared leaf
+    /// entry into the compile snapshot.
+    ///
+    /// The receiver layout comes from the same feedback a property site
+    /// records, so generated code guards it with the shared way walk and
+    /// prototype hop rather than a second description of the same access.
+    pub(crate) fn bake_method_native_leaf_calls(&mut self, view: &mut jit::JitCompileSnapshot) {
+        let sites: Vec<_> = view
+            .instructions
+            .iter()
+            .filter_map(|instr| {
+                let site = instr.property_ic_site(&view.code_block)?;
+                Some((instr.byte_pc, site))
+            })
+            .collect();
+        for (byte_pc, site) in sites {
+            let Some(MethodCallFeedback::MonoNativeLeaf {
+                stub_id,
+                method_value_byte,
+                recv_shape_offset,
+                holder_shape_offset,
+                ..
+            }) = self.method_target_feedback(site)
+            else {
+                continue;
+            };
+            // An empty shape token never matches a live receiver, so a site
+            // that cannot name its guard stays on the runtime path.
+            if recv_shape_offset == 0 {
+                continue;
+            }
+            let Some(declaration) = crate::math::jit_leaf_builtin(stub_id) else {
+                continue;
+            };
+            view.method_native_leaf_calls.insert(
+                byte_pc,
+                jit::JitMethodNativeLeafCall {
+                    receiver_shape: recv_shape_offset,
+                    holder_shape: holder_shape_offset,
+                    method_value_byte,
+                    builtin_fn_addr: crate::math::jit_static_call_address(stub_id),
+                    leaf_stub_id: stub_id,
+                    argument_count: declaration.argument_count,
+                },
+            );
+        }
+    }
+
     pub(crate) fn method_site_for_receiver(
         &mut self,
         context: &ExecutionContext,
         caller_fid: u32,
         name_idx: u32,
-        recv: Value,
+        recv: &mut Value,
     ) -> Option<MethodSite> {
         let name = context.property_atom_for_function(caller_fid, name_idx)?;
-        let recv = recv.as_object()?;
+        let mut receiver = recv.as_object()?;
+        // A receiver without a hidden class cannot be named by any guard, so
+        // put it and its prototype chain on the shaped path first. The
+        // migration allocates and may relocate the receiver, so the caller's
+        // value is refreshed from the rooted handle before anything reads it.
+        self.migrate_slow_to_fast(&mut receiver);
+        *recv = Value::object(receiver);
+        let recv = receiver;
         let recv_shape_handle = crate::object::shape(recv, &self.gc_heap);
         if recv_shape_handle.is_null() {
             return None;
@@ -676,6 +757,8 @@ impl Interpreter {
                 recv_shape,
                 proto_chain: crate::MethodProtoChain::own(),
                 method_value_byte: slot_byte(slot),
+                recv_shape_offset: recv_shape_handle.offset(),
+                holder_shape_offset: 0,
             });
         }
         // Walk the prototype chain, recording each hopped object's shape; the
@@ -694,6 +777,8 @@ impl Interpreter {
                     recv_shape,
                     proto_chain,
                     method_value_byte: slot_byte(slot),
+                    recv_shape_offset: recv_shape_handle.offset(),
+                    holder_shape_offset: shape.offset(),
                 });
             }
         }
@@ -1021,49 +1106,53 @@ impl Interpreter {
             call_byte_pc: u32,
             targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]>,
         }
-        let method_sites: Vec<PolySnapshot> = view
-            .instructions
-            .iter()
-            .filter_map(|instr| {
-                let site = instr.property_ic_site(&view.code_block)?;
-                let state = self.method_target_feedback(site)?;
-                match state {
-                    MethodCallFeedback::Mono {
-                        method_fid,
-                        recv_shape,
-                        proto_chain,
-                        method_value_byte,
-                    } => {
-                        let mut targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]> =
-                            SmallVec::new();
-                        targets.push(PolyMethodTarget {
+        let method_sites: Vec<PolySnapshot> =
+            view.instructions
+                .iter()
+                .filter_map(|instr| {
+                    let site = instr.property_ic_site(&view.code_block)?;
+                    let state = self.method_target_feedback(site)?;
+                    match state {
+                        MethodCallFeedback::Mono {
                             method_fid,
                             recv_shape,
                             proto_chain,
                             method_value_byte,
-                            hits: 1,
-                        });
-                        Some(PolySnapshot {
-                            instruction_pc: instr.instruction_pc(&view.code_block),
-                            call_byte_pc: instr.byte_pc,
-                            targets,
-                        })
+                        } => {
+                            let mut targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]> =
+                                SmallVec::new();
+                            targets.push(PolyMethodTarget {
+                                method_fid,
+                                recv_shape,
+                                proto_chain,
+                                method_value_byte,
+                                hits: 1,
+                            });
+                            Some(PolySnapshot {
+                                instruction_pc: instr.instruction_pc(&view.code_block),
+                                call_byte_pc: instr.byte_pc,
+                                targets,
+                            })
+                        }
+                        MethodCallFeedback::Poly(observed) => {
+                            let mut targets = (*observed).clone();
+                            // Most-frequent target first: the common receiver shape
+                            // then hits the shortest guard chain.
+                            targets.sort_by_key(|t| std::cmp::Reverse(t.hits));
+                            Some(PolySnapshot {
+                                instruction_pc: instr.instruction_pc(&view.code_block),
+                                call_byte_pc: instr.byte_pc,
+                                targets,
+                            })
+                        }
+                        // Native leaf sites are baked by their own pass: they
+                        // carry an entry id rather than a callee body, so there is
+                        // no inline chain to build here.
+                        MethodCallFeedback::MonoNativeLeaf { .. }
+                        | MethodCallFeedback::Megamorphic => None,
                     }
-                    MethodCallFeedback::Poly(observed) => {
-                        let mut targets = (*observed).clone();
-                        // Most-frequent target first: the common receiver shape
-                        // then hits the shortest guard chain.
-                        targets.sort_by_key(|t| std::cmp::Reverse(t.hits));
-                        Some(PolySnapshot {
-                            instruction_pc: instr.instruction_pc(&view.code_block),
-                            call_byte_pc: instr.byte_pc,
-                            targets,
-                        })
-                    }
-                    MethodCallFeedback::Megamorphic => None,
-                }
-            })
-            .collect();
+                })
+                .collect();
         for snap in method_sites {
             let mut direct_methods = Vec::with_capacity(snap.targets.len());
             let target_count = u32::try_from(snap.targets.len()).unwrap_or(u32::MAX);

@@ -56,7 +56,7 @@ pub(crate) struct MethodSite {
 
 /// Prove the receiver is a heap cell carrying `receiver_type_tag`. On success
 /// `x13` holds its header pointer.
-fn emit_receiver_type_guard(
+pub(crate) fn emit_receiver_type_guard(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
@@ -93,7 +93,7 @@ fn emit_receiver_type_guard(
 /// Prove the realm prototype still has the expected identity and shape. On
 /// success `x15` holds its value-slab pointer.
 #[allow(clippy::too_many_arguments)]
-fn emit_prototype_guard(
+pub(crate) fn emit_prototype_guard(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
@@ -194,7 +194,7 @@ fn emit_receiver_guards(
 
 /// Guard the method slot against the exact static builtin address. Expects
 /// the prototype slab pointer in `x15`; leaves nothing live.
-fn emit_builtin_identity_guard(
+pub(crate) fn emit_builtin_identity_guard(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,

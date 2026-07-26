@@ -322,6 +322,7 @@ impl CodeBlock {
             inline_methods: rustc_hash::FxHashMap::default(),
             inline_poly_methods: rustc_hash::FxHashMap::default(),
             collection_leaf_methods: rustc_hash::FxHashMap::default(),
+            method_native_leaf_calls: rustc_hash::FxHashMap::default(),
             collection_alloc_methods: rustc_hash::FxHashMap::default(),
             array_methods: rustc_hash::FxHashMap::default(),
             primitive_method_guards: rustc_hash::FxHashMap::default(),

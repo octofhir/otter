@@ -17,6 +17,7 @@ time is a sanity check only). Kernels are a thermometer, never a target.
 | 2a | Collection method slot byte; optimizing tier bakes and emits allocating collection + array calls | +46 / −4 | 26.6% | 1.7 | `Map.set` 24.80ms → 6.94ms |
 | 2b | Shared exotic-`length` emitter, both tiers | +101 / −37 | 7.1% | 14.2 | string `.length` 4.42ms → 1.24ms |
 | 2c | Native leaf calls lower from one emitter; `JitStaticNativeCallKind` deleted | +118 / −208 | — | — | 5 builtins, 0 machine-code arms; engine code net **−90 lines** |
+| 2d | Dictionary→fast migration + `CallMethodValue` native-leaf attach | +588 / −84 | 90.8% | 5.5 | `m.abs` 21.82ms → 2.02ms; 0 new lines of assembly |
 
 ## Slice 1 result — 2026-07-26
 
@@ -571,6 +572,56 @@ records no static-native feedback today (12.91 ms against 1.05 ms for `f(x)`),
 because a static native pushes no bytecode frame for the `CallMethodValue` arm
 to see. As a cache program the method form is the *primary* shape rather than
 an unreachable one.
+
+## Namespace objects had no hidden class — LANDED
+
+The `CallMethodValue` attach was complete and did not fire. Instrumentation put
+it in one line: `MV jit=true pushed=false fb=true site=false leaf=None`.
+`method_site_for_receiver` returned `None` because `Math` has **no shape at
+all**, so nothing about the receiver could be named by a guard.
+
+The cause is structural, not a `Math` detail. Hidden-class transitions are
+interned by `ShapeRuntime`, which the `Interpreter` owns; the bootstrap
+installers reach objects through `js_surface`'s heap-only builders, which have
+no shape runtime to take a transition from. `object::define_own_property_in_place`
+therefore appends every new key with `body.shape = ShapeHandle::null()`. Every
+namespace built by `holt!` — `Math`, `JSON`, `Reflect`, `Atomics`, `Intl` — is
+in dictionary storage from birth and stays there for the isolate's life. An
+inline cache identifies its receiver by shape; a dictionary object has none, so
+neither method feedback nor the property IC could ever cache on one.
+
+Fixed the way an engine fixes it, by migrating rather than by special-casing the
+builders: `Interpreter::migrate_slow_to_fast` replays a dictionary object's
+existing slots from the empty root through the ordinary transition table and
+re-points the object at the resulting class, dropping its key vector, key index
+and materialized per-slot metadata. It runs on the first cache attach — the
+method site and the load-IC install — and refuses exactly what it must: an
+object that left fast-shape mode through a delete, and one holding more than
+`MAX_FAST_PROPERTIES` slots. One fix, every namespace, no bootstrap ordering to
+get wrong.
+
+`m.abs`, 200 000 iterations, `production-tiered`:
+
+| form | before | after | node | vs node |
+| --- | ---: | ---: | ---: | ---: |
+| `m.abs(i & 15)` | 21.82 ms | **2.02 ms** | 0.158 | 12.8x |
+| `m.max(i & 3, 2)` | 27.21 ms | **1.67 ms** | 0.255 | 6.5x |
+| `Math.abs(i & 15)` (`Op::MathCall`) | 12.90 ms | 12.81 ms | 0.148 | unchanged |
+| `a(i & 15)` (`Op::Call`) | 1.26 ms | 1.23 ms | 0.130 | unchanged |
+
+`native-boundary`: 56.08 ms → **51.12 ms**, 14.60x → **13.43x** node and
+17.06x → **16.53x** bun. No suite kernel moved and difftest is 13/0.
+
+The attach itself added **zero lines of assembly**: `emit_native_leaf_method_call`
+is composed from the receiver type guard, the baked shape compare, the existing
+prototype hop, the slab base and the identity guard, and ends in the same shared
+entry call an ordinary `Op::Call` site uses. `MethodCallFeedback::MonoNativeLeaf`
+is a separate variant rather than a widening of `Mono`: a native leaf pushes no
+frame, so it can never be a bytecode inline target and never joins a poly chain.
+
+`Op::MathCall` is untouched and is the next unit — with namespaces shaped,
+`Math.abs(x)` written literally can compile to an ordinary `CallMethodValue` and
+cache like anything else, so the opcode, its runtime guard and its stub go.
 
 ## Found, not fixed
 

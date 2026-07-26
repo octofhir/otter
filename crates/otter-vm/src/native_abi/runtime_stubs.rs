@@ -1218,6 +1218,22 @@ pub const STUB_ARRAY_SHIFT_LEAF: RuntimeStubDescriptor = descriptor(
 ///
 /// Inserting at the head may grow the dense buffer, so the site publishes a
 /// precise safepoint exactly like the `push` entry.
+/// Leaf `Math.abs`.
+///
+/// A numeric unary builtin reached through a declared entry rather than a
+/// per-builtin machine-code body. Adding a sibling is a declaration plus its
+/// entry; it costs no generated code.
+pub const STUB_MATH_ABS_LEAF: RuntimeStubDescriptor = descriptor(
+    80,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::StatusPair,
+);
+
+/// Allocating dense-array `Array.prototype.unshift` mutation.
 pub const STUB_ARRAY_UNSHIFT_ALLOC: RuntimeStubDescriptor = descriptor(
     79,
     RuntimeStubClass::Alloc,
@@ -1311,6 +1327,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         77 => "array_push_alloc",
         78 => "array_shift_leaf",
         79 => "array_unshift_alloc",
+        80 => "math_abs_leaf",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1396,6 +1413,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_ARRAY_PUSH_ALLOC,
     STUB_ARRAY_SHIFT_LEAF,
     STUB_ARRAY_UNSHIFT_ALLOC,
+    STUB_MATH_ABS_LEAF,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

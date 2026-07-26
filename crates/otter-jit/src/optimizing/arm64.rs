@@ -4911,6 +4911,18 @@ fn emit(
                                 instruction.inputs[1],
                                 10,
                             )?;
+                            let second = if instruction.inputs.len() >= 3 {
+                                emit_load_boxed_value(
+                                    &mut ops,
+                                    reprs,
+                                    allocation,
+                                    instruction.inputs[2],
+                                    11,
+                                )?;
+                                Some(11)
+                            } else {
+                                None
+                            };
                             emit_static_native_call(
                                 &mut ops,
                                 &mut relocations,
@@ -4918,6 +4930,7 @@ fn emit(
                                 static_site,
                                 9,
                                 10,
+                                second,
                                 code_map.as_mut(),
                                 bail,
                             )?;

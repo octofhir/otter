@@ -239,25 +239,38 @@ Ruled out so far:
 - Not `inline_leaf_template_plan`'s `collection_alloc_methods.clear()` — that
   view is for inlined leaf bodies, not the top-level loop.
 
-Still open: why `view.collection_alloc_methods` stays empty for the site.
-Remaining suspects are inside `jit_collection_alloc_method_feedback` — the
-`method_ic(site)` lookup, the `proto_shape` equality check, or
-`matches_builtin`. `--jit-events` does not resolve it: its
-`methodFeedbackSites` counter reads 0 for the working `get` case too, so it
-is reporting a different channel.
+**Root cause, found by instrumenting the bake path.** There are two compile
+snapshot builders in `crates/otter-vm/src/interp/jit_compile.rs`. The
+template builder bakes collection leaf methods, collection *alloc* methods,
+array methods and primitive guards. The optimizing builder bakes only the
+leaf methods and the primitive guards — directly under a comment asserting
+that "the optimizing tier consumes the same baked compile inputs as the
+template tier". It does not.
 
-Next step is instrumentation rather than more reading: a targeted test that
-drives a warm `map.set` site through `bake_collection_alloc_methods` and
-asserts the entry is published. That lands as a permanent regression test
-instead of a one-off print.
+The kernel's loop runs in OSR-compiled optimizing code (`tmpl_entries` and
+`opt_entries` are both 0, and `jit-optimized-osr-entries` is 1), so
+`Map.set`, `Set.add`, `Map.delete` and every dense-array method are invisible
+to the tier that actually executes the loop.
 
-Note for whoever picks this up: a `set` on a key that already exists does not
-allocate at all. Once the site reaches its guarded path, the honest next
-question is whether it should take the allocating entry at all, or a
-`MutatingLeafValue3` entry that updates in place and misses to the allocating
-one only when the key is absent — the shape `STUB_ARRAY_POP_LEAF` already
-uses. That signature family does not exist yet; the mutating leaf carries two
-values and `set` needs three.
+Baking them there was tried and reverted: it changes nothing, because the
+optimizing backend has no emission for them either. `collection_alloc_methods`
+and `array_methods` are read in exactly one place,
+`crates/otter-jit/src/template/arm64/calls.rs`. Landing the bake alone would
+publish metadata plus safepoint records that nothing consumes — a dead
+forward contract, which is the thing this plan exists to delete.
+
+So the work is emission, not feedback: the optimizing tier needs the
+allocating collection and dense-array call sequences, with the alloc context
+and precise safepoint publication its own frame model requires. That is
+squarely Slice 2, and it is the first place where the two tiers genuinely
+have different machinery rather than a shared description used twice.
+
+Note for that work: a `set` on a key that already exists does not allocate at
+all. Once the site reaches a guarded path, the honest question is whether it
+should take the allocating entry at all, or a `MutatingLeafValue3` entry that
+updates in place and misses to the allocating one only when the key is absent
+— the shape `STUB_ARRAY_POP_LEAF` already uses. That signature family does
+not exist yet: the mutating leaf carries two values and `set` needs three.
 
 ## Fixed to make the gate runnable
 

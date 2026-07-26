@@ -155,7 +155,6 @@ impl NumericLeafBackend {
             frame_map_bitmap_words,
             BTreeMap::new(),
             Box::default(),
-            BTreeMap::new(),
             Box::default(),
             Box::default(),
             OptimizedMetadata {

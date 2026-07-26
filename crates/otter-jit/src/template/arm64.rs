@@ -551,22 +551,6 @@ pub(super) fn compile(
                     threw,
                 );
             }
-            TemplateOp::MathCall {
-                dst,
-                method,
-                arguments,
-            } => {
-                transitions::emit_math_call(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    dst,
-                    method,
-                    plan.register_tail(arguments),
-                    arguments,
-                    threw,
-                )?;
-            }
             TemplateOp::FreshUpvalue { index } => {
                 transitions::emit_fresh_upvalue(
                     &mut ops,

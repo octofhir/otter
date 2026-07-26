@@ -45,7 +45,6 @@ const TARGET_RUNTIME_STUB: u8 = 1;
 const TARGET_GC_CAGE_BASE: u8 = 2;
 const TARGET_PROPERTY_IC_CELL: u8 = 3;
 const TARGET_TEMPLATE_OPERAND_SLICE: u8 = 4;
-const TARGET_OPTIMIZED_MATH_ARGUMENTS: u8 = 5;
 const TARGET_GUARDED_HEAP_REFERENCE: u8 = 6;
 const TARGET_GUARDED_BUILTIN_FUNCTION: u8 = 7;
 const TARGET_DIRECT_CALL_ENTRY_CELL: u8 = 8;
@@ -74,7 +73,6 @@ pub(crate) enum TemplateOperandArena {
 pub(crate) enum TemplateOperandRole {
     ClosureParents,
     NewArrayElements,
-    MathArguments,
     ConstructArguments,
 }
 
@@ -132,11 +130,6 @@ pub(crate) enum RelocationTarget {
         start: u32,
         len: u32,
     },
-    OptimizedMathArguments {
-        inline_frame: u32,
-        logical_pc: u32,
-        len: u32,
-    },
     GuardedHeapReference {
         component: GuardedHeapComponent,
         feedback_kind: GuardedBuiltinKind,
@@ -182,7 +175,6 @@ fn runtime_stub_signature_name(signature: RuntimeStubSignature) -> &'static str 
         RuntimeStubSignature::AllocValue3 => "allocValue3",
         RuntimeStubSignature::Poll1 => "poll1",
         RuntimeStubSignature::Variadic => "variadic",
-        RuntimeStubSignature::NullaryValue => "nullaryValue",
         RuntimeStubSignature::MutatingLeafValue2 => "mutatingLeafValue2",
     }
 }
@@ -1031,20 +1023,9 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             output.push(match role {
                 TemplateOperandRole::ClosureParents => 0,
                 TemplateOperandRole::NewArrayElements => 1,
-                TemplateOperandRole::MathArguments => 2,
                 TemplateOperandRole::ConstructArguments => 3,
             });
             put_u32(output, *start);
-            put_u32(output, *len);
-        }
-        RelocationTarget::OptimizedMathArguments {
-            inline_frame,
-            logical_pc,
-            len,
-        } => {
-            output.push(TARGET_OPTIMIZED_MATH_ARGUMENTS);
-            put_u32(output, *inline_frame);
-            put_u32(output, *logical_pc);
             put_u32(output, *len);
         }
         RelocationTarget::GuardedHeapReference {
@@ -1411,11 +1392,6 @@ mod tests {
                 start: 3,
                 len: 4,
             },
-            RelocationTarget::OptimizedMathArguments {
-                inline_frame: 5,
-                logical_pc: 6,
-                len: 7,
-            },
             RelocationTarget::GuardedHeapReference {
                 component: GuardedHeapComponent::Prototype,
                 feedback_kind: GuardedBuiltinKind::Leaf,
@@ -1440,7 +1416,7 @@ mod tests {
             .into_iter()
             .map(|target| render_single(&code, 4, target).normalized_code)
             .collect();
-        assert_eq!(normalized.len(), 9);
+        assert_eq!(normalized.len(), 8);
 
         let first = render_single(
             &code,

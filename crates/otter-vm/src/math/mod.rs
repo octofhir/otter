@@ -1,18 +1,16 @@
-//! `Math` namespace — constants and unary / variadic numeric
-//! functions reachable through the dedicated `Op::MathLoad` and
-//! `Op::MathCall` opcodes.
+//! `Math` namespace — constants and unary / variadic numeric functions.
 //!
-//! `Math` is also exposed as a real global namespace through the
-//! static spec / builder bootstrap flow. The dedicated
-//! opcodes remain as a compiler fast path for direct
-//! `Math.<name>(...)` calls, while extracted methods such as
-//! `let abs = Math.abs; abs(-1)` dispatch through static native
-//! function pointers.
+//! `Math` is a real global namespace installed through the static spec /
+//! builder bootstrap flow, and every call on it — `Math.abs(x)` written
+//! directly, `m.abs(x)` through a variable, or `let abs = Math.abs; abs(-1)` —
+//! is an ordinary call whose site caches the receiver shape, the method slot
+//! and the declared leaf entry. `Op::MathLoad` remains as the compiler's
+//! constant read.
 //!
 //! # Contents
 //! - [`MATH_SPEC`] — static namespace spec used by bootstrap.
 //! - [`load_constant`] — used by `Op::MathLoad`.
-//! - [`call`] — used by `Op::MathCall` and native wrappers.
+//! - [`call`] — typed numeric dispatch shared by the native wrappers.
 //! - [`MathError`] — failure modes the dispatcher converts to
 //!   `VmError`.
 //! - Static-native identity selection for extracted-method JIT leaves.
@@ -27,7 +25,6 @@
 
 use crate::native_function::NativeFastFn;
 use crate::number::{NumberValue, bitwise};
-use crate::object::{self, JsObject};
 use crate::{NativeCtx, NativeError, Value};
 
 /// Foundation `Math` constants per ECMA-262 §21.3.1. Each constant
@@ -196,25 +193,6 @@ pub fn call(
         M::Trunc => impl_trunc(&nums),
     };
     Ok(Value::number(value))
-}
-
-/// Return the original realm `Math` object when `Math.<method>` still points at
-/// the bootstrap native function for `method`.
-pub(crate) fn original_method_receiver(
-    global: JsObject,
-    heap: &otter_gc::GcHeap,
-    method: otter_bytecode::method_id::MathMethod,
-) -> Option<JsObject> {
-    let math = object::get(global, heap, "Math")?.as_object()?;
-    let native = object::get(math, heap, method.name())?.as_native_function()?;
-    native
-        .is_static_fn(heap, original_native_fn(method))
-        .then_some(math)
-}
-
-/// `true` when direct [`call`] can run without observable `ToPrimitive`.
-pub(crate) fn args_skip_to_primitive(args: &[Value]) -> bool {
-    args.iter().all(|value| !needs_to_primitive_for_math(value))
 }
 
 fn original_native_fn(method: otter_bytecode::method_id::MathMethod) -> NativeFastFn {

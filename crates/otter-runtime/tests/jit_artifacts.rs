@@ -611,7 +611,7 @@ fn optimizing_osr_returns_ir_deopt_and_safepoint_payloads() {
 }
 
 #[test]
-fn optimizing_math_artifact_types_code_owned_argument_slice() {
+fn optimizing_math_artifact_types_the_guarded_builtin_address() {
     let mut runtime = runtime_with_artifacts(JitSelection::ProductionTiered, 4);
     let result = runtime
         .run_script(
@@ -625,8 +625,8 @@ fn optimizing_math_artifact_types_code_owned_argument_slice() {
 
     assert_eq!(result.completion_string(), "2544");
     assert!(
-        kinds.contains("optimizedMathArguments"),
-        "optimizing Math arguments must be represented symbolically: {kinds:?}"
+        kinds.contains("guardedBuiltinFunction"),
+        "the guarded builtin address must be represented symbolically: {kinds:?}"
     );
     assert!(
         kinds.contains("runtimeStub"),

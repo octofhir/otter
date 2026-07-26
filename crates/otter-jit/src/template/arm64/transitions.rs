@@ -366,54 +366,6 @@ pub(super) fn emit_new_array(
     );
 }
 
-pub(super) fn emit_math_call(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    table: &TransitionTable,
-    dst: u16,
-    method: u32,
-    arguments: &[u16],
-    arguments_tail: TemplateTail,
-    threw: DynamicLabel,
-) -> Result<(), Unsupported> {
-    if arguments.is_empty()
-        && otter_bytecode::method_id::MathMethod::from_u32(method)
-            == Some(otter_bytecode::method_id::MathMethod::Random)
-    {
-        // Value-producing leaf entry: no context, no status, result in x0.
-        emit_load_runtime_stub(
-            ops,
-            relocations,
-            16,
-            table.nullary_value_entry(abi::STUB_JIT_MATH_RANDOM),
-            abi::STUB_JIT_MATH_RANDOM,
-        );
-        dynasm!(ops ; .arch aarch64 ; blr x16);
-        return emit_store_reg(ops, 0, dst);
-    }
-    emit_ctx_arg(ops);
-    dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
-    emit_load_u64(ops, 2, u64::from(method));
-    emit_operand_slice_address(
-        ops,
-        relocations,
-        3,
-        arguments.as_ptr() as u64,
-        TemplateOperandArena::Registers,
-        TemplateOperandRole::MathArguments,
-        arguments_tail,
-    );
-    emit_load_u64(ops, 4, arguments.len() as u64);
-    emit_transition_call(
-        ops,
-        relocations,
-        table.variadic_entry(abi::STUB_JIT_MATH_CALL),
-        abi::STUB_JIT_MATH_CALL,
-        threw,
-    );
-    Ok(())
-}
-
 pub(super) fn emit_fresh_upvalue(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,

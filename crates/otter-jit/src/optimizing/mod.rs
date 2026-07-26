@@ -108,10 +108,6 @@ pub struct OptimizedCode {
     osr_entries: BTreeMap<u32, usize>,
     /// Exact installed callee generations entered by emitted direct edges.
     dependencies: Box<[CodeDependency]>,
-    /// Per-`MathCall`-site argument window registers. The emitted calls carry
-    /// interior pointers into these boxed slices, so they must live exactly as
-    /// long as the code.
-    _math_call_arguments: BTreeMap<u32, Box<[u16]>>,
     /// Per-`LoadProperty`-site inline caches. Their addresses are baked into
     /// the emitted probes and self-patched by the miss transition, so the
     /// allocation must live exactly as long as the code.
@@ -133,7 +129,6 @@ impl OptimizedCode {
         frame_map_bitmap_words: Box<[u64]>,
         osr_entries: BTreeMap<u32, usize>,
         dependencies: Box<[CodeDependency]>,
-        math_call_arguments: BTreeMap<u32, Box<[u16]>>,
         load_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
         store_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
         metadata: OptimizedMetadata,
@@ -157,7 +152,6 @@ impl OptimizedCode {
             frame_map_bitmap_words,
             osr_entries,
             dependencies,
-            _math_call_arguments: math_call_arguments,
             _load_ic_cells: load_ic_cells,
             _store_ic_cells: store_ic_cells,
             metadata,

@@ -195,14 +195,6 @@ pub(crate) struct NewArrayOperands {
     pub(crate) elements: OperandRange,
 }
 
-/// Typed math-call operands backed by the plan's register side buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MathCallOperands {
-    pub(crate) dst: u16,
-    pub(crate) method: u32,
-    pub(crate) arguments: OperandRange,
-}
-
 /// Typed closure-construction operands backed by the plan's index side buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MakeClosureOperands {
@@ -355,7 +347,6 @@ enum LoweredOperands {
     PropertyStore(PropertyStoreOperands),
     Upvalue(UpvalueOperands),
     NewArray(NewArrayOperands),
-    MathCall(MathCallOperands),
     MakeClosure(MakeClosureOperands),
     Call(CallOperands),
     CallWithThis(CallWithThisOperands),
@@ -508,13 +499,6 @@ impl LoweredInstr {
         match self.operands {
             LoweredOperands::NewArray(operands) => Ok(operands),
             _ => Err(Unsupported::OperandShape("lowered NewArray operands")),
-        }
-    }
-
-    pub(crate) fn math_call_operands(self) -> Result<MathCallOperands, Unsupported> {
-        match self.operands {
-            LoweredOperands::MathCall(operands) => Ok(operands),
-            _ => Err(Unsupported::OperandShape("lowered MathCall operands")),
         }
     }
 
@@ -946,22 +930,6 @@ impl BaselinePlan {
                         dst: reg(operands, 0)?,
                         method: const_index(operands, 1)?,
                         arguments: elements,
-                    })
-                }
-                Op::MathCall => {
-                    let count = const_index(operands, 2)? as usize;
-                    let arguments = append_register_tail(
-                        &mut register_operands,
-                        operands,
-                        operands.len(),
-                        3,
-                        count,
-                        "MathCall register tail",
-                    )?;
-                    LoweredOperands::MathCall(MathCallOperands {
-                        dst: reg(operands, 0)?,
-                        method: const_index(operands, 1)?,
-                        arguments,
                     })
                 }
                 Op::MakeClosure => {

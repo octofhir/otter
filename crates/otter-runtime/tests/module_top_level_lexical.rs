@@ -59,10 +59,9 @@ fn cross_module_global_lookup_after_fragment_merge() {
 }
 
 /// `Math.abs` after fragment merge — the existing `is_const_pool_ref`
-/// table was offsetting the `MathCall` method-id slot, silently
-/// rebinding to a different `MathMethod` after merge. Cover the
-/// fix by computing a known result through `Math.abs` from a
-/// module that has dependencies.
+/// table was offsetting a call's constant slot, silently rebinding it to a
+/// different method after merge. Cover the fix by computing a known result
+/// through `Math.abs` from a module that has dependencies.
 #[test]
 fn cross_module_method_id_call_after_fragment_merge() {
     let dir = tempfile::tempdir().expect("tempdir");

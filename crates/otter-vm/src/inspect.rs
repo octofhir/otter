@@ -904,7 +904,6 @@ mod tests {
         Op::NotEqualImm,
         Op::MakeClass,
         Op::MathLoad,
-        Op::MathCall,
         Op::CollectRest,
         Op::ReturnValue,
         Op::ReturnUndefined,

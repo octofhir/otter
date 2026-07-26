@@ -153,8 +153,9 @@ use crate::{
         ssa::{SsaFunction, SsaInstr, ValueDef, ValueId},
     },
     template::arm64::ic_probe::{
-        emit_guarded_method_call, emit_native_leaf_call, guarded_method_call_is_supported,
-        native_leaf_call_is_supported, native_leaf_call_name,
+        DenseIndexForm, emit_dense_element_address, emit_dense_element_read,
+        emit_dense_element_write, emit_guarded_method_call, emit_native_leaf_call,
+        guarded_method_call_is_supported, native_leaf_call_is_supported, native_leaf_call_name,
     },
 };
 
@@ -2707,23 +2708,30 @@ fn emit(
                     // so it takes the generic path like every other miss.
                     let miss = ops.new_dynamic_label();
                     let done = ops.new_dynamic_label();
-                    emit_dense_element_guards(
+                    emit_dense_element_address(
                         &mut ops,
                         &mut relocations,
                         view,
-                        reprs,
-                        allocation,
-                        instruction.inputs[0],
-                        instruction.inputs[1],
+                        |ops, register| {
+                            emit_load_tagged_location(
+                                ops,
+                                allocation.location(instruction.inputs[0]),
+                                register,
+                            )
+                        },
+                        |ops, register| {
+                            emit_load_dense_index(
+                                ops,
+                                reprs,
+                                allocation,
+                                instruction.inputs[1],
+                                register,
+                            )
+                        },
+                        dense_index_form(reprs, instruction.inputs[1])?,
                         miss,
                     )?;
-                    emit_load_u64(&mut ops, 11, VALUE_HOLE);
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; ldr x9, [x16]
-                        ; cmp x9, x11
-                        ; b.eq =>miss
-                    );
+                    emit_dense_element_read(&mut ops, miss);
                     emit_store_tagged_location(
                         &mut ops,
                         allocation.location(
@@ -2800,23 +2808,30 @@ fn emit(
                     let miss = ops.new_dynamic_label();
                     let done = ops.new_dynamic_label();
                     if store_fast {
-                        emit_dense_element_guards(
+                        emit_dense_element_address(
                             &mut ops,
                             &mut relocations,
                             view,
-                            reprs,
-                            allocation,
-                            instruction.inputs[0],
-                            instruction.inputs[1],
+                            |ops, register| {
+                                emit_load_tagged_location(
+                                    ops,
+                                    allocation.location(instruction.inputs[0]),
+                                    register,
+                                )
+                            },
+                            |ops, register| {
+                                emit_load_dense_index(
+                                    ops,
+                                    reprs,
+                                    allocation,
+                                    instruction.inputs[1],
+                                    register,
+                                )
+                            },
+                            dense_index_form(reprs, instruction.inputs[1])?,
                             miss,
                         )?;
-                        emit_load_u64(&mut ops, 11, VALUE_HOLE);
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; ldr x9, [x16]
-                            ; cmp x9, x11
-                            ; b.eq =>miss
-                        );
+                        emit_dense_element_read(&mut ops, miss);
                         match value_repr {
                             Representation::Int32 => {
                                 emit_load_location(
@@ -2841,7 +2856,7 @@ fn emit(
                                 ));
                             }
                         }
-                        dynasm!(ops ; .arch aarch64 ; str x9, [x16]);
+                        emit_dense_element_write(&mut ops);
                         dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
                     }
                     emit_materialize_element_transition(
@@ -6346,83 +6361,31 @@ fn emit_store_tagged_location(
     Ok(())
 }
 
-/// Emit the dense-array fast-path guards for one element access.
-///
-/// On the hit path this leaves the element's address in `x16` and falls
-/// through; any failed guard branches to `miss`, where the reentrant stub
-/// completes the access generically. Guards, in order: the receiver is a heap
-/// cell, its body is an ordinary `ArrayBody` with no exotic sidecar, and the
-/// index is an int32 (untagged inline when its representation is `Tagged`)
-/// inside the dense bounds. The dense base and length load from the
-/// VM-maintained body cache, so `Vec` layout stays unobserved.
-///
-/// Clobbers `x9`, `x11`-`x16`.
-#[allow(clippy::too_many_arguments)]
-fn emit_dense_element_guards(
+/// Whether an SSA index value still carries its `Value` tag when the dense
+/// element guard reads it. A float64 index is not an element index at all.
+fn dense_index_form(reprs: &ReprMap, index: ValueId) -> Result<DenseIndexForm, Unsupported> {
+    match reprs.representation(index) {
+        Representation::Int32 => Ok(DenseIndexForm::Int32),
+        Representation::Tagged => Ok(DenseIndexForm::Tagged),
+        Representation::Float64 => Err(Unsupported::OperandShape("dense element float64 index")),
+    }
+}
+
+/// Materialize an SSA index value into `register` in the form
+/// [`dense_index_form`] declared for it.
+fn emit_load_dense_index(
     ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
     reprs: &ReprMap,
     allocation: &Allocation,
-    receiver: ValueId,
     index: ValueId,
-    miss: DynamicLabel,
+    register: u8,
 ) -> Result<(), Unsupported> {
-    let layout = view.array_layout;
-    // Receiver: a heap cell whose body is an ordinary dense array.
-    emit_load_tagged_location(ops, allocation.location(receiver), 9)?;
-    dynasm!(ops
-        ; .arch aarch64
-        ; movz x11, NUMBER_TAG_HI16, lsl #48
-        ; orr x11, x11, #0x2       // NOT_CELL_MASK
-        ; tst x9, x11
-        ; b.ne =>miss
-        ; mov w12, w9              // low-32 Gc offset
-    );
-    emit_load_symbolic_u64(
-        ops,
-        relocations,
-        13,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; add x13, x13, x12        // x13 = GcHeader ptr
-        ; ldrb w14, [x13]
-        ; cmp w14, layout.type_tag as u32
-        ; b.ne =>miss
-        ; ldr x14, [x13, layout.exotic_byte]
-        ; cbnz x14, =>miss         // exotic sidecar: stub owns the semantics
-    );
-    // Index: an int32, untagged inline when it reaches here tagged.
-    match reprs.representation(index) {
-        Representation::Int32 => {
-            emit_load_location(ops, allocation.location(index), 15)?;
-        }
-        Representation::Tagged => {
-            emit_load_tagged_location(ops, allocation.location(index), 15)?;
-            dynasm!(ops
-                ; .arch aarch64
-                ; lsr x11, x15, #48
-                ; movz x12, NUMBER_TAG_HI16
-                ; cmp x11, x12
-                ; b.ne =>miss      // not an int32 payload
-            );
-        }
-        Representation::Float64 => {
-            return Err(Unsupported::OperandShape("dense element float64 index"));
+    match dense_index_form(reprs, index)? {
+        DenseIndexForm::Int32 => emit_load_location(ops, allocation.location(index), register),
+        DenseIndexForm::Tagged => {
+            emit_load_tagged_location(ops, allocation.location(index), register)
         }
     }
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr w16, [x13, layout.dense_len_byte]
-        ; cmp w15, w16
-        ; b.hs =>miss              // unsigned: negative indices miss too
-        ; ldr x16, [x13, layout.elements_ptr_byte]
-        ; add x16, x16, w15, uxtw #3
-    );
-    Ok(())
 }
 
 fn emit_box_int32(ops: &mut Assembler, value: u8, scratch: u8) {

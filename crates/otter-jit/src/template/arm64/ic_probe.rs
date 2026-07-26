@@ -9,6 +9,8 @@
 //!   that cannot execute them.
 //! - [`emit_exotic_length_fast`] — the `.length` reads no cache program can
 //!   describe.
+//! - [`emit_dense_element_address`] / [`emit_dense_element_read`] /
+//!   [`emit_dense_element_write`] — the dense element access program.
 //! - [`emit_native_leaf_call`] — guard a callee's bootstrap identity and run
 //!   its declared leaf entry without materializing a frame.
 //! - [`emit_guarded_method_call`] — the same for `receiver.method(args…)`, over
@@ -46,7 +48,8 @@ use crate::artifact::relocation::{GuardedHeapComponent, RelocationCapture, Reloc
 use crate::entry::{
     ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
     ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, IC_WAYS, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG,
-    THREAD_OFFSET, Unsupported, VALUE_UNDEFINED, VM_THREAD_GC_HEAP_OFFSET, WHISKER_IC_WAY_BYTES,
+    THREAD_OFFSET, Unsupported, VALUE_HOLE, VALUE_UNDEFINED, VM_THREAD_GC_HEAP_OFFSET,
+    WHISKER_IC_WAY_BYTES,
 };
 
 /// Match `w14` against the cell's ways, branching to `miss` when none hold.
@@ -185,6 +188,126 @@ pub(crate) fn emit_exotic_length_fast(
     );
     emit_box_int32(ops, 9, 12);
     dynasm!(ops ; .arch aarch64 ; b =>have_length);
+}
+
+/// Branch to `miss` when `x9` holds a heap cell.
+///
+/// A store over an existing element replaces one boxed value with another; a
+/// cell needs the generational write barrier, which only the runtime stub owns.
+/// Clobbers `x11`.
+pub(crate) fn emit_guard_value_is_not_cell(ops: &mut Assembler, miss: DynamicLabel) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz x11, NUMBER_TAG_HI16, lsl #48
+        ; orr x11, x11, #0x2       // NOT_CELL_MASK
+        ; tst x9, x11
+        ; b.eq =>miss
+    );
+}
+
+/// Whether the index operand a site supplies still carries a `Value` tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DenseIndexForm {
+    /// A boxed `Value` whose int32 payload the guard must still prove.
+    Tagged,
+    /// A raw int32 the site has already proven by representation.
+    Int32,
+}
+
+/// Prove an ordinary in-bounds dense element access, leaving the element's
+/// address in `x16`.
+///
+/// The guard is one program: the receiver is a heap cell carrying an array
+/// body with no exotic sidecar, the index is a non-negative int32 below the
+/// VM-maintained dense length, and the address comes from the body's
+/// `(elements_ptr, dense_len)` cache so the backing `Vec`'s layout stays
+/// unobserved. Nothing here allocates, so no safepoint is owed.
+///
+/// `load_receiver` and `load_index` materialize their operand into the register
+/// they are handed and run inside the guard sequence, so they must touch no
+/// other register. That is the only thing a tier supplies: the guard itself is
+/// written once. Clobbers `x9`, `x11`–`x16`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_dense_element_address<R, I>(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    load_receiver: R,
+    load_index: I,
+    index_form: DenseIndexForm,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported>
+where
+    R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
+    I: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
+{
+    let layout = view.array_layout;
+    load_receiver(ops, 9)?;
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz x11, NUMBER_TAG_HI16, lsl #48
+        ; orr x11, x11, #0x2       // NOT_CELL_MASK
+        ; tst x9, x11
+        ; b.ne =>miss
+        ; mov w12, w9              // low-32 Gc offset
+    );
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        13,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; add x13, x13, x12        // x13 = GcHeader ptr
+        ; ldrb w14, [x13]
+        ; cmp w14, layout.type_tag as u32
+        ; b.ne =>miss
+        ; ldr x14, [x13, layout.exotic_byte]
+        ; cbnz x14, =>miss         // exotic sidecar: the stub owns semantics
+    );
+    load_index(ops, 15)?;
+    if index_form == DenseIndexForm::Tagged {
+        dynasm!(ops
+            ; .arch aarch64
+            ; lsr x11, x15, #48
+            ; movz x12, NUMBER_TAG_HI16
+            ; cmp x11, x12
+            ; b.ne =>miss          // index is not an int32 payload
+        );
+    }
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr w16, [x13, layout.dense_len_byte]
+        ; cmp w15, w16
+        ; b.hs =>miss              // unsigned: negative indices miss too
+        ; ldr x16, [x13, layout.elements_ptr_byte]
+        ; add x16, x16, w15, uxtw #3
+    );
+    Ok(())
+}
+
+/// Read the element whose address [`emit_dense_element_address`] left in `x16`
+/// into `x9`, branching to `miss` on a hole.
+///
+/// A hole is an absent property — the prototype chain answers a read, and a
+/// prototype setter may observe a write — so both accesses treat it as a guard
+/// failure. Clobbers `x11`.
+pub(crate) fn emit_dense_element_read(ops: &mut Assembler, miss: DynamicLabel) {
+    emit_load_u64(ops, 11, VALUE_HOLE);
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x9, [x16]
+        ; cmp x9, x11
+        ; b.eq =>miss
+    );
+}
+
+/// Overwrite the element whose address [`emit_dense_element_address`] left in
+/// `x16` with the boxed value in `x9`.
+pub(crate) fn emit_dense_element_write(ops: &mut Assembler) {
+    dynasm!(ops ; .arch aarch64 ; str x9, [x16]);
 }
 
 /// Whether a declared leaf entry can be called inline at a site of this arity.

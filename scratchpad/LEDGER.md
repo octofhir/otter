@@ -14,6 +14,39 @@ time is a sanity check only). Kernels are a thermometer, never a target.
 | --- | --- | ---: | ---: | ---: | --- |
 | 0 | `just cost`, `just gate`, this ledger | 0 | — | — | tooling, nothing replaced |
 
+## The bar — otter vs node and bun, 2026-07-26, before Slice 1
+
+`just vs`. Milliseconds per `engineKernel()`, startup excluded on both
+sides, median of 20 after 8 warmups. Otter on `production-tiered`.
+**This is the number that says whether the engine is good.** Internal tier
+ratios only say whether a change helped.
+
+| Kernel | otter | node | bun | otter/node | otter/bun |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| method-call-monomorphic | 4.5053 | 0.9463 | 0.4866 | 4.76x | 9.26x |
+| numeric-leaf | 1.6847 | 0.0510 | 0.0313 | **33.03x** | 53.82x |
+| branch-phi | 5.1176 | 0.6924 | 0.9391 | 7.39x | 5.45x |
+| dense-array | 3.9922 | 0.8623 | 0.7264 | 4.63x | 5.50x |
+| boxed-double-property | 4.1404 | 0.9387 | 0.9424 | 4.41x | 4.39x |
+| property-polymorphic | 60.6562 | 2.3886 | 1.4419 | **25.39x** | 42.07x |
+
+Reading the two outliers:
+
+- **numeric-leaf 33x is partly an artifact.** V8 inlines `engineNumericLeaf`
+  and constant-folds it — the arguments are the literals `2, 2`, so the body
+  collapses to `-7` and the loop becomes an accumulate. Verified it is not
+  eliminated: quadrupling the iteration count quadruples node's time
+  (0.0547ms -> 0.2032ms). The missing capability is real (inlining plus
+  constant folding in the optimizing tier), but no real program calls
+  `f(2, 2)` a million times, so this gap is worth less than its size.
+- **property-polymorphic 25x is the real one**, and it is what this plan
+  already targets. Polymorphic property access is what actual JavaScript
+  does.
+
+Bytecode is not the cause. `just bcdiff property-polymorphic` puts otter's
+loop body at 26 ops against V8 Ignition's 22 — comparable. The cost is
+underneath: see the counter breakdown below.
+
 ## Baseline — 2026-07-26, before Slice 1
 
 Retired instructions, `samples=20 warmup=8`, per `just cost`.
@@ -35,6 +68,32 @@ Instructions per VM reduction (dispatch density):
 | branch-phi | 131.3 | 90.4 |
 | dense-array | 137.8 | 80.0 |
 | boxed-double-property | 222.5 | 76.4 |
+
+## Where property-polymorphic's 25x actually goes
+
+Counters for one `engineKernel()` invocation on the template tier (400 000
+loop iterations, three property accesses each):
+
+| Counter | Per invocation | Per loop iteration |
+| --- | ---: | ---: |
+| `jit-runtime-property-stubs` | 1 197 000 | **3.0** |
+| `jit-reentrant-stub-transitions` | 1 197 000 | 3.0 |
+| `jit-runtime-stub-transitions` | 1 197 097 | 3.0 |
+| `property-ic-load-hits` | 1 000 | 0.0025 |
+| `property-ic-load-disables` | 3 (total) | — |
+
+Every single property access in the JIT tiers leaves generated code and
+re-enters the runtime. The interpreter's inline cache serves only the first
+~1 000 iterations, before the loop tiers up; after that its hit counter
+stops moving entirely. Three sites hit `load-disables`, meaning the
+interpreter cache gives up on the polymorphic receiver set rather than
+attaching a polymorphic stub chain.
+
+That is the 25x, stated precisely: **the JIT tiers have no inline property
+cache — they have a call into the runtime with a cache behind it.** It is
+exactly what lowering `CacheOp` into generated code removes, so Slice 1 has
+a measurable target: drive `jit-runtime-property-stubs` on this kernel
+toward zero and re-run `just vs`.
 
 ## Fixed to make the gate runnable
 

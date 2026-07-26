@@ -55,6 +55,16 @@ clean:
 cost *args:
     bash scripts/cost.sh {{args}}
 
+# The bar: otter against node and bun on the same kernel, startup excluded.
+# Ratios above 1.00x mean otter is slower by that factor. Optional filter.
+vs *args:
+    bash scripts/vs.sh {{args}}
+
+# Diff otter's bytecode for a kernel against V8 Ignition's listing for the
+# same function. Usage: just bcdiff dense-array [functionName]
+bcdiff kernel function="engineKernel":
+    bash scripts/bcdiff.sh {{kernel}} {{function}}
+
 # Iteration gate: fmt, clippy, vm/jit/bytecode tests, difftest across tiers,
 # kernel ledger. Deliberately excludes test262 — that is the closing gate,
 # compared as failing sets.

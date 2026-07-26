@@ -217,7 +217,7 @@ pub(crate) struct CodeRegion {
     #[serde(skip_serializing_if = "Option::is_none")]
     method_guard: Option<MethodGuardArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    static_native_call: Option<otter_vm::JitStaticNativeCallKind>,
+    native_leaf_call: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     logical_pc: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -246,7 +246,7 @@ impl CodeRegion {
             function_id: None,
             direct_call: None,
             method_guard: None,
-            static_native_call: None,
+            native_leaf_call: None,
             logical_pc: None,
             byte_pc: None,
             operation_index: None,
@@ -279,7 +279,7 @@ impl CodeRegion {
             function_id: Some(function_id),
             direct_call: None,
             method_guard: None,
-            static_native_call: None,
+            native_leaf_call: None,
             logical_pc: Some(logical_pc),
             byte_pc: Some(byte_pc),
             operation_index,
@@ -366,11 +366,11 @@ impl CodeRegion {
         caller_function_id: u32,
         logical_pc: u32,
         byte_pc: u32,
-        target: otter_vm::JitStaticNativeCallKind,
+        target: &'static str,
     ) -> Self {
         let mut region = Self::structural(kind, start, end);
         region.function_id = Some(caller_function_id);
-        region.static_native_call = Some(target);
+        region.native_leaf_call = Some(target);
         region.logical_pc = Some(logical_pc);
         region.byte_pc = Some(byte_pc);
         region

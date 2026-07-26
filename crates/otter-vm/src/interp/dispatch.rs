@@ -297,8 +297,10 @@ impl Interpreter {
                                 stack[stack.len() - 1].function_id,
                             ))
                         } else {
-                            static_native_target.map(|(kind, _)| {
-                                crate::feedback::OrdinaryCallTarget::StaticNative(kind)
+                            static_native_target.map(|declaration| {
+                                crate::feedback::OrdinaryCallTarget::StaticNative(
+                                    declaration.leaf_stub_id,
+                                )
                             })
                         }
                     {

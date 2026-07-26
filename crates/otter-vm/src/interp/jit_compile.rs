@@ -263,7 +263,7 @@ impl Interpreter {
         caller_function_id: u32,
         instruction_pc: u32,
         tier: jit_debug::JitDebugTier,
-        target: jit::JitStaticNativeCallKind,
+        target: &'static str,
     ) {
         self.record_jit_debug_event(|| jit_debug::JitDebugEvent::StaticNativeCallPlan {
             caller_function_id,
@@ -859,13 +859,16 @@ impl Interpreter {
             };
             let callee_fid = match target.target {
                 feedback::OrdinaryCallTarget::Bytecode(callee_fid) => callee_fid,
-                feedback::OrdinaryCallTarget::StaticNative(kind) => {
+                feedback::OrdinaryCallTarget::StaticNative(stub_id) => {
+                    let name = crate::native_abi::runtime_stub_name(stub_id);
+                    let declaration = crate::math::jit_leaf_builtin(stub_id)
+                        .expect("native leaf call feedback names a declared entry");
                     view.static_native_calls.insert(
                         call_byte_pc,
                         jit::JitStaticNativeCall {
-                            kind,
-                            builtin_fn_addr: crate::math::jit_static_call_address(kind),
-                            leaf_stub_id: crate::math::jit_leaf_stub_id(kind),
+                            builtin_fn_addr: crate::math::jit_static_call_address(stub_id),
+                            leaf_stub_id: stub_id,
+                            argument_count: declaration.argument_count,
                         },
                     );
                     self.record_jit_inline_candidate(
@@ -873,9 +876,9 @@ impl Interpreter {
                         instruction_pc,
                         tier,
                         None,
-                        Some(jit_debug::JitInlineRejectionReason::StaticNative { target: kind }),
+                        Some(jit_debug::JitInlineRejectionReason::StaticNative { target: name }),
                     );
-                    self.record_jit_static_native_call_plan(fid, instruction_pc, tier, kind);
+                    self.record_jit_static_native_call_plan(fid, instruction_pc, tier, name);
                     continue;
                 }
             };

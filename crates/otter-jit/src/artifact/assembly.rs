@@ -530,9 +530,10 @@ fn symbolic_target(target: &RelocationTarget) -> String {
             "guardedBuiltinFunction(feedback={},bytePc={byte_pc},runtimeStubId={runtime_stub_id})",
             feedback_kind_name(*feedback_kind)
         ),
-        RelocationTarget::StaticNativeBuiltinFunction { target, byte_pc } => {
-            format!("staticNativeBuiltinFunction(target={target:?},bytePc={byte_pc})")
-        }
+        RelocationTarget::NativeLeafBuiltinFunction { stub_id } => format!(
+            "nativeLeafBuiltinFunction(entry={})",
+            otter_vm::native_abi::runtime_stub_name(*stub_id)
+        ),
         RelocationTarget::DirectCallEntryCell {
             byte_pc,
             direct_call,

@@ -22,7 +22,6 @@
 
 mod direct_call;
 mod method_guard;
-mod static_native;
 
 pub(crate) use direct_call::{
     DirectCallForm, DirectCallSite, direct_call_artifact, emit_direct_call,
@@ -30,8 +29,4 @@ pub(crate) use direct_call::{
 };
 pub(crate) use method_guard::{
     MethodGuardSite, emit_method_guard, emit_method_guard_from_tagged_register,
-};
-pub(crate) use static_native::{
-    StaticNativeCallSite, emit_static_native_call,
-    target_is_supported as static_native_target_is_supported,
 };

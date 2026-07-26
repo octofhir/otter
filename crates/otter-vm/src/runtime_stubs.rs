@@ -33,7 +33,8 @@ use crate::native_abi::{
     STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC,
     STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC,
     STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
-    STUB_MATH_ABS_LEAF, STUB_NUMBER_REM_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF,
+    STUB_MATH_ABS_LEAF, STUB_MATH_FLOOR_LEAF, STUB_MATH_MAX_LEAF, STUB_MATH_MIN_LEAF,
+    STUB_MATH_SQRT_LEAF, STUB_NUMBER_REM_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF,
     STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_STRING_ENDS_WITH_LEAF,
     STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF, STUB_STRING_STARTS_WITH_LEAF,
     STUB_TO_BOOLEAN_LEAF, SafepointId, SafepointRecord, TaggedLocationKind,
@@ -439,6 +440,30 @@ pub const MATH_ABS_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     entry: math_abs_leaf,
 };
 
+/// Callable ABI entry for `Math.floor`.
+pub const MATH_FLOOR_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_MATH_FLOOR_LEAF,
+    entry: math_floor_leaf,
+};
+
+/// Callable ABI entry for `Math.sqrt`.
+pub const MATH_SQRT_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_MATH_SQRT_LEAF,
+    entry: math_sqrt_leaf,
+};
+
+/// Callable ABI entry for two-argument `Math.max`.
+pub const MATH_MAX_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_MATH_MAX_LEAF,
+    entry: math_max_leaf,
+};
+
+/// Callable ABI entry for two-argument `Math.min`.
+pub const MATH_MIN_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_MATH_MIN_LEAF,
+    entry: math_min_leaf,
+};
+
 /// Callable ABI entry for `String.prototype.charCodeAt`.
 pub const STRING_CHAR_CODE_AT_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: STUB_STRING_CHAR_CODE_AT_LEAF,
@@ -593,6 +618,10 @@ pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocS
     match id {
         id if id == STUB_COLLECTION_MAP_GET_LEAF.id => Some(COLLECTION_MAP_GET_LEAF),
         id if id == STUB_MATH_ABS_LEAF.id => Some(MATH_ABS_LEAF),
+        id if id == STUB_MATH_FLOOR_LEAF.id => Some(MATH_FLOOR_LEAF),
+        id if id == STUB_MATH_SQRT_LEAF.id => Some(MATH_SQRT_LEAF),
+        id if id == STUB_MATH_MAX_LEAF.id => Some(MATH_MAX_LEAF),
+        id if id == STUB_MATH_MIN_LEAF.id => Some(MATH_MIN_LEAF),
         id if id == STUB_COLLECTION_MAP_HAS_LEAF.id => Some(COLLECTION_MAP_HAS_LEAF),
         id if id == STUB_COLLECTION_SET_HAS_LEAF.id => Some(COLLECTION_SET_HAS_LEAF),
         id if id == STUB_STRICT_EQ_LEAF.id => Some(STRICT_EQ_LEAF),
@@ -1133,6 +1162,48 @@ fn math_unary_leaf(arg_bits: u64, op: fn(f64) -> f64) -> RuntimeStubResult {
     RuntimeStubResult::ok_value(Value::number_f64(op(value)))
 }
 
+/// One numeric binary builtin, reached through the declared leaf ABI.
+///
+/// Both arguments arrive already boxed; either one non-numeric misses, for the
+/// same reason the unary entry does — coercion can observe user code.
+fn math_binary_leaf(lhs_bits: u64, rhs_bits: u64, op: fn(f64, f64) -> f64) -> RuntimeStubResult {
+    let (Some(lhs), Some(rhs)) = (
+        Value::from_abi_bits(lhs_bits).as_f64(),
+        Value::from_abi_bits(rhs_bits).as_f64(),
+    ) else {
+        return RuntimeStubResult::miss();
+    };
+    RuntimeStubResult::ok_value(Value::number_f64(op(lhs, rhs)))
+}
+
+/// §21.3.2.24 `Math.max` over two numbers.
+///
+/// `f64::max` is IEEE `maxNum`: it swallows a NaN operand and picks either
+/// zero when the operands compare equal. JavaScript propagates NaN and orders
+/// `-0` below `+0`, so the comparison is written out rather than delegated.
+fn js_math_max(lhs: f64, rhs: f64) -> f64 {
+    if lhs.is_nan() || rhs.is_nan() {
+        return f64::NAN;
+    }
+    if rhs > lhs || (rhs == 0.0 && lhs == 0.0 && lhs.is_sign_negative()) {
+        rhs
+    } else {
+        lhs
+    }
+}
+
+/// §21.3.2.25 `Math.min` over two numbers, mirroring [`js_math_max`].
+fn js_math_min(lhs: f64, rhs: f64) -> f64 {
+    if lhs.is_nan() || rhs.is_nan() {
+        return f64::NAN;
+    }
+    if rhs < lhs || (rhs == 0.0 && lhs == 0.0 && rhs.is_sign_negative()) {
+        rhs
+    } else {
+        lhs
+    }
+}
+
 /// Leaf ABI entry for `Math.abs`.
 pub extern "C" fn math_abs_leaf(
     heap: *const otter_gc::GcHeap,
@@ -1141,6 +1212,46 @@ pub extern "C" fn math_abs_leaf(
 ) -> RuntimeStubResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
     RuntimeStubResultPair::from_result(math_unary_leaf(arg_bits, f64::abs))
+}
+
+/// Leaf ABI entry for `Math.floor`.
+pub extern "C" fn math_floor_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> RuntimeStubResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    RuntimeStubResultPair::from_result(math_unary_leaf(arg_bits, f64::floor))
+}
+
+/// Leaf ABI entry for `Math.sqrt`.
+pub extern "C" fn math_sqrt_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> RuntimeStubResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    RuntimeStubResultPair::from_result(math_unary_leaf(arg_bits, f64::sqrt))
+}
+
+/// Leaf ABI entry for two-argument `Math.max`.
+pub extern "C" fn math_max_leaf(
+    heap: *const otter_gc::GcHeap,
+    lhs_bits: u64,
+    rhs_bits: u64,
+) -> RuntimeStubResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    RuntimeStubResultPair::from_result(math_binary_leaf(lhs_bits, rhs_bits, js_math_max))
+}
+
+/// Leaf ABI entry for two-argument `Math.min`.
+pub extern "C" fn math_min_leaf(
+    heap: *const otter_gc::GcHeap,
+    lhs_bits: u64,
+    rhs_bits: u64,
+) -> RuntimeStubResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    RuntimeStubResultPair::from_result(math_binary_leaf(lhs_bits, rhs_bits, js_math_min))
 }
 
 /// Leaf `Map.prototype.get` probe.

@@ -1218,9 +1218,19 @@ pub const STUB_ARRAY_SHIFT_LEAF: RuntimeStubDescriptor = descriptor(
 ///
 /// Inserting at the head may grow the dense buffer, so the site publishes a
 /// precise safepoint exactly like the `push` entry.
+pub const STUB_ARRAY_UNSHIFT_ALLOC: RuntimeStubDescriptor = descriptor(
+    79,
+    RuntimeStubClass::Alloc,
+    RuntimeStubSignature::AllocValue3,
+    3,
+    RuntimeStubEffects::allocating(false, true),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::StatusPair,
+);
+
 /// Leaf `Math.abs`.
 ///
-/// A numeric unary builtin reached through a declared entry rather than a
+/// A numeric builtin reached through a declared entry rather than a
 /// per-builtin machine-code body. Adding a sibling is a declaration plus its
 /// entry; it costs no generated code.
 pub const STUB_MATH_ABS_LEAF: RuntimeStubDescriptor = descriptor(
@@ -1233,13 +1243,49 @@ pub const STUB_MATH_ABS_LEAF: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusPair,
 );
 
-/// Allocating dense-array `Array.prototype.unshift` mutation.
-pub const STUB_ARRAY_UNSHIFT_ALLOC: RuntimeStubDescriptor = descriptor(
-    79,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(false, true),
+/// Leaf `Math.floor`.
+pub const STUB_MATH_FLOOR_LEAF: RuntimeStubDescriptor = descriptor(
+    81,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::StatusPair,
+);
+
+/// Leaf `Math.sqrt`.
+pub const STUB_MATH_SQRT_LEAF: RuntimeStubDescriptor = descriptor(
+    82,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::StatusPair,
+);
+
+/// Leaf `Math.max` over exactly two arguments.
+///
+/// The variadic and zero/one-argument forms keep the ordinary call path; the
+/// declared arity is what makes a site eligible for this entry.
+pub const STUB_MATH_MAX_LEAF: RuntimeStubDescriptor = descriptor(
+    83,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::StatusPair,
+);
+
+/// Leaf `Math.min` over exactly two arguments.
+pub const STUB_MATH_MIN_LEAF: RuntimeStubDescriptor = descriptor(
+    84,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
     RuntimeStubException::Never,
     RuntimeStubResultAbi::StatusPair,
 );
@@ -1328,6 +1374,10 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         78 => "array_shift_leaf",
         79 => "array_unshift_alloc",
         80 => "math_abs_leaf",
+        81 => "math_floor_leaf",
+        82 => "math_sqrt_leaf",
+        83 => "math_max_leaf",
+        84 => "math_min_leaf",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1414,6 +1464,10 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_ARRAY_SHIFT_LEAF,
     STUB_ARRAY_UNSHIFT_ALLOC,
     STUB_MATH_ABS_LEAF,
+    STUB_MATH_FLOOR_LEAF,
+    STUB_MATH_SQRT_LEAF,
+    STUB_MATH_MAX_LEAF,
+    STUB_MATH_MIN_LEAF,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

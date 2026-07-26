@@ -9,6 +9,8 @@
 //!   that cannot execute them.
 //! - [`emit_exotic_length_fast`] — the `.length` reads no cache program can
 //!   describe.
+//! - [`emit_native_leaf_call`] — guard a callee's bootstrap identity and run
+//!   its declared leaf entry without materializing a frame.
 //!
 //! # Invariants
 //! - Both tiers emit property probes from here. A cache program has exactly one
@@ -27,9 +29,15 @@
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::JitCompileSnapshot;
 
+use otter_vm::native_abi::{RuntimeStubId, runtime_stub_name};
+use otter_vm::runtime_stubs::leaf_no_alloc_stub2_by_id;
+
 use super::values::{emit_box_int32, emit_load_symbol_u64, emit_load_u64};
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
-use crate::entry::{IC_WAYS, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, WHISKER_IC_WAY_BYTES};
+use crate::entry::{
+    IC_WAYS, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, THREAD_OFFSET, Unsupported, VALUE_UNDEFINED,
+    VM_THREAD_GC_HEAP_OFFSET, WHISKER_IC_WAY_BYTES,
+};
 
 /// Match `w14` against the cell's ways, branching to `miss` when none hold.
 ///
@@ -167,4 +175,123 @@ pub(crate) fn emit_exotic_length_fast(
     );
     emit_box_int32(ops, 9, 12);
     dynasm!(ops ; .arch aarch64 ; b =>have_length);
+}
+
+/// Whether a declared leaf entry can be called inline at a site of this arity.
+///
+/// Support follows the declaration: an entry is callable exactly when it is a
+/// guarded callable builtin and the site passes the argument count that entry
+/// implements. No builtin is named here, so a new one costs a declaration and
+/// no generated code.
+pub(crate) fn native_leaf_call_is_supported(
+    view: &JitCompileSnapshot,
+    stub_id: RuntimeStubId,
+    argc: usize,
+) -> bool {
+    let Some(declaration) = otter_vm::math::jit_leaf_builtin(stub_id) else {
+        return false;
+    };
+    view.native_static_fn_byte != 0
+        && argc == usize::from(declaration.argument_count)
+        && leaf_no_alloc_stub2_by_id(stub_id).is_some()
+}
+
+/// Guard a callee's exact bootstrap identity, then run its declared leaf entry.
+///
+/// Every guard runs *before* any argument is materialized, and arguments are
+/// loaded straight into the ABI registers the entry reads. An argument
+/// therefore never occupies a register the guard sequence owns, which is the
+/// whole clobber class that parking inputs ahead of the guards makes
+/// expressible.
+///
+/// `callee_x` holds the callee `Value` and must not name guard scratch.
+/// `load_argument(ops, index, register)` materializes one argument and runs
+/// only once every guard has passed, so it may freely use `x10`–`x15`. The
+/// boxed result is left in `x0`; every miss branches to `bail`.
+pub(crate) fn emit_native_leaf_call<F>(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    stub_id: RuntimeStubId,
+    builtin_fn_addr: usize,
+    callee_x: u8,
+    mut load_argument: F,
+    bail: DynamicLabel,
+) -> Result<(), Unsupported>
+where
+    F: FnMut(&mut Assembler, u8, u8) -> Result<(), Unsupported>,
+{
+    let (Some(declaration), Some(stub)) = (
+        otter_vm::math::jit_leaf_builtin(stub_id),
+        leaf_no_alloc_stub2_by_id(stub_id),
+    ) else {
+        return Err(Unsupported::OperandShape("native leaf entry"));
+    };
+    debug_assert!(
+        !(12..=16).contains(&callee_x),
+        "the callee must survive the guard, which owns x12..x16"
+    );
+    debug_assert!(stub.is_valid());
+
+    let native_type_tag = u32::from(view.collection_layout.native_function_type_tag);
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz x12, NUMBER_TAG_HI16, lsl #48
+        ; orr x12, x12, #0x2       // NOT_CELL_MASK
+        ; tst X(callee_x), x12
+        ; b.ne =>bail
+        ; cbz X(callee_x), =>bail
+        ; ldrb w14, [X(callee_x)]
+        ; cmp w14, native_type_tag
+        ; b.ne =>bail
+        ; ldr x14, [X(callee_x), view.native_static_fn_byte]
+    );
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        15,
+        builtin_fn_addr as u64,
+        RelocationTarget::NativeLeafBuiltinFunction { stub_id },
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; cmp x14, x15
+        ; b.ne =>bail
+    );
+
+    // Guards are done; nothing below is live across a miss. `(heap, arg0, arg1)
+    // -> pair`, with no safepoint: a leaf entry cannot allocate, collect, or
+    // re-enter JS.
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x0, [x20, THREAD_OFFSET]
+        ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+    );
+    load_argument(ops, 0, 1)?;
+    if declaration.argument_count >= 2 {
+        load_argument(ops, 1, 2)?;
+    } else {
+        emit_load_u64(ops, 2, VALUE_UNDEFINED);
+    }
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        16,
+        stub.entry_addr() as u64,
+        RelocationTarget::runtime_stub(stub.descriptor),
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; and x1, x1, #0xff
+        ; cbnz x1, =>bail
+    );
+    Ok(())
+}
+
+/// Declared entry name for one guarded callable builtin, for diagnostics.
+///
+/// Process-independent: the id names a declaration, never an address.
+pub(crate) fn native_leaf_call_name(stub_id: RuntimeStubId) -> &'static str {
+    runtime_stub_name(stub_id)
 }

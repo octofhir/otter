@@ -146,6 +146,45 @@ exactly what lowering `CacheOp` into generated code removes, so Slice 1 has
 a measurable target: drive `jit-runtime-property-stubs` on this kernel
 toward zero and re-run `just vs`.
 
+## Slice 2 target, measured before any code
+
+After Slice 1 every kernel reports a native-transition count of ~250 and a
+property-stub count of 0. The suite had gone blind to exactly the axis Slice
+2 attacks, so `native-boundary` was added: a loop of nothing but builtins —
+string methods, `Math`, and a `Map` round-trip.
+
+| | value |
+| --- | ---: |
+| otter | 82.22 ms |
+| node | 3.83 ms |
+| bun | 3.15 ms |
+| **vs node** | **21.44x** |
+| **vs bun** | **26.10x** |
+
+Both axes light up, per invocation of 200 000 iterations:
+
+| Axis | Per invocation | Per iteration |
+| --- | ---: | ---: |
+| `native` | 796 049 | 4.0 |
+| `prop_stub` | 398 000 | 2.0 |
+
+Two distinct causes, and they need different work:
+
+1. **Property loads on non-ordinary receivers stay on the stub.** `word.length`
+   on a string primitive and `table.get` on a `Map` are property loads whose
+   receiver fails `supports_fast_property_ic`, so no cache program is ever
+   built. That is CacheIR op-set coverage — the same shape of fix as the
+   prototype hop.
+2. **Every builtin call crosses the boundary untyped.** Four transitions per
+   iteration through `NativeFastFn`'s `&[Value]` slice. That is the native
+   descriptor work: types are known at macro expansion and thrown away.
+
+The kernel suite is now honest about both. `method-call-monomorphic` (4.67x
+node / 9.02x bun) and `branch-phi` (7.39x node) remain, but their event axes
+are zero and their bytecode is at parity with Ignition (18 ops against 20),
+so what is left there is optimizing-tier code quality, not substrate work —
+a different slice, and not one to start by hand-tuning.
+
 ## Fixed to make the gate runnable
 
 Both were sitting on `main` before this work and made `just gate`

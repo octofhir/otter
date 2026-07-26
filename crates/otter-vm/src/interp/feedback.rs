@@ -156,53 +156,35 @@ impl FeedbackDirectory {
             })
     }
 
-    /// Encode one monomorphic own-data load recipe for the WhiskerIC cell.
+    /// Lower this load site's cache program to the way generated code runs.
+    ///
+    /// Whatever the stub's op sequence is — own data, or a guarded hop to the
+    /// receiver's prototype — the lowering walks it. A shape the site has never
+    /// seen, or a program with an op that has no inline form yet, yields `None`
+    /// and leaves the access on the stub.
     pub(crate) fn whisker_load_cell_fill(
         &self,
         site: usize,
         obj: crate::object::JsObject,
         heap: &otter_gc::GcHeap,
         key: crate::property_atom::AtomizedPropertyKey<'_>,
-    ) -> u64 {
-        let recv_shape = crate::object::shape(obj, heap).offset();
-        if recv_shape == 0 {
-            return 0;
-        }
-        let Some(stubs) = self.property_stubs(site, PropertyIcKind::Load) else {
-            return 0;
-        };
-        for stub in stubs {
-            if let Some(hit) = stub.own_data_hit()
-                && hit.shape.offset() == recv_shape
-                && hit.atom_id == key.atom().id()
-                && crate::object::load_own_data_slot_atom(obj, heap, key, hit).is_some()
-            {
-                let value_byte = u32::from(hit.slot)
-                    * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
-                return (u64::from(value_byte) << 32) | u64::from(hit.shape.offset());
-            }
-        }
-        0
+    ) -> Option<crate::jit::JitPropertyIcWay> {
+        self.property_stubs(site, PropertyIcKind::Load)?
+            .iter()
+            .find_map(|stub| stub.lower_jit_way(obj, heap, key))
     }
 
-    /// Encode one monomorphic existing-own-data store recipe for WhiskerIC.
-    pub(crate) fn whisker_store_cell_fill(&self, site: usize, recv_shape: u32) -> u64 {
-        if recv_shape == 0 {
-            return 0;
-        }
-        let Some(stubs) = self.property_stubs(site, PropertyIcKind::Store) else {
-            return 0;
-        };
-        for stub in stubs {
-            if let Some(hit) = stub.store_own_data_hit()
-                && hit.shape.offset() == recv_shape
-            {
-                let value_byte = u32::from(hit.slot)
-                    * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
-                return (u64::from(value_byte) << 32) | u64::from(hit.shape.offset());
-            }
-        }
-        0
+    /// Lower this store site's cache program the same way.
+    pub(crate) fn whisker_store_cell_fill(
+        &self,
+        site: usize,
+        obj: crate::object::JsObject,
+        heap: &otter_gc::GcHeap,
+        key: crate::property_atom::AtomizedPropertyKey<'_>,
+    ) -> Option<crate::jit::JitPropertyIcWay> {
+        self.property_stubs(site, PropertyIcKind::Store)?
+            .iter()
+            .find_map(|stub| stub.lower_jit_way(obj, heap, key))
     }
 
     #[must_use]
@@ -242,7 +224,7 @@ impl FeedbackDirectory {
 
     pub(crate) fn record_property_uncached_miss(&mut self, site: usize, kind: PropertyIcKind) {
         let (bank, stats) = self.property_bank_with_stats_mut(kind);
-        if let Some(entry) = bank.get(site) {
+        if let Some(entry) = bank.get_mut(site) {
             entry.record_uncached_miss_with_stats(stats, kind);
         }
     }

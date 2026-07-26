@@ -47,7 +47,9 @@ pub(crate) use lowering::{
     unpack_method_arg_regs,
 };
 use runtime_ops::*;
-pub(crate) use runtime_ops::{IC_WAYS, WhiskerIcCell, jit_backedge_poll_stub};
+pub(crate) use runtime_ops::{
+    IC_WAYS, WHISKER_IC_WAY_BYTES, WhiskerIcCell, jit_backedge_poll_stub,
+};
 pub(crate) use value_abi::*;
 
 /// GC header type tag for an ordinary `ObjectBody` (mirrors

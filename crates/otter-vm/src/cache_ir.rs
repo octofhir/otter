@@ -30,19 +30,10 @@ use smallvec::SmallVec;
 use otter_gc::raw::SlotVisitor;
 
 use crate::object::{
-    self, AtomOwnPropertyHit, OwnPropertySlotHit, ShapeHandle, ShapeId, StorePropertyTransition,
+    self, AtomOwnPropertyHit, OwnPropertySlotHit, ShapeId, StorePropertyTransition,
 };
 use crate::property_atom::AtomizedPropertyKey;
 use crate::{JsObject, JsString, Value};
-
-/// Version stamp for the [`CacheStub`] / [`CacheOp`] feedback ABI.
-///
-/// The optimizing tier transpiles a [`CacheStubSnapshot`] taken at compile
-/// time and records the version it compiled against, so a stub whose op
-/// semantics or table encoding later change (a bumped version) is recognized as
-/// incompatible rather than mis-transpiled. Bump whenever a [`CacheOp`]
-/// variant's meaning, operand assignment, or table indexing changes.
-pub(crate) const CACHE_STUB_ABI_VERSION: u32 = 1;
 
 /// Operand slot in a stub's tiny register file. `0` is the receiver; `1` is the
 /// receiver's prototype after [`CacheOp::LoadPrototype`].
@@ -111,10 +102,6 @@ pub(crate) struct CacheStub {
     ops: SmallVec<[CacheOp; 4]>,
     /// Receiver / prototype shape ids guarded by [`CacheOp::GuardShapeId`].
     shape_ids: SmallVec<[ShapeId; 1]>,
-    /// Receiver shapes for direct-prototype load stubs. The interpreter guards
-    /// by [`ShapeId`], while the JIT needs the immortal shape handle's
-    /// compressed offset for an inline shape compare.
-    receiver_shapes: SmallVec<[ShapeHandle; 1]>,
     /// Atom-aware own-property hits consumed by load terminals.
     hits: SmallVec<[AtomOwnPropertyHit; 1]>,
     /// Slot hits consumed by `has` terminals.
@@ -147,7 +134,6 @@ impl CacheStub {
     #[must_use]
     pub(crate) fn load_direct_prototype_data(
         receiver_shape_id: ShapeId,
-        receiver_shape: ShapeHandle,
         hit: AtomOwnPropertyHit,
     ) -> Self {
         let mut ops = SmallVec::new();
@@ -157,7 +143,6 @@ impl CacheStub {
         Self {
             ops,
             shape_ids: SmallVec::from_elem(receiver_shape_id, 1),
-            receiver_shapes: SmallVec::from_elem(receiver_shape, 1),
             hits: SmallVec::from_elem(hit, 1),
             ..Self::default()
         }
@@ -326,7 +311,6 @@ impl CacheStub {
             return None;
         }
         let receiver_shape_id = object::shape_id(obj, heap);
-        let receiver_shape = object::shape(obj, heap);
         let atom_lookup = object::lookup_own_atom(obj, heap, key);
         if let (Some(hit), object::PropertyLookup::Data { value, .. }) =
             (atom_lookup.hit, atom_lookup.lookup)
@@ -345,7 +329,7 @@ impl CacheStub {
             (proto_lookup.hit, proto_lookup.lookup)
         {
             return Some((
-                Self::load_direct_prototype_data(receiver_shape_id, receiver_shape, hit),
+                Self::load_direct_prototype_data(receiver_shape_id, hit),
                 value,
             ));
         }
@@ -381,28 +365,6 @@ impl CacheStub {
                 [shape_id],
                 [hit],
             ) => Some((*shape_id, *hit)),
-            _ => None,
-        }
-    }
-
-    /// The `(receiver shape, prototype hit)` of a direct-prototype data load
-    /// stub, for JIT lowering.
-    #[must_use]
-    pub(crate) fn direct_prototype_load_jit(&self) -> Option<(ShapeHandle, AtomOwnPropertyHit)> {
-        match (
-            self.ops.as_slice(),
-            self.receiver_shapes.as_slice(),
-            self.hits.as_slice(),
-        ) {
-            (
-                [
-                    CacheOp::GuardShapeId { obj: 0, shape: 0 },
-                    CacheOp::LoadPrototype { obj: 0, dst: 1 },
-                    CacheOp::LoadDataSlotResult { obj: 1, hit: 0 },
-                ],
-                [shape],
-                [hit],
-            ) => Some((*shape, *hit)),
             _ => None,
         }
     }
@@ -542,116 +504,82 @@ impl CacheStub {
         }
     }
 
-    /// Take an immutable copy-on-compile snapshot of this stub. Captures the
-    /// stub's program and tables at this instant so the optimizing tier reads a
-    /// stable view for the duration of a compile, decoupled from later
-    /// interpreter updates to the live site.
-    #[allow(dead_code)] // consumed by the optimizing tier when it re-enables.
+    /// Lower this stub to the guarded sequence generated code executes inline.
+    ///
+    /// This walks the op program rather than matching whole stub shapes, so a
+    /// new op composition becomes inline-capable the moment its ops are
+    /// individually lowerable — no new recognizer, no new emitter case.
+    ///
+    /// `recv` is the live receiver the site just saw: the returned way's guard
+    /// token is its current shape, and every op is replayed against it so a
+    /// stub that no longer applies lowers to `None` instead of a wrong slot.
     #[must_use]
-    pub(crate) fn snapshot(&self) -> CacheStubSnapshot {
-        CacheStubSnapshot {
-            stub: self.clone(),
-            version: CACHE_STUB_ABI_VERSION,
+    pub(crate) fn lower_jit_way(
+        &self,
+        recv: JsObject,
+        heap: &otter_gc::GcHeap,
+        key: AtomizedPropertyKey<'_>,
+    ) -> Option<crate::jit::JitPropertyIcWay> {
+        let receiver_shape = object::shape(recv, heap).offset();
+        if receiver_shape == 0 {
+            return None;
         }
+
+        let mut holder = recv;
+        let mut holder_shape = 0;
+        for op in &self.ops {
+            match *op {
+                CacheOp::GuardShapeId { obj: 0, shape } => {
+                    if object::shape_id(recv, heap) != self.shape_ids[shape as usize] {
+                        return None;
+                    }
+                }
+                CacheOp::LoadPrototype { obj: 0, dst: 1 } => {
+                    let proto = object::prototype(recv, heap)?;
+                    if !object::supports_fast_property_ic(proto, heap) {
+                        return None;
+                    }
+                    let shape = object::shape(proto, heap).offset();
+                    if shape == 0 {
+                        return None;
+                    }
+                    holder = proto;
+                    holder_shape = shape;
+                }
+                CacheOp::LoadDataSlotResult { hit, .. } => {
+                    let hit = self.hits[hit as usize];
+                    if hit.atom_id != key.atom().id()
+                        || hit.shape.offset() != object::shape(holder, heap).offset()
+                        || object::load_own_data_slot_atom(holder, heap, key, hit).is_none()
+                    {
+                        return None;
+                    }
+                    return Some(crate::jit::JitPropertyIcWay {
+                        receiver_shape,
+                        holder_shape,
+                        value_byte: slot_value_byte(hit.slot),
+                    });
+                }
+                CacheOp::StoreDataSlot { obj: 0, hit } => {
+                    let hit = self.hits[hit as usize];
+                    if hit.shape.offset() != receiver_shape {
+                        return None;
+                    }
+                    return Some(crate::jit::JitPropertyIcWay {
+                        receiver_shape,
+                        holder_shape,
+                        value_byte: slot_value_byte(hit.slot),
+                    });
+                }
+                // Ops with no inline lowering yet keep the site on the stub.
+                _ => return None,
+            }
+        }
+        None
     }
 }
 
-/// Immutable copy-on-compile view of a [`CacheStub`].
-///
-/// The optimizing tier must read a site's cache from a stable snapshot for the
-/// duration of a compile, never the live mutable stub the interpreter keeps
-/// updating. A snapshot owns an independent clone of the stub's program and
-/// tables taken at one instant, so a later interpreter update to the site never
-/// shifts the shape ids or slot offsets the compile baked. The captured
-/// [`CACHE_STUB_ABI_VERSION`] lets a transpiler reject a stub whose ABI changed
-/// under it.
-///
-/// GC-safe with no tracing required: every shape the tables reference is
-/// interned, immortal, and pinned in non-moving old space, so a snapshot's
-/// captured shape ids and transition targets neither dangle nor relocate while
-/// it is held. [`Self::trace_roots`] is offered for callers that root it anyway.
-#[allow(dead_code)] // the read surface the optimizing tier lowers from on re-enable.
-#[derive(Debug, Clone)]
-pub(crate) struct CacheStubSnapshot {
-    stub: CacheStub,
-    version: u32,
-}
-
-#[allow(dead_code)] // forward ABI: every accessor is a compile-time reader for the JIT.
-impl CacheStubSnapshot {
-    /// ABI version this snapshot was taken under.
-    #[must_use]
-    pub(crate) fn version(&self) -> u32 {
-        self.version
-    }
-
-    /// Own-data load hit, if this site is a monomorphic own-data load.
-    #[must_use]
-    pub(crate) fn own_data_hit(&self) -> Option<AtomOwnPropertyHit> {
-        self.stub.own_data_hit()
-    }
-
-    /// Direct-prototype data load: the guarded prototype shape and the hit.
-    #[must_use]
-    pub(crate) fn direct_prototype_load(&self) -> Option<(ShapeId, AtomOwnPropertyHit)> {
-        self.stub.direct_prototype_load()
-    }
-
-    /// Direct-prototype data load as JIT-readable shape handles.
-    #[must_use]
-    pub(crate) fn direct_prototype_load_jit(&self) -> Option<(ShapeHandle, AtomOwnPropertyHit)> {
-        self.stub.direct_prototype_load_jit()
-    }
-
-    /// Existing-own-data store hit.
-    #[must_use]
-    pub(crate) fn store_own_data_hit(&self) -> Option<AtomOwnPropertyHit> {
-        self.stub.store_own_data_hit()
-    }
-
-    /// Replayed add-transition of an add-a-slot store stub.
-    #[must_use]
-    pub(crate) fn store_transition_ref(&self) -> Option<&StorePropertyTransition> {
-        self.stub.store_transition_ref()
-    }
-
-    /// Visit GC roots — the target shapes of replayed transitions. Not required
-    /// (referenced shapes are immortal and pinned) but offered for callers that
-    /// choose to root the snapshot.
-    pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
-        self.stub.trace_roots(visitor);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn snapshot_is_independent_of_later_site_updates() {
-        // A monomorphic own-data store stub at slot 7. The hit's exact
-        // contents are irrelevant here; the snapshot semantics are.
-        let hit = AtomOwnPropertyHit {
-            shape_id: ShapeId::UNASSIGNED,
-            shape: object::ShapeHandle::null(),
-            atom_id: crate::property_atom::AtomId::from_constant_index(7),
-            slot: 7,
-            is_data: true,
-        };
-        let mut site = CacheStub::store_own_data(hit);
-        let snap = site.snapshot();
-
-        // The snapshot reads the captured store hit and the current ABI version.
-        assert_eq!(snap.version(), CACHE_STUB_ABI_VERSION);
-        assert!(snap.store_own_data_hit().is_some());
-        assert!(snap.own_data_hit().is_none());
-
-        // The live site is then replaced by a different (load) stub, as happens
-        // when the interpreter re-profiles the site. The snapshot, owning its
-        // own clone, is unaffected.
-        site = CacheStub::load_own_data(hit);
-        assert!(site.own_data_hit().is_some());
-        assert!(snap.store_own_data_hit().is_some());
-        assert!(snap.own_data_hit().is_none());
-    }
+/// Byte offset of a string-keyed own slot inside the object's value slab.
+fn slot_value_byte(slot: u16) -> u32 {
+    u32::from(slot) * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32
 }

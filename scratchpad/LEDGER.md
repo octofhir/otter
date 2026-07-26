@@ -179,6 +179,29 @@ Two distinct causes, and they need different work:
    iteration through `NativeFastFn`'s `&[Value]` slice. That is the native
    descriptor work: types are known at macro expansion and thrown away.
 
+Isolated per operation, `production-tiered`, 200 000 iterations each:
+
+| Operation | prop_stub/iter | native/iter | wall |
+| --- | ---: | ---: | ---: |
+| `t.set(k, v)` + `t.get(k)` | 0.00 | 1.00 | **30.52 ms** |
+| `Math.abs(i & 15)` | 0.00 | 0.00 | **12.67 ms** |
+| `W[i & 7].length` | **1.00** | **1.00** | 4.35 ms |
+| `W[i & 7].charCodeAt(i & 3)` | 0.00 | 0.00 | 2.27 ms |
+
+Ranked, and two of the three are not what the aggregate suggested:
+
+- **`Map.set` dominates at 30.5 ms** with one transition per iteration. The
+  non-allocating read is already inline; the allocating write is not.
+- **`Math.abs` costs 12.7 ms while crossing nothing.** Zero transitions and
+  zero stubs, yet 63 ns per iteration against node's 19 ns for the whole
+  six-operation loop. Its cost is in the guarded call sequence, not the
+  boundary — so the descriptor work will not touch it and it needs its own
+  measurement before anyone writes code for it.
+- **String `.length` is the only property-stub source**: one stub *and* one
+  transition per iteration, even though an inline primitive-string length
+  path exists in the emitter. Its receiver is a primitive, so no cache
+  program is built for it at all.
+
 The kernel suite is now honest about both. `method-call-monomorphic` (4.67x
 node / 9.02x bun) and `branch-phi` (7.39x node) remain, but their event axes
 are zero and their bytecode is at parity with Ignition (18 ops against 20),

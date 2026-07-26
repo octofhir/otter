@@ -186,24 +186,6 @@ pub(super) extern "C" fn jit_make_closure_stub(
     park_result(ctx, result)
 }
 
-pub(super) extern "C" fn jit_math_call_stub(
-    ctx: *mut JitCtx,
-    dst: u64,
-    method_id: u64,
-    argument_regs: *const u16,
-    argument_count: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract and immutable metadata owner.
-    let ctx = unsafe { &mut *ctx };
-    let argument_regs =
-        unsafe { std::slice::from_raw_parts(argument_regs, argument_count as usize) };
-    let result = (|| {
-        ctx.runtime_call()?
-            .math_call(dst as u16, method_id as u32, argument_regs)
-    })();
-    park_result(ctx, result)
-}
-
 pub(super) extern "C" fn jit_new_array_stub(
     ctx: *mut JitCtx,
     dst: u64,

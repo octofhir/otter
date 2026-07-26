@@ -119,18 +119,6 @@ impl TransitionTable {
         self.entry(descriptor)
     }
 
-    /// Validated machine entry for a `NullaryValue` producer.
-    pub(crate) fn nullary_value_entry(
-        &self,
-        descriptor: otter_vm::native_abi::RuntimeStubDescriptor,
-    ) -> u64 {
-        assert_eq!(
-            descriptor.signature,
-            otter_vm::native_abi::RuntimeStubSignature::NullaryValue
-        );
-        self.entry(descriptor)
-    }
-
     /// Swap any stub entry for a test double, whatever its signature family.
     #[cfg(test)]
     pub(crate) fn replace_entry_for_test(
@@ -181,10 +169,6 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
         ),
         binding(abi::STUB_JIT_ADD, jit_add_stub as *const () as usize),
         binding(abi::STUB_JIT_NEG, jit_neg_stub as *const () as usize),
-        binding(
-            abi::STUB_JIT_MATH_CALL,
-            jit_math_call_stub as *const () as usize,
-        ),
         binding(
             abi::STUB_JIT_LOAD_GLOBAL,
             jit_load_global_stub as *const () as usize,
@@ -276,10 +260,6 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
         binding(
             abi::STUB_JIT_INLINE_CLOSURE_UPVALUES,
             jit_inline_closure_upvalues_stub as *const () as usize,
-        ),
-        binding(
-            abi::STUB_JIT_MATH_RANDOM,
-            otter_jit_math_random as *const () as usize,
         ),
         binding(
             abi::STUB_JIT_LOOSE_EQ,
@@ -667,16 +647,6 @@ mod tests {
                 ],
             ),
             (
-                Op::MathCall,
-                vec![
-                    Operand::Register(3),
-                    Operand::ConstIndex(0),
-                    Operand::ConstIndex(2),
-                    Operand::Register(1),
-                    Operand::Register(2),
-                ],
-            ),
-            (
                 Op::MakeClosure,
                 vec![
                     Operand::Register(4),
@@ -704,23 +674,18 @@ mod tests {
             .expect("NewArray operands");
         assert_eq!(array.dst, 0);
         assert_eq!(plan.register_tail(array.elements), Ok(&[1, 2][..]));
-        let math = plan.instructions[1]
-            .math_call_operands()
-            .expect("MathCall operands");
-        assert_eq!((math.dst, math.method), (3, 0));
-        assert_eq!(plan.register_tail(math.arguments), Ok(&[1, 2][..]));
-        let closure = plan.instructions[2]
+        let closure = plan.instructions[1]
             .make_closure_operands()
             .expect("MakeClosure operands");
         assert_eq!((closure.dst, closure.function), (4, 9));
         assert_eq!(plan.index_tail(closure.parents), Ok(&[0, 1][..]));
         assert_eq!(
-            plan.instructions[3]
+            plan.instructions[2]
                 .immediate_operands()
                 .map(|operands| operands.value),
             Ok(6)
         );
-        let triple = plan.instructions[4]
+        let triple = plan.instructions[3]
             .triple_operands()
             .expect("DefineDataProperty operands");
         assert_eq!((triple.first, triple.second, triple.third), (0, 1, 2));

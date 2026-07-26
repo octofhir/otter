@@ -2769,7 +2769,6 @@ mod tests {
                     descriptor.signature,
                     crate::native_abi::RuntimeStubSignature::Poll1
                         | crate::native_abi::RuntimeStubSignature::Variadic
-                        | crate::native_abi::RuntimeStubSignature::NullaryValue
                 ));
             }
         }

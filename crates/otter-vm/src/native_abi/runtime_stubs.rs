@@ -136,8 +136,6 @@ pub enum RuntimeStubSignature {
     /// every call site. Precise roots are published through the VM frame the
     /// context names, not through a numeric safepoint id.
     Variadic = 3,
-    /// Nullary value producer (`fn() -> value bits`).
-    NullaryValue = 4,
     /// `(heap_mut, value0, value1)` leaf mutation.
     ///
     /// Same shape as [`Self::LeafValue2`] with a mutable heap: the entry may
@@ -448,19 +446,9 @@ pub const STUB_JIT_NEG: RuntimeStubDescriptor = descriptor(
     RuntimeStubException::Status,
     RuntimeStubResultAbi::StatusWord,
 );
-/// `Math.*` builtin call; argument coercion may re-enter JS.
-pub const STUB_JIT_MATH_CALL: RuntimeStubDescriptor = descriptor(
-    15,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-);
 /// Global read; global accessors may re-enter JS.
 pub const STUB_JIT_LOAD_GLOBAL: RuntimeStubDescriptor = descriptor(
-    16,
+    15,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -470,7 +458,7 @@ pub const STUB_JIT_LOAD_GLOBAL: RuntimeStubDescriptor = descriptor(
 );
 /// Computed element read; getters/proxies may re-enter JS.
 pub const STUB_JIT_LOAD_ELEMENT: RuntimeStubDescriptor = descriptor(
-    17,
+    16,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -480,7 +468,7 @@ pub const STUB_JIT_LOAD_ELEMENT: RuntimeStubDescriptor = descriptor(
 );
 /// Computed element write; setters/proxies may re-enter JS.
 pub const STUB_JIT_STORE_ELEMENT: RuntimeStubDescriptor = descriptor(
-    18,
+    17,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -490,7 +478,7 @@ pub const STUB_JIT_STORE_ELEMENT: RuntimeStubDescriptor = descriptor(
 );
 /// Descriptor-driven define; descriptor reads may re-enter JS.
 pub const STUB_JIT_DEFINE_OWN_PROPERTY: RuntimeStubDescriptor = descriptor(
-    19,
+    18,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -500,7 +488,7 @@ pub const STUB_JIT_DEFINE_OWN_PROPERTY: RuntimeStubDescriptor = descriptor(
 );
 /// Named-property IC miss handler over the canonical activation.
 pub const STUB_JIT_LOAD_PROPERTY: RuntimeStubDescriptor = descriptor(
-    20,
+    19,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -510,7 +498,7 @@ pub const STUB_JIT_LOAD_PROPERTY: RuntimeStubDescriptor = descriptor(
 );
 /// Named-property store miss handler; shape transitions allocate.
 pub const STUB_JIT_STORE_PROPERTY: RuntimeStubDescriptor = descriptor(
-    21,
+    20,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -520,7 +508,7 @@ pub const STUB_JIT_STORE_PROPERTY: RuntimeStubDescriptor = descriptor(
 );
 /// Plain data-property define.
 pub const STUB_JIT_DEFINE_DATA_PROPERTY: RuntimeStubDescriptor = descriptor(
-    22,
+    21,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -530,7 +518,7 @@ pub const STUB_JIT_DEFINE_DATA_PROPERTY: RuntimeStubDescriptor = descriptor(
 );
 /// String-constant materialization.
 pub const STUB_JIT_LOAD_STRING: RuntimeStubDescriptor = descriptor(
-    23,
+    22,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -540,7 +528,7 @@ pub const STUB_JIT_LOAD_STRING: RuntimeStubDescriptor = descriptor(
 );
 /// Builtin error-constructor load.
 pub const STUB_JIT_LOAD_BUILTIN_ERROR: RuntimeStubDescriptor = descriptor(
-    24,
+    23,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -550,7 +538,7 @@ pub const STUB_JIT_LOAD_BUILTIN_ERROR: RuntimeStubDescriptor = descriptor(
 );
 /// `MakeFunction` closure construction.
 pub const STUB_JIT_MAKE_FN: RuntimeStubDescriptor = descriptor(
-    25,
+    24,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -560,7 +548,7 @@ pub const STUB_JIT_MAKE_FN: RuntimeStubDescriptor = descriptor(
 );
 /// `MakeClosure` construction with captured parent upvalues.
 pub const STUB_JIT_MAKE_CLOSURE: RuntimeStubDescriptor = descriptor(
-    26,
+    25,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -570,7 +558,7 @@ pub const STUB_JIT_MAKE_CLOSURE: RuntimeStubDescriptor = descriptor(
 );
 /// Ordinary object allocation.
 pub const STUB_JIT_NEW_OBJECT: RuntimeStubDescriptor = descriptor(
-    27,
+    26,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -580,7 +568,7 @@ pub const STUB_JIT_NEW_OBJECT: RuntimeStubDescriptor = descriptor(
 );
 /// Array literal allocation.
 pub const STUB_JIT_NEW_ARRAY: RuntimeStubDescriptor = descriptor(
-    28,
+    27,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -590,7 +578,7 @@ pub const STUB_JIT_NEW_ARRAY: RuntimeStubDescriptor = descriptor(
 );
 /// Fresh loop-iteration upvalue cell allocation.
 pub const STUB_JIT_FRESH_UPVALUE: RuntimeStubDescriptor = descriptor(
-    29,
+    28,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -600,7 +588,7 @@ pub const STUB_JIT_FRESH_UPVALUE: RuntimeStubDescriptor = descriptor(
 );
 /// Registers a native activation's scalar root slots.
 pub const STUB_JIT_PUSH_NATIVE_ACTIVATION: RuntimeStubDescriptor = descriptor(
-    30,
+    29,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -610,7 +598,7 @@ pub const STUB_JIT_PUSH_NATIVE_ACTIVATION: RuntimeStubDescriptor = descriptor(
 );
 /// Releases the topmost native activation registration.
 pub const STUB_JIT_POP_NATIVE_ACTIVATION: RuntimeStubDescriptor = descriptor(
-    31,
+    30,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -620,7 +608,7 @@ pub const STUB_JIT_POP_NATIVE_ACTIVATION: RuntimeStubDescriptor = descriptor(
 );
 /// Captured-binding read; TDZ reads throw.
 pub const STUB_JIT_LOAD_UPVALUE: RuntimeStubDescriptor = descriptor(
-    32,
+    31,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -630,7 +618,7 @@ pub const STUB_JIT_LOAD_UPVALUE: RuntimeStubDescriptor = descriptor(
 );
 /// Captured-binding write with barrier.
 pub const STUB_JIT_STORE_UPVALUE: RuntimeStubDescriptor = descriptor(
-    33,
+    32,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -640,7 +628,7 @@ pub const STUB_JIT_STORE_UPVALUE: RuntimeStubDescriptor = descriptor(
 );
 /// TDZ-checked captured-binding write with barrier.
 pub const STUB_JIT_STORE_UPVALUE_CHECKED: RuntimeStubDescriptor = descriptor(
-    34,
+    33,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -650,7 +638,7 @@ pub const STUB_JIT_STORE_UPVALUE_CHECKED: RuntimeStubDescriptor = descriptor(
 );
 /// Generational write barrier for an inline pointer store.
 pub const STUB_JIT_WRITE_BARRIER: RuntimeStubDescriptor = descriptor(
-    35,
+    34,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -660,7 +648,7 @@ pub const STUB_JIT_WRITE_BARRIER: RuntimeStubDescriptor = descriptor(
 );
 /// Frameless write barrier over the register window.
 pub const STUB_JIT_WRITE_BARRIER_WINDOW: RuntimeStubDescriptor = descriptor(
-    36,
+    35,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -670,20 +658,10 @@ pub const STUB_JIT_WRITE_BARRIER_WINDOW: RuntimeStubDescriptor = descriptor(
 );
 /// Validates an inline-call closure and returns its upvalue base.
 pub const STUB_JIT_INLINE_CLOSURE_UPVALUES: RuntimeStubDescriptor = descriptor(
-    37,
+    36,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::leaf(false, false),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::ValueWord,
-);
-/// `Math.random` value producer.
-pub const STUB_JIT_MATH_RANDOM: RuntimeStubDescriptor = descriptor(
-    38,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::NullaryValue,
-    0,
     RuntimeStubEffects::leaf(false, false),
     RuntimeStubException::Never,
     RuntimeStubResultAbi::ValueWord,
@@ -692,7 +670,7 @@ pub const STUB_JIT_MATH_RANDOM: RuntimeStubDescriptor = descriptor(
 /// throws, never allocates; a null heap reports a miss so probe harnesses
 /// without a live isolate fall back to normal dispatch.
 pub const STUB_STRICT_EQ_LEAF: RuntimeStubDescriptor = descriptor(
-    39,
+    37,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::LeafValue2,
     2,
@@ -703,7 +681,7 @@ pub const STUB_STRICT_EQ_LEAF: RuntimeStubDescriptor = descriptor(
 /// Completes one full loose-equality opcode in the VM; object-to-primitive
 /// coercion may re-enter JS.
 pub const STUB_JIT_LOOSE_EQ: RuntimeStubDescriptor = descriptor(
-    40,
+    38,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -714,7 +692,7 @@ pub const STUB_JIT_LOOSE_EQ: RuntimeStubDescriptor = descriptor(
 /// Materializes a regex literal from the constant pool; allocates the
 /// RegExp body and may compile the pattern.
 pub const STUB_JIT_LOAD_REGEXP: RuntimeStubDescriptor = descriptor(
-    43,
+    41,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -726,7 +704,7 @@ pub const STUB_JIT_LOAD_REGEXP: RuntimeStubDescriptor = descriptor(
 /// argument is ignored): never throws, never allocates; total for every
 /// value including heap cells, so it never misses on a live isolate.
 pub const STUB_TO_BOOLEAN_LEAF: RuntimeStubDescriptor = descriptor(
-    41,
+    39,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::LeafValue2,
     2,
@@ -738,7 +716,7 @@ pub const STUB_TO_BOOLEAN_LEAF: RuntimeStubDescriptor = descriptor(
 /// numbers: full f64 remainder semantics (sign of the dividend, NaN for a
 /// zero divisor), boxed without allocation.
 pub const STUB_NUMBER_REM_LEAF: RuntimeStubDescriptor = descriptor(
-    42,
+    40,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::LeafValue2,
     2,
@@ -752,7 +730,7 @@ pub const STUB_NUMBER_REM_LEAF: RuntimeStubDescriptor = descriptor(
 /// (non-string receiver, non-integral or out-of-range index) report through
 /// the status word so the caller falls back to the general method path.
 pub const STUB_STRING_CHAR_CODE_AT_LEAF: RuntimeStubDescriptor = descriptor(
-    70,
+    68,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::LeafValue2,
     2,
@@ -765,7 +743,7 @@ pub const STUB_STRING_CHAR_CODE_AT_LEAF: RuntimeStubDescriptor = descriptor(
 /// index. Misses on a non-string receiver, a non-integral or out-of-range
 /// index, so the general path owns coercion and the `undefined` result.
 pub const STUB_STRING_CODE_POINT_AT_LEAF: RuntimeStubDescriptor = descriptor(
-    71,
+    69,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::LeafValue2,
     2,
@@ -777,7 +755,7 @@ pub const STUB_STRING_CODE_POINT_AT_LEAF: RuntimeStubDescriptor = descriptor(
 /// Leaf `String.prototype.indexOf` over two string operands, searching from
 /// index zero. Misses when either operand is not a string.
 pub const STUB_STRING_INDEX_OF_LEAF: RuntimeStubDescriptor = descriptor(
-    72,
+    70,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::LeafValue2,
     2,
@@ -789,7 +767,7 @@ pub const STUB_STRING_INDEX_OF_LEAF: RuntimeStubDescriptor = descriptor(
 /// Leaf `String.prototype.includes` over two string operands, searching from
 /// index zero. Misses when either operand is not a string.
 pub const STUB_STRING_INCLUDES_LEAF: RuntimeStubDescriptor = descriptor(
-    73,
+    71,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::LeafValue2,
     2,
@@ -801,7 +779,7 @@ pub const STUB_STRING_INCLUDES_LEAF: RuntimeStubDescriptor = descriptor(
 /// Leaf `String.prototype.startsWith` over two string operands, anchored at
 /// index zero. Misses when either operand is not a string.
 pub const STUB_STRING_STARTS_WITH_LEAF: RuntimeStubDescriptor = descriptor(
-    74,
+    72,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::LeafValue2,
     2,
@@ -813,7 +791,7 @@ pub const STUB_STRING_STARTS_WITH_LEAF: RuntimeStubDescriptor = descriptor(
 /// Leaf `String.prototype.endsWith` over two string operands, anchored at the
 /// receiver's end. Misses when either operand is not a string.
 pub const STUB_STRING_ENDS_WITH_LEAF: RuntimeStubDescriptor = descriptor(
-    75,
+    73,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::LeafValue2,
     2,
@@ -825,7 +803,7 @@ pub const STUB_STRING_ENDS_WITH_LEAF: RuntimeStubDescriptor = descriptor(
 /// Completes one full `Op::New` construct in the VM for a New site outside
 /// the compiled subset; the constructor body may run arbitrary JS.
 pub const STUB_JIT_CONSTRUCT: RuntimeStubDescriptor = descriptor(
-    44,
+    42,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -837,7 +815,7 @@ pub const STUB_JIT_CONSTRUCT: RuntimeStubDescriptor = descriptor(
 /// Completes one coercive `ToPrimitive` or `ToNumeric` opcode; user conversion
 /// hooks may allocate, throw, and re-enter arbitrary JS.
 pub const STUB_JIT_COERCE_UNARY: RuntimeStubDescriptor = descriptor(
-    45,
+    43,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -850,7 +828,7 @@ pub const STUB_JIT_COERCE_UNARY: RuntimeStubDescriptor = descriptor(
 /// The shared family is conservatively reentrant because `Increment` may run
 /// user conversion hooks and BigInt results may allocate.
 pub const STUB_JIT_NUMERIC_OP: RuntimeStubDescriptor = descriptor(
-    46,
+    44,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -862,7 +840,7 @@ pub const STUB_JIT_NUMERIC_OP: RuntimeStubDescriptor = descriptor(
 /// Completes structured exception-region state changes, abrupt unwinds, and
 /// TDZ `ReferenceError` materialization.
 pub const STUB_JIT_EXCEPTION_OP: RuntimeStubDescriptor = descriptor(
-    47,
+    45,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -874,7 +852,7 @@ pub const STUB_JIT_EXCEPTION_OP: RuntimeStubDescriptor = descriptor(
 /// Completes iterator stepping, iterator close, and closer-registry state
 /// through the VM's full iterator semantics.
 pub const STUB_JIT_ITERATOR_OP: RuntimeStubDescriptor = descriptor(
-    48,
+    46,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -886,7 +864,7 @@ pub const STUB_JIT_ITERATOR_OP: RuntimeStubDescriptor = descriptor(
 /// Completes `Function.prototype.bind` — accessor `name`/`length` getters and
 /// bound-function allocation — through the VM's full bind semantics.
 pub const STUB_JIT_BIND_FUNCTION: RuntimeStubDescriptor = descriptor(
-    49,
+    47,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -898,7 +876,7 @@ pub const STUB_JIT_BIND_FUNCTION: RuntimeStubDescriptor = descriptor(
 /// Completes global-variable reads and writes — including accessor globals —
 /// through the VM's global environment-record helpers.
 pub const STUB_JIT_GLOBAL_OP: RuntimeStubDescriptor = descriptor(
-    50,
+    48,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -911,7 +889,7 @@ pub const STUB_JIT_GLOBAL_OP: RuntimeStubDescriptor = descriptor(
 /// `[[GetPrototypeOf]]`, `[[SetPrototypeOf]]`) — including Proxy traps —
 /// through the VM's Proxy-aware drivers and fast paths.
 pub const STUB_JIT_OBJECT_PROTOCOL_OP: RuntimeStubDescriptor = descriptor(
-    51,
+    49,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -924,7 +902,7 @@ pub const STUB_JIT_OBJECT_PROTOCOL_OP: RuntimeStubDescriptor = descriptor(
 /// including the Proxy `deleteProperty` trap and unqualified delete — through
 /// the VM's delete drivers and fast paths.
 pub const STUB_JIT_DELETE_OP: RuntimeStubDescriptor = descriptor(
-    52,
+    50,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -937,7 +915,7 @@ pub const STUB_JIT_DELETE_OP: RuntimeStubDescriptor = descriptor(
 /// `ToPropertyKey`, `TypeOf`, `LoadNewTarget`, `SameValue`, `IsArray`,
 /// `ArrayLength`, `LoadLength`) through the VM's register helpers.
 pub const STUB_JIT_SCALAR_OP: RuntimeStubDescriptor = descriptor(
-    53,
+    51,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -950,7 +928,7 @@ pub const STUB_JIT_SCALAR_OP: RuntimeStubDescriptor = descriptor(
 /// `LoadSuperElement`, `SetSuperProperty`, `SetSuperElement`) — including home-
 /// prototype accessor getters/setters — through the VM's super helpers.
 pub const STUB_JIT_SUPER_OP: RuntimeStubDescriptor = descriptor(
-    54,
+    52,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -963,7 +941,7 @@ pub const STUB_JIT_SUPER_OP: RuntimeStubDescriptor = descriptor(
 /// `PrivateBrandCheck`) — including private accessor getters/setters — through
 /// the VM's private-element helpers.
 pub const STUB_JIT_PRIVATE_OP: RuntimeStubDescriptor = descriptor(
-    55,
+    53,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -975,7 +953,7 @@ pub const STUB_JIT_PRIVATE_OP: RuntimeStubDescriptor = descriptor(
 /// Completes static value loads (`MathLoad`, `SymbolLoad`, `TemporalLoad`,
 /// `LoadBigInt`, `GetStringIndex`) through the VM's load helpers.
 pub const STUB_JIT_VALUE_LOAD_OP: RuntimeStubDescriptor = descriptor(
-    56,
+    54,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -987,7 +965,7 @@ pub const STUB_JIT_VALUE_LOAD_OP: RuntimeStubDescriptor = descriptor(
 /// Completes allocating construction opcodes (`CollectRest`, `NewError`,
 /// `NewBuiltinError`, `ArrayPush`) through the VM's construction helpers.
 pub const STUB_JIT_CONSTRUCT_OP: RuntimeStubDescriptor = descriptor(
-    57,
+    55,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -999,7 +977,7 @@ pub const STUB_JIT_CONSTRUCT_OP: RuntimeStubDescriptor = descriptor(
 /// Completes structural object opcodes (`ForInKeys`, `CopyDataProperties`)
 /// through the VM's structural helpers.
 pub const STUB_JIT_STRUCTURAL_OP: RuntimeStubDescriptor = descriptor(
-    58,
+    56,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -1011,7 +989,7 @@ pub const STUB_JIT_STRUCTURAL_OP: RuntimeStubDescriptor = descriptor(
 /// Completes class-construction opcodes (`BindThisValue`, `ClassCheck`,
 /// `SetFunctionName`) through the VM's class helpers.
 pub const STUB_JIT_CLASS_OP: RuntimeStubDescriptor = descriptor(
-    59,
+    57,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -1023,7 +1001,7 @@ pub const STUB_JIT_CLASS_OP: RuntimeStubDescriptor = descriptor(
 /// Completes variadic construction opcodes (`ArrayConstruct`, `ArrayFrom`,
 /// `ArrayOf`, `QueueMicrotask`) through the VM's variadic helpers.
 pub const STUB_JIT_VARIADIC_OP: RuntimeStubDescriptor = descriptor(
-    60,
+    58,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -1036,7 +1014,7 @@ pub const STUB_JIT_VARIADIC_OP: RuntimeStubDescriptor = descriptor(
 /// `SharedArrayBufferCall`, `BigIntCall`, `DataViewCall`) through the VM's
 /// static-call helpers, rebuilding their method-id operand layout.
 pub const STUB_JIT_STATIC_CALL_OP: RuntimeStubDescriptor = descriptor(
-    61,
+    59,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -1048,7 +1026,7 @@ pub const STUB_JIT_STATIC_CALL_OP: RuntimeStubDescriptor = descriptor(
 /// Completes dynamic control-family reads (`LoadShadowedUpvalue`) through the
 /// VM's shared dynamic-environment/upvalue helper.
 pub const STUB_JIT_CONTROL_OP: RuntimeStubDescriptor = descriptor(
-    62,
+    60,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -1063,7 +1041,7 @@ pub const STUB_JIT_CONTROL_OP: RuntimeStubDescriptor = descriptor(
 /// caller frame for true tail recursion, so it stays an exact side exit rather
 /// than a nested call.
 pub const STUB_JIT_SPREAD_CALL_OP: RuntimeStubDescriptor = descriptor(
-    63,
+    61,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -1076,7 +1054,7 @@ pub const STUB_JIT_SPREAD_CALL_OP: RuntimeStubDescriptor = descriptor(
 /// materialization, eval identity, and full `ToNumber` coercion through shared
 /// VM helpers.
 pub const STUB_JIT_CLASS_VALUE_OP: RuntimeStubDescriptor = descriptor(
-    64,
+    62,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -1089,7 +1067,7 @@ pub const STUB_JIT_CLASS_VALUE_OP: RuntimeStubDescriptor = descriptor(
 /// star re-export, module-record marking, and `import.meta.resolve` through
 /// shared VM helpers. Promise-producing module operations remain side exits.
 pub const STUB_JIT_MODULE_OP: RuntimeStubDescriptor = descriptor(
-    65,
+    63,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -1105,7 +1083,7 @@ pub const STUB_JIT_MODULE_OP: RuntimeStubDescriptor = descriptor(
 /// [`crate::native_abi::runtime_stubs`] status `1` (bailed to the published
 /// catch/finally PC) or `2` (re-parked, propagate).
 pub const STUB_JIT_RESOLVE_THREW: RuntimeStubDescriptor = descriptor(
-    66,
+    64,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -1127,7 +1105,7 @@ pub const STUB_JIT_RESOLVE_THREW: RuntimeStubDescriptor = descriptor(
 /// Returns the new frame's register-window pointer, or `0` when the call path
 /// raised (a stack overflow the interpreter would also have raised).
 pub const STUB_JIT_DEOPT_REIFY_FRAME: RuntimeStubDescriptor = descriptor(
-    67,
+    65,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -1144,7 +1122,7 @@ pub const STUB_JIT_DEOPT_REIFY_FRAME: RuntimeStubDescriptor = descriptor(
 /// exact native PC, and returns the final value/status pair to generated
 /// linkage. This is deoptimization support, never normal call preparation.
 pub const STUB_JIT_DEOPT_STACK_CALL: RuntimeStubDescriptor = descriptor(
-    68,
+    66,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -1160,7 +1138,7 @@ pub const STUB_JIT_DEOPT_STACK_CALL: RuntimeStubDescriptor = descriptor(
 /// installed fallback generation, returning its generation-cell address or
 /// zero when the caller must take an exact pre-effect side exit.
 pub const STUB_JIT_RESOLVE_DIRECT_ENTRY: RuntimeStubDescriptor = descriptor(
-    69,
+    67,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -1177,7 +1155,7 @@ pub const STUB_JIT_RESOLVE_DIRECT_ENTRY: RuntimeStubDescriptor = descriptor(
 /// own last element, no accessor override in range) and reports a miss when
 /// they fail, so the call site falls through to ordinary dispatch.
 pub const STUB_ARRAY_POP_LEAF: RuntimeStubDescriptor = descriptor(
-    76,
+    74,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::MutatingLeafValue2,
     2,
@@ -1191,7 +1169,7 @@ pub const STUB_ARRAY_POP_LEAF: RuntimeStubDescriptor = descriptor(
 /// safepoint. Like the `pop` entry it re-checks the dense preconditions and
 /// misses instead of falling back internally.
 pub const STUB_ARRAY_PUSH_ALLOC: RuntimeStubDescriptor = descriptor(
-    77,
+    75,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::AllocValue3,
     3,
@@ -1206,7 +1184,7 @@ pub const STUB_ARRAY_PUSH_ALLOC: RuntimeStubDescriptor = descriptor(
 /// length pair without allocating. Like the `pop` entry it re-checks the dense
 /// preconditions and misses instead of falling back internally.
 pub const STUB_ARRAY_SHIFT_LEAF: RuntimeStubDescriptor = descriptor(
-    78,
+    76,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::MutatingLeafValue2,
     2,
@@ -1219,7 +1197,7 @@ pub const STUB_ARRAY_SHIFT_LEAF: RuntimeStubDescriptor = descriptor(
 /// Inserting at the head may grow the dense buffer, so the site publishes a
 /// precise safepoint exactly like the `push` entry.
 pub const STUB_ARRAY_UNSHIFT_ALLOC: RuntimeStubDescriptor = descriptor(
-    79,
+    77,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::AllocValue3,
     3,
@@ -1234,7 +1212,7 @@ pub const STUB_ARRAY_UNSHIFT_ALLOC: RuntimeStubDescriptor = descriptor(
 /// per-builtin machine-code body. Adding a sibling is a declaration plus its
 /// entry; it costs no generated code.
 pub const STUB_MATH_ABS_LEAF: RuntimeStubDescriptor = descriptor(
-    80,
+    78,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::LeafValue2,
     2,
@@ -1245,7 +1223,7 @@ pub const STUB_MATH_ABS_LEAF: RuntimeStubDescriptor = descriptor(
 
 /// Leaf `Math.floor`.
 pub const STUB_MATH_FLOOR_LEAF: RuntimeStubDescriptor = descriptor(
-    81,
+    79,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::LeafValue2,
     2,
@@ -1256,7 +1234,7 @@ pub const STUB_MATH_FLOOR_LEAF: RuntimeStubDescriptor = descriptor(
 
 /// Leaf `Math.sqrt`.
 pub const STUB_MATH_SQRT_LEAF: RuntimeStubDescriptor = descriptor(
-    82,
+    80,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::LeafValue2,
     2,
@@ -1270,7 +1248,7 @@ pub const STUB_MATH_SQRT_LEAF: RuntimeStubDescriptor = descriptor(
 /// The variadic and zero/one-argument forms keep the ordinary call path; the
 /// declared arity is what makes a site eligible for this entry.
 pub const STUB_MATH_MAX_LEAF: RuntimeStubDescriptor = descriptor(
-    83,
+    81,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::LeafValue2,
     2,
@@ -1281,7 +1259,7 @@ pub const STUB_MATH_MAX_LEAF: RuntimeStubDescriptor = descriptor(
 
 /// Leaf `Math.min` over exactly two arguments.
 pub const STUB_MATH_MIN_LEAF: RuntimeStubDescriptor = descriptor(
-    84,
+    82,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::LeafValue2,
     2,
@@ -1308,76 +1286,74 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         12 => "string_concat_alloc",
         13 => "jit_add",
         14 => "jit_neg",
-        15 => "jit_math_call",
-        16 => "jit_load_global",
-        17 => "jit_load_element",
-        18 => "jit_store_element",
-        19 => "jit_define_own_property",
-        20 => "jit_load_prop_window",
-        21 => "jit_store_prop_window",
-        22 => "jit_define_data_property",
-        23 => "jit_load_string",
-        24 => "jit_load_builtin_error",
-        25 => "jit_make_fn",
-        26 => "jit_make_closure",
-        27 => "jit_new_object",
-        28 => "jit_new_array",
-        29 => "jit_fresh_upvalue",
-        30 => "jit_push_native_activation",
-        31 => "jit_pop_native_activation",
-        32 => "jit_load_upvalue",
-        33 => "jit_store_upvalue",
-        34 => "jit_store_upvalue_checked",
-        35 => "jit_write_barrier",
-        36 => "jit_write_barrier_window",
-        37 => "jit_inline_closure_upvalues",
-        38 => "jit_math_random",
-        39 => "strict_eq_leaf",
-        40 => "jit_loose_eq",
-        41 => "to_boolean_leaf",
-        42 => "number_rem_leaf",
-        43 => "jit_load_regexp",
-        44 => "jit_construct",
-        45 => "jit_coerce_unary",
-        46 => "jit_numeric_op",
-        47 => "jit_exception_op",
-        48 => "jit_iterator_op",
-        49 => "jit_bind_function",
-        50 => "jit_global_op",
-        51 => "jit_object_protocol_op",
-        52 => "jit_delete_op",
-        53 => "jit_scalar_op",
-        54 => "jit_super_op",
-        55 => "jit_private_op",
-        56 => "jit_value_load_op",
-        57 => "jit_construct_op",
-        58 => "jit_structural_op",
-        59 => "jit_class_op",
-        60 => "jit_variadic_op",
-        61 => "jit_static_call_op",
-        62 => "jit_control_op",
-        63 => "jit_spread_call_op",
-        64 => "jit_class_value_op",
-        65 => "jit_module_op",
-        66 => "jit_resolve_threw",
-        67 => "jit_deopt_reify_frame",
-        68 => "jit_deopt_stack_call",
-        69 => "jit_resolve_direct_entry",
-        70 => "string_char_code_at_leaf",
-        71 => "string_code_point_at_leaf",
-        72 => "string_index_of_leaf",
-        73 => "string_includes_leaf",
-        74 => "string_starts_with_leaf",
-        75 => "string_ends_with_leaf",
-        76 => "array_pop_leaf",
-        77 => "array_push_alloc",
-        78 => "array_shift_leaf",
-        79 => "array_unshift_alloc",
-        80 => "math_abs_leaf",
-        81 => "math_floor_leaf",
-        82 => "math_sqrt_leaf",
-        83 => "math_max_leaf",
-        84 => "math_min_leaf",
+        15 => "jit_load_global",
+        16 => "jit_load_element",
+        17 => "jit_store_element",
+        18 => "jit_define_own_property",
+        19 => "jit_load_prop_window",
+        20 => "jit_store_prop_window",
+        21 => "jit_define_data_property",
+        22 => "jit_load_string",
+        23 => "jit_load_builtin_error",
+        24 => "jit_make_fn",
+        25 => "jit_make_closure",
+        26 => "jit_new_object",
+        27 => "jit_new_array",
+        28 => "jit_fresh_upvalue",
+        29 => "jit_push_native_activation",
+        30 => "jit_pop_native_activation",
+        31 => "jit_load_upvalue",
+        32 => "jit_store_upvalue",
+        33 => "jit_store_upvalue_checked",
+        34 => "jit_write_barrier",
+        35 => "jit_write_barrier_window",
+        36 => "jit_inline_closure_upvalues",
+        37 => "strict_eq_leaf",
+        38 => "jit_loose_eq",
+        39 => "to_boolean_leaf",
+        40 => "number_rem_leaf",
+        41 => "jit_load_regexp",
+        42 => "jit_construct",
+        43 => "jit_coerce_unary",
+        44 => "jit_numeric_op",
+        45 => "jit_exception_op",
+        46 => "jit_iterator_op",
+        47 => "jit_bind_function",
+        48 => "jit_global_op",
+        49 => "jit_object_protocol_op",
+        50 => "jit_delete_op",
+        51 => "jit_scalar_op",
+        52 => "jit_super_op",
+        53 => "jit_private_op",
+        54 => "jit_value_load_op",
+        55 => "jit_construct_op",
+        56 => "jit_structural_op",
+        57 => "jit_class_op",
+        58 => "jit_variadic_op",
+        59 => "jit_static_call_op",
+        60 => "jit_control_op",
+        61 => "jit_spread_call_op",
+        62 => "jit_class_value_op",
+        63 => "jit_module_op",
+        64 => "jit_resolve_threw",
+        65 => "jit_deopt_reify_frame",
+        66 => "jit_deopt_stack_call",
+        67 => "jit_resolve_direct_entry",
+        68 => "string_char_code_at_leaf",
+        69 => "string_code_point_at_leaf",
+        70 => "string_index_of_leaf",
+        71 => "string_includes_leaf",
+        72 => "string_starts_with_leaf",
+        73 => "string_ends_with_leaf",
+        74 => "array_pop_leaf",
+        75 => "array_push_alloc",
+        76 => "array_shift_leaf",
+        77 => "array_unshift_alloc",
+        78 => "math_abs_leaf",
+        79 => "math_floor_leaf",
+        80 => "math_sqrt_leaf",
+        81 => "math_max_leaf",
+        82 => "math_min_leaf",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1398,7 +1374,6 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_STRING_CONCAT_ALLOC,
     STUB_JIT_ADD,
     STUB_JIT_NEG,
-    STUB_JIT_MATH_CALL,
     STUB_JIT_LOAD_GLOBAL,
     STUB_JIT_LOAD_ELEMENT,
     STUB_JIT_STORE_ELEMENT,
@@ -1421,7 +1396,6 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_WRITE_BARRIER,
     STUB_JIT_WRITE_BARRIER_WINDOW,
     STUB_JIT_INLINE_CLOSURE_UPVALUES,
-    STUB_JIT_MATH_RANDOM,
     STUB_STRICT_EQ_LEAF,
     STUB_JIT_LOOSE_EQ,
     STUB_TO_BOOLEAN_LEAF,
@@ -1495,10 +1469,6 @@ pub const fn validate_stub_descriptor(
                 RuntimeStubResultAbi::ValueWord
             )
         ),
-        RuntimeStubSignature::NullaryValue => {
-            matches!(desc.result_abi, RuntimeStubResultAbi::ValueWord)
-                && matches!(desc.exception, RuntimeStubException::Never)
-        }
     };
     if !throwing_matches || !result_matches {
         return false;

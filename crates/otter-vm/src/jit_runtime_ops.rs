@@ -360,20 +360,6 @@ impl Interpreter {
         frame.set_pc(saved_pc);
         result
     }
-
-    /// Execute a guarded `Math` call from decoded argument registers.
-    #[allow(clippy::too_many_arguments)]
-    pub fn jit_runtime_math_call(
-        &mut self,
-        stack: &mut crate::ActivationStack,
-        context: &ExecutionContext,
-        frame: &mut ActiveFrameMut<'_>,
-        dst: u16,
-        method_id: u32,
-        argument_regs: &[u16],
-    ) -> Result<(), VmError> {
-        self.do_math_call_active(stack, context, frame, dst, method_id, argument_regs)
-    }
 }
 
 #[cfg(test)]

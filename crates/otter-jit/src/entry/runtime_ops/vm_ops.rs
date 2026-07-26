@@ -12,8 +12,6 @@
 //! # See also
 //! - `otter_vm::jit_runtime_ops` — safe VM-side implementations.
 
-use otter_vm::Value;
-
 use super::super::JitCtx;
 use super::park_jit_error;
 
@@ -353,10 +351,6 @@ pub(crate) extern "C" fn jit_load_regexp_stub(ctx: *mut JitCtx, dst: u64, idx: u
             1
         }
     }
-}
-
-pub(crate) extern "C" fn otter_jit_math_random() -> u64 {
-    Value::number(otter_vm::math::random_number()).to_bits()
 }
 
 /// Runtime stub: perform a computed `StoreElement` (`recv[idx] = src`) from

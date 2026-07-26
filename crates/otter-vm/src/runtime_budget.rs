@@ -288,7 +288,6 @@ pub(crate) const fn opcode_reductions(op: Op) -> u8 {
         Op::Call
         | Op::CallWithThis
         | Op::CallMethodValue
-        | Op::MathCall
         | Op::CallSpread
         | Op::New
         | Op::NewSpread

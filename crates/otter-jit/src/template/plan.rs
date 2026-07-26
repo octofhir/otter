@@ -233,12 +233,6 @@ pub(crate) enum TemplateOp {
     NewObject { dst: u16 },
     /// `r<dst> = [elements…]` from the plan-owned register tail.
     NewArray { dst: u16, elements: TemplateTail },
-    /// `r<dst> = Math.<method>(arguments…)`.
-    MathCall {
-        dst: u16,
-        method: u32,
-        arguments: TemplateTail,
-    },
     /// Refresh the captured binding cell at `index` (per-iteration bindings).
     FreshUpvalue { index: i32 },
     /// `object[key] = value` as a data property definition.
@@ -954,20 +948,6 @@ impl TemplatePlan {
                     TemplateOp::NewArray {
                         dst: operands.dst,
                         elements: TemplateTail {
-                            start,
-                            len: slice.len(),
-                        },
-                    }
-                }
-                Op::MathCall => {
-                    let operands = lowered.math_call_operands()?;
-                    let slice = lowering.register_tail(operands.arguments)?;
-                    let start = register_operands.len();
-                    register_operands.extend_from_slice(slice);
-                    TemplateOp::MathCall {
-                        dst: operands.dst,
-                        method: operands.method,
-                        arguments: TemplateTail {
                             start,
                             len: slice.len(),
                         },

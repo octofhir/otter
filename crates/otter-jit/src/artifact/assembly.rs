@@ -505,13 +505,6 @@ fn symbolic_target(target: &RelocationTarget) -> String {
             operand_arena_name(*arena),
             operand_role_name(*role)
         ),
-        RelocationTarget::OptimizedMathArguments {
-            inline_frame,
-            logical_pc,
-            len,
-        } => {
-            format!("optimizedMathArguments(inlineFrame={inline_frame},pc={logical_pc},len={len})")
-        }
         RelocationTarget::GuardedHeapReference {
             component,
             feedback_kind,
@@ -563,7 +556,6 @@ fn operand_role_name(role: TemplateOperandRole) -> &'static str {
     match role {
         TemplateOperandRole::ClosureParents => "closureParents",
         TemplateOperandRole::NewArrayElements => "newArrayElements",
-        TemplateOperandRole::MathArguments => "mathArguments",
         TemplateOperandRole::ConstructArguments => "constructArguments",
     }
 }

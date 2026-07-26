@@ -86,23 +86,6 @@ impl RuntimeCall<'_> {
         vm.jit_runtime_define_own_property(stack, context, &mut frame, target, key, descriptor)
     }
 
-    /// Complete a guarded Math call through the current activation.
-    pub fn math_call(
-        &mut self,
-        dst: u16,
-        method_id: u32,
-        argument_regs: &[u16],
-    ) -> Result<(), VmError> {
-        let vm = unsafe { &mut *self.vm.as_ptr() };
-        let stack = unsafe { &mut *self.stack.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
-        let frame = self.frame.as_ptr();
-        // SAFETY: RuntimeCall exclusively owns this validated descriptor.
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
-        vm.jit_runtime_math_call(stack, context, &mut frame, dst, method_id, argument_regs)
-    }
-
     /// Materialize a string constant into the current activation.
     pub fn load_string(
         &mut self,

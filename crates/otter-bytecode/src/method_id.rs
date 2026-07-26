@@ -82,9 +82,12 @@ method_id_enum! {
 }
 
 method_id_enum! {
-    /// Methods reached through [`Op::MathCall`](crate::Op::MathCall).
-    /// Pure functions only — namespace constants (`PI`, `E`, …)
-    /// load through [`Op::MathLoad`](crate::Op::MathLoad).
+    /// Typed dispatch key for the `Math` namespace's pure numeric methods.
+    /// The compiler emits no dedicated opcode for them — calls flow through
+    /// ordinary method dispatch — but the VM-side implementations key off this
+    /// enum to keep one switch per method instead of a string compare.
+    /// Namespace constants (`PI`, `E`, …) load through
+    /// [`Op::MathLoad`](crate::Op::MathLoad).
     MathMethod {
         Abs = 0 => "abs",
         Acos = 1 => "acos",

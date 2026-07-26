@@ -612,18 +612,17 @@ opcode_schema! {
     (Op::GetTemplateObject, 0xA3),
     (Op::DeleteDynamic, 0xA4),
     (Op::NewPrivateName, 0xA5),
-    (Op::MathCall, 0xA6),
-    (Op::TailCall, 0xA7),
-    (Op::IsEvalIntrinsic, 0xA8),
-    (Op::PopParkedFinally, 0xA9),
-    (Op::GlobalBindingExists, 0xAA),
-    (Op::StoreGlobalChecked, 0xAB),
-    (Op::AddImm, 0xAC),
-    (Op::SubImm, 0xAD),
-    (Op::BitwiseAndImm, 0xAE),
-    (Op::LessThanImm, 0xAF),
-    (Op::EqualImm, 0xB0),
-    (Op::NotEqualImm, 0xB1),
+    (Op::TailCall, 0xA6),
+    (Op::IsEvalIntrinsic, 0xA7),
+    (Op::PopParkedFinally, 0xA8),
+    (Op::GlobalBindingExists, 0xA9),
+    (Op::StoreGlobalChecked, 0xAA),
+    (Op::AddImm, 0xAB),
+    (Op::SubImm, 0xAC),
+    (Op::BitwiseAndImm, 0xAD),
+    (Op::LessThanImm, 0xAE),
+    (Op::EqualImm, 0xAF),
+    (Op::NotEqualImm, 0xB0),
 }
 
 /// Return the authoritative schema row for `op`.
@@ -844,11 +843,6 @@ const fn operand_shape(op: Op) -> OperandShape {
         Op::CallMethodValue => OperandShape::Variadic {
             prefix: METHOD_CALL_PREFIX,
             count_operand_index: 3,
-            tail: R,
-        },
-        Op::MathCall => OperandShape::Variadic {
-            prefix: NAMESPACE_CALL_PREFIX,
-            count_operand_index: 2,
             tail: R,
         },
         Op::Throw => OperandShape::Fixed(&[R]),
@@ -1085,7 +1079,6 @@ const fn control_flow(op: Op) -> ControlFlow {
         | Op::NewSpread
         | Op::SuperConstructSpread
         | Op::Eval
-        | Op::MathCall
         | Op::PromiseCall => ControlFlow::Call,
         _ => ControlFlow::Fallthrough,
     }

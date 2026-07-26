@@ -208,6 +208,57 @@ are zero and their bytecode is at parity with Ignition (18 ops against 20),
 so what is left there is optimizing-tier code quality, not substrate work —
 a different slice, and not one to start by hand-tuning.
 
+## Slice 2, first target: `Map.set` never reaches its own fast path
+
+Split from `Map.get`, both on `production-tiered`, 200 000 iterations over a
+pre-filled 64-key map (so no `set` in the measured loop actually grows it):
+
+| Operation | transitions/iter | wall |
+| --- | ---: | ---: |
+| `t.get(i & 63)` | 0.00 | 3.24 ms |
+| `t.set(i & 63, 1)` | 1.00 | **24.72 ms** |
+
+The transition is `jit-to-rust-call-transitions`, **not**
+`jit-alloc-stub-transitions`, which is 0. So `set` is not paying for the
+allocating collection entry — it never reaches it, and falls all the way back
+to a generic method call into the runtime. Same disease as Slice 1: a fast
+path exists and is unreachable.
+
+Ruled out so far:
+
+- Not the opcode gate. Both compile to `CALL_METHOD_VALUE`, which is what
+  `bake_collection_alloc_methods` filters on.
+- Not the stub registry. `COLLECTION_MAP_SET_ALLOC` has an entry, and the
+  crate's own tests assert `has_entry()`, `entry_addr().is_some()` and
+  `is_valid_for_safepoint(1)`.
+- Not the safepoint sentinel. `NO_SAFEPOINT` is `u32::MAX`, so the first
+  site's `safepoint_id` of 0 does not collide with it.
+- Not the emitter conditions. `emit_alloc_method_guarded_call` only refuses
+  on `cage_base == 0` or `value_arg_count != 3`; the cage base is live (the
+  property probes use it) and the count is hardcoded to 3.
+- Not `inline_leaf_template_plan`'s `collection_alloc_methods.clear()` — that
+  view is for inlined leaf bodies, not the top-level loop.
+
+Still open: why `view.collection_alloc_methods` stays empty for the site.
+Remaining suspects are inside `jit_collection_alloc_method_feedback` — the
+`method_ic(site)` lookup, the `proto_shape` equality check, or
+`matches_builtin`. `--jit-events` does not resolve it: its
+`methodFeedbackSites` counter reads 0 for the working `get` case too, so it
+is reporting a different channel.
+
+Next step is instrumentation rather than more reading: a targeted test that
+drives a warm `map.set` site through `bake_collection_alloc_methods` and
+asserts the entry is published. That lands as a permanent regression test
+instead of a one-off print.
+
+Note for whoever picks this up: a `set` on a key that already exists does not
+allocate at all. Once the site reaches its guarded path, the honest next
+question is whether it should take the allocating entry at all, or a
+`MutatingLeafValue3` entry that updates in place and misses to the allocating
+one only when the key is absent — the shape `STUB_ARRAY_POP_LEAF` already
+uses. That signature family does not exist yet; the mutating leaf carries two
+values and `set` needs three.
+
 ## Fixed to make the gate runnable
 
 Both were sitting on `main` before this work and made `just gate`

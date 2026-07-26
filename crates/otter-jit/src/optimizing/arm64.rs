@@ -3045,6 +3045,28 @@ fn emit(
                     // re-derived from its rooted location every access.
                     if view.cage_base != 0 {
                         let shape_byte = view.object_shape_byte;
+                        // `.length` on a dense array or a primitive string is
+                        // not an own data slot, so no cache program describes
+                        // it and the probe below cannot serve it.
+                        if view.instructions[instruction.pc as usize].load_array_length {
+                            let have_length = ops.new_dynamic_label();
+                            let not_length = ops.new_dynamic_label();
+                            emit_load_tagged_location(
+                                &mut ops,
+                                allocation.location(instruction.inputs[0]),
+                                9,
+                            )?;
+                            ic_probe::emit_exotic_length_fast(
+                                &mut ops,
+                                &mut relocations,
+                                view,
+                                have_length,
+                                not_length,
+                            );
+                            dynasm!(ops ; .arch aarch64 ; =>have_length);
+                            emit_store_tagged_location(&mut ops, result_location, 9)?;
+                            dynasm!(ops ; .arch aarch64 ; b =>done ; =>not_length);
+                        }
                         emit_load_tagged_location(
                             &mut ops,
                             allocation.location(instruction.inputs[0]),

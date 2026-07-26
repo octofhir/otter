@@ -49,7 +49,7 @@ const TARGET_OPTIMIZED_MATH_ARGUMENTS: u8 = 5;
 const TARGET_GUARDED_HEAP_REFERENCE: u8 = 6;
 const TARGET_GUARDED_BUILTIN_FUNCTION: u8 = 7;
 const TARGET_DIRECT_CALL_ENTRY_CELL: u8 = 8;
-const TARGET_STATIC_NATIVE_BUILTIN_FUNCTION: u8 = 9;
+const TARGET_NATIVE_LEAF_BUILTIN_FUNCTION: u8 = 9;
 const TARGET_GLOBAL_LEXICAL_CELL: u8 = 10;
 
 /// Whether a property inline-cache cell serves a load or a store site.
@@ -148,11 +148,11 @@ pub(crate) enum RelocationTarget {
         byte_pc: u32,
         runtime_stub_id: u32,
     },
-    /// Exact bootstrap function identity guarded by an ordinary-call native
-    /// leaf. The process address is deliberately absent.
-    StaticNativeBuiltinFunction {
-        target: otter_vm::JitStaticNativeCallKind,
-        byte_pc: u32,
+    /// Exact bootstrap function identity guarded before a declared leaf entry
+    /// runs. The process address is deliberately absent; the entry id names the
+    /// declaration that owns it.
+    NativeLeafBuiltinFunction {
+        stub_id: otter_vm::native_abi::RuntimeStubId,
     },
     /// Stable registry cell guarded by one generated direct-call site.
     ///
@@ -1082,10 +1082,9 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             put_u32(output, *byte_pc);
             put_u32(output, *runtime_stub_id);
         }
-        RelocationTarget::StaticNativeBuiltinFunction { target, byte_pc } => {
-            output.push(TARGET_STATIC_NATIVE_BUILTIN_FUNCTION);
-            put_u32(output, *target as u32);
-            put_u32(output, *byte_pc);
+        RelocationTarget::NativeLeafBuiltinFunction { stub_id } => {
+            output.push(TARGET_NATIVE_LEAF_BUILTIN_FUNCTION);
+            put_u32(output, *stub_id);
         }
         RelocationTarget::DirectCallEntryCell {
             byte_pc,
@@ -1428,9 +1427,8 @@ mod tests {
                 byte_pc: 10,
                 runtime_stub_id: 11,
             },
-            RelocationTarget::StaticNativeBuiltinFunction {
-                target: otter_vm::JitStaticNativeCallKind::MathAbs,
-                byte_pc: 12,
+            RelocationTarget::NativeLeafBuiltinFunction {
+                stub_id: otter_vm::native_abi::STUB_MATH_ABS_LEAF.id,
             },
             direct_call_target(
                 29,

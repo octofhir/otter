@@ -47,6 +47,9 @@ use super::collections::{
     MethodSite, emit_alloc_method_guarded_call, emit_array_method_guarded_call,
     emit_leaf_method_guarded_call, emit_primitive_method_guarded_call,
 };
+use super::ic_probe::{
+    emit_native_leaf_call, native_leaf_call_is_supported, native_leaf_call_name,
+};
 use super::transitions::TransitionTable;
 use super::values::{
     emit_box_double, emit_box_int32, emit_box_number, emit_decompress_slot, emit_load_reg,
@@ -54,9 +57,8 @@ use super::values::{
     emit_slab_base, emit_store_reg,
 };
 use crate::arm64::{
-    DirectCallForm, DirectCallSite, MethodGuardSite, StaticNativeCallSite, direct_call_artifact,
-    direct_call_target_is_supported, emit_direct_call, emit_method_guard, emit_static_native_call,
-    static_native_target_is_supported,
+    DirectCallForm, DirectCallSite, MethodGuardSite, direct_call_artifact,
+    direct_call_target_is_supported, emit_direct_call, emit_method_guard,
 };
 use crate::artifact::relocation::{
     RelocationCapture, RelocationTarget, TemplateOperandArena, TemplateOperandRole,
@@ -943,44 +945,46 @@ pub(super) fn emit_call(
 ) -> Result<(), Unsupported> {
     let done = ops.new_dynamic_label();
     if let Some(target) = view.static_native_calls.get(&byte_pc) {
-        let site = StaticNativeCallSite {
-            target,
-            caller_function_id: view.code_block.id,
-            logical_pc,
-            byte_pc,
-            argc: usize::from(argc),
-        };
-        if let Some(&argument) = argument_registers.first()
-            && static_native_target_is_supported(view, site)
-        {
+        let stub_id = target.leaf_stub_id;
+        let name = native_leaf_call_name(stub_id);
+        let start = ops.offset().0;
+        if native_leaf_call_is_supported(view, stub_id, usize::from(argc)) {
             emit_load_reg(ops, 9, callee)?;
-            emit_load_reg(ops, 10, argument)?;
-            let second = match argument_registers.get(1) {
-                Some(&register) => {
-                    emit_load_reg(ops, 11, register)?;
-                    Some(11)
-                }
-                None => None,
-            };
-            emit_static_native_call(
+            emit_native_leaf_call(
                 ops,
                 relocations,
                 view,
-                site,
+                stub_id,
+                target.builtin_fn_addr,
                 9,
-                10,
-                second,
-                code_map.as_deref_mut(),
+                |ops, index, register| {
+                    let source = argument_registers
+                        .get(usize::from(index))
+                        .copied()
+                        .ok_or(Unsupported::OperandShape("native leaf call argument"))?;
+                    emit_load_reg(ops, register, source)
+                },
                 bail,
             )?;
-            emit_store_reg(ops, 9, dst)?;
+            emit_store_reg(ops, 0, dst)?;
+            if let Some(code_map) = code_map.as_deref_mut() {
+                code_map.record(CodeRegion::static_native_structural(
+                    "nativeLeafCall",
+                    start,
+                    ops.offset().0,
+                    view.code_block.id,
+                    logical_pc,
+                    byte_pc,
+                    name,
+                ));
+            }
             if let Some(events) = direct_call_events.as_deref_mut() {
                 events.insert(
                     (byte_pc, 0),
                     otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
                         instruction_pc: logical_pc,
                         byte_pc,
-                        target: target.kind,
+                        target: name,
                         outcome: otter_vm::JitStaticNativeCallLoweringOutcome::Generated,
                     },
                 );
@@ -994,13 +998,10 @@ pub(super) fn emit_call(
                 otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
                     instruction_pc: logical_pc,
                     byte_pc,
-                    target: target.kind,
+                    target: name,
                     outcome: otter_vm::JitStaticNativeCallLoweringOutcome::Rejected {
-                        reason: if argument_registers.is_empty() {
-                            otter_vm::JitStaticNativeCallLoweringRejectionReason::ArityUnsupported
-                        } else {
-                            otter_vm::JitStaticNativeCallLoweringRejectionReason::LayoutUnsupported
-                        },
+                        reason:
+                            otter_vm::JitStaticNativeCallLoweringRejectionReason::ArityUnsupported,
                     },
                 },
             );

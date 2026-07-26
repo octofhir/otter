@@ -580,35 +580,14 @@ impl JitPropertyIcWay {
     }
 }
 
-/// Static native operation that a backend may lower without entering Rust.
+/// One monomorphic native leaf call selected from ordinary-call feedback.
 ///
-/// Variants are semantic operations rather than raw function addresses. The
-/// address travels separately as an identity guard, while the variant selects
-/// exact machine code and makes diagnostics process-independent.
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum JitStaticNativeCallKind {
-    /// Numeric fast path for the original realm `Math.abs`.
-    MathAbs = 0,
-}
-
-impl JitStaticNativeCallKind {
-    /// Decode the compact call-feedback payload.
-    #[must_use]
-    pub(crate) const fn from_u32(value: u32) -> Option<Self> {
-        match value {
-            0 => Some(Self::MathAbs),
-            _ => None,
-        }
-    }
-}
-
-/// One monomorphic static-native call selected from ordinary-call feedback.
+/// The declared entry id is the target's whole identity: it selects the machine
+/// code, keys the relocation, and names the operation in diagnostics through
+/// [`crate::native_abi::runtime_stub_name`], which is process-independent. No
+/// second taxonomy of builtins exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JitStaticNativeCall {
-    /// Semantic leaf operation emitted by the backend.
-    pub kind: JitStaticNativeCallKind,
     /// Exact process-local bootstrap function address checked before the leaf
     /// executes. This address is never serialized into diagnostics or
     /// normalized artifacts.
@@ -616,6 +595,10 @@ pub struct JitStaticNativeCall {
     /// Declared leaf entry the call site invokes once its guards pass. The
     /// operation lives in that entry, so a new builtin needs no generated code.
     pub leaf_stub_id: crate::native_abi::RuntimeStubId,
+    /// Exact JavaScript argument count the declared entry implements. A site
+    /// whose count differs is not lowered, so variadic and defaulted forms keep
+    /// the ordinary path instead of being truncated to this entry's arity.
+    pub argument_count: u8,
 }
 
 /// VM-resolved direct-call target for one eligible compiled callee.

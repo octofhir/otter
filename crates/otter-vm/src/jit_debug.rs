@@ -171,8 +171,8 @@ pub enum JitInlineRejectionReason {
     /// The monomorphic target is a static native handled by dedicated leaf
     /// codegen rather than bytecode-body inlining.
     StaticNative {
-        /// Exact semantic operation selected from bootstrap identity feedback.
-        target: crate::jit::JitStaticNativeCallKind,
+        /// Declared leaf entry selected from bootstrap identity feedback.
+        target: &'static str,
     },
     /// Feedback named a callee that is absent from the execution context.
     MissingCallee,
@@ -349,8 +349,8 @@ pub enum JitCompilerDiagnostic {
         instruction_pc: u32,
         /// Encoded byte PC used by the compile snapshot's call tables.
         byte_pc: u32,
-        /// Semantic leaf operation guarded at the call site.
-        target: crate::jit::JitStaticNativeCallKind,
+        /// Declared leaf entry guarded at the call site.
+        target: &'static str,
         /// Actual lowering emitted by the backend.
         outcome: JitStaticNativeCallLoweringOutcome,
     },
@@ -471,10 +471,10 @@ pub enum JitDebugEvent {
         instruction_pc: u32,
         /// Tier for which the target was selected.
         tier: JitDebugTier,
-        /// Exact semantic leaf operation.
-        target: crate::jit::JitStaticNativeCallKind,
+        /// Declared leaf entry.
+        target: &'static str,
     },
-    /// Final backend lowering for one static-native plan.
+    /// Final backend lowering for one native leaf call plan.
     StaticNativeCallLowered {
         /// Function containing the call site.
         caller_function_id: u32,
@@ -486,8 +486,8 @@ pub enum JitDebugEvent {
         byte_pc: u32,
         /// Tier that compiled the caller.
         tier: JitDebugTier,
-        /// Exact semantic leaf operation.
-        target: crate::jit::JitStaticNativeCallKind,
+        /// Declared leaf entry.
+        target: &'static str,
         /// Actual lowering emitted by the backend.
         outcome: JitStaticNativeCallLoweringOutcome,
     },

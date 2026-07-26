@@ -125,10 +125,9 @@ use super::{
 use crate::{
     CompiledCode,
     arm64::{
-        DirectCallForm, DirectCallSite, MethodGuardSite, StaticNativeCallSite,
-        direct_call_artifact, direct_call_target_is_supported, emit_direct_call, emit_method_guard,
-        emit_method_guard_from_tagged_register, emit_static_native_call,
-        static_native_target_is_supported,
+        DirectCallForm, DirectCallSite, MethodGuardSite, direct_call_artifact,
+        direct_call_target_is_supported, emit_direct_call, emit_method_guard,
+        emit_method_guard_from_tagged_register,
     },
     artifact::{
         ArtifactRequest, CodeMapCapture, CodeRegion, NativeCompileOutput, build_bundle,
@@ -156,6 +155,9 @@ use crate::{
         },
         repr::{ConversionKind, ReprMap, Representation},
         ssa::{SsaFunction, SsaInstr, ValueDef, ValueId},
+    },
+    template::arm64::ic_probe::{
+        emit_native_leaf_call, native_leaf_call_is_supported, native_leaf_call_name,
     },
 };
 
@@ -2459,7 +2461,7 @@ fn emit(
                 otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
                     instruction_pc,
                     byte_pc,
-                    target: target.kind,
+                    target: native_leaf_call_name(target.leaf_stub_id),
                     outcome: otter_vm::JitStaticNativeCallLoweringOutcome::Rejected {
                         reason: otter_vm::JitStaticNativeCallLoweringRejectionReason::Eliminated,
                     },
@@ -4887,16 +4889,10 @@ fn emit(
                         .then(|| view.static_native_calls.get(&byte_pc))
                         .flatten();
                     if let Some(target) = static_target {
-                        let static_site = StaticNativeCallSite {
-                            target,
-                            caller_function_id: frame.function_id,
-                            logical_pc: instruction.pc,
-                            byte_pc,
-                            argc: arg_regs.len(),
-                        };
-                        if instruction.inputs.len() >= 2
-                            && static_native_target_is_supported(view, static_site)
-                        {
+                        let stub_id = target.leaf_stub_id;
+                        let name = native_leaf_call_name(stub_id);
+                        let start = ops.offset().0;
+                        if native_leaf_call_is_supported(view, stub_id, arg_regs.len()) {
                             emit_load_boxed_value(
                                 &mut ops,
                                 reprs,
@@ -4904,34 +4900,23 @@ fn emit(
                                 instruction.inputs[0],
                                 9,
                             )?;
-                            emit_load_boxed_value(
-                                &mut ops,
-                                reprs,
-                                allocation,
-                                instruction.inputs[1],
-                                10,
-                            )?;
-                            let second = if instruction.inputs.len() >= 3 {
-                                emit_load_boxed_value(
-                                    &mut ops,
-                                    reprs,
-                                    allocation,
-                                    instruction.inputs[2],
-                                    11,
-                                )?;
-                                Some(11)
-                            } else {
-                                None
-                            };
-                            emit_static_native_call(
+                            emit_native_leaf_call(
                                 &mut ops,
                                 &mut relocations,
                                 view,
-                                static_site,
+                                stub_id,
+                                target.builtin_fn_addr,
                                 9,
-                                10,
-                                second,
-                                code_map.as_mut(),
+                                |ops, index, register| {
+                                    let value = instruction
+                                        .inputs
+                                        .get(usize::from(index) + 1)
+                                        .copied()
+                                        .ok_or(Unsupported::OperandShape(
+                                            "native leaf call argument",
+                                        ))?;
+                                    emit_load_boxed_value(ops, reprs, allocation, value, register)
+                                },
                                 bail,
                             )?;
                             emit_store_tagged_location(
@@ -4939,15 +4924,26 @@ fn emit(
                                 allocation.location(
                                     instruction.result.expect("eligibility checked call result"),
                                 ),
-                                9,
+                                0,
                             )?;
+                            if let Some(code_map) = code_map.as_mut() {
+                                code_map.record(CodeRegion::static_native_structural(
+                                    "nativeLeafCall",
+                                    start,
+                                    ops.offset().0,
+                                    frame.function_id,
+                                    instruction.pc,
+                                    byte_pc,
+                                    name,
+                                ));
+                            }
                             if let Some(events) = direct_call_events.as_mut() {
                                 events.insert(
                                     (byte_pc, 0),
                                     otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
                                         instruction_pc: instruction.pc,
                                         byte_pc,
-                                        target: target.kind,
+                                        target: name,
                                         outcome:
                                             otter_vm::JitStaticNativeCallLoweringOutcome::Generated,
                                     },
@@ -4960,13 +4956,10 @@ fn emit(
                                     otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
                                         instruction_pc: instruction.pc,
                                         byte_pc,
-                                        target: target.kind,
+                                        target: name,
                                         outcome: otter_vm::JitStaticNativeCallLoweringOutcome::Rejected {
-                                            reason: if instruction.inputs.len() < 2 {
-                                                otter_vm::JitStaticNativeCallLoweringRejectionReason::ArityUnsupported
-                                            } else {
-                                                otter_vm::JitStaticNativeCallLoweringRejectionReason::LayoutUnsupported
-                                            },
+                                            reason:
+                                                otter_vm::JitStaticNativeCallLoweringRejectionReason::ArityUnsupported,
                                         },
                                     },
                                 );

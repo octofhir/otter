@@ -189,7 +189,9 @@ pub(super) fn compile(
                 otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
                     instruction_pc,
                     byte_pc,
-                    target: target.kind,
+                    target: crate::template::arm64::ic_probe::native_leaf_call_name(
+                        target.leaf_stub_id,
+                    ),
                     outcome: otter_vm::JitStaticNativeCallLoweringOutcome::Rejected {
                         reason: otter_vm::JitStaticNativeCallLoweringRejectionReason::Eliminated,
                     },

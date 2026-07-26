@@ -45,10 +45,10 @@ use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering, fen
 use otter_bytecode::Op;
 use smallvec::SmallVec;
 
+use crate::Value;
 use crate::cache_ir::CacheStub;
 use crate::jit::JitElementLoadKind;
 use crate::property_ic::{PropertyIcEntry, PropertyIcKind};
-use crate::{Value, jit::JitStaticNativeCallKind};
 
 /// At least one operand was an `int32` fast-path number.
 pub const ARITH_INT32: u8 = 1 << 0;
@@ -115,8 +115,9 @@ pub(crate) const MAX_CALL_TARGETS: usize = 8;
 pub(crate) enum OrdinaryCallTarget {
     /// Plain bytecode function body.
     Bytecode(u32),
-    /// Original bootstrap static native supported by direct leaf codegen.
-    StaticNative(JitStaticNativeCallKind),
+    /// Original bootstrap native reached through a declared leaf entry,
+    /// identified by that entry's id.
+    StaticNative(crate::native_abi::RuntimeStubId),
 }
 
 /// One observed call target and its saturating execution count.
@@ -248,7 +249,7 @@ const fn call_target_kind(target: OrdinaryCallTarget) -> u8 {
 const fn call_target_payload(target: OrdinaryCallTarget) -> u32 {
     match target {
         OrdinaryCallTarget::Bytecode(fid) => fid,
-        OrdinaryCallTarget::StaticNative(kind) => kind as u32,
+        OrdinaryCallTarget::StaticNative(stub_id) => stub_id,
     }
 }
 
@@ -260,10 +261,13 @@ fn unpack_call_target(packed: u64, kind: u8) -> CallTargetCount {
     let payload = (packed >> 32) as u32;
     let target = match kind {
         CALL_TARGET_BYTECODE => OrdinaryCallTarget::Bytecode(payload),
-        CALL_TARGET_STATIC_NATIVE => OrdinaryCallTarget::StaticNative(
-            JitStaticNativeCallKind::from_u32(payload)
-                .expect("static-native call feedback contains a valid kind"),
-        ),
+        CALL_TARGET_STATIC_NATIVE => {
+            debug_assert!(
+                crate::math::jit_leaf_builtin(payload).is_some(),
+                "native leaf call feedback names a declared entry"
+            );
+            OrdinaryCallTarget::StaticNative(payload)
+        }
         _ => unreachable!("invalid atomic call target kind"),
     };
     CallTargetCount {

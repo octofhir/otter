@@ -14,6 +14,7 @@ time is a sanity check only). Kernels are a thermometer, never a target.
 | --- | --- | ---: | ---: | ---: | --- |
 | 0 | `just cost`, `just gate`, this ledger | 0 | — | — | tooling, nothing replaced |
 | 1 | CacheIR lowered generically; one probe emitter; megamorphic re-probation | +366 / −322 | 87.7% | 4.2 | engine code net **−57 lines** |
+| 2a | Collection method slot byte; optimizing tier bakes and emits allocating collection + array calls | +46 / −4 | 26.6% | 1.7 | `Map.set` 24.80ms → 6.94ms |
 
 ## Slice 1 result — 2026-07-26
 
@@ -238,6 +239,39 @@ Ruled out so far:
   property probes use it) and the count is hardcoded to 3.
 - Not `inline_leaf_template_plan`'s `collection_alloc_methods.clear()` — that
   view is for inlined leaf bodies, not the top-level loop.
+
+**FIXED.** Two defects stacked, both found by instrumenting the bake path.
+
+The first was the one the aggregate pointed at. There are two compile
+snapshot builders in `crates/otter-vm/src/interp/jit_compile.rs`; the
+optimizing one baked neither the allocating collection methods nor the array
+methods, directly under a comment asserting it consumes the same baked inputs
+as the template tier. The optimizing backend had no emission for them either.
+Both now bake and both now emit, mirroring the leaf-method site that already
+sat there.
+
+That alone changed nothing, which exposed the second and real defect. In
+`method_ops/jit_snapshot.rs` three builders compute the guarded method's slot
+offset with `compressed_slot_byte`, and the two collection builders computed
+it as `slot * size_of::<Value>()`. `Value` is eight bytes; the slab holds
+four-byte `CompressedValue`. Every collection method's builtin-identity guard
+was reading at twice the right offset, so it could never match and every call
+fell through to the generic runtime path. Both now use `compressed_slot_byte`.
+
+| | before | after |
+| --- | ---: | ---: |
+| `t.set(i & 63, 1)` wall | 24.80 ms | **6.94 ms** |
+| transitions per iteration | 1.00 | **0.00** |
+| native-boundary vs node | 21.44x | **15.63x** |
+| native-boundary vs bun | 26.10x | **19.13x** |
+| native-boundary retired | 38 299 538 507 | 29 597 938 475 |
+
+The remaining 398 000 property stubs per invocation are all string `.length`,
+which is the next target: its receiver is a primitive, so no cache program is
+built for it at all.
+
+Original investigation, kept because the ruled-out list is still the map of
+this area:
 
 **Root cause, found by instrumenting the bake path.** There are two compile
 snapshot builders in `crates/otter-vm/src/interp/jit_compile.rs`. The

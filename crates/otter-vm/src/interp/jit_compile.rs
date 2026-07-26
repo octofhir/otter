@@ -311,6 +311,8 @@ impl Interpreter {
             false,
         );
         self.bake_collection_leaf_methods(&mut snapshot);
+        self.bake_collection_alloc_methods(&mut snapshot);
+        self.bake_array_methods(&mut snapshot);
         self.bake_primitive_method_guards(&mut snapshot);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }

@@ -4,7 +4,7 @@
 //! code. Runtime method dispatch remains interpreter-owned.
 
 use super::MethodCallIc;
-use crate::{Interpreter, Value};
+use crate::Interpreter;
 
 fn compressed_slot_byte(slot: u16) -> u32 {
     u32::from(slot) * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32
@@ -153,7 +153,7 @@ impl Interpreter {
             receiver_type_tag,
             proto_offset: proto.offset(),
             proto_shape: crate::object::shape(proto, &self.gc_heap).offset(),
-            method_value_byte: u32::from(ic.proto_slot) * std::mem::size_of::<Value>() as u32,
+            method_value_byte: compressed_slot_byte(ic.proto_slot),
             builtin_fn_addr,
             leaf_stub_id: stub_id,
         })
@@ -202,7 +202,7 @@ impl Interpreter {
             receiver_type_tag,
             proto_offset: proto.offset(),
             proto_shape: crate::object::shape(proto, &self.gc_heap).offset(),
-            method_value_byte: u32::from(ic.proto_slot) * std::mem::size_of::<Value>() as u32,
+            method_value_byte: compressed_slot_byte(ic.proto_slot),
             builtin_fn_addr,
             alloc_stub_id: stub_id,
             safepoint_id,

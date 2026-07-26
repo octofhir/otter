@@ -436,7 +436,7 @@ pub(crate) fn emit_primitive_method_guarded_call(
 /// `map.delete`/…) through the resolved `AllocValue3` entry over the frozen
 /// call packet, publishing the snapshot-assigned safepoint. Returns `false`
 /// when the site cannot take the fast path at all.
-pub(super) fn emit_alloc_method_guarded_call(
+pub(crate) fn emit_alloc_method_guarded_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
@@ -564,7 +564,7 @@ fn emit_dense_array_receiver_guard(
 /// accessor override in range, the indexed-accessor protector) are re-checked
 /// by the entry, which reports a miss so the site falls through to ordinary
 /// dispatch.
-pub(super) fn emit_array_method_guarded_call(
+pub(crate) fn emit_array_method_guarded_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,

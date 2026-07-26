@@ -52,3 +52,5 @@ tests/node-compat/reports/
 # Local benchmark suite checkouts (older scripts used these root paths)
 /v8-v7/
 /octane/
+
+scratchpad

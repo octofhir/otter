@@ -1559,11 +1559,25 @@ pub(super) fn is_boolean_value(ssa: &SsaFunction, value: ValueId) -> bool {
                     | Op::GreaterThan
                     | Op::GreaterEq
                     | Op::Equal
-                    | Op::NotEqual,
+                    | Op::NotEqual
+                    | Op::LessThanImm
+                    | Op::EqualImm
+                    | Op::NotEqualImm
+                    | Op::LogicalNot,
             ),
             ..
         }
     )
+}
+
+/// The two-register comparison an immediate-right form performs.
+pub(super) fn register_comparison_form(op: Op) -> Op {
+    match op {
+        Op::LessThanImm => Op::LessThan,
+        Op::EqualImm => Op::Equal,
+        Op::NotEqualImm => Op::NotEqual,
+        other => other,
+    }
 }
 
 /// Whether `instructions[index]` can leave its numeric comparison in flags for
@@ -1585,12 +1599,26 @@ pub(super) fn fused_numeric_compare_at(
     let Some(branch) = instructions.get(index.saturating_add(1)) else {
         return false;
     };
-    if !matches!(
+    // An immediate-right form loads one operand and materializes the other, so
+    // it leaves the same flags; it has no float lowering, so only an int32 site
+    // can leave them for the branch.
+    let immediate = matches!(
         comparison.op,
-        SsaOp::Bytecode(
-            Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq | Op::Equal | Op::NotEqual
-        )
-    ) || !matches!(branch.op, SsaOp::Bytecode(Op::JumpIfTrue | Op::JumpIfFalse))
+        SsaOp::Bytecode(Op::LessThanImm | Op::EqualImm | Op::NotEqualImm)
+    );
+    if !(immediate
+        || matches!(
+            comparison.op,
+            SsaOp::Bytecode(
+                Op::LessThan
+                    | Op::LessEq
+                    | Op::GreaterThan
+                    | Op::GreaterEq
+                    | Op::Equal
+                    | Op::NotEqual
+            )
+        ))
+        || !matches!(branch.op, SsaOp::Bytecode(Op::JumpIfTrue | Op::JumpIfFalse))
         || comparison.inline != branch.inline
         || insufficient_feedback.contains(&(comparison.inline, comparison.pc))
         || insufficient_feedback.contains(&(branch.inline, branch.pc))
@@ -1604,6 +1632,9 @@ pub(super) fn fused_numeric_compare_at(
         return false;
     }
     let feedback = frame_feedback(tree, comparison);
+    if immediate {
+        return feedback.is_int32_only();
+    }
     feedback.is_int32_only() || feedback.is_numeric_only()
 }
 

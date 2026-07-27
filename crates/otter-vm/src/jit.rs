@@ -166,6 +166,11 @@ pub struct JitCompileSnapshot {
     /// keyed by byte-PC. A store may not write through a prototype, so a
     /// settled store needs no hop check either.
     pub property_stores: rustc_hash::FxHashMap<u32, Vec<JitInlinePropertyLoad>>,
+    /// Load sites whose every program reaches its slot through the receiver's
+    /// prototype, keyed by byte-PC. Guarding the receiver shape fixes which
+    /// prototype the hop reaches and guarding the holder shape fixes the slot,
+    /// so generated code runs the hop without the site's cache cell.
+    pub property_prototype_loads: rustc_hash::FxHashMap<u32, Vec<JitInlinePropertyHop>>,
     /// Logical PCs an earlier optimized generation of this function
     /// deoptimized at. Moving a settled access out of a loop makes its guard
     /// run on paths that would not have reached it, so a pass that would place
@@ -529,16 +534,29 @@ pub enum JitDirectCallThisMode {
     MethodReceiver,
 }
 
+/// A settled prototype-hop load: the two shapes it guards and the slot it
+/// reaches.
+///
+/// Both shapes are compressed shape-handle offsets — stable tokens, since
+/// shapes are interned, immortal, and pinned in non-moving old space, so a
+/// descriptor holds no GC pointer and needs no tracing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct JitInlinePropertyHop {
+    /// Hidden class the receiver must still carry for the hop to reach this
+    /// prototype.
+    pub receiver_shape: u32,
+    /// Hidden class the prototype must still carry for the slot to be there.
+    pub holder_shape: u32,
+    /// Byte offset of the slot inside the holder's value slab.
+    pub value_byte: u32,
+}
+
 /// One cache program lowered to the form generated code executes inline.
 ///
 /// This is the single description of a property fast path: the interpreter's
 /// [`crate::cache_ir::CacheStub`] lowers its op sequence to this, and every
 /// tier's emitted probe consumes exactly this. Nothing re-derives a slot or a
 /// guard on its own, so the tiers cannot disagree about what a site caches.
-///
-/// Shape fields are compressed shape-handle offsets — stable tokens, since
-/// shapes are interned, immortal, and pinned in non-moving old space, so a way
-/// holds no GC pointer and needs no tracing.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct JitPropertyIcWay {
@@ -971,6 +989,7 @@ impl JitCompileSnapshot {
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             property_loads: rustc_hash::FxHashMap::default(),
             property_stores: rustc_hash::FxHashMap::default(),
+            property_prototype_loads: rustc_hash::FxHashMap::default(),
             optimized_bail_pcs: std::collections::BTreeSet::new(),
             safepoints: rustc_hash::FxHashMap::default(),
         }

@@ -325,6 +325,7 @@ impl CodeBlock {
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             property_loads: rustc_hash::FxHashMap::default(),
             property_stores: rustc_hash::FxHashMap::default(),
+            property_prototype_loads: rustc_hash::FxHashMap::default(),
             optimized_bail_pcs: std::collections::BTreeSet::new(),
             safepoints: rustc_hash::FxHashMap::default(),
         }

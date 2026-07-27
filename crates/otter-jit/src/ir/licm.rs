@@ -228,9 +228,11 @@ fn plan_loop(
 /// it.
 fn preserves_hoisted_reads(instruction: &SsaInstr) -> bool {
     let op = match instruction.op {
-        SsaOp::LoadHeader | SsaOp::CheckShape { .. } | SsaOp::LoadField { .. } | SsaOp::Reuse => {
-            return true;
-        }
+        SsaOp::LoadHeader
+        | SsaOp::LoadPrototype
+        | SsaOp::CheckShape { .. }
+        | SsaOp::LoadField { .. }
+        | SsaOp::Reuse => return true,
         SsaOp::StoreField { .. } => return false,
         SsaOp::Bytecode(op) => op,
     };
@@ -297,15 +299,21 @@ fn hoistable_holder(
     if derivation.op != SsaOp::LoadHeader {
         return None;
     }
-    let holder = derivation.result?;
-    // A holder never leaves its block, so everything trusting it is here.
+    // A holder never leaves its block, so everything trusting it is here — and
+    // a hop derives another holder whose own dependents come along with it.
+    let mut holders = vec![derivation.result?];
     let mut indices = vec![index];
     for (position, instruction) in instrs.iter().enumerate().skip(index + 1) {
-        if instruction.inputs.first() != Some(&holder) {
+        if !instruction
+            .inputs
+            .first()
+            .is_some_and(|input| holders.contains(input))
+        {
             continue;
         }
         match instruction.op {
             SsaOp::CheckShape { .. } => {}
+            SsaOp::LoadPrototype => holders.push(instruction.result?),
             SsaOp::LoadField { .. } => {
                 let result_register = instruction.result_register?;
                 // Re-executing the pre-header's trailing instruction after a

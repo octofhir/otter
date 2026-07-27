@@ -174,6 +174,20 @@ impl FeedbackDirectory {
         (!settled.is_empty() && settled.len() == stubs.len()).then_some(settled)
     }
 
+    /// Receiver shape, holder shape and slot for a load site every one of whose
+    /// programs reaches its slot through the receiver's prototype.
+    pub(crate) fn settled_prototype_slots(
+        &self,
+        site: usize,
+    ) -> Option<Vec<(crate::object::ShapeId, crate::object::ShapeId, u32, u16)>> {
+        let stubs = self.property_stubs(site, PropertyIcKind::Load)?;
+        let settled: Vec<_> = stubs
+            .iter()
+            .filter_map(crate::cache_ir::CacheStub::settled_prototype_slot)
+            .collect();
+        (!settled.is_empty() && settled.len() == stubs.len()).then_some(settled)
+    }
+
     /// Lower this load site's cache program to the way generated code runs.
     ///
     /// Whatever the stub's op sequence is — own data, or a guarded hop to the

@@ -200,6 +200,42 @@ where
     Ok(())
 }
 
+/// Read the `[[Prototype]]` of the object `header` names, leaving that
+/// prototype's `GcHeader` address in `dst`.
+///
+/// The prototype lives in the object body, so `setPrototypeOf` moves it while
+/// the receiver's shape stays put: the hop is a run-time read whatever guard
+/// precedes it. A receiver with no prototype, or one carrying a body this path
+/// cannot address, branches to `miss`. Clobbers `w12` and `w14`.
+pub(crate) fn emit_load_prototype(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    header: u8,
+    dst: u8,
+    miss: DynamicLabel,
+) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr w12, [X(header), view.jit_proto_byte]
+        ; cbz w12, =>miss
+    );
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        14,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; add X(dst), x14, x12     // dst = prototype GcHeader ptr
+        ; ldrb w14, [X(dst)]
+        ; cmp w14, OBJECT_BODY_TYPE_TAG
+        ; b.ne =>miss
+    );
+}
+
 /// Prove the holder `header` names still carries the compile-time hidden class
 /// `shape`.
 ///

@@ -543,7 +543,8 @@ impl Interpreter {
         view.cage_base = otter_gc::cage_base() as usize;
     }
 
-    /// Describe every property-load site whose receiver shape has settled.
+    /// Describe every property load and store site whose receiver shape has
+    /// settled.
     ///
     /// The site's own-data feedback is the declaration: a shape handle and a
     /// slot. Generated code then compares against that shape as an immediate
@@ -556,15 +557,31 @@ impl Interpreter {
         let sites: Vec<_> = view
             .instructions
             .iter()
-            .filter(|instr| instr.op(&view.code_block) == Op::LoadProperty)
+            .filter(|instr| {
+                matches!(
+                    instr.op(&view.code_block),
+                    Op::LoadProperty | Op::StoreProperty
+                )
+            })
             .filter(|instr| !instr.load_array_length)
-            .map(|instr| (instr.byte_pc, instr.property_ic_site(&view.code_block)))
+            .map(|instr| {
+                (
+                    instr.byte_pc,
+                    instr.op(&view.code_block),
+                    instr.property_ic_site(&view.code_block),
+                )
+            })
             .collect();
-        for (byte_pc, site) in sites {
+        for (byte_pc, op, site) in sites {
             let Some(site) = site else { continue };
-            self.publish_property_feedback(site, crate::property_ic::PropertyIcKind::Load);
+            let kind = if op == Op::LoadProperty {
+                crate::property_ic::PropertyIcKind::Load
+            } else {
+                crate::property_ic::PropertyIcKind::Store
+            };
+            self.publish_property_feedback(site, kind);
             let Some(crate::feedback::PropertyFeedbackState::MonomorphicOwnData { shape_id, slot }) =
-                self.property_feedback_state(site, crate::property_ic::PropertyIcKind::Load)
+                self.property_feedback_state(site, kind)
             else {
                 continue;
             };
@@ -576,13 +593,15 @@ impl Interpreter {
             if receiver_shape == 0 {
                 continue;
             }
-            view.property_loads.insert(
-                byte_pc,
-                jit::JitInlinePropertyLoad {
-                    receiver_shape,
-                    value_byte: u32::from(slot) * SLOT_BYTES,
-                },
-            );
+            let settled = jit::JitInlinePropertyLoad {
+                receiver_shape,
+                value_byte: u32::from(slot) * SLOT_BYTES,
+            };
+            if op == Op::LoadProperty {
+                view.property_loads.insert(byte_pc, settled);
+            } else {
+                view.property_stores.insert(byte_pc, settled);
+            }
         }
     }
 

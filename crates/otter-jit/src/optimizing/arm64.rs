@@ -1367,7 +1367,8 @@ fn emit(
                             view,
                             (instruction.inline == InlineId::ROOT)
                                 .then(|| view.property_loads.get(&property_byte_pc))
-                                .flatten(),
+                                .flatten()
+                                .map(Vec::as_slice),
                             |ops, register| {
                                 emit_load_tagged_location(
                                     ops,
@@ -1509,7 +1510,8 @@ fn emit(
                             view,
                             (instruction.inline == InlineId::ROOT)
                                 .then(|| view.property_stores.get(&store_byte_pc))
-                                .flatten(),
+                                .flatten()
+                                .map(Vec::as_slice),
                             |ops, register| {
                                 emit_load_tagged_location(
                                     ops,

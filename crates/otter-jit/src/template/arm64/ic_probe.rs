@@ -149,7 +149,7 @@ pub(crate) fn emit_property_ic_load<R>(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
-    settled: Option<&otter_vm::JitInlinePropertyLoad>,
+    settled: Option<&[otter_vm::JitInlinePropertyLoad]>,
     load_receiver: R,
     cell_addr: usize,
     cell_ordinal: u32,
@@ -182,23 +182,48 @@ where
         ; ldr w14, [x13, shape_byte] // receiver shape handle
         ; cbz w14, =>miss          // empty-cell sentinel
     );
-    if let Some(settled) = settled {
-        // The shape is a compile-time constant, so the guard is one compare
-        // against an immediate and the slot is a fixed offset: no cell load,
-        // no way walk, no prototype hop.
-        emit_load_u64(ops, 12, u64::from(settled.receiver_shape));
-        dynasm!(ops
-            ; .arch aarch64
-            ; cmp w14, w12
-            ; b.ne =>miss
-        );
-        super::values::emit_slab_base(ops, view, 13, 14);
-        let value_byte = settled.value_byte;
-        dynasm!(ops
-            ; .arch aarch64
-            ; cbz x13, =>miss
-            ; ldr w9, [x13, value_byte]
-        );
+    if let Some(chain) = settled.filter(|chain| !chain.is_empty()) {
+        // Every shape the site installed is a compile-time constant, so the
+        // guard is a compare against an immediate per shape and the slot is a
+        // fixed offset: no cell load, no way walk, no prototype hop. A
+        // monomorphic site is the one-entry case of this chain.
+        if let [only] = chain {
+            // One target: the slot is an immediate, so the chain's dispatch
+            // register and its join branch fold away entirely.
+            emit_load_u64(ops, 12, u64::from(only.receiver_shape));
+            dynasm!(ops
+                ; .arch aarch64
+                ; cmp w14, w12
+                ; b.ne =>miss
+            );
+            super::values::emit_slab_base(ops, view, 13, 14);
+            let value_byte = only.value_byte;
+            dynasm!(ops
+                ; .arch aarch64
+                ; cbz x13, =>miss
+                ; ldr w9, [x13, value_byte]
+            );
+        } else {
+            let resolved = ops.new_dynamic_label();
+            for entry in chain {
+                let next = ops.new_dynamic_label();
+                emit_load_u64(ops, 12, u64::from(entry.receiver_shape));
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; cmp w14, w12
+                    ; b.ne =>next
+                );
+                emit_load_u64(ops, 17, u64::from(entry.value_byte));
+                dynasm!(ops ; .arch aarch64 ; b =>resolved ; =>next);
+            }
+            dynasm!(ops ; .arch aarch64 ; b =>miss ; =>resolved);
+            super::values::emit_slab_base(ops, view, 13, 14);
+            dynasm!(ops
+                ; .arch aarch64
+                ; cbz x13, =>miss
+                ; ldr w9, [x13, x17]
+            );
+        }
     } else {
         emit_load_symbol_u64(
             ops,
@@ -251,7 +276,7 @@ pub(crate) fn emit_property_ic_store_guard<R>(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
-    settled: Option<&otter_vm::JitInlinePropertyLoad>,
+    settled: Option<&[otter_vm::JitInlinePropertyLoad]>,
     load_receiver: R,
     cell_addr: usize,
     cell_ordinal: u32,
@@ -283,14 +308,30 @@ where
         ; ldr w14, [x13, shape_byte] // receiver shape handle
         ; cbz w14, =>miss
     );
-    if let Some(settled) = settled {
-        emit_load_u64(ops, 12, u64::from(settled.receiver_shape));
-        dynasm!(ops
-            ; .arch aarch64
-            ; cmp w14, w12
-            ; b.ne =>miss
-        );
-        emit_load_u64(ops, 17, u64::from(settled.value_byte));
+    if let Some(chain) = settled.filter(|chain| !chain.is_empty()) {
+        if let [only] = chain {
+            emit_load_u64(ops, 12, u64::from(only.receiver_shape));
+            dynasm!(ops
+                ; .arch aarch64
+                ; cmp w14, w12
+                ; b.ne =>miss
+            );
+            emit_load_u64(ops, 17, u64::from(only.value_byte));
+        } else {
+            let resolved = ops.new_dynamic_label();
+            for entry in chain {
+                let next = ops.new_dynamic_label();
+                emit_load_u64(ops, 12, u64::from(entry.receiver_shape));
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; cmp w14, w12
+                    ; b.ne =>next
+                );
+                emit_load_u64(ops, 17, u64::from(entry.value_byte));
+                dynasm!(ops ; .arch aarch64 ; b =>resolved ; =>next);
+            }
+            dynasm!(ops ; .arch aarch64 ; b =>miss ; =>resolved);
+        }
     } else {
         emit_load_symbol_u64(
             ops,

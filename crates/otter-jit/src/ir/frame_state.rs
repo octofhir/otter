@@ -550,21 +550,20 @@ impl FrameStateTable {
                     && ssa.frames[instruction.inline.0 as usize]
                         .this_value
                         .is_some_and(|value| instruction.inputs.as_slice() == [value]);
-                if !synthetic_this
-                    && !instruction.op.reads_header()
-                    && instruction.input_registers.len() != instruction.inputs.len()
-                {
+                // A node that consumes a holder address keeps a source register
+                // for every operand but the holder, which names no register.
+                let operands = &instruction.inputs[usize::from(
+                    instruction.op.reads_header() && !instruction.inputs.is_empty(),
+                )..];
+                if !synthetic_this && instruction.input_registers.len() != operands.len() {
                     return Err(FrameStateError::OperandRegisterCountMismatch {
                         pc: instruction.pc,
                         inputs: instruction.inputs.len(),
                         registers: instruction.input_registers.len(),
                     });
                 }
-                for (operand_index, (&register, &expected)) in instruction
-                    .input_registers
-                    .iter()
-                    .zip(&instruction.inputs)
-                    .enumerate()
+                for (operand_index, (&register, &expected)) in
+                    instruction.input_registers.iter().zip(operands).enumerate()
                 {
                     let Some(actual) = state.registers.get(usize::from(register)).copied() else {
                         return Err(FrameStateError::OperandRegisterOutOfRange {

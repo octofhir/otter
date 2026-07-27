@@ -463,6 +463,29 @@ where
     Ok(())
 }
 
+/// Overwrite the own data slot at `value_byte` of the holder `header` names with
+/// the boxed `Value` in `x9`.
+///
+/// The value is compressed into the slot, never boxed: a double or an int the
+/// encoding cannot hold branches to `miss` instead, which is what keeps this
+/// free of an allocation and of the generational write barrier a heap cell would
+/// owe. Clobbers `x10`, `x11`, `x13`, `x14`.
+pub(crate) fn emit_store_field(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    header: u8,
+    value_byte: u32,
+    miss: DynamicLabel,
+) {
+    if header != 13 {
+        dynasm!(ops ; .arch aarch64 ; mov x13, X(header));
+    }
+    super::values::emit_slab_base(ops, view, 13, 14);
+    dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);
+    super::values::emit_compress_slot_or_bail(ops, miss);
+    dynasm!(ops ; .arch aarch64 ; str w10, [x13, value_byte]);
+}
+
 /// Serve `receiver.length` for the two receivers whose length is not an own
 /// data slot: a dense array's exotic `length`, and a primitive string's.
 ///

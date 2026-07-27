@@ -40,7 +40,7 @@ use crate::{
         frame_state::{FrameStateError, FrameStateTable},
         inline::{InlineError, InlineTree},
         liveness::{Liveness, LivenessError},
-        lower::lower_settled_property_loads,
+        lower::lower_settled_property_accesses,
         regalloc::{Allocation, Location, RegClass, RegallocError, RegisterBudget},
         repr::{ReprError, ReprMap},
         ssa::{SsaError, SsaFunction, ValueId},
@@ -134,7 +134,12 @@ impl OptimizationPipeline {
 
         let mut ssa =
             SsaFunction::build_inlined(&tree, &cfg).map_err(OptimizationError::SsaConstruction)?;
-        lower_settled_property_loads(&mut ssa, &cfg, view, &tree);
+        // Lowering a settled write needs the stored value's representation,
+        // which this pass does not change: it selects by producer and every
+        // producer here keeps its node. The map is recomputed below over the
+        // renumbered graph.
+        let value_reprs = ReprMap::compute(&tree, &ssa);
+        lower_settled_property_accesses(&mut ssa, &cfg, view, &tree, &value_reprs);
         ssa.verify(&cfg, &dom)
             .map_err(OptimizationError::SsaVerification)?;
 

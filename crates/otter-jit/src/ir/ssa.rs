@@ -84,6 +84,17 @@ pub enum SsaOp {
         /// Byte offset of the slot in the holder's value slab.
         byte: u32,
     },
+    /// Overwrite the own data slot at `byte` of the holder its first input
+    /// names with its second input.
+    ///
+    /// The slot already exists and keeps its hidden class, so this neither
+    /// allocates nor transitions. A value the compressed slot encoding cannot
+    /// hold resumes in the interpreter instead of boxing, which is what keeps it
+    /// free of a write barrier and of a safepoint.
+    StoreField {
+        /// Byte offset of the slot in the holder's value slab.
+        byte: u32,
+    },
 }
 
 impl SsaOp {
@@ -92,14 +103,20 @@ impl SsaOp {
     pub const fn bytecode(self) -> Option<Op> {
         match self {
             Self::Bytecode(op) => Some(op),
-            Self::LoadHeader | Self::CheckShape { .. } | Self::LoadField { .. } => None,
+            Self::LoadHeader
+            | Self::CheckShape { .. }
+            | Self::LoadField { .. }
+            | Self::StoreField { .. } => None,
         }
     }
 
     /// Whether this node consumes a [`Self::LoadHeader`] address.
     #[must_use]
     pub const fn reads_header(self) -> bool {
-        matches!(self, Self::CheckShape { .. } | Self::LoadField { .. })
+        matches!(
+            self,
+            Self::CheckShape { .. } | Self::LoadField { .. } | Self::StoreField { .. }
+        )
     }
 }
 
@@ -1351,11 +1368,13 @@ impl SsaFunction {
                             return Err(SsaError::MalformedPrimitive { pc: instruction.pc });
                         }
                     }
-                    // The read trusts a proven hidden class, so a check over
-                    // the same holder must dominate it.
-                    SsaOp::LoadField { .. } => {
-                        if instruction.inputs.len() != 1
-                            || !instruction.input_registers.is_empty()
+                    // A read and a write both trust a proven hidden class, so a
+                    // check over the same holder must dominate them.
+                    SsaOp::LoadField { .. } | SsaOp::StoreField { .. } => {
+                        let operands =
+                            1 + usize::from(matches!(instruction.op, SsaOp::StoreField { .. }));
+                        if instruction.inputs.len() != operands
+                            || instruction.input_registers.len() != operands - 1
                             || instruction.result.is_none()
                             || instruction.result_register.is_none()
                             || !self.defines_header(instruction.inputs[0])
@@ -1381,11 +1400,11 @@ impl SsaFunction {
                         .this_value
                         .is_some_and(|value| instruction.inputs.as_slice() == [value]);
                 // A holder address is not a register read, so a node that
-                // consumes one has one operand and no source register.
-                if !synthetic_this
-                    && !instruction.op.reads_header()
-                    && instruction.input_registers.len() != instruction.inputs.len()
-                {
+                // consumes one keeps a source register for every operand but
+                // the holder.
+                let operand_registers = instruction.inputs.len()
+                    - usize::from(instruction.op.reads_header() && !instruction.inputs.is_empty());
+                if !synthetic_this && instruction.input_registers.len() != operand_registers {
                     return Err(SsaError::InputRegisterCountMismatch {
                         pc: instruction.pc,
                         inputs: instruction.inputs.len(),

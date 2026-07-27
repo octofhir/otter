@@ -1040,6 +1040,44 @@ fn emit(
                         dynasm!(ops ; .arch aarch64 ; =>done);
                     }
                 }
+                // The slot exists and keeps its class, so the write is one
+                // compressed store with no barrier and no allocation. A value
+                // the encoding cannot hold resumes in the interpreter.
+                SsaOp::StoreField { byte } => {
+                    let deopt = ops.new_dynamic_label();
+                    deopt_exits.push((
+                        deopt,
+                        deopt_exit_at(frame_states, instruction)?,
+                        instruction.pc,
+                    ));
+                    let header = materialized_header(&mut ops, allocation, instruction.inputs[0])?;
+                    // The lowering selects a site only for a proven int32, so
+                    // the boxed value is the one the compressed slot takes
+                    // whole.
+                    match reprs.representation(instruction.inputs[1]) {
+                        Representation::Int32 => {
+                            emit_load_location(
+                                &mut ops,
+                                allocation.location(instruction.inputs[1]),
+                                9,
+                            )?;
+                            emit_box_int32(&mut ops, 9, 11);
+                        }
+                        Representation::Tagged => {
+                            emit_load_tagged_location(
+                                &mut ops,
+                                allocation.location(instruction.inputs[1]),
+                                9,
+                            )?;
+                        }
+                        Representation::Float64 => {
+                            return Err(Unsupported::OperandShape(
+                                "optimizing settled store expects an int32 value",
+                            ));
+                        }
+                    }
+                    ic_probe::emit_store_field(&mut ops, view, header, byte, deopt);
+                }
                 SsaOp::Bytecode(op) => match op {
                     Op::LoadInt32 => {
                         let value = load_int32(view, instruction.pc)?;

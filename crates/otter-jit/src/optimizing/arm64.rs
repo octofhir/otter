@@ -912,6 +912,37 @@ fn emit(
                         )?;
                     }
                 }
+                // The prototype is read at run time: a guarded receiver shape
+                // fixes which object the hop should land on, never where it is.
+                SsaOp::LoadPrototype => {
+                    let holder = instruction
+                        .result
+                        .expect("eligibility checked the hop address");
+                    let deopt = ops.new_dynamic_label();
+                    deopt_exits.push((
+                        deopt,
+                        deopt_exit_at(frame_states, instruction)?,
+                        instruction.pc,
+                    ));
+                    let receiver =
+                        materialized_header(&mut ops, allocation, instruction.inputs[0])?;
+                    let target = header_register(allocation, holder)?;
+                    ic_probe::emit_load_prototype(
+                        &mut ops,
+                        &mut relocations,
+                        view,
+                        receiver,
+                        target.unwrap_or(HEADER_SCRATCH),
+                        deopt,
+                    );
+                    if target.is_none() {
+                        emit_store_tagged_location(
+                            &mut ops,
+                            allocation.location(holder),
+                            HEADER_SCRATCH,
+                        )?;
+                    }
+                }
                 SsaOp::CheckShape { shape } => {
                     let deopt = ops.new_dynamic_label();
                     deopt_exits.push((

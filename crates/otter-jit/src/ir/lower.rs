@@ -36,7 +36,7 @@
 use std::collections::BTreeMap;
 
 use otter_bytecode::{Op, opcode_schema::opcode_schema};
-use otter_vm::JitCompileSnapshot;
+use otter_vm::{JitCompileSnapshot, JitInlinePropertyHop};
 use smallvec::SmallVec;
 
 use super::{
@@ -54,23 +54,30 @@ pub fn lower_settled_property_accesses(
     tree: &InlineTree,
     reprs: &ReprMap,
 ) {
-    if view.cage_base == 0 || (view.property_loads.is_empty() && view.property_stores.is_empty()) {
+    if view.cage_base == 0
+        || (view.property_loads.is_empty()
+            && view.property_stores.is_empty()
+            && view.property_prototype_loads.is_empty())
+    {
         return;
     }
     let root = &tree.frames[InlineId::ROOT.0 as usize];
     let mut lowered_any = false;
     for block_index in 0..ssa.blocks.len() {
-        if !ssa.blocks[block_index]
-            .instrs
-            .iter()
-            .any(|instruction| settled_slot(view, root, reprs, instruction).is_some())
-        {
+        if !ssa.blocks[block_index].instrs.iter().any(|instruction| {
+            settled_slot(view, root, reprs, instruction).is_some()
+                || settled_hop(view, root, instruction).is_some()
+        }) {
             continue;
         }
         lowered_any = true;
         let source = std::mem::take(&mut ssa.blocks[block_index].instrs);
         let mut lowered = Vec::with_capacity(source.len() + 2);
         for instruction in source {
+            if let Some(hop) = settled_hop(view, root, &instruction) {
+                lower_prototype_load(ssa, &mut lowered, instruction, hop, block_index);
+                continue;
+            }
             let Some((shape, byte, writes)) = settled_slot(view, root, reprs, &instruction) else {
                 lowered.push(instruction);
                 continue;
@@ -134,6 +141,134 @@ pub fn lower_settled_property_accesses(
         let renumbered = ReprMap::compute(tree, ssa);
         eliminate_redundant_checks(ssa, cfg, &renumbered);
     }
+}
+
+/// Rewrite a settled prototype-hop load into its guard chain.
+///
+/// Two shapes and one hop: the receiver's class fixes which prototype the hop
+/// lands on, the hop reads that prototype at run time because `setPrototypeOf`
+/// moves it, and the holder's class fixes the slot inside it.
+fn lower_prototype_load(
+    ssa: &mut SsaFunction,
+    lowered: &mut Vec<SsaInstr>,
+    instruction: SsaInstr,
+    hop: JitInlinePropertyHop,
+    block_index: usize,
+) {
+    let result = instruction
+        .result
+        .expect("a settled property load writes one register");
+    let receiver = append_header_value(ssa, &instruction, block_index);
+    let holder = append_value(
+        ssa,
+        &instruction,
+        block_index,
+        SsaOp::LoadPrototype,
+        &[receiver],
+    );
+    let access = SsaOp::LoadField {
+        byte: hop.value_byte,
+    };
+    let ValueDef::Op { op, inputs, .. } = &mut ssa.values[result.0 as usize].def else {
+        unreachable!("an instruction result is defined by its instruction");
+    };
+    *op = access;
+    *inputs = Box::new([holder]);
+    lowered.push(SsaInstr {
+        op: SsaOp::LoadHeader,
+        inputs: SmallVec::from_slice(&[instruction.inputs[0]]),
+        input_registers: SmallVec::from_slice(&[instruction.input_registers[0]]),
+        result: Some(receiver),
+        result_register: None,
+        ..instruction.clone()
+    });
+    lowered.push(SsaInstr {
+        op: SsaOp::CheckShape {
+            shape: hop.receiver_shape,
+        },
+        inputs: SmallVec::from_slice(&[receiver]),
+        input_registers: SmallVec::new(),
+        result: None,
+        result_register: None,
+        ..instruction.clone()
+    });
+    lowered.push(SsaInstr {
+        op: SsaOp::LoadPrototype,
+        inputs: SmallVec::from_slice(&[receiver]),
+        input_registers: SmallVec::new(),
+        result: Some(holder),
+        result_register: None,
+        ..instruction.clone()
+    });
+    lowered.push(SsaInstr {
+        op: SsaOp::CheckShape {
+            shape: hop.holder_shape,
+        },
+        inputs: SmallVec::from_slice(&[holder]),
+        input_registers: SmallVec::new(),
+        result: None,
+        result_register: None,
+        ..instruction.clone()
+    });
+    lowered.push(SsaInstr {
+        op: access,
+        inputs: SmallVec::from_slice(&[holder]),
+        input_registers: SmallVec::new(),
+        ..instruction
+    });
+}
+
+/// The sole prototype hop a load site has settled on.
+fn settled_hop(
+    view: &JitCompileSnapshot,
+    root: &super::inline::InlineFrame,
+    instruction: &SsaInstr,
+) -> Option<JitInlinePropertyHop> {
+    if instruction.inline != InlineId::ROOT
+        || instruction.op != SsaOp::Bytecode(Op::LoadProperty)
+        || instruction.inputs.len() != 1
+        || instruction.input_registers.len() != 1
+        || instruction.result.is_none()
+        || instruction.result_register.is_none()
+    {
+        return None;
+    }
+    let metadata = root.instructions.get(instruction.pc as usize)?;
+    if metadata.load_array_length {
+        return None;
+    }
+    let [only] = view
+        .property_prototype_loads
+        .get(&metadata.byte_pc)?
+        .as_slice()
+    else {
+        return None;
+    };
+    (only.receiver_shape != 0 && only.holder_shape != 0).then_some(*only)
+}
+
+/// Append a value one lowered site defines but no interpreter register names.
+fn append_value(
+    ssa: &mut SsaFunction,
+    instruction: &SsaInstr,
+    block_index: usize,
+    op: SsaOp,
+    inputs: &[ValueId],
+) -> ValueId {
+    let id = ValueId(
+        u32::try_from(ssa.values.len()).expect("a lowered graph fits the value identity space"),
+    );
+    ssa.values.push(ValueData {
+        id,
+        def: ValueDef::Op {
+            inline: instruction.inline,
+            pc: instruction.pc,
+            op,
+            inputs: inputs.into(),
+        },
+        def_block: ssa.blocks[block_index].id,
+    });
+    id
 }
 
 /// Append the holder-address value one lowered site defines.
@@ -227,6 +362,20 @@ pub fn eliminate_redundant_checks(ssa: &mut SsaFunction, cfg: &ControlFlowGraph,
                 // move the object: both facts survive it. A rebound value
                 // touches nothing at all.
                 SsaOp::LoadField { .. } | SsaOp::StoreField { .. } | SsaOp::Reuse => {}
+                // A hop changes nothing, so a second hop off a holder already
+                // hopped from lands on the same object.
+                SsaOp::LoadPrototype => {
+                    let receiver = instruction.inputs[0];
+                    let holder = instruction
+                        .result
+                        .expect("a hop derives its holder address");
+                    if let Some(&existing) = holder_of.get(&receiver) {
+                        replacement.insert(holder, existing);
+                        deleted_any = true;
+                        continue;
+                    }
+                    holder_of.insert(receiver, holder);
+                }
                 SsaOp::Bytecode(op) => {
                     // Anything that can run arbitrary code, allocate, or write
                     // the heap invalidates both a raw address and a proven
@@ -311,7 +460,7 @@ fn settled_slot(
 #[cfg(test)]
 mod tests {
     use otter_bytecode::Operand;
-    use otter_vm::{JitInlinePropertyLoad, jit::JitTestInstruction};
+    use otter_vm::{JitInlinePropertyHop, JitInlinePropertyLoad, jit::JitTestInstruction};
 
     use super::*;
     use crate::ir::{cfg::ControlFlowGraph, dom::DominatorTree, ssa::SsaError};
@@ -701,6 +850,71 @@ mod tests {
         )
         .expect("the lowered graph verifies");
         ssa.blocks[0].instrs.iter().map(|i| i.op).collect()
+    }
+
+    /// A prototype hop is two guards and a run-time read: the receiver's class
+    /// fixes which prototype it lands on, the holder's fixes the slot.
+    #[test]
+    fn a_settled_prototype_hop_becomes_two_guards_and_a_hop() {
+        let mut view = JitCompileSnapshot::without_feedback(
+            0,
+            1,
+            2,
+            vec![
+                JitTestInstruction::new(
+                    Op::LoadProperty,
+                    0,
+                    0,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 1, 4, vec![Operand::Register(1)]),
+            ],
+        );
+        view.cage_base = 0x1000;
+        view.property_prototype_loads.insert(
+            0,
+            vec![JitInlinePropertyHop {
+                receiver_shape: 7,
+                holder_shape: 9,
+                value_byte: 24,
+            }],
+        );
+        let tree = InlineTree::trivial(&view);
+        let cfg = ControlFlowGraph::build_inlined(&tree).expect("CFG builds");
+        let mut ssa = SsaFunction::build_inlined(&tree, &cfg).expect("SSA builds");
+        let reprs = ReprMap::compute(&tree, &ssa);
+        lower_settled_property_accesses(&mut ssa, &cfg, &view, &tree, &reprs);
+
+        let ops: Vec<_> = ssa.blocks[0].instrs.iter().map(|i| i.op).collect();
+        assert_eq!(
+            ops,
+            vec![
+                SsaOp::LoadHeader,
+                SsaOp::CheckShape { shape: 7 },
+                SsaOp::LoadPrototype,
+                SsaOp::CheckShape { shape: 9 },
+                SsaOp::LoadField { byte: 24 },
+                SsaOp::Bytecode(Op::ReturnValue),
+            ]
+        );
+        // The hop consumes the receiver's holder and the read consumes the
+        // hop's, so the second guard proves the object the slot is on.
+        let receiver = ssa.blocks[0].instrs[0].result.expect("a holder value");
+        let holder = ssa.blocks[0].instrs[2].result.expect("a hop value");
+        assert_eq!(ssa.blocks[0].instrs[2].inputs.as_slice(), [receiver]);
+        assert_eq!(ssa.blocks[0].instrs[3].inputs.as_slice(), [holder]);
+        assert_eq!(ssa.blocks[0].instrs[4].inputs.as_slice(), [holder]);
+
+        ssa.verify(
+            &cfg,
+            &DominatorTree::compute(&cfg),
+            &ReprMap::compute(&tree, &ssa),
+        )
+        .expect("the lowered graph verifies");
     }
 
     #[test]

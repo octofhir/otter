@@ -74,6 +74,14 @@ pub enum SsaOp {
     /// may not live across an instruction this tier emits as anything but
     /// machine arithmetic, where a moving collection would leave it stale.
     LoadHeader,
+    /// Read the `[[Prototype]]` of the object its input names and produce that
+    /// prototype's `GcHeader` address.
+    ///
+    /// The hop is a run-time read whatever the receiver's shape says, because
+    /// `setPrototypeOf` moves the prototype while the receiver's shape stays
+    /// put. What the receiver's guard fixes is only *which* prototype the hop
+    /// is expected to land on; the guard after it proves the slot is there.
+    LoadPrototype,
     /// Prove the holder its input names still carries hidden class `shape`.
     CheckShape {
         /// Hidden-class handle the holder must still carry.
@@ -111,6 +119,7 @@ impl SsaOp {
         match self {
             Self::Bytecode(op) => Some(op),
             Self::LoadHeader
+            | Self::LoadPrototype
             | Self::CheckShape { .. }
             | Self::LoadField { .. }
             | Self::StoreField { .. }
@@ -127,6 +136,13 @@ impl SsaOp {
         )
     }
 
+    /// Whether this node produces a raw holder address, which may not outlive
+    /// its block or a collection.
+    #[must_use]
+    pub const fn defines_header(self) -> bool {
+        matches!(self, Self::LoadHeader | Self::LoadPrototype)
+    }
+
     /// How many leading inputs name no interpreter register.
     ///
     /// A holder address and a value bound from elsewhere are values a pass
@@ -136,7 +152,8 @@ impl SsaOp {
     pub const fn synthetic_inputs(self) -> usize {
         match self {
             Self::Bytecode(_) | Self::LoadHeader => 0,
-            Self::CheckShape { .. }
+            Self::LoadPrototype
+            | Self::CheckShape { .. }
             | Self::LoadField { .. }
             | Self::StoreField { .. }
             | Self::Reuse => 1,
@@ -1396,6 +1413,18 @@ impl SsaFunction {
                             return Err(SsaError::MalformedPrimitive { pc: instruction.pc });
                         }
                     }
+                    // A hop reads exactly the holder it comes from and, like
+                    // that holder, names no interpreter register.
+                    SsaOp::LoadPrototype => {
+                        if instruction.inputs.len() != 1
+                            || !instruction.input_registers.is_empty()
+                            || instruction.result.is_none()
+                            || instruction.result_register.is_some()
+                            || !self.defines_header(instruction.inputs[0])
+                        {
+                            return Err(SsaError::MalformedPrimitive { pc: instruction.pc });
+                        }
+                    }
                     // A shape check reads exactly the holder it proves, writes
                     // nothing, and can never match the empty-class sentinel.
                     SsaOp::CheckShape { shape } => {
@@ -1457,7 +1486,7 @@ impl SsaFunction {
                 for &register in &instruction.input_registers {
                     check_register(Some(instruction.pc), register, self.register_count)?;
                 }
-                if instruction.op == SsaOp::LoadHeader {
+                if instruction.op.defines_header() {
                     let header = instruction
                         .result
                         .expect("a holder address is checked above to have a result");
@@ -1466,8 +1495,7 @@ impl SsaFunction {
                 // A holder address is the one result no interpreter register
                 // names; every other result is a register write.
                 if instruction.result.is_some()
-                    != (instruction.result_register.is_some()
-                        || instruction.op == SsaOp::LoadHeader)
+                    != (instruction.result_register.is_some() || instruction.op.defines_header())
                 {
                     return Err(SsaError::ResultRegisterMismatch { pc: instruction.pc });
                 }
@@ -1696,7 +1724,10 @@ impl SsaFunction {
         loop {
             match &self.values.get(value.0 as usize)?.def {
                 ValueDef::Op {
-                    op: SsaOp::Bytecode(Op::LoadLocal | Op::StoreLocal) | SsaOp::LoadHeader,
+                    op:
+                        SsaOp::Bytecode(Op::LoadLocal | Op::StoreLocal)
+                        | SsaOp::LoadHeader
+                        | SsaOp::LoadPrototype,
                     inputs,
                     ..
                 } if inputs.len() == 1 => value = inputs[0],
@@ -1710,10 +1741,7 @@ impl SsaFunction {
     pub fn defines_header(&self, value: ValueId) -> bool {
         matches!(
             self.values.get(value.0 as usize).map(|data| &data.def),
-            Some(ValueDef::Op {
-                op: SsaOp::LoadHeader,
-                ..
-            })
+            Some(ValueDef::Op { op, .. }) if op.defines_header()
         )
     }
 

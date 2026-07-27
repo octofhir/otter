@@ -520,6 +520,36 @@ impl CacheStub {
         (shape_offset != 0).then_some((hit.shape_id, shape_offset, hit.slot))
     }
 
+    /// The receiver shape, holder shape and slot a settled prototype-hop load
+    /// resolves to, when this program is exactly that.
+    ///
+    /// The hop is the one program whose slot lives on an object the site does
+    /// not name: guarding the receiver's shape fixes which prototype it reaches,
+    /// and guarding the holder's shape fixes the slot inside it. Both are
+    /// compile-time constants, so generated code runs the same two compares and
+    /// one hop the stub does, without the cell.
+    #[must_use]
+    pub(crate) fn settled_prototype_slot(&self) -> Option<(ShapeId, ShapeId, u32, u16)> {
+        let (
+            [
+                CacheOp::GuardShapeId { obj: 0, shape: 0 },
+                CacheOp::LoadPrototype { obj: 0, dst: 1 },
+                CacheOp::LoadDataSlotResult { obj: 1, hit: 0 },
+            ],
+            [receiver_shape_id],
+            [hit],
+        ) = (
+            self.ops.as_slice(),
+            self.shape_ids.as_slice(),
+            self.hits.as_slice(),
+        )
+        else {
+            return None;
+        };
+        let holder_offset = hit.shape.offset();
+        (holder_offset != 0).then_some((*receiver_shape_id, hit.shape_id, holder_offset, hit.slot))
+    }
+
     /// Visit GC roots in stub data — the target shapes of replayed transitions.
     pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
         for transition in &self.transitions {

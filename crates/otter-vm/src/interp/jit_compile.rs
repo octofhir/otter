@@ -649,6 +649,52 @@ impl Interpreter {
                 view.property_stores.insert(byte_pc, chain);
             }
         }
+        self.bake_prototype_loads(view);
+    }
+
+    /// Describe every load site whose programs all reach their slot through the
+    /// receiver's prototype.
+    ///
+    /// The receiver's shape decides which prototype the hop lands on and the
+    /// holder's shape decides where the slot is, so both are compile-time
+    /// constants and the site needs no cache cell. A shape that has since moved
+    /// on drops its way, and a site that loses every way keeps its cell.
+    fn bake_prototype_loads(&mut self, view: &mut jit::JitCompileSnapshot) {
+        const SLOT_BYTES: u32 =
+            std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
+        let sites: Vec<_> = view
+            .instructions
+            .iter()
+            .filter(|instr| instr.op(&view.code_block) == Op::LoadProperty)
+            .filter(|instr| !instr.load_array_length)
+            .map(|instr| (instr.byte_pc, instr.property_ic_site(&view.code_block)))
+            .collect();
+        for (byte_pc, site) in sites {
+            let Some(site) = site else { continue };
+            if view.property_loads.contains_key(&byte_pc) {
+                continue;
+            }
+            let Some(slots) = self.feedback_directory.settled_prototype_slots(site) else {
+                continue;
+            };
+            let chain: Vec<_> = slots
+                .into_iter()
+                .filter_map(|(receiver_id, holder_id, holder_offset, slot)| {
+                    let receiver = self.shape_runtime.handle_for_id(receiver_id)?;
+                    let holder = self.shape_runtime.handle_for_id(holder_id)?;
+                    (holder.offset() == holder_offset && receiver.offset() != 0).then_some(
+                        jit::JitInlinePropertyHop {
+                            receiver_shape: receiver.offset(),
+                            holder_shape: holder_offset,
+                            value_byte: u32::from(slot) * SLOT_BYTES,
+                        },
+                    )
+                })
+                .collect();
+            if !chain.is_empty() {
+                view.property_prototype_loads.insert(byte_pc, chain);
+            }
+        }
     }
 
     /// Describe how each `LoadElement` / `StoreElement` site addresses its

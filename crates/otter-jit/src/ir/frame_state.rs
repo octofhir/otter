@@ -378,10 +378,11 @@ impl FrameStateTable {
                                     stacks[slot].push(value);
                                     pushed.push(slot);
                                 }
-                                // A holder address writes no interpreter
-                                // register, so no frame slot names it.
+                                // A holder address, however it was derived,
+                                // writes no interpreter register, so no frame
+                                // slot names it.
                                 (None, None) => {}
-                                (Some(_), None) if instruction.op == SsaOp::LoadHeader => {}
+                                (Some(_), None) if instruction.op.defines_header() => {}
                                 _ => {
                                     return Err(FrameStateError::ResultRegisterMismatch {
                                         pc: instruction.pc,

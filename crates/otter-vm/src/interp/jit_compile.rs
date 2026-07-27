@@ -311,6 +311,7 @@ impl Interpreter {
             false,
         );
         self.bake_guarded_method_calls(&mut snapshot);
+        self.bake_element_accesses(&mut snapshot);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
         });
@@ -463,6 +464,7 @@ impl Interpreter {
             eager_direct_targets,
         );
         self.bake_guarded_method_calls(&mut view);
+        self.bake_element_accesses(&mut view);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
         });
@@ -536,11 +538,56 @@ impl Interpreter {
             type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
             length_byte: header + crate::array::ARRAY_BODY_LENGTH_OFFSET as u32,
         };
-        // A dense array's elements are boxed `Value`s behind the body's
-        // element cache, and its exotic sidecar is what invalidates that
-        // layout: a non-null sidecar means custom prototype, accessor or
-        // descriptor state can make a plain indexed access observable.
-        view.element_access = jit::JitElementAccess {
+        view.cage_base = otter_gc::cage_base() as usize;
+    }
+
+    /// Describe how each `LoadElement` / `StoreElement` site addresses its
+    /// receiver's elements.
+    ///
+    /// The family comes from what the site observed, so a typed view and a
+    /// dense array are the same program over different declared offsets. A
+    /// store always bakes the dense instance: an inline typed store owes
+    /// `ToNumber` on a non-numeric value, which the store fast path does not
+    /// model.
+    pub(crate) fn bake_element_accesses(&mut self, view: &mut jit::JitCompileSnapshot) {
+        let sites: Vec<_> = view
+            .instructions
+            .iter()
+            .filter_map(|instr| {
+                let op = instr.op(&view.code_block);
+                matches!(op, Op::LoadElement | Op::StoreElement).then_some((
+                    instr.byte_pc,
+                    instr.instruction_pc(&view.code_block),
+                    op,
+                ))
+            })
+            .collect();
+        for (byte_pc, pc, op) in sites {
+            let family = if op == Op::LoadElement {
+                view.code_block
+                    .feedback_at(pc as usize)
+                    .map_or(jit::JitElementFamily::Unseen, |cell| cell.element_family())
+            } else {
+                jit::JitElementFamily::Dense
+            };
+            let access = match family {
+                jit::JitElementFamily::TypedInt32 => Self::typed_int32_element_access(),
+                jit::JitElementFamily::Dense | jit::JitElementFamily::Unseen => {
+                    Self::dense_element_access()
+                }
+                jit::JitElementFamily::Generic => continue,
+            };
+            view.element_accesses.insert(byte_pc, access);
+        }
+    }
+
+    /// A dense array's elements are boxed `Value`s behind the body's element
+    /// cache, and its exotic sidecar is what invalidates that layout: a
+    /// non-null sidecar means custom prototype, accessor or descriptor state
+    /// can make a plain indexed access observable.
+    fn dense_element_access() -> jit::JitElementAccess {
+        let header = otter_gc::header::HEADER_SIZE as u32;
+        jit::JitElementAccess {
             type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
             guards: [
                 Some(jit::JitBodyGuard::clear(
@@ -550,9 +597,50 @@ impl Interpreter {
                 None,
             ],
             length_byte: header + crate::array::ARRAY_BODY_DENSE_LEN_OFFSET as u32,
-            data_ptr_byte: header + crate::array::ARRAY_BODY_ELEMENTS_PTR_OFFSET as u32,
-        };
-        view.cage_base = otter_gc::cage_base() as usize;
+            length_width: jit::JitGuardWidth::Word32,
+            base: jit::JitElementBase::InBody {
+                byte: header + crate::array::ARRAY_BODY_ELEMENTS_PTR_OFFSET as u32,
+            },
+            element: jit::JitElementRepr::Boxed,
+        }
+    }
+
+    /// An `Int32Array` view's elements are raw scalars in its backing buffer.
+    /// The view's own cached length is a construction-time field that a detach
+    /// leaves untouched, so the buffer's detached flag is guarded on the way
+    /// through rather than inferred from the bounds check; a length-tracking
+    /// view over a resizable buffer has a stale cached length and leaves the
+    /// fast path outright.
+    fn typed_int32_element_access() -> jit::JitElementAccess {
+        use crate::binary::array_buffer as buffer;
+        use crate::binary::typed_array as view;
+        let header = otter_gc::header::HEADER_SIZE as u32;
+        let buffer_byte = header + view::TYPED_ARRAY_BODY_BUFFER_OFFSET as u32;
+        jit::JitElementAccess {
+            type_tag: view::TYPED_ARRAY_BODY_TYPE_TAG,
+            guards: [
+                Some(jit::JitBodyGuard {
+                    byte: header + view::TYPED_ARRAY_BODY_KIND_OFFSET as u32,
+                    width: jit::JitGuardWidth::Word32,
+                    expect: crate::binary::TypedArrayKind::Int32 as u32,
+                }),
+                Some(jit::JitBodyGuard::clear(
+                    header + view::TYPED_ARRAY_BODY_LENGTH_TRACKING_OFFSET as u32,
+                    jit::JitGuardWidth::Byte,
+                )),
+            ],
+            length_byte: header + view::TYPED_ARRAY_BODY_LENGTH_OFFSET as u32,
+            length_width: jit::JitGuardWidth::Word64,
+            base: jit::JitElementBase::ThroughLocalBuffer {
+                storage_tag_byte: buffer_byte + buffer::BUFFER_STORAGE_DISCRIMINANT_OFFSET as u32,
+                local_tag: buffer::BUFFER_STORAGE_LOCAL_TAG,
+                handle_byte: buffer_byte + buffer::BUFFER_STORAGE_HANDLE_OFFSET as u32,
+                detached_byte: header + buffer::LOCAL_ARRAY_BUFFER_BODY_DETACHED_OFFSET as u32,
+                data_ptr_byte: header + buffer::LOCAL_ARRAY_BUFFER_BODY_DATA_OFFSET as u32,
+                view_offset_byte: header + view::TYPED_ARRAY_BODY_BYTE_OFFSET_OFFSET as u32,
+            },
+            element: jit::JitElementRepr::Int32,
+        }
     }
 
     /// Bake the static heap-layout offsets for inline primitive string fast

@@ -153,10 +153,9 @@ use crate::{
         ssa::{SsaFunction, SsaInstr, ValueDef, ValueId},
     },
     template::arm64::ic_probe::{
-        DenseIndexForm, element_access_is_supported, emit_dense_element_read,
-        emit_dense_element_write, emit_element_address, emit_guarded_method_call,
-        emit_native_leaf_call, guarded_method_call_is_supported, native_leaf_call_is_supported,
-        native_leaf_call_name,
+        DenseIndexForm, element_access_for, emit_dense_element_write, emit_element_address,
+        emit_element_read, emit_guarded_method_call, emit_native_leaf_call,
+        guarded_method_call_is_supported, native_leaf_call_is_supported, native_leaf_call_name,
     },
 };
 
@@ -2709,40 +2708,54 @@ fn emit(
                     // so it takes the generic path like every other miss.
                     let miss = ops.new_dynamic_label();
                     let done = ops.new_dynamic_label();
-                    emit_element_address(
-                        &mut ops,
-                        &mut relocations,
-                        view,
-                        |ops, register| {
-                            emit_load_tagged_location(
-                                ops,
-                                allocation.location(instruction.inputs[0]),
-                                register,
-                            )
-                        },
-                        |ops, register| {
-                            emit_load_dense_index(
-                                ops,
-                                reprs,
-                                allocation,
-                                instruction.inputs[1],
-                                register,
-                            )
-                        },
-                        dense_index_form(reprs, instruction.inputs[1])?,
-                        miss,
-                    )?;
-                    emit_dense_element_read(&mut ops, miss);
-                    emit_store_tagged_location(
-                        &mut ops,
-                        allocation.location(
-                            instruction
-                                .result
-                                .expect("eligibility checked element-load result"),
-                        ),
-                        9,
-                    )?;
-                    dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+                    let frame = &tree.frames[instruction.inline.0 as usize];
+                    let byte_pc = frame
+                        .instructions
+                        .get(instruction.pc as usize)
+                        .map(|metadata| metadata.byte_pc)
+                        .ok_or(Unsupported::OperandShape("optimizing element byte PC"))?;
+                    let load_access = (instruction.inline == InlineId::ROOT)
+                        .then(|| element_access_for(view, byte_pc))
+                        .flatten()
+                        .copied();
+                    if let Some(access) = load_access.as_ref() {
+                        emit_element_address(
+                            &mut ops,
+                            &mut relocations,
+                            view,
+                            access,
+                            |ops, register| {
+                                emit_load_tagged_location(
+                                    ops,
+                                    allocation.location(instruction.inputs[0]),
+                                    register,
+                                )
+                            },
+                            |ops, register| {
+                                emit_load_dense_index(
+                                    ops,
+                                    reprs,
+                                    allocation,
+                                    instruction.inputs[1],
+                                    register,
+                                )
+                            },
+                            dense_index_form(reprs, instruction.inputs[1])?,
+                            miss,
+                        )?;
+                        emit_element_read(&mut ops, access.element, miss);
+                        emit_store_tagged_location(
+                            &mut ops,
+                            allocation.location(
+                                instruction
+                                    .result
+                                    .expect("eligibility checked element-load result"),
+                            ),
+                            9,
+                        )?;
+                        dynasm!(ops ; .arch aarch64 ; b =>done);
+                    }
+                    dynasm!(ops ; .arch aarch64 ; =>miss);
                     emit_materialize_element_transition(
                         &mut ops,
                         reprs,
@@ -2804,15 +2817,27 @@ fn emit(
                     // observe the store — and a tagged value may be a cell that
                     // needs the generational barrier, so both take the stub.
                     let value_repr = reprs.representation(instruction.inputs[2]);
-                    let store_fast = element_access_is_supported(view)
-                        && matches!(value_repr, Representation::Int32 | Representation::Float64);
+                    let frame = &tree.frames[instruction.inline.0 as usize];
+                    let byte_pc = frame
+                        .instructions
+                        .get(instruction.pc as usize)
+                        .map(|metadata| metadata.byte_pc)
+                        .ok_or(Unsupported::OperandShape("optimizing element byte PC"))?;
+                    let store_access = (instruction.inline == InlineId::ROOT)
+                        .then(|| element_access_for(view, byte_pc))
+                        .flatten()
+                        .filter(|_| {
+                            matches!(value_repr, Representation::Int32 | Representation::Float64)
+                        })
+                        .copied();
                     let miss = ops.new_dynamic_label();
                     let done = ops.new_dynamic_label();
-                    if store_fast {
+                    if let Some(access) = store_access.as_ref() {
                         emit_element_address(
                             &mut ops,
                             &mut relocations,
                             view,
+                            access,
                             |ops, register| {
                                 emit_load_tagged_location(
                                     ops,
@@ -2832,7 +2857,7 @@ fn emit(
                             dense_index_form(reprs, instruction.inputs[1])?,
                             miss,
                         )?;
-                        emit_dense_element_read(&mut ops, miss);
+                        emit_element_read(&mut ops, access.element, miss);
                         match value_repr {
                             Representation::Int32 => {
                                 emit_load_location(

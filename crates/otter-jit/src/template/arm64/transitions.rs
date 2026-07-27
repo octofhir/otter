@@ -33,8 +33,8 @@ use otter_vm::native_abi::{self as abi};
 use otter_vm::runtime_stubs::alloc_value_stub_by_id;
 
 use super::ic_probe::{
-    DenseIndexForm, element_access_is_supported, emit_dense_element_read, emit_dense_element_write,
-    emit_element_address, emit_guard_value_is_not_cell,
+    DenseIndexForm, element_access_for, emit_dense_element_write, emit_element_address,
+    emit_element_read, emit_guard_value_is_not_cell,
 };
 use super::values::{
     emit_decompress_slot, emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64,
@@ -446,6 +446,7 @@ pub(super) fn emit_load_element(
     dst: u16,
     receiver: u16,
     index: u16,
+    byte_pc: u32,
     threw: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let miss = ops.new_dynamic_label();
@@ -453,17 +454,18 @@ pub(super) fn emit_load_element(
     // Dense fast path: read the element straight from the buffer. A hole is an
     // absent property — the prototype chain answers — so it misses like every
     // other failed guard.
-    if element_access_is_supported(view) {
+    if let Some(access) = element_access_for(view, byte_pc) {
         emit_element_address(
             ops,
             relocations,
             view,
+            access,
             |ops, register| emit_load_reg(ops, register, receiver),
             |ops, register| emit_load_reg(ops, register, index),
             DenseIndexForm::Tagged,
             miss,
         )?;
-        emit_dense_element_read(ops, miss);
+        emit_element_read(ops, access.element, miss);
         emit_store_reg(ops, 9, dst)?;
         dynasm!(ops ; .arch aarch64 ; b =>done);
     }
@@ -494,6 +496,7 @@ pub(super) fn emit_store_element(
     receiver: u16,
     index: u16,
     value: u16,
+    byte_pc: u32,
     threw: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let miss = ops.new_dynamic_label();
@@ -502,17 +505,18 @@ pub(super) fn emit_store_element(
     // non-hole element with a non-cell value owes no generational write
     // barrier and cannot allocate. A cell value takes the stub (barrier), a
     // hole takes the stub (a prototype setter may observe the store).
-    if element_access_is_supported(view) {
+    if let Some(access) = element_access_for(view, byte_pc) {
         emit_element_address(
             ops,
             relocations,
             view,
+            access,
             |ops, register| emit_load_reg(ops, register, receiver),
             |ops, register| emit_load_reg(ops, register, index),
             DenseIndexForm::Tagged,
             miss,
         )?;
-        emit_dense_element_read(ops, miss);
+        emit_element_read(ops, access.element, miss);
         emit_load_reg(ops, 9, value)?;
         emit_guard_value_is_not_cell(ops, miss);
         emit_dense_element_write(ops);

@@ -9,7 +9,7 @@
 //!   that cannot execute them.
 //! - [`emit_exotic_length_fast`] — the `.length` reads no cache program can
 //!   describe.
-//! - [`emit_element_address`] / [`emit_dense_element_read`] /
+//! - [`emit_element_address`] / [`emit_element_read`] /
 //!   [`emit_dense_element_write`] — the indexed element access program.
 //! - [`emit_native_leaf_call`] — guard a callee's bootstrap identity and run
 //!   its declared leaf entry without materializing a frame.
@@ -36,7 +36,8 @@
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::{
-    JitBodyGuard, JitCompileSnapshot, JitGuardWidth, JitGuardedMethodCall, JitGuardedReceiver,
+    JitBodyGuard, JitCompileSnapshot, JitElementAccess, JitElementBase, JitElementRepr,
+    JitGuardWidth, JitGuardedMethodCall, JitGuardedReceiver,
 };
 
 use otter_vm::native_abi::{NO_SAFEPOINT, RuntimeStubId, SafepointId, runtime_stub_name};
@@ -221,8 +222,14 @@ pub(crate) enum DenseIndexForm {
 /// The declaration is the whole gate: without a cage base the guard cannot
 /// reach a body at all, and a zero cell tag means no element-bearing family was
 /// described, so the site keeps the runtime path.
-pub(crate) fn element_access_is_supported(view: &JitCompileSnapshot) -> bool {
-    view.cage_base != 0 && view.element_access.type_tag != 0
+pub(crate) fn element_access_for(
+    view: &JitCompileSnapshot,
+    byte_pc: u32,
+) -> Option<&JitElementAccess> {
+    (view.cage_base != 0)
+        .then(|| view.element_accesses.get(&byte_pc))
+        .flatten()
+        .filter(|access| access.type_tag != 0)
 }
 
 /// Prove an in-bounds indexed element access, leaving the element's address in
@@ -244,6 +251,7 @@ pub(crate) fn emit_element_address<R, I>(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
+    access: &JitElementAccess,
     load_receiver: R,
     load_index: I,
     index_form: DenseIndexForm,
@@ -253,7 +261,6 @@ where
     R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
     I: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
 {
-    let access = view.element_access;
     load_receiver(ops, 9)?;
     dynasm!(ops
         ; .arch aarch64
@@ -290,31 +297,110 @@ where
             ; b.ne =>miss          // index is not an int32 payload
         );
     }
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr w16, [x13, access.length_byte]
-        ; cmp w15, w16
-        ; b.hs =>miss              // unsigned: negative indices miss too
-        ; ldr x16, [x13, access.data_ptr_byte]
-        ; add x16, x16, w15, uxtw #3
-    );
+    // Bounds. The index is compared unsigned, so a negative int32 becomes a
+    // large positive and misses like any out-of-range read.
+    let length_byte = access.length_byte;
+    match access.length_width {
+        // A count that fits 32 bits compares directly against the index's
+        // 32-bit view; a pointer-width one needs the index zero-extended
+        // first, which is the only reason the two forms differ.
+        JitGuardWidth::Byte => dynasm!(ops
+            ; .arch aarch64
+            ; ldrb w16, [x13, length_byte]
+            ; cmp w15, w16
+            ; b.hs =>miss
+        ),
+        JitGuardWidth::Word32 => dynasm!(ops
+            ; .arch aarch64
+            ; ldr w16, [x13, length_byte]
+            ; cmp w15, w16
+            ; b.hs =>miss
+        ),
+        JitGuardWidth::Word64 => dynasm!(ops
+            ; .arch aarch64
+            ; ldr x16, [x13, length_byte]
+            ; mov w15, w15
+            ; cmp x15, x16
+            ; b.hs =>miss
+        ),
+    }
+    match access.base {
+        JitElementBase::None => return Err(Unsupported::OperandShape("element base")),
+        JitElementBase::InBody { byte } => {
+            dynasm!(ops ; .arch aarch64 ; ldr x16, [x13, byte]);
+        }
+        JitElementBase::ThroughLocalBuffer {
+            storage_tag_byte,
+            local_tag,
+            handle_byte,
+            detached_byte,
+            data_ptr_byte,
+            view_offset_byte,
+        } => {
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr w14, [x13, storage_tag_byte]
+            );
+            emit_load_u64(ops, 12, u64::from(local_tag));
+            dynasm!(ops
+                ; .arch aarch64
+                ; cmp w14, w12
+                ; b.ne =>miss              // not an in-heap local buffer
+                ; ldr w12, [x13, handle_byte]
+                ; cbz w12, =>miss
+            );
+            emit_load_symbol_u64(
+                ops,
+                relocations,
+                11,
+                view.cage_base as u64,
+                RelocationTarget::GcCageBase,
+            );
+            dynasm!(ops
+                ; .arch aarch64
+                ; add x11, x11, x12        // x11 = buffer GcHeader ptr
+                ; ldrb w14, [x11, detached_byte]
+                ; cbnz w14, =>miss         // a detach leaves the view's length alone
+                ; ldr x16, [x11, data_ptr_byte]
+                ; cbz x16, =>miss
+                ; ldr x14, [x13, view_offset_byte]
+                ; add x16, x16, x14
+            );
+        }
+    }
+    let shift = access.element.stride_shift();
+    match shift {
+        2 => dynasm!(ops ; .arch aarch64 ; add x16, x16, w15, uxtw #2),
+        _ => dynasm!(ops ; .arch aarch64 ; add x16, x16, w15, uxtw #3),
+    }
     Ok(())
 }
 
-/// Read the element whose address [`emit_element_address`] left in `x16`
-/// into `x9`, branching to `miss` on a hole.
+/// Read the element whose address [`emit_element_address`] left in `x16` into
+/// `x9` as a boxed `Value`, branching to `miss` when the declared
+/// representation says the slot holds no value.
 ///
-/// A hole is an absent property — the prototype chain answers a read, and a
-/// prototype setter may observe a write — so both accesses treat it as a guard
-/// failure. Clobbers `x11`.
-pub(crate) fn emit_dense_element_read(ops: &mut Assembler, miss: DynamicLabel) {
-    emit_load_u64(ops, 11, VALUE_HOLE);
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr x9, [x16]
-        ; cmp x9, x11
-        ; b.eq =>miss
-    );
+/// A boxed hole is an absent property — the prototype chain answers a read, and
+/// a prototype setter may observe a write — so it is a guard failure. A scalar
+/// element has no such state and always produces a value. Clobbers `x11`.
+pub(crate) fn emit_element_read(ops: &mut Assembler, element: JitElementRepr, miss: DynamicLabel) {
+    match element {
+        JitElementRepr::Boxed => {
+            emit_load_u64(ops, 11, VALUE_HOLE);
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x9, [x16]
+                ; cmp x9, x11
+                ; b.eq =>miss
+            );
+        }
+        JitElementRepr::Int32 => {
+            // `ldr w` zero-extends, which is what the int32 box wants: the
+            // payload is the low 32 bits and the tag occupies the top.
+            dynasm!(ops ; .arch aarch64 ; ldr w9, [x16]);
+            emit_box_int32(ops, 9, 11);
+        }
+    }
 }
 
 /// Overwrite the element whose address [`emit_element_address`] left in `x16`

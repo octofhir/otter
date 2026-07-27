@@ -598,6 +598,7 @@ pub(super) fn compile(
                     dst,
                     receiver,
                     index,
+                    instr.byte_pc,
                     threw,
                 )?;
             }
@@ -614,6 +615,7 @@ pub(super) fn compile(
                     receiver,
                     index,
                     value,
+                    instr.byte_pc,
                     threw,
                 )?;
             }

@@ -774,6 +774,23 @@ impl Interpreter {
                 }
                 Op::LoadElement => {
                     let operands = function.operand_view(instr);
+                    if let Some(feedback) = feedback
+                        && let Some(recv_reg) = function.register(instr, 1)
+                        && let Ok(recv) = read_register(&stack[top_idx], recv_reg)
+                    {
+                        let recv = *recv;
+                        let family = if recv.as_array().is_some() {
+                            jit::JitElementFamily::Dense
+                        } else if recv
+                            .as_typed_array(&self.gc_heap)
+                            .is_some_and(|t| t.kind() == crate::binary::TypedArrayKind::Int32)
+                        {
+                            jit::JitElementFamily::TypedInt32
+                        } else {
+                            jit::JitElementFamily::Generic
+                        };
+                        feedback.record_element_family(family);
+                    }
                     if self.drive_load_element(stack, context, operands)? {
                         continue;
                     }

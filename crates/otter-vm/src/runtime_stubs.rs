@@ -31,14 +31,14 @@ use crate::native_abi::{
     RuntimeStubResult, RuntimeStubResultPair, STUB_ARRAY_POP_LEAF, STUB_ARRAY_PUSH_ALLOC,
     STUB_ARRAY_SHIFT_LEAF, STUB_ARRAY_UNSHIFT_ALLOC, STUB_COLLECTION_MAP_DELETE_ALLOC,
     STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC,
-    STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC,
-    STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
-    STUB_MATH_ABS_LEAF, STUB_MATH_FLOOR_LEAF, STUB_MATH_MAX_LEAF, STUB_MATH_MIN_LEAF,
-    STUB_MATH_SQRT_LEAF, STUB_NUMBER_REM_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF,
-    STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_STRING_ENDS_WITH_LEAF,
-    STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF, STUB_STRING_STARTS_WITH_LEAF,
-    STUB_TO_BOOLEAN_LEAF, SafepointId, SafepointRecord, TaggedLocationKind,
-    validate_stub_descriptor,
+    STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_MAP_SET_MUTATING,
+    STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC,
+    STUB_COLLECTION_SET_HAS_LEAF, STUB_MATH_ABS_LEAF, STUB_MATH_FLOOR_LEAF, STUB_MATH_MAX_LEAF,
+    STUB_MATH_MIN_LEAF, STUB_MATH_SQRT_LEAF, STUB_NUMBER_REM_LEAF, STUB_STRICT_EQ_LEAF,
+    STUB_STRING_CHAR_CODE_AT_LEAF, STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC,
+    STUB_STRING_ENDS_WITH_LEAF, STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF,
+    STUB_STRING_STARTS_WITH_LEAF, STUB_TO_BOOLEAN_LEAF, SafepointId, SafepointRecord,
+    TaggedLocationKind, validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
@@ -129,6 +129,52 @@ impl MutatingLeafStub2 {
         a1_bits: u64,
     ) -> RuntimeStubResult {
         (self.entry)(heap, a0_bits, a1_bits).into_result()
+    }
+}
+
+/// Three-argument mutating leaf runtime stub ABI.
+///
+/// [`MutatingLeafStub2Fn`] with one more operand word, for an in-place write
+/// whose receiver and two arguments do not fit two words. The same rules
+/// apply: rewrite GC-managed state in place, run every required write barrier,
+/// and never allocate, collect, or re-enter JS, so the call site publishes no
+/// safepoint and no rooting packet.
+pub type MutatingLeafStub3Fn =
+    extern "C" fn(*mut otter_gc::GcHeap, u64, u64, u64) -> RuntimeStubResultPair;
+
+/// Callable three-argument mutating-leaf stub entry with its ABI descriptor.
+#[derive(Clone, Copy)]
+pub struct MutatingLeafStub3 {
+    /// Passive descriptor shared with profiler/JIT metadata.
+    pub descriptor: RuntimeStubDescriptor,
+    /// Machine-callable Rust entrypoint with the descriptor's fixed ABI shape.
+    pub entry: MutatingLeafStub3Fn,
+}
+
+impl MutatingLeafStub3 {
+    /// `true` when descriptor metadata matches this callable ABI shape.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        validate_stub_descriptor(self.descriptor, NO_SAFEPOINT)
+            && self.descriptor.argument_count == 3
+    }
+
+    /// Raw native entry address for generated code.
+    #[must_use]
+    pub fn entry_addr(self) -> usize {
+        self.entry as usize
+    }
+
+    /// Invoke this entry with raw ABI bits.
+    #[must_use]
+    pub fn invoke_raw(
+        self,
+        heap: *mut otter_gc::GcHeap,
+        a0_bits: u64,
+        a1_bits: u64,
+        a2_bits: u64,
+    ) -> RuntimeStubResult {
+        (self.entry)(heap, a0_bits, a1_bits, a2_bits).into_result()
     }
 }
 
@@ -434,6 +480,12 @@ pub const COLLECTION_MAP_GET_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     entry: collection_map_get_leaf,
 };
 
+/// Callable ABI entry for in-place `Map.prototype.set`.
+pub const COLLECTION_MAP_SET_MUTATING: MutatingLeafStub3 = MutatingLeafStub3 {
+    descriptor: STUB_COLLECTION_MAP_SET_MUTATING,
+    entry: collection_map_set_mutating,
+};
+
 /// Callable ABI entry for `Math.abs`.
 pub const MATH_ABS_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: STUB_MATH_ABS_LEAF,
@@ -612,6 +664,15 @@ pub const fn mutating_leaf_stub2_by_id(id: RuntimeStubId) -> Option<MutatingLeaf
     }
 }
 
+/// Resolve a three-argument mutating-leaf entry by descriptor id.
+#[must_use]
+pub const fn mutating_leaf_stub3_by_id(id: RuntimeStubId) -> Option<MutatingLeafStub3> {
+    if id == STUB_COLLECTION_MAP_SET_MUTATING.id {
+        return Some(COLLECTION_MAP_SET_MUTATING);
+    }
+    None
+}
+
 /// Resolve a fixed two-argument leaf/no-allocation stub by ABI descriptor id.
 #[must_use]
 pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocStub2> {
@@ -660,6 +721,7 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
 pub(crate) fn is_vm_owned_runtime_stub(id: RuntimeStubId) -> bool {
     leaf_no_alloc_stub2_by_id(id).is_some()
         || mutating_leaf_stub2_by_id(id).is_some()
+        || mutating_leaf_stub3_by_id(id).is_some()
         || alloc_value_stub_by_id(id)
             .and_then(|stub| stub.entry)
             .is_some()
@@ -737,6 +799,29 @@ pub fn invoke_leaf_no_alloc_stub2(
         heap as *const otter_gc::GcHeap,
         a0.to_abi_bits(),
         a1.to_abi_bits(),
+    )
+}
+
+/// Invoke a three-argument mutating-leaf entry by descriptor id.
+///
+/// The interpreter reaches the same entry generated code calls, so an in-place
+/// write has one implementation and one set of preconditions.
+#[must_use]
+pub fn invoke_mutating_leaf_stub3(
+    heap: &mut otter_gc::GcHeap,
+    id: RuntimeStubId,
+    a0: Value,
+    a1: Value,
+    a2: Value,
+) -> RuntimeStubResult {
+    let Some(stub) = mutating_leaf_stub3_by_id(id) else {
+        return RuntimeStubResult::miss();
+    };
+    stub.invoke_raw(
+        heap as *mut otter_gc::GcHeap,
+        a0.to_abi_bits(),
+        a1.to_abi_bits(),
+        a2.to_abi_bits(),
     )
 }
 
@@ -1287,6 +1372,50 @@ fn collection_map_get_leaf_inner(
     RuntimeStubResult::ok_value(
         collections::map_get(map, heap, &key).unwrap_or_else(Value::undefined),
     )
+}
+
+/// Leaf in-place `Map.prototype.set`.
+///
+/// Runs only the case that cannot allocate: a key the map already holds, whose
+/// value slot is rewritten in place with its write barrier. An absent key, an
+/// unmaterialized key, or a non-Map receiver misses, and the allocating
+/// sibling completes the call.
+#[must_use]
+pub extern "C" fn collection_map_set_mutating(
+    heap: *mut otter_gc::GcHeap,
+    recv_bits: u64,
+    key_bits: u64,
+    value_bits: u64,
+) -> RuntimeStubResultPair {
+    RuntimeStubResultPair::from_result(collection_map_set_mutating_inner(
+        heap, recv_bits, key_bits, value_bits,
+    ))
+}
+
+fn collection_map_set_mutating_inner(
+    heap: *mut otter_gc::GcHeap,
+    recv_bits: u64,
+    key_bits: u64,
+    value_bits: u64,
+) -> RuntimeStubResult {
+    let Some(heap) = heap_mut(heap) else {
+        return RuntimeStubResult::miss();
+    };
+    let recv = Value::from_abi_bits(recv_bits);
+    let key = Value::from_abi_bits(key_bits);
+    // A key needing materialization for SameValueZero would flatten a string,
+    // which a leaf entry may not do.
+    if !leaf_key_is_materialized(heap, key) {
+        return RuntimeStubResult::miss();
+    }
+    let Some(map) = recv.as_map() else {
+        return RuntimeStubResult::miss();
+    };
+    if collections::map_set_existing(map, heap, &key, Value::from_abi_bits(value_bits)) {
+        RuntimeStubResult::ok_value(recv)
+    } else {
+        RuntimeStubResult::miss()
+    }
 }
 
 /// Leaf `Map.prototype.has` probe.
@@ -2753,6 +2882,12 @@ mod tests {
                         assert!(
                             mutating_leaf_stub2_by_id(descriptor.id)
                                 .is_some_and(MutatingLeafStub2::is_valid)
+                        );
+                    }
+                    crate::native_abi::RuntimeStubSignature::MutatingLeafValue3 => {
+                        assert!(
+                            mutating_leaf_stub3_by_id(descriptor.id)
+                                .is_some_and(MutatingLeafStub3::is_valid)
                         );
                     }
                     crate::native_abi::RuntimeStubSignature::AllocValue3 => {

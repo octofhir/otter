@@ -174,9 +174,13 @@ impl Interpreter {
         };
         // A read that has a leaf entry never needs the allocating one: the leaf
         // family cannot collect, so it carries no safepoint and no root map.
-        let (stub_id, safepoint_id) = match ic.leaf_stub_id {
-            Some(leaf) => (leaf, crate::native_abi::NO_SAFEPOINT),
-            None => (ic.alloc_stub_id?, alloc_safepoint_id),
+        // A read resolves in the leaf family; an in-place write in the
+        // mutating family. Both cannot collect, so neither owes a safepoint,
+        // and only a write that may grow the table reaches the allocating one.
+        let (stub_id, safepoint_id) = match (ic.leaf_stub_id, ic.mutating_stub_id) {
+            (Some(leaf), _) => (leaf, crate::native_abi::NO_SAFEPOINT),
+            (None, Some(mutating)) => (mutating, crate::native_abi::NO_SAFEPOINT),
+            (None, None) => (ic.alloc_stub_id?, alloc_safepoint_id),
         };
         let (proto, receiver_type_tag) = if ic.op.is_map() {
             (

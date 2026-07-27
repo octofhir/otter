@@ -1392,6 +1392,7 @@ impl Interpreter {
                 proto_slot: hit.slot,
                 op,
                 leaf_stub_id: op.leaf_stub_id(),
+                mutating_stub_id: op.mutating_stub_id(),
                 alloc_stub_id: op.alloc_stub_id(),
             };
             self.feedback_directory
@@ -1414,6 +1415,21 @@ impl Interpreter {
             && let Some(value) = self
                 .dispatch_collection_builtin_leaf_no_alloc(stub_id, recv, args)
                 .into_value()
+        {
+            return Ok(value);
+        }
+        // An in-place write cannot allocate either, so it runs the same way
+        // with a mutable heap and no rooting packet. A key the map does not
+        // hold misses and the rooted path appends.
+        if let Some(stub_id) = target.op.mutating_stub_id()
+            && let Some(value) = crate::runtime_stubs::invoke_mutating_leaf_stub3(
+                &mut self.gc_heap,
+                stub_id,
+                recv,
+                args.first().copied().unwrap_or_else(Value::undefined),
+                args.get(1).copied().unwrap_or_else(Value::undefined),
+            )
+            .into_value()
         {
             return Ok(value);
         }

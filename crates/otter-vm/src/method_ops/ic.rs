@@ -98,6 +98,21 @@ impl CollectionFastOp {
         }
     }
 
+    /// Entry for the in-place case of a write, which cannot allocate and so
+    /// needs no safepoint. `None` for an op whose every case may grow the
+    /// table.
+    pub(crate) fn mutating_stub_id(self) -> Option<RuntimeStubId> {
+        match self {
+            Self::MapSet => Some(crate::native_abi::STUB_COLLECTION_MAP_SET_MUTATING.id),
+            Self::MapGet
+            | Self::MapHas
+            | Self::MapDelete
+            | Self::SetAdd
+            | Self::SetHas
+            | Self::SetDelete => None,
+        }
+    }
+
     pub(crate) fn alloc_stub_id(self) -> Option<RuntimeStubId> {
         match self {
             Self::MapGet => Some(crate::native_abi::STUB_COLLECTION_MAP_GET_ALLOC.id),
@@ -170,5 +185,6 @@ pub(crate) struct CollectionMethodCallIc {
     pub(crate) proto_slot: u16,
     pub(crate) op: CollectionFastOp,
     pub(crate) leaf_stub_id: Option<RuntimeStubId>,
+    pub(crate) mutating_stub_id: Option<RuntimeStubId>,
     pub(crate) alloc_stub_id: Option<RuntimeStubId>,
 }

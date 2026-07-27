@@ -157,6 +157,7 @@ use crate::{
         emit_element_write, emit_guarded_method_call, emit_native_leaf_call,
         guarded_method_call_is_supported, native_leaf_call_is_supported, native_leaf_call_name,
     },
+    template::arm64::values::{CellTest, emit_cell_test},
 };
 
 const ALLOCATABLE_REGISTER_COUNT: u8 = 8;
@@ -3073,12 +3074,9 @@ fn emit(
                             allocation.location(instruction.inputs[0]),
                             9,
                         )?;
+                        emit_cell_test(&mut ops, 9, 11, CellTest::IsNotCell, miss);
                         dynasm!(ops
                             ; .arch aarch64
-                            ; movz x11, NUMBER_TAG_HI16, lsl #48
-                            ; orr x11, x11, #0x2       // NOT_CELL_MASK
-                            ; tst x9, x11
-                            ; b.ne =>miss
                             ; mov w12, w9              // low-32 Gc offset
                         );
                         emit_load_symbolic_u64(
@@ -3256,12 +3254,9 @@ fn emit(
                             allocation.location(instruction.inputs[0]),
                             9,
                         )?;
+                        emit_cell_test(&mut ops, 9, 11, CellTest::IsNotCell, miss);
                         dynasm!(ops
                             ; .arch aarch64
-                            ; movz x11, NUMBER_TAG_HI16, lsl #48
-                            ; orr x11, x11, #0x2       // NOT_CELL_MASK
-                            ; tst x9, x11
-                            ; b.ne =>miss
                             ; mov w12, w9              // low-32 Gc offset
                         );
                         emit_load_symbolic_u64(
@@ -4970,12 +4965,9 @@ fn emit(
                         allocation.location(instruction.inputs[0]),
                         9,
                     )?;
+                    emit_cell_test(&mut ops, 9, 11, CellTest::IsNotCell, deopt);
                     dynasm!(ops
                         ; .arch aarch64
-                        ; movz x11, NUMBER_TAG_HI16, lsl #48
-                        ; orr x11, x11, #0x2       // NOT_CELL_MASK
-                        ; tst x9, x11
-                        ; b.ne =>deopt
                         ; mov w12, w9              // low-32 Gc offset
                     );
                     emit_load_symbolic_u64(

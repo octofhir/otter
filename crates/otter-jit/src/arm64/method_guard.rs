@@ -18,6 +18,7 @@
 //! - [`otter_vm::JitMethodGuard`] — owned compile-time guard metadata.
 //! - [`super::direct_call`] — generated callee-frame construction.
 
+use crate::template::arm64::values::{CellTest, emit_cell_test};
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::{
     JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG, jit::JitMethodGuard,
@@ -141,7 +142,6 @@ pub(crate) fn emit_method_guard_from_tagged_register(
     emit_decompress_slot(ops, relocations, view.cage_base as u64, bail);
     dynasm!(ops ; .arch aarch64 ; mov X(callable_register), x9);
 
-    let closure = ops.new_dynamic_label();
     let guarded = ops.new_dynamic_label();
     emit_load_u64(ops, 10, value_tag::box_function_id(guard.method_fid));
     dynasm!(ops
@@ -150,13 +150,9 @@ pub(crate) fn emit_method_guard_from_tagged_register(
         ; b.eq =>guarded
         ; cbz X(callable_register), =>bail
     );
-    emit_load_u64(ops, 10, value_tag::NOT_CELL_MASK);
+    emit_cell_test(ops, callable_register, 10, CellTest::IsNotCell, bail);
     dynasm!(ops
         ; .arch aarch64
-        ; tst X(callable_register), x10
-        ; b.eq =>closure
-        ; b =>bail
-        ; =>closure
         ; ldrb w11, [X(callable_register)]
         ; cmp w11, JS_CLOSURE_BODY_TYPE_TAG as u32
         ; b.ne =>bail

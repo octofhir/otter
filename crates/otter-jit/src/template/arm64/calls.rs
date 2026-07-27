@@ -49,9 +49,9 @@ use super::ic_probe::{
 };
 use super::transitions::TransitionTable;
 use super::values::{
-    emit_box_double, emit_box_int32, emit_box_number, emit_decompress_slot, emit_load_reg,
-    emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64, emit_num_to_double,
-    emit_slab_base, emit_store_reg,
+    CellTest, emit_box_double, emit_box_int32, emit_box_number, emit_cell_test,
+    emit_decompress_slot, emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64,
+    emit_load_u64, emit_num_to_double, emit_slab_base, emit_store_reg,
 };
 use crate::arm64::{
     DirectCallForm, DirectCallSite, MethodGuardSite, direct_call_artifact,
@@ -801,7 +801,6 @@ fn try_emit_inline_numeric_callee(
         byte_pc: call_byte_pc,
         has_receiver_property: false,
     };
-    let closure = ops.new_dynamic_label();
     let guarded = ops.new_dynamic_label();
     let guard_start = ops.offset().0;
 
@@ -813,13 +812,9 @@ fn try_emit_inline_numeric_callee(
         ; b.eq =>guarded
         ; cbz x9, =>bail
     );
-    emit_load_u64(ops, 10, value_tag::NOT_CELL_MASK);
+    emit_cell_test(ops, 9, 10, CellTest::IsNotCell, bail);
     dynasm!(ops
         ; .arch aarch64
-        ; tst x9, x10
-        ; b.eq =>closure
-        ; b =>bail
-        ; =>closure
         // Heap-cell Values already carry the full pointer. No cage relocation
         // belongs on this path.
         ; ldrb w11, [x9]

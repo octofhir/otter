@@ -33,11 +33,11 @@ use otter_vm::native_abi as abi;
 use super::ic_probe;
 use super::transitions::TransitionTable;
 use super::values::{
-    BoxedSlotSlowPath, emit_compress_slot_or_bail, emit_decompress_slot, emit_load_runtime_stub,
-    emit_load_symbol_u64, emit_load_u64, emit_slab_base,
+    BoxedSlotSlowPath, CellTest, emit_cell_test, emit_compress_slot_or_bail, emit_decompress_slot,
+    emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64, emit_slab_base,
 };
 use crate::artifact::relocation::{PropertyIcAccess, RelocationCapture, RelocationTarget};
-use crate::entry::{NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, Unsupported, reg_offset};
+use crate::entry::{OBJECT_BODY_TYPE_TAG, Unsupported, reg_offset};
 
 /// Emit `dst = obj.name` with the inline WhiskerIC probe.
 #[allow(clippy::too_many_arguments)]
@@ -87,10 +87,10 @@ pub(super) fn emit_load_property(
         dynasm!(ops
             ; .arch aarch64
             ; ldr x9, [x19, obj_off]   // receiver Value
-            ; movz x11, NUMBER_TAG_HI16, lsl #48
-            ; orr x11, x11, #0x2       // NOT_CELL_MASK
-            ; tst x9, x11
-            ; b.ne =>miss
+        );
+        emit_cell_test(ops, 9, 11, CellTest::IsNotCell, miss);
+        dynasm!(ops
+            ; .arch aarch64
             ; mov w12, w9              // low-32 Gc offset (zero-ext)
         );
         emit_load_symbol_u64(
@@ -211,10 +211,10 @@ pub(super) fn emit_store_property(
         dynasm!(ops
             ; .arch aarch64
             ; ldr x9, [x19, obj_off]   // receiver Value
-            ; movz x11, NUMBER_TAG_HI16, lsl #48
-            ; orr x11, x11, #0x2       // NOT_CELL_MASK
-            ; tst x9, x11
-            ; b.ne =>miss
+        );
+        emit_cell_test(ops, 9, 11, CellTest::IsNotCell, miss);
+        dynasm!(ops
+            ; .arch aarch64
             ; mov w12, w9              // low-32 Gc offset
         );
         emit_load_symbol_u64(
@@ -255,10 +255,10 @@ pub(super) fn emit_store_property(
         dynasm!(ops
             ; .arch aarch64
             ; cbz x13, =>miss
-            ; movz x11, NUMBER_TAG_HI16, lsl #48
-            ; orr x11, x11, #0x2       // NOT_CELL_MASK
-            ; tst x9, x11
-            ; b.ne =>store_prim        // primitive → compress, no barrier
+        );
+        emit_cell_test(ops, 9, 11, CellTest::IsNotCell, store_prim);
+        dynasm!(ops
+            ; .arch aarch64
             // Cell: the compressed ref is the low-32 8-aligned offset
             // (low-3 tag 000), i.e. the value's low word.
             ; str w9, [x13, x17]

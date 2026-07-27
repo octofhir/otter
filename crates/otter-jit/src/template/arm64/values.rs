@@ -96,6 +96,37 @@ pub(super) fn emit_load_runtime_stub(
     );
 }
 
+/// Which way a cell test branches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CellTest {
+    /// Branch when the value is a heap cell.
+    IsCell,
+    /// Branch when the value is anything else: a number or a tagged immediate.
+    IsNotCell,
+}
+
+/// Branch to `target` when `X(value)`'s cell-ness matches `test`.
+///
+/// A boxed `Value` is a heap cell exactly when it carries neither the number
+/// tag nor the immediate tag, so the whole test is one mask and one `tst`. The
+/// scratch register is explicit because callers hold live values in different
+/// places; the mask is materialized rather than written as a logical immediate
+/// because `dynasm` accepts one only against a literal register.
+pub(crate) fn emit_cell_test(
+    ops: &mut Assembler,
+    value: u8,
+    scratch: u8,
+    test: CellTest,
+    target: DynamicLabel,
+) {
+    emit_load_u64(ops, scratch, otter_vm::value::tag::NOT_CELL_MASK);
+    dynasm!(ops ; .arch aarch64 ; tst X(value), X(scratch));
+    match test {
+        CellTest::IsCell => dynasm!(ops ; .arch aarch64 ; b.eq =>target),
+        CellTest::IsNotCell => dynasm!(ops ; .arch aarch64 ; b.ne =>target),
+    }
+}
+
 /// Box the int32 payload in the low 32 bits of `X(t)` by setting the number
 /// tag. The producing op wrote `X(t)` through its `W` view, which zeroes bits
 /// [63:32], so a single `orr` completes the box. Clobbers `X(scratch)`.

@@ -29,6 +29,7 @@ use std::collections::BTreeSet;
 use super::{
     cfg::{BlockId, ControlFlowGraph},
     dom::{DomError, DominatorTree},
+    regalloc::is_dead_phi,
     ssa::{SsaFunction, ValueDef, ValueId},
 };
 
@@ -326,8 +327,18 @@ fn block_facts(ssa: &SsaFunction) -> Vec<BlockFacts> {
     ssa.blocks
         .iter()
         .map(|block| {
-            let phi_defs: BTreeSet<_> = block.phis.iter().copied().collect();
-            let mut defined = phi_defs.clone();
+            // Construction is unpruned: every register written anywhere in a
+            // loop gets a header phi whether or not anything reads it. A phi
+            // nothing reads is compiler scratch the deopt table already
+            // reconstructs as a literal, so keeping it live would reserve a
+            // machine home for a value no code ever loads.
+            let phi_defs: BTreeSet<_> = block
+                .phis
+                .iter()
+                .copied()
+                .filter(|&phi| !is_dead_phi(ssa, phi))
+                .collect();
+            let mut defined: BTreeSet<_> = block.phis.iter().copied().collect();
             let mut instr_defs = BTreeSet::new();
             let mut uses = BTreeSet::new();
             for instruction in &block.instrs {
@@ -417,6 +428,9 @@ fn phi_uses(
     ssa.blocks[successor.0 as usize]
         .phis
         .iter()
+        // A phi nothing reads takes no edge move, so its incoming value is not
+        // a use of this edge either.
+        .filter(|&&phi| !is_dead_phi(ssa, phi))
         .filter_map(|&phi| match &ssa.values[phi.0 as usize].def {
             // A spliced call's result merges the callee's returned values, so
             // like a phi it uses one input per predecessor edge.

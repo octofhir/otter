@@ -12,8 +12,9 @@
 //! - Program points are dense in CFG block order, with block heads before
 //!   instructions, and intervals conservatively cover holes in liveness.
 //! - Phi inputs are live through the final point of their normal predecessor.
-//! - Definitions at one block head overlap through its final head point because
-//!   phi destinations are simultaneous even when individual phis are dead.
+//! - Definitions at one block head overlap through its final head point,
+//!   because the parallel copy writes those destinations simultaneously. A
+//!   structurally dead phi receives no copy and is not one of them.
 //! - Overlapping closed intervals never share a register within their class.
 //! - GPR and FP values have independent register files and spill namespaces.
 //! - Phi edge moves preserve parallel-copy semantics and perform only lossless
@@ -906,12 +907,19 @@ fn extend_simultaneous_block_heads(
     intervals: &mut [LiveInterval],
 ) -> Result<(), RegallocError> {
     for block in &ssa.blocks {
-        let Some(&last_head) = block.phis.last() else {
+        // Simultaneity is a property of the parallel copy that writes the
+        // destinations. A phi nothing reads receives no copy, so it is not one
+        // of them: holding a register across the whole head run for each would
+        // reserve the file for values no code ever writes or loads.
+        let Some(&last_head) = block.phis.iter().rfind(|&&phi| !is_dead_phi(ssa, phi)) else {
             continue;
         };
         let last_position = linear.definition_positions[value_index(last_head, ssa.values.len())?]
             .ok_or(RegallocError::MissingDefinition { value: last_head })?;
         for &head in &block.phis {
+            if is_dead_phi(ssa, head) {
+                continue;
+            }
             extend_interval(intervals, head, last_position, ssa.values.len())?;
         }
     }
@@ -989,12 +997,17 @@ fn verify_intervals(
     }
 
     for block in &ssa.blocks {
-        let Some(&last_head) = block.phis.last() else {
+        // Mirrors construction: only destinations the parallel copy writes are
+        // simultaneous, and a structurally dead phi receives no copy.
+        let Some(&last_head) = block.phis.iter().rfind(|&&phi| !is_dead_phi(ssa, phi)) else {
             continue;
         };
         let last_position = linear.definition_positions[value_index(last_head, value_count)?]
             .ok_or(RegallocError::MissingDefinition { value: last_head })?;
         for &head in &block.phis {
+            if is_dead_phi(ssa, head) {
+                continue;
+            }
             let index = value_index(head, value_count)?;
             required_ends[index] = required_ends[index].max(last_position);
         }
@@ -1318,19 +1331,35 @@ pub(crate) fn is_dead_phi(ssa: &SsaFunction, value: ValueId) -> bool {
     ) {
         return false;
     }
-    !ssa.blocks.iter().any(|block| {
-        block
-            .instrs
-            .iter()
-            .any(|instruction| instruction.inputs.contains(&value))
-            || block.phis.iter().copied().any(|phi| {
-                matches!(
+    // Reaching a phi is not being read: construction gives a loop's header and
+    // its body a phi per written register, and the two feed each other, so a
+    // register nothing computes with still has a cycle of live-looking merges.
+    // The question is whether any *instruction* reads the value, directly or
+    // through merges that are themselves only read by merges.
+    let mut visited = BTreeSet::from([value]);
+    let mut pending = vec![value];
+    while let Some(current) = pending.pop() {
+        for block in &ssa.blocks {
+            if block
+                .instrs
+                .iter()
+                .any(|instruction| instruction.inputs.contains(&current))
+            {
+                return false;
+            }
+            for phi in block.phis.iter().copied() {
+                if matches!(
                     &ssa.values[phi.0 as usize].def,
                     ValueDef::Phi { inputs, .. } | ValueDef::InlineResult { inputs, .. }
-                        if inputs.contains(&value)
-                )
-            })
-    })
+                        if inputs.contains(&current)
+                ) && visited.insert(phi)
+                {
+                    pending.push(phi);
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Return whether `value` reaches an instruction or a non-dead phi. Inputs

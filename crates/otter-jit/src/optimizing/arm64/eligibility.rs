@@ -349,7 +349,7 @@ pub(super) fn cached_method_guard_site(
     let [(call_block, call)] = candidates.as_slice() else {
         return None;
     };
-    let receiver = transparent_origin(ssa, *call.inputs.first()?)?;
+    let receiver = ssa.copy_origin(*call.inputs.first()?)?;
     for &(latch, header) in back_edges.keys() {
         let loop_blocks = natural_loop_blocks(cfg, latch, header);
         if !loop_blocks.contains(call_block)

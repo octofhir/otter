@@ -670,6 +670,27 @@ pub(super) fn check_eligibility(
                         instruction_index,
                     ));
                 }
+                Op::LoadString => {
+                    // `WRITE_CONST`: the constant names a string in the code
+                    // block's pool and there are no register inputs. Resolving
+                    // it interns and may allocate, so it is a precise-rooted
+                    // transition like any other reentrant stub.
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("string-load result"))?;
+                    if reprs.representation(result) != Representation::Tagged
+                        || !instruction.inputs.is_empty()
+                        || !instruction.input_registers.is_empty()
+                        || instruction.result_register.is_none()
+                    {
+                        return Err(Unsupported::Opcode(op));
+                    }
+                    element_transition_instructions.push((
+                        instruction.pc,
+                        block,
+                        instruction_index,
+                    ));
+                }
                 Op::LooseEqual | Op::LooseNotEqual => {
                     // `WRITE_READ_READ`: two tagged register operands compared
                     // under §7.2.14 abstract equality, which may run `ToPrimitive`

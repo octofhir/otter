@@ -414,6 +414,7 @@ mod tests {
                     descriptor.signature,
                     RuntimeStubSignature::LeafValue2
                         | RuntimeStubSignature::MutatingLeafValue2
+                        | RuntimeStubSignature::MutatingLeafValue3
                         | RuntimeStubSignature::AllocValue3
                 )
             })

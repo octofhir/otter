@@ -42,8 +42,8 @@ use otter_vm::{
 
 use otter_vm::native_abi::{NO_SAFEPOINT, RuntimeStubId, SafepointId, runtime_stub_name};
 use otter_vm::runtime_stubs::{
-    LeafNoAllocStub2, MutatingLeafStub2, alloc_value_stub_by_id, leaf_no_alloc_stub2_by_id,
-    mutating_leaf_stub2_by_id,
+    LeafNoAllocStub2, MutatingLeafStub2, MutatingLeafStub3, alloc_value_stub_by_id,
+    leaf_no_alloc_stub2_by_id, mutating_leaf_stub2_by_id, mutating_leaf_stub3_by_id,
 };
 
 use super::values::{
@@ -474,7 +474,8 @@ pub(crate) fn native_leaf_call_is_supported(
 fn native_entry_call_is_supported(stub_id: RuntimeStubId, safepoint_id: SafepointId) -> bool {
     if safepoint_id == NO_SAFEPOINT {
         return leaf_no_alloc_stub2_by_id(stub_id).is_some_and(LeafNoAllocStub2::is_valid)
-            || mutating_leaf_stub2_by_id(stub_id).is_some_and(MutatingLeafStub2::is_valid);
+            || mutating_leaf_stub2_by_id(stub_id).is_some_and(MutatingLeafStub2::is_valid)
+            || mutating_leaf_stub3_by_id(stub_id).is_some_and(MutatingLeafStub3::is_valid);
     }
     alloc_value_stub_by_id(stub_id)
         .is_some_and(|stub| stub.is_valid_for_safepoint(safepoint_id) && stub.has_entry())
@@ -585,15 +586,23 @@ where
     F: FnMut(&mut Assembler, u8, u8) -> Result<(), Unsupported>,
 {
     if safepoint_id == NO_SAFEPOINT {
+        // Both leaf families take the heap and their operand words directly;
+        // they differ only in how many words they read, so the width is the
+        // whole distinction.
         let pair = leaf_no_alloc_stub2_by_id(stub_id)
             .filter(|stub| stub.is_valid())
-            .map(|stub| (stub.entry_addr(), stub.descriptor))
+            .map(|stub| (stub.entry_addr(), stub.descriptor, 2))
             .or_else(|| {
                 mutating_leaf_stub2_by_id(stub_id)
                     .filter(|stub| stub.is_valid())
-                    .map(|stub| (stub.entry_addr(), stub.descriptor))
+                    .map(|stub| (stub.entry_addr(), stub.descriptor, 2))
+            })
+            .or_else(|| {
+                mutating_leaf_stub3_by_id(stub_id)
+                    .filter(|stub| stub.is_valid())
+                    .map(|stub| (stub.entry_addr(), stub.descriptor, 3))
             });
-        let Some((entry_addr, descriptor)) = pair else {
+        let Some((entry_addr, descriptor, last_register)) = pair else {
             return Err(Unsupported::OperandShape("native leaf entry"));
         };
         dynasm!(ops
@@ -601,7 +610,7 @@ where
             ; ldr x0, [x20, THREAD_OFFSET]
             ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
         );
-        emit_entry_values(ops, 1, 2, value_count, &mut load_value)?;
+        emit_entry_values(ops, 1, last_register, value_count, &mut load_value)?;
         emit_load_symbol_u64(
             ops,
             relocations,

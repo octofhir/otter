@@ -1601,7 +1601,9 @@ fn reserve_guarded_entry_safepoint(
         return crate::runtime_stubs::leaf_no_alloc_stub2_by_id(stub_id)
             .is_some_and(crate::runtime_stubs::LeafNoAllocStub2::is_valid)
             || crate::runtime_stubs::mutating_leaf_stub2_by_id(stub_id)
-                .is_some_and(crate::runtime_stubs::MutatingLeafStub2::is_valid);
+                .is_some_and(crate::runtime_stubs::MutatingLeafStub2::is_valid)
+            || crate::runtime_stubs::mutating_leaf_stub3_by_id(stub_id)
+                .is_some_and(crate::runtime_stubs::MutatingLeafStub3::is_valid);
     }
     if !crate::runtime_stubs::alloc_value_stub_by_id(stub_id)
         .is_some_and(|stub| stub.is_valid_for_safepoint(call.safepoint_id) && stub.has_entry())

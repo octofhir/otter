@@ -492,6 +492,29 @@ pub fn map_set(
     Ok(())
 }
 
+/// `Map.prototype.set` restricted to a key the map already holds.
+///
+/// Overwriting an existing entry rewrites one slot and runs its write barrier;
+/// insertion order is unchanged and nothing allocates, which is what lets a
+/// leaf entry perform it with no safepoint and no rooting packet. Returns
+/// `false` when the key is absent, leaving the map untouched so the allocating
+/// path can append.
+#[must_use]
+pub fn map_set_existing(
+    map: JsMap,
+    heap: &mut otter_gc::GcHeap,
+    key: &Value,
+    value: Value,
+) -> bool {
+    let k = MapKey::from_value(key, heap);
+    let Some(idx) = heap.read_payload(map, |body| map_find_entry(body, &k, heap)) else {
+        return false;
+    };
+    heap.with_payload(map, |body| body.entries[idx].value = Some(value));
+    heap.record_write(map, &value);
+    true
+}
+
 /// `Map.prototype.set` for stack-visible VM construction paths.
 pub(crate) fn map_set_with_roots(
     map: &mut JsMap,

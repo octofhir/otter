@@ -143,6 +143,13 @@ pub enum RuntimeStubSignature {
     /// barriers) but still cannot allocate, trigger collection, or re-enter
     /// JS, so the call site publishes no safepoint.
     MutatingLeafValue2 = 5,
+    /// `(heap_mut, value0, value1, value2)` leaf mutation.
+    ///
+    /// [`Self::MutatingLeafValue2`] with one more operand word, for an
+    /// in-place write whose receiver and two arguments do not fit two words.
+    /// The same rules apply: rewrite in place, run the matching write
+    /// barriers, never allocate, collect, or re-enter JS.
+    MutatingLeafValue3 = 6,
 }
 
 /// Safepoint requirement encoded in the descriptor.
@@ -1206,6 +1213,22 @@ pub const STUB_ARRAY_UNSHIFT_ALLOC: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusPair,
 );
 
+/// Leaf in-place `Map.prototype.set` over a key the map already holds.
+///
+/// Overwriting an existing entry rewrites one slot and runs its write
+/// barrier; nothing allocates, so the site owes no safepoint and no rooting
+/// packet. A key the map does not hold appends and may grow the table, so the
+/// entry misses and the allocating sibling completes the call.
+pub const STUB_COLLECTION_MAP_SET_MUTATING: RuntimeStubDescriptor = descriptor(
+    83,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::MutatingLeafValue3,
+    3,
+    RuntimeStubEffects::leaf(false, true),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::StatusPair,
+);
+
 /// Leaf `Math.abs`.
 ///
 /// A numeric builtin reached through a declared entry rather than a
@@ -1354,6 +1377,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         80 => "math_sqrt_leaf",
         81 => "math_max_leaf",
         82 => "math_min_leaf",
+        83 => "collection_map_set_mutating",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1442,6 +1466,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_MATH_SQRT_LEAF,
     STUB_MATH_MAX_LEAF,
     STUB_MATH_MIN_LEAF,
+    STUB_COLLECTION_MAP_SET_MUTATING,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.
@@ -1456,6 +1481,7 @@ pub const fn validate_stub_descriptor(
     let result_matches = match desc.signature {
         RuntimeStubSignature::LeafValue2
         | RuntimeStubSignature::MutatingLeafValue2
+        | RuntimeStubSignature::MutatingLeafValue3
         | RuntimeStubSignature::AllocValue3 => {
             matches!(desc.result_abi, RuntimeStubResultAbi::StatusPair)
         }

@@ -160,6 +160,7 @@ fn runtime_stub_signature_name(signature: RuntimeStubSignature) -> &'static str 
         RuntimeStubSignature::Poll1 => "poll1",
         RuntimeStubSignature::Variadic => "variadic",
         RuntimeStubSignature::MutatingLeafValue2 => "mutatingLeafValue2",
+        RuntimeStubSignature::MutatingLeafValue3 => "mutatingLeafValue3",
     }
 }
 

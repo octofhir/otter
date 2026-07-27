@@ -731,6 +731,8 @@ pub enum JitElementRepr {
     Boxed,
     /// A raw signed 32-bit scalar, boxed on the way out.
     Int32,
+    /// A raw IEEE-754 double, canonicalized and boxed on the way out.
+    Float64,
 }
 
 impl JitElementRepr {
@@ -738,7 +740,7 @@ impl JitElementRepr {
     #[must_use]
     pub const fn stride_shift(self) -> u32 {
         match self {
-            Self::Boxed => 3,
+            Self::Boxed | Self::Float64 => 3,
             Self::Int32 => 2,
         }
     }
@@ -1053,6 +1055,8 @@ pub enum JitElementFamily {
     Dense,
     /// `Int32Array` receivers only.
     TypedInt32,
+    /// `Float64Array` receivers only.
+    TypedFloat64,
     /// More than one family, or one no instance describes.
     Generic,
 }

@@ -71,8 +71,9 @@ const ARITH_WIDEN_FLOAT: u8 = 1 << 7;
 const ELEMENT_UNSEEN: u8 = 0;
 const ELEMENT_DENSE: u8 = 1;
 const ELEMENT_TYPED_INT32: u8 = 2;
-const ELEMENT_GENERIC: u8 = 3;
-const ELEMENT_MASK: u8 = 0b0000_0011;
+const ELEMENT_TYPED_FLOAT64: u8 = 3;
+const ELEMENT_GENERIC: u8 = 4;
+const ELEMENT_MASK: u8 = 0b0000_0111;
 
 const BRANCH_TAKEN_SEEN: u8 = 1 << 4;
 const BRANCH_NOT_TAKEN_SEEN: u8 = 1 << 5;
@@ -690,6 +691,7 @@ impl InstructionFeedback {
         let observed = match observed {
             Family::Dense => ELEMENT_DENSE,
             Family::TypedInt32 => ELEMENT_TYPED_INT32,
+            Family::TypedFloat64 => ELEMENT_TYPED_FLOAT64,
             Family::Unseen | Family::Generic => ELEMENT_GENERIC,
         };
         let mut states = self.states.load(Ordering::Relaxed);
@@ -723,6 +725,7 @@ impl InstructionFeedback {
         match self.states.load(Ordering::Relaxed) & ELEMENT_MASK {
             ELEMENT_DENSE => Family::Dense,
             ELEMENT_TYPED_INT32 => Family::TypedInt32,
+            ELEMENT_TYPED_FLOAT64 => Family::TypedFloat64,
             ELEMENT_GENERIC => Family::Generic,
             _ => Family::Unseen,
         }

@@ -456,7 +456,10 @@ pub(super) fn check_eligibility(
                     .result
                     .is_some_and(|result| reprs.representation(result) != Representation::Tagged)
                 {
-                    return Err(instruction_unsupported(instruction));
+                    return Err(instruction_unsupported(
+                        instruction,
+                        "primitive node result repr",
+                    ));
                 }
                 check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                 continue;
@@ -517,13 +520,18 @@ pub(super) fn check_eligibility(
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("inlined LoadThis result"))?;
-                    if instruction.inputs.len() != 1
-                        || !instruction.input_registers.is_empty()
-                        || reprs.representation(result) != Representation::Tagged
-                        || reprs.representation(instruction.inputs[0]) != Representation::Tagged
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        instruction.inputs.len() == 1 && instruction.input_registers.is_empty(),
+                        op,
+                        "synthetic this operand arity",
+                    )?;
+                    require(
+                        reprs.representation(result) == Representation::Tagged
+                            && reprs.representation(instruction.inputs[0])
+                                == Representation::Tagged,
+                        op,
+                        "tagged this repr",
+                    )?;
                 }
                 Op::LoadThis => check_tagged_constant_result(instruction, reprs)?,
                 Op::LoadTrue | Op::LoadFalse => check_boolean_result(instruction, reprs)?,
@@ -531,27 +539,35 @@ pub(super) fn check_eligibility(
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("local move result"))?;
-                    if instruction.inputs.len() != 1
-                        || instruction.input_registers.len() != 1
-                        || instruction.result_register.is_none()
-                        || reprs.representation(result)
-                            != reprs.representation(instruction.inputs[0])
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        instruction.inputs.len() == 1
+                            && instruction.input_registers.len() == 1
+                            && instruction.result_register.is_some(),
+                        op,
+                        "local move arity",
+                    )?;
+                    require(
+                        reprs.representation(result) == reprs.representation(instruction.inputs[0]),
+                        op,
+                        "local move repr",
+                    )?;
                 }
                 Op::ToPrimitive | Op::ToNumeric => {
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("numeric coercion result"))?;
-                    if instruction.inputs.len() != 1
-                        || instruction.input_registers.len() != 1
-                        || instruction.result_register.is_none()
-                        || reprs.representation(result)
-                            != reprs.representation(instruction.inputs[0])
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        instruction.inputs.len() == 1
+                            && instruction.input_registers.len() == 1
+                            && instruction.result_register.is_some(),
+                        op,
+                        "coercion arity",
+                    )?;
+                    require(
+                        reprs.representation(result) == reprs.representation(instruction.inputs[0]),
+                        op,
+                        "coercion repr",
+                    )?;
                     if reprs.representation(instruction.inputs[0]) == Representation::Tagged {
                         check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                         guarded_uses.insert((instruction.pc, instruction.inputs[0]), None);
@@ -561,13 +577,18 @@ pub(super) fn check_eligibility(
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("element-load result"))?;
-                    if reprs.representation(result) != Representation::Tagged
-                        || instruction.inputs.len() != 2
-                        || instruction.input_registers.len() != 2
-                        || instruction.result_register.is_none()
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        reprs.representation(result) == Representation::Tagged,
+                        op,
+                        "tagged result repr",
+                    )?;
+                    require(
+                        instruction.inputs.len() == 2
+                            && instruction.input_registers.len() == 2
+                            && instruction.result_register.is_some(),
+                        op,
+                        "element operand arity",
+                    )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
                         instruction.pc,
@@ -576,15 +597,24 @@ pub(super) fn check_eligibility(
                     ));
                 }
                 Op::StoreElement => {
-                    if instruction.result.is_some()
-                        || instruction.result_register.is_some()
-                        || instruction.inputs.len() != 3
-                        || instruction.input_registers.len() != 3
-                        || reprs.representation(instruction.inputs[0]) != Representation::Tagged
-                        || reprs.representation(instruction.inputs[1]) == Representation::Float64
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        instruction.result.is_none()
+                            && instruction.result_register.is_none()
+                            && instruction.inputs.len() == 3
+                            && instruction.input_registers.len() == 3,
+                        op,
+                        "element store arity",
+                    )?;
+                    require(
+                        reprs.representation(instruction.inputs[0]) == Representation::Tagged,
+                        op,
+                        "tagged receiver repr",
+                    )?;
+                    require(
+                        reprs.representation(instruction.inputs[1]) != Representation::Float64,
+                        op,
+                        "element index repr",
+                    )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
                         instruction.pc,
@@ -596,14 +626,20 @@ pub(super) fn check_eligibility(
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("inlined property-load result"))?;
-                    if reprs.representation(result) != Representation::Tagged
-                        || instruction.inputs.len() != 1
-                        || instruction.input_registers.len() != 1
-                        || instruction.result_register.is_none()
-                        || reprs.representation(instruction.inputs[0]) != Representation::Tagged
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        instruction.inputs.len() == 1
+                            && instruction.input_registers.len() == 1
+                            && instruction.result_register.is_some(),
+                        op,
+                        "property operand arity",
+                    )?;
+                    require(
+                        reprs.representation(result) == Representation::Tagged
+                            && reprs.representation(instruction.inputs[0])
+                                == Representation::Tagged,
+                        op,
+                        "tagged property repr",
+                    )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                 }
                 Op::LoadProperty => {
@@ -613,14 +649,20 @@ pub(super) fn check_eligibility(
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("property-load result"))?;
-                    if reprs.representation(result) != Representation::Tagged
-                        || instruction.inputs.len() != 1
-                        || instruction.input_registers.len() != 1
-                        || instruction.result_register.is_none()
-                        || reprs.representation(instruction.inputs[0]) != Representation::Tagged
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        instruction.inputs.len() == 1
+                            && instruction.input_registers.len() == 1
+                            && instruction.result_register.is_some(),
+                        op,
+                        "property operand arity",
+                    )?;
+                    require(
+                        reprs.representation(result) == Representation::Tagged
+                            && reprs.representation(instruction.inputs[0])
+                                == Representation::Tagged,
+                        op,
+                        "tagged property repr",
+                    )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
                         instruction.pc,
@@ -635,14 +677,23 @@ pub(super) fn check_eligibility(
                     let scratch = instruction
                         .result_register
                         .ok_or(Unsupported::OperandShape("property-store scratch"))?;
-                    if instruction.result.is_none()
-                        || instruction.inputs.len() != 2
-                        || instruction.input_registers.len() != 2
-                        || reprs.representation(instruction.inputs[0]) != Representation::Tagged
-                        || instruction.input_registers.contains(&scratch)
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        instruction.result.is_some()
+                            && instruction.inputs.len() == 2
+                            && instruction.input_registers.len() == 2,
+                        op,
+                        "property store arity",
+                    )?;
+                    require(
+                        reprs.representation(instruction.inputs[0]) == Representation::Tagged,
+                        op,
+                        "tagged receiver repr",
+                    )?;
+                    require(
+                        !instruction.input_registers.contains(&scratch),
+                        op,
+                        "store scratch aliases an operand",
+                    )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
                         instruction.pc,
@@ -657,13 +708,14 @@ pub(super) fn check_eligibility(
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("global-load result"))?;
-                    if reprs.representation(result) != Representation::Tagged
-                        || !instruction.inputs.is_empty()
-                        || !instruction.input_registers.is_empty()
-                        || instruction.result_register.is_none()
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        reprs.representation(result) == Representation::Tagged
+                            && instruction.inputs.is_empty()
+                            && instruction.input_registers.is_empty()
+                            && instruction.result_register.is_some(),
+                        op,
+                        "global load shape",
+                    )?;
                     element_transition_instructions.push((
                         instruction.pc,
                         block,
@@ -678,13 +730,14 @@ pub(super) fn check_eligibility(
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("string-load result"))?;
-                    if reprs.representation(result) != Representation::Tagged
-                        || !instruction.inputs.is_empty()
-                        || !instruction.input_registers.is_empty()
-                        || instruction.result_register.is_none()
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        reprs.representation(result) == Representation::Tagged
+                            && instruction.inputs.is_empty()
+                            && instruction.input_registers.is_empty()
+                            && instruction.result_register.is_some(),
+                        op,
+                        "string load shape",
+                    )?;
                     element_transition_instructions.push((
                         instruction.pc,
                         block,
@@ -692,22 +745,27 @@ pub(super) fn check_eligibility(
                     ));
                 }
                 Op::LooseEqual | Op::LooseNotEqual => {
-                    // `WRITE_READ_READ`: two tagged register operands compared
-                    // under §7.2.14 abstract equality, which may run `ToPrimitive`
+                    // `WRITE_READ_READ`: two register operands compared under
+                    // §7.2.14 abstract equality, which may run `ToPrimitive`
                     // (user `valueOf`/`toString`), allocate, and throw — a precise
-                    // reentrant transition. The boolean result is tagged.
+                    // reentrant transition. An unboxed numeric operand
+                    // materializes boxed into its window slot; the boolean
+                    // result is tagged.
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("loose-eq result"))?;
-                    if reprs.representation(result) != Representation::Tagged
-                        || instruction.inputs.len() != 2
-                        || instruction.input_registers.len() != 2
-                        || instruction.result_register.is_none()
-                        || reprs.representation(instruction.inputs[0]) != Representation::Tagged
-                        || reprs.representation(instruction.inputs[1]) != Representation::Tagged
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        instruction.inputs.len() == 2
+                            && instruction.input_registers.len() == 2
+                            && instruction.result_register.is_some(),
+                        op,
+                        "comparison arity",
+                    )?;
+                    require(
+                        reprs.representation(result) == Representation::Tagged,
+                        op,
+                        "tagged result repr",
+                    )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
                         instruction.pc,
@@ -725,15 +783,25 @@ pub(super) fn check_eligibility(
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("method-call result"))?;
-                    if reprs.representation(result) != Representation::Tagged
-                        || instruction.result_register.is_none()
-                        || instruction.input_registers.is_empty()
-                        || instruction.input_registers.len() > 1 + MAX_METHOD_ARGS
-                        || instruction.inputs.len() != instruction.input_registers.len()
-                        || reprs.representation(instruction.inputs[0]) != Representation::Tagged
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        instruction.result_register.is_some()
+                            && !instruction.input_registers.is_empty()
+                            && instruction.inputs.len() == instruction.input_registers.len(),
+                        op,
+                        "method operand arity",
+                    )?;
+                    require(
+                        instruction.input_registers.len() <= 1 + MAX_METHOD_ARGS,
+                        op,
+                        "method argument count",
+                    )?;
+                    require(
+                        reprs.representation(result) == Representation::Tagged
+                            && reprs.representation(instruction.inputs[0])
+                                == Representation::Tagged,
+                        op,
+                        "tagged receiver repr",
+                    )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
                         instruction.pc,
@@ -742,39 +810,50 @@ pub(super) fn check_eligibility(
                     ));
                 }
                 Op::CallMethodValue if is_spliced_call(cfg, block, instruction) => {
-                    if instruction.result.is_some()
-                        || instruction.result_register.is_some()
-                        || instruction.inputs.is_empty()
-                        || instruction.inputs.len() != instruction.input_registers.len()
-                        || reprs.representation(instruction.inputs[0]) != Representation::Tagged
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        instruction.result.is_none()
+                            && instruction.result_register.is_none()
+                            && !instruction.inputs.is_empty()
+                            && instruction.inputs.len() == instruction.input_registers.len(),
+                        op,
+                        "spliced method arity",
+                    )?;
+                    require(
+                        reprs.representation(instruction.inputs[0]) == Representation::Tagged,
+                        op,
+                        "tagged receiver repr",
+                    )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                 }
                 Op::New => {
                     // `dst, callee, argc-const, arg-regs...`. Construction may
-                    // execute arbitrary JS, allocate, or throw, so every tagged
-                    // operand is materialized in the precise frame window.
+                    // execute arbitrary JS, allocate, or throw, so every operand
+                    // materializes in the precise frame window — an unboxed
+                    // numeric argument boxes on the way in.
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("construct result"))?;
                     let argc = view.instructions[instruction.pc as usize]
                         .const_index(view.code_block.as_ref(), 2)
                         .ok_or(Unsupported::OperandShape("construct argument count"))?;
-                    if reprs.representation(result) != Representation::Tagged
-                        || instruction.result_register.is_none()
-                        || instruction.input_registers.is_empty()
-                        || instruction.input_registers.len() > 1 + MAX_METHOD_ARGS
-                        || instruction.inputs.len() != instruction.input_registers.len()
-                        || argc as usize != instruction.input_registers.len() - 1
-                        || instruction
-                            .inputs
-                            .iter()
-                            .any(|&input| reprs.representation(input) != Representation::Tagged)
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        instruction.result_register.is_some()
+                            && !instruction.input_registers.is_empty()
+                            && instruction.inputs.len() == instruction.input_registers.len()
+                            && argc as usize == instruction.input_registers.len() - 1,
+                        op,
+                        "construct operand arity",
+                    )?;
+                    require(
+                        instruction.input_registers.len() <= 1 + MAX_METHOD_ARGS,
+                        op,
+                        "construct argument count",
+                    )?;
+                    require(
+                        reprs.representation(result) == Representation::Tagged,
+                        op,
+                        "tagged result repr",
+                    )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
                         instruction.pc,
@@ -787,11 +866,12 @@ pub(super) fn check_eligibility(
                         .result
                         .ok_or(Unsupported::OperandShape("arithmetic result"))?;
                     let result_repr = reprs.representation(result);
-                    if !matches!(result_repr, Representation::Int32 | Representation::Float64)
-                        || instruction.inputs.len() != 2
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        matches!(result_repr, Representation::Int32 | Representation::Float64),
+                        op,
+                        "numeric result repr",
+                    )?;
+                    require(instruction.inputs.len() == 2, op, "arithmetic arity")?;
                     check_numeric_inputs(
                         instruction,
                         ssa,
@@ -807,11 +887,12 @@ pub(super) fn check_eligibility(
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("increment result"))?;
-                    if reprs.representation(result) != Representation::Int32
-                        || instruction.inputs.len() != 1
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        reprs.representation(result) == Representation::Int32,
+                        op,
+                        "int32 result repr",
+                    )?;
+                    require(instruction.inputs.len() == 1, op, "arithmetic arity")?;
                     check_numeric_inputs(
                         instruction,
                         ssa,
@@ -828,11 +909,12 @@ pub(super) fn check_eligibility(
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("immediate int32 result"))?;
-                    if reprs.representation(result) != Representation::Int32
-                        || instruction.inputs.len() != 1
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        reprs.representation(result) == Representation::Int32,
+                        op,
+                        "int32 result repr",
+                    )?;
+                    require(instruction.inputs.len() == 1, op, "arithmetic arity")?;
                     check_numeric_inputs(
                         instruction,
                         ssa,
@@ -849,12 +931,17 @@ pub(super) fn check_eligibility(
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("immediate comparison result"))?;
-                    if reprs.representation(result) != Representation::Tagged
-                        || instruction.inputs.len() != 1
-                        || !frame_feedback(tree, instruction).is_int32_only()
-                    {
-                        return Err(Unsupported::OperandShape("immediate comparison shape"));
-                    }
+                    require(
+                        reprs.representation(result) == Representation::Tagged,
+                        op,
+                        "tagged result repr",
+                    )?;
+                    require(instruction.inputs.len() == 1, op, "comparison arity")?;
+                    require(
+                        frame_feedback(tree, instruction).is_int32_only(),
+                        op,
+                        "int32 comparison feedback",
+                    )?;
                     check_numeric_inputs(
                         instruction,
                         ssa,
@@ -869,11 +956,12 @@ pub(super) fn check_eligibility(
                         .result
                         .ok_or(Unsupported::OperandShape("negate result"))?;
                     let result_repr = reprs.representation(result);
-                    if !matches!(result_repr, Representation::Int32 | Representation::Float64)
-                        || instruction.inputs.len() != 1
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        matches!(result_repr, Representation::Int32 | Representation::Float64),
+                        op,
+                        "numeric result repr",
+                    )?;
+                    require(instruction.inputs.len() == 1, op, "arithmetic arity")?;
                     check_numeric_inputs(
                         instruction,
                         ssa,
@@ -887,23 +975,25 @@ pub(super) fn check_eligibility(
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("logical-not result"))?;
-                    if reprs.representation(result) != Representation::Tagged
-                        || instruction.inputs.len() != 1
-                        || instruction.input_registers.len() != 1
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        reprs.representation(result) == Representation::Tagged
+                            && instruction.inputs.len() == 1
+                            && instruction.input_registers.len() == 1,
+                        op,
+                        "logical-not shape",
+                    )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                 }
                 Op::Div | Op::Rem => {
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("float arithmetic result"))?;
-                    if reprs.representation(result) != Representation::Float64
-                        || instruction.inputs.len() != 2
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        reprs.representation(result) == Representation::Float64,
+                        op,
+                        "float64 result repr",
+                    )?;
+                    require(instruction.inputs.len() == 2, op, "arithmetic arity")?;
                     check_numeric_inputs(
                         instruction,
                         ssa,
@@ -921,14 +1011,15 @@ pub(super) fn check_eligibility(
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("bitwise result"))?;
-                    if instruction.inputs.len() != 2 {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(instruction.inputs.len() == 2, op, "arithmetic arity")?;
                     let required = match reprs.representation(result) {
                         Representation::Int32 => Representation::Int32,
                         Representation::Float64 => Representation::Float64,
                         Representation::Tagged => {
-                            return Err(Unsupported::Opcode(op));
+                            return Err(Unsupported::Constraint {
+                                op,
+                                constraint: "numeric result repr",
+                            });
                         }
                     };
                     check_numeric_inputs(
@@ -949,12 +1040,12 @@ pub(super) fn check_eligibility(
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("comparison result"))?;
-                    if reprs.representation(result) != Representation::Tagged {
-                        return Err(Unsupported::OperandShape("comparison result repr"));
-                    }
-                    if instruction.inputs.len() != 2 {
-                        return Err(Unsupported::OperandShape("comparison input count"));
-                    }
+                    require(
+                        reprs.representation(result) == Representation::Tagged,
+                        op,
+                        "tagged result repr",
+                    )?;
+                    require(instruction.inputs.len() == 2, op, "comparison arity")?;
                     let feedback = frame_feedback(tree, instruction);
                     if feedback.is_int32_only() {
                         check_numeric_inputs(
@@ -979,7 +1070,10 @@ pub(super) fn check_eligibility(
                         // values, so it lowers inline whatever the feedback.
                         check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     } else {
-                        return Err(Unsupported::OperandShape("comparison feedback kind"));
+                        return Err(Unsupported::Constraint {
+                            op,
+                            constraint: "comparison feedback kind",
+                        });
                     }
                 }
                 // A plain call uses only a VM-baked monomorphic native target.
@@ -990,13 +1084,18 @@ pub(super) fn check_eligibility(
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("call result"))?;
-                    if reprs.representation(result) != Representation::Tagged
-                        || instruction.result_register.is_none()
-                        || instruction.input_registers.is_empty()
-                        || instruction.inputs.len() != instruction.input_registers.len()
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        instruction.result_register.is_some()
+                            && !instruction.input_registers.is_empty()
+                            && instruction.inputs.len() == instruction.input_registers.len(),
+                        op,
+                        "call operand arity",
+                    )?;
+                    require(
+                        reprs.representation(result) == Representation::Tagged,
+                        op,
+                        "tagged result repr",
+                    )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     let frame = &tree.frames[instruction.inline.0 as usize];
                     let byte_pc = frame
@@ -1019,14 +1118,19 @@ pub(super) fn check_eligibility(
                 // guard the callee's identity, and the continuation's merge —
                 // not the call — defines its result.
                 Op::Call if is_spliced_call(cfg, block, instruction) => {
-                    if instruction.result.is_some()
-                        || instruction.result_register.is_some()
-                        || instruction.inputs.is_empty()
-                        || instruction.inputs.len() != instruction.input_registers.len()
-                        || reprs.representation(instruction.inputs[0]) != Representation::Tagged
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        instruction.result.is_none()
+                            && instruction.result_register.is_none()
+                            && !instruction.inputs.is_empty()
+                            && instruction.inputs.len() == instruction.input_registers.len(),
+                        op,
+                        "spliced call arity",
+                    )?;
+                    require(
+                        reprs.representation(instruction.inputs[0]) == Representation::Tagged,
+                        op,
+                        "tagged callee repr",
+                    )?;
                 }
                 // A spliced return hands its value to the continuation's merge
                 // through the edge at the merge's representation, so it needs
@@ -1083,12 +1187,13 @@ pub(super) fn check_eligibility(
                 // checked form throws on a TDZ write. The value materializes
                 // into its window slot for the stub.
                 Op::StoreUpvalue | Op::StoreUpvalueChecked => {
-                    if instruction.result.is_some()
-                        || instruction.inputs.len() != 1
-                        || instruction.input_registers.len() != 1
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        instruction.result.is_none()
+                            && instruction.inputs.len() == 1
+                            && instruction.input_registers.len() == 1,
+                        op,
+                        "upvalue store shape",
+                    )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                 }
                 // A captured-binding read is a leaf: it reaches the upvalue
@@ -1099,12 +1204,13 @@ pub(super) fn check_eligibility(
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("upvalue-load result"))?;
-                    if reprs.representation(result) != Representation::Tagged
-                        || instruction.result_register.is_none()
-                        || !instruction.inputs.is_empty()
-                    {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        reprs.representation(result) == Representation::Tagged
+                            && instruction.result_register.is_some()
+                            && instruction.inputs.is_empty(),
+                        op,
+                        "upvalue load shape",
+                    )?;
                 }
                 Op::Jump => {
                     if instruction.result.is_some() || !instruction.inputs.is_empty() {
@@ -1119,9 +1225,11 @@ pub(super) fn check_eligibility(
                     // tagged value reduces through the total `ToBoolean` sequence
                     // (numbers/bool/null/undefined inline, heap cells via the leaf
                     // probe) at emit time.
-                    if reprs.representation(instruction.inputs[0]) != Representation::Tagged {
-                        return Err(Unsupported::Opcode(op));
-                    }
+                    require(
+                        reprs.representation(instruction.inputs[0]) == Representation::Tagged,
+                        op,
+                        "tagged branch operand",
+                    )?;
                 }
                 Op::Return | Op::ReturnValue => {
                     if instruction.result.is_some() || instruction.inputs.len() != 1 {
@@ -1464,12 +1572,33 @@ pub(super) fn frame_register_for_value(
         .and_then(|register| u16::try_from(register).ok())
 }
 
-/// The silent-fallback reason for an instruction this backend cannot lower.
-pub(super) fn instruction_unsupported(instruction: &SsaInstr) -> Unsupported {
-    instruction.op.bytecode().map_or(
-        Unsupported::OperandShape("optimizing primitive node shape"),
-        Unsupported::Opcode,
-    )
+/// The silent-fallback reason for a site whose lowering exists but whose
+/// named condition failed. A primitive node has no opcode to attribute the
+/// condition to, so it reports the condition alone.
+pub(super) fn instruction_unsupported(
+    instruction: &SsaInstr,
+    constraint: &'static str,
+) -> Unsupported {
+    instruction
+        .op
+        .bytecode()
+        .map_or(Unsupported::OperandShape(constraint), |op| {
+            Unsupported::Constraint { op, constraint }
+        })
+}
+
+/// `Ok` when `condition` holds; otherwise the lowering for `op` rejects the
+/// site with the named condition.
+pub(super) fn require(
+    condition: bool,
+    op: Op,
+    constraint: &'static str,
+) -> Result<(), Unsupported> {
+    if condition {
+        Ok(())
+    } else {
+        Err(Unsupported::Constraint { op, constraint })
+    }
 }
 
 pub(super) fn check_tagged_inputs(
@@ -1523,7 +1652,12 @@ pub(super) fn check_numeric_inputs(
             (Representation::Tagged, Representation::Float64) => {
                 ConversionKind::CheckedTaggedToFloat64
             }
-            _ => return Err(instruction_unsupported(instruction)),
+            _ => {
+                return Err(instruction_unsupported(
+                    instruction,
+                    "operand conversion pair",
+                ));
+            }
         };
         let conversion = reprs.conversions().iter().find(|conversion| {
             conversion.inline == instruction.inline
@@ -1541,7 +1675,10 @@ pub(super) fn check_numeric_inputs(
                     && conversion.kind == expected_kind
                     && conversion.may_deopt == may_deopt
         ) {
-            return Err(instruction_unsupported(instruction));
+            return Err(instruction_unsupported(
+                instruction,
+                "numeric conversion plan",
+            ));
         }
         if may_deopt {
             // A checked tagged->numeric conversion guards the value and can
@@ -1559,7 +1696,12 @@ pub(super) fn check_numeric_inputs(
             let parameter_index = match ssa.values[input.0 as usize].def {
                 ValueDef::Param { index, .. } => Some(index),
                 ValueDef::Op { .. } => None,
-                _ => return Err(instruction_unsupported(instruction)),
+                _ => {
+                    return Err(instruction_unsupported(
+                        instruction,
+                        "guarded operand reconstruction",
+                    ));
+                }
             };
             guarded_uses.insert((instruction.pc, input), parameter_index);
         }
@@ -1734,7 +1876,7 @@ pub(super) fn check_constant_result(
         .result
         .ok_or(Unsupported::OperandShape("optimizing constant result"))?;
     if !instruction.inputs.is_empty() || reprs.representation(result) != Representation::Int32 {
-        return Err(instruction_unsupported(instruction));
+        return Err(instruction_unsupported(instruction, "int32 constant shape"));
     }
     Ok(())
 }
@@ -1754,7 +1896,7 @@ pub(super) fn check_number_constant_result(
         Representation::Float64
     };
     if !instruction.inputs.is_empty() || reprs.representation(result) != expected {
-        return Err(instruction_unsupported(instruction));
+        return Err(instruction_unsupported(instruction, "number constant repr"));
     }
     Ok(())
 }
@@ -1767,7 +1909,10 @@ pub(super) fn check_boolean_result(
         .result
         .ok_or(Unsupported::OperandShape("optimizing boolean result"))?;
     if !instruction.inputs.is_empty() || reprs.representation(result) != Representation::Tagged {
-        return Err(instruction_unsupported(instruction));
+        return Err(instruction_unsupported(
+            instruction,
+            "boolean constant shape",
+        ));
     }
     Ok(())
 }
@@ -1780,7 +1925,10 @@ pub(super) fn check_tagged_constant_result(
         "optimizing tagged constant result",
     ))?;
     if !instruction.inputs.is_empty() || reprs.representation(result) != Representation::Tagged {
-        return Err(instruction_unsupported(instruction));
+        return Err(instruction_unsupported(
+            instruction,
+            "tagged constant shape",
+        ));
     }
     Ok(())
 }

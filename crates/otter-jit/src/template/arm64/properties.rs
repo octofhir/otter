@@ -53,6 +53,7 @@ pub(super) fn emit_load_property(
     array_length: bool,
     cell_addr: usize,
     cell_ordinal: u32,
+    settled: Option<&otter_vm::JitInlinePropertyLoad>,
     boxed_slot_slow_paths: &mut Vec<BoxedSlotSlowPath>,
     threw: DynamicLabel,
 ) -> Result<(), Unsupported> {
@@ -87,6 +88,7 @@ pub(super) fn emit_load_property(
             ops,
             relocations,
             view,
+            settled,
             |ops, register| {
                 dynasm!(ops ; .arch aarch64 ; ldr X(register), [x19, obj_off]);
                 Ok(())

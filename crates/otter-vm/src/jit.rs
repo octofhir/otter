@@ -158,10 +158,11 @@ pub struct JitCompileSnapshot {
     /// once at compile time from `otter-vm`'s `#[repr(C)]` body layouts so the
     /// emitter stays layout-agnostic.
     pub array_layout: JitArrayLayout,
-    /// How the indexed-element program addresses a receiver's elements.
-    /// Generated code reads only this; the family's body layout never reaches
-    /// the emitter, so a second element-bearing family costs a declaration.
-    pub element_access: JitElementAccess,
+    /// How the indexed-element program addresses each site's receiver, keyed by
+    /// the site's byte-PC. Generated code reads only this; the family's body
+    /// layout never reaches the emitter, so a second element-bearing family
+    /// costs a declaration.
+    pub element_accesses: rustc_hash::FxHashMap<u32, JitElementAccess>,
     /// Static heap-layout offsets for inline primitive string `.length`.
     pub string_layout: JitStringLayout,
     /// Byte offset from a decompressed upvalue-cell pointer to its captured
@@ -686,26 +687,86 @@ pub struct JitArrayLayout {
     pub length_byte: u32,
 }
 
+/// Where a receiver family keeps the base of its element storage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JitElementBase {
+    /// No family is described and the site keeps the runtime path.
+    #[default]
+    None,
+    /// A word in the receiver body itself, as a dense array keeps.
+    InBody {
+        /// Byte offset of the base pointer from the body's `GcHeader`.
+        byte: u32,
+    },
+    /// A word in a separate buffer cell the receiver names by a compressed
+    /// handle, at the receiver's own byte offset into it, as a typed view
+    /// keeps. The buffer's own liveness is guarded on the way through, because
+    /// a detached buffer leaves the view's cached length untouched and so is
+    /// invisible to a bounds check.
+    ThroughLocalBuffer {
+        /// Byte offset, in the receiver body, of the buffer's storage
+        /// discriminant.
+        storage_tag_byte: u32,
+        /// Discriminant value naming an in-heap local buffer. Any other
+        /// storage leaves the fast path.
+        local_tag: u32,
+        /// Byte offset, in the receiver body, of the compressed buffer handle.
+        handle_byte: u32,
+        /// Byte offset, in the buffer body, of the detached flag.
+        detached_byte: u32,
+        /// Byte offset, in the buffer body, of the element base pointer.
+        data_ptr_byte: u32,
+        /// Byte offset, in the receiver body, of the view's own byte offset
+        /// into the buffer.
+        view_offset_byte: u32,
+    },
+}
+
+/// How one element is stored, which fixes both the address stride and the load.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JitElementRepr {
+    /// A boxed `Value`. A hole is an absent property, so it leaves the fast
+    /// path.
+    #[default]
+    Boxed,
+    /// A raw signed 32-bit scalar, boxed on the way out.
+    Int32,
+}
+
+impl JitElementRepr {
+    /// Log2 of the element stride in bytes.
+    #[must_use]
+    pub const fn stride_shift(self) -> u32 {
+        match self {
+            Self::Boxed => 3,
+            Self::Int32 => 2,
+        }
+    }
+}
+
 /// One receiver family's indexed-element storage, as the guard program reads it.
 ///
-/// Every element-bearing body answers the same four questions — which cell tag
-/// it carries, what instance state invalidates the layout, where its live
-/// element count lives, and where its element base pointer lives — so the
-/// address program is written once and the family is data.
+/// Every element-bearing body answers the same questions — which cell tag it
+/// carries, what instance state invalidates the layout, where its live element
+/// count lives, where its element base lives, and how one element is stored —
+/// so the address program is written once and the family is data.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JitElementAccess {
-    /// Expected receiver `GcHeader::type_tag`. `0` means no family is baked and
-    /// the site keeps the runtime path.
+    /// Expected receiver `GcHeader::type_tag`.
     pub type_tag: u8,
     /// Instance state that must hold before the offsets below are trusted.
     /// Read in order; an absent entry ends the list.
     pub guards: [Option<JitBodyGuard>; 2],
-    /// Byte offset of the VM-maintained live element count, read as 32 bits.
+    /// Byte offset of the VM-maintained live element count.
     pub length_byte: u32,
-    /// Byte offset of the VM-maintained element base pointer. The buffer is a
-    /// plain host allocation, so it survives a moving collection of the body;
-    /// every mutation refreshes it.
-    pub data_ptr_byte: u32,
+    /// Width of that count.
+    pub length_width: JitGuardWidth,
+    /// Where the element base pointer lives. The storage is a plain host
+    /// allocation, so it survives a moving collection of the body; every
+    /// mutation refreshes it.
+    pub base: JitElementBase,
+    /// How one element is stored.
+    pub element: JitElementRepr,
 }
 
 /// Ready-to-use byte offsets and tags for inline primitive string fast paths.
@@ -846,7 +907,7 @@ impl JitCompileSnapshot {
             derived_constructor: false,
             cage_base: 0,
             array_layout: JitArrayLayout::default(),
-            element_access: JitElementAccess::default(),
+            element_accesses: rustc_hash::FxHashMap::default(),
             string_layout: JitStringLayout::default(),
             object_shape_byte: 0,
             object_dictionary_shape_id_byte: 0,
@@ -976,6 +1037,24 @@ impl JitInstructionMetadata {
             exception_register: region.exception_register,
         })
     }
+}
+
+/// Receiver family observed at one `Op::LoadElement` site.
+///
+/// Selects which [`JitElementAccess`] the site bakes. A site that sees more
+/// than one family stays `Dense`, which is the only family whose guard also
+/// admits the ordinary miss path cheaply.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JitElementFamily {
+    /// Nothing observed yet, or a receiver no instance describes.
+    #[default]
+    Unseen,
+    /// Ordinary dense arrays only.
+    Dense,
+    /// `Int32Array` receivers only.
+    TypedInt32,
+    /// More than one family, or one no instance describes.
+    Generic,
 }
 
 /// Common method names the external JIT can specialize without reading VM

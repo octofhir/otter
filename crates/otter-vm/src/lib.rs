@@ -262,9 +262,10 @@ pub use jit::{
     JitArrayLayout, JitBodyGuard, JitClosureCallLayout, JitCodeGenerationSnapshot,
     JitCodeResidency, JitCollectionLayout, JitCompileError, JitCompileRequest, JitCompileSnapshot,
     JitCompileStatus, JitCompilerHook, JitDirectCallKind, JitDirectCallThisMode, JitDirectCallee,
-    JitElementAccess, JitExecOutcome, JitFunctionCode, JitGuardWidth, JitGuardedMethodCall,
-    JitGuardedReceiver, JitInlineCallee, JitInlineMethod, JitInstructionMetadata, JitPropertyIcWay,
-    JitRuntimeStubBinding, JitStaticNativeCall, JitStringLayout, VmRuntimeActivation,
+    JitElementAccess, JitElementBase, JitElementFamily, JitElementRepr, JitExecOutcome,
+    JitFunctionCode, JitGuardWidth, JitGuardedMethodCall, JitGuardedReceiver, JitInlineCallee,
+    JitInlineMethod, JitInstructionMetadata, JitPropertyIcWay, JitRuntimeStubBinding,
+    JitStaticNativeCall, JitStringLayout, VmRuntimeActivation,
 };
 pub use jit_artifact::{
     JIT_ARTIFACT_BUNDLE_LIMIT, JIT_ARTIFACT_BYTE_LIMIT, JitArtifactBatch, JitArtifactBuildError,

@@ -68,6 +68,12 @@ pub const ARITH_OTHER: u8 = 1 << 4;
 const NON_NUMERIC: u8 = ARITH_STRING | ARITH_BIGINT | ARITH_OTHER;
 const ARITH_WIDEN_FLOAT: u8 = 1 << 7;
 
+const ELEMENT_UNSEEN: u8 = 0;
+const ELEMENT_DENSE: u8 = 1;
+const ELEMENT_TYPED_INT32: u8 = 2;
+const ELEMENT_GENERIC: u8 = 3;
+const ELEMENT_MASK: u8 = 0b0000_0011;
+
 const BRANCH_TAKEN_SEEN: u8 = 1 << 4;
 const BRANCH_NOT_TAKEN_SEEN: u8 = 1 << 5;
 
@@ -676,6 +682,52 @@ impl InstructionFeedback {
         self.arith.fetch_or(ARITH_WIDEN_FLOAT, Ordering::Relaxed) & ARITH_WIDEN_FLOAT == 0
     }
 
+    /// Record the receiver family observed at one `LoadElement` instruction.
+    /// A site that sees two families becomes permanently generic. Returns
+    /// `true` when the bounded family changes.
+    pub fn record_element_family(&self, observed: crate::jit::JitElementFamily) -> bool {
+        use crate::jit::JitElementFamily as Family;
+        let observed = match observed {
+            Family::Dense => ELEMENT_DENSE,
+            Family::TypedInt32 => ELEMENT_TYPED_INT32,
+            Family::Unseen | Family::Generic => ELEMENT_GENERIC,
+        };
+        let mut states = self.states.load(Ordering::Relaxed);
+        loop {
+            let current = states & ELEMENT_MASK;
+            let next_family = match current {
+                ELEMENT_UNSEEN => observed,
+                value if value == observed => value,
+                _ => ELEMENT_GENERIC,
+            };
+            if next_family == current {
+                return false;
+            }
+            let next = (states & !ELEMENT_MASK) | next_family;
+            match self.states.compare_exchange_weak(
+                states,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => states = actual,
+            }
+        }
+    }
+
+    /// Element receiver family consumed by a compile snapshot.
+    #[must_use]
+    pub fn element_family(&self) -> crate::jit::JitElementFamily {
+        use crate::jit::JitElementFamily as Family;
+        match self.states.load(Ordering::Relaxed) & ELEMENT_MASK {
+            ELEMENT_DENSE => Family::Dense,
+            ELEMENT_TYPED_INT32 => Family::TypedInt32,
+            ELEMENT_GENERIC => Family::Generic,
+            _ => Family::Unseen,
+        }
+    }
+
     /// Arithmetic bits consumed by a compile snapshot.
     #[must_use]
     pub fn arith_bits(&self) -> u8 {
@@ -850,6 +902,11 @@ impl<'a> InstructionFeedbackRecorder<'a> {
     #[inline]
     pub(crate) fn record_arith(self, lhs: Value, rhs: Value) -> bool {
         self.note_transition(self.cell.record_arith(lhs, rhs))
+    }
+
+    /// Record an element receiver family and advance the epoch on a change.
+    pub(crate) fn record_element_family(self, observed: crate::jit::JitElementFamily) -> bool {
+        self.note_transition(self.cell.record_element_family(observed))
     }
 
     /// Record a branch sample and advance the epoch on a newly seen direction.

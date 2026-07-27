@@ -215,7 +215,7 @@ impl CodeBlock {
             // all-zero default is never read because the emitter gates inline
             // element access on `cage_base != 0`.
             array_layout: crate::jit::JitArrayLayout::default(),
-            element_access: crate::jit::JitElementAccess::default(),
+            element_accesses: rustc_hash::FxHashMap::default(),
             string_layout: crate::jit::JitStringLayout::default(),
             // `#[repr(C)]` constant: offset from the decompressed object
             // pointer to its shape handle, for the WhiskerIC load-cell guard.

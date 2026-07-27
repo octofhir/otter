@@ -423,7 +423,11 @@ mod tests {
         let cfg = ControlFlowGraph::build(&snapshot).expect("CFG builds");
         let ssa = SsaFunction::build(&snapshot, &cfg).expect("SSA builds");
         let full_dom = DominatorTree::compute(&cfg);
-        ssa.verify(&cfg, &full_dom).expect("SSA verifies");
+        let reprs = crate::ir::repr::ReprMap::compute(
+            &crate::ir::inline::InlineTree::trivial(&snapshot),
+            &ssa,
+        );
+        ssa.verify(&cfg, &full_dom, &reprs).expect("SSA verifies");
         let liveness = Liveness::compute(&ssa, &cfg);
         liveness
             .verify(&ssa, &cfg, &full_dom)

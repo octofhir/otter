@@ -71,8 +71,8 @@ pub enum SsaOp {
     /// a read that share a holder need not be adjacent and a pass may delete a
     /// second derivation of the same one. It is a raw interior pointer: no
     /// interpreter register names it, so it never reaches a frame state, and it
-    /// may not live across a safepoint, where a moving collection would leave it
-    /// stale.
+    /// may not live across an instruction this tier emits as anything but
+    /// machine arithmetic, where a moving collection would leave it stale.
     LoadHeader,
     /// Prove the holder its input names still carries hidden class `shape`.
     CheckShape {
@@ -910,7 +910,8 @@ impl SsaFunction {
         };
         function.rename(tree, cfg, &normal_dom, &flows, &layout, &undefined_return)?;
         let full_dom = DominatorTree::compute(cfg);
-        function.verify(cfg, &full_dom)?;
+        let reprs = super::repr::ReprMap::compute(tree, &function);
+        function.verify(cfg, &full_dom, &reprs)?;
         Ok(function)
     }
 
@@ -1145,7 +1146,12 @@ impl SsaFunction {
     }
 
     /// Verify SSA structure, dominance, exception inputs, and deterministic order.
-    pub fn verify(&self, cfg: &ControlFlowGraph, full_dom: &DominatorTree) -> Result<(), SsaError> {
+    pub fn verify(
+        &self,
+        cfg: &ControlFlowGraph,
+        full_dom: &DominatorTree,
+        reprs: &super::repr::ReprMap,
+    ) -> Result<(), SsaError> {
         if !full_dom.includes_exception_edges() {
             return Err(SsaError::NormalDominatorUsedForVerification);
         }
@@ -1418,7 +1424,7 @@ impl SsaFunction {
                     let header = instruction
                         .result
                         .expect("a holder address is checked above to have a result");
-                    self.verify_header_liveness(block, instruction_index, header)?;
+                    self.verify_header_liveness(block, instruction_index, header, reprs)?;
                 }
                 // A holder address is the one result no interpreter register
                 // names; every other result is a register write.
@@ -1599,6 +1605,7 @@ impl SsaFunction {
         block: &SsaBlock,
         definition: usize,
         header: ValueId,
+        reprs: &super::repr::ReprMap,
     ) -> Result<(), SsaError> {
         for other in &self.blocks {
             if other.instrs.iter().any(|instruction| {
@@ -1631,6 +1638,9 @@ impl SsaFunction {
                     .op
                     .bytecode()
                     .is_some_and(|op| opcode_schema(op).effects.safepoint_required)
+                    && !instruction
+                        .result
+                        .is_some_and(|result| reprs.emits_unboxed_numeric(instruction, result))
             })
         {
             return Err(SsaError::HeaderCrossesSafepoint { value: header });
@@ -2006,8 +2016,12 @@ mod tests {
         assert_eq!(tree.frames.len(), 2, "the fixture must splice");
         let cfg = ControlFlowGraph::build_inlined(&tree).expect("a spliced CFG builds");
         let ssa = SsaFunction::build_inlined(&tree, &cfg).expect("a spliced SSA builds");
-        ssa.verify(&cfg, &DominatorTree::compute(&cfg))
-            .expect("a spliced SSA verifies");
+        ssa.verify(
+            &cfg,
+            &DominatorTree::compute(&cfg),
+            &crate::ir::repr::ReprMap::compute(&tree, &ssa),
+        )
+        .expect("a spliced SSA verifies");
         (cfg, ssa, tree)
     }
 
@@ -2165,13 +2179,18 @@ mod tests {
         param_count: u16,
         register_count: u16,
         instructions: Vec<(Op, Vec<Operand>)>,
-    ) -> (ControlFlowGraph, SsaFunction) {
+    ) -> (ControlFlowGraph, SsaFunction, InlineTree) {
         let snapshot = snapshot(param_count, register_count, instructions);
         let cfg = ControlFlowGraph::build(&snapshot).expect("CFG builds");
         let ssa = SsaFunction::build(&snapshot, &cfg).expect("SSA builds");
-        ssa.verify(&cfg, &DominatorTree::compute(&cfg))
-            .expect("SSA verifies");
-        (cfg, ssa)
+        let tree = InlineTree::trivial(&snapshot);
+        ssa.verify(
+            &cfg,
+            &DominatorTree::compute(&cfg),
+            &crate::ir::repr::ReprMap::compute(&tree, &ssa),
+        )
+        .expect("SSA verifies");
+        (cfg, ssa, tree)
     }
 
     fn phi_for(ssa: &SsaFunction, block: BlockId, register: u16) -> Option<ValueId> {
@@ -2202,7 +2221,7 @@ mod tests {
 
     #[test]
     fn straight_line_uses_latest_register_definition() {
-        let (_cfg, ssa) = build(
+        let (_cfg, ssa, _tree) = build(
             1,
             3,
             vec![
@@ -2236,7 +2255,7 @@ mod tests {
 
     #[test]
     fn diamond_places_only_the_needed_phi_in_predecessor_order() {
-        let (cfg, ssa) = build(
+        let (cfg, ssa, _tree) = build(
             1,
             3,
             vec![
@@ -2280,7 +2299,7 @@ mod tests {
 
     #[test]
     fn while_loop_has_preheader_and_latch_phi_inputs() {
-        let (cfg, ssa) = build(
+        let (cfg, ssa, _tree) = build(
             1,
             3,
             vec![
@@ -2317,7 +2336,7 @@ mod tests {
 
     #[test]
     fn nested_loops_place_phis_at_both_headers() {
-        let (cfg, ssa) = build(
+        let (cfg, ssa, _tree) = build(
             1,
             3,
             vec![
@@ -2364,7 +2383,7 @@ mod tests {
 
     #[test]
     fn try_catch_reloads_every_register_without_exception_edge_phis() {
-        let (cfg, ssa) = build(
+        let (cfg, ssa, _tree) = build(
             0,
             4,
             vec![
@@ -2423,7 +2442,7 @@ mod tests {
 
     #[test]
     fn verifier_rejects_corrupt_phi_input_count() {
-        let (cfg, mut ssa) = build(
+        let (cfg, mut ssa, tree) = build(
             1,
             2,
             vec![
@@ -2445,7 +2464,11 @@ mod tests {
         *inputs = vec![inputs[0]].into_boxed_slice();
 
         assert_eq!(
-            ssa.verify(&cfg, &DominatorTree::compute(&cfg)),
+            ssa.verify(
+                &cfg,
+                &DominatorTree::compute(&cfg),
+                &crate::ir::repr::ReprMap::compute(&tree, &ssa),
+            ),
             Err(SsaError::PhiInputCountMismatch {
                 value: phi,
                 expected: 2,

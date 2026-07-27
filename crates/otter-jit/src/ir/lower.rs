@@ -127,7 +127,12 @@ pub fn lower_settled_property_accesses(
     }
     if lowered_any {
         ssa.renumber_values(cfg);
-        eliminate_redundant_checks(ssa, cfg);
+        // Renumbering moved every identity, so the map the caller selected by
+        // no longer addresses this graph. Elimination asks which instructions
+        // the tier emits without leaving compiled code, which is a question
+        // about the graph as it now stands.
+        let renumbered = ReprMap::compute(tree, ssa);
+        eliminate_redundant_checks(ssa, cfg, &renumbered);
     }
 }
 
@@ -165,11 +170,18 @@ fn append_header_value(
 /// What survives is exactly what a receiver touched several times in one
 /// effect-free stretch would otherwise re-prove.
 ///
+/// Which instructions end that stretch is a question about this tier, not about
+/// the interpreter. The opcode schema marks every arithmetic opcode as needing a
+/// safepoint because coercing an operand may run user code; where feedback
+/// proved a site numeric, this tier emits machine arithmetic that coerces
+/// nothing and allocates nothing, and a failed operand guard leaves through
+/// deoptimization rather than through a call.
+///
 /// A fact belongs to the object, not to the value that named it: bytecode reads
 /// a variable through its own register move before each access, so two accesses
 /// to one variable arrive as two receiver values. Keying by the value they were
 /// copied from is what lets the second access see the first one's holder.
-pub fn eliminate_redundant_checks(ssa: &mut SsaFunction, cfg: &ControlFlowGraph) {
+pub fn eliminate_redundant_checks(ssa: &mut SsaFunction, cfg: &ControlFlowGraph, reprs: &ReprMap) {
     let mut deleted_any = false;
     for block_index in 0..ssa.blocks.len() {
         // A holder available for a receiver, and the classes already proven of
@@ -217,8 +229,15 @@ pub fn eliminate_redundant_checks(ssa: &mut SsaFunction, cfg: &ControlFlowGraph)
                 SsaOp::Bytecode(op) => {
                     // Anything that can run arbitrary code, allocate, or write
                     // the heap invalidates both a raw address and a proven
-                    // class.
-                    if opcode_schema(op).effects.safepoint_required {
+                    // class. The opcode schema answers that for the
+                    // interpreter, where every arithmetic opcode may coerce its
+                    // operands; this tier emits the numeric sites it proved as
+                    // machine arithmetic, and those move nothing.
+                    if opcode_schema(op).effects.safepoint_required
+                        && !instruction
+                            .result
+                            .is_some_and(|result| reprs.emits_unboxed_numeric(&instruction, result))
+                    {
                         holder_of.clear();
                         proven.clear();
                     }
@@ -332,7 +351,7 @@ mod tests {
 
     #[test]
     fn a_monomorphic_settled_site_becomes_a_holder_a_check_and_a_read() {
-        let (cfg, ssa, _tree) = analyzed(vec![JitInlinePropertyLoad {
+        let (cfg, ssa, tree) = analyzed(vec![JitInlinePropertyLoad {
             receiver_shape: 7,
             value_byte: 24,
         }]);
@@ -357,8 +376,12 @@ mod tests {
                 .all(|(index, value)| value.id == ValueId(index as u32))
         );
 
-        ssa.verify(&cfg, &DominatorTree::compute(&cfg))
-            .expect("the lowered graph verifies");
+        ssa.verify(
+            &cfg,
+            &DominatorTree::compute(&cfg),
+            &ReprMap::compute(&tree, &ssa),
+        )
+        .expect("the lowered graph verifies");
     }
 
     #[test]
@@ -429,8 +452,12 @@ mod tests {
             .expect("the holder is a value");
         assert_eq!(ssa.blocks[0].instrs[3].inputs.as_slice(), [header]);
 
-        ssa.verify(&cfg, &DominatorTree::compute(&cfg))
-            .expect("the eliminated graph verifies");
+        ssa.verify(
+            &cfg,
+            &DominatorTree::compute(&cfg),
+            &ReprMap::compute(&tree, &ssa),
+        )
+        .expect("the eliminated graph verifies");
     }
 
     /// Real bytecode reads a variable through its own move before each access,
@@ -516,8 +543,163 @@ mod tests {
             .expect("the holder is a value");
         assert_eq!(ssa.blocks[0].instrs[5].inputs.as_slice(), [header]);
 
-        ssa.verify(&cfg, &DominatorTree::compute(&cfg))
-            .expect("the eliminated graph verifies");
+        ssa.verify(
+            &cfg,
+            &DominatorTree::compute(&cfg),
+            &ReprMap::compute(&tree, &ssa),
+        )
+        .expect("the eliminated graph verifies");
+    }
+
+    /// A settled load, some numeric work, another settled load: the tier emits
+    /// that work as machine arithmetic, which moves nothing.
+    #[test]
+    fn numeric_work_between_two_accesses_keeps_one_holder() {
+        let ops = two_accesses_separated_by(vec![
+            JitTestInstruction::new(
+                Op::LoadInt32,
+                2,
+                8,
+                vec![Operand::Register(5), Operand::Imm32(2)],
+            ),
+            JitTestInstruction::new(
+                Op::Mul,
+                3,
+                12,
+                vec![
+                    Operand::Register(6),
+                    Operand::Register(2),
+                    Operand::Register(5),
+                ],
+            ),
+        ]);
+        assert_eq!(
+            ops,
+            vec![
+                SsaOp::Bytecode(Op::LoadLocal),
+                SsaOp::LoadHeader,
+                SsaOp::CheckShape { shape: 7 },
+                SsaOp::LoadField { byte: 24 },
+                SsaOp::Bytecode(Op::LoadInt32),
+                SsaOp::Bytecode(Op::Mul),
+                SsaOp::Bytecode(Op::LoadLocal),
+                SsaOp::LoadField { byte: 32 },
+                SsaOp::Bytecode(Op::ReturnValue),
+            ]
+        );
+    }
+
+    /// A call between the accesses can run anything, so the holder and its
+    /// proven class both die at it.
+    #[test]
+    fn a_call_between_two_accesses_reproves_the_holder() {
+        let ops = two_accesses_separated_by(vec![JitTestInstruction::new(
+            Op::LoadGlobalOrThrow,
+            2,
+            8,
+            vec![Operand::Register(5), Operand::ConstIndex(2)],
+        )]);
+        assert_eq!(
+            ops,
+            vec![
+                SsaOp::Bytecode(Op::LoadLocal),
+                SsaOp::LoadHeader,
+                SsaOp::CheckShape { shape: 7 },
+                SsaOp::LoadField { byte: 24 },
+                SsaOp::Bytecode(Op::LoadGlobalOrThrow),
+                SsaOp::Bytecode(Op::LoadLocal),
+                SsaOp::LoadHeader,
+                SsaOp::CheckShape { shape: 7 },
+                SsaOp::LoadField { byte: 32 },
+                SsaOp::Bytecode(Op::ReturnValue),
+            ]
+        );
+    }
+
+    /// `r1 = r0; r2 = r1.name; <between>; r3 = r0; r4 = r3.other; return r4`.
+    fn two_accesses_separated_by(between: Vec<JitTestInstruction>) -> Vec<SsaOp> {
+        let tail_pc = 2 + between.len() as u32;
+        let mut instructions = vec![
+            JitTestInstruction::new(
+                Op::LoadLocal,
+                0,
+                0,
+                vec![Operand::Register(1), Operand::Imm32(0)],
+            ),
+            JitTestInstruction::new(
+                Op::LoadProperty,
+                1,
+                4,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(1),
+                    Operand::ConstIndex(0),
+                ],
+            ),
+        ];
+        instructions.extend(between);
+        instructions.extend([
+            JitTestInstruction::new(
+                Op::LoadLocal,
+                tail_pc,
+                4 * tail_pc,
+                vec![Operand::Register(3), Operand::Imm32(0)],
+            ),
+            JitTestInstruction::new(
+                Op::LoadProperty,
+                tail_pc + 1,
+                4 * (tail_pc + 1),
+                vec![
+                    Operand::Register(4),
+                    Operand::Register(3),
+                    Operand::ConstIndex(1),
+                ],
+            ),
+            JitTestInstruction::new(
+                Op::ReturnValue,
+                tail_pc + 2,
+                4 * (tail_pc + 2),
+                vec![Operand::Register(4)],
+            ),
+        ]);
+        let mut view = JitCompileSnapshot::without_feedback(0, 1, 7, instructions);
+        view.cage_base = 0x1000;
+        // The separating work only counts as machine arithmetic where feedback
+        // proved the site numeric.
+        for pc in 2..tail_pc {
+            view.seed_arith_feedback_for_test(
+                pc,
+                otter_vm::jit_feedback::ArithFeedback::from_bits(
+                    otter_vm::jit_feedback::ARITH_INT32,
+                ),
+            );
+        }
+        view.property_loads.insert(
+            4,
+            vec![JitInlinePropertyLoad {
+                receiver_shape: 7,
+                value_byte: 24,
+            }],
+        );
+        view.property_loads.insert(
+            4 * (tail_pc + 1),
+            vec![JitInlinePropertyLoad {
+                receiver_shape: 7,
+                value_byte: 32,
+            }],
+        );
+        let tree = InlineTree::trivial(&view);
+        let cfg = ControlFlowGraph::build_inlined(&tree).expect("CFG builds");
+        let mut ssa = SsaFunction::build_inlined(&tree, &cfg).expect("SSA builds");
+        let reprs = ReprMap::compute(&tree, &ssa);
+        lower_settled_property_accesses(&mut ssa, &cfg, &view, &tree, &reprs);
+        ssa.verify(
+            &cfg,
+            &DominatorTree::compute(&cfg),
+            &ReprMap::compute(&tree, &ssa),
+        )
+        .expect("the lowered graph verifies");
+        ssa.blocks[0].instrs.iter().map(|i| i.op).collect()
     }
 
     #[test]
@@ -549,13 +731,17 @@ mod tests {
 
     #[test]
     fn a_field_read_without_its_shape_check_is_rejected() {
-        let (cfg, mut ssa, _tree) = analyzed(vec![JitInlinePropertyLoad {
+        let (cfg, mut ssa, tree) = analyzed(vec![JitInlinePropertyLoad {
             receiver_shape: 7,
             value_byte: 24,
         }]);
         ssa.blocks[0].instrs.remove(1);
         assert_eq!(
-            ssa.verify(&cfg, &DominatorTree::compute(&cfg)),
+            ssa.verify(
+                &cfg,
+                &DominatorTree::compute(&cfg),
+                &ReprMap::compute(&tree, &ssa)
+            ),
             Err(SsaError::LoadFieldWithoutCheckShape { pc: 0 })
         );
     }

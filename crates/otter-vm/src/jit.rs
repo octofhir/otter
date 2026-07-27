@@ -161,11 +161,11 @@ pub struct JitCompileSnapshot {
     /// Property-load sites whose receiver shape and own slot are settled,
     /// keyed by byte-PC. Generated code compares against the shape directly
     /// instead of loading the site's cache cell.
-    pub property_loads: rustc_hash::FxHashMap<u32, JitInlinePropertyLoad>,
+    pub property_loads: rustc_hash::FxHashMap<u32, Vec<JitInlinePropertyLoad>>,
     /// Property-store sites whose receiver shape and own slot are settled,
     /// keyed by byte-PC. A store may not write through a prototype, so a
     /// settled store needs no hop check either.
-    pub property_stores: rustc_hash::FxHashMap<u32, JitInlinePropertyLoad>,
+    pub property_stores: rustc_hash::FxHashMap<u32, Vec<JitInlinePropertyLoad>>,
     /// How the indexed-element program addresses each site's receiver, keyed by
     /// the site's byte-PC. Generated code reads only this; the family's body
     /// layout never reaches the emitter, so a second element-bearing family
@@ -779,8 +779,11 @@ pub struct JitElementAccess {
     pub element: JitElementRepr,
 }
 
-/// One property site whose receiver shape and own slot the compile snapshot
-/// already knows.
+/// One receiver shape a property site resolves, with the own slot it reaches.
+///
+/// A site contributes one of these per installed cache program, so a
+/// monomorphic site is the one-element case of a polymorphic chain rather than
+/// a separate mechanism.
 ///
 /// The runtime cache cell exists because a site's shape can change after the
 /// code is generated. A site the profile has settled on does not need it: the

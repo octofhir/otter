@@ -156,6 +156,24 @@ impl FeedbackDirectory {
             })
     }
 
+    /// Every settled own-slot program installed at a site, in install order.
+    ///
+    /// This is the site's cache as a compile-time declaration: one shape and
+    /// one slot per installed program. Generated code turns it into a guard
+    /// chain and never loads the runtime cell.
+    pub(crate) fn settled_property_slots(
+        &self,
+        site: usize,
+        kind: PropertyIcKind,
+    ) -> Option<Vec<(crate::object::ShapeId, u32, u16)>> {
+        let stubs = self.property_stubs(site, kind)?;
+        let settled: Vec<_> = stubs
+            .iter()
+            .filter_map(crate::cache_ir::CacheStub::settled_own_slot)
+            .collect();
+        (!settled.is_empty() && settled.len() == stubs.len()).then_some(settled)
+    }
+
     /// Lower this load site's cache program to the way generated code runs.
     ///
     /// Whatever the stub's op sequence is — own data, or a guarded hop to the

@@ -676,7 +676,7 @@ pub(super) fn compile(
                     array_length,
                     cell_addr,
                     cell_ordinal,
-                    view.property_loads.get(&instr.byte_pc),
+                    view.property_loads.get(&instr.byte_pc).map(Vec::as_slice),
                     &mut boxed_slot_slow_paths,
                     threw,
                 )?;
@@ -703,7 +703,7 @@ pub(super) fn compile(
                     site,
                     cell_addr,
                     cell_ordinal,
-                    view.property_stores.get(&instr.byte_pc),
+                    view.property_stores.get(&instr.byte_pc).map(Vec::as_slice),
                     threw,
                 )?;
             }

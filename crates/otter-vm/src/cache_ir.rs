@@ -497,6 +497,29 @@ impl CacheStub {
         }
     }
 
+    /// The receiver shape and own slot this program resolves, with no live
+    /// receiver.
+    ///
+    /// A stub whose whole program is an own-data terminal already names both:
+    /// the hit carries the shape handle it was installed under and the slot it
+    /// found. That is exactly what a compile-time guard needs, so a site's
+    /// installed programs lower to the guard chain generated code runs without
+    /// replaying them against an object.
+    ///
+    /// `None` for any program that reaches its slot some other way — a
+    /// prototype hop, a key guard, a transition — which keeps that site on the
+    /// runtime cache cell.
+    #[must_use]
+    pub(crate) fn settled_own_slot(&self) -> Option<(ShapeId, u32, u16)> {
+        let hit = match (self.ops.as_slice(), self.hits.as_slice()) {
+            ([CacheOp::LoadDataSlotResult { obj: 0, hit: 0 }], [hit])
+            | ([CacheOp::StoreDataSlot { obj: 0, hit: 0 }], [hit]) => *hit,
+            _ => return None,
+        };
+        let shape_offset = hit.shape.offset();
+        (shape_offset != 0).then_some((hit.shape_id, shape_offset, hit.slot))
+    }
+
     /// Visit GC roots in stub data — the target shapes of replayed transitions.
     pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
         for transition in &self.transitions {

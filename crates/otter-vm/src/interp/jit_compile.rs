@@ -579,28 +579,28 @@ impl Interpreter {
             } else {
                 crate::property_ic::PropertyIcKind::Store
             };
-            self.publish_property_feedback(site, kind);
-            let Some(crate::feedback::PropertyFeedbackState::MonomorphicOwnData { shape_id, slot }) =
-                self.property_feedback_state(site, kind)
-            else {
+            let Some(slots) = self.feedback_directory.settled_property_slots(site, kind) else {
                 continue;
             };
-            let Some(shape) = self.shape_runtime.handle_for_id(shape_id) else {
-                continue;
-            };
-            let receiver_shape = shape.offset();
-            // An empty shape token never matches a live receiver.
-            if receiver_shape == 0 {
+            // Every installed program must lower, or the chain would silently
+            // drop a shape the site really sees and send it to the transition.
+            let chain: Vec<_> = slots
+                .into_iter()
+                .filter_map(|(shape_id, shape_offset, slot)| {
+                    let live = self.shape_runtime.handle_for_id(shape_id)?;
+                    (live.offset() == shape_offset).then_some(jit::JitInlinePropertyLoad {
+                        receiver_shape: shape_offset,
+                        value_byte: u32::from(slot) * SLOT_BYTES,
+                    })
+                })
+                .collect();
+            if chain.is_empty() {
                 continue;
             }
-            let settled = jit::JitInlinePropertyLoad {
-                receiver_shape,
-                value_byte: u32::from(slot) * SLOT_BYTES,
-            };
             if op == Op::LoadProperty {
-                view.property_loads.insert(byte_pc, settled);
+                view.property_loads.insert(byte_pc, chain);
             } else {
-                view.property_stores.insert(byte_pc, settled);
+                view.property_stores.insert(byte_pc, chain);
             }
         }
     }

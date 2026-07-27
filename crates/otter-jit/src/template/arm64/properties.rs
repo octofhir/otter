@@ -53,7 +53,7 @@ pub(super) fn emit_load_property(
     array_length: bool,
     cell_addr: usize,
     cell_ordinal: u32,
-    settled: Option<&otter_vm::JitInlinePropertyLoad>,
+    settled: Option<&[otter_vm::JitInlinePropertyLoad]>,
     boxed_slot_slow_paths: &mut Vec<BoxedSlotSlowPath>,
     threw: DynamicLabel,
 ) -> Result<(), Unsupported> {
@@ -157,7 +157,7 @@ pub(super) fn emit_store_property(
     site: u64,
     cell_addr: usize,
     cell_ordinal: u32,
-    settled: Option<&otter_vm::JitInlinePropertyLoad>,
+    settled: Option<&[otter_vm::JitInlinePropertyLoad]>,
     threw: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let cage_base = view.cage_base;

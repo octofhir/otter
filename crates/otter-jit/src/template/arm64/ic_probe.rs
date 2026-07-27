@@ -50,9 +50,9 @@ use super::values::{emit_box_int32, emit_load_reg, emit_load_symbol_u64, emit_lo
 use crate::artifact::relocation::{GuardedHeapComponent, RelocationCapture, RelocationTarget};
 use crate::entry::{
     ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
-    ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, IC_WAYS, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG,
-    THREAD_OFFSET, Unsupported, VALUE_HOLE, VALUE_UNDEFINED, VM_THREAD_GC_HEAP_OFFSET,
-    WHISKER_IC_WAY_BYTES,
+    ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, IC_WAYS,
+    NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, THREAD_OFFSET, Unsupported, VALUE_HOLE, VALUE_UNDEFINED,
+    VM_THREAD_GC_HEAP_OFFSET, WHISKER_IC_WAY_BYTES,
 };
 
 /// Match `w14` against the cell's ways, branching to `miss` when none hold.
@@ -399,6 +399,27 @@ pub(crate) fn emit_element_read(ops: &mut Assembler, element: JitElementRepr, mi
             // payload is the low 32 bits and the tag occupies the top.
             dynasm!(ops ; .arch aarch64 ; ldr w9, [x16]);
             emit_box_int32(ops, 9, 11);
+        }
+        JitElementRepr::Float64 => {
+            // The same box `emit_box_double` produces, computed without an FP
+            // register: neither tier reserves an FP scratch here, and the
+            // optimizing tier's are allocated. A double is a NaN exactly when
+            // its sign-cleared bits exceed the all-ones exponent, so the
+            // canonicalization is one masked compare; the encode offset then
+            // moves the bits into the number space.
+            let ready = ops.new_dynamic_label();
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x9, [x16]
+                ; and x11, x9, #0x7fff_ffff_ffff_ffff
+                ; movz x12, 0x7ff0, lsl #48
+                ; cmp x11, x12
+                ; b.ls =>ready
+                ; movz x9, CANONICAL_NAN_HI16, lsl #48
+                ; =>ready
+                ; movz x11, DOUBLE_OFFSET_HI16, lsl #48
+                ; add x9, x9, x11
+            );
         }
     }
 }

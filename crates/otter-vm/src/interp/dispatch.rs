@@ -781,13 +781,16 @@ impl Interpreter {
                         let recv = *recv;
                         let family = if recv.as_array().is_some() {
                             jit::JitElementFamily::Dense
-                        } else if recv
-                            .as_typed_array(&self.gc_heap)
-                            .is_some_and(|t| t.kind() == crate::binary::TypedArrayKind::Int32)
-                        {
-                            jit::JitElementFamily::TypedInt32
                         } else {
-                            jit::JitElementFamily::Generic
+                            match recv.as_typed_array(&self.gc_heap).map(|t| t.kind()) {
+                                Some(crate::binary::TypedArrayKind::Int32) => {
+                                    jit::JitElementFamily::TypedInt32
+                                }
+                                Some(crate::binary::TypedArrayKind::Float64) => {
+                                    jit::JitElementFamily::TypedFloat64
+                                }
+                                _ => jit::JitElementFamily::Generic,
+                            }
                         };
                         feedback.record_element_family(family);
                     }

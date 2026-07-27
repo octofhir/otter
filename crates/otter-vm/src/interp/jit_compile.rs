@@ -571,7 +571,14 @@ impl Interpreter {
                 jit::JitElementFamily::Dense
             };
             let access = match family {
-                jit::JitElementFamily::TypedInt32 => Self::typed_int32_element_access(),
+                jit::JitElementFamily::TypedInt32 => Self::typed_element_access(
+                    crate::binary::TypedArrayKind::Int32,
+                    jit::JitElementRepr::Int32,
+                ),
+                jit::JitElementFamily::TypedFloat64 => Self::typed_element_access(
+                    crate::binary::TypedArrayKind::Float64,
+                    jit::JitElementRepr::Float64,
+                ),
                 jit::JitElementFamily::Dense | jit::JitElementFamily::Unseen => {
                     Self::dense_element_access()
                 }
@@ -605,13 +612,16 @@ impl Interpreter {
         }
     }
 
-    /// An `Int32Array` view's elements are raw scalars in its backing buffer.
-    /// The view's own cached length is a construction-time field that a detach
+    /// A typed view's elements are raw scalars in its backing buffer. The
+    /// view's own cached length is a construction-time field that a detach
     /// leaves untouched, so the buffer's detached flag is guarded on the way
     /// through rather than inferred from the bounds check; a length-tracking
     /// view over a resizable buffer has a stale cached length and leaves the
     /// fast path outright.
-    fn typed_int32_element_access() -> jit::JitElementAccess {
+    fn typed_element_access(
+        kind: crate::binary::TypedArrayKind,
+        element: jit::JitElementRepr,
+    ) -> jit::JitElementAccess {
         use crate::binary::array_buffer as buffer;
         use crate::binary::typed_array as view;
         let header = otter_gc::header::HEADER_SIZE as u32;
@@ -622,7 +632,7 @@ impl Interpreter {
                 Some(jit::JitBodyGuard {
                     byte: header + view::TYPED_ARRAY_BODY_KIND_OFFSET as u32,
                     width: jit::JitGuardWidth::Word32,
-                    expect: crate::binary::TypedArrayKind::Int32 as u32,
+                    expect: kind as u32,
                 }),
                 Some(jit::JitBodyGuard::clear(
                     header + view::TYPED_ARRAY_BODY_LENGTH_TRACKING_OFFSET as u32,
@@ -639,7 +649,7 @@ impl Interpreter {
                 data_ptr_byte: header + buffer::LOCAL_ARRAY_BUFFER_BODY_DATA_OFFSET as u32,
                 view_offset_byte: header + view::TYPED_ARRAY_BODY_BYTE_OFFSET_OFFSET as u32,
             },
-            element: jit::JitElementRepr::Int32,
+            element,
         }
     }
 

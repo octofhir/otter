@@ -1334,7 +1334,6 @@ fn emit(
                     // frame materialize, and no reload — the receiver pointer is
                     // re-derived from its rooted location every access.
                     if view.cage_base != 0 {
-                        let shape_byte = view.object_shape_byte;
                         // `.length` on a dense array or a primitive string is
                         // not an own data slot, so no cache program describes
                         // it and the probe below cannot serve it.
@@ -1357,67 +1356,22 @@ fn emit(
                             emit_store_tagged_location(&mut ops, result_location, 9)?;
                             dynasm!(ops ; .arch aarch64 ; b =>done ; =>not_length);
                         }
-                        emit_load_tagged_location(
+                        ic_probe::emit_property_ic_load(
                             &mut ops,
-                            allocation.location(instruction.inputs[0]),
-                            9,
+                            &mut relocations,
+                            view,
+                            |ops, register| {
+                                emit_load_tagged_location(
+                                    ops,
+                                    allocation.location(instruction.inputs[0]),
+                                    register,
+                                )
+                            },
+                            cell_addr,
+                            cell_ordinal,
+                            &mut boxed_slot_slow_paths,
+                            miss,
                         )?;
-                        emit_cell_test(&mut ops, 9, 11, CellTest::IsNotCell, miss);
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; mov w12, w9              // low-32 Gc offset
-                        );
-                        emit_load_symbolic_u64(
-                            &mut ops,
-                            &mut relocations,
-                            13,
-                            view.cage_base as u64,
-                            RelocationTarget::GcCageBase,
-                        );
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; add x13, x13, x12        // x13 = GcHeader ptr
-                            ; ldrb w14, [x13]
-                            ; cmp w14, OBJECT_BODY_TYPE_TAG
-                            ; b.ne =>miss
-                            ; ldr w14, [x13, shape_byte]
-                            ; cbz w14, =>miss          // empty-cell sentinel
-                        );
-                        emit_load_symbolic_u64(
-                            &mut ops,
-                            &mut relocations,
-                            15,
-                            cell_addr as u64,
-                            RelocationTarget::PropertyIcCell {
-                                access: PropertyIcAccess::Load,
-                                ordinal: cell_ordinal,
-                            },
-                        );
-                        let do_load = ops.new_dynamic_label();
-                        ic_probe::emit_way_walk(&mut ops, do_load, miss);
-                        ic_probe::emit_resolve_holder(&mut ops, &mut relocations, view, miss);
-                        crate::template::arm64::values::emit_slab_base(&mut ops, view, 13, 14);
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; cbz x13, =>miss
-                            ; ldr w9, [x13, x17]
-                        );
-                        let boxed_entry = ops.new_dynamic_label();
-                        let continuation = ops.new_dynamic_label();
-                        boxed_slot_slow_paths.push(
-                            crate::template::arm64::values::BoxedSlotSlowPath {
-                                entry: boxed_entry,
-                                continuation,
-                                miss,
-                            },
-                        );
-                        crate::template::arm64::values::emit_decompress_slot(
-                            &mut ops,
-                            &mut relocations,
-                            view.cage_base as u64,
-                            boxed_entry,
-                        );
-                        dynasm!(ops ; .arch aarch64 ; =>continuation);
                         if let Some(loop_cache_site) = loop_cache_site {
                             let not_number = ops.new_dynamic_label();
                             let cache_number = ops.new_dynamic_label();

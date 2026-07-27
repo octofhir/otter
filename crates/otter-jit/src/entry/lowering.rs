@@ -29,8 +29,16 @@ pub(crate) const MAX_METHOD_ARGS: usize = 4;
 /// a JavaScript error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unsupported {
-    /// An opcode outside the supported subset.
+    /// An opcode with no lowering at all in the selected tier.
     Opcode(Op),
+    /// An opcode whose lowering exists but whose site failed the named
+    /// operand, representation or feedback condition.
+    Constraint {
+        /// The opcode whose lowering rejected the site.
+        op: Op,
+        /// The condition that failed.
+        constraint: &'static str,
+    },
     /// An operand whose kind/shape baseline lowering does not handle.
     OperandShape(&'static str),
     /// A branch whose logical target does not name an instruction boundary.

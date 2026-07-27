@@ -13,6 +13,7 @@
 //!   template tier rather than failing the compile.
 
 use super::*;
+use crate::ir::licm::natural_loop_blocks;
 
 pub(super) fn splice_lowerable(callee: &otter_vm::JitInlineCallee) -> bool {
     callee.instructions.iter().all(|instruction| {
@@ -202,63 +203,6 @@ pub(super) fn fused_method_property_for_frame(
         })
 }
 
-pub(super) fn property_cache_offset(base: u32, slot: u32) -> Result<u32, Unsupported> {
-    slot.checked_mul(STACK_SLOT_BYTES)
-        .and_then(|offset| base.checked_add(offset))
-        .ok_or(Unsupported::OperandShape(
-            "optimizing property loop cache offset overflow",
-        ))
-}
-
-pub(super) fn emit_reset_property_loop_cache(
-    ops: &mut Assembler,
-    cache_base: u32,
-    cache: &PropertyLoopCache,
-) -> Result<(), Unsupported> {
-    dynasm!(ops ; .arch aarch64 ; mov x9, xzr);
-    emit_sp_str_x(ops, 9, property_cache_offset(cache_base, cache.ready_slot)?);
-    emit_load_u64(ops, 9, VALUE_HOLE);
-    for &slot in cache.value_slots.iter() {
-        emit_sp_str_x(ops, 9, property_cache_offset(cache_base, slot)?);
-    }
-    Ok(())
-}
-
-pub(super) fn emit_reset_all_property_loop_caches(
-    ops: &mut Assembler,
-    cache_base: u32,
-    plan: &PropertyLoopCachePlan,
-) -> Result<(), Unsupported> {
-    for cache in plan.loops.values() {
-        emit_reset_property_loop_cache(ops, cache_base, cache)?;
-    }
-    Ok(())
-}
-
-/// Finish a training iteration. The loop is versioned only if every property
-/// site stored a Number from its fast own-data path during this same iteration.
-pub(super) fn emit_finish_property_loop_iteration(
-    ops: &mut Assembler,
-    cache_base: u32,
-    cache: &PropertyLoopCache,
-) -> Result<(), Unsupported> {
-    let done = ops.new_dynamic_label();
-    let incomplete = ops.new_dynamic_label();
-    emit_sp_ldr_x(ops, 9, property_cache_offset(cache_base, cache.ready_slot)?);
-    dynasm!(ops ; .arch aarch64 ; cbnz x9, =>done);
-    emit_load_u64(ops, 10, VALUE_HOLE);
-    for &slot in cache.value_slots.iter() {
-        emit_sp_ldr_x(ops, 9, property_cache_offset(cache_base, slot)?);
-        dynasm!(ops ; .arch aarch64 ; cmp x9, x10 ; b.eq =>incomplete);
-    }
-    dynasm!(ops ; .arch aarch64 ; movz x9, #1);
-    emit_sp_str_x(ops, 9, property_cache_offset(cache_base, cache.ready_slot)?);
-    dynasm!(ops ; .arch aarch64 ; b =>done ; =>incomplete);
-    emit_reset_property_loop_cache(ops, cache_base, cache)?;
-    dynasm!(ops ; .arch aarch64 ; =>done);
-    Ok(())
-}
-
 pub(super) fn guard_cache_safe_instruction(
     tree: &InlineTree,
     cfg: &ControlFlowGraph,
@@ -420,6 +364,7 @@ pub(super) fn check_eligibility(
     cfg: &ControlFlowGraph,
     dom: &DominatorTree,
     ssa: &SsaFunction,
+    hoisted_loop_headers: &BTreeSet<BlockId>,
     analyses: EligibilityAnalyses<'_>,
 ) -> Result<Eligibility, Unsupported> {
     let EligibilityAnalyses {
@@ -1247,13 +1192,9 @@ pub(super) fn check_eligibility(
         frame_states,
         element_transition_instructions,
     )?;
-    let osr_entries = build_osr_entry_sites(cfg, ssa, liveness, frame_states)?;
+    let osr_entries =
+        build_osr_entry_sites(cfg, ssa, liveness, frame_states, hoisted_loop_headers)?;
     let cached_method_guard = cached_method_guard_site(tree, cfg, ssa, &back_edges);
-    let property_loop_cache = analyze_property_loop_caches(
-        cfg,
-        ssa,
-        &back_edges.keys().copied().collect::<BTreeSet<_>>(),
-    );
     Ok(Eligibility {
         guarded_uses: guarded_numeric_uses,
         back_edges,
@@ -1261,7 +1202,6 @@ pub(super) fn check_eligibility(
         element_transitions,
         insufficient_feedback,
         cached_method_guard,
-        property_loop_cache,
     })
 }
 
@@ -1270,6 +1210,7 @@ pub(super) fn build_osr_entry_sites(
     ssa: &SsaFunction,
     liveness: &Liveness,
     frame_states: &FrameStateTable,
+    hoisted_loop_headers: &BTreeSet<BlockId>,
 ) -> Result<BTreeMap<BlockId, OsrEntrySite>, Unsupported> {
     let mut sites = BTreeMap::new();
     // Only the root frame's headers are OSR targets: the interpreter requests
@@ -1280,6 +1221,9 @@ pub(super) fn build_osr_entry_sites(
         .blocks
         .iter()
         .filter(|block| block.is_loop_header && block.inline == InlineId::ROOT)
+        // Entering a hoisted loop here would skip the pre-header that computes
+        // what its body reads.
+        .filter(|block| !hoisted_loop_headers.contains(&block.id))
     {
         let frame_state =
             frame_states

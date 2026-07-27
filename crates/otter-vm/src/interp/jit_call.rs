@@ -268,9 +268,13 @@ impl Interpreter {
                 .jit_runtime_stats
                 .optimized_osr_entries
                 .saturating_add(1);
-            if matches!(outcome, jit::JitExecOutcome::Bailed(_)) {
+            if let jit::JitExecOutcome::Bailed(resume_pc) = outcome {
                 self.jit_runtime_stats.optimized_deopts =
                     self.jit_runtime_stats.optimized_deopts.saturating_add(1);
+                self.jit_optimized_bail_pcs
+                    .entry(fid)
+                    .or_default()
+                    .insert(resume_pc);
             }
             (outcome, true)
         } else {
@@ -610,9 +614,13 @@ impl Interpreter {
             self.jit_runtime_stats.optimized_entries.saturating_add(1);
         let activation = VmRuntimeActivation::new(self, stack, context, top_idx);
         let outcome = code.run_optimized_entry(activation)?;
-        if matches!(outcome, jit::JitExecOutcome::Bailed(_)) {
+        if let jit::JitExecOutcome::Bailed(resume_pc) = outcome {
             self.jit_runtime_stats.optimized_deopts =
                 self.jit_runtime_stats.optimized_deopts.saturating_add(1);
+            self.jit_optimized_bail_pcs
+                .entry(fid)
+                .or_default()
+                .insert(resume_pc);
         }
         Some(outcome)
     }

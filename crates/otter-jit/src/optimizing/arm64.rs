@@ -110,9 +110,6 @@ use crate::template::arm64::ic_probe;
 use super::{
     OptimizedCode, OptimizedMetadata,
     artifact::render_optimized_unit,
-    loop_versioning::{
-        PropertyLoopCache, PropertyLoopCachePlan, analyze_property_loop_caches, natural_loop_blocks,
-    },
     pipeline::{
         OptimizationError, OptimizationPipeline, total_spill_slots as analyzed_spill_slot_count,
     },
@@ -209,9 +206,6 @@ struct Eligibility {
     /// receiver body is cached after the first exact identity check in each
     /// native entry/OSR activation.
     cached_method_guard: Option<(InlineId, u32)>,
-    /// Loop-versioned own-data Number loads. A loop becomes cache-active only
-    /// after every listed site completed one fast IC hit in the same iteration.
-    property_loop_cache: PropertyLoopCachePlan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,6 +353,7 @@ pub(super) fn compile_with_artifacts(
         &unit.cfg,
         &unit.dom,
         &unit.ssa,
+        &unit.hoisted_loop_headers,
         EligibilityAnalyses {
             liveness: &unit.liveness,
             reprs: &unit.reprs,
@@ -580,46 +575,6 @@ fn header_register(allocation: &Allocation, header: ValueId) -> Result<Option<u8
     }
 }
 
-/// Replay a cache-active loop's recorded value for the site `instruction`
-/// belongs to, returning the label the rest of the site branches past.
-///
-/// The replay anchors at the first node of a site's group: the holder
-/// derivation when the site has one, the field read when a preceding site
-/// already derived that holder. Either way an armed loop stores the recorded
-/// value and skips everything the site would otherwise run.
-fn emit_property_loop_cache_replay(
-    ops: &mut Assembler,
-    eligibility: &Eligibility,
-    property_cache_base: u32,
-    instruction: &SsaInstr,
-    field_location: Location,
-) -> Result<Option<DynamicLabel>, Unsupported> {
-    let Some(site) = eligibility
-        .property_loop_cache
-        .sites
-        .get(&(instruction.inline, instruction.pc))
-    else {
-        return Ok(None);
-    };
-    let loop_cache = &eligibility.property_loop_cache.loops[&site.header];
-    emit_sp_ldr_x(
-        ops,
-        9,
-        property_cache_offset(property_cache_base, loop_cache.ready_slot)?,
-    );
-    let not_ready = ops.new_dynamic_label();
-    dynasm!(ops ; .arch aarch64 ; cbz x9, =>not_ready);
-    emit_sp_ldr_x(
-        ops,
-        9,
-        property_cache_offset(property_cache_base, site.value_slot)?,
-    );
-    emit_store_tagged_location(ops, field_location, 9)?;
-    let done = ops.new_dynamic_label();
-    dynasm!(ops ; .arch aarch64 ; b =>done ; =>not_ready);
-    Ok(Some(done))
-}
-
 /// The register a node may read a holder address from, filling
 /// [`HEADER_SCRATCH`] first when the allocator spilled it.
 fn materialized_header(
@@ -693,21 +648,10 @@ fn emit(
     } else {
         allocated_spill_bytes
     };
-    let property_cache_base = after_fused_slots;
-    let property_cache_bytes = eligibility
-        .property_loop_cache
-        .slot_count
-        .checked_mul(STACK_SLOT_BYTES)
-        .ok_or(Unsupported::OperandShape(
-            "optimizing property loop cache frame overflow",
-        ))?;
-    let spill_frame_bytes = property_cache_base
-        .checked_add(property_cache_bytes)
-        .and_then(|bytes| bytes.checked_add(15))
+    let spill_frame_bytes = after_fused_slots
+        .checked_add(15)
         .map(|bytes| bytes & !15)
-        .ok_or(Unsupported::OperandShape(
-            "optimizing property loop cache frame overflow",
-        ))?;
+        .ok_or(Unsupported::OperandShape("optimizing spill frame overflow"))?;
     if spill_frame_bytes > MAX_SPILL_FRAME_BYTES {
         return Err(Unsupported::OperandShape(
             "optimizing property loop cache frame exceeds arm64 immediates",
@@ -808,11 +752,6 @@ fn emit(
         let receiver_slot = fused_method_receiver_slot.expect("cached guard reserves a slot");
         emit_sp_str_x(&mut ops, 9, receiver_slot);
     }
-    emit_reset_all_property_loop_caches(
-        &mut ops,
-        property_cache_base,
-        &eligibility.property_loop_cache,
-    )?;
     if !eligibility.back_edges.is_empty() {
         dynasm!(ops ; .arch aarch64 ; movz w29, OPTIMIZED_POLL_BATCH);
     }
@@ -885,7 +824,6 @@ fn emit(
         let block_instructions = &ssa.blocks[block_id.0 as usize].instrs;
         // A lowered site's loop-cache fast path is opened by its shape check
         // and closed by the field read that follows it.
-        let mut property_cache_done: Option<DynamicLabel> = None;
         for (instruction_index, instruction) in block_instructions.iter().enumerate() {
             let instruction_start = ops.offset().0;
             if eligibility
@@ -945,37 +883,6 @@ fn emit(
                     let header = instruction
                         .result
                         .expect("eligibility checked the holder address");
-                    // A loop whose body cannot mutate the heap reads this site
-                    // once and replays the value, skipping the whole access. A
-                    // write is never such a site, so it never looks for a read
-                    // to replay into.
-                    property_cache_done = if eligibility
-                        .property_loop_cache
-                        .sites
-                        .contains_key(&(instruction.inline, instruction.pc))
-                    {
-                        let field_location = allocation.location(
-                            block_instructions[instruction_index..]
-                                .iter()
-                                .find(|candidate| {
-                                    matches!(candidate.op, SsaOp::LoadField { .. })
-                                        && candidate.pc == instruction.pc
-                                })
-                                .and_then(|field| field.result)
-                                .ok_or(Unsupported::OperandShape(
-                                    "optimizing holder address has no field read",
-                                ))?,
-                        );
-                        emit_property_loop_cache_replay(
-                            &mut ops,
-                            eligibility,
-                            property_cache_base,
-                            instruction,
-                            field_location,
-                        )?
-                    } else {
-                        None
-                    };
                     let deopt = ops.new_dynamic_label();
                     deopt_exits.push((
                         deopt,
@@ -1024,19 +931,6 @@ fn emit(
                             .result
                             .expect("eligibility checked field-load result"),
                     );
-                    // An access whose holder a preceding site already derived
-                    // has no holder node of its own, so the replay anchors here
-                    // instead. Every read in a cache-active loop is a site, so
-                    // an armed loop still skips all of them.
-                    if property_cache_done.is_none() {
-                        property_cache_done = emit_property_loop_cache_replay(
-                            &mut ops,
-                            eligibility,
-                            property_cache_base,
-                            instruction,
-                            result_location,
-                        )?;
-                    }
                     let deopt = ops.new_dynamic_label();
                     deopt_exits.push((
                         deopt,
@@ -1053,37 +947,7 @@ fn emit(
                         &mut boxed_slot_slow_paths,
                         deopt,
                     );
-                    if let Some(loop_cache_site) = eligibility
-                        .property_loop_cache
-                        .sites
-                        .get(&(instruction.inline, instruction.pc))
-                    {
-                        // Only a number is replayable from a raw slot: any
-                        // other value leaves the slot unfilled, and the loop
-                        // never arms.
-                        let not_number = ops.new_dynamic_label();
-                        let cache_number = ops.new_dynamic_label();
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; movz x15, NUMBER_TAG_HI16, lsl #48
-                            ; and x14, x9, x15
-                            ; cmp x14, x15
-                            ; b.eq =>cache_number
-                            ; tst x9, x15
-                            ; b.eq =>not_number
-                            ; =>cache_number
-                        );
-                        emit_sp_str_x(
-                            &mut ops,
-                            9,
-                            property_cache_offset(property_cache_base, loop_cache_site.value_slot)?,
-                        );
-                        dynasm!(ops ; .arch aarch64 ; =>not_number);
-                    }
                     emit_store_tagged_location(&mut ops, result_location, 9)?;
-                    if let Some(done) = property_cache_done.take() {
-                        dynasm!(ops ; .arch aarch64 ; =>done);
-                    }
                 }
                 // The slot exists and keeps its class, so the write is one
                 // compressed store with no barrier and no allocation. A value
@@ -1122,6 +986,19 @@ fn emit(
                         }
                     }
                     ic_probe::emit_store_field(&mut ops, view, header, byte, deopt);
+                }
+                // The access itself runs where it was hoisted to; here the
+                // value only has to reach the register this site writes.
+                SsaOp::Reuse => {
+                    let result = instruction
+                        .result
+                        .expect("eligibility checked the rebound result");
+                    emit_load_tagged_location(
+                        &mut ops,
+                        allocation.location(instruction.inputs[0]),
+                        9,
+                    )?;
+                    emit_store_tagged_location(&mut ops, allocation.location(result), 9)?;
                 }
                 SsaOp::Bytecode(op) => match op {
                     Op::LoadInt32 => {
@@ -1574,32 +1451,6 @@ fn emit(
                         debug_assert_eq!(site.safepoint_id, site.frame_map.id);
                         let miss = ops.new_dynamic_label();
                         let done = ops.new_dynamic_label();
-                        let loop_cache_site = eligibility
-                            .property_loop_cache
-                            .sites
-                            .get(&(instruction.inline, instruction.pc));
-                        if let Some(loop_cache_site) = loop_cache_site {
-                            let loop_cache =
-                                &eligibility.property_loop_cache.loops[&loop_cache_site.header];
-                            emit_sp_ldr_x(
-                                &mut ops,
-                                9,
-                                property_cache_offset(property_cache_base, loop_cache.ready_slot)?,
-                            );
-                            let not_ready = ops.new_dynamic_label();
-                            dynasm!(ops ; .arch aarch64 ; cbz x9, =>not_ready);
-                            emit_sp_ldr_x(
-                                &mut ops,
-                                9,
-                                property_cache_offset(
-                                    property_cache_base,
-                                    loop_cache_site.value_slot,
-                                )?,
-                            );
-                            emit_store_tagged_location(&mut ops, result_location, 9)?;
-                            dynasm!(ops ; .arch aarch64 ; b =>done ; =>not_ready);
-                        }
-
                         // Inline own-data probe through the self-patching cell:
                         // guard cell tag, body tag, and shape, then read the value
                         // slab slot straight into the destination. The sequence
@@ -1654,29 +1505,6 @@ fn emit(
                                 &mut boxed_slot_slow_paths,
                                 miss,
                             )?;
-                            if let Some(loop_cache_site) = loop_cache_site {
-                                let not_number = ops.new_dynamic_label();
-                                let cache_number = ops.new_dynamic_label();
-                                dynasm!(ops
-                                    ; .arch aarch64
-                                    ; movz x15, NUMBER_TAG_HI16, lsl #48
-                                    ; and x14, x9, x15
-                                    ; cmp x14, x15
-                                    ; b.eq =>cache_number
-                                    ; tst x9, x15
-                                    ; b.eq =>not_number
-                                    ; =>cache_number
-                                );
-                                emit_sp_str_x(
-                                    &mut ops,
-                                    9,
-                                    property_cache_offset(
-                                        property_cache_base,
-                                        loop_cache_site.value_slot,
-                                    )?,
-                                );
-                                dynasm!(ops ; .arch aarch64 ; =>not_number);
-                            }
                             emit_store_tagged_location(&mut ops, result_location, 9)?;
                             dynasm!(ops ; .arch aarch64 ; b =>done);
                         }
@@ -1684,13 +1512,6 @@ fn emit(
                         // Miss: the window transition resolves full `[[Get]]`
                         // semantics and self-patches this site's cell.
                         dynasm!(ops ; .arch aarch64 ; =>miss);
-                        if let Some(loop_cache_site) = loop_cache_site {
-                            emit_reset_property_loop_cache(
-                                &mut ops,
-                                property_cache_base,
-                                &eligibility.property_loop_cache.loops[&loop_cache_site.header],
-                            )?;
-                        }
                         emit_materialize_element_transition(
                             &mut ops,
                             reprs,
@@ -3114,7 +2935,6 @@ fn emit(
                             &mut relocations,
                             allocation,
                             eligibility,
-                            property_cache_base,
                             poll_entry,
                             threw,
                             &block_labels,
@@ -3179,7 +2999,6 @@ fn emit(
                                 &mut relocations,
                                 allocation,
                                 eligibility,
-                                property_cache_base,
                                 poll_entry,
                                 threw,
                                 &block_labels,
@@ -3197,7 +3016,6 @@ fn emit(
                                 &mut relocations,
                                 allocation,
                                 eligibility,
-                                property_cache_base,
                                 poll_entry,
                                 threw,
                                 &block_labels,
@@ -3239,7 +3057,6 @@ fn emit(
                                 &mut relocations,
                                 allocation,
                                 eligibility,
-                                property_cache_base,
                                 poll_entry,
                                 threw,
                                 &block_labels,
@@ -3253,7 +3070,6 @@ fn emit(
                                 &mut relocations,
                                 allocation,
                                 eligibility,
-                                property_cache_base,
                                 poll_entry,
                                 threw,
                                 &block_labels,
@@ -3631,7 +3447,6 @@ fn emit(
                 &mut relocations,
                 allocation,
                 eligibility,
-                property_cache_base,
                 poll_entry,
                 threw,
                 &block_labels,
@@ -3767,11 +3582,6 @@ fn emit(
             let receiver_slot = fused_method_receiver_slot.expect("cached guard reserves a slot");
             emit_sp_str_x(&mut ops, 9, receiver_slot);
         }
-        emit_reset_all_property_loop_caches(
-            &mut ops,
-            property_cache_base,
-            &eligibility.property_loop_cache,
-        )?;
         if !eligibility.back_edges.is_empty() {
             dynasm!(ops ; .arch aarch64 ; movz w29, OPTIMIZED_POLL_BATCH);
         }

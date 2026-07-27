@@ -39,6 +39,7 @@ use crate::{
         dom::{DomError, DominatorTree},
         frame_state::{FrameStateError, FrameStateTable},
         inline::{InlineError, InlineTree},
+        licm::hoist_loop_invariant_accesses,
         liveness::{Liveness, LivenessError},
         lower::lower_settled_property_accesses,
         regalloc::{Allocation, Location, RegClass, RegallocError, RegisterBudget},
@@ -140,6 +141,10 @@ impl OptimizationPipeline {
         // renumbered graph.
         let value_reprs = ReprMap::compute(&tree, &ssa);
         lower_settled_property_accesses(&mut ssa, &cfg, view, &tree, &value_reprs);
+        // A settled access on a receiver its loop cannot change belongs before
+        // the loop, not in it.
+        let hoisted_loop_headers =
+            hoist_loop_invariant_accesses(&mut ssa, &cfg, &dom, &view.optimized_bail_pcs);
 
         let reprs = ReprMap::compute(&tree, &ssa);
         reprs
@@ -190,6 +195,7 @@ impl OptimizationPipeline {
             allocation,
             frame_states,
             deopt,
+            hoisted_loop_headers,
             linear_scan_spill_slot_count,
             spill_slot_count,
         })

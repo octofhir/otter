@@ -20,7 +20,6 @@ pub(super) fn emit_cfg_edge(
     relocations: &mut RelocationCapture,
     allocation: &Allocation,
     eligibility: &Eligibility,
-    property_cache_base: u32,
     poll_entry: ResolvedRuntimeEntry,
     threw: DynamicLabel,
     block_labels: &[DynamicLabel],
@@ -33,13 +32,6 @@ pub(super) fn emit_cfg_edge(
         edge_moves(allocation, predecessor, target)?,
     )?;
     let is_back_edge = eligibility.back_edges.contains_key(&(predecessor, target));
-    if let Some(cache) = eligibility.property_loop_cache.loops.get(&target) {
-        if is_back_edge {
-            emit_finish_property_loop_iteration(ops, property_cache_base, cache)?;
-        } else {
-            emit_reset_property_loop_cache(ops, property_cache_base, cache)?;
-        }
-    }
     if is_back_edge {
         emit_backedge_poll(ops, relocations, poll_entry, threw);
     }

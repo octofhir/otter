@@ -24,12 +24,11 @@ use otter_bytecode::Op;
 use otter_vm::{JitCompileSnapshot, native_abi as abi};
 
 use super::values::{
-    emit_box_int32, emit_load_reg, emit_load_runtime_stub, emit_load_u64, emit_store_reg,
+    CellTest, emit_box_int32, emit_cell_test, emit_load_reg, emit_load_runtime_stub, emit_load_u64,
+    emit_store_reg,
 };
 use crate::artifact::relocation::RelocationCapture;
-use crate::entry::{
-    NUMBER_TAG_HI16, STATUS_BAILED, STATUS_THREW, Unsupported, VALUE_FALSE, VALUE_TRUE,
-};
+use crate::entry::{STATUS_BAILED, STATUS_THREW, Unsupported, VALUE_FALSE, VALUE_TRUE};
 
 /// Decompress one heap-cell value into `x13`.
 ///
@@ -44,10 +43,10 @@ fn emit_cell_header(
     dynasm!(ops
         ; .arch aarch64
         ; cbz x9, =>non_cell
-        ; movz x11, NUMBER_TAG_HI16, lsl #48
-        ; orr x11, x11, #0x2       // NOT_CELL_MASK
-        ; tst x9, x11
-        ; b.ne =>non_cell
+    );
+    emit_cell_test(ops, 9, 11, CellTest::IsNotCell, non_cell);
+    dynasm!(ops
+        ; .arch aarch64
         ; mov x13, x9              // Value stores the full GcHeader pointer
     );
     Ok(())

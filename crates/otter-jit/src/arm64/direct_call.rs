@@ -32,6 +32,7 @@
 //! - `otter-vm/src/native_abi/code_entry.rs` — stable generation leases.
 //! - `otter-vm/src/native_abi/frame.rs` — stack-register root ownership.
 
+use crate::template::arm64::values::{CellTest, emit_cell_test};
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::{
     JitCompileSnapshot, JitDirectCallThisMode, JitDirectCallee, closure::JS_CLOSURE_BODY_TYPE_TAG,
@@ -327,7 +328,6 @@ pub(crate) fn emit_direct_call(
     let (layout, direct_call) = layout_and_artifact(view, site)?;
 
     let direct_function = ops.new_dynamic_label();
-    let closure = ops.new_dynamic_label();
     let callable_ready = ops.new_dynamic_label();
     let generation_ready = ops.new_dynamic_label();
     let uncommitted_rejected = ops.new_dynamic_label();
@@ -392,13 +392,9 @@ pub(crate) fn emit_direct_call(
                 ; b.eq =>direct_function
                 ; cbz x9, =>bail
             );
-            emit_load_u64(ops, 10, value_tag::NOT_CELL_MASK);
+            emit_cell_test(ops, 9, 10, CellTest::IsNotCell, bail);
             dynasm!(ops
                 ; .arch aarch64
-                ; tst x9, x10
-                ; b.eq =>closure
-                ; b =>bail
-                ; =>closure
                 ; ldrb w10, [x9]
                 ; cmp w10, JS_CLOSURE_BODY_TYPE_TAG as u32
                 ; b.ne =>bail

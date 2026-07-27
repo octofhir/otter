@@ -46,7 +46,9 @@ use otter_vm::runtime_stubs::{
     mutating_leaf_stub2_by_id,
 };
 
-use super::values::{emit_box_int32, emit_load_reg, emit_load_symbol_u64, emit_load_u64};
+use super::values::{
+    CellTest, emit_box_int32, emit_cell_test, emit_load_reg, emit_load_symbol_u64, emit_load_u64,
+};
 use crate::artifact::relocation::{GuardedHeapComponent, RelocationCapture, RelocationTarget};
 use crate::entry::{
     ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
@@ -150,14 +152,8 @@ pub(crate) fn emit_exotic_length_fast(
     let string_len_byte = view.string_layout.string_len_byte;
     let try_string = ops.new_dynamic_label();
 
-    dynasm!(ops
-        ; .arch aarch64
-        ; movz x11, NUMBER_TAG_HI16, lsl #48
-        ; orr x11, x11, #0x2       // NOT_CELL_MASK
-        ; tst x9, x11
-        ; b.ne =>not_length
-        ; mov w12, w9              // low-32 Gc offset
-    );
+    emit_cell_test(ops, 9, 11, CellTest::IsNotCell, not_length);
+    dynasm!(ops ; .arch aarch64 ; mov w12, w9); // low-32 Gc offset
     emit_load_symbol_u64(
         ops,
         relocations,
@@ -247,14 +243,8 @@ where
     I: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
 {
     load_receiver(ops, 9)?;
-    dynasm!(ops
-        ; .arch aarch64
-        ; movz x11, NUMBER_TAG_HI16, lsl #48
-        ; orr x11, x11, #0x2       // NOT_CELL_MASK
-        ; tst x9, x11
-        ; b.ne =>miss
-        ; mov w12, w9              // low-32 Gc offset
-    );
+    emit_cell_test(ops, 9, 11, CellTest::IsNotCell, miss);
+    dynasm!(ops ; .arch aarch64 ; mov w12, w9); // low-32 Gc offset
     emit_load_symbol_u64(
         ops,
         relocations,
@@ -422,14 +412,9 @@ pub(crate) fn emit_element_read(ops: &mut Assembler, element: JitElementRepr, mi
 pub(crate) fn emit_element_write(ops: &mut Assembler, element: JitElementRepr, miss: DynamicLabel) {
     match element {
         JitElementRepr::Boxed => {
-            dynasm!(ops
-                ; .arch aarch64
-                ; movz x11, NUMBER_TAG_HI16, lsl #48
-                ; orr x11, x11, #0x2       // NOT_CELL_MASK
-                ; tst x9, x11
-                ; b.eq =>miss              // heap cell: the stub owns the barrier
-                ; str x9, [x16]
-            );
+            // A heap cell would owe the generational barrier only the stub runs.
+            emit_cell_test(ops, 9, 11, CellTest::IsCell, miss);
+            dynasm!(ops ; .arch aarch64 ; str x9, [x16]);
         }
         JitElementRepr::Int32 => {
             // Only a value already boxed as an int32 stores exactly. A double
@@ -539,12 +524,9 @@ where
     );
 
     let native_type_tag = u32::from(view.collection_layout.native_function_type_tag);
+    emit_cell_test(ops, callee_x, 12, CellTest::IsNotCell, bail);
     dynasm!(ops
         ; .arch aarch64
-        ; movz x12, NUMBER_TAG_HI16, lsl #48
-        ; orr x12, x12, #0x2       // NOT_CELL_MASK
-        ; tst X(callee_x), x12
-        ; b.ne =>bail
         ; cbz X(callee_x), =>bail
         ; ldrb w14, [X(callee_x)]
         ; cmp w14, native_type_tag
@@ -839,14 +821,8 @@ pub(crate) fn emit_receiver_type_guard(
     miss: DynamicLabel,
 ) -> Result<(), Unsupported> {
     emit_load_reg(ops, 9, receiver)?;
-    dynasm!(ops
-        ; .arch aarch64
-        ; movz x11, NUMBER_TAG_HI16, lsl #48
-        ; orr x11, x11, #0x2       // NOT_CELL_MASK
-        ; tst x9, x11
-        ; b.ne =>miss
-        ; mov w12, w9
-    );
+    emit_cell_test(ops, 9, 11, CellTest::IsNotCell, miss);
+    dynasm!(ops ; .arch aarch64 ; mov w12, w9);
     emit_load_symbol_u64(
         ops,
         relocations,

@@ -5,11 +5,15 @@
 //!   optimizing tier through a hot back-edge.
 //! - An int32 loop that overflows after optimized OSR and resumes from its
 //!   reconstructed interpreter frame.
+//! - A once-called loop reading one invariant property, whose access the
+//!   optimizing tier moves into a pre-header the OSR entry never reaches.
 //!
 //! # Invariants
 //! - Tiered and interpreter-only runs execute identical source.
 //! - The tiered run records an optimizing OSR entry, not merely template OSR.
 //! - A post-OSR deopt preserves all loop-carried values needed for completion.
+//! - A loop whose invariant access was hoisted still has an OSR entry, which
+//!   performs that access itself before entering the loop.
 
 use otter_runtime::{JitSelection, Runtime, RuntimeExecutionStats, SourceInput};
 
@@ -47,6 +51,20 @@ const POST_OSR_DEOPT: &str = r#"
     String(onceOverflow(20));
 "#;
 
+const HOISTED_INVARIANT_READ: &str = r#"
+    function OsrHolder(value) { this.slot = value; }
+    const osrHolder = new OsrHolder(7);
+
+    function onceInvariantRead(holder, limit) {
+      let total = 0;
+      for (let index = 0; index < limit; index = index + 1) {
+        total = total + holder.slot;
+      }
+      return total;
+    }
+    String(onceInvariantRead(osrHolder, 4096));
+"#;
+
 fn run(source: &str, selection: JitSelection, url: &str) -> (String, RuntimeExecutionStats) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
@@ -79,6 +97,27 @@ fn once_called_float_array_loop_enters_optimized_osr() {
     assert!(
         stats.jit_optimized_osr_entries >= 1,
         "once-called loop must enter the optimizing tier through OSR: {stats:?}"
+    );
+}
+
+#[test]
+fn osr_entry_performs_the_pre_header_access_a_hoisted_loop_reads() {
+    let (oracle, _) = run(
+        HOISTED_INVARIANT_READ,
+        JitSelection::InterpreterOnly,
+        "optimizing-osr-hoist-oracle.js",
+    );
+    let (tiered, stats) = run(
+        HOISTED_INVARIANT_READ,
+        JitSelection::ProductionTiered,
+        "optimizing-osr-hoist-tiered.js",
+    );
+
+    assert_eq!(tiered, oracle);
+    assert_eq!(oracle, "28672");
+    assert!(
+        stats.jit_optimized_osr_entries >= 1,
+        "a hoisted loop keeps its OSR entry: {stats:?}"
     );
 }
 

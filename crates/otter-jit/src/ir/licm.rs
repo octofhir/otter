@@ -8,6 +8,7 @@
 //!
 //! # Contents
 //! - [`hoist_loop_invariant_accesses`] — the pass.
+//! - [`HoistedGroup`] — where a loop's moved access run ended up.
 //! - [`natural_loop_blocks`] — deterministic natural-loop membership.
 //!
 //! # Invariants
@@ -22,8 +23,10 @@
 //! - The holder derivation is re-pointed at the receiver's copy origin, which
 //!   is defined outside the loop; the value it named inside the loop does not
 //!   dominate the pre-header.
-//! - Entering a hoisted loop by OSR would skip the pre-header that computes the
-//!   values it reads, so the unit offers no OSR entry into a loop it hoisted.
+//! - The moved run is contiguous and its position is reported, because an OSR
+//!   entry into the loop skips the pre-header and has to run that run itself.
+//!   A later loop always inserts after an earlier one, so a reported position
+//!   stays valid for the rest of the pass.
 //! - A loop body never post-dominates its pre-header, so a hoisted guard runs
 //!   on paths that would not have reached it. That is speculation. The VM
 //!   records the PCs a function's optimized code deoptimized at, and a group
@@ -35,7 +38,7 @@
 //! - [`super::lower`] — the lowering whose groups this moves.
 //! - [`super::ssa::SsaFunction::copy_origin`] — the invariance question.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use otter_bytecode::Op;
 
@@ -64,18 +67,31 @@ pub fn natural_loop_blocks(
     blocks
 }
 
+/// The run of instructions one loop moved into its pre-header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoistedGroup {
+    /// Block the run now lives in.
+    pub preheader: BlockId,
+    /// Index of the run's first instruction in that block.
+    pub start: usize,
+    /// Number of instructions in the run.
+    pub len: usize,
+}
+
 /// Move every loop-invariant settled access into its loop's pre-header.
 ///
 /// `bail_pcs` are the PCs an earlier generation of this function deoptimized
 /// at. A group placed at one of them already failed this speculation once, and
 /// its loop is left alone.
+///
+/// The result maps each loop header to the run its pre-header gained.
 pub fn hoist_loop_invariant_accesses(
     ssa: &mut SsaFunction,
     cfg: &ControlFlowGraph,
     dom: &DominatorTree,
     bail_pcs: &BTreeSet<u32>,
-) -> BTreeSet<BlockId> {
-    let mut hoisted = BTreeSet::new();
+) -> BTreeMap<BlockId, HoistedGroup> {
+    let mut hoisted = BTreeMap::new();
     for (latch, header) in back_edges(cfg, dom) {
         let Some(plan) = plan_loop(ssa, cfg, dom, latch, header) else {
             continue;
@@ -83,8 +99,15 @@ pub fn hoist_loop_invariant_accesses(
         if bail_pcs.contains(&plan.insert_pc) {
             continue;
         }
-        if hoist(ssa, &plan) {
-            hoisted.insert(header);
+        if let Some(len) = hoist(ssa, &plan) {
+            hoisted.insert(
+                header,
+                HoistedGroup {
+                    preheader: plan.preheader,
+                    start: plan.insert_at,
+                    len,
+                },
+            );
         }
     }
     if !hoisted.is_empty() {
@@ -416,7 +439,7 @@ fn append_rebound_value(ssa: &mut SsaFunction, read: &SsaInstr, block: BlockId) 
 /// Each read leaves a rebind behind at its own PC, so the block keeps every
 /// source instruction it had and the register the interpreter would have
 /// written still gets written there.
-fn hoist(ssa: &mut SsaFunction, plan: &LoopPlan) -> bool {
+fn hoist(ssa: &mut SsaFunction, plan: &LoopPlan) -> Option<usize> {
     let mut moved: Vec<SsaInstr> = Vec::new();
     let mut rebound_values: Vec<(ValueId, ValueId)> = Vec::new();
     for holder in &plan.holders {
@@ -454,7 +477,7 @@ fn hoist(ssa: &mut SsaFunction, plan: &LoopPlan) -> bool {
         }
     }
     if moved.is_empty() {
-        return false;
+        return None;
     }
     // Everything in the loop now reads the rebind rather than the value that
     // left, so a frame state naming the register agrees with the operand.
@@ -531,10 +554,11 @@ fn hoist(ssa: &mut SsaFunction, plan: &LoopPlan) -> bool {
             }
         }
     }
+    let moved_count = moved.len();
     ssa.blocks[plan.preheader.0 as usize]
         .instrs
         .splice(plan.insert_at..plan.insert_at, moved);
-    true
+    Some(moved_count)
 }
 
 #[cfg(test)]

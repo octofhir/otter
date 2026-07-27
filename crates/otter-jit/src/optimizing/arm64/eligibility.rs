@@ -364,7 +364,7 @@ pub(super) fn check_eligibility(
     cfg: &ControlFlowGraph,
     dom: &DominatorTree,
     ssa: &SsaFunction,
-    hoisted_loop_headers: &BTreeSet<BlockId>,
+    hoisted_loops: &BTreeMap<BlockId, HoistedGroup>,
     analyses: EligibilityAnalyses<'_>,
 ) -> Result<Eligibility, Unsupported> {
     let EligibilityAnalyses {
@@ -1192,8 +1192,7 @@ pub(super) fn check_eligibility(
         frame_states,
         element_transition_instructions,
     )?;
-    let osr_entries =
-        build_osr_entry_sites(cfg, ssa, liveness, frame_states, hoisted_loop_headers)?;
+    let osr_entries = build_osr_entry_sites(cfg, ssa, liveness, frame_states, hoisted_loops)?;
     let cached_method_guard = cached_method_guard_site(tree, cfg, ssa, &back_edges);
     Ok(Eligibility {
         guarded_uses: guarded_numeric_uses,
@@ -1210,7 +1209,7 @@ pub(super) fn build_osr_entry_sites(
     ssa: &SsaFunction,
     liveness: &Liveness,
     frame_states: &FrameStateTable,
-    hoisted_loop_headers: &BTreeSet<BlockId>,
+    hoisted_loops: &BTreeMap<BlockId, HoistedGroup>,
 ) -> Result<BTreeMap<BlockId, OsrEntrySite>, Unsupported> {
     let mut sites = BTreeMap::new();
     // Only the root frame's headers are OSR targets: the interpreter requests
@@ -1221,9 +1220,6 @@ pub(super) fn build_osr_entry_sites(
         .blocks
         .iter()
         .filter(|block| block.is_loop_header && block.inline == InlineId::ROOT)
-        // Entering a hoisted loop here would skip the pre-header that computes
-        // what its body reads.
-        .filter(|block| !hoisted_loop_headers.contains(&block.id))
     {
         let frame_state =
             frame_states
@@ -1241,13 +1237,24 @@ pub(super) fn build_osr_entry_sites(
                 .map_err(|_| Unsupported::OperandShape("optimizing OSR register overflow"))?;
             register_by_value.entry(value).or_insert(register);
         }
-        if live_in
-            .iter()
-            .any(|value| has_non_dead_use(ssa, *value) && !register_by_value.contains_key(value))
-        {
-            return Err(Unsupported::OperandShape(
-                "optimizing OSR live value is absent from header frame state",
-            ));
+        // Whatever the loop reads out of its pre-header is not in the frame
+        // state — the interpreter never computed it. The entry recovers it by
+        // running that pre-header run, so those values need no register.
+        let preheader_run = hoisted_loops
+            .get(&block.id)
+            .copied()
+            .filter(|group| recoverable_at_entry(ssa, frame_state, *group));
+        let recovered: BTreeSet<ValueId> = preheader_run
+            .into_iter()
+            .flat_map(|group| hoisted_instructions(ssa, group))
+            .filter_map(|instruction| instruction.result)
+            .collect();
+        if live_in.iter().any(|value| {
+            has_non_dead_use(ssa, *value)
+                && !register_by_value.contains_key(value)
+                && !recovered.contains(value)
+        }) {
+            continue;
         }
         let live_values = register_by_value
             .into_iter()
@@ -1259,10 +1266,61 @@ pub(super) fn build_osr_entry_sites(
             OsrEntrySite {
                 logical_pc: block.start_pc,
                 live_values,
+                preheader_run,
             },
         );
     }
     Ok(sites)
+}
+
+/// The instructions one hoisted run holds, in the order they run.
+pub(super) fn hoisted_instructions(
+    ssa: &SsaFunction,
+    group: HoistedGroup,
+) -> impl Iterator<Item = &SsaInstr> {
+    ssa.blocks[group.preheader.0 as usize].instrs[group.start..group.start + group.len].iter()
+}
+
+/// Whether an OSR entry can run this pre-header run from the interpreter frame.
+///
+/// Every holder in the run is derived inside it, so the only value the run
+/// takes from outside is a receiver, and it is read straight out of the
+/// interpreter frame. That is sound exactly when the frame state entering the
+/// loop still names that value in that register — otherwise the interpreter
+/// holds something else there and the run is not recoverable.
+fn recoverable_at_entry(
+    ssa: &SsaFunction,
+    frame_state: &crate::ir::frame_state::AbstractFrameState,
+    group: HoistedGroup,
+) -> bool {
+    let mut derived = BTreeSet::<ValueId>::new();
+    for instruction in hoisted_instructions(ssa, group) {
+        let available = match instruction.op {
+            SsaOp::LoadHeader => {
+                let (Some(&value), Some(&register)) = (
+                    instruction.inputs.first(),
+                    instruction.input_registers.first(),
+                ) else {
+                    return false;
+                };
+                frame_state.registers.get(usize::from(register)) == Some(&Some(value))
+            }
+            SsaOp::LoadPrototype | SsaOp::CheckShape { .. } | SsaOp::LoadField { .. } => {
+                instruction
+                    .inputs
+                    .first()
+                    .is_some_and(|input| derived.contains(input))
+            }
+            SsaOp::StoreField { .. } | SsaOp::Reuse | SsaOp::Bytecode(_) => false,
+        };
+        if !available {
+            return false;
+        }
+        if let Some(result) = instruction.result {
+            derived.insert(result);
+        }
+    }
+    true
 }
 
 pub(super) fn build_element_transition_sites(

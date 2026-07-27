@@ -1103,6 +1103,15 @@ pub struct Interpreter {
     /// optimizing tier reads this back so a pass that speculates about where
     /// execution reaches does not repeat a speculation that already failed.
     jit_optimized_bail_pcs: std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>>,
+    /// Deoptimizations the current optimizing generation has taken, per exit
+    /// site. One site bailing repeatedly is a wrong speculation in a loop —
+    /// only that pattern discards the generation; occasional bails spread
+    /// across sites never accumulate on one key.
+    jit_optimized_bail_counts: rustc_hash::FxHashMap<(u32, u32), u32>,
+    /// How many times each function's optimizing code has been discarded for
+    /// a bail loop. Past the cap the installed body is the best this
+    /// feedback produces and stays; the speculation-failure record remains.
+    jit_optimized_reopt_counts: rustc_hash::FxHashMap<u32, u32>,
     /// Feedback epoch at which a hot function last failed optimizing compilation.
     /// A back-edge only re-attempts the whole-body optimizer when the epoch has
     /// advanced, so a structurally-ineligible body is not recompiled on every hot

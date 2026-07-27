@@ -2289,6 +2289,10 @@ fn emit(
                             .filter(|call| arg_regs.len() == usize::from(call.argument_count))
                             .filter(|call| guarded_method_call_is_supported(view, call));
                         if let Some(call) = native_leaf {
+                            // A missed guard falls through to the generic
+                            // method transition below: a receiver this site
+                            // did not settle on is a slower call, not a wrong
+                            // speculation to deoptimize over.
                             let leaf_miss = ops.new_dynamic_label();
                             emit_guarded_method_call(
                                 &mut ops,
@@ -2312,7 +2316,6 @@ fn emit(
                                 ; .arch aarch64
                                 ; b =>succeeded
                                 ; =>leaf_miss
-                                ; b =>bail
                             );
                         }
                         let planned_methods = native_leaf

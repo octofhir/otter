@@ -164,6 +164,11 @@ fn append_header_value(
 /// object or change its hidden class, so both facts die at such an instruction.
 /// What survives is exactly what a receiver touched several times in one
 /// effect-free stretch would otherwise re-prove.
+///
+/// A fact belongs to the object, not to the value that named it: bytecode reads
+/// a variable through its own register move before each access, so two accesses
+/// to one variable arrive as two receiver values. Keying by the value they were
+/// copied from is what lets the second access see the first one's holder.
 pub fn eliminate_redundant_checks(ssa: &mut SsaFunction, cfg: &ControlFlowGraph) {
     let mut deleted_any = false;
     for block_index in 0..ssa.blocks.len() {
@@ -182,7 +187,12 @@ pub fn eliminate_redundant_checks(ssa: &mut SsaFunction, cfg: &ControlFlowGraph)
             }
             match instruction.op {
                 SsaOp::LoadHeader => {
-                    let receiver = instruction.inputs[0];
+                    // Two accesses to one variable read it through two register
+                    // moves, so the receiver values differ while the object does
+                    // not: the fact belongs to what the moves copied.
+                    let receiver = ssa
+                        .copy_origin(instruction.inputs[0])
+                        .unwrap_or(instruction.inputs[0]);
                     let header = instruction
                         .result
                         .expect("a holder derivation defines its address");
@@ -418,6 +428,93 @@ mod tests {
             .result
             .expect("the holder is a value");
         assert_eq!(ssa.blocks[0].instrs[3].inputs.as_slice(), [header]);
+
+        ssa.verify(&cfg, &DominatorTree::compute(&cfg))
+            .expect("the eliminated graph verifies");
+    }
+
+    /// Real bytecode reads a variable through its own move before each access,
+    /// so the two receivers are different values naming one object.
+    #[test]
+    fn two_accesses_through_separate_register_moves_keep_one_holder() {
+        let mut view = JitCompileSnapshot::without_feedback(
+            0,
+            1,
+            5,
+            vec![
+                JitTestInstruction::new(
+                    Op::LoadLocal,
+                    0,
+                    0,
+                    vec![Operand::Register(1), Operand::Imm32(0)],
+                ),
+                JitTestInstruction::new(
+                    Op::LoadProperty,
+                    1,
+                    4,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(1),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                JitTestInstruction::new(
+                    Op::LoadLocal,
+                    2,
+                    8,
+                    vec![Operand::Register(3), Operand::Imm32(0)],
+                ),
+                JitTestInstruction::new(
+                    Op::LoadProperty,
+                    3,
+                    12,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(3),
+                        Operand::ConstIndex(1),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 4, 16, vec![Operand::Register(4)]),
+            ],
+        );
+        view.cage_base = 0x1000;
+        view.property_loads.insert(
+            4,
+            vec![JitInlinePropertyLoad {
+                receiver_shape: 7,
+                value_byte: 24,
+            }],
+        );
+        view.property_loads.insert(
+            12,
+            vec![JitInlinePropertyLoad {
+                receiver_shape: 7,
+                value_byte: 32,
+            }],
+        );
+        let tree = InlineTree::trivial(&view);
+        let cfg = ControlFlowGraph::build_inlined(&tree).expect("CFG builds");
+        let mut ssa = SsaFunction::build_inlined(&tree, &cfg).expect("SSA builds");
+        let reprs = ReprMap::compute(&tree, &ssa);
+        lower_settled_property_accesses(&mut ssa, &cfg, &view, &tree, &reprs);
+
+        let ops: Vec<_> = ssa.blocks[0].instrs.iter().map(|i| i.op).collect();
+        assert_eq!(
+            ops,
+            vec![
+                SsaOp::Bytecode(Op::LoadLocal),
+                SsaOp::LoadHeader,
+                SsaOp::CheckShape { shape: 7 },
+                SsaOp::LoadField { byte: 24 },
+                SsaOp::Bytecode(Op::LoadLocal),
+                SsaOp::LoadField { byte: 32 },
+                SsaOp::Bytecode(Op::ReturnValue),
+            ]
+        );
+        let header = ssa.blocks[0].instrs[1]
+            .result
+            .expect("the holder is a value");
+        assert_eq!(ssa.blocks[0].instrs[5].inputs.as_slice(), [header]);
 
         ssa.verify(&cfg, &DominatorTree::compute(&cfg))
             .expect("the eliminated graph verifies");

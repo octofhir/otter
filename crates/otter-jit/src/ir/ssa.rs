@@ -1638,6 +1638,26 @@ impl SsaFunction {
         Ok(())
     }
 
+    /// The value a register move or a holder derivation ultimately came from.
+    ///
+    /// A register read is its own SSA value even when it only copies one, so two
+    /// uses of the same variable name different values. Anything asking whether
+    /// two nodes talk about the same object has to ask about the origin, not the
+    /// copy.
+    #[must_use]
+    pub fn copy_origin(&self, mut value: ValueId) -> Option<ValueId> {
+        loop {
+            match &self.values.get(value.0 as usize)?.def {
+                ValueDef::Op {
+                    op: SsaOp::Bytecode(Op::LoadLocal | Op::StoreLocal) | SsaOp::LoadHeader,
+                    inputs,
+                    ..
+                } if inputs.len() == 1 => value = inputs[0],
+                _ => return Some(value),
+            }
+        }
+    }
+
     /// Whether `value` is a holder address produced by [`SsaOp::LoadHeader`].
     #[must_use]
     pub fn defines_header(&self, value: ValueId) -> bool {

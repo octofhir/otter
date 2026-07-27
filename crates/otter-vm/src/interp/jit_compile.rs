@@ -133,6 +133,47 @@ impl Interpreter {
             inline_methods: u32::try_from(view.inline_methods.len()).unwrap_or(u32::MAX),
         };
         self.push_reserved_jit_debug_event(event);
+        self.record_settled_property_sites(fid, tier, view);
+    }
+
+    /// Report the guard chain every settled property site in `view` carries.
+    ///
+    /// Emitted once per baked snapshot, immediately after the prepare event, so
+    /// a report reads as: this function, this tier, these sites lower without
+    /// their cache cells and these are the ways each one must distinguish.
+    fn record_settled_property_sites(
+        &mut self,
+        fid: u32,
+        tier: jit_debug::JitDebugTier,
+        view: &jit::JitCompileSnapshot,
+    ) {
+        let sites = view
+            .property_loads
+            .iter()
+            .map(|entry| (jit_debug::JitDebugPropertyAccess::Load, entry))
+            .chain(
+                view.property_stores
+                    .iter()
+                    .map(|entry| (jit_debug::JitDebugPropertyAccess::Store, entry)),
+            );
+        for (access, (&byte_pc, chain)) in sites {
+            if !self.reserve_jit_debug_event() {
+                return;
+            }
+            self.push_reserved_jit_debug_event(jit_debug::JitDebugEvent::PropertySiteSettled {
+                function_id: fid,
+                tier,
+                byte_pc,
+                access,
+                ways: chain
+                    .iter()
+                    .map(|way| jit_debug::JitDebugPropertyWay {
+                        shape: way.receiver_shape,
+                        value_byte: way.value_byte,
+                    })
+                    .collect(),
+            });
+        }
     }
 
     fn record_jit_compile_finished(

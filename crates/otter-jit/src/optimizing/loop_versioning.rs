@@ -4,7 +4,6 @@
 //! - [`PropertyLoopCachePlan`] — cache groups and sites keyed by loop header.
 //! - [`analyze_property_loop_caches`] — reducible-loop safety analysis.
 //! - [`natural_loop_blocks`] — deterministic natural-loop membership.
-//! - [`transparent_origin`] — local-move stripping for invariant receivers.
 //!
 //! # Invariants
 //! - A candidate loop contains no heap-observing operation except property
@@ -24,7 +23,7 @@ use otter_bytecode::Op;
 use crate::ir::{
     cfg::{BlockId, ControlFlowGraph},
     inline::InlineId,
-    ssa::{SsaFunction, SsaInstr, SsaOp, ValueDef, ValueId},
+    ssa::{SsaFunction, SsaInstr, SsaOp},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -61,22 +60,6 @@ pub(crate) fn natural_loop_blocks(
         }
     }
     blocks
-}
-
-pub(crate) fn transparent_origin(ssa: &SsaFunction, mut value: ValueId) -> Option<ValueId> {
-    loop {
-        let data = ssa.values.get(value.0 as usize)?;
-        match &data.def {
-            // A holder address is transparent to the receiver it came from:
-            // the loop-invariance question is about that receiver.
-            ValueDef::Op {
-                op: SsaOp::Bytecode(Op::LoadLocal | Op::StoreLocal) | SsaOp::LoadHeader,
-                inputs,
-                ..
-            } if inputs.len() == 1 => value = inputs[0],
-            _ => return Some(value),
-        }
-    }
 }
 
 fn safe_instruction(instruction: &SsaInstr) -> bool {
@@ -175,7 +158,7 @@ pub(crate) fn analyze_property_loop_caches(
                     .inputs
                     .first()
                     .copied()
-                    .and_then(|value| transparent_origin(ssa, value))
+                    .and_then(|value| ssa.copy_origin(value))
                 else {
                     receivers_are_invariant = false;
                     continue;

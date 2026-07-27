@@ -356,6 +356,26 @@ pub enum JitCompilerDiagnostic {
     },
 }
 
+/// Whether a settled property site reads or writes its slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JitDebugPropertyAccess {
+    /// The site reads the slot.
+    Load,
+    /// The site writes the slot.
+    Store,
+}
+
+/// One hidden class a property site settled on, and the slot it resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JitDebugPropertyWay {
+    /// Hidden-class handle the receiver must carry for this way to hold.
+    pub shape: u32,
+    /// Byte offset of the slot in the holder's value slab.
+    pub value_byte: u32,
+}
+
 /// One structured JIT diagnostics event.
 ///
 /// The enum uses an internally tagged representation so report consumers can
@@ -403,6 +423,25 @@ pub enum JitDebugEvent {
         inline_callees: u32,
         /// Monomorphic method bodies baked into the snapshot.
         inline_methods: u32,
+    },
+    /// One property site whose feedback settled into a guard chain the backend
+    /// can emit from immediates, without loading the site's cache cell.
+    ///
+    /// The way list is the whole declaration a settled site carries: how many
+    /// hidden classes the guard must distinguish, and which slot each one
+    /// resolves to. A site absent from this stream is one the backend still
+    /// serves through its cache cell.
+    PropertySiteSettled {
+        /// Global bytecode function id containing the site.
+        function_id: u32,
+        /// Tier the snapshot was baked for.
+        tier: JitDebugTier,
+        /// Encoded byte PC used by the compile snapshot's property tables.
+        byte_pc: u32,
+        /// Whether the site reads or writes the slot.
+        access: JitDebugPropertyAccess,
+        /// One way per settled hidden class, in installed order.
+        ways: Vec<JitDebugPropertyWay>,
     },
     /// One plain-call inline candidate was made available or rejected by the
     /// VM.

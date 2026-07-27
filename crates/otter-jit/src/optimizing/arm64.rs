@@ -111,8 +111,7 @@ use super::{
     OptimizedCode, OptimizedMetadata,
     artifact::render_optimized_unit,
     loop_versioning::{
-        PropertyLoopCache, PropertyLoopCachePlan, analyze_property_loop_caches,
-        natural_loop_blocks, transparent_origin,
+        PropertyLoopCache, PropertyLoopCachePlan, analyze_property_loop_caches, natural_loop_blocks,
     },
     pipeline::{
         OptimizationError, OptimizationPipeline, total_spill_slots as analyzed_spill_slot_count,
@@ -581,6 +580,46 @@ fn header_register(allocation: &Allocation, header: ValueId) -> Result<Option<u8
     }
 }
 
+/// Replay a cache-active loop's recorded value for the site `instruction`
+/// belongs to, returning the label the rest of the site branches past.
+///
+/// The replay anchors at the first node of a site's group: the holder
+/// derivation when the site has one, the field read when a preceding site
+/// already derived that holder. Either way an armed loop stores the recorded
+/// value and skips everything the site would otherwise run.
+fn emit_property_loop_cache_replay(
+    ops: &mut Assembler,
+    eligibility: &Eligibility,
+    property_cache_base: u32,
+    instruction: &SsaInstr,
+    field_location: Location,
+) -> Result<Option<DynamicLabel>, Unsupported> {
+    let Some(site) = eligibility
+        .property_loop_cache
+        .sites
+        .get(&(instruction.inline, instruction.pc))
+    else {
+        return Ok(None);
+    };
+    let loop_cache = &eligibility.property_loop_cache.loops[&site.header];
+    emit_sp_ldr_x(
+        ops,
+        9,
+        property_cache_offset(property_cache_base, loop_cache.ready_slot)?,
+    );
+    let not_ready = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64 ; cbz x9, =>not_ready);
+    emit_sp_ldr_x(
+        ops,
+        9,
+        property_cache_offset(property_cache_base, site.value_slot)?,
+    );
+    emit_store_tagged_location(ops, field_location, 9)?;
+    let done = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64 ; b =>done ; =>not_ready);
+    Ok(Some(done))
+}
+
 /// The register a node may read a holder address from, filling
 /// [`HEADER_SCRATCH`] first when the allocator spilled it.
 fn materialized_header(
@@ -907,14 +946,14 @@ fn emit(
                         .result
                         .expect("eligibility checked the holder address");
                     // A loop whose body cannot mutate the heap reads this site
-                    // once and replays the value, skipping the whole access.
-                    if let Some(loop_cache_site) = eligibility
+                    // once and replays the value, skipping the whole access. A
+                    // write is never such a site, so it never looks for a read
+                    // to replay into.
+                    property_cache_done = if eligibility
                         .property_loop_cache
                         .sites
-                        .get(&(instruction.inline, instruction.pc))
+                        .contains_key(&(instruction.inline, instruction.pc))
                     {
-                        let loop_cache =
-                            &eligibility.property_loop_cache.loops[&loop_cache_site.header];
                         let field_location = allocation.location(
                             block_instructions[instruction_index..]
                                 .iter()
@@ -927,23 +966,16 @@ fn emit(
                                     "optimizing holder address has no field read",
                                 ))?,
                         );
-                        emit_sp_ldr_x(
+                        emit_property_loop_cache_replay(
                             &mut ops,
-                            9,
-                            property_cache_offset(property_cache_base, loop_cache.ready_slot)?,
-                        );
-                        let not_ready = ops.new_dynamic_label();
-                        dynasm!(ops ; .arch aarch64 ; cbz x9, =>not_ready);
-                        emit_sp_ldr_x(
-                            &mut ops,
-                            9,
-                            property_cache_offset(property_cache_base, loop_cache_site.value_slot)?,
-                        );
-                        emit_store_tagged_location(&mut ops, field_location, 9)?;
-                        let done = ops.new_dynamic_label();
-                        dynasm!(ops ; .arch aarch64 ; b =>done ; =>not_ready);
-                        property_cache_done = Some(done);
-                    }
+                            eligibility,
+                            property_cache_base,
+                            instruction,
+                            field_location,
+                        )?
+                    } else {
+                        None
+                    };
                     let deopt = ops.new_dynamic_label();
                     deopt_exits.push((
                         deopt,
@@ -992,6 +1024,19 @@ fn emit(
                             .result
                             .expect("eligibility checked field-load result"),
                     );
+                    // An access whose holder a preceding site already derived
+                    // has no holder node of its own, so the replay anchors here
+                    // instead. Every read in a cache-active loop is a site, so
+                    // an armed loop still skips all of them.
+                    if property_cache_done.is_none() {
+                        property_cache_done = emit_property_loop_cache_replay(
+                            &mut ops,
+                            eligibility,
+                            property_cache_base,
+                            instruction,
+                            result_location,
+                        )?;
+                    }
                     let deopt = ops.new_dynamic_label();
                     deopt_exits.push((
                         deopt,

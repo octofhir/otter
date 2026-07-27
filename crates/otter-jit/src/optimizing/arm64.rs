@@ -2630,9 +2630,9 @@ fn emit(
                         dynasm!(ops ; .arch aarch64 ; and w11, w9, w10);
                         emit_store_location(&mut ops, allocation.location(result), 11)?;
                     }
-                    // Immediate-right int32 comparison, boxed to a boolean (never
-                    // fused with a following branch — `fused_numeric_compare_at`
-                    // matches only the register forms).
+                    // Immediate-right int32 comparison. Like the register forms
+                    // it leaves its result in flags when the branch that reads
+                    // it comes next, and boxes a boolean otherwise.
                     Op::LessThanImm | Op::EqualImm | Op::NotEqualImm => {
                         let result = instruction
                             .result
@@ -2640,6 +2640,12 @@ fn emit(
                         let imm = view.instructions[instruction.pc as usize]
                             .imm32(view.code_block.as_ref(), 2)
                             .ok_or(Unsupported::OperandShape("immediate operand"))?;
+                        let fused_branch = fused_numeric_compare_at(
+                            tree,
+                            block_instructions,
+                            instruction_index,
+                            &eligibility.insufficient_feedback,
+                        );
                         emit_load_int_operand(
                             &mut ops,
                             reprs,
@@ -2650,13 +2656,12 @@ fn emit(
                             guard_deopt,
                         )?;
                         emit_load_u32(&mut ops, 10, imm as u32);
-                        let register_op = match op {
-                            Op::LessThanImm => Op::LessThan,
-                            Op::EqualImm => Op::Equal,
-                            _ => Op::NotEqual,
-                        };
-                        emit_int_comparison(&mut ops, register_op);
-                        emit_store_tagged_location(&mut ops, allocation.location(result), 11)?;
+                        if fused_branch {
+                            emit_int_compare_flags(&mut ops);
+                        } else {
+                            emit_int_comparison(&mut ops, register_comparison_form(op));
+                            emit_store_tagged_location(&mut ops, allocation.location(result), 11)?;
+                        }
                     }
                     Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem => {
                         let result = instruction.result.expect("eligibility checked result");
@@ -2999,10 +3004,12 @@ fn emit(
                             })
                         {
                             let comparison = &block_instructions[compare_index];
-                            let comparison_op = comparison
-                                .op
-                                .bytecode()
-                                .expect("a fused comparison is a bytecode node");
+                            let comparison_op = register_comparison_form(
+                                comparison
+                                    .op
+                                    .bytecode()
+                                    .expect("a fused comparison is a bytecode node"),
+                            );
                             let result = comparison
                                 .result
                                 .expect("fused comparison owns its branch condition");

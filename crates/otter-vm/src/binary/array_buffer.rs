@@ -62,17 +62,34 @@ pub const SHARED_ARRAY_BUFFER_BODY_TYPE_TAG: u8 = 0x2d;
 /// Mutators flip every field through [`otter_gc::GcHeap::with_payload`]
 /// (no interior mutability in GC bodies).
 ///
-/// `#[repr(C)]` with `bytes` first so the baseline JIT can read the
-/// `Vec<u8>` data pointer (the Vec's first word) and the `detached`
-/// flag at fixed byte offsets ([`LOCAL_ARRAY_BUFFER_BODY_BYTES_OFFSET`]
-/// / [`LOCAL_ARRAY_BUFFER_BODY_DETACHED_OFFSET`]) for inline typed-array
+/// `#[repr(C)]` so the cached `(data, byte_len)` pair and the `detached`
+/// flag sit at fixed byte offsets
+/// ([`LOCAL_ARRAY_BUFFER_BODY_DATA_OFFSET`] /
+/// [`LOCAL_ARRAY_BUFFER_BODY_BYTE_LEN_OFFSET`] /
+/// [`LOCAL_ARRAY_BUFFER_BODY_DETACHED_OFFSET`]) for inline typed-array
 /// element access — no interpreter round-trip.
 #[derive(Debug)]
 #[repr(C)]
 pub struct LocalArrayBufferBodyGc {
-    /// Raw bytes. Empty when detached. `#[repr(C)]` keeps this first so
-    /// the JIT reads the data pointer at the body's first word.
-    pub bytes: Vec<u8>,
+    /// Raw bytes. Empty when detached.
+    ///
+    /// This Rust container is deliberately not part of any native
+    /// contract: `Vec`'s field order is unspecified, so compiled code
+    /// reads the cached [`Self::data`] / [`Self::byte_len`] pair
+    /// instead. Every path that can move or resize the allocation must
+    /// call [`Self::refresh_byte_cache`].
+    bytes: Vec<u8>,
+    /// Always-current base of the byte storage, kept in a fixed body
+    /// field so compiled code can address bytes without knowing `Vec`
+    /// layout. The storage is a plain Rust allocation, so a moving
+    /// collection of the body leaves it valid; only growth, shrinkage,
+    /// reallocation and detach change it. Null for empty or detached
+    /// storage, which no access can reach because every access proves
+    /// `index < byte_len` first.
+    data: std::cell::Cell<*mut u8>,
+    /// Always-current `bytes.len()`, mirrored next to the base pointer
+    /// so a compiled bounds check is one load.
+    byte_len: std::cell::Cell<usize>,
     /// `true` after detach / transfer; once set, stays set per spec.
     pub detached: bool,
     /// `Some(n)` for a resizable buffer; `None` for a fixed-length
@@ -85,17 +102,63 @@ pub struct LocalArrayBufferBodyGc {
     pub expando: Option<crate::object::JsObject>,
 }
 
-/// Byte offset of [`LocalArrayBufferBodyGc::bytes`] from the body start
-/// (after the GC header). The first word at this offset is the
-/// `Vec<u8>` data pointer the baseline JIT loads for inline element
-/// access. `0` by construction (`bytes` is the first field), exported
-/// via `offset_of!` so it stays correct under any reorder.
-pub const LOCAL_ARRAY_BUFFER_BODY_BYTES_OFFSET: usize =
-    std::mem::offset_of!(LocalArrayBufferBodyGc, bytes);
+/// Byte offset of the cached byte-storage base within
+/// [`LocalArrayBufferBodyGc`]. Compiled element access loads the base
+/// from here; the `Vec` itself is never addressed by native code.
+pub const LOCAL_ARRAY_BUFFER_BODY_DATA_OFFSET: usize =
+    std::mem::offset_of!(LocalArrayBufferBodyGc, data);
+/// Byte offset of the cached byte length within
+/// [`LocalArrayBufferBodyGc`], read by a compiled bounds check.
+pub const LOCAL_ARRAY_BUFFER_BODY_BYTE_LEN_OFFSET: usize =
+    std::mem::offset_of!(LocalArrayBufferBodyGc, byte_len);
 /// Byte offset of [`LocalArrayBufferBodyGc::detached`] from the body
 /// start. The JIT bails inline access when this flag is set.
 pub const LOCAL_ARRAY_BUFFER_BODY_DETACHED_OFFSET: usize =
     std::mem::offset_of!(LocalArrayBufferBodyGc, detached);
+
+impl LocalArrayBufferBodyGc {
+    /// Recompute the compiled-code-visible byte cache after any mutation
+    /// that can move or resize the storage.
+    #[inline]
+    pub(crate) fn refresh_byte_cache(&self) {
+        self.data.set(if self.bytes.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            self.bytes.as_ptr().cast_mut()
+        });
+        self.byte_len.set(self.bytes.len());
+    }
+
+    /// Read-only view of the storage.
+    #[inline]
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Mutable access to the storage that refreshes the cache afterwards,
+    /// so no caller can leave a stale base behind.
+    #[inline]
+    pub(crate) fn with_bytes_mut<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(&mut Vec<u8>) -> R,
+    {
+        let result = f(&mut self.bytes);
+        self.refresh_byte_cache();
+        result
+    }
+
+    /// Verifier for the always-current byte cache: the cached pair must
+    /// equal what [`Self::refresh_byte_cache`] would recompute now, so any
+    /// new mutation path that forgets to refresh fails deterministically.
+    /// Read paths assert it under `debug_assertions`.
+    #[must_use]
+    pub(crate) fn byte_cache_is_current(&self) -> bool {
+        if self.bytes.is_empty() {
+            return self.data.get().is_null() && self.byte_len.get() == 0;
+        }
+        self.data.get() == self.bytes.as_ptr().cast_mut() && self.byte_len.get() == self.bytes.len()
+    }
+}
 
 impl otter_gc::SafeTraceable for LocalArrayBufferBodyGc {
     const TYPE_TAG: u8 = LOCAL_ARRAY_BUFFER_BODY_TYPE_TAG;
@@ -105,7 +168,8 @@ impl otter_gc::SafeTraceable for LocalArrayBufferBodyGc {
             let p = expando as *mut crate::object::JsObject as *mut otter_gc::raw::RawGc;
             visitor(p);
         }
-        // No outgoing GC slots — `Vec<u8>` is plain data.
+        // No outgoing GC slots — the byte storage and its cached base are
+        // plain data.
     }
 }
 
@@ -124,13 +188,19 @@ pub fn alloc_local_array_buffer(
     max_byte_length: Option<usize>,
     external: Option<otter_gc::ExternalMemory>,
 ) -> Result<LocalArrayBufferHandle, otter_gc::OutOfMemory> {
-    heap.alloc_old(LocalArrayBufferBodyGc {
+    let handle = heap.alloc_old(LocalArrayBufferBodyGc {
         bytes,
+        data: std::cell::Cell::new(std::ptr::null_mut()),
+        byte_len: std::cell::Cell::new(0),
         detached: false,
         max_byte_length,
         external,
         expando: None,
-    })
+    })?;
+    // The `Vec`'s buffer is a separate allocation, so moving the body — here
+    // and in any later collection — leaves the cached base valid.
+    heap.with_payload(handle, |body| body.refresh_byte_cache());
+    Ok(handle)
 }
 
 /// GC body for `SharedArrayBuffer` per ECMA-262 §25.2.
@@ -464,7 +534,7 @@ impl JsArrayBuffer {
     pub fn byte_length(self, heap: &otter_gc::GcHeap) -> usize {
         match self.storage {
             BufferStorage::Local(h) => {
-                heap.read_payload(h, |body| if body.detached { 0 } else { body.bytes.len() })
+                heap.read_payload(h, |body| if body.detached { 0 } else { body.bytes().len() })
             }
             BufferStorage::Shared(h) => {
                 let arc = heap.read_payload(h, |body| body.inner.clone());
@@ -483,7 +553,7 @@ impl JsArrayBuffer {
                 if body.detached {
                     return 0;
                 }
-                body.max_byte_length.unwrap_or(body.bytes.len())
+                body.max_byte_length.unwrap_or(body.bytes().len())
             }),
             BufferStorage::Shared(h) => {
                 let arc = heap.read_payload(h, |body| body.inner.clone());
@@ -523,7 +593,13 @@ impl JsArrayBuffer {
         F: FnOnce(&[u8]) -> R,
     {
         match self.storage {
-            BufferStorage::Local(h) => heap.read_payload(h, |body| f(&body.bytes)),
+            BufferStorage::Local(h) => heap.read_payload(h, |body| {
+                debug_assert!(
+                    body.byte_cache_is_current(),
+                    "a mutation path left the byte cache stale"
+                );
+                f(body.bytes())
+            }),
             BufferStorage::Shared(h) => {
                 let arc = heap.read_payload(h, |body| body.inner.clone());
                 let guard = arc.bytes.lock().expect("SharedArrayBuffer mutex poisoned");
@@ -539,7 +615,7 @@ impl JsArrayBuffer {
         F: FnOnce(&mut Vec<u8>) -> R,
     {
         match self.storage {
-            BufferStorage::Local(h) => heap.with_payload(h, |body| f(&mut body.bytes)),
+            BufferStorage::Local(h) => heap.with_payload(h, |body| body.with_bytes_mut(f)),
             BufferStorage::Shared(h) => {
                 let arc = heap.read_payload(h, |body| body.inner.clone());
                 let mut guard = arc.bytes.lock().expect("SharedArrayBuffer mutex poisoned");
@@ -558,7 +634,7 @@ impl JsArrayBuffer {
         heap.with_payload(h, |body| {
             if !body.detached {
                 body.detached = true;
-                body.bytes.clear();
+                body.with_bytes_mut(Vec::clear);
                 let _ = body.external.take();
             }
         });
@@ -583,7 +659,7 @@ impl JsArrayBuffer {
             if new_len > max {
                 return false;
             }
-            body.bytes.resize(new_len, 0u8);
+            body.with_bytes_mut(|bytes| bytes.resize(new_len, 0u8));
             true
         })
     }
@@ -693,5 +769,84 @@ impl JsArrayBuffer {
                 visitor(p);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cached `(data, byte_len)` pair is what compiled element access
+    /// addresses, so every path that can move or resize the storage must leave
+    /// it current. This walks each of those paths and asserts the invariant
+    /// after it, which is what makes
+    /// [`LOCAL_ARRAY_BUFFER_BODY_DATA_OFFSET`] a contract rather than a
+    /// comment.
+    fn assert_cache_current(buffer: JsArrayBuffer, heap: &otter_gc::GcHeap, what: &str) {
+        let BufferStorage::Local(handle) = buffer.storage else {
+            panic!("{what}: expected a local buffer");
+        };
+        let (current, data, len, vec_ptr, vec_len) = heap.read_payload(handle, |body| {
+            (
+                body.byte_cache_is_current(),
+                body.data.get(),
+                body.byte_len.get(),
+                body.bytes().as_ptr().cast_mut(),
+                body.bytes().len(),
+            )
+        });
+        assert!(current, "{what}: cache stale (data={data:?} len={len})");
+        assert_eq!(len, vec_len, "{what}: cached length");
+        if vec_len != 0 {
+            assert_eq!(data, vec_ptr, "{what}: cached base");
+        }
+    }
+
+    #[test]
+    fn byte_cache_stays_current_across_every_mutation_path() {
+        let mut heap = otter_gc::GcHeap::new().expect("heap");
+
+        let empty = JsArrayBuffer::new(&mut heap, 0).expect("empty buffer");
+        assert_cache_current(empty, &heap, "fresh empty");
+
+        let buffer = JsArrayBuffer::new(&mut heap, 8).expect("buffer");
+        assert_cache_current(buffer, &heap, "fresh");
+
+        // A push past capacity reallocates, which is exactly the case a raw
+        // `Vec`-first-word read would get wrong.
+        buffer.with_bytes_mut(&mut heap, |bytes| {
+            bytes.reserve_exact(0);
+            for value in 0..4096u32 {
+                bytes.push(value as u8);
+            }
+        });
+        assert_cache_current(buffer, &heap, "after reallocating push");
+
+        buffer.with_bytes_mut(&mut heap, |bytes| bytes.truncate(2));
+        assert_cache_current(buffer, &heap, "after truncate");
+
+        buffer.detach(&mut heap);
+        assert_cache_current(buffer, &heap, "after detach");
+        assert!(buffer.is_detached(&heap), "detach must stick");
+    }
+
+    #[test]
+    fn resizable_byte_cache_tracks_growth_and_shrink() {
+        let mut heap = otter_gc::GcHeap::new().expect("heap");
+        let mut closure = |_: &mut dyn FnMut(*mut otter_gc::compressed::RawGc)| {};
+        let visitor: &mut otter_gc::heap::RootSlotVisitor<'_> = &mut &mut closure;
+        let buffer = JsArrayBuffer::new_resizable_with_roots(4, 64, &mut heap, visitor)
+            .expect("reservation")
+            .expect("resizable buffer");
+        assert_cache_current(buffer, &heap, "fresh resizable");
+
+        assert!(buffer.resize(&mut heap, 64), "grow to max");
+        assert_cache_current(buffer, &heap, "after grow");
+
+        assert!(buffer.resize(&mut heap, 1), "shrink");
+        assert_cache_current(buffer, &heap, "after shrink");
+
+        assert!(buffer.resize(&mut heap, 0), "shrink to empty");
+        assert_cache_current(buffer, &heap, "after shrink to empty");
     }
 }

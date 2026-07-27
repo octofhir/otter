@@ -13,8 +13,9 @@
 //!   — the indexed element access program.
 //! - [`emit_receiver_shape`] — prove an ordinary object cell and read its
 //!   hidden class.
-//! - [`emit_check_shape`] / [`emit_load_field`] — the two halves of a settled
-//!   own-slot read, which the optimizing tier emits as separate IR nodes.
+//! - [`emit_load_header`] / [`emit_check_shape`] / [`emit_load_field`] — the
+//!   three parts of a settled own-slot read, which the optimizing tier emits as
+//!   separate IR nodes over a holder address the allocator placed.
 //! - [`emit_property_ic_load`] / [`emit_property_ic_store_guard`] — the
 //!   named-property cache probes.
 //! - [`emit_native_leaf_call`] — guard a callee's bootstrap identity and run
@@ -150,7 +151,32 @@ pub(crate) fn emit_receiver_shape<R>(
 where
     R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
 {
+    emit_load_header(ops, relocations, view, load_receiver, 13, miss)?;
     let shape_byte = view.object_shape_byte;
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr w14, [x13, shape_byte] // receiver shape handle
+        ; cbz w14, =>miss          // empty-cell sentinel
+    );
+    Ok(())
+}
+
+/// Prove the receiver is a heap cell carrying an ordinary object body, leaving
+/// that body's `GcHeader` address in `header`.
+///
+/// The address is a raw interior pointer: a moving collection invalidates it, so
+/// a caller may keep it only until its next safepoint.
+pub(crate) fn emit_load_header<R>(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    load_receiver: R,
+    header: u8,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported>
+where
+    R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
+{
     load_receiver(ops, 9)?;
     super::values::emit_cell_test(ops, 9, 11, super::values::CellTest::IsNotCell, miss);
     dynasm!(ops
@@ -166,52 +192,58 @@ where
     );
     dynasm!(ops
         ; .arch aarch64
-        ; add x13, x13, x12        // x13 = GcHeader ptr
-        ; ldrb w14, [x13]          // header type tag
+        ; add X(header), x13, x12  // header = GcHeader ptr
+        ; ldrb w14, [X(header)]    // header type tag
         ; cmp w14, OBJECT_BODY_TYPE_TAG
         ; b.ne =>miss
-        ; ldr w14, [x13, shape_byte] // receiver shape handle
-        ; cbz w14, =>miss          // empty-cell sentinel
     );
     Ok(())
 }
 
-/// Prove the receiver still carries the compile-time hidden class `shape`,
-/// leaving its `GcHeader` in `x13`.
+/// Prove the holder `header` names still carries the compile-time hidden class
+/// `shape`.
 ///
 /// A settled shape is an immediate, so the whole guard is one compare: no cell
-/// load, no way walk, no prototype hop.
-pub(crate) fn emit_check_shape<R>(
+/// load, no way walk, no prototype hop. Clobbers `w12` and `w14`.
+pub(crate) fn emit_check_shape(
     ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
-    load_receiver: R,
+    header: u8,
     shape: u32,
     miss: DynamicLabel,
-) -> Result<(), Unsupported>
-where
-    R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
-{
-    emit_receiver_shape(ops, relocations, view, load_receiver, miss)?;
+) {
+    let shape_byte = view.object_shape_byte;
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr w14, [X(header), shape_byte]
+        ; cbz w14, =>miss          // empty-cell sentinel
+    );
     emit_load_u64(ops, 12, u64::from(shape));
     dynasm!(ops
         ; .arch aarch64
         ; cmp w14, w12
         ; b.ne =>miss
     );
-    Ok(())
 }
 
-/// Read the own data slot at `value_byte` from the holder whose `GcHeader`
-/// [`emit_check_shape`] left in `x13`, leaving the boxed `Value` in `x9`.
+/// Read the own data slot at `value_byte` from the holder `header` names,
+/// leaving the boxed `Value` in `x9`.
+///
+/// The slab base is computed in `x13` — `dynasm` cannot add a constant offset to
+/// a dynamic base register — so a holder held anywhere else is moved there
+/// first.
 pub(crate) fn emit_load_field(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
+    header: u8,
     value_byte: u32,
     boxed_slot_slow_paths: &mut Vec<super::values::BoxedSlotSlowPath>,
     miss: DynamicLabel,
 ) {
+    if header != 13 {
+        dynasm!(ops ; .arch aarch64 ; mov x13, X(header));
+    }
     super::values::emit_slab_base(ops, view, 13, 14);
     dynasm!(ops
         ; .arch aarch64
@@ -274,18 +306,13 @@ where
     // reaches the slot through the same two sequences the optimizing tier
     // emits as separate nodes.
     if let Some([only]) = settled.filter(|chain| !chain.is_empty()) {
-        emit_check_shape(
-            ops,
-            relocations,
-            view,
-            load_receiver,
-            only.receiver_shape,
-            miss,
-        )?;
+        emit_load_header(ops, relocations, view, load_receiver, 13, miss)?;
+        emit_check_shape(ops, view, 13, only.receiver_shape, miss);
         emit_load_field(
             ops,
             relocations,
             view,
+            13,
             only.value_byte,
             boxed_slot_slow_paths,
             miss,

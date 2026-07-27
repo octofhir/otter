@@ -7,14 +7,18 @@
 //!
 //! # Contents
 //! - [`lower_settled_property_loads`] — a monomorphic settled `LoadProperty`
-//!   becomes [`SsaOp::CheckShape`] followed by [`SsaOp::LoadField`].
+//!   becomes [`SsaOp::LoadHeader`], [`SsaOp::CheckShape`] and
+//!   [`SsaOp::LoadField`].
+//! - [`eliminate_redundant_checks`] — a second derivation of a holder, or a
+//!   second proof of a hidden class already established, is deleted.
 //!
 //! # Invariants
-//! - Lowering preserves dense value identity and order: a replaced instruction
-//!   keeps its result value, its result register, and its canonical PC, so
-//!   every later analysis keyed by `(frame, PC)` still finds the site.
-//! - The nodes a site lowers to are adjacent and carry that site's PC, which is
-//!   the exact-PC deopt state the whole group resumes at.
+//! - A replaced instruction keeps its result value, its result register and its
+//!   canonical PC, so every later analysis keyed by `(frame, PC)` still finds
+//!   the site. Creating or deleting a definition renumbers identities back into
+//!   canonical order.
+//! - The nodes a site lowers to carry that site's PC, which is the exact-PC
+//!   deopt state the whole group resumes at.
 //! - Only the root frame lowers: the settled-site maps are keyed by the root
 //!   body's byte PC, and a spliced callee's byte PCs collide with them.
 //! - A site whose cache program reaches past the receiver — a prototype hop, a
@@ -25,17 +29,22 @@
 //! - [`super::ssa`] — the vocabulary and its verifier.
 //! - [`otter_vm::JitInlinePropertyLoad`] — the settled site description.
 
-use otter_bytecode::Op;
+use std::collections::BTreeMap;
+
+use otter_bytecode::{Op, opcode_schema::opcode_schema};
 use otter_vm::JitCompileSnapshot;
+use smallvec::SmallVec;
 
 use super::{
+    cfg::ControlFlowGraph,
     inline::{InlineId, InlineTree},
-    ssa::{SsaFunction, SsaInstr, SsaOp, ValueDef},
+    ssa::{SsaFunction, SsaInstr, SsaOp, ValueData, ValueDef, ValueId},
 };
 
 /// Replace every settled monomorphic property load with its primitive nodes.
 pub fn lower_settled_property_loads(
     ssa: &mut SsaFunction,
+    cfg: &ControlFlowGraph,
     view: &JitCompileSnapshot,
     tree: &InlineTree,
 ) {
@@ -43,16 +52,19 @@ pub fn lower_settled_property_loads(
         return;
     }
     let root = &tree.frames[InlineId::ROOT.0 as usize];
-    for block in &mut ssa.blocks {
-        if !block
+    let mut lowered_any = false;
+    for block_index in 0..ssa.blocks.len() {
+        if !ssa.blocks[block_index]
             .instrs
             .iter()
             .any(|instruction| settled_slot(view, root, instruction).is_some())
         {
             continue;
         }
-        let mut lowered = Vec::with_capacity(block.instrs.len() + 1);
-        for instruction in block.instrs.drain(..) {
+        lowered_any = true;
+        let source = std::mem::take(&mut ssa.blocks[block_index].instrs);
+        let mut lowered = Vec::with_capacity(source.len() + 2);
+        for instruction in source {
             let Some((shape, byte)) = settled_slot(view, root, &instruction) else {
                 lowered.push(instruction);
                 continue;
@@ -60,22 +72,137 @@ pub fn lower_settled_property_loads(
             let result = instruction
                 .result
                 .expect("a settled property load writes one register");
-            let ValueDef::Op { op, .. } = &mut ssa.values[result.0 as usize].def else {
+            // The holder address is a value of its own, so the guard and the
+            // read that trust it need not be adjacent and the allocator, not a
+            // register convention, decides where it lives.
+            let header = append_header_value(ssa, &instruction, block_index);
+            let ValueDef::Op { op, inputs, .. } = &mut ssa.values[result.0 as usize].def else {
                 unreachable!("an instruction result is defined by its instruction");
             };
             *op = SsaOp::LoadField { byte };
+            *inputs = Box::new([header]);
+            let holder: SmallVec<[ValueId; 4]> = SmallVec::from_slice(&[header]);
+            lowered.push(SsaInstr {
+                op: SsaOp::LoadHeader,
+                result: Some(header),
+                result_register: None,
+                ..instruction.clone()
+            });
             lowered.push(SsaInstr {
                 op: SsaOp::CheckShape { shape },
+                inputs: holder.clone(),
+                input_registers: SmallVec::new(),
                 result: None,
                 result_register: None,
                 ..instruction.clone()
             });
             lowered.push(SsaInstr {
                 op: SsaOp::LoadField { byte },
+                inputs: holder,
+                input_registers: SmallVec::new(),
                 ..instruction
             });
         }
-        block.instrs = lowered;
+        ssa.blocks[block_index].instrs = lowered;
+    }
+    if lowered_any {
+        ssa.renumber_values(cfg);
+        eliminate_redundant_checks(ssa, cfg);
+    }
+}
+
+/// Append the holder-address value one lowered site defines.
+///
+/// Its identity is provisional: [`SsaFunction::renumber_values`] restores the
+/// canonical dense order once every site is lowered.
+fn append_header_value(
+    ssa: &mut SsaFunction,
+    instruction: &SsaInstr,
+    block_index: usize,
+) -> ValueId {
+    let id = ValueId(
+        u32::try_from(ssa.values.len()).expect("a lowered graph fits the value identity space"),
+    );
+    ssa.values.push(ValueData {
+        id,
+        def: ValueDef::Op {
+            inline: instruction.inline,
+            pc: instruction.pc,
+            op: SsaOp::LoadHeader,
+            inputs: instruction.inputs.to_vec().into_boxed_slice(),
+        },
+        def_block: ssa.blocks[block_index].id,
+    });
+    id
+}
+
+/// Delete a holder derivation, or a hidden-class proof, that a preceding one in
+/// the same block already established.
+///
+/// Straight-line scope on purpose: a raw holder address may not outlive its
+/// block, and anything that can allocate, call, or write the heap can move the
+/// object or change its hidden class, so both facts die at such an instruction.
+/// What survives is exactly what a receiver touched several times in one
+/// effect-free stretch would otherwise re-prove.
+pub fn eliminate_redundant_checks(ssa: &mut SsaFunction, cfg: &ControlFlowGraph) {
+    let mut deleted_any = false;
+    for block_index in 0..ssa.blocks.len() {
+        // A holder available for a receiver, and the classes already proven of
+        // each available holder.
+        let mut holder_of = BTreeMap::<ValueId, ValueId>::new();
+        let mut proven = BTreeMap::<ValueId, u32>::new();
+        let mut replacement = BTreeMap::<ValueId, ValueId>::new();
+        let source = std::mem::take(&mut ssa.blocks[block_index].instrs);
+        let mut kept = Vec::with_capacity(source.len());
+        for mut instruction in source {
+            for input in &mut instruction.inputs {
+                if let Some(&existing) = replacement.get(input) {
+                    *input = existing;
+                }
+            }
+            match instruction.op {
+                SsaOp::LoadHeader => {
+                    let receiver = instruction.inputs[0];
+                    let header = instruction
+                        .result
+                        .expect("a holder derivation defines its address");
+                    if let Some(&existing) = holder_of.get(&receiver) {
+                        replacement.insert(header, existing);
+                        deleted_any = true;
+                        continue;
+                    }
+                    holder_of.insert(receiver, header);
+                }
+                SsaOp::CheckShape { shape } => {
+                    let header = instruction.inputs[0];
+                    if proven.get(&header) == Some(&shape) {
+                        deleted_any = true;
+                        continue;
+                    }
+                    proven.insert(header, shape);
+                }
+                SsaOp::LoadField { .. } => {}
+                SsaOp::Bytecode(op) => {
+                    // Anything that can run arbitrary code, allocate, or write
+                    // the heap invalidates both a raw address and a proven
+                    // class.
+                    if opcode_schema(op).effects.safepoint_required {
+                        holder_of.clear();
+                        proven.clear();
+                    }
+                }
+            }
+            if let Some(result) = instruction.result
+                && let ValueDef::Op { inputs, .. } = &mut ssa.values[result.0 as usize].def
+            {
+                *inputs = instruction.inputs.to_vec().into_boxed_slice();
+            }
+            kept.push(instruction);
+        }
+        ssa.blocks[block_index].instrs = kept;
+    }
+    if deleted_any {
+        ssa.renumber_values(cfg);
     }
 }
 
@@ -145,29 +272,110 @@ mod tests {
         let tree = InlineTree::trivial(&view);
         let cfg = ControlFlowGraph::build_inlined(&tree).expect("CFG builds");
         let mut ssa = SsaFunction::build_inlined(&tree, &cfg).expect("SSA builds");
-        lower_settled_property_loads(&mut ssa, &view, &tree);
+        lower_settled_property_loads(&mut ssa, &cfg, &view, &tree);
         (cfg, ssa, tree)
     }
 
     #[test]
-    fn a_monomorphic_settled_site_becomes_a_check_and_a_field_read() {
+    fn a_monomorphic_settled_site_becomes_a_holder_a_check_and_a_read() {
         let (cfg, ssa, _tree) = analyzed(vec![JitInlinePropertyLoad {
             receiver_shape: 7,
             value_byte: 24,
         }]);
         let instrs = &ssa.blocks[0].instrs;
-        assert_eq!(instrs[0].op, SsaOp::CheckShape { shape: 7 });
-        assert_eq!(instrs[1].op, SsaOp::LoadField { byte: 24 });
-        // Both nodes carry the site's PC and read the same receiver, and only
-        // the read defines the site's value.
-        assert_eq!((instrs[0].pc, instrs[1].pc), (0, 0));
-        assert_eq!(instrs[0].inputs, instrs[1].inputs);
-        assert_eq!(instrs[0].result, None);
-        assert!(instrs[1].result.is_some());
-        assert_eq!(instrs[1].result_register, Some(1));
+        assert_eq!(instrs[0].op, SsaOp::LoadHeader);
+        assert_eq!(instrs[1].op, SsaOp::CheckShape { shape: 7 });
+        assert_eq!(instrs[2].op, SsaOp::LoadField { byte: 24 });
+        // Every node carries the site's PC; the guard and the read consume the
+        // holder the first node defines, and only the read writes a register.
+        assert_eq!((instrs[0].pc, instrs[1].pc, instrs[2].pc), (0, 0, 0));
+        let header = instrs[0].result.expect("the holder is a value");
+        assert_eq!(instrs[0].result_register, None);
+        assert_eq!(instrs[1].inputs.as_slice(), [header]);
+        assert_eq!(instrs[2].inputs.as_slice(), [header]);
+        assert_eq!(instrs[1].result, None);
+        assert_eq!(instrs[2].result_register, Some(1));
+        // Identities stay dense and in construction order after the insertion.
+        assert!(
+            ssa.values
+                .iter()
+                .enumerate()
+                .all(|(index, value)| value.id == ValueId(index as u32))
+        );
 
         ssa.verify(&cfg, &DominatorTree::compute(&cfg))
             .expect("the lowered graph verifies");
+    }
+
+    #[test]
+    fn a_second_access_to_one_receiver_keeps_one_holder_and_one_check() {
+        let mut view = JitCompileSnapshot::without_feedback(
+            0,
+            1,
+            3,
+            vec![
+                JitTestInstruction::new(
+                    Op::LoadProperty,
+                    0,
+                    0,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                JitTestInstruction::new(
+                    Op::LoadProperty,
+                    1,
+                    4,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::ConstIndex(1),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 2, 8, vec![Operand::Register(2)]),
+            ],
+        );
+        view.cage_base = 0x1000;
+        view.property_loads.insert(
+            0,
+            vec![JitInlinePropertyLoad {
+                receiver_shape: 7,
+                value_byte: 24,
+            }],
+        );
+        view.property_loads.insert(
+            4,
+            vec![JitInlinePropertyLoad {
+                receiver_shape: 7,
+                value_byte: 32,
+            }],
+        );
+        let tree = InlineTree::trivial(&view);
+        let cfg = ControlFlowGraph::build_inlined(&tree).expect("CFG builds");
+        let mut ssa = SsaFunction::build_inlined(&tree, &cfg).expect("SSA builds");
+        lower_settled_property_loads(&mut ssa, &cfg, &view, &tree);
+
+        let ops: Vec<_> = ssa.blocks[0].instrs.iter().map(|i| i.op).collect();
+        assert_eq!(
+            ops,
+            vec![
+                SsaOp::LoadHeader,
+                SsaOp::CheckShape { shape: 7 },
+                SsaOp::LoadField { byte: 24 },
+                SsaOp::LoadField { byte: 32 },
+                SsaOp::Bytecode(Op::ReturnValue),
+            ]
+        );
+        // The second read consumes the first holder.
+        let header = ssa.blocks[0].instrs[0]
+            .result
+            .expect("the holder is a value");
+        assert_eq!(ssa.blocks[0].instrs[3].inputs.as_slice(), [header]);
+
+        ssa.verify(&cfg, &DominatorTree::compute(&cfg))
+            .expect("the eliminated graph verifies");
     }
 
     #[test]
@@ -203,7 +411,7 @@ mod tests {
             receiver_shape: 7,
             value_byte: 24,
         }]);
-        ssa.blocks[0].instrs.remove(0);
+        ssa.blocks[0].instrs.remove(1);
         assert_eq!(
             ssa.verify(&cfg, &DominatorTree::compute(&cfg)),
             Err(SsaError::LoadFieldWithoutCheckShape { pc: 0 })

@@ -64,16 +64,22 @@ pub struct ValueId(pub u32);
 pub enum SsaOp {
     /// A bytecode opcode carried whole.
     Bytecode(Op),
-    /// Prove the instruction's sole input still carries hidden class `shape`.
+    /// Prove the sole input is a heap cell carrying an ordinary object body and
+    /// produce that body's `GcHeader` address.
     ///
-    /// The check owns no result value: it hands the receiver's object header to
-    /// the [`Self::LoadField`] that must immediately follow it.
+    /// The address is an ordinary SSA value the allocator places, so a guard and
+    /// a read that share a holder need not be adjacent and a pass may delete a
+    /// second derivation of the same one. It is a raw interior pointer: no
+    /// interpreter register names it, so it never reaches a frame state, and it
+    /// may not live across a safepoint, where a moving collection would leave it
+    /// stale.
+    LoadHeader,
+    /// Prove the holder its input names still carries hidden class `shape`.
     CheckShape {
-        /// Hidden-class handle the receiver must still carry.
+        /// Hidden-class handle the holder must still carry.
         shape: u32,
     },
-    /// Read the own data slot at `byte` from the receiver a dominating
-    /// [`Self::CheckShape`] proved.
+    /// Read the own data slot at `byte` from the holder its input names.
     LoadField {
         /// Byte offset of the slot in the holder's value slab.
         byte: u32,
@@ -86,8 +92,14 @@ impl SsaOp {
     pub const fn bytecode(self) -> Option<Op> {
         match self {
             Self::Bytecode(op) => Some(op),
-            Self::CheckShape { .. } | Self::LoadField { .. } => None,
+            Self::LoadHeader | Self::CheckShape { .. } | Self::LoadField { .. } => None,
         }
+    }
+
+    /// Whether this node consumes a [`Self::LoadHeader`] address.
+    #[must_use]
+    pub const fn reads_header(self) -> bool {
+        matches!(self, Self::CheckShape { .. } | Self::LoadField { .. })
     }
 }
 
@@ -496,10 +508,22 @@ pub enum SsaError {
         /// Block containing the non-canonical head sequence.
         block: BlockId,
     },
-    /// A field load is not preceded by the shape check that proves its holder.
+    /// A field load has no dominating shape check over its holder.
     LoadFieldWithoutCheckShape {
         /// Instruction owning the unproven load.
         pc: u32,
+    },
+    /// A holder address reaches something other than a guard or a field read in
+    /// its own block.
+    HeaderEscapes {
+        /// Holder value used outside the vocabulary.
+        value: ValueId,
+    },
+    /// A holder address is live across an instruction that may collect, where a
+    /// moving collection would leave the raw address stale.
+    HeaderCrossesSafepoint {
+        /// Holder value that would go stale.
+        value: ValueId,
     },
     /// A primitive node's operands, result, or immediate are not well formed.
     MalformedPrimitive {
@@ -1304,33 +1328,46 @@ impl SsaFunction {
             for (instruction_index, instruction) in block.instrs.iter().enumerate() {
                 match instruction.op {
                     SsaOp::Bytecode(_) => {}
-                    // A shape check reads exactly the receiver it proves,
-                    // writes no register, and can never match the empty-class
-                    // sentinel.
-                    SsaOp::CheckShape { shape } => {
-                        if shape == 0
-                            || instruction.inputs.len() != 1
-                            || instruction.result.is_some()
+                    // A holder address takes the receiver and writes no
+                    // interpreter register.
+                    SsaOp::LoadHeader => {
+                        if instruction.inputs.len() != 1
+                            || instruction.result.is_none()
                             || instruction.result_register.is_some()
                         {
                             return Err(SsaError::MalformedPrimitive { pc: instruction.pc });
                         }
                     }
-                    // The load reads the holder the check resolved, so the
-                    // check on the same receiver must immediately precede it.
-                    SsaOp::LoadField { .. } => {
-                        if instruction.inputs.len() != 1 || instruction.result.is_none() {
+                    // A shape check reads exactly the holder it proves, writes
+                    // nothing, and can never match the empty-class sentinel.
+                    SsaOp::CheckShape { shape } => {
+                        if shape == 0
+                            || instruction.inputs.len() != 1
+                            || !instruction.input_registers.is_empty()
+                            || instruction.result.is_some()
+                            || instruction.result_register.is_some()
+                            || !self.defines_header(instruction.inputs[0])
+                        {
                             return Err(SsaError::MalformedPrimitive { pc: instruction.pc });
                         }
-                        let proven = instruction_index
-                            .checked_sub(1)
-                            .and_then(|previous| block.instrs.get(previous))
-                            .is_some_and(|previous| {
-                                matches!(previous.op, SsaOp::CheckShape { .. })
-                                    && previous.pc == instruction.pc
-                                    && previous.inputs.first() == instruction.inputs.first()
-                            });
-                        if !proven {
+                    }
+                    // The read trusts a proven hidden class, so a check over
+                    // the same holder must dominate it.
+                    SsaOp::LoadField { .. } => {
+                        if instruction.inputs.len() != 1
+                            || !instruction.input_registers.is_empty()
+                            || instruction.result.is_none()
+                            || instruction.result_register.is_none()
+                            || !self.defines_header(instruction.inputs[0])
+                        {
+                            return Err(SsaError::MalformedPrimitive { pc: instruction.pc });
+                        }
+                        if !self.header_is_checked(
+                            full_dom,
+                            block_id,
+                            instruction_index,
+                            instruction.inputs[0],
+                        ) {
                             return Err(SsaError::LoadFieldWithoutCheckShape {
                                 pc: instruction.pc,
                             });
@@ -1343,7 +1380,11 @@ impl SsaFunction {
                     && self.frames[instruction.inline.0 as usize]
                         .this_value
                         .is_some_and(|value| instruction.inputs.as_slice() == [value]);
-                if !synthetic_this && instruction.input_registers.len() != instruction.inputs.len()
+                // A holder address is not a register read, so a node that
+                // consumes one has one operand and no source register.
+                if !synthetic_this
+                    && !instruction.op.reads_header()
+                    && instruction.input_registers.len() != instruction.inputs.len()
                 {
                     return Err(SsaError::InputRegisterCountMismatch {
                         pc: instruction.pc,
@@ -1354,7 +1395,18 @@ impl SsaFunction {
                 for &register in &instruction.input_registers {
                     check_register(Some(instruction.pc), register, self.register_count)?;
                 }
-                if instruction.result.is_some() != instruction.result_register.is_some() {
+                if instruction.op == SsaOp::LoadHeader {
+                    let header = instruction
+                        .result
+                        .expect("a holder address is checked above to have a result");
+                    self.verify_header_liveness(block, instruction_index, header)?;
+                }
+                // A holder address is the one result no interpreter register
+                // names; every other result is a register write.
+                if instruction.result.is_some()
+                    != (instruction.result_register.is_some()
+                        || instruction.op == SsaOp::LoadHeader)
+                {
                     return Err(SsaError::ResultRegisterMismatch { pc: instruction.pc });
                 }
                 if let Some(register) = instruction.result_register {
@@ -1517,6 +1569,178 @@ impl SsaFunction {
             .get(id.0 as usize)
             .ok_or(SsaError::ValueReferenceOutOfRange { value: id })
     }
+
+    /// A holder address is consumed only by the vocabulary that understands it,
+    /// only inside its own block, and never across a possible collection.
+    ///
+    /// It is a raw interior pointer with no interpreter register and no
+    /// safepoint root, so escaping any of those would make it observably stale.
+    fn verify_header_liveness(
+        &self,
+        block: &SsaBlock,
+        definition: usize,
+        header: ValueId,
+    ) -> Result<(), SsaError> {
+        for other in &self.blocks {
+            if other.instrs.iter().any(|instruction| {
+                instruction.inputs.contains(&header)
+                    && (other.id != block.id || !instruction.op.reads_header())
+            }) {
+                return Err(SsaError::HeaderEscapes { value: header });
+            }
+        }
+        for value in &self.values {
+            if matches!(
+                &value.def,
+                ValueDef::Phi { inputs, .. } | ValueDef::InlineResult { inputs, .. }
+                    if inputs.contains(&header)
+            ) {
+                return Err(SsaError::HeaderEscapes { value: header });
+            }
+        }
+        let Some(last_use) = block.instrs[definition + 1..]
+            .iter()
+            .rposition(|instruction| instruction.inputs.contains(&header))
+            .map(|offset| definition + 1 + offset)
+        else {
+            return Ok(());
+        };
+        if block.instrs[definition + 1..last_use]
+            .iter()
+            .any(|instruction| {
+                instruction
+                    .op
+                    .bytecode()
+                    .is_some_and(|op| opcode_schema(op).effects.safepoint_required)
+            })
+        {
+            return Err(SsaError::HeaderCrossesSafepoint { value: header });
+        }
+        Ok(())
+    }
+
+    /// Whether `value` is a holder address produced by [`SsaOp::LoadHeader`].
+    #[must_use]
+    pub fn defines_header(&self, value: ValueId) -> bool {
+        matches!(
+            self.values.get(value.0 as usize).map(|data| &data.def),
+            Some(ValueDef::Op {
+                op: SsaOp::LoadHeader,
+                ..
+            })
+        )
+    }
+
+    /// Whether a [`SsaOp::CheckShape`] over `header` dominates the instruction
+    /// at `index` in `block`.
+    fn header_is_checked(
+        &self,
+        full_dom: &DominatorTree,
+        block: BlockId,
+        index: usize,
+        header: ValueId,
+    ) -> bool {
+        let proves = |instruction: &SsaInstr| {
+            matches!(instruction.op, SsaOp::CheckShape { .. })
+                && instruction.inputs.first() == Some(&header)
+        };
+        if self.blocks[block.0 as usize].instrs[..index]
+            .iter()
+            .any(proves)
+        {
+            return true;
+        }
+        let mut current = full_dom.immediate_dominator(block);
+        while let Some(dominator) = current {
+            if self.blocks[dominator.0 as usize].instrs.iter().any(proves) {
+                return true;
+            }
+            current = full_dom.immediate_dominator(dominator);
+        }
+        false
+    }
+
+    /// Reassign dense value identities to the canonical construction order.
+    ///
+    /// A pass that creates or deletes a definition cannot know the identities
+    /// the graph must take: they are dense and ordered by normal-edge block RPO,
+    /// block-head definitions before instruction results. This restores that
+    /// order over whatever definition sites the graph now has and rewrites every
+    /// reference to match.
+    pub fn renumber_values(&mut self, cfg: &ControlFlowGraph) {
+        let normal_dom = DominatorTree::compute_normal(cfg);
+        let mut mapping = vec![None; self.values.len()];
+        let mut next = 0_u32;
+        for &block in normal_dom.reverse_postorder() {
+            let ssa_block = &self.blocks[block.0 as usize];
+            for &value in &ssa_block.phis {
+                mapping[value.0 as usize] = Some(ValueId(next));
+                next += 1;
+            }
+            for instruction in &ssa_block.instrs {
+                if let Some(value) = instruction.result {
+                    mapping[value.0 as usize] = Some(ValueId(next));
+                    next += 1;
+                }
+            }
+        }
+        if mapping
+            .iter()
+            .zip(0..)
+            .all(|(mapped, index)| *mapped == Some(ValueId(index)))
+        {
+            return;
+        }
+
+        let mut placed: Vec<Option<ValueData>> = vec![None; next as usize];
+        for mut data in std::mem::take(&mut self.values) {
+            let Some(id) = mapping[data.id.0 as usize] else {
+                // A value whose definition site no longer exists goes with it.
+                continue;
+            };
+            data.id = id;
+            match &mut data.def {
+                ValueDef::InlineResult { inputs, .. }
+                | ValueDef::Phi { inputs, .. }
+                | ValueDef::Op { inputs, .. } => {
+                    for input in inputs.iter_mut() {
+                        *input = remap(&mapping, *input);
+                    }
+                }
+                ValueDef::Param { .. }
+                | ValueDef::Uninitialized { .. }
+                | ValueDef::InlineUndefinedReturn { .. }
+                | ValueDef::ExceptionInput { .. } => {}
+            }
+            placed[id.0 as usize] = Some(data);
+        }
+        self.values = placed
+            .into_iter()
+            .map(|data| data.expect("every dense identity has a definition"))
+            .collect();
+        for block in &mut self.blocks {
+            for value in &mut block.phis {
+                *value = remap(&mapping, *value);
+            }
+            for instruction in &mut block.instrs {
+                for input in &mut instruction.inputs {
+                    *input = remap(&mapping, *input);
+                }
+                if let Some(result) = &mut instruction.result {
+                    *result = remap(&mapping, *result);
+                }
+            }
+        }
+        for frame in &mut self.frames {
+            if let Some(value) = &mut frame.this_value {
+                *value = remap(&mapping, *value);
+            }
+        }
+    }
+}
+
+fn remap(mapping: &[Option<ValueId>], value: ValueId) -> ValueId {
+    mapping[value.0 as usize].expect("every referenced value keeps a definition site")
 }
 
 fn register_flow(

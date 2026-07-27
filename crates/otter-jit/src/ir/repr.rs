@@ -75,6 +75,9 @@ pub enum ConversionKind {
     CheckedTaggedToInt32,
     /// Guard and unbox a tagged value as a `Float64` number.
     CheckedTaggedToFloat64,
+    /// Narrow a `Float64` that holds an exact int32 value; a fractional,
+    /// out-of-range, NaN, or negative-zero value deoptimizes.
+    CheckedFloat64ToInt32,
     /// Widen an `Int32` to `Float64` without loss.
     Int32ToFloat64,
     /// Box an `Int32` as a tagged VM value.
@@ -790,6 +793,9 @@ fn conversion_kind(from: Representation, to: Representation) -> Option<(Conversi
         (Representation::Tagged, Representation::Float64) => {
             Some((ConversionKind::CheckedTaggedToFloat64, true))
         }
+        (Representation::Float64, Representation::Int32) => {
+            Some((ConversionKind::CheckedFloat64ToInt32, true))
+        }
         (Representation::Int32, Representation::Float64) => {
             Some((ConversionKind::Int32ToFloat64, false))
         }
@@ -823,6 +829,8 @@ fn verified_conversion_kind(
         Some((ConversionKind::CheckedTaggedToInt32, true))
     } else if from == Representation::Tagged && to == Representation::Float64 {
         Some((ConversionKind::CheckedTaggedToFloat64, true))
+    } else if from == Representation::Float64 && to == Representation::Int32 {
+        Some((ConversionKind::CheckedFloat64ToInt32, true))
     } else if from == Representation::Int32 && to == Representation::Float64 {
         Some((ConversionKind::Int32ToFloat64, false))
     } else if from == Representation::Int32 && to == Representation::Tagged {
@@ -1218,6 +1226,50 @@ mod tests {
                 && !conversion.may_deopt
         }));
         assert_eq!(widen_map.verify(&widen_view, &widen_ssa), Ok(()));
+    }
+
+    /// A `Float64` value feeding an int32-proven site narrows through a checked
+    /// conversion instead of declining the function.
+    #[test]
+    fn records_checked_float64_narrowing() {
+        let (view, ssa) = build(
+            0,
+            4,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(5)]),
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(2)]),
+                (
+                    Op::Div,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::BitwiseAnd,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(2),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnUndefined, vec![]),
+            ],
+            &[(2, ARITH_FLOAT64), (3, ARITH_INT32)],
+        );
+        let map = ReprMap::compute(&view, &ssa);
+        assert_eq!(
+            map.representation(op_value_at(&ssa, 2)),
+            Representation::Float64
+        );
+        assert!(map.conversions().iter().any(|conversion| {
+            conversion.at_pc == 3
+                && conversion.operand_index == 0
+                && conversion.kind == ConversionKind::CheckedFloat64ToInt32
+                && conversion.may_deopt
+        }));
+        assert_eq!(map.verify(&view, &ssa), Ok(()));
     }
 
     #[test]

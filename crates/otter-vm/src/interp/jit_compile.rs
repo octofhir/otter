@@ -349,7 +349,7 @@ impl Interpreter {
             context,
             fid,
             jit_debug::JitDebugTier::Optimizing,
-            false,
+            true,
         );
         self.bake_guarded_method_calls(&mut snapshot);
         self.bake_element_accesses(&mut snapshot);

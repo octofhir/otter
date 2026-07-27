@@ -25,6 +25,16 @@
 #![allow(unused_imports)]
 use crate::*;
 
+/// Deoptimizations one exit site absorbs before its generation is discarded
+/// and rebuilt against the feedback those bails refined. A body that bails
+/// occasionally across many sites never trips this; a per-iteration bail
+/// loop trips it in milliseconds.
+const OPTIMIZED_SITE_BAIL_REOPT_THRESHOLD: u32 = 100;
+
+/// Rebuilds a function is granted before its installed body is accepted as
+/// the best this feedback produces.
+const MAX_OPTIMIZED_REOPTIMIZATIONS: u32 = 3;
+
 #[derive(Debug, Default)]
 struct GeneratedFunctionFeedback {
     entries: u64,
@@ -269,12 +279,7 @@ impl Interpreter {
                 .optimized_osr_entries
                 .saturating_add(1);
             if let jit::JitExecOutcome::Bailed(resume_pc) = outcome {
-                self.jit_runtime_stats.optimized_deopts =
-                    self.jit_runtime_stats.optimized_deopts.saturating_add(1);
-                self.jit_optimized_bail_pcs
-                    .entry(fid)
-                    .or_default()
-                    .insert(resume_pc);
+                self.note_jit_optimized_bail(fid, resume_pc);
             }
             (outcome, true)
         } else {
@@ -447,6 +452,60 @@ impl Interpreter {
         }
     }
 
+    /// Record one optimizing-tier deoptimization and self-correct the
+    /// speculation that caused it.
+    ///
+    /// The resume PC joins the function's speculation-failure record, which
+    /// the next compile reads back. One exit site bailing repeatedly is a
+    /// wrong speculation in a loop: the interpreter has been refining the
+    /// site's feedback on every bail, so the optimizing generation — and only
+    /// it — is discarded and the next hot entry recompiles against what
+    /// execution actually does. Callers that bound the discarded entry
+    /// directly drop with it; the function's template generation survives.
+    /// Past [`MAX_OPTIMIZED_REOPTIMIZATIONS`] rebuilds the installed body is
+    /// the best this feedback produces and stays.
+    fn note_jit_optimized_bail(&mut self, fid: u32, resume_pc: u32) {
+        self.jit_runtime_stats.optimized_deopts =
+            self.jit_runtime_stats.optimized_deopts.saturating_add(1);
+        self.jit_optimized_bail_pcs
+            .entry(fid)
+            .or_default()
+            .insert(resume_pc);
+        let reopts = self
+            .jit_optimized_reopt_counts
+            .get(&fid)
+            .copied()
+            .unwrap_or(0);
+        if reopts >= MAX_OPTIMIZED_REOPTIMIZATIONS {
+            return;
+        }
+        let bails = self
+            .jit_optimized_bail_counts
+            .entry((fid, resume_pc))
+            .or_insert(0);
+        *bails = bails.saturating_add(1);
+        if *bails < OPTIMIZED_SITE_BAIL_REOPT_THRESHOLD {
+            return;
+        }
+        self.jit_optimized_reopt_counts.insert(fid, reopts + 1);
+        self.jit_optimized_bail_counts
+            .retain(|&(counted_fid, _), _| counted_fid != fid);
+        let dependents = match self.jit_optimized_code.get(&fid) {
+            Some(Some(code)) => self
+                .jit_code_registry
+                .invalidate_code_object(code.metadata().id),
+            _ => Vec::new(),
+        };
+        self.jit_optimized_code.remove(&fid);
+        self.jit_optimized_declined_epoch.remove(&fid);
+        self.jit_optimized_code_cache = None;
+        let dependents: Vec<u32> = dependents
+            .into_iter()
+            .filter(|&dependent| dependent != fid)
+            .collect();
+        self.discard_invalidated_jit_state(&dependents);
+    }
+
     /// Remove cache/map ownership for every function whose installed code was
     /// invalidated.
     ///
@@ -467,6 +526,8 @@ impl Interpreter {
             self.jit_entry_bail_counts.remove(&fid);
             self.jit_optimized_declined_epoch.remove(&fid);
         }
+        self.jit_optimized_bail_counts
+            .retain(|&(counted_fid, _), _| !affected.contains(&counted_fid));
         self.jit_osr_code
             .retain(|(fid, _), _| !affected.contains(fid));
         self.jit_osr_disabled
@@ -615,12 +676,7 @@ impl Interpreter {
         let activation = VmRuntimeActivation::new(self, stack, context, top_idx);
         let outcome = code.run_optimized_entry(activation)?;
         if let jit::JitExecOutcome::Bailed(resume_pc) = outcome {
-            self.jit_runtime_stats.optimized_deopts =
-                self.jit_runtime_stats.optimized_deopts.saturating_add(1);
-            self.jit_optimized_bail_pcs
-                .entry(fid)
-                .or_default()
-                .insert(resume_pc);
+            self.note_jit_optimized_bail(fid, resume_pc);
         }
         Some(outcome)
     }

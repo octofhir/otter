@@ -312,6 +312,7 @@ impl Interpreter {
         );
         self.bake_guarded_method_calls(&mut snapshot);
         self.bake_element_accesses(&mut snapshot);
+        self.bake_property_loads(&mut snapshot);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
         });
@@ -465,6 +466,7 @@ impl Interpreter {
         );
         self.bake_guarded_method_calls(&mut view);
         self.bake_element_accesses(&mut view);
+        self.bake_property_loads(&mut view);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
         });
@@ -539,6 +541,49 @@ impl Interpreter {
             length_byte: header + crate::array::ARRAY_BODY_LENGTH_OFFSET as u32,
         };
         view.cage_base = otter_gc::cage_base() as usize;
+    }
+
+    /// Describe every property-load site whose receiver shape has settled.
+    ///
+    /// The site's own-data feedback is the declaration: a shape handle and a
+    /// slot. Generated code then compares against that shape as an immediate
+    /// and reads a fixed slab offset, so the settled site never loads its
+    /// cache cell or walks the cell's ways. A receiver that stops matching
+    /// misses to the same window transition, which re-patches the cell.
+    pub(crate) fn bake_property_loads(&mut self, view: &mut jit::JitCompileSnapshot) {
+        const SLOT_BYTES: u32 =
+            std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
+        let sites: Vec<_> = view
+            .instructions
+            .iter()
+            .filter(|instr| instr.op(&view.code_block) == Op::LoadProperty)
+            .filter(|instr| !instr.load_array_length)
+            .map(|instr| (instr.byte_pc, instr.property_ic_site(&view.code_block)))
+            .collect();
+        for (byte_pc, site) in sites {
+            let Some(site) = site else { continue };
+            self.publish_property_feedback(site, crate::property_ic::PropertyIcKind::Load);
+            let Some(crate::feedback::PropertyFeedbackState::MonomorphicOwnData { shape_id, slot }) =
+                self.property_feedback_state(site, crate::property_ic::PropertyIcKind::Load)
+            else {
+                continue;
+            };
+            let Some(shape) = self.shape_runtime.handle_for_id(shape_id) else {
+                continue;
+            };
+            let receiver_shape = shape.offset();
+            // An empty shape token never matches a live receiver.
+            if receiver_shape == 0 {
+                continue;
+            }
+            view.property_loads.insert(
+                byte_pc,
+                jit::JitInlinePropertyLoad {
+                    receiver_shape,
+                    value_byte: u32::from(slot) * SLOT_BYTES,
+                },
+            );
+        }
     }
 
     /// Describe how each `LoadElement` / `StoreElement` site addresses its

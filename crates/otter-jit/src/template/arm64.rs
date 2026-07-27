@@ -676,6 +676,7 @@ pub(super) fn compile(
                     array_length,
                     cell_addr,
                     cell_ordinal,
+                    view.property_loads.get(&instr.byte_pc),
                     &mut boxed_slot_slow_paths,
                     threw,
                 )?;

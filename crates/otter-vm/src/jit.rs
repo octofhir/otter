@@ -158,6 +158,10 @@ pub struct JitCompileSnapshot {
     /// once at compile time from `otter-vm`'s `#[repr(C)]` body layouts so the
     /// emitter stays layout-agnostic.
     pub array_layout: JitArrayLayout,
+    /// Property-load sites whose receiver shape and own slot are settled,
+    /// keyed by byte-PC. Generated code compares against the shape directly
+    /// instead of loading the site's cache cell.
+    pub property_loads: rustc_hash::FxHashMap<u32, JitInlinePropertyLoad>,
     /// How the indexed-element program addresses each site's receiver, keyed by
     /// the site's byte-PC. Generated code reads only this; the family's body
     /// layout never reaches the emitter, so a second element-bearing family
@@ -771,6 +775,24 @@ pub struct JitElementAccess {
     pub element: JitElementRepr,
 }
 
+/// One property site whose receiver shape and own slot the compile snapshot
+/// already knows.
+///
+/// The runtime cache cell exists because a site's shape can change after the
+/// code is generated. A site the profile has settled on does not need it: the
+/// shape is a compile-time constant, so the probe compares against an
+/// immediate and reads a fixed slab offset instead of loading the cell and
+/// walking its ways. A receiver that stops matching misses to the same window
+/// transition the cell walk would have, which re-patches the cell and lets the
+/// next compile re-bake.
+#[derive(Debug, Clone, Copy)]
+pub struct JitInlinePropertyLoad {
+    /// Guarded receiver shape handle offset.
+    pub receiver_shape: u32,
+    /// Byte offset of the slot inside the receiver's own value slab.
+    pub value_byte: u32,
+}
+
 /// Ready-to-use byte offsets and tags for inline primitive string fast paths.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JitStringLayout {
@@ -935,6 +957,7 @@ impl JitCompileSnapshot {
             inline_methods: rustc_hash::FxHashMap::default(),
             inline_poly_methods: rustc_hash::FxHashMap::default(),
             guarded_method_calls: rustc_hash::FxHashMap::default(),
+            property_loads: rustc_hash::FxHashMap::default(),
             safepoints: rustc_hash::FxHashMap::default(),
         }
     }

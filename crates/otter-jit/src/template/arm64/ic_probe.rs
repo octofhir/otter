@@ -148,6 +148,7 @@ pub(crate) fn emit_property_ic_load<R>(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
+    settled: Option<&otter_vm::JitInlinePropertyLoad>,
     load_receiver: R,
     cell_addr: usize,
     cell_ordinal: u32,
@@ -180,25 +181,44 @@ where
         ; ldr w14, [x13, shape_byte] // receiver shape handle
         ; cbz w14, =>miss          // empty-cell sentinel
     );
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        15,
-        cell_addr as u64,
-        RelocationTarget::PropertyIcCell {
-            access: crate::artifact::relocation::PropertyIcAccess::Load,
-            ordinal: cell_ordinal,
-        },
-    );
-    let do_load = ops.new_dynamic_label();
-    emit_way_walk(ops, do_load, miss);
-    emit_resolve_holder(ops, relocations, view, miss);
-    super::values::emit_slab_base(ops, view, 13, 14);
-    dynasm!(ops
-        ; .arch aarch64
-        ; cbz x13, =>miss
-        ; ldr w9, [x13, x17]       // 4-byte compressed slot
-    );
+    if let Some(settled) = settled {
+        // The shape is a compile-time constant, so the guard is one compare
+        // against an immediate and the slot is a fixed offset: no cell load,
+        // no way walk, no prototype hop.
+        emit_load_u64(ops, 12, u64::from(settled.receiver_shape));
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp w14, w12
+            ; b.ne =>miss
+        );
+        super::values::emit_slab_base(ops, view, 13, 14);
+        let value_byte = settled.value_byte;
+        dynasm!(ops
+            ; .arch aarch64
+            ; cbz x13, =>miss
+            ; ldr w9, [x13, value_byte]
+        );
+    } else {
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            15,
+            cell_addr as u64,
+            RelocationTarget::PropertyIcCell {
+                access: crate::artifact::relocation::PropertyIcAccess::Load,
+                ordinal: cell_ordinal,
+            },
+        );
+        let do_load = ops.new_dynamic_label();
+        emit_way_walk(ops, do_load, miss);
+        emit_resolve_holder(ops, relocations, view, miss);
+        super::values::emit_slab_base(ops, view, 13, 14);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cbz x13, =>miss
+            ; ldr w9, [x13, x17]       // 4-byte compressed slot
+        );
+    }
     let boxed_entry = ops.new_dynamic_label();
     let continuation = ops.new_dynamic_label();
     boxed_slot_slow_paths.push(super::values::BoxedSlotSlowPath {

@@ -1333,6 +1333,11 @@ fn emit(
                     // neither allocates nor calls, so it needs no safepoint, no
                     // frame materialize, and no reload — the receiver pointer is
                     // re-derived from its rooted location every access.
+                    let property_byte_pc = tree.frames[instruction.inline.0 as usize]
+                        .instructions
+                        .get(instruction.pc as usize)
+                        .map(|metadata| metadata.byte_pc)
+                        .ok_or(Unsupported::OperandShape("optimizing property byte PC"))?;
                     if view.cage_base != 0 {
                         // `.length` on a dense array or a primitive string is
                         // not an own data slot, so no cache program describes
@@ -1360,6 +1365,9 @@ fn emit(
                             &mut ops,
                             &mut relocations,
                             view,
+                            (instruction.inline == InlineId::ROOT)
+                                .then(|| view.property_loads.get(&property_byte_pc))
+                                .flatten(),
                             |ops, register| {
                                 emit_load_tagged_location(
                                     ops,

@@ -19,7 +19,6 @@
 //! - [`compile_optimized`] — whole-pipeline compilation entry point.
 //! - [`OptimizedCode`] — executable code plus deopt and allocation metadata.
 //! - `cranelift` — restartable, call-free Number leaves.
-//! - `loop_versioning` — safe speculative invariant property-load planning.
 //! - `pipeline` / `unit` — backend-neutral orchestration and its owned,
 //!   verified analysis product.
 //!
@@ -68,7 +67,6 @@ mod arm64;
 mod artifact;
 #[cfg(target_arch = "aarch64")]
 mod cranelift;
-pub(crate) mod loop_versioning;
 pub(crate) mod pipeline;
 pub(crate) mod unit;
 

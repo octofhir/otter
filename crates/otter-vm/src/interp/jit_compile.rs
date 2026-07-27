@@ -354,6 +354,11 @@ impl Interpreter {
         self.bake_guarded_method_calls(&mut snapshot);
         self.bake_element_accesses(&mut snapshot);
         self.bake_property_loads(&mut snapshot);
+        snapshot.optimized_bail_pcs = self
+            .jit_optimized_bail_pcs
+            .get(&fid)
+            .cloned()
+            .unwrap_or_default();
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
         });

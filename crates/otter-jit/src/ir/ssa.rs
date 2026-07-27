@@ -95,6 +95,13 @@ pub enum SsaOp {
         /// Byte offset of the slot in the holder's value slab.
         byte: u32,
     },
+    /// Bind a value computed before this site to the register the site writes.
+    ///
+    /// What the site computes moved somewhere that dominates it — out of a loop
+    /// it cannot change. The assignment stays here, so every frame state and
+    /// every later read still finds the value in the register the interpreter
+    /// would have written at this PC.
+    Reuse,
 }
 
 impl SsaOp {
@@ -106,7 +113,8 @@ impl SsaOp {
             Self::LoadHeader
             | Self::CheckShape { .. }
             | Self::LoadField { .. }
-            | Self::StoreField { .. } => None,
+            | Self::StoreField { .. }
+            | Self::Reuse => None,
         }
     }
 
@@ -117,6 +125,22 @@ impl SsaOp {
             self,
             Self::CheckShape { .. } | Self::LoadField { .. } | Self::StoreField { .. }
         )
+    }
+
+    /// How many leading inputs name no interpreter register.
+    ///
+    /// A holder address and a value bound from elsewhere are values a pass
+    /// created, not operands the bytecode read, so a node taking them keeps a
+    /// source register only for the operands after them.
+    #[must_use]
+    pub const fn synthetic_inputs(self) -> usize {
+        match self {
+            Self::Bytecode(_) | Self::LoadHeader => 0,
+            Self::CheckShape { .. }
+            | Self::LoadField { .. }
+            | Self::StoreField { .. }
+            | Self::Reuse => 1,
+        }
     }
 }
 
@@ -1351,6 +1375,17 @@ impl SsaFunction {
             for (instruction_index, instruction) in block.instrs.iter().enumerate() {
                 match instruction.op {
                     SsaOp::Bytecode(_) => {}
+                    // A rebound value names no register of its own; the site
+                    // it stands for still writes one.
+                    SsaOp::Reuse => {
+                        if instruction.inputs.len() != 1
+                            || !instruction.input_registers.is_empty()
+                            || instruction.result.is_none()
+                            || instruction.result_register.is_none()
+                        {
+                            return Err(SsaError::MalformedPrimitive { pc: instruction.pc });
+                        }
+                    }
                     // A holder address takes the receiver and writes no
                     // interpreter register.
                     SsaOp::LoadHeader => {
@@ -1408,8 +1443,10 @@ impl SsaFunction {
                 // A holder address is not a register read, so a node that
                 // consumes one keeps a source register for every operand but
                 // the holder.
-                let operand_registers = instruction.inputs.len()
-                    - usize::from(instruction.op.reads_header() && !instruction.inputs.is_empty());
+                let operand_registers = instruction
+                    .inputs
+                    .len()
+                    .saturating_sub(instruction.op.synthetic_inputs());
                 if !synthetic_this && instruction.input_registers.len() != operand_registers {
                     return Err(SsaError::InputRegisterCountMismatch {
                         pc: instruction.pc,
@@ -1610,7 +1647,7 @@ impl SsaFunction {
         for other in &self.blocks {
             if other.instrs.iter().any(|instruction| {
                 instruction.inputs.contains(&header)
-                    && (other.id != block.id || !instruction.op.reads_header())
+                    && (other.id != block.id || instruction.op.synthetic_inputs() == 0)
             }) {
                 return Err(SsaError::HeaderEscapes { value: header });
             }

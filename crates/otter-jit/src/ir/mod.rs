@@ -6,6 +6,7 @@
 //! - [`deopt_lower`] — concrete exact-PC interpreter-frame reconstruction.
 //! - [`frame_state`] — abstract exact-PC interpreter-frame reconstruction.
 //! - [`inline`] — verified splice decision over monomorphic call sites.
+//! - [`licm`] — settled accesses moved out of loops that cannot change them.
 //! - [`liveness`] — backward SSA-value liveness over normal control edges.
 //! - [`lower`] — bytecode nodes rewritten into the primitive guard vocabulary.
 //! - [`regalloc`] — backend-independent linear-scan SSA register allocation.
@@ -26,6 +27,7 @@ pub mod deopt_lower;
 pub mod dom;
 pub mod frame_state;
 pub mod inline;
+pub mod licm;
 pub mod liveness;
 pub mod lower;
 pub mod regalloc;

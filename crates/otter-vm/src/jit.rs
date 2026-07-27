@@ -166,6 +166,11 @@ pub struct JitCompileSnapshot {
     /// keyed by byte-PC. A store may not write through a prototype, so a
     /// settled store needs no hop check either.
     pub property_stores: rustc_hash::FxHashMap<u32, Vec<JitInlinePropertyLoad>>,
+    /// Logical PCs an earlier optimized generation of this function
+    /// deoptimized at. Moving a settled access out of a loop makes its guard
+    /// run on paths that would not have reached it, so a pass that would place
+    /// one at a PC already known to deoptimize leaves the loop alone instead.
+    pub optimized_bail_pcs: std::collections::BTreeSet<u32>,
     /// How the indexed-element program addresses each site's receiver, keyed by
     /// the site's byte-PC. Generated code reads only this; the family's body
     /// layout never reaches the emitter, so a second element-bearing family
@@ -966,6 +971,7 @@ impl JitCompileSnapshot {
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             property_loads: rustc_hash::FxHashMap::default(),
             property_stores: rustc_hash::FxHashMap::default(),
+            optimized_bail_pcs: std::collections::BTreeSet::new(),
             safepoints: rustc_hash::FxHashMap::default(),
         }
     }

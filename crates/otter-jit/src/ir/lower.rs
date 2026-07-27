@@ -224,8 +224,9 @@ pub fn eliminate_redundant_checks(ssa: &mut SsaFunction, cfg: &ControlFlowGraph,
                     proven.insert(header, shape);
                 }
                 // A settled write keeps the class it wrote through, and cannot
-                // move the object: both facts survive it.
-                SsaOp::LoadField { .. } | SsaOp::StoreField { .. } => {}
+                // move the object: both facts survive it. A rebound value
+                // touches nothing at all.
+                SsaOp::LoadField { .. } | SsaOp::StoreField { .. } | SsaOp::Reuse => {}
                 SsaOp::Bytecode(op) => {
                     // Anything that can run arbitrary code, allocate, or write
                     // the heap invalidates both a raw address and a proven

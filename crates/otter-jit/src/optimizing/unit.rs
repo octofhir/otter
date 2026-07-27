@@ -38,6 +38,10 @@ pub(crate) struct OptimizedUnit {
     pub(crate) allocation: Allocation,
     pub(crate) frame_states: FrameStateTable,
     pub(crate) deopt: DeoptLowering,
+    /// Loop headers whose invariant accesses were moved into a pre-header.
+    /// Entering such a loop by OSR would skip the block that computes them, so
+    /// this body offers no OSR entry there.
+    pub(crate) hoisted_loop_headers: std::collections::BTreeSet<crate::ir::cfg::BlockId>,
     pub(crate) linear_scan_spill_slot_count: u32,
     pub(crate) spill_slot_count: u32,
 }

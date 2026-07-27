@@ -1098,6 +1098,10 @@ pub struct Interpreter {
         rustc_hash::FxHashMap<u32, Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
     /// Single-entry cache over [`Self::jit_optimized_code`] for hot leaf calls.
     jit_optimized_code_cache: Option<(u32, std::sync::Arc<dyn jit::JitFunctionCode>)>,
+    /// Logical PCs each function's optimized code has deoptimized at. The
+    /// optimizing tier reads this back so a pass that speculates about where
+    /// execution reaches does not repeat a speculation that already failed.
+    jit_optimized_bail_pcs: std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>>,
     /// Feedback epoch at which a hot function last failed optimizing compilation.
     /// A back-edge only re-attempts the whole-body optimizer when the epoch has
     /// advanced, so a structurally-ineligible body is not recompiled on every hot

@@ -557,9 +557,10 @@ impl FrameStateTable {
                         .is_some_and(|value| instruction.inputs.as_slice() == [value]);
                 // A node that consumes a holder address keeps a source register
                 // for every operand but the holder, which names no register.
-                let operands = &instruction.inputs[usize::from(
-                    instruction.op.reads_header() && !instruction.inputs.is_empty(),
-                )..];
+                let operands = &instruction.inputs[instruction
+                    .op
+                    .synthetic_inputs()
+                    .min(instruction.inputs.len())..];
                 if !synthetic_this && instruction.input_registers.len() != operands.len() {
                     return Err(FrameStateError::OperandRegisterCountMismatch {
                         pc: instruction.pc,

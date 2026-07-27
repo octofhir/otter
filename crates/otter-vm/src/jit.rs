@@ -162,6 +162,10 @@ pub struct JitCompileSnapshot {
     /// keyed by byte-PC. Generated code compares against the shape directly
     /// instead of loading the site's cache cell.
     pub property_loads: rustc_hash::FxHashMap<u32, JitInlinePropertyLoad>,
+    /// Property-store sites whose receiver shape and own slot are settled,
+    /// keyed by byte-PC. A store may not write through a prototype, so a
+    /// settled store needs no hop check either.
+    pub property_stores: rustc_hash::FxHashMap<u32, JitInlinePropertyLoad>,
     /// How the indexed-element program addresses each site's receiver, keyed by
     /// the site's byte-PC. Generated code reads only this; the family's body
     /// layout never reaches the emitter, so a second element-bearing family
@@ -958,6 +962,7 @@ impl JitCompileSnapshot {
             inline_poly_methods: rustc_hash::FxHashMap::default(),
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             property_loads: rustc_hash::FxHashMap::default(),
+            property_stores: rustc_hash::FxHashMap::default(),
             safepoints: rustc_hash::FxHashMap::default(),
         }
     }

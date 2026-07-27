@@ -34,10 +34,10 @@ use super::ic_probe;
 use super::transitions::TransitionTable;
 use super::values::{
     BoxedSlotSlowPath, CellTest, emit_cell_test, emit_compress_slot_or_bail,
-    emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64, emit_slab_base,
+    emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64,
 };
 use crate::artifact::relocation::{PropertyIcAccess, RelocationCapture, RelocationTarget};
-use crate::entry::{OBJECT_BODY_TYPE_TAG, Unsupported, reg_offset};
+use crate::entry::{Unsupported, reg_offset};
 
 /// Emit `dst = obj.name` with the inline WhiskerIC probe.
 #[allow(clippy::too_many_arguments)]
@@ -157,6 +157,7 @@ pub(super) fn emit_store_property(
     site: u64,
     cell_addr: usize,
     cell_ordinal: u32,
+    settled: Option<&otter_vm::JitInlinePropertyLoad>,
     threw: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let cage_base = view.cage_base;
@@ -168,55 +169,21 @@ pub(super) fn emit_store_property(
     if cage_base != 0 {
         let obj_off = reg_offset(object)?;
         let src_off = reg_offset(value)?;
-        let shape_byte = view.object_shape_byte;
-        dynasm!(ops
-            ; .arch aarch64
-            ; ldr x9, [x19, obj_off]   // receiver Value
-        );
-        emit_cell_test(ops, 9, 11, CellTest::IsNotCell, miss);
-        dynasm!(ops
-            ; .arch aarch64
-            ; mov w12, w9              // low-32 Gc offset
-        );
-        emit_load_symbol_u64(
+        ic_probe::emit_property_ic_store_guard(
             ops,
             relocations,
-            13,
-            cage_base as u64,
-            RelocationTarget::GcCageBase,
-        );
-        dynasm!(ops
-            ; .arch aarch64
-            ; add x13, x13, x12        // x13 = GcHeader ptr
-            ; ldrb w14, [x13]
-            ; cmp w14, OBJECT_BODY_TYPE_TAG
-            ; b.ne =>miss
-            ; ldr w14, [x13, shape_byte] // receiver shape handle
-            ; cbz w14, =>miss
-        );
-        emit_load_symbol_u64(
-            ops,
-            relocations,
-            15,
-            cell_addr as u64,
-            RelocationTarget::PropertyIcCell {
-                access: PropertyIcAccess::Store,
-                ordinal: cell_ordinal,
+            view,
+            settled,
+            |ops, register| {
+                dynasm!(ops ; .arch aarch64 ; ldr X(register), [x19, obj_off]);
+                Ok(())
             },
-        );
-        let do_store = ops.new_dynamic_label();
-        ic_probe::emit_way_walk(ops, do_store, miss);
-        ic_probe::emit_refuse_prototype_hop(ops, miss);
+            cell_addr,
+            cell_ordinal,
+            miss,
+        )?;
         let store_prim = ops.new_dynamic_label();
-        dynasm!(ops
-            ; .arch aarch64
-            ; ldr x9, [x19, src_off]   // value to store
-        );
-        emit_slab_base(ops, view, 13, 14);
-        dynasm!(ops
-            ; .arch aarch64
-            ; cbz x13, =>miss
-        );
+        dynasm!(ops ; .arch aarch64 ; ldr x9, [x19, src_off]);
         emit_cell_test(ops, 9, 11, CellTest::IsNotCell, store_prim);
         dynasm!(ops
             ; .arch aarch64

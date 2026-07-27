@@ -703,6 +703,7 @@ pub(super) fn compile(
                     site,
                     cell_addr,
                     cell_ordinal,
+                    view.property_stores.get(&instr.byte_pc),
                     threw,
                 )?;
             }

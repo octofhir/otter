@@ -11,7 +11,8 @@
 //!   describe.
 //! - [`emit_element_address`] / [`emit_element_read`] / [`emit_element_write`]
 //!   — the indexed element access program.
-//! - [`emit_property_ic_load`] — the named-property cache probe.
+//! - [`emit_property_ic_load`] / [`emit_property_ic_store_guard`] — the
+//!   named-property cache probes.
 //! - [`emit_native_leaf_call`] — guard a callee's bootstrap identity and run
 //!   its declared leaf entry without materializing a frame.
 //! - [`emit_guarded_method_call`] — the same for `receiver.method(args…)`, over
@@ -228,6 +229,85 @@ where
     });
     super::values::emit_decompress_slot(ops, relocations, view.cage_base as u64, boxed_entry);
     dynasm!(ops ; .arch aarch64 ; =>continuation);
+    Ok(())
+}
+
+/// Prove a named-property store site's receiver and resolve its slot, leaving
+/// the holder's value slab in `x13` and the slot's byte offset in `x17`.
+///
+/// One program serves both tiers: the receiver is an ordinary object cell with
+/// a non-empty hidden class, the site's cache names a slot that the receiver
+/// itself owns — a store may not write through a prototype, so a program
+/// asking for the hop leaves the fast path — and the slab is present. A
+/// settled site compares its shape against an immediate and materializes a
+/// constant offset instead of loading the cell and walking its ways.
+///
+/// The caller owns everything after the slot is resolved: loading the value,
+/// choosing between the compressed primitive store and the pointer store, and
+/// running the generational write barrier. Those genuinely differ between the
+/// tiers; the guard does not.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_property_ic_store_guard<R>(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    settled: Option<&otter_vm::JitInlinePropertyLoad>,
+    load_receiver: R,
+    cell_addr: usize,
+    cell_ordinal: u32,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported>
+where
+    R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
+{
+    let shape_byte = view.object_shape_byte;
+    load_receiver(ops, 9)?;
+    super::values::emit_cell_test(ops, 9, 11, super::values::CellTest::IsNotCell, miss);
+    dynasm!(ops
+        ; .arch aarch64
+        ; mov w12, w9              // low-32 Gc offset
+    );
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        13,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; add x13, x13, x12        // x13 = GcHeader ptr
+        ; ldrb w14, [x13]
+        ; cmp w14, OBJECT_BODY_TYPE_TAG
+        ; b.ne =>miss
+        ; ldr w14, [x13, shape_byte] // receiver shape handle
+        ; cbz w14, =>miss
+    );
+    if let Some(settled) = settled {
+        emit_load_u64(ops, 12, u64::from(settled.receiver_shape));
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp w14, w12
+            ; b.ne =>miss
+        );
+        emit_load_u64(ops, 17, u64::from(settled.value_byte));
+    } else {
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            15,
+            cell_addr as u64,
+            RelocationTarget::PropertyIcCell {
+                access: crate::artifact::relocation::PropertyIcAccess::Store,
+                ordinal: cell_ordinal,
+            },
+        );
+        let do_store = ops.new_dynamic_label();
+        emit_way_walk(ops, do_store, miss);
+        emit_refuse_prototype_hop(ops, miss);
+    }
+    super::values::emit_slab_base(ops, view, 13, 14);
+    dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);
     Ok(())
 }
 

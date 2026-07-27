@@ -1497,49 +1497,30 @@ fn emit(
                     // write barrier through the window (receiver and value are
                     // staged into their slots first). Wide primitives and every
                     // failed guard take the window transition.
+                    let store_byte_pc = tree.frames[instruction.inline.0 as usize]
+                        .instructions
+                        .get(instruction.pc as usize)
+                        .map(|metadata| metadata.byte_pc)
+                        .ok_or(Unsupported::OperandShape("optimizing property byte PC"))?;
                     if view.cage_base != 0 {
-                        let shape_byte = view.object_shape_byte;
-                        emit_load_tagged_location(
-                            &mut ops,
-                            allocation.location(instruction.inputs[0]),
-                            9,
-                        )?;
-                        emit_cell_test(&mut ops, 9, 11, CellTest::IsNotCell, miss);
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; mov w12, w9              // low-32 Gc offset
-                        );
-                        emit_load_symbolic_u64(
+                        ic_probe::emit_property_ic_store_guard(
                             &mut ops,
                             &mut relocations,
-                            13,
-                            view.cage_base as u64,
-                            RelocationTarget::GcCageBase,
-                        );
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; add x13, x13, x12
-                            ; ldrb w14, [x13]
-                            ; cmp w14, OBJECT_BODY_TYPE_TAG
-                            ; b.ne =>miss
-                            ; ldr w14, [x13, shape_byte]
-                            ; cbz w14, =>miss
-                        );
-                        emit_load_symbolic_u64(
-                            &mut ops,
-                            &mut relocations,
-                            15,
-                            cell_addr as u64,
-                            RelocationTarget::PropertyIcCell {
-                                access: PropertyIcAccess::Store,
-                                ordinal: cell_ordinal,
+                            view,
+                            (instruction.inline == InlineId::ROOT)
+                                .then(|| view.property_stores.get(&store_byte_pc))
+                                .flatten(),
+                            |ops, register| {
+                                emit_load_tagged_location(
+                                    ops,
+                                    allocation.location(instruction.inputs[0]),
+                                    register,
+                                )
                             },
-                        );
-                        let do_store = ops.new_dynamic_label();
-                        ic_probe::emit_way_walk(&mut ops, do_store, miss);
-                        ic_probe::emit_refuse_prototype_hop(&mut ops, miss);
-                        crate::template::arm64::values::emit_slab_base(&mut ops, view, 13, 14);
-                        dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);
+                            cell_addr,
+                            cell_ordinal,
+                            miss,
+                        )?;
                         // Boxed value bits into x9, whatever its representation.
                         match reprs.representation(instruction.inputs[1]) {
                             Representation::Tagged => {

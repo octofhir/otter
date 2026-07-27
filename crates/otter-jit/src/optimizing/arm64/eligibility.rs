@@ -1652,6 +1652,9 @@ pub(super) fn check_numeric_inputs(
             (Representation::Tagged, Representation::Float64) => {
                 ConversionKind::CheckedTaggedToFloat64
             }
+            (Representation::Float64, Representation::Int32) => {
+                ConversionKind::CheckedFloat64ToInt32
+            }
             _ => {
                 return Err(instruction_unsupported(
                     instruction,
@@ -1666,7 +1669,9 @@ pub(super) fn check_numeric_inputs(
         });
         let may_deopt = matches!(
             expected_kind,
-            ConversionKind::CheckedTaggedToInt32 | ConversionKind::CheckedTaggedToFloat64
+            ConversionKind::CheckedTaggedToInt32
+                | ConversionKind::CheckedTaggedToFloat64
+                | ConversionKind::CheckedFloat64ToInt32
         );
         if !matches!(
             conversion,

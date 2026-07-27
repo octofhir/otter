@@ -240,9 +240,13 @@ pub(super) fn emit_move(
             emit_box_double(ops, FP_SCRATCH_2, 9);
             emit_store_move_gpr(ops, movement.dst, 9)
         }
-        Some(ConversionKind::CheckedTaggedToInt32 | ConversionKind::CheckedTaggedToFloat64) => Err(
-            Unsupported::OperandShape("optimizing checked phi conversion"),
-        ),
+        Some(
+            ConversionKind::CheckedTaggedToInt32
+            | ConversionKind::CheckedTaggedToFloat64
+            | ConversionKind::CheckedFloat64ToInt32,
+        ) => Err(Unsupported::OperandShape(
+            "optimizing checked phi conversion",
+        )),
     }
 }
 
@@ -866,10 +870,46 @@ pub(super) fn emit_load_int_operand(
             emit_guard_int32(ops, scratch, deopt);
             Ok(())
         }
+        Representation::Float64
+            if conversion_kind_at(reprs, instruction, operand_index)
+                == Some(ConversionKind::CheckedFloat64ToInt32) =>
+        {
+            let deopt = deopt.ok_or(Unsupported::OperandShape(
+                "optimizing int32 narrow missing deopt exit",
+            ))?;
+            emit_load_fp_location(ops, allocation, allocation.location(input), FP_SCRATCH)?;
+            emit_checked_float64_to_int32(ops, FP_SCRATCH, scratch, deopt);
+            Ok(())
+        }
         Representation::Float64 | Representation::Tagged => Err(Unsupported::OperandShape(
             "optimizing int32 operand conversion",
         )),
     }
+}
+
+/// Narrow an exact-int32 `Float64` into `scratch`, deoptimizing on a
+/// fractional, out-of-range, NaN, or negative-zero value. The round trip
+/// through `fcvtzs`/`scvtf` proves exactness — `fcvtzs` saturates and NaN
+/// converts to zero, so any inexact input fails the compare — and a zero
+/// result with the sign bit set is `-0.0`, which int32 cannot represent.
+pub(super) fn emit_checked_float64_to_int32(
+    ops: &mut Assembler,
+    source_fp: u8,
+    scratch: u8,
+    deopt: DynamicLabel,
+) {
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; fcvtzs W(scratch), D(source_fp)
+        ; scvtf D(FP_SCRATCH_2), W(scratch)
+        ; fcmp D(source_fp), D(FP_SCRATCH_2)
+        ; b.ne =>deopt
+        ; cbnz W(scratch), =>done
+        ; fmov x14, D(source_fp)
+        ; cbnz x14, =>deopt
+        ; =>done
+    );
 }
 
 pub(super) fn emit_load_float_operand(

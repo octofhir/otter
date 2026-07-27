@@ -1453,7 +1453,8 @@ fn validate_move_shape(
         Some(ConversionKind::BoxFloat64) => source == RegClass::Fp && destination == RegClass::Gpr,
         Some(
             conversion @ (ConversionKind::CheckedTaggedToInt32
-            | ConversionKind::CheckedTaggedToFloat64),
+            | ConversionKind::CheckedTaggedToFloat64
+            | ConversionKind::CheckedFloat64ToInt32),
         ) => {
             return Err(RegallocError::MoveConversionMismatch {
                 predecessor,

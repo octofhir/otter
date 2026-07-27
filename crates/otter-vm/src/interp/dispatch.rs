@@ -779,20 +779,7 @@ impl Interpreter {
                         && let Ok(recv) = read_register(&stack[top_idx], recv_reg)
                     {
                         let recv = *recv;
-                        let family = if recv.as_array().is_some() {
-                            jit::JitElementFamily::Dense
-                        } else {
-                            match recv.as_typed_array(&self.gc_heap).map(|t| t.kind()) {
-                                Some(crate::binary::TypedArrayKind::Int32) => {
-                                    jit::JitElementFamily::TypedInt32
-                                }
-                                Some(crate::binary::TypedArrayKind::Float64) => {
-                                    jit::JitElementFamily::TypedFloat64
-                                }
-                                _ => jit::JitElementFamily::Generic,
-                            }
-                        };
-                        feedback.record_element_family(family);
+                        feedback.record_element_family(self.element_family_of(recv));
                     }
                     if self.drive_load_element(stack, context, operands)? {
                         continue;
@@ -898,6 +885,8 @@ impl Interpreter {
                     if let Some(feedback) = feedback {
                         let value = *read_register(&stack[top_idx], src_reg)?;
                         feedback.record_arith(value, value);
+                        let recv = *read_register(&stack[top_idx], recv_reg)?;
+                        feedback.record_element_family(self.element_family_of(recv));
                     }
                     // Copy the operands through a short representation-neutral
                     // view, then end the frame borrow before `[[Set]]` can

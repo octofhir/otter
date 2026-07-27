@@ -153,8 +153,8 @@ use crate::{
         ssa::{SsaFunction, SsaInstr, ValueDef, ValueId},
     },
     template::arm64::ic_probe::{
-        DenseIndexForm, element_access_for, emit_dense_element_write, emit_element_address,
-        emit_element_read, emit_guarded_method_call, emit_native_leaf_call,
+        DenseIndexForm, element_access_for, emit_element_address, emit_element_read,
+        emit_element_write, emit_guarded_method_call, emit_native_leaf_call,
         guarded_method_call_is_supported, native_leaf_call_is_supported, native_leaf_call_name,
     },
 };
@@ -2882,7 +2882,7 @@ fn emit(
                                 ));
                             }
                         }
-                        emit_dense_element_write(&mut ops);
+                        emit_element_write(&mut ops, access.element, miss);
                         dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
                     }
                     emit_materialize_element_transition(

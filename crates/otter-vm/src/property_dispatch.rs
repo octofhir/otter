@@ -2209,6 +2209,21 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Which element-bearing family a receiver belongs to, as an element site
+    /// records it. The families are exactly those a `JitElementAccess` instance
+    /// describes; anything else is generic and keeps the runtime path.
+    pub(crate) fn element_family_of(&self, recv: Value) -> crate::jit::JitElementFamily {
+        use crate::jit::JitElementFamily as Family;
+        if recv.as_array().is_some() {
+            return Family::Dense;
+        }
+        match recv.as_typed_array(&self.gc_heap).map(|view| view.kind()) {
+            Some(crate::binary::TypedArrayKind::Int32) => Family::TypedInt32,
+            Some(crate::binary::TypedArrayKind::Float64) => Family::TypedFloat64,
+            _ => Family::Generic,
+        }
+    }
+
     pub(crate) fn run_load_element_regs(
         &mut self,
         context: &ExecutionContext,

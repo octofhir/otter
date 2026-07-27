@@ -175,6 +175,8 @@ const REGISTER_BUDGET: RegisterBudget = RegisterBudget {
     fp: 8,
 };
 const VALUE_REGISTERS: [u8; ALLOCATABLE_REGISTER_COUNT as usize] = [21, 22, 23, 24, 25, 26, 27, 28];
+/// Where a spilled holder address is materialized for the node that reads it.
+const HEADER_SCRATCH: u8 = 13;
 const FP_REGISTERS: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
 const FP_SCRATCH: u8 = 16;
 const FP_SCRATCH_2: u8 = 17;
@@ -563,6 +565,38 @@ pub(super) fn compile_with_artifacts(
 /// arithmetic, compares, branches, moves, constants, and returns qualify;
 /// anything that calls, allocates, or reaches the heap through a reentrant
 /// window transition does not.
+/// The allocatable register a holder address occupies, or `None` when the
+/// allocator spilled it.
+fn header_register(allocation: &Allocation, header: ValueId) -> Result<Option<u8>, Unsupported> {
+    match allocation.location(header) {
+        Location::Register(RegClass::Gpr, register) => VALUE_REGISTERS
+            .get(register as usize)
+            .copied()
+            .map(Some)
+            .ok_or(Unsupported::OperandShape("optimizing holder register")),
+        Location::Spill(RegClass::Gpr, _) => Ok(None),
+        Location::Register(RegClass::Fp, _) | Location::Spill(RegClass::Fp, _) => {
+            Err(Unsupported::OperandShape("optimizing holder in an FP home"))
+        }
+    }
+}
+
+/// The register a node may read a holder address from, filling
+/// [`HEADER_SCRATCH`] first when the allocator spilled it.
+fn materialized_header(
+    ops: &mut Assembler,
+    allocation: &Allocation,
+    header: ValueId,
+) -> Result<u8, Unsupported> {
+    match header_register(allocation, header)? {
+        Some(register) => Ok(register),
+        None => {
+            emit_load_tagged_location(ops, allocation.location(header), HEADER_SCRATCH)?;
+            Ok(HEADER_SCRATCH)
+        }
+    }
+}
+
 fn emit(
     view: &JitCompileSnapshot,
     cfg: &ControlFlowGraph,
@@ -862,13 +896,18 @@ fn emit(
                 None => None,
             };
             match instruction.op {
-                // The receiver's hidden class is a compile-time constant at a
-                // settled site, so the guard is one compare against an
-                // immediate. It resolves the holder the field read consumes.
-                SsaOp::CheckShape { shape } => {
+                // The receiver's hidden class and its slot are compile-time
+                // constants at a settled site, so the whole access is: derive
+                // the holder, compare one immediate, read one offset. The
+                // holder is an ordinary SSA value, so the allocator decides
+                // where it lives, the three nodes need not be adjacent, and a
+                // second access to the same receiver reuses both facts.
+                SsaOp::LoadHeader => {
+                    let header = instruction
+                        .result
+                        .expect("eligibility checked the holder address");
                     // A loop whose body cannot mutate the heap reads this site
-                    // once and replays the value; the guard the cache skips is
-                    // this one, so the fast path branches over the whole pair.
+                    // once and replays the value, skipping the whole access.
                     if let Some(loop_cache_site) = eligibility
                         .property_loop_cache
                         .sites
@@ -876,13 +915,18 @@ fn emit(
                     {
                         let loop_cache =
                             &eligibility.property_loop_cache.loops[&loop_cache_site.header];
-                        let field = block_instructions.get(instruction_index + 1).ok_or(
-                            Unsupported::OperandShape("optimizing shape check has no read"),
-                        )?;
-                        let field_location =
-                            allocation.location(field.result.ok_or(Unsupported::OperandShape(
-                                "optimizing field-read result",
-                            ))?);
+                        let field_location = allocation.location(
+                            block_instructions[instruction_index..]
+                                .iter()
+                                .find(|candidate| {
+                                    matches!(candidate.op, SsaOp::LoadField { .. })
+                                        && candidate.pc == instruction.pc
+                                })
+                                .and_then(|field| field.result)
+                                .ok_or(Unsupported::OperandShape(
+                                    "optimizing holder address has no field read",
+                                ))?,
+                        );
                         emit_sp_ldr_x(
                             &mut ops,
                             9,
@@ -906,7 +950,8 @@ fn emit(
                         deopt_exit_at(frame_states, instruction)?,
                         instruction.pc,
                     ));
-                    ic_probe::emit_check_shape(
+                    let target = header_register(allocation, header)?;
+                    ic_probe::emit_load_header(
                         &mut ops,
                         &mut relocations,
                         view,
@@ -917,13 +962,30 @@ fn emit(
                                 register,
                             )
                         },
-                        shape,
+                        target.unwrap_or(HEADER_SCRATCH),
                         deopt,
                     )?;
+                    if target.is_none() {
+                        emit_store_tagged_location(
+                            &mut ops,
+                            allocation.location(header),
+                            HEADER_SCRATCH,
+                        )?;
+                    }
                 }
-                // Reads the holder the preceding check resolved. Nothing
-                // between them can allocate or move it, and a slot the
-                // compressed encoding cannot hold takes the shared cold path.
+                SsaOp::CheckShape { shape } => {
+                    let deopt = ops.new_dynamic_label();
+                    deopt_exits.push((
+                        deopt,
+                        deopt_exit_at(frame_states, instruction)?,
+                        instruction.pc,
+                    ));
+                    let header = materialized_header(&mut ops, allocation, instruction.inputs[0])?;
+                    ic_probe::emit_check_shape(&mut ops, view, header, shape, deopt);
+                }
+                // A slot the compressed encoding cannot hold takes the shared
+                // cold path; a holder with no slab resumes in the interpreter
+                // at this site's PC.
                 SsaOp::LoadField { byte } => {
                     let result_location = allocation.location(
                         instruction
@@ -936,10 +998,12 @@ fn emit(
                         deopt_exit_at(frame_states, instruction)?,
                         instruction.pc,
                     ));
+                    let header = materialized_header(&mut ops, allocation, instruction.inputs[0])?;
                     ic_probe::emit_load_field(
                         &mut ops,
                         &mut relocations,
                         view,
+                        header,
                         byte,
                         &mut boxed_slot_slow_paths,
                         deopt,

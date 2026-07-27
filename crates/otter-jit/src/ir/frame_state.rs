@@ -373,7 +373,10 @@ impl FrameStateTable {
                                     stacks[slot].push(value);
                                     pushed.push(slot);
                                 }
+                                // A holder address writes no interpreter
+                                // register, so no frame slot names it.
                                 (None, None) => {}
+                                (Some(_), None) if instruction.op == SsaOp::LoadHeader => {}
                                 _ => {
                                     return Err(FrameStateError::ResultRegisterMismatch {
                                         pc: instruction.pc,
@@ -547,7 +550,9 @@ impl FrameStateTable {
                     && ssa.frames[instruction.inline.0 as usize]
                         .this_value
                         .is_some_and(|value| instruction.inputs.as_slice() == [value]);
-                if !synthetic_this && instruction.input_registers.len() != instruction.inputs.len()
+                if !synthetic_this
+                    && !instruction.op.reads_header()
+                    && instruction.input_registers.len() != instruction.inputs.len()
                 {
                     return Err(FrameStateError::OperandRegisterCountMismatch {
                         pc: instruction.pc,

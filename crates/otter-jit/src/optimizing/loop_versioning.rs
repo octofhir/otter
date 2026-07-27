@@ -67,8 +67,10 @@ pub(crate) fn transparent_origin(ssa: &SsaFunction, mut value: ValueId) -> Optio
     loop {
         let data = ssa.values.get(value.0 as usize)?;
         match &data.def {
+            // A holder address is transparent to the receiver it came from:
+            // the loop-invariance question is about that receiver.
             ValueDef::Op {
-                op: SsaOp::Bytecode(Op::LoadLocal | Op::StoreLocal),
+                op: SsaOp::Bytecode(Op::LoadLocal | Op::StoreLocal) | SsaOp::LoadHeader,
                 inputs,
                 ..
             } if inputs.len() == 1 => value = inputs[0],

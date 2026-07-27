@@ -134,7 +134,7 @@ impl OptimizationPipeline {
 
         let mut ssa =
             SsaFunction::build_inlined(&tree, &cfg).map_err(OptimizationError::SsaConstruction)?;
-        lower_settled_property_loads(&mut ssa, view, &tree);
+        lower_settled_property_loads(&mut ssa, &cfg, view, &tree);
         ssa.verify(&cfg, &dom)
             .map_err(OptimizationError::SsaVerification)?;
 

@@ -11,6 +11,7 @@
 //!   describe.
 //! - [`emit_element_address`] / [`emit_element_read`] / [`emit_element_write`]
 //!   — the indexed element access program.
+//! - [`emit_property_ic_load`] — the named-property cache probe.
 //! - [`emit_native_leaf_call`] — guard a callee's bootstrap identity and run
 //!   its declared leaf entry without materializing a frame.
 //! - [`emit_guarded_method_call`] — the same for `receiver.method(args…)`, over
@@ -126,6 +127,88 @@ pub(crate) fn emit_resolve_holder(
 /// such a program stays on the stub rather than writing the wrong object.
 pub(crate) fn emit_refuse_prototype_hop(ops: &mut Assembler, miss: DynamicLabel) {
     dynasm!(ops ; .arch aarch64 ; cbnz w7, =>miss);
+}
+
+/// Probe a named-property load site's cache cell and leave the loaded `Value`
+/// in `x9`.
+///
+/// One program serves both tiers: prove the receiver is an ordinary object
+/// cell with a non-empty hidden class, walk the cell's ways for that class,
+/// perform the guarded prototype hop a matched way asks for, and read the
+/// slot from the holder's value slab. A slot the compressed encoding cannot
+/// hold continues through the caller's boxed slow path; every failed guard
+/// branches to `miss`, where the site's window transition owns full `[[Get]]`
+/// semantics and re-patches the cell.
+///
+/// `load_receiver` materializes the receiver `Value` into the register it is
+/// handed and is the only thing a tier supplies. On return the boxed value is
+/// in `x9` and the boxed-slot continuation label is already bound.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_property_ic_load<R>(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    load_receiver: R,
+    cell_addr: usize,
+    cell_ordinal: u32,
+    boxed_slot_slow_paths: &mut Vec<super::values::BoxedSlotSlowPath>,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported>
+where
+    R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
+{
+    let shape_byte = view.object_shape_byte;
+    load_receiver(ops, 9)?;
+    super::values::emit_cell_test(ops, 9, 11, super::values::CellTest::IsNotCell, miss);
+    dynasm!(ops
+        ; .arch aarch64
+        ; mov w12, w9              // low-32 Gc offset (zero-ext)
+    );
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        13,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; add x13, x13, x12        // x13 = GcHeader ptr
+        ; ldrb w14, [x13]          // header type tag
+        ; cmp w14, OBJECT_BODY_TYPE_TAG
+        ; b.ne =>miss
+        ; ldr w14, [x13, shape_byte] // receiver shape handle
+        ; cbz w14, =>miss          // empty-cell sentinel
+    );
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        15,
+        cell_addr as u64,
+        RelocationTarget::PropertyIcCell {
+            access: crate::artifact::relocation::PropertyIcAccess::Load,
+            ordinal: cell_ordinal,
+        },
+    );
+    let do_load = ops.new_dynamic_label();
+    emit_way_walk(ops, do_load, miss);
+    emit_resolve_holder(ops, relocations, view, miss);
+    super::values::emit_slab_base(ops, view, 13, 14);
+    dynasm!(ops
+        ; .arch aarch64
+        ; cbz x13, =>miss
+        ; ldr w9, [x13, x17]       // 4-byte compressed slot
+    );
+    let boxed_entry = ops.new_dynamic_label();
+    let continuation = ops.new_dynamic_label();
+    boxed_slot_slow_paths.push(super::values::BoxedSlotSlowPath {
+        entry: boxed_entry,
+        continuation,
+        miss,
+    });
+    super::values::emit_decompress_slot(ops, relocations, view.cage_base as u64, boxed_entry);
+    dynasm!(ops ; .arch aarch64 ; =>continuation);
+    Ok(())
 }
 
 /// Serve `receiver.length` for the two receivers whose length is not an own

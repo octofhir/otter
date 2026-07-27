@@ -33,7 +33,7 @@ use otter_vm::native_abi as abi;
 use super::ic_probe;
 use super::transitions::TransitionTable;
 use super::values::{
-    BoxedSlotSlowPath, CellTest, emit_cell_test, emit_compress_slot_or_bail, emit_decompress_slot,
+    BoxedSlotSlowPath, CellTest, emit_cell_test, emit_compress_slot_or_bail,
     emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64, emit_slab_base,
 };
 use crate::artifact::relocation::{PropertyIcAccess, RelocationCapture, RelocationTarget};
@@ -83,62 +83,21 @@ pub(super) fn emit_load_property(
     if cage_base != 0 {
         let obj_off = reg_offset(object)?;
         let dst_off = reg_offset(dst)?;
-        let shape_byte = view.object_shape_byte;
-        dynasm!(ops
-            ; .arch aarch64
-            ; ldr x9, [x19, obj_off]   // receiver Value
-        );
-        emit_cell_test(ops, 9, 11, CellTest::IsNotCell, miss);
-        dynasm!(ops
-            ; .arch aarch64
-            ; mov w12, w9              // low-32 Gc offset (zero-ext)
-        );
-        emit_load_symbol_u64(
+        ic_probe::emit_property_ic_load(
             ops,
             relocations,
-            13,
-            cage_base as u64,
-            RelocationTarget::GcCageBase,
-        );
-        dynasm!(ops
-            ; .arch aarch64
-            ; add x13, x13, x12        // x13 = GcHeader ptr
-            ; ldrb w14, [x13]          // header type tag
-            ; cmp w14, OBJECT_BODY_TYPE_TAG
-            ; b.ne =>miss
-            ; ldr w14, [x13, shape_byte] // receiver shape handle
-            ; cbz w14, =>miss
-        );
-        emit_load_symbol_u64(
-            ops,
-            relocations,
-            15,
-            cell_addr as u64,
-            RelocationTarget::PropertyIcCell {
-                access: PropertyIcAccess::Load,
-                ordinal: cell_ordinal,
+            view,
+            |ops, register| {
+                dynasm!(ops ; .arch aarch64 ; ldr X(register), [x19, obj_off]);
+                Ok(())
             },
-        );
-        let do_load = ops.new_dynamic_label();
-        ic_probe::emit_way_walk(ops, do_load, miss);
-        ic_probe::emit_resolve_holder(ops, relocations, view, miss);
-        emit_slab_base(ops, view, 13, 14);
-        dynasm!(ops
-            ; .arch aarch64
-            ; cbz x13, =>miss
-            ; ldr w9, [x13, x17]       // 4-byte compressed slot
-        );
-        let boxed_entry = ops.new_dynamic_label();
-        let continuation = ops.new_dynamic_label();
-        boxed_slot_slow_paths.push(BoxedSlotSlowPath {
-            entry: boxed_entry,
-            continuation,
+            cell_addr,
+            cell_ordinal,
+            boxed_slot_slow_paths,
             miss,
-        });
-        emit_decompress_slot(ops, relocations, cage_base as u64, boxed_entry);
+        )?;
         dynasm!(ops
             ; .arch aarch64
-            ; =>continuation
             ; str x9, [x19, dst_off]
             ; b =>done
         );

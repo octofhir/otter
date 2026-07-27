@@ -98,8 +98,8 @@ use otter_vm::deopt::{DeoptExitId, DeoptFrame, DeoptLocation, DeoptRepr, DeoptTa
 use otter_vm::native_abi::{
     FrameMap, NO_FRAME_STATE, RuntimeStubDescriptor, STUB_JIT_BACKEDGE_POLL, STUB_JIT_CONSTRUCT,
     STUB_JIT_DEOPT_REIFY_FRAME, STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_LOAD_ELEMENT,
-    STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROPERTY, STUB_JIT_LOAD_UPVALUE, STUB_JIT_LOOSE_EQ,
-    STUB_JIT_SPREAD_CALL_OP, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY,
+    STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROPERTY, STUB_JIT_LOAD_STRING, STUB_JIT_LOAD_UPVALUE,
+    STUB_JIT_LOOSE_EQ, STUB_JIT_SPREAD_CALL_OP, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY,
     STUB_JIT_STORE_UPVALUE, STUB_JIT_STORE_UPVALUE_CHECKED, STUB_JIT_WRITE_BARRIER, SafepointId,
     SafepointRecord,
 };
@@ -282,6 +282,7 @@ struct EmissionPlan<'a> {
     load_property_entry: ResolvedRuntimeEntry,
     store_property_entry: ResolvedRuntimeEntry,
     load_global_entry: ResolvedRuntimeEntry,
+    load_string_entry: ResolvedRuntimeEntry,
     loose_eq_entry: ResolvedRuntimeEntry,
     construct_entry: ResolvedRuntimeEntry,
     /// Completes a method-call guard miss through canonical `GetMethod + Call`.
@@ -419,6 +420,10 @@ pub(super) fn compile_with_artifacts(
             load_global_entry: ResolvedRuntimeEntry::new(
                 STUB_JIT_LOAD_GLOBAL,
                 transitions.variadic_entry(STUB_JIT_LOAD_GLOBAL),
+            ),
+            load_string_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_LOAD_STRING,
+                transitions.variadic_entry(STUB_JIT_LOAD_STRING),
             ),
             loose_eq_entry: ResolvedRuntimeEntry::new(
                 STUB_JIT_LOOSE_EQ,
@@ -741,6 +746,7 @@ fn emit(
         load_property_entry,
         store_property_entry,
         load_global_entry,
+        load_string_entry,
         loose_eq_entry,
         construct_entry,
         method_call_entry,
@@ -2032,6 +2038,63 @@ fn emit(
                             Some((dst, result_location)),
                         )?;
                         dynasm!(ops ; .arch aarch64 ; =>done);
+                    }
+                    // The pool entry is a heap string the collector may move,
+                    // so the constant is resolved at run time rather than baked.
+                    Op::LoadString => {
+                        let dst = instruction
+                            .result_register
+                            .expect("eligibility checked string-load destination");
+                        let constant = view.instructions[instruction.pc as usize]
+                            .const_index(view.code_block.as_ref(), 1)
+                            .ok_or(Unsupported::OperandShape("string-load constant"))?;
+                        let site = eligibility
+                            .element_transitions
+                            .sites
+                            .get(&instruction.pc)
+                            .ok_or(Unsupported::OperandShape(
+                                "optimizing string load missing site",
+                            ))?;
+                        debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                        emit_materialize_element_transition(
+                            &mut ops,
+                            reprs,
+                            allocation,
+                            instruction,
+                            site,
+                        )?;
+                        emit_load_u32(&mut ops, 9, instruction.pc);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                            ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+                            ; mov x0, x20
+                        );
+                        emit_load_u64(&mut ops, 1, function_id);
+                        dynasm!(ops ; .arch aarch64 ; movz x2, dst as u32);
+                        emit_load_u64(&mut ops, 3, u64::from(constant));
+                        emit_runtime_entry(&mut ops, &mut relocations, 16, load_string_entry);
+                        let succeeded = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; blr x16
+                            ; cbz x0, =>succeeded
+                            ; b =>threw
+                            ; =>succeeded
+                        );
+                        emit_reload_element_transition(
+                            &mut ops,
+                            allocation,
+                            site,
+                            Some((
+                                dst,
+                                allocation.location(
+                                    instruction
+                                        .result
+                                        .expect("eligibility checked string-load result"),
+                                ),
+                            )),
+                        )?;
                     }
                     Op::LooseEqual | Op::LooseNotEqual => {
                         let dst = instruction

@@ -9,8 +9,8 @@
 //!   that cannot execute them.
 //! - [`emit_exotic_length_fast`] — the `.length` reads no cache program can
 //!   describe.
-//! - [`emit_element_address`] / [`emit_element_read`] /
-//!   [`emit_dense_element_write`] — the indexed element access program.
+//! - [`emit_element_address`] / [`emit_element_read`] / [`emit_element_write`]
+//!   — the indexed element access program.
 //! - [`emit_native_leaf_call`] — guard a callee's bootstrap identity and run
 //!   its declared leaf entry without materializing a frame.
 //! - [`emit_guarded_method_call`] — the same for `receiver.method(args…)`, over
@@ -191,21 +191,6 @@ pub(crate) fn emit_exotic_length_fast(
     );
     emit_box_int32(ops, 9, 12);
     dynasm!(ops ; .arch aarch64 ; b =>have_length);
-}
-
-/// Branch to `miss` when `x9` holds a heap cell.
-///
-/// A store over an existing element replaces one boxed value with another; a
-/// cell needs the generational write barrier, which only the runtime stub owns.
-/// Clobbers `x11`.
-pub(crate) fn emit_guard_value_is_not_cell(ops: &mut Assembler, miss: DynamicLabel) {
-    dynasm!(ops
-        ; .arch aarch64
-        ; movz x11, NUMBER_TAG_HI16, lsl #48
-        ; orr x11, x11, #0x2       // NOT_CELL_MASK
-        ; tst x9, x11
-        ; b.eq =>miss
-    );
 }
 
 /// Whether the index operand a site supplies still carries a `Value` tag.
@@ -425,9 +410,59 @@ pub(crate) fn emit_element_read(ops: &mut Assembler, element: JitElementRepr, mi
 }
 
 /// Overwrite the element whose address [`emit_element_address`] left in `x16`
-/// with the boxed value in `x9`.
-pub(crate) fn emit_dense_element_write(ops: &mut Assembler) {
-    dynasm!(ops ; .arch aarch64 ; str x9, [x16]);
+/// with the boxed `Value` in `x9`, unboxing it into the declared
+/// representation.
+///
+/// The value is *guarded*, never coerced: `ToNumber` on a non-numeric value can
+/// call user code, which cannot run inside a guard sequence, so a value that is
+/// not already in the view's representation leaves the fast path and the
+/// runtime stub performs the whole observable store. A boxed element takes any
+/// non-cell value, because a cell would owe the generational write barrier that
+/// only the stub runs. Clobbers `x11`, `x12`, `x14`.
+pub(crate) fn emit_element_write(ops: &mut Assembler, element: JitElementRepr, miss: DynamicLabel) {
+    match element {
+        JitElementRepr::Boxed => {
+            dynasm!(ops
+                ; .arch aarch64
+                ; movz x11, NUMBER_TAG_HI16, lsl #48
+                ; orr x11, x11, #0x2       // NOT_CELL_MASK
+                ; tst x9, x11
+                ; b.eq =>miss              // heap cell: the stub owns the barrier
+                ; str x9, [x16]
+            );
+        }
+        JitElementRepr::Int32 => {
+            // Only a value already boxed as an int32 stores exactly. A double
+            // would owe `ToInt32`, whose modular truncation is not `fcvtzs`.
+            dynasm!(ops
+                ; .arch aarch64
+                ; lsr x11, x9, #48
+                ; movz x12, NUMBER_TAG_HI16
+                ; cmp x11, x12
+                ; b.ne =>miss
+                ; str w9, [x16]
+            );
+        }
+        JitElementRepr::Float64 => {
+            // A number that is not an int32 is a boxed double, so undoing the
+            // encode offset yields the raw bit pattern. An int32 would owe an
+            // integer-to-double conversion, which needs an FP register neither
+            // tier reserves here.
+            dynasm!(ops
+                ; .arch aarch64
+                ; movz x11, NUMBER_TAG_HI16, lsl #48
+                ; tst x9, x11
+                ; b.eq =>miss              // not a number at all
+                ; lsr x12, x9, #48
+                ; movz x14, NUMBER_TAG_HI16
+                ; cmp x12, x14
+                ; b.eq =>miss              // int32-boxed, not a double
+                ; movz x11, DOUBLE_OFFSET_HI16, lsl #48
+                ; sub x9, x9, x11
+                ; str x9, [x16]
+            );
+        }
+    }
 }
 
 /// Whether a declared leaf entry can be called inline at a site of this arity.

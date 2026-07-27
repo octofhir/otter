@@ -33,8 +33,7 @@ use otter_vm::native_abi::{self as abi};
 use otter_vm::runtime_stubs::alloc_value_stub_by_id;
 
 use super::ic_probe::{
-    DenseIndexForm, element_access_for, emit_dense_element_write, emit_element_address,
-    emit_element_read, emit_guard_value_is_not_cell,
+    DenseIndexForm, element_access_for, emit_element_address, emit_element_read, emit_element_write,
 };
 use super::values::{
     emit_decompress_slot, emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64,
@@ -518,8 +517,7 @@ pub(super) fn emit_store_element(
         )?;
         emit_element_read(ops, access.element, miss);
         emit_load_reg(ops, 9, value)?;
-        emit_guard_value_is_not_cell(ops, miss);
-        emit_dense_element_write(ops);
+        emit_element_write(ops, access.element, miss);
         dynasm!(ops ; .arch aarch64 ; b =>done);
     }
     dynasm!(ops ; .arch aarch64 ; =>miss);

@@ -546,30 +546,23 @@ impl Interpreter {
     ///
     /// The family comes from what the site observed, so a typed view and a
     /// dense array are the same program over different declared offsets. A
-    /// store always bakes the dense instance: an inline typed store owes
-    /// `ToNumber` on a non-numeric value, which the store fast path does not
-    /// model.
+    /// store additionally guards that the value already has the view's
+    /// representation, because coercing it could run user code.
     pub(crate) fn bake_element_accesses(&mut self, view: &mut jit::JitCompileSnapshot) {
         let sites: Vec<_> = view
             .instructions
             .iter()
             .filter_map(|instr| {
                 let op = instr.op(&view.code_block);
-                matches!(op, Op::LoadElement | Op::StoreElement).then_some((
-                    instr.byte_pc,
-                    instr.instruction_pc(&view.code_block),
-                    op,
-                ))
+                matches!(op, Op::LoadElement | Op::StoreElement)
+                    .then_some((instr.byte_pc, instr.instruction_pc(&view.code_block)))
             })
             .collect();
-        for (byte_pc, pc, op) in sites {
-            let family = if op == Op::LoadElement {
-                view.code_block
-                    .feedback_at(pc as usize)
-                    .map_or(jit::JitElementFamily::Unseen, |cell| cell.element_family())
-            } else {
-                jit::JitElementFamily::Dense
-            };
+        for (byte_pc, pc) in sites {
+            let family = view
+                .code_block
+                .feedback_at(pc as usize)
+                .map_or(jit::JitElementFamily::Unseen, |cell| cell.element_family());
             let access = match family {
                 jit::JitElementFamily::TypedInt32 => Self::typed_element_access(
                     crate::binary::TypedArrayKind::Int32,

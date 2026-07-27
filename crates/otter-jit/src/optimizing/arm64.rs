@@ -141,6 +141,7 @@ use crate::{
         dom::DominatorTree,
         frame_state::{AbstractFrameState, FrameStateTable},
         inline::{InlineCallKind, InlineFrame, InlineId, InlineTree},
+        licm::HoistedGroup,
         liveness::Liveness,
         regalloc::{
             Allocation, EdgeMoves, Location, Move, RegClass, RegisterBudget, has_non_dead_use,
@@ -218,6 +219,9 @@ struct OsrLiveValue {
 struct OsrEntrySite {
     logical_pc: u32,
     live_values: Box<[OsrLiveValue]>,
+    /// The pre-header run this entry has to perform itself, because reaching
+    /// the header from the interpreter skips the block that holds it.
+    preheader_run: Option<HoistedGroup>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,7 +357,7 @@ pub(super) fn compile_with_artifacts(
         &unit.cfg,
         &unit.dom,
         &unit.ssa,
-        &unit.hoisted_loop_headers,
+        &unit.hoisted_loops,
         EligibilityAnalyses {
             liveness: &unit.liveness,
             reprs: &unit.reprs,
@@ -589,6 +593,129 @@ fn materialized_header(
             Ok(HEADER_SCRATCH)
         }
     }
+}
+
+/// Lower one node of the settled-access vocabulary.
+///
+/// The receiver's hidden class and its slot are compile-time constants at a
+/// settled site, so the whole access is: derive the holder, compare one
+/// immediate, read or write one offset. The holder is an ordinary SSA value, so
+/// the allocator decides where it lives, the nodes need not be adjacent, and a
+/// second access to the same receiver reuses both facts. A prototype is read at
+/// run time: a guarded receiver shape fixes which object a hop lands on, never
+/// where it is.
+///
+/// `load_receiver` says where the receiver comes from, because an OSR entry
+/// runs a hoisted run before any of the unit's own code has: it reads the
+/// receiver out of the interpreter frame where the block's own copy reads it
+/// out of the value's machine home. Everything a run derives after that is
+/// internal to it and needs no such choice.
+#[allow(clippy::too_many_arguments)]
+fn emit_settled_access<R>(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    allocation: &Allocation,
+    reprs: &ReprMap,
+    boxed_slot_slow_paths: &mut Vec<crate::template::arm64::values::BoxedSlotSlowPath>,
+    instruction: &SsaInstr,
+    load_receiver: R,
+    deopt: DynamicLabel,
+) -> Result<(), Unsupported>
+where
+    R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
+{
+    match instruction.op {
+        SsaOp::LoadHeader => {
+            let header = instruction
+                .result
+                .expect("eligibility checked the holder address");
+            let target = header_register(allocation, header)?;
+            ic_probe::emit_load_header(
+                ops,
+                relocations,
+                view,
+                load_receiver,
+                target.unwrap_or(HEADER_SCRATCH),
+                deopt,
+            )?;
+            if target.is_none() {
+                emit_store_tagged_location(ops, allocation.location(header), HEADER_SCRATCH)?;
+            }
+        }
+        SsaOp::LoadPrototype => {
+            let holder = instruction
+                .result
+                .expect("eligibility checked the hop address");
+            let receiver = materialized_header(ops, allocation, instruction.inputs[0])?;
+            let target = header_register(allocation, holder)?;
+            ic_probe::emit_load_prototype(
+                ops,
+                relocations,
+                view,
+                receiver,
+                target.unwrap_or(HEADER_SCRATCH),
+                deopt,
+            );
+            if target.is_none() {
+                emit_store_tagged_location(ops, allocation.location(holder), HEADER_SCRATCH)?;
+            }
+        }
+        SsaOp::CheckShape { shape } => {
+            let header = materialized_header(ops, allocation, instruction.inputs[0])?;
+            ic_probe::emit_check_shape(ops, view, header, shape, deopt);
+        }
+        // A slot the compressed encoding cannot hold takes the shared cold
+        // path; a holder with no slab resumes in the interpreter at this
+        // site's PC.
+        SsaOp::LoadField { byte } => {
+            let result_location = allocation.location(
+                instruction
+                    .result
+                    .expect("eligibility checked field-load result"),
+            );
+            let header = materialized_header(ops, allocation, instruction.inputs[0])?;
+            ic_probe::emit_load_field(
+                ops,
+                relocations,
+                view,
+                header,
+                byte,
+                boxed_slot_slow_paths,
+                deopt,
+            );
+            emit_store_tagged_location(ops, result_location, 9)?;
+        }
+        // The slot exists and keeps its class, so the write is one compressed
+        // store with no barrier and no allocation. A value the encoding cannot
+        // hold resumes in the interpreter.
+        SsaOp::StoreField { byte } => {
+            let header = materialized_header(ops, allocation, instruction.inputs[0])?;
+            // The lowering selects a site only for a proven int32, so the
+            // boxed value is the one the compressed slot takes whole.
+            match reprs.representation(instruction.inputs[1]) {
+                Representation::Int32 => {
+                    emit_load_location(ops, allocation.location(instruction.inputs[1]), 9)?;
+                    emit_box_int32(ops, 9, 11);
+                }
+                Representation::Tagged => {
+                    emit_load_tagged_location(ops, allocation.location(instruction.inputs[1]), 9)?;
+                }
+                Representation::Float64 => {
+                    return Err(Unsupported::OperandShape(
+                        "optimizing settled store expects an int32 value",
+                    ));
+                }
+            }
+            ic_probe::emit_store_field(ops, view, header, byte, deopt);
+        }
+        SsaOp::Reuse | SsaOp::Bytecode(_) => {
+            return Err(Unsupported::OperandShape(
+                "optimizing settled access expects a guard-vocabulary node",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn emit(
@@ -873,27 +1000,25 @@ fn emit(
                 None => None,
             };
             match instruction.op {
-                // The receiver's hidden class and its slot are compile-time
-                // constants at a settled site, so the whole access is: derive
-                // the holder, compare one immediate, read one offset. The
-                // holder is an ordinary SSA value, so the allocator decides
-                // where it lives, the three nodes need not be adjacent, and a
-                // second access to the same receiver reuses both facts.
-                SsaOp::LoadHeader => {
-                    let header = instruction
-                        .result
-                        .expect("eligibility checked the holder address");
+                SsaOp::LoadHeader
+                | SsaOp::LoadPrototype
+                | SsaOp::CheckShape { .. }
+                | SsaOp::LoadField { .. }
+                | SsaOp::StoreField { .. } => {
                     let deopt = ops.new_dynamic_label();
                     deopt_exits.push((
                         deopt,
                         deopt_exit_at(frame_states, instruction)?,
                         instruction.pc,
                     ));
-                    let target = header_register(allocation, header)?;
-                    ic_probe::emit_load_header(
+                    emit_settled_access(
                         &mut ops,
                         &mut relocations,
                         view,
+                        allocation,
+                        reprs,
+                        &mut boxed_slot_slow_paths,
+                        instruction,
                         |ops, register| {
                             emit_load_tagged_location(
                                 ops,
@@ -901,122 +1026,8 @@ fn emit(
                                 register,
                             )
                         },
-                        target.unwrap_or(HEADER_SCRATCH),
                         deopt,
                     )?;
-                    if target.is_none() {
-                        emit_store_tagged_location(
-                            &mut ops,
-                            allocation.location(header),
-                            HEADER_SCRATCH,
-                        )?;
-                    }
-                }
-                // The prototype is read at run time: a guarded receiver shape
-                // fixes which object the hop should land on, never where it is.
-                SsaOp::LoadPrototype => {
-                    let holder = instruction
-                        .result
-                        .expect("eligibility checked the hop address");
-                    let deopt = ops.new_dynamic_label();
-                    deopt_exits.push((
-                        deopt,
-                        deopt_exit_at(frame_states, instruction)?,
-                        instruction.pc,
-                    ));
-                    let receiver =
-                        materialized_header(&mut ops, allocation, instruction.inputs[0])?;
-                    let target = header_register(allocation, holder)?;
-                    ic_probe::emit_load_prototype(
-                        &mut ops,
-                        &mut relocations,
-                        view,
-                        receiver,
-                        target.unwrap_or(HEADER_SCRATCH),
-                        deopt,
-                    );
-                    if target.is_none() {
-                        emit_store_tagged_location(
-                            &mut ops,
-                            allocation.location(holder),
-                            HEADER_SCRATCH,
-                        )?;
-                    }
-                }
-                SsaOp::CheckShape { shape } => {
-                    let deopt = ops.new_dynamic_label();
-                    deopt_exits.push((
-                        deopt,
-                        deopt_exit_at(frame_states, instruction)?,
-                        instruction.pc,
-                    ));
-                    let header = materialized_header(&mut ops, allocation, instruction.inputs[0])?;
-                    ic_probe::emit_check_shape(&mut ops, view, header, shape, deopt);
-                }
-                // A slot the compressed encoding cannot hold takes the shared
-                // cold path; a holder with no slab resumes in the interpreter
-                // at this site's PC.
-                SsaOp::LoadField { byte } => {
-                    let result_location = allocation.location(
-                        instruction
-                            .result
-                            .expect("eligibility checked field-load result"),
-                    );
-                    let deopt = ops.new_dynamic_label();
-                    deopt_exits.push((
-                        deopt,
-                        deopt_exit_at(frame_states, instruction)?,
-                        instruction.pc,
-                    ));
-                    let header = materialized_header(&mut ops, allocation, instruction.inputs[0])?;
-                    ic_probe::emit_load_field(
-                        &mut ops,
-                        &mut relocations,
-                        view,
-                        header,
-                        byte,
-                        &mut boxed_slot_slow_paths,
-                        deopt,
-                    );
-                    emit_store_tagged_location(&mut ops, result_location, 9)?;
-                }
-                // The slot exists and keeps its class, so the write is one
-                // compressed store with no barrier and no allocation. A value
-                // the encoding cannot hold resumes in the interpreter.
-                SsaOp::StoreField { byte } => {
-                    let deopt = ops.new_dynamic_label();
-                    deopt_exits.push((
-                        deopt,
-                        deopt_exit_at(frame_states, instruction)?,
-                        instruction.pc,
-                    ));
-                    let header = materialized_header(&mut ops, allocation, instruction.inputs[0])?;
-                    // The lowering selects a site only for a proven int32, so
-                    // the boxed value is the one the compressed slot takes
-                    // whole.
-                    match reprs.representation(instruction.inputs[1]) {
-                        Representation::Int32 => {
-                            emit_load_location(
-                                &mut ops,
-                                allocation.location(instruction.inputs[1]),
-                                9,
-                            )?;
-                            emit_box_int32(&mut ops, 9, 11);
-                        }
-                        Representation::Tagged => {
-                            emit_load_tagged_location(
-                                &mut ops,
-                                allocation.location(instruction.inputs[1]),
-                                9,
-                            )?;
-                        }
-                        Representation::Float64 => {
-                            return Err(Unsupported::OperandShape(
-                                "optimizing settled store expects an int32 value",
-                            ));
-                        }
-                    }
-                    ic_probe::emit_store_field(&mut ops, view, header, byte, deopt);
                 }
                 // The access itself runs where it was hoisted to; here the
                 // value only has to reach the register this site writes.
@@ -3512,6 +3523,72 @@ fn emit(
         ));
     }
 
+    let mut osr_entries = BTreeMap::new();
+    for (&block, site) in &eligibility.osr_entries {
+        let target = block_labels[block.0 as usize];
+        let offset = ops.offset().0;
+        let representation_bail = ops.new_dynamic_label();
+        emit_prologue(&mut ops, spill_frame_bytes);
+        if eligibility.cached_method_guard.is_some() {
+            dynasm!(ops ; .arch aarch64 ; mov x9, xzr);
+            let receiver_slot = fused_method_receiver_slot.expect("cached guard reserves a slot");
+            emit_sp_str_x(&mut ops, 9, receiver_slot);
+        }
+        if !eligibility.back_edges.is_empty() {
+            dynasm!(ops ; .arch aarch64 ; movz w29, OPTIMIZED_POLL_BATCH);
+        }
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov x20, x0
+            ; ldr x9, [x20, NATIVE_FRAME_OFFSET]
+            ; ldr x19, [x9, NATIVE_FRAME_REGISTER_BASE_OFFSET]
+        );
+        emit_osr_materialization(&mut ops, reprs, allocation, site, representation_bail)?;
+        // Arriving from the interpreter skips the pre-header, so this entry is
+        // that pre-header: it performs the run the loop was allowed to leave
+        // there. Nothing of the loop has run yet, so a guard that fails here
+        // resumes at the header the interpreter is already sitting on.
+        for instruction in site
+            .preheader_run
+            .into_iter()
+            .flat_map(|group| hoisted_instructions(ssa, group))
+        {
+            // Only the derivation reads a receiver; everything after it reads a
+            // holder this run already produced.
+            let receiver_register = instruction.input_registers.first().copied();
+            emit_settled_access(
+                &mut ops,
+                &mut relocations,
+                view,
+                allocation,
+                reprs,
+                &mut boxed_slot_slow_paths,
+                instruction,
+                |ops, register| {
+                    let frame_register = receiver_register.ok_or(Unsupported::OperandShape(
+                        "optimizing OSR pre-header run derives from no frame register",
+                    ))?;
+                    emit_load_frame_register(ops, u32::from(frame_register), register)
+                },
+                representation_bail,
+            )?;
+        }
+        dynasm!(ops ; .arch aarch64 ; b =>target ; =>representation_bail);
+        emit_load_u32(&mut ops, 9, site.logical_pc);
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+            ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+            ; mov x0, xzr
+            ; movz x1, STATUS_BAILED as u32
+        );
+        emit_epilogue(&mut ops, spill_frame_bytes);
+        if let Some(code_map) = code_map.as_mut() {
+            code_map.record_osr(site.logical_pc, offset, ops.offset().0);
+        }
+        osr_entries.insert(site.logical_pc, offset);
+    }
+
     let boxed_slow_start = ops.offset().0;
     crate::template::arm64::values::emit_boxed_slot_slow_paths(
         &mut ops,
@@ -3600,43 +3677,6 @@ fn emit(
                 resume_pc,
             ));
         }
-    }
-
-    let mut osr_entries = BTreeMap::new();
-    for (&block, site) in &eligibility.osr_entries {
-        let target = block_labels[block.0 as usize];
-        let offset = ops.offset().0;
-        let representation_bail = ops.new_dynamic_label();
-        emit_prologue(&mut ops, spill_frame_bytes);
-        if eligibility.cached_method_guard.is_some() {
-            dynasm!(ops ; .arch aarch64 ; mov x9, xzr);
-            let receiver_slot = fused_method_receiver_slot.expect("cached guard reserves a slot");
-            emit_sp_str_x(&mut ops, 9, receiver_slot);
-        }
-        if !eligibility.back_edges.is_empty() {
-            dynasm!(ops ; .arch aarch64 ; movz w29, OPTIMIZED_POLL_BATCH);
-        }
-        dynasm!(ops
-            ; .arch aarch64
-            ; mov x20, x0
-            ; ldr x9, [x20, NATIVE_FRAME_OFFSET]
-            ; ldr x19, [x9, NATIVE_FRAME_REGISTER_BASE_OFFSET]
-        );
-        emit_osr_materialization(&mut ops, reprs, allocation, site, representation_bail)?;
-        dynasm!(ops ; .arch aarch64 ; b =>target ; =>representation_bail);
-        emit_load_u32(&mut ops, 9, site.logical_pc);
-        dynasm!(ops
-            ; .arch aarch64
-            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-            ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
-            ; mov x0, xzr
-            ; movz x1, STATUS_BAILED as u32
-        );
-        emit_epilogue(&mut ops, spill_frame_bytes);
-        if let Some(code_map) = code_map.as_mut() {
-            code_map.record_osr(site.logical_pc, offset, ops.offset().0);
-        }
-        osr_entries.insert(site.logical_pc, offset);
     }
 
     let buffer = ops

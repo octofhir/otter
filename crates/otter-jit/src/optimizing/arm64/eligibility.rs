@@ -126,7 +126,7 @@ pub(super) fn inline_method_property<'a>(
     tree: &'a InlineTree,
     instruction: &SsaInstr,
 ) -> Option<(&'a InlineFrame, u32, u32)> {
-    if instruction.inline == InlineId::ROOT || instruction.op != Op::LoadProperty {
+    if instruction.inline == InlineId::ROOT || instruction.op != SsaOp::Bytecode(Op::LoadProperty) {
         return None;
     }
     let frame = tree.frames.get(instruction.inline.0 as usize)?;
@@ -168,7 +168,7 @@ pub(super) fn fused_inline_method_property<'a>(
         &ssa.values.get(loaded_this.0 as usize)?.def,
         ValueDef::Op {
             inline,
-            op: Op::LoadThis,
+            op: SsaOp::Bytecode(Op::LoadThis),
             inputs,
             ..
         } if *inline == instruction.inline && inputs.as_ref() == [synthetic_this]
@@ -265,7 +265,11 @@ pub(super) fn guard_cache_safe_instruction(
     block: BlockId,
     instruction: &SsaInstr,
 ) -> bool {
-    match instruction.op {
+    let Some(op) = instruction.op.bytecode() else {
+        // A primitive guard or field read touches no cache cell.
+        return true;
+    };
+    match op {
         Op::LoadInt32
         | Op::LoadNumber
         | Op::LoadUndefined
@@ -324,7 +328,8 @@ pub(super) fn cached_method_guard_site(
     let mut candidates = Vec::new();
     for block in &cfg.blocks {
         for instruction in &ssa.blocks[block.id.0 as usize].instrs {
-            if instruction.op != Op::CallMethodValue || !is_spliced_call(cfg, block.id, instruction)
+            if instruction.op != SsaOp::Bytecode(Op::CallMethodValue)
+                || !is_spliced_call(cfg, block.id, instruction)
             {
                 continue;
             }
@@ -496,11 +501,29 @@ pub(super) fn check_eligibility(
         for (instruction_index, instruction) in
             ssa.blocks[block.0 as usize].instrs.iter().enumerate()
         {
+            let Some(op) = instruction.op.bytecode() else {
+                // A primitive neither calls, throws, nor allocates, so it owes
+                // no materialized frame. It takes its receiver as it is and
+                // produces an ordinary boxed value: nothing here boxes or
+                // unboxes, and two nodes sharing one PC could not both own a
+                // conversion at it.
+                if instruction
+                    .inputs
+                    .iter()
+                    .any(|&input| reprs.representation(input) != Representation::Tagged)
+                    || instruction.result.is_some_and(|result| {
+                        reprs.representation(result) != Representation::Tagged
+                    })
+                {
+                    return Err(instruction_unsupported(instruction));
+                }
+                continue;
+            };
             // A feedback-driven op whose cell never recorded an execution is
             // unreachable-by-feedback: lower it as an unconditional deopt
             // instead of refusing the whole function for a cold path.
             if matches!(
-                instruction.op,
+                op,
                 Op::Add
                     | Op::Sub
                     | Op::Mul
@@ -543,7 +566,7 @@ pub(super) fn check_eligibility(
                 }
                 continue;
             }
-            match instruction.op {
+            match op {
                 Op::LoadInt32 => check_constant_result(instruction, reprs)?,
                 Op::LoadNumber => check_number_constant_result(view, instruction, reprs)?,
                 Op::LoadUndefined => check_tagged_constant_result(instruction, reprs)?,
@@ -557,7 +580,7 @@ pub(super) fn check_eligibility(
                         || reprs.representation(result) != Representation::Tagged
                         || reprs.representation(instruction.inputs[0]) != Representation::Tagged
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                 }
                 Op::LoadThis => check_tagged_constant_result(instruction, reprs)?,
@@ -572,7 +595,7 @@ pub(super) fn check_eligibility(
                         || reprs.representation(result)
                             != reprs.representation(instruction.inputs[0])
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                 }
                 Op::ToPrimitive | Op::ToNumeric => {
@@ -585,7 +608,7 @@ pub(super) fn check_eligibility(
                         || reprs.representation(result)
                             != reprs.representation(instruction.inputs[0])
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     if reprs.representation(instruction.inputs[0]) == Representation::Tagged {
                         check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
@@ -601,7 +624,7 @@ pub(super) fn check_eligibility(
                         || instruction.input_registers.len() != 2
                         || instruction.result_register.is_none()
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
@@ -618,7 +641,7 @@ pub(super) fn check_eligibility(
                         || reprs.representation(instruction.inputs[0]) != Representation::Tagged
                         || reprs.representation(instruction.inputs[1]) == Representation::Float64
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
@@ -637,7 +660,7 @@ pub(super) fn check_eligibility(
                         || instruction.result_register.is_none()
                         || reprs.representation(instruction.inputs[0]) != Representation::Tagged
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                 }
@@ -654,7 +677,7 @@ pub(super) fn check_eligibility(
                         || instruction.result_register.is_none()
                         || reprs.representation(instruction.inputs[0]) != Representation::Tagged
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
@@ -676,7 +699,7 @@ pub(super) fn check_eligibility(
                         || reprs.representation(instruction.inputs[0]) != Representation::Tagged
                         || instruction.input_registers.contains(&scratch)
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
@@ -697,7 +720,7 @@ pub(super) fn check_eligibility(
                         || !instruction.input_registers.is_empty()
                         || instruction.result_register.is_none()
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     element_transition_instructions.push((
                         instruction.pc,
@@ -720,7 +743,7 @@ pub(super) fn check_eligibility(
                         || reprs.representation(instruction.inputs[0]) != Representation::Tagged
                         || reprs.representation(instruction.inputs[1]) != Representation::Tagged
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
@@ -746,7 +769,7 @@ pub(super) fn check_eligibility(
                         || instruction.inputs.len() != instruction.input_registers.len()
                         || reprs.representation(instruction.inputs[0]) != Representation::Tagged
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
@@ -762,7 +785,7 @@ pub(super) fn check_eligibility(
                         || instruction.inputs.len() != instruction.input_registers.len()
                         || reprs.representation(instruction.inputs[0]) != Representation::Tagged
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                 }
@@ -787,7 +810,7 @@ pub(super) fn check_eligibility(
                             .iter()
                             .any(|&input| reprs.representation(input) != Representation::Tagged)
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
@@ -804,7 +827,7 @@ pub(super) fn check_eligibility(
                     if !matches!(result_repr, Representation::Int32 | Representation::Float64)
                         || instruction.inputs.len() != 2
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     check_numeric_inputs(
                         instruction,
@@ -824,7 +847,7 @@ pub(super) fn check_eligibility(
                     if reprs.representation(result) != Representation::Int32
                         || instruction.inputs.len() != 1
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     check_numeric_inputs(
                         instruction,
@@ -845,7 +868,7 @@ pub(super) fn check_eligibility(
                     if reprs.representation(result) != Representation::Int32
                         || instruction.inputs.len() != 1
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     check_numeric_inputs(
                         instruction,
@@ -886,7 +909,7 @@ pub(super) fn check_eligibility(
                     if !matches!(result_repr, Representation::Int32 | Representation::Float64)
                         || instruction.inputs.len() != 1
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     check_numeric_inputs(
                         instruction,
@@ -905,7 +928,7 @@ pub(super) fn check_eligibility(
                         || instruction.inputs.len() != 1
                         || instruction.input_registers.len() != 1
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                 }
@@ -916,7 +939,7 @@ pub(super) fn check_eligibility(
                     if reprs.representation(result) != Representation::Float64
                         || instruction.inputs.len() != 2
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     check_numeric_inputs(
                         instruction,
@@ -936,13 +959,13 @@ pub(super) fn check_eligibility(
                         .result
                         .ok_or(Unsupported::OperandShape("bitwise result"))?;
                     if instruction.inputs.len() != 2 {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     let required = match reprs.representation(result) {
                         Representation::Int32 => Representation::Int32,
                         Representation::Float64 => Representation::Float64,
                         Representation::Tagged => {
-                            return Err(Unsupported::Opcode(instruction.op));
+                            return Err(Unsupported::Opcode(op));
                         }
                     };
                     check_numeric_inputs(
@@ -988,7 +1011,7 @@ pub(super) fn check_eligibility(
                             &mut guarded_uses,
                             &mut allowed_conversions,
                         )?;
-                    } else if matches!(instruction.op, Op::Equal | Op::NotEqual) {
+                    } else if matches!(op, Op::Equal | Op::NotEqual) {
                         // Mixed operands: strict equality is total over tagged
                         // values, so it lowers inline whatever the feedback.
                         check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
@@ -1009,7 +1032,7 @@ pub(super) fn check_eligibility(
                         || instruction.input_registers.is_empty()
                         || instruction.inputs.len() != instruction.input_registers.len()
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     let frame = &tree.frames[instruction.inline.0 as usize];
@@ -1039,7 +1062,7 @@ pub(super) fn check_eligibility(
                         || instruction.inputs.len() != instruction.input_registers.len()
                         || reprs.representation(instruction.inputs[0]) != Representation::Tagged
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                 }
                 // A spliced return hands its value to the continuation's merge
@@ -1101,7 +1124,7 @@ pub(super) fn check_eligibility(
                         || instruction.inputs.len() != 1
                         || instruction.input_registers.len() != 1
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                 }
@@ -1117,7 +1140,7 @@ pub(super) fn check_eligibility(
                         || instruction.result_register.is_none()
                         || !instruction.inputs.is_empty()
                     {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                 }
                 Op::Jump => {
@@ -1134,7 +1157,7 @@ pub(super) fn check_eligibility(
                     // (numbers/bool/null/undefined inline, heap cells via the leaf
                     // probe) at emit time.
                     if reprs.representation(instruction.inputs[0]) != Representation::Tagged {
-                        return Err(Unsupported::Opcode(instruction.op));
+                        return Err(Unsupported::Opcode(op));
                     }
                 }
                 Op::Return | Op::ReturnValue => {
@@ -1368,7 +1391,7 @@ pub(super) fn build_element_transition_sites(
                 root_registers.insert(register);
             }
         }
-        if instruction.op == Op::StoreProperty
+        if instruction.op == SsaOp::Bytecode(Op::StoreProperty)
             && root_registers.contains(
                 &instruction
                     .result_register
@@ -1419,6 +1442,14 @@ pub(super) fn frame_register_for_value(
         .iter()
         .position(|candidate| *candidate == Some(value))
         .and_then(|register| u16::try_from(register).ok())
+}
+
+/// The silent-fallback reason for an instruction this backend cannot lower.
+pub(super) fn instruction_unsupported(instruction: &SsaInstr) -> Unsupported {
+    instruction.op.bytecode().map_or(
+        Unsupported::OperandShape("optimizing primitive node shape"),
+        Unsupported::Opcode,
+    )
 }
 
 pub(super) fn check_tagged_inputs(
@@ -1472,7 +1503,7 @@ pub(super) fn check_numeric_inputs(
             (Representation::Tagged, Representation::Float64) => {
                 ConversionKind::CheckedTaggedToFloat64
             }
-            _ => return Err(Unsupported::Opcode(instruction.op)),
+            _ => return Err(instruction_unsupported(instruction)),
         };
         let conversion = reprs.conversions().iter().find(|conversion| {
             conversion.inline == instruction.inline
@@ -1490,7 +1521,7 @@ pub(super) fn check_numeric_inputs(
                     && conversion.kind == expected_kind
                     && conversion.may_deopt == may_deopt
         ) {
-            return Err(Unsupported::Opcode(instruction.op));
+            return Err(instruction_unsupported(instruction));
         }
         if may_deopt {
             // A checked tagged->numeric conversion guards the value and can
@@ -1508,7 +1539,7 @@ pub(super) fn check_numeric_inputs(
             let parameter_index = match ssa.values[input.0 as usize].def {
                 ValueDef::Param { index, .. } => Some(index),
                 ValueDef::Op { .. } => None,
-                _ => return Err(Unsupported::Opcode(instruction.op)),
+                _ => return Err(instruction_unsupported(instruction)),
             };
             guarded_uses.insert((instruction.pc, input), parameter_index);
         }
@@ -1521,14 +1552,16 @@ pub(super) fn is_boolean_value(ssa: &SsaFunction, value: ValueId) -> bool {
     matches!(
         ssa.values[value.0 as usize].def,
         ValueDef::Op {
-            op: Op::LoadTrue
-                | Op::LoadFalse
-                | Op::LessThan
-                | Op::LessEq
-                | Op::GreaterThan
-                | Op::GreaterEq
-                | Op::Equal
-                | Op::NotEqual,
+            op: SsaOp::Bytecode(
+                Op::LoadTrue
+                    | Op::LoadFalse
+                    | Op::LessThan
+                    | Op::LessEq
+                    | Op::GreaterThan
+                    | Op::GreaterEq
+                    | Op::Equal
+                    | Op::NotEqual,
+            ),
             ..
         }
     )
@@ -1555,8 +1588,10 @@ pub(super) fn fused_numeric_compare_at(
     };
     if !matches!(
         comparison.op,
-        Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq | Op::Equal | Op::NotEqual
-    ) || !matches!(branch.op, Op::JumpIfTrue | Op::JumpIfFalse)
+        SsaOp::Bytecode(
+            Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq | Op::Equal | Op::NotEqual
+        )
+    ) || !matches!(branch.op, SsaOp::Bytecode(Op::JumpIfTrue | Op::JumpIfFalse))
         || comparison.inline != branch.inline
         || insufficient_feedback.contains(&(comparison.inline, comparison.pc))
         || insufficient_feedback.contains(&(branch.inline, branch.pc))
@@ -1648,7 +1683,7 @@ pub(super) fn check_constant_result(
         .result
         .ok_or(Unsupported::OperandShape("optimizing constant result"))?;
     if !instruction.inputs.is_empty() || reprs.representation(result) != Representation::Int32 {
-        return Err(Unsupported::Opcode(instruction.op));
+        return Err(instruction_unsupported(instruction));
     }
     Ok(())
 }
@@ -1668,7 +1703,7 @@ pub(super) fn check_number_constant_result(
         Representation::Float64
     };
     if !instruction.inputs.is_empty() || reprs.representation(result) != expected {
-        return Err(Unsupported::Opcode(instruction.op));
+        return Err(instruction_unsupported(instruction));
     }
     Ok(())
 }
@@ -1681,7 +1716,7 @@ pub(super) fn check_boolean_result(
         .result
         .ok_or(Unsupported::OperandShape("optimizing boolean result"))?;
     if !instruction.inputs.is_empty() || reprs.representation(result) != Representation::Tagged {
-        return Err(Unsupported::Opcode(instruction.op));
+        return Err(instruction_unsupported(instruction));
     }
     Ok(())
 }
@@ -1694,7 +1729,7 @@ pub(super) fn check_tagged_constant_result(
         "optimizing tagged constant result",
     ))?;
     if !instruction.inputs.is_empty() || reprs.representation(result) != Representation::Tagged {
-        return Err(Unsupported::Opcode(instruction.op));
+        return Err(instruction_unsupported(instruction));
     }
     Ok(())
 }

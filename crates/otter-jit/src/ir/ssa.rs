@@ -2,10 +2,17 @@
 //!
 //! # Contents
 //! - [`SsaFunction`] — block/value storage and SSA construction.
-//! - [`ValueDef`] and [`SsaInstr`] — value definitions and renamed bytecode.
+//! - [`SsaOp`] — the node vocabulary: a whole bytecode opcode, or a primitive
+//!   guard or memory access an optimization pass can reason about.
+//! - [`ValueDef`] and [`SsaInstr`] — value definitions and renamed nodes.
 //! - [`SsaError`] — precise construction and pure verification failures.
 //!
 //! # Invariants
+//! - Construction produces one [`SsaOp::Bytecode`] node per bytecode
+//!   instruction; primitive nodes come only from a later lowering, which keeps
+//!   them adjacent and under the PC of the instruction they replace.
+//! - A [`SsaOp::LoadField`] reads the holder its immediately preceding
+//!   [`SsaOp::CheckShape`] resolved, over the same receiver value.
 //! - Phi placement and renaming use normal edges and the normal-edge dominator
 //!   forest; exception edges never supply phi inputs.
 //! - Every exception-handler entry reloads every virtual register through a
@@ -47,6 +54,42 @@ use super::{
 /// Dense SSA value identity; every value is defined exactly once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ValueId(pub u32);
+
+/// What one SSA instruction computes.
+///
+/// A bytecode opcode is one node until something lowers it into primitives, so
+/// [`Self::Bytecode`] is how far the primitive vocabulary currently reaches,
+/// not a second way of describing an operation the vocabulary already covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SsaOp {
+    /// A bytecode opcode carried whole.
+    Bytecode(Op),
+    /// Prove the instruction's sole input still carries hidden class `shape`.
+    ///
+    /// The check owns no result value: it hands the receiver's object header to
+    /// the [`Self::LoadField`] that must immediately follow it.
+    CheckShape {
+        /// Hidden-class handle the receiver must still carry.
+        shape: u32,
+    },
+    /// Read the own data slot at `byte` from the receiver a dominating
+    /// [`Self::CheckShape`] proved.
+    LoadField {
+        /// Byte offset of the slot in the holder's value slab.
+        byte: u32,
+    },
+}
+
+impl SsaOp {
+    /// The bytecode opcode this node carries, if it carries one whole.
+    #[must_use]
+    pub const fn bytecode(self) -> Option<Op> {
+        match self {
+            Self::Bytecode(op) => Some(op),
+            Self::CheckShape { .. } | Self::LoadField { .. } => None,
+        }
+    }
+}
 
 /// The unique definition that produces one SSA value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,14 +140,14 @@ pub enum ValueDef {
         /// One value per normal predecessor, in predecessor order.
         inputs: Box<[ValueId]>,
     },
-    /// Result of one bytecode instruction.
+    /// Result of one SSA instruction.
     Op {
         /// Frame owning the instruction; [`Self::Op::pc`] is canonical in it.
         inline: InlineId,
         /// Original canonical bytecode PC.
         pc: u32,
-        /// Original bytecode opcode.
-        op: Op,
+        /// Node the instruction computes.
+        op: SsaOp,
         /// SSA values for schema-declared read operands, in operand order.
         inputs: Box<[ValueId]>,
     },
@@ -121,15 +164,15 @@ pub struct ValueData {
     pub def_block: BlockId,
 }
 
-/// One bytecode instruction with register reads renamed to SSA values.
+/// One SSA instruction: a node with its register reads renamed to SSA values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SsaInstr {
     /// Frame owning this instruction; [`Self::pc`] is canonical within it.
     pub inline: InlineId,
     /// Original canonical bytecode PC.
     pub pc: u32,
-    /// Original bytecode opcode.
-    pub op: Op,
+    /// Node this instruction computes.
+    pub op: SsaOp,
     /// SSA values for schema-declared read registers, in operand order.
     pub inputs: SmallVec<[ValueId; 4]>,
     /// Source registers corresponding one-for-one with [`Self::inputs`].
@@ -147,8 +190,26 @@ pub struct SsaBlock {
     pub id: BlockId,
     /// Phi, entry-seed, or exception-input values defined at block entry.
     pub phis: Vec<ValueId>,
-    /// Renamed bytecode instructions in canonical PC order.
+    /// Renamed instructions in canonical PC order.
     pub instrs: Vec<SsaInstr>,
+}
+
+impl SsaBlock {
+    /// The source bytecode PCs this block covers, in canonical order.
+    ///
+    /// Primitive nodes lowered from one bytecode instruction share its PC and
+    /// stay adjacent, so a run of equal PCs is one source instruction.
+    pub fn source_pcs(&self) -> impl Iterator<Item = u32> + '_ {
+        let mut previous = None;
+        self.instrs
+            .iter()
+            .map(|instruction| instruction.pc)
+            .filter(move |&pc| {
+                let first = previous != Some(pc);
+                previous = Some(pc);
+                first
+            })
+    }
 }
 
 /// Complete SSA form for one bytecode function.
@@ -434,6 +495,16 @@ pub enum SsaError {
     NonCanonicalHeadOrder {
         /// Block containing the non-canonical head sequence.
         block: BlockId,
+    },
+    /// A field load is not preceded by the shape check that proves its holder.
+    LoadFieldWithoutCheckShape {
+        /// Instruction owning the unproven load.
+        pc: u32,
+    },
+    /// A primitive node's operands, result, or immediate are not well formed.
+    MalformedPrimitive {
+        /// Instruction owning the malformed node.
+        pc: u32,
     },
 }
 
@@ -753,7 +824,7 @@ impl SsaFunction {
 
             for &pc in &cfg.blocks[block_index].instr_pcs {
                 let instruction = &frame.instructions[pc as usize];
-                let op = instruction.op(frame.code_block.as_ref());
+                let op = SsaOp::Bytecode(instruction.op(frame.code_block.as_ref()));
                 let flow = &flows[layout.instruction(inline, pc)];
                 let result = if flow.def.is_some() {
                     Some(append_value(
@@ -919,7 +990,8 @@ impl SsaFunction {
                                     })?;
                                 inputs.push(value);
                             }
-                            if self.blocks[block_index].instrs[instruction_index].op == Op::LoadThis
+                            if self.blocks[block_index].instrs[instruction_index].op
+                                == SsaOp::Bytecode(Op::LoadThis)
                                 && inline != InlineId::ROOT
                                 && let Some(this_value) = self.frames[inline.0 as usize].this_value
                             {
@@ -1019,7 +1091,7 @@ impl SsaFunction {
             return None;
         }
         let last = self.blocks[block.0 as usize].instrs.last()?;
-        if last.op == Op::ReturnValue {
+        if last.op == SsaOp::Bytecode(Op::ReturnValue) {
             return last.inputs.first().copied();
         }
         undefined_return[cfg.blocks[block.0 as usize].inline.0 as usize]
@@ -1223,17 +1295,49 @@ impl SsaFunction {
                 previous_head_key = Some(key);
             }
 
-            if block.instrs.len() != cfg.blocks[block_index].instr_pcs.len()
-                || block
-                    .instrs
-                    .iter()
-                    .map(|instruction| instruction.pc)
-                    .ne(cfg.blocks[block_index].instr_pcs.iter().copied())
+            if block
+                .source_pcs()
+                .ne(cfg.blocks[block_index].instr_pcs.iter().copied())
             {
                 return Err(SsaError::InstructionLayoutMismatch { block: block_id });
             }
             for (instruction_index, instruction) in block.instrs.iter().enumerate() {
-                let synthetic_this = instruction.op == Op::LoadThis
+                match instruction.op {
+                    SsaOp::Bytecode(_) => {}
+                    // A shape check reads exactly the receiver it proves,
+                    // writes no register, and can never match the empty-class
+                    // sentinel.
+                    SsaOp::CheckShape { shape } => {
+                        if shape == 0
+                            || instruction.inputs.len() != 1
+                            || instruction.result.is_some()
+                            || instruction.result_register.is_some()
+                        {
+                            return Err(SsaError::MalformedPrimitive { pc: instruction.pc });
+                        }
+                    }
+                    // The load reads the holder the check resolved, so the
+                    // check on the same receiver must immediately precede it.
+                    SsaOp::LoadField { .. } => {
+                        if instruction.inputs.len() != 1 || instruction.result.is_none() {
+                            return Err(SsaError::MalformedPrimitive { pc: instruction.pc });
+                        }
+                        let proven = instruction_index
+                            .checked_sub(1)
+                            .and_then(|previous| block.instrs.get(previous))
+                            .is_some_and(|previous| {
+                                matches!(previous.op, SsaOp::CheckShape { .. })
+                                    && previous.pc == instruction.pc
+                                    && previous.inputs.first() == instruction.inputs.first()
+                            });
+                        if !proven {
+                            return Err(SsaError::LoadFieldWithoutCheckShape {
+                                pc: instruction.pc,
+                            });
+                        }
+                    }
+                }
+                let synthetic_this = instruction.op == SsaOp::Bytecode(Op::LoadThis)
                     && instruction.inline != InlineId::ROOT
                     && instruction.input_registers.is_empty()
                     && self.frames[instruction.inline.0 as usize]
@@ -1671,7 +1775,7 @@ mod tests {
             "a spliced frame defines no parameters of its own",
         );
         let ret = callee_block.instrs.last().expect("the callee returns");
-        assert_eq!(ret.op, Op::ReturnValue);
+        assert_eq!(ret.op, SsaOp::Bytecode(Op::ReturnValue));
         assert_eq!(ret.inline, InlineId(1));
         assert_eq!(ret.inputs.as_slice(), [argument]);
     }
@@ -1682,7 +1786,7 @@ mod tests {
 
         // The spliced call defines nothing; the continuation's merge does.
         let call = ssa.blocks[0].instrs.last().expect("the call is emitted");
-        assert_eq!(call.op, Op::Call);
+        assert_eq!(call.op, SsaOp::Bytecode(Op::Call));
         assert_eq!(call.result, None);
         assert_eq!(call.result_register, None);
 

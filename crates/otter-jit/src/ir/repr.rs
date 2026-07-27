@@ -32,7 +32,7 @@ use otter_vm::{JitInstructionMetadata, jit_feedback::ArithFeedback};
 
 use super::{
     inline::{InlineId, InlineTree},
-    ssa::{SsaFunction, ValueDef, ValueId},
+    ssa::{SsaFunction, SsaOp, ValueDef, ValueId},
 };
 
 /// The constant a `LoadNumber` in one frame materializes.
@@ -212,7 +212,10 @@ impl ReprMap {
                 ValueDef::Phi { .. }
                 | ValueDef::InlineResult { .. }
                 | ValueDef::Op {
-                    op: Op::LoadLocal | Op::StoreLocal | Op::ToPrimitive | Op::ToNumeric,
+                    op:
+                        SsaOp::Bytecode(
+                            Op::LoadLocal | Op::StoreLocal | Op::ToPrimitive | Op::ToNumeric,
+                        ),
                     ..
                 } => Representation::Int32,
                 _ => selected_non_phi_representation(tree, &value.def),
@@ -229,7 +232,10 @@ impl ReprMap {
                         })
                     }
                     ValueDef::Op {
-                        op: Op::LoadLocal | Op::StoreLocal | Op::ToPrimitive | Op::ToNumeric,
+                        op:
+                            SsaOp::Bytecode(
+                                Op::LoadLocal | Op::StoreLocal | Op::ToPrimitive | Op::ToNumeric,
+                            ),
                         inputs,
                         ..
                     } if inputs.len() == 1 => reprs[inputs[0].0 as usize],
@@ -251,16 +257,25 @@ impl ReprMap {
             for instruction in &block.instrs {
                 let required = if matches!(
                     instruction.op,
-                    Op::LoadLocal | Op::StoreLocal | Op::ToPrimitive | Op::ToNumeric
+                    SsaOp::Bytecode(
+                        Op::LoadLocal | Op::StoreLocal | Op::ToPrimitive | Op::ToNumeric
+                    )
                 ) {
                     reprs[instruction
                         .result
                         .expect("local moves have one SSA result")
                         .0 as usize]
                 } else {
-                    selected_input_representation(
-                        instruction.op,
-                        feedback_at(tree, instruction.inline, instruction.pc),
+                    instruction.op.bytecode().map_or(
+                        // A primitive guard or memory access reads and writes
+                        // ordinary boxed values.
+                        Representation::Tagged,
+                        |op| {
+                            selected_input_representation(
+                                op,
+                                feedback_at(tree, instruction.inline, instruction.pc),
+                            )
+                        },
                     )
                 };
                 for (operand_index, &value) in instruction.inputs.iter().enumerate() {
@@ -334,7 +349,13 @@ impl ReprMap {
                 def => {
                     let expected = match def {
                         ValueDef::Op {
-                            op: Op::LoadLocal | Op::StoreLocal | Op::ToPrimitive | Op::ToNumeric,
+                            op:
+                                SsaOp::Bytecode(
+                                    Op::LoadLocal
+                                    | Op::StoreLocal
+                                    | Op::ToPrimitive
+                                    | Op::ToNumeric,
+                                ),
                             inputs,
                             ..
                         } if inputs.len() == 1 => self.representation(inputs[0]),
@@ -381,16 +402,23 @@ impl ReprMap {
             for instruction in &block.instrs {
                 let required = if matches!(
                     instruction.op,
-                    Op::LoadLocal | Op::StoreLocal | Op::ToPrimitive | Op::ToNumeric
+                    SsaOp::Bytecode(
+                        Op::LoadLocal | Op::StoreLocal | Op::ToPrimitive | Op::ToNumeric
+                    )
                 ) {
                     self.representation(
                         instruction.result.expect("local moves have one SSA result"),
                     )
                 } else {
-                    verified_input_representation(
-                        instruction.op,
-                        feedback_at(tree, instruction.inline, instruction.pc),
-                    )
+                    instruction
+                        .op
+                        .bytecode()
+                        .map_or(Representation::Tagged, |op| {
+                            verified_input_representation(
+                                op,
+                                feedback_at(tree, instruction.inline, instruction.pc),
+                            )
+                        })
                 };
                 for (operand_index, &value) in instruction.inputs.iter().enumerate() {
                     let key = (instruction.inline, instruction.pc, operand_index);
@@ -474,19 +502,20 @@ const fn meet(left: Representation, right: Representation) -> Representation {
 fn selected_non_phi_representation(tree: &InlineTree, def: &ValueDef) -> Representation {
     match *def {
         ValueDef::Op {
-            op: Op::LoadInt32, ..
+            op: SsaOp::Bytecode(Op::LoadInt32),
+            ..
         } => Representation::Int32,
         ValueDef::Op {
             inline,
             pc,
-            op: Op::LoadNumber,
+            op: SsaOp::Bytecode(Op::LoadNumber),
             ..
         } => {
             load_number_at(tree, inline, pc).map_or(Representation::Float64, number_representation)
         }
-        ValueDef::Op { inline, pc, op, .. } => {
+        ValueDef::Op { inline, pc, op, .. } => op.bytecode().map_or(Representation::Tagged, |op| {
             selected_result_representation(op, feedback_at(tree, inline, pc))
-        }
+        }),
         _ => Representation::Tagged,
     }
 }
@@ -494,21 +523,22 @@ fn selected_non_phi_representation(tree: &InlineTree, def: &ValueDef) -> Represe
 fn verified_non_phi_representation(tree: &InlineTree, def: &ValueDef) -> Representation {
     match *def {
         ValueDef::Op {
-            op: Op::LoadInt32, ..
+            op: SsaOp::Bytecode(Op::LoadInt32),
+            ..
         } => Representation::Int32,
         ValueDef::Op {
             inline,
             pc,
-            op: Op::LoadNumber,
+            op: SsaOp::Bytecode(Op::LoadNumber),
             ..
         } => match load_number_at(tree, inline, pc) {
             Some(number) if is_exact_i32(number) => Representation::Int32,
             Some(_) => Representation::Float64,
             None => Representation::Float64,
         },
-        ValueDef::Op { inline, pc, op, .. } => {
+        ValueDef::Op { inline, pc, op, .. } => op.bytecode().map_or(Representation::Tagged, |op| {
             verified_result_representation(op, feedback_at(tree, inline, pc))
-        }
+        }),
         _ => Representation::Tagged,
     }
 }

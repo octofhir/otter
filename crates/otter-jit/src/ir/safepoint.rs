@@ -33,8 +33,19 @@ use super::{
     cfg::{BlockId, ControlFlowGraph},
     dom::{DomError, DominatorTree},
     liveness::Liveness,
-    ssa::{SsaFunction, ValueId},
+    ssa::{SsaFunction, SsaInstr, ValueId},
 };
+
+/// The bytecode opcode whose schema owes this instruction a safepoint.
+///
+/// A primitive guard or memory access neither allocates, collects, nor
+/// re-enters JS, so it owes none.
+fn safepoint_op(instruction: &SsaInstr) -> Option<Op> {
+    instruction
+        .op
+        .bytecode()
+        .filter(|&op| opcode_schema(op).effects.safepoint_required)
+}
 
 /// Precise SSA roots for every safepoint instruction in one function.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,11 +198,11 @@ impl SafepointRoots {
             let mut live_after = liveness.live_out(block).clone();
             let mut block_points = Vec::new();
             for instruction in ssa.blocks[block.0 as usize].instrs.iter().rev() {
-                if opcode_schema(instruction.op).effects.safepoint_required {
+                if let Some(op) = safepoint_op(instruction) {
                     block_points.push(SafepointPoint {
                         block,
                         pc: instruction.pc,
-                        op: instruction.op,
+                        op,
                         roots: live_after.clone(),
                     });
                 }
@@ -240,9 +251,9 @@ impl SafepointRoots {
         let mut expected_by_location = BTreeMap::new();
         for &block in full_dom.reverse_postorder() {
             for instruction in &ssa.blocks[block.0 as usize].instrs {
-                if opcode_schema(instruction.op).effects.safepoint_required {
-                    expected_points.push((block, instruction.pc, instruction.op));
-                    expected_by_location.insert((block, instruction.pc), instruction.op);
+                if let Some(op) = safepoint_op(instruction) {
+                    expected_points.push((block, instruction.pc, op));
+                    expected_by_location.insert((block, instruction.pc), op);
                 }
             }
         }
@@ -344,7 +355,7 @@ impl SafepointRoots {
         for &block in full_dom.reverse_postorder() {
             let mut live = liveness.live_out(block).clone();
             for instruction in ssa.blocks[block.0 as usize].instrs.iter().rev() {
-                if opcode_schema(instruction.op).effects.safepoint_required {
+                if safepoint_op(instruction).is_some() {
                     recomputed.insert((block, instruction.pc), live.clone());
                 }
                 if let Some(definition) = instruction.result {

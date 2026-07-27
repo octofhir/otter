@@ -421,14 +421,17 @@ fn validate_inputs(
     // reachable instructions of each frame's body: SSA is the authority for
     // which those are. A PC and a byte PC are canonical only within one frame,
     // so every check here is a per-frame invariant, never a unit-wide one.
+    // Primitive nodes lowered from one bytecode instruction share its PC and so
+    // name one site between them.
     let mut ssa_sites: Vec<(InlineId, u32)> = ssa
         .blocks
         .iter()
         .flat_map(|block| {
-            block
+            let inline = block
                 .instrs
-                .iter()
-                .map(|instruction| (instruction.inline, instruction.pc))
+                .first()
+                .map_or(InlineId::ROOT, |instruction| instruction.inline);
+            block.source_pcs().map(move |pc| (inline, pc))
         })
         .collect();
     ssa_sites.sort_unstable();

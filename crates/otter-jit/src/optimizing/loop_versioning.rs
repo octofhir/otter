@@ -9,6 +9,8 @@
 //! # Invariants
 //! - A candidate loop contains no heap-observing operation except property
 //!   reads, and every receiver is defined outside its natural loop.
+//! - A property read is one site whether it is carried by its bytecode node or
+//!   by the guard-and-field pair it lowers to.
 //! - Nested candidates sharing a site are rejected instead of choosing an
 //!   arbitrary activation boundary.
 //! - This plan moves no JS operation. A backend must train through the original
@@ -22,7 +24,7 @@ use otter_bytecode::Op;
 use crate::ir::{
     cfg::{BlockId, ControlFlowGraph},
     inline::InlineId,
-    ssa::{SsaFunction, SsaInstr, ValueDef, ValueId},
+    ssa::{SsaFunction, SsaInstr, SsaOp, ValueDef, ValueId},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -66,7 +68,7 @@ pub(crate) fn transparent_origin(ssa: &SsaFunction, mut value: ValueId) -> Optio
         let data = ssa.values.get(value.0 as usize)?;
         match &data.def {
             ValueDef::Op {
-                op: Op::LoadLocal | Op::StoreLocal,
+                op: SsaOp::Bytecode(Op::LoadLocal | Op::StoreLocal),
                 inputs,
                 ..
             } if inputs.len() == 1 => value = inputs[0],
@@ -76,8 +78,14 @@ pub(crate) fn transparent_origin(ssa: &SsaFunction, mut value: ValueId) -> Optio
 }
 
 fn safe_instruction(instruction: &SsaInstr) -> bool {
+    // A lowered guard and field read observe the heap no more than the
+    // bytecode load they came from, so they do not disqualify a loop; they
+    // simply carry their own guard and take no cache slot.
+    let Some(op) = instruction.op.bytecode() else {
+        return true;
+    };
     matches!(
-        instruction.op,
+        op,
         Op::LoadInt32
             | Op::LoadNumber
             | Op::LoadUndefined
@@ -149,7 +157,13 @@ pub(crate) fn analyze_property_loop_caches(
         let mut receivers_are_invariant = true;
         for block in &blocks {
             for instruction in &ssa.blocks[block.0 as usize].instrs {
-                if instruction.op != Op::LoadProperty {
+                // A settled site lowered into primitives is still one
+                // property read: the field node names it, and the check that
+                // resolves its holder belongs to the same site.
+                if !matches!(
+                    instruction.op,
+                    SsaOp::Bytecode(Op::LoadProperty) | SsaOp::LoadField { .. }
+                ) {
                     continue;
                 }
                 let Some(receiver) = instruction

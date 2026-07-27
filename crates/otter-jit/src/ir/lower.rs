@@ -6,9 +6,9 @@
 //! optimization pass can see, move, or delete.
 //!
 //! # Contents
-//! - [`lower_settled_property_loads`] — a monomorphic settled `LoadProperty`
-//!   becomes [`SsaOp::LoadHeader`], [`SsaOp::CheckShape`] and
-//!   [`SsaOp::LoadField`].
+//! - [`lower_settled_property_accesses`] — a monomorphic settled `LoadProperty`
+//!   or `StoreProperty` becomes [`SsaOp::LoadHeader`], [`SsaOp::CheckShape`] and
+//!   [`SsaOp::LoadField`] or [`SsaOp::StoreField`].
 //! - [`eliminate_redundant_checks`] — a second derivation of a holder, or a
 //!   second proof of a hidden class already established, is deleted.
 //!
@@ -24,6 +24,10 @@
 //! - A site whose cache program reaches past the receiver — a prototype hop, a
 //!   polymorphic chain, an exotic `length` — keeps its bytecode node. Those
 //!   need the cache cell the node vocabulary does not describe.
+//! - A store lowers only when its value is a proven `Int32`. Anything else may
+//!   be a heap cell, which owes the generational write barrier, or a double,
+//!   which owes a heap number: both are calls, and a call is what the lowered
+//!   form exists to avoid.
 //!
 //! # See also
 //! - [`super::ssa`] — the vocabulary and its verifier.
@@ -38,17 +42,19 @@ use smallvec::SmallVec;
 use super::{
     cfg::ControlFlowGraph,
     inline::{InlineId, InlineTree},
+    repr::{ReprMap, Representation},
     ssa::{SsaFunction, SsaInstr, SsaOp, ValueData, ValueDef, ValueId},
 };
 
-/// Replace every settled monomorphic property load with its primitive nodes.
-pub fn lower_settled_property_loads(
+/// Replace every settled monomorphic property access with its primitive nodes.
+pub fn lower_settled_property_accesses(
     ssa: &mut SsaFunction,
     cfg: &ControlFlowGraph,
     view: &JitCompileSnapshot,
     tree: &InlineTree,
+    reprs: &ReprMap,
 ) {
-    if view.cage_base == 0 || view.property_loads.is_empty() {
+    if view.cage_base == 0 || (view.property_loads.is_empty() && view.property_stores.is_empty()) {
         return;
     }
     let root = &tree.frames[InlineId::ROOT.0 as usize];
@@ -57,7 +63,7 @@ pub fn lower_settled_property_loads(
         if !ssa.blocks[block_index]
             .instrs
             .iter()
-            .any(|instruction| settled_slot(view, root, instruction).is_some())
+            .any(|instruction| settled_slot(view, root, reprs, instruction).is_some())
         {
             continue;
         }
@@ -65,41 +71,55 @@ pub fn lower_settled_property_loads(
         let source = std::mem::take(&mut ssa.blocks[block_index].instrs);
         let mut lowered = Vec::with_capacity(source.len() + 2);
         for instruction in source {
-            let Some((shape, byte)) = settled_slot(view, root, &instruction) else {
+            let Some((shape, byte, writes)) = settled_slot(view, root, reprs, &instruction) else {
                 lowered.push(instruction);
                 continue;
             };
             let result = instruction
                 .result
-                .expect("a settled property load writes one register");
+                .expect("a settled property access writes one register");
             // The holder address is a value of its own, so the guard and the
-            // read that trust it need not be adjacent and the allocator, not a
+            // access that trust it need not be adjacent and the allocator, not a
             // register convention, decides where it lives.
             let header = append_header_value(ssa, &instruction, block_index);
+            let access = if writes {
+                SsaOp::StoreField { byte }
+            } else {
+                SsaOp::LoadField { byte }
+            };
+            let mut operands: SmallVec<[ValueId; 4]> = SmallVec::from_slice(&[header]);
+            let mut operand_registers = SmallVec::new();
+            if writes {
+                // The stored value keeps its operand and its source register;
+                // only the receiver folds into the holder.
+                operands.push(instruction.inputs[1]);
+                operand_registers.push(instruction.input_registers[1]);
+            }
             let ValueDef::Op { op, inputs, .. } = &mut ssa.values[result.0 as usize].def else {
                 unreachable!("an instruction result is defined by its instruction");
             };
-            *op = SsaOp::LoadField { byte };
-            *inputs = Box::new([header]);
-            let holder: SmallVec<[ValueId; 4]> = SmallVec::from_slice(&[header]);
+            *op = access;
+            *inputs = operands.to_vec().into_boxed_slice();
             lowered.push(SsaInstr {
                 op: SsaOp::LoadHeader,
+                inputs: SmallVec::from_slice(&[instruction.inputs[0]]),
+                input_registers: SmallVec::from_slice(&[instruction.input_registers[0]]),
                 result: Some(header),
                 result_register: None,
                 ..instruction.clone()
             });
             lowered.push(SsaInstr {
                 op: SsaOp::CheckShape { shape },
-                inputs: holder.clone(),
+                inputs: SmallVec::from_slice(&[header]),
                 input_registers: SmallVec::new(),
                 result: None,
                 result_register: None,
                 ..instruction.clone()
             });
             lowered.push(SsaInstr {
-                op: SsaOp::LoadField { byte },
-                inputs: holder,
-                input_registers: SmallVec::new(),
+                op: access,
+                inputs: operands,
+                input_registers: operand_registers,
                 ..instruction
             });
         }
@@ -129,7 +149,7 @@ fn append_header_value(
             inline: instruction.inline,
             pc: instruction.pc,
             op: SsaOp::LoadHeader,
-            inputs: instruction.inputs.to_vec().into_boxed_slice(),
+            inputs: Box::new([instruction.inputs[0]]),
         },
         def_block: ssa.blocks[block_index].id,
     });
@@ -181,7 +201,9 @@ pub fn eliminate_redundant_checks(ssa: &mut SsaFunction, cfg: &ControlFlowGraph)
                     }
                     proven.insert(header, shape);
                 }
-                SsaOp::LoadField { .. } => {}
+                // A settled write keeps the class it wrote through, and cannot
+                // move the object: both facts survive it.
+                SsaOp::LoadField { .. } | SsaOp::StoreField { .. } => {}
                 SsaOp::Bytecode(op) => {
                     // Anything that can run arbitrary code, allocate, or write
                     // the heap invalidates both a raw address and a proven
@@ -206,33 +228,54 @@ pub fn eliminate_redundant_checks(ssa: &mut SsaFunction, cfg: &ControlFlowGraph)
     }
 }
 
-/// The single own slot a property-load site has settled on, if it has one.
+/// The single own slot a property site has settled on, and whether it writes.
 fn settled_slot(
     view: &JitCompileSnapshot,
     root: &super::inline::InlineFrame,
+    reprs: &ReprMap,
     instruction: &SsaInstr,
-) -> Option<(u32, u32)> {
+) -> Option<(u32, u32, bool)> {
     if instruction.inline != InlineId::ROOT
-        || instruction.op != SsaOp::Bytecode(Op::LoadProperty)
-        || instruction.inputs.len() != 1
-        || instruction.input_registers.len() != 1
         || instruction.result.is_none()
         || instruction.result_register.is_none()
     {
         return None;
     }
+    let writes = match instruction.op {
+        SsaOp::Bytecode(Op::LoadProperty)
+            if instruction.inputs.len() == 1 && instruction.input_registers.len() == 1 =>
+        {
+            false
+        }
+        // Only a proven `Int32` may be written inline: the compressed slot
+        // takes it whole, so there is no box to allocate and no cell to
+        // barrier.
+        SsaOp::Bytecode(Op::StoreProperty)
+            if instruction.inputs.len() == 2
+                && instruction.input_registers.len() == 2
+                && reprs.representation(instruction.inputs[1]) == Representation::Int32 =>
+        {
+            true
+        }
+        _ => return None,
+    };
     let metadata = root.instructions.get(instruction.pc as usize)?;
     // A dense array's or a primitive string's `.length` is not an own data
     // slot, so no settled slot can stand in for it.
     if metadata.load_array_length {
         return None;
     }
-    let [only] = view.property_loads.get(&metadata.byte_pc)?.as_slice() else {
+    let sites = if writes {
+        &view.property_stores
+    } else {
+        &view.property_loads
+    };
+    let [only] = sites.get(&metadata.byte_pc)?.as_slice() else {
         return None;
     };
     // Zero is the empty-hidden-class sentinel: no receiver ever carries it, so
     // a check against it could never hold.
-    (only.receiver_shape != 0).then_some((only.receiver_shape, only.value_byte))
+    (only.receiver_shape != 0).then_some((only.receiver_shape, only.value_byte, writes))
 }
 
 #[cfg(test)]
@@ -272,7 +315,8 @@ mod tests {
         let tree = InlineTree::trivial(&view);
         let cfg = ControlFlowGraph::build_inlined(&tree).expect("CFG builds");
         let mut ssa = SsaFunction::build_inlined(&tree, &cfg).expect("SSA builds");
-        lower_settled_property_loads(&mut ssa, &cfg, &view, &tree);
+        let reprs = ReprMap::compute(&tree, &ssa);
+        lower_settled_property_accesses(&mut ssa, &cfg, &view, &tree, &reprs);
         (cfg, ssa, tree)
     }
 
@@ -355,7 +399,8 @@ mod tests {
         let tree = InlineTree::trivial(&view);
         let cfg = ControlFlowGraph::build_inlined(&tree).expect("CFG builds");
         let mut ssa = SsaFunction::build_inlined(&tree, &cfg).expect("SSA builds");
-        lower_settled_property_loads(&mut ssa, &cfg, &view, &tree);
+        let reprs = ReprMap::compute(&tree, &ssa);
+        lower_settled_property_accesses(&mut ssa, &cfg, &view, &tree, &reprs);
 
         let ops: Vec<_> = ssa.blocks[0].instrs.iter().map(|i| i.op).collect();
         assert_eq!(

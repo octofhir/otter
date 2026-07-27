@@ -503,20 +503,17 @@ pub(super) fn check_eligibility(
         {
             let Some(op) = instruction.op.bytecode() else {
                 // A primitive neither calls, throws, nor allocates, so it owes
-                // no materialized frame. It takes its receiver as it is and
-                // produces an ordinary boxed value: nothing here boxes or
-                // unboxes, and two nodes sharing one PC could not both own a
-                // conversion at it.
+                // no materialized frame. Its receiver, its holder and anything
+                // it produces are ordinary boxed values; a numeric operand is
+                // boxed at the site, which is the conversion representation
+                // selection already planned.
                 if instruction
-                    .inputs
-                    .iter()
-                    .any(|&input| reprs.representation(input) != Representation::Tagged)
-                    || instruction.result.is_some_and(|result| {
-                        reprs.representation(result) != Representation::Tagged
-                    })
+                    .result
+                    .is_some_and(|result| reprs.representation(result) != Representation::Tagged)
                 {
                     return Err(instruction_unsupported(instruction));
                 }
+                check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                 continue;
             };
             // A feedback-driven op whose cell never recorded an execution is

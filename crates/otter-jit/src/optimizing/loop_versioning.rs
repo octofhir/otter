@@ -80,11 +80,14 @@ pub(crate) fn transparent_origin(ssa: &SsaFunction, mut value: ValueId) -> Optio
 }
 
 fn safe_instruction(instruction: &SsaInstr) -> bool {
-    // A lowered guard and field read observe the heap no more than the
-    // bytecode load they came from, so they do not disqualify a loop; they
-    // simply carry their own guard and take no cache slot.
-    let Some(op) = instruction.op.bytecode() else {
-        return true;
+    let op = match instruction.op {
+        // A lowered guard and field read observe the heap no more than the
+        // bytecode load they came from, so they do not disqualify a loop.
+        SsaOp::LoadHeader | SsaOp::CheckShape { .. } | SsaOp::LoadField { .. } => return true,
+        // A write does: replaying a cached read assumes the loop body cannot
+        // change what it reads.
+        SsaOp::StoreField { .. } => return false,
+        SsaOp::Bytecode(op) => op,
     };
     matches!(
         op,

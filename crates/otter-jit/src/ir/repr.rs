@@ -316,6 +316,53 @@ impl ReprMap {
         self.reprs[value.0 as usize]
     }
 
+    /// Whether the tier emits the instruction at `(inline, pc)` as machine
+    /// arithmetic or a machine constant, with nothing that can allocate, call,
+    /// or re-enter JavaScript.
+    ///
+    /// A non-`Tagged` result is what commits the emission: only these opcodes
+    /// get one, and an arithmetic site gets one only where feedback proved it
+    /// numeric, so the generic boxed path — the one that owns the call — is not
+    /// the path taken. A failed operand guard leaves compiled code through
+    /// deoptimization rather than through a call, and boxing a double is the
+    /// one conversion that would still allocate.
+    #[must_use]
+    pub fn emits_unboxed_numeric(
+        &self,
+        instruction: &crate::ir::ssa::SsaInstr,
+        result: ValueId,
+    ) -> bool {
+        let Some(op) = instruction.op.bytecode() else {
+            return false;
+        };
+        matches!(
+            op,
+            Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Rem
+                | Op::Pow
+                | Op::Neg
+                | Op::Increment
+                | Op::AddImm
+                | Op::SubImm
+                | Op::BitwiseAndImm
+                | Op::BitwiseAnd
+                | Op::BitwiseOr
+                | Op::BitwiseXor
+                | Op::Shl
+                | Op::Shr
+                | Op::LoadInt32
+                | Op::LoadNumber
+        ) && self.representation(result) != Representation::Tagged
+            && !self.conversions().iter().any(|conversion| {
+                conversion.inline == instruction.inline
+                    && conversion.at_pc == instruction.pc
+                    && conversion.kind == ConversionKind::BoxFloat64
+            })
+    }
+
     /// Ordered conversions required by instruction inputs.
     #[must_use]
     pub fn conversions(&self) -> &[Conversion] {
@@ -829,8 +876,12 @@ mod tests {
         let tree = InlineTree::trivial(&view);
         let cfg = ControlFlowGraph::build_inlined(&tree).expect("CFG builds");
         let ssa = SsaFunction::build_inlined(&tree, &cfg).expect("SSA builds");
-        ssa.verify(&cfg, &DominatorTree::compute(&cfg))
-            .expect("SSA verifies");
+        ssa.verify(
+            &cfg,
+            &DominatorTree::compute(&cfg),
+            &ReprMap::compute(&tree, &ssa),
+        )
+        .expect("SSA verifies");
         (tree, ssa)
     }
 

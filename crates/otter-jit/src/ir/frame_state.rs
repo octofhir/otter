@@ -224,8 +224,12 @@ impl std::error::Error for FrameStateError {}
 impl FrameStateTable {
     /// Build one abstract frame state before every SSA instruction.
     /// Build the table for one function with nothing spliced into it.
-    pub fn build(ssa: &SsaFunction, cfg: &ControlFlowGraph) -> Result<Self, FrameStateError> {
-        Self::build_inlined(&[None], ssa, cfg)
+    pub fn build(
+        ssa: &SsaFunction,
+        cfg: &ControlFlowGraph,
+        reprs: &super::repr::ReprMap,
+    ) -> Result<Self, FrameStateError> {
+        Self::build_inlined(&[None], ssa, cfg, reprs)
     }
 
     /// Build the table for a whole compiled unit.
@@ -236,9 +240,10 @@ impl FrameStateTable {
         call_sites: &[Option<InlineCallSite>],
         ssa: &SsaFunction,
         cfg: &ControlFlowGraph,
+        reprs: &super::repr::ReprMap,
     ) -> Result<Self, FrameStateError> {
         let full_dom = DominatorTree::compute(cfg);
-        ssa.verify(cfg, &full_dom)
+        ssa.verify(cfg, &full_dom, reprs)
             .map_err(FrameStateError::InvalidSsa)?;
         let normal_dom = DominatorTree::compute_normal(cfg);
 
@@ -691,8 +696,13 @@ mod tests {
             .iter()
             .map(|frame| frame.call_site.clone())
             .collect();
-        let table = FrameStateTable::build_inlined(&call_sites, &ssa, &cfg)
-            .expect("spliced frame states build");
+        let table = FrameStateTable::build_inlined(
+            &call_sites,
+            &ssa,
+            &cfg,
+            &crate::ir::repr::ReprMap::compute(&tree, &ssa),
+        )
+        .expect("spliced frame states build");
 
         let root_states: Vec<_> = table
             .states()
@@ -739,10 +749,17 @@ mod tests {
         let cfg = ControlFlowGraph::build(&snapshot).expect("CFG builds");
         let ssa = SsaFunction::build(&snapshot, &cfg).expect("SSA builds");
         let full_dom = DominatorTree::compute(&cfg);
-        let states = FrameStateTable::build(&ssa, &cfg).expect("frame states build");
+        let tree = crate::ir::inline::InlineTree::trivial(&snapshot);
+        let reprs = crate::ir::repr::ReprMap::compute(&tree, &ssa);
+        let states = FrameStateTable::build(&ssa, &cfg, &reprs).expect("frame states build");
         states
             .verify(&ssa, &cfg, &full_dom)
             .expect("frame states verify");
+        assert_eq!(
+            states,
+            FrameStateTable::build(&ssa, &cfg, &reprs).expect("frame states rebuild"),
+            "building twice over identical inputs must agree"
+        );
         (cfg, ssa, full_dom, states)
     }
 
@@ -772,7 +789,7 @@ mod tests {
 
     #[test]
     fn straight_line_snapshots_each_latest_definition() {
-        let (cfg, ssa, _dom, states) = analyses(
+        let (_cfg, ssa, _dom, states) = analyses(
             1,
             3,
             vec![
@@ -802,7 +819,6 @@ mod tests {
             states.at(InlineId::ROOT, 3).unwrap().registers[2],
             Some(op_value_at(&ssa, 2))
         );
-        assert_eq!(states, FrameStateTable::build(&ssa, &cfg).unwrap());
     }
 
     #[test]

@@ -774,19 +774,19 @@ mod tests {
         cfg.verify().expect("CFG verifies");
         let ssa = SsaFunction::build_inlined(&tree, &cfg).expect("SSA builds");
         let dom = DominatorTree::compute(&cfg);
-        ssa.verify(&cfg, &dom).expect("SSA verifies");
+        let reprs = ReprMap::compute(&tree, &ssa);
+        ssa.verify(&cfg, &dom, &reprs).expect("SSA verifies");
         let liveness = Liveness::compute(&ssa, &cfg);
         liveness
             .verify(&ssa, &cfg, &dom)
             .expect("liveness verifies");
-        let reprs = ReprMap::compute(&tree, &ssa);
         reprs.verify(&tree, &ssa).expect("representations verify");
         let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, register_budget)
             .expect("allocation computes");
         allocation
             .verify(&ssa, &cfg, &liveness, &reprs)
             .expect("allocation verifies");
-        let frame_states = FrameStateTable::build(&ssa, &cfg).expect("frame states build");
+        let frame_states = FrameStateTable::build(&ssa, &cfg, &reprs).expect("frame states build");
         frame_states
             .verify(&ssa, &cfg, &dom)
             .expect("frame states verify");

@@ -140,18 +140,18 @@ impl OptimizationPipeline {
         // renumbered graph.
         let value_reprs = ReprMap::compute(&tree, &ssa);
         lower_settled_property_accesses(&mut ssa, &cfg, view, &tree, &value_reprs);
-        ssa.verify(&cfg, &dom)
+
+        let reprs = ReprMap::compute(&tree, &ssa);
+        reprs
+            .verify(&tree, &ssa)
+            .map_err(OptimizationError::RepresentationVerification)?;
+        ssa.verify(&cfg, &dom, &reprs)
             .map_err(OptimizationError::SsaVerification)?;
 
         let liveness = Liveness::compute(&ssa, &cfg);
         liveness
             .verify(&ssa, &cfg, &dom)
             .map_err(OptimizationError::LivenessVerification)?;
-
-        let reprs = ReprMap::compute(&tree, &ssa);
-        reprs
-            .verify(&tree, &ssa)
-            .map_err(OptimizationError::RepresentationVerification)?;
 
         let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, self.register_budget)
             .map_err(OptimizationError::RegisterAllocation)?;
@@ -164,7 +164,7 @@ impl OptimizationPipeline {
             .iter()
             .map(|frame| frame.call_site.clone())
             .collect();
-        let frame_states = FrameStateTable::build_inlined(&call_sites, &ssa, &cfg)
+        let frame_states = FrameStateTable::build_inlined(&call_sites, &ssa, &cfg, &reprs)
             .map_err(OptimizationError::FrameStateConstruction)?;
         frame_states
             .verify(&ssa, &cfg, &dom)

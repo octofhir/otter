@@ -1517,7 +1517,9 @@ mod tests {
         cfg.verify().expect("CFG verifies");
         let ssa = SsaFunction::build(&snapshot, &cfg).expect("SSA builds");
         let dom = DominatorTree::compute(&cfg);
-        ssa.verify(&cfg, &dom).expect("SSA verifies");
+        let tree = crate::ir::inline::InlineTree::trivial(&snapshot);
+        ssa.verify(&cfg, &dom, &ReprMap::compute(&tree, &ssa))
+            .expect("SSA verifies");
         let liveness = Liveness::compute(&ssa, &cfg);
         liveness
             .verify(&ssa, &cfg, &dom)

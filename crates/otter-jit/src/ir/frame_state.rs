@@ -9,7 +9,9 @@
 //!
 //! # Invariants
 //! - Every frame-local canonical instruction PC has exactly one state, sorted
-//!   by `(inline frame, PC)`.
+//!   by `(inline frame, PC)`. Primitive nodes lowered from one bytecode
+//!   instruction share that PC and therefore share its state: none of them has
+//!   written anything the interpreter would not redo from there.
 //! - State slots are interpreter registers, never machine locations.
 //! - Construction follows the same normal-edge dominator forest and block-head
 //!   definitions as SSA renaming, including independent exception-handler roots.
@@ -25,7 +27,7 @@ use super::{
     cfg::{BlockId, ControlFlowGraph},
     dom::{DomError, DominatorTree},
     inline::{InlineCallSite, InlineId},
-    ssa::{SsaError, SsaFunction, ValueDef, ValueId},
+    ssa::{SsaError, SsaFunction, SsaOp, ValueDef, ValueId},
 };
 
 /// Reaching SSA values for all interpreter registers at one deopt point.
@@ -329,19 +331,28 @@ impl FrameStateTable {
                             pushed.push(slot);
                         }
 
+                        let mut described_pc = None;
                         for instruction in &ssa.blocks[block_index].instrs {
-                            let base = usize::from(register_base(ssa, inline));
-                            states.push(AbstractFrameState {
-                                inline,
-                                pc: instruction.pc,
-                                block,
-                                registers: stacks[base..base + usize::from(frame_registers)]
-                                    .iter()
-                                    .map(|stack| stack.last().copied())
-                                    .collect::<Vec<_>>()
-                                    .into_boxed_slice(),
-                                caller: None,
-                            });
+                            // Primitive nodes lowered from one bytecode
+                            // instruction share its PC and its resume state:
+                            // the group's first node is the only one that has
+                            // yet to write anything, and the whole group
+                            // resumes there.
+                            if described_pc != Some(instruction.pc) {
+                                described_pc = Some(instruction.pc);
+                                let base = usize::from(register_base(ssa, inline));
+                                states.push(AbstractFrameState {
+                                    inline,
+                                    pc: instruction.pc,
+                                    block,
+                                    registers: stacks[base..base + usize::from(frame_registers)]
+                                        .iter()
+                                        .map(|stack| stack.last().copied())
+                                        .collect::<Vec<_>>()
+                                        .into_boxed_slice(),
+                                    caller: None,
+                                });
+                            }
 
                             match (instruction.result, instruction.result_register) {
                                 (Some(value), Some(register)) => {
@@ -456,19 +467,23 @@ impl FrameStateTable {
         let mut state_index = 0;
         for cfg_block in &cfg.blocks {
             let ssa_block = &ssa.blocks[cfg_block.id.0 as usize];
-            if ssa_block.instrs.len() != cfg_block.instr_pcs.len()
-                || ssa_block
-                    .instrs
-                    .iter()
-                    .map(|instruction| instruction.pc)
-                    .ne(cfg_block.instr_pcs.iter().copied())
+            if ssa_block
+                .source_pcs()
+                .ne(cfg_block.instr_pcs.iter().copied())
             {
                 return Err(FrameStateError::SsaInstructionLayoutMismatch {
                     block: cfg_block.id,
                 });
             }
 
+            // Primitive nodes lowered from one bytecode instruction share its
+            // PC and so describe one resume state between them.
+            let mut described_pc = None;
             for instruction in &ssa_block.instrs {
+                if described_pc.is_some_and(|pc| pc != instruction.pc) {
+                    state_index += 1;
+                }
+                described_pc = Some(instruction.pc);
                 let state = &self.states[state_index];
                 if state.pc != instruction.pc {
                     return Err(FrameStateError::StatePcMismatch {
@@ -525,7 +540,8 @@ impl FrameStateTable {
                     }
                 }
 
-                let synthetic_this = instruction.op == otter_bytecode::Op::LoadThis
+                let synthetic_this = instruction.op
+                    == SsaOp::Bytecode(otter_bytecode::Op::LoadThis)
                     && instruction.inline != InlineId::ROOT
                     && instruction.input_registers.is_empty()
                     && ssa.frames[instruction.inline.0 as usize]
@@ -563,6 +579,8 @@ impl FrameStateTable {
                         });
                     }
                 }
+            }
+            if described_pc.is_some() {
                 state_index += 1;
             }
         }

@@ -15,6 +15,8 @@
 //! # Invariants
 //! - Stages run in dependency order and every verifier runs before its output is
 //!   consumed by a later stage.
+//! - Bytecode nodes are lowered into the primitive guard vocabulary between SSA
+//!   construction and SSA verification, so every later stage sees one graph.
 //! - Deopt legalization happens after recording raw linear-scan pressure and
 //!   before rebuilding phi edge moves and lowering the concrete deopt table.
 //! - Analysis is pure over the compile snapshot; no executable memory or
@@ -38,6 +40,7 @@ use crate::{
         frame_state::{FrameStateError, FrameStateTable},
         inline::{InlineError, InlineTree},
         liveness::{Liveness, LivenessError},
+        lower::lower_settled_property_loads,
         regalloc::{Allocation, Location, RegClass, RegallocError, RegisterBudget},
         repr::{ReprError, ReprMap},
         ssa::{SsaError, SsaFunction, ValueId},
@@ -129,8 +132,9 @@ impl OptimizationPipeline {
         dom.verify(&cfg)
             .map_err(OptimizationError::DominanceVerification)?;
 
-        let ssa =
+        let mut ssa =
             SsaFunction::build_inlined(&tree, &cfg).map_err(OptimizationError::SsaConstruction)?;
+        lower_settled_property_loads(&mut ssa, view, &tree);
         ssa.verify(&cfg, &dom)
             .map_err(OptimizationError::SsaVerification)?;
 

@@ -789,7 +789,13 @@ fn linearize(ssa: &SsaFunction, cfg: &ControlFlowGraph) -> Result<Linearization,
     for (block_index, cfg_block) in cfg.blocks.iter().enumerate() {
         let block = BlockId(block_index as u32);
         let ssa_block = &ssa.blocks[block_index];
-        if cfg_block.instr_pcs.len() != ssa_block.instrs.len() {
+        // Primitive nodes lowered from one bytecode instruction share its PC,
+        // so a block holds at least one node per source instruction and each
+        // node still gets its own linear-scan position.
+        if ssa_block
+            .source_pcs()
+            .ne(cfg_block.instr_pcs.iter().copied())
+        {
             return Err(RegallocError::InstructionCountMismatch {
                 block,
                 cfg: cfg_block.instr_pcs.len(),

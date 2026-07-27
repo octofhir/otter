@@ -7,6 +7,7 @@
 //! - [`frame_state`] — abstract exact-PC interpreter-frame reconstruction.
 //! - [`inline`] — verified splice decision over monomorphic call sites.
 //! - [`liveness`] — backward SSA-value liveness over normal control edges.
+//! - [`lower`] — bytecode nodes rewritten into the primitive guard vocabulary.
 //! - [`regalloc`] — backend-independent linear-scan SSA register allocation.
 //! - [`repr`] — feedback-guided SSA representation selection and conversions.
 //! - [`safepoint`] — precise SSA root sets live across GC safepoints.
@@ -26,6 +27,7 @@ pub mod dom;
 pub mod frame_state;
 pub mod inline;
 pub mod liveness;
+pub mod lower;
 pub mod regalloc;
 pub mod repr;
 pub mod safepoint;

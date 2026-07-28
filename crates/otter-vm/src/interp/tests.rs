@@ -1197,7 +1197,7 @@ fn call_method_string_prototype_non_callable_shadows_builtin() {
     );
     let recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -1287,7 +1287,7 @@ fn call_char_code_at(interp: &mut Interpreter, recv: Value) -> Result<Activation
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     };
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -1337,7 +1337,7 @@ fn call_method_number_prototype_non_callable_shadows_builtin() {
         Value::number_i32(1),
     );
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -1432,7 +1432,7 @@ fn call_number_to_string(
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     };
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])

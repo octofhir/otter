@@ -325,7 +325,7 @@ mod tests {
     }
 
     fn key<'a>(name: &'a str) -> AtomizedPropertyKey<'a> {
-        AtomizedPropertyKey::new(PropertyAtom::new(AtomId::from_constant_index(7)), name)
+        AtomizedPropertyKey::new(PropertyAtom::new(AtomId::from_global(7)), name)
     }
 
     #[test]

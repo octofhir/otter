@@ -65,8 +65,9 @@ pub(crate) fn initialize_unmapped(
     }
 
     object::mark_as_arguments_object(obj, heap);
+    let mut key_buffer = itoa::Buffer::new();
     for index in 0..args.len() {
-        let key = index.to_string();
+        let key = key_buffer.format(index);
         let descriptor = PropertyDescriptor::data(args[index], true, true, true);
         object::define_own_property(obj, heap, &key, descriptor);
     }
@@ -134,8 +135,9 @@ pub(crate) fn initialize_mapped(
     }
 
     object::mark_as_arguments_object(obj, heap);
+    let mut key_buffer = itoa::Buffer::new();
     for index in 0..args.len() {
-        let key = index.to_string();
+        let key = key_buffer.format(index);
         let descriptor = PropertyDescriptor::data(args[index], true, true, true);
         object::define_own_property(obj, heap, &key, descriptor);
     }

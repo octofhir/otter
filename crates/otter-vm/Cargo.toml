@@ -33,6 +33,7 @@ otter-gc = { workspace = true }
 otter-regex = { workspace = true }
 otter-macros = { workspace = true }
 serde = { workspace = true }
+itoa = "1"
 serde_json = { workspace = true }
 smallvec = { workspace = true }
 indexmap = { workspace = true }

@@ -6,8 +6,8 @@
 //! - Loop-header OSR trampolines materializing allocated state from the
 //!   interpreter register window.
 //! - Bounded batched back-edge polling with loop-header bail writeback.
-//! - Precise live-tagged GC safepoints around element, property, global,
-//!   comparison, and method-call transitions.
+//! - Precise live-tagged GC safepoints around root-frame transitions and
+//!   exact-PC chain exits for reentrant operations in spliced frames.
 //! - Direct live-value reads from baked global lexical cells and guarded
 //!   global-object property records.
 //! - Baked stable-entry plain and method calls with stack-owned rooted callee
@@ -58,11 +58,13 @@
 //!   comparison with the VM's `true` immediate; all other values run the full
 //!   inline `ToBoolean` reduction before selecting an edge. `LogicalNot` uses
 //!   the same reduction and materializes the inverted canonical boolean.
-//! - Every reentrant transition boxes its operands plus tagged SSA values live
-//!   across the call into their canonical native-frame slots. Its precise frame
-//!   bitmap names every tagged input and live-across value; moving-GC reloads
-//!   restore live values and load results while numeric machine locations
-//!   remain untouched.
+//! - Every root-frame reentrant transition boxes its operands plus tagged SSA
+//!   values live across the call into their canonical native-frame slots. Its
+//!   precise frame bitmap names every tagged input and live-across value;
+//!   moving-GC reloads restore live values and load results while numeric
+//!   machine locations remain untouched. A spliced-frame transition exits
+//!   before effects and reconstructs the complete inline chain instead of
+//!   addressing the root frame's register window.
 //! - A baked global lexical address names a permanent old-space cell. Generated
 //!   code loads the cell's current value and uses the canonical transition for
 //!   TDZ holes.
@@ -202,6 +204,10 @@ struct Eligibility {
     osr_entries: BTreeMap<BlockId, OsrEntrySite>,
     /// Precise transition protocol per element load/store logical PC.
     element_transitions: ElementTransitionSafepoints,
+    /// Reentrant bytecodes inside spliced frames. Their ordinary machine fast
+    /// paths are lowered before this classification; any remaining operation
+    /// exits before effects and lets the reconstructed interpreter chain run it.
+    inline_transitions: BTreeSet<(InlineId, u32)>,
     /// Sites whose feedback cell has never recorded an execution. Emission
     /// replaces each with an unconditional deopt: if the cold path is ever
     /// reached, the interpreter runs it, records feedback, bumps the epoch,
@@ -1104,9 +1110,15 @@ fn emit(
             if eligibility
                 .insufficient_feedback
                 .contains(&(instruction.inline, instruction.pc))
+                || eligibility
+                    .inline_transitions
+                    .contains(&(instruction.inline, instruction.pc))
             {
-                // Never-executed site: deopt to the interpreter, which runs it,
-                // records feedback, and triggers a recompile via the epoch.
+                // A never-executed feedback site needs the interpreter to
+                // populate its cell. A reentrant operation in a spliced frame
+                // has no physical interpreter window for a runtime stub. Both
+                // exit before effects; exact frame state rebuilds the complete
+                // chain and the interpreter executes the opcode once.
                 let deopt = ops.new_dynamic_label();
                 deopt_exits.push((
                     deopt,
@@ -1192,7 +1204,7 @@ fn emit(
                 }
                 SsaOp::Bytecode(op) => match op {
                     Op::LoadInt32 => {
-                        let value = load_int32(view, instruction.pc)?;
+                        let value = load_int32(tree, instruction)?;
                         emit_load_i32(&mut ops, 9, value);
                         emit_store_location(
                             &mut ops,
@@ -1203,7 +1215,7 @@ fn emit(
                     }
                     Op::LoadNumber => {
                         let result = instruction.result.expect("eligibility checked result");
-                        let value = load_number(view, instruction.pc)?;
+                        let value = load_number(tree, instruction)?;
                         match reprs.representation(result) {
                             Representation::Int32 => {
                                 emit_load_i32(&mut ops, 9, value as i32);
@@ -2846,8 +2858,7 @@ fn emit(
                         let result = instruction
                             .result
                             .expect("eligibility checked increment result");
-                        let delta = view.instructions[instruction.pc as usize]
-                            .imm32(view.code_block.as_ref(), 2)
+                        let delta = frame_imm32(tree, instruction, 2)
                             .ok_or(Unsupported::OperandShape("increment delta operand"))?;
                         emit_load_int_operand(
                             &mut ops,
@@ -2879,8 +2890,7 @@ fn emit(
                         let result = instruction
                             .result
                             .expect("eligibility checked immediate result");
-                        let imm = view.instructions[instruction.pc as usize]
-                            .imm32(view.code_block.as_ref(), 2)
+                        let imm = frame_imm32(tree, instruction, 2)
                             .ok_or(Unsupported::OperandShape("immediate operand"))?;
                         emit_load_int_operand(
                             &mut ops,
@@ -2910,8 +2920,7 @@ fn emit(
                         let result = instruction
                             .result
                             .expect("eligibility checked immediate result");
-                        let imm = view.instructions[instruction.pc as usize]
-                            .imm32(view.code_block.as_ref(), 2)
+                        let imm = frame_imm32(tree, instruction, 2)
                             .ok_or(Unsupported::OperandShape("immediate operand"))?;
                         emit_load_int_operand(
                             &mut ops,
@@ -2933,8 +2942,7 @@ fn emit(
                         let result = instruction
                             .result
                             .expect("eligibility checked immediate result");
-                        let imm = view.instructions[instruction.pc as usize]
-                            .imm32(view.code_block.as_ref(), 2)
+                        let imm = frame_imm32(tree, instruction, 2)
                             .ok_or(Unsupported::OperandShape("immediate operand"))?;
                         let fused_branch = fused_numeric_compare_at(
                             tree,
@@ -3934,13 +3942,18 @@ fn emit(
             let callee_pc = logical_pc(tree, frame.function_id, frame.byte_pc)?;
             chain.push(DeoptChainCall { call_pc, callee_pc });
         }
+        let outer_resume_pc = logical_pc(
+            tree,
+            frame_state.outermost().function_id,
+            frame_state.outermost().byte_pc,
+        )?;
         let index = u32::try_from(exit_descriptors.len())
             .ok()
             .filter(|&index| index <= u32::from(u16::MAX))
             .ok_or(Unsupported::OperandShape("optimizing deopt exit count"))?;
         exit_descriptors.push(DeoptExitDescriptor {
             state: exit,
-            resume_pc,
+            resume_pc: outer_resume_pc,
             chain: chain.into_boxed_slice(),
         });
         dynasm!(ops

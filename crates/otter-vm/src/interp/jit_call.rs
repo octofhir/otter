@@ -17,8 +17,11 @@
 //! already-active Invalid code remains independent.
 //! Optimized entries run only over fresh ordinary frames; every bail resumes
 //! the interpreter on the generated exit's fully reconstructed register
-//! window. They use the same fully wired runtime activation, published native
-//! frame, and call-scoped VM thread as baseline entries.
+//! window. Spliced exits re-enter each call through the interpreter's canonical
+//! frame builder, restore every callee window, and publish the outer caller's
+//! exact continuation PC to the native entry boundary. They use the same fully
+//! wired runtime activation, published native frame, and call-scoped VM thread
+//! as baseline entries.
 //! Canonical tier transitions retain one [`NativeFrame`] and register window;
 //! materialized [`Frame`] construction is confined to cold deoptimization and
 //! interpreter-owned dispatch.
@@ -1062,6 +1065,8 @@ impl Interpreter {
         stack: &mut ActivationStack,
         call_pc: u32,
         callee_pc: u32,
+        chain_index: u32,
+        chain_total: u32,
     ) -> Result<*mut crate::Value, VmError> {
         let caller_index = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
         let function_id = stack[caller_index].function_id;
@@ -1099,6 +1104,12 @@ impl Interpreter {
             return Err(VmError::InvalidOperand);
         }
         stack[callee_index].pc = callee_pc;
+        self.record_jit_debug_event(|| crate::JitDebugEvent::InlineDeoptFrame {
+            index: chain_index,
+            total: chain_total,
+            function_id: stack[callee_index].function_id,
+            resume_pc: callee_pc,
+        });
         Ok(stack[callee_index].registers.as_mut_ptr())
     }
 

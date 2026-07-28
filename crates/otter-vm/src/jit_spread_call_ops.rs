@@ -102,11 +102,11 @@ impl Interpreter {
                 }
             }
             if method.is_undefined() {
-                let name = context
-                    .string_constant_str_for_function(function_id, name_index)
+                let method_key = context
+                    .property_atom_for_function(function_id, name_index)
                     .ok_or(VmError::InvalidOperand)?;
                 method = interp
-                    .get_method_value_for_call(context, stack, receiver, name)?
+                    .get_method_value_for_call(context, stack, receiver, method_key)?
                     .unwrap_or_else(Value::undefined);
             }
             if !interp.is_callable_runtime(&method) {

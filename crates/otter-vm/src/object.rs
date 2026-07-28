@@ -1920,19 +1920,20 @@ pub(super) fn body_offset_of(heap: &otter_gc::GcHeap, body: &ObjectBody, key: &s
     body.dictionary_index_get(key)
 }
 
-/// [`body_offset_of`] for a key whose storage is isolate-pinned (an atom
-/// table): the shape walk answers through the head shape's lookup memo.
-pub(super) fn body_offset_of_pinned(
+/// [`body_offset_of`] for an atomized key: a shaped object answers with one
+/// `u32` compare per shape-chain link and never touches a heap string.
+/// Dictionary storage keys by spelling, so it still hashes the name.
+pub(super) fn body_offset_of_atom(
     heap: &otter_gc::GcHeap,
     body: &ObjectBody,
-    key: &str,
+    key: AtomizedPropertyKey<'_>,
 ) -> Option<u16> {
     if !body.shape.is_null() {
         debug_assert_object_shape_handle(body.shape, "property offset lookup");
-        return shape_body::shape_offset_of_pinned_str(heap, body.shape, key)
+        return shape_body::shape_offset_of_atom(heap, body.shape, key.atom().id())
             .and_then(|offset| u16::try_from(offset).ok());
     }
-    body.dictionary_index_get(key)
+    body.dictionary_index_get(key.name())
 }
 
 /// Number of own string-keyed properties recorded in a fast-mode
@@ -2158,31 +2159,29 @@ pub(crate) fn lookup_own_atom(
     heap: &otter_gc::GcHeap,
     key: AtomizedPropertyKey<'_>,
 ) -> AtomPropertyLookup {
-    heap.read_payload(obj, |body| {
-        match body_offset_of_pinned(heap, body, key.name()) {
-            Some(offset) => {
-                let mut lookup = body.slot_lookup_at(heap, offset as usize);
-                if let Some(cell) = mapped_argument_cell(body, key.name())
-                    && let PropertyLookup::Data { value, .. } = &mut lookup
-                {
-                    *value = read_upvalue(heap, cell);
-                }
-                AtomPropertyLookup {
-                    hit: Some(AtomOwnPropertyHit {
-                        shape_id: body_shape_id(heap, body),
-                        shape: body.shape,
-                        atom_id: key.atom().id(),
-                        slot: offset,
-                        is_data: matches!(lookup, PropertyLookup::Data { .. }),
-                    }),
-                    lookup,
-                }
+    heap.read_payload(obj, |body| match body_offset_of_atom(heap, body, key) {
+        Some(offset) => {
+            let mut lookup = body.slot_lookup_at(heap, offset as usize);
+            if let Some(cell) = mapped_argument_cell(body, key.name())
+                && let PropertyLookup::Data { value, .. } = &mut lookup
+            {
+                *value = read_upvalue(heap, cell);
             }
-            None => AtomPropertyLookup {
-                hit: None,
-                lookup: PropertyLookup::Absent,
-            },
+            AtomPropertyLookup {
+                hit: Some(AtomOwnPropertyHit {
+                    shape_id: body_shape_id(heap, body),
+                    shape: body.shape,
+                    atom_id: key.atom().id(),
+                    slot: offset,
+                    is_data: matches!(lookup, PropertyLookup::Data { .. }),
+                }),
+                lookup,
+            }
         }
+        None => AtomPropertyLookup {
+            hit: None,
+            lookup: PropertyLookup::Absent,
+        },
     })
 }
 
@@ -3875,14 +3874,14 @@ impl otter_gc::GcStore for PropertyDescriptor {
     }
 }
 
-/// The [`resolve_set`] variant for a key in isolate-pinned storage: every
-/// own-lookup on the walk answers through the shape lookup memos.
+/// The [`resolve_set`] variant for an atomized key: every own-lookup on the
+/// receiver-and-prototype walk resolves by atom compare.
 pub(crate) fn resolve_set_atomized(
     obj: JsObject,
     heap: &otter_gc::GcHeap,
     key: AtomizedPropertyKey<'_>,
 ) -> SetOutcome {
-    resolve_set_inner(obj, heap, key.name(), true)
+    resolve_set_inner(obj, heap, key.name(), Some(key))
 }
 
 /// Resolve a `[[Set]]` against `obj` as receiver — walks the
@@ -3897,21 +3896,20 @@ pub(crate) fn resolve_set_atomized(
 /// - <https://tc39.es/ecma262/#sec-ordinaryset>
 /// - <https://tc39.es/ecma262/#sec-ordinarysetwithowndescriptor>
 pub fn resolve_set(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> SetOutcome {
-    resolve_set_inner(obj, heap, key, false)
+    resolve_set_inner(obj, heap, key, None)
 }
 
 fn resolve_set_inner(
     obj: JsObject,
     heap: &otter_gc::GcHeap,
     key: &str,
-    key_is_pinned: bool,
+    atomized: Option<AtomizedPropertyKey<'_>>,
 ) -> SetOutcome {
     let lookup = |target: JsObject| {
         heap.read_payload(target, |body| {
-            let offset = if key_is_pinned {
-                body_offset_of_pinned(heap, body, key)
-            } else {
-                body_offset_of(heap, body, key)
+            let offset = match atomized {
+                Some(atomized) => body_offset_of_atom(heap, body, atomized),
+                None => body_offset_of(heap, body, key),
             };
             match offset {
                 Some(offset) => {

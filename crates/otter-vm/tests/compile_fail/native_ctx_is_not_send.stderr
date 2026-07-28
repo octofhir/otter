@@ -733,11 +733,16 @@ note: required because it appears within the type `otter_gc::compressed::Gc<JsSt
   | pub struct Gc<T: ?Sized> {
   |            ^^
   = note: required for `Cell<otter_gc::compressed::Gc<JsStringBody>>` to implement `Send`
-  = note: required because it appears within the type `(std::string::String, Cell<otter_gc::compressed::Gc<JsStringBody>>)`
-  = note: required for `hashbrown::raw::RawTable<(std::string::String, Cell<otter_gc::compressed::Gc<JsStringBody>>)>` to implement `Send`
-note: required because it appears within the type `hashbrown::map::HashMap<std::string::String, Cell<otter_gc::compressed::Gc<JsStringBody>>, rustc_hash::FxBuildHasher>`
+note: required because it appears within the type `otter_vm::object::shape_runtime::ShapeKey`
+ --> src/object/shape_runtime.rs
+  |
+  | struct ShapeKey {
+  |        ^^^^^^^^
+  = note: required because it appears within the type `(Box<str>, otter_vm::object::shape_runtime::ShapeKey)`
+  = note: required for `hashbrown::raw::RawTable<(Box<str>, otter_vm::object::shape_runtime::ShapeKey)>` to implement `Send`
+note: required because it appears within the type `hashbrown::map::HashMap<Box<str>, otter_vm::object::shape_runtime::ShapeKey, rustc_hash::FxBuildHasher>`
  --> /rust/deps/hashbrown-0.16.1/src/map.rs:185:11
-note: required because it appears within the type `HashMap<std::string::String, Cell<otter_gc::compressed::Gc<JsStringBody>>, rustc_hash::FxBuildHasher>`
+note: required because it appears within the type `HashMap<Box<str>, otter_vm::object::shape_runtime::ShapeKey, rustc_hash::FxBuildHasher>`
  --> $RUST/std/src/collections/hash/map.rs
   |
   | pub struct HashMap<

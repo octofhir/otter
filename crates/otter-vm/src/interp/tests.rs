@@ -82,8 +82,8 @@ fn with_test_runtime_turn<R>(
 #[test]
 fn rooted_dispatch_rejects_a_different_activation_stack() {
     let module = module_with(Vec::new(), 1);
-    let context = ExecutionContext::from_module(module);
     let mut interp = Interpreter::new();
+    let context = interp.link_module(module);
     let mut other_interp = Interpreter::new();
     let mut published = ActivationStack::new();
     let mut unrelated = ActivationStack::new();
@@ -158,7 +158,7 @@ fn returns_undefined_for_load_then_return() {
         1,
     );
     let mut interp = Interpreter::new();
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     assert_eq!(interp.run(&context).unwrap(), Value::undefined());
 }
 
@@ -197,7 +197,7 @@ fn strict_store_global_binding_rejects_non_writable_global_property() {
         module_inits: Vec::new(),
     };
     let mut interp = Interpreter::new();
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
 
     let err = interp
         .run(&context)
@@ -237,7 +237,7 @@ fn load_string_constant_reuses_traced_cache_entry() {
         module_inits: Vec::new(),
     };
     let mut interp = Interpreter::new();
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
 
     assert!(interp.run(&context).unwrap().is_string());
     assert_eq!(interp.string_constant_cache_len_for_test(), 1);
@@ -282,8 +282,8 @@ fn load_string_constant_cache_distinguishes_standalone_contexts() {
     }
 
     let mut interp = Interpreter::new();
-    let first = ExecutionContext::from_module(module_with_string("first.ts", "first literal"));
-    let second = ExecutionContext::from_module(module_with_string("second.ts", "second literal"));
+    let first = interp.link_module(module_with_string("first.ts", "first literal"));
+    let second = interp.link_module(module_with_string("second.ts", "second literal"));
 
     assert!(interp.run(&first).unwrap().is_string());
     assert!(interp.run(&second).unwrap().is_string());
@@ -321,7 +321,7 @@ fn load_bigint_constant_reuses_traced_cache_entry() {
         module_inits: Vec::new(),
     };
     let mut interp = Interpreter::new();
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
 
     assert!(interp.run(&context).unwrap().is_big_int());
     assert_eq!(interp.bigint_constant_cache_len_for_test(), 1);
@@ -366,8 +366,8 @@ fn load_bigint_constant_cache_distinguishes_standalone_contexts() {
     }
 
     let mut interp = Interpreter::new();
-    let first = ExecutionContext::from_module(module_with_bigint("first.ts", "1"));
-    let second = ExecutionContext::from_module(module_with_bigint("second.ts", "2"));
+    let first = interp.link_module(module_with_bigint("first.ts", "1"));
+    let second = interp.link_module(module_with_bigint("second.ts", "2"));
 
     assert!(interp.run(&first).unwrap().is_big_int());
     assert!(interp.run(&second).unwrap().is_big_int());
@@ -484,7 +484,7 @@ fn direct_bytecode_call_binds_arguments_from_register_window() {
         module_inits: Vec::new(),
     };
     let mut interp = Interpreter::new();
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     assert_eq!(
         interp.run(&context).unwrap(),
         Value::number(NumberValue::Smi(312))
@@ -555,7 +555,7 @@ fn direct_bytecode_call_window_populates_arguments_object() {
         module_inits: Vec::new(),
     };
     let mut interp = Interpreter::new();
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     let Some(args) = (interp.run(&context).unwrap()).as_object() else {
         panic!("expected arguments object");
     };
@@ -643,7 +643,7 @@ fn direct_bytecode_call_window_populates_rest_arguments() {
         module_inits: Vec::new(),
     };
     let mut interp = Interpreter::new();
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
     let Some(rest) = (interp.run(&context).unwrap()).as_array() else {
         panic!("expected rest array");
@@ -709,7 +709,7 @@ fn bytecode_store_property_function_bag_uses_young_allocation_with_frame_roots()
     };
     let mut interp = Interpreter::new();
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     let completion = interp.run(&context).unwrap();
     assert!(crate::is_callable(&completion));
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -736,8 +736,8 @@ fn bytecode_function_prototype_preserves_the_shared_caller_frame() {
     module
         .functions
         .push(test_function(1, "target", 0, 1, Vec::new()));
-    let context = ExecutionContext::from_module(module.clone());
     let mut interp = Interpreter::new();
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -787,8 +787,8 @@ fn handle_scoped_function_prototype_keeps_sibling_handle_live_without_a_frame() 
     module
         .functions
         .push(test_function(1, "target", 0, 1, Vec::new()));
-    let context = ExecutionContext::from_module(module);
     let mut interp = Interpreter::new();
+    let context = interp.link_module(module);
     let mut stack = ActivationStack::new();
     let target = Value::function(1);
     let arg = Value::string(JsString::from_str("rooted-arg", interp.gc_heap_mut()).unwrap());
@@ -837,8 +837,8 @@ fn handle_scoped_function_prototype_keeps_sibling_handle_live_without_a_frame() 
 #[test]
 fn bytecode_instanceof_function_prototype_uses_stack_roots() {
     let module = module_with(Vec::new(), 4);
-    let context = ExecutionContext::from_module(module.clone());
     let mut interp = Interpreter::new();
+    let context = interp.link_module(module.clone());
     let lhs = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("lhs");
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
@@ -1000,7 +1000,7 @@ fn get_iterator_user_resume_uses_old_iterator_state_allocation_with_frame_roots(
         Some(PendingGetIterator { pc: 0, dst: 1 });
     frame.registers[1] = Value::object(iterator_obj);
     stack.push(frame);
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     let operands = vec![Operand::Register(1), Operand::Register(0)];
 
     let before = interp.gc_heap_mut().stats().old_allocated_bytes;
@@ -1049,7 +1049,7 @@ fn array_callback_map_uses_stack_rooted_result_allocation() {
     .unwrap();
     let mapper =
         native_value_static(interp.gc_heap_mut(), "identityMapper", 1, identity_mapper).unwrap();
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -1102,7 +1102,7 @@ fn call_method_on_nullish_receiver_reports_type_error() {
         module_inits: Vec::new(),
     };
     let mut interp = Interpreter::new();
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -1146,7 +1146,7 @@ fn call_method_on_missing_primitive_method_reports_not_callable() {
         module_inits: Vec::new(),
     };
     let mut interp = Interpreter::new();
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -1491,7 +1491,7 @@ fn call_method_boolean_prototype_non_callable_shadows_builtin() {
         Value::number_i32(1),
     );
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -1543,7 +1543,7 @@ fn call_method_bigint_prototype_non_callable_shadows_builtin() {
     let bigint =
         crate::bigint::BigIntValue::from_i32(interp.gc_heap_mut(), 7).expect("bigint allocation");
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -1594,7 +1594,7 @@ fn call_method_symbol_prototype_non_callable_shadows_builtin() {
     );
     let symbol = JsSymbol::new(interp.gc_heap_mut(), None).expect("symbol allocation");
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -1649,7 +1649,7 @@ fn call_method_weak_ref_prototype_non_callable_shadows_builtin() {
     let weak_ref =
         crate::test_support::alloc_weak_ref(interp.gc_heap_mut(), &target).expect("weak ref");
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -1707,7 +1707,7 @@ fn call_method_finalization_registry_prototype_non_callable_shadows_builtin() {
     let registry = crate::test_support::alloc_finalization_registry(interp.gc_heap_mut(), cleanup)
         .expect("registry");
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -1750,7 +1750,7 @@ fn call_method_promise_expando_non_callable_shadows_builtin() {
         .expect("promise expando");
     object::set(&mut bag, interp.gc_heap_mut(), "then", Value::number_i32(1));
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -1801,7 +1801,7 @@ fn call_method_promise_prototype_non_callable_shadows_builtin() {
         Value::number_i32(1),
     );
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -1845,7 +1845,7 @@ fn call_method_array_own_non_callable_shadows_builtin() {
     crate::array::set_named_property(array, interp.gc_heap_mut(), "map", Value::number_i32(1))
         .expect("array expando property");
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -1889,7 +1889,7 @@ fn call_method_regexp_own_non_callable_shadows_builtin() {
         .expect("regexp expando");
     object::set(&mut bag, interp.gc_heap_mut(), "exec", Value::number_i32(1));
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -1941,7 +1941,7 @@ fn call_method_regexp_prototype_non_callable_shadows_builtin() {
     let units: Vec<u16> = "x".encode_utf16().collect();
     let regexp = JsRegExp::compile(interp.gc_heap_mut(), &units, "").expect("regexp");
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -1995,7 +1995,7 @@ fn call_method_date_prototype_non_callable_shadows_builtin() {
     object::set_prototype(date, interp.gc_heap_mut(), Some(proto));
     object::set_date_data(date, interp.gc_heap_mut(), 0.0);
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -2049,7 +2049,7 @@ fn call_method_date_setter_prototype_non_callable_shadows_builtin() {
     object::set_prototype(date, interp.gc_heap_mut(), Some(proto));
     object::set_date_data(date, interp.gc_heap_mut(), 0.0);
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -2103,7 +2103,7 @@ fn call_method_typed_array_own_non_callable_shadows_builtin() {
             .expect("typed array expando");
     object::set(&mut bag, interp.gc_heap_mut(), "map", Value::number_i32(1));
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -2164,7 +2164,7 @@ fn call_method_typed_array_callback_prototype_non_callable_shadows_builtin() {
     )
     .expect("typed array");
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -2225,7 +2225,7 @@ fn call_method_typed_array_slice_prototype_non_callable_shadows_builtin() {
     )
     .expect("typed array");
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -2280,7 +2280,7 @@ fn call_method_iterator_prototype_non_callable_shadows_helper() {
     )
     .expect("source array");
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -2335,7 +2335,7 @@ fn call_method_map_prototype_non_callable_shadows_builtin_for_each() {
     );
     let map = crate::collections::alloc_map(interp.gc_heap_mut()).expect("map");
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -2386,7 +2386,7 @@ fn call_method_set_prototype_non_callable_shadows_builtin_for_each() {
     );
     let set = crate::collections::alloc_set(interp.gc_heap_mut()).expect("set");
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -2437,7 +2437,7 @@ fn call_method_map_prototype_non_callable_shadows_map_method() {
     );
     let map = crate::collections::alloc_map(interp.gc_heap_mut()).expect("map");
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -2488,7 +2488,7 @@ fn call_method_set_prototype_non_callable_shadows_set_add() {
     );
     let set = crate::collections::alloc_set(interp.gc_heap_mut()).expect("set");
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -2539,7 +2539,7 @@ fn call_method_weak_map_prototype_non_callable_shadows_weak_map_method() {
     );
     let weak_map = crate::collections::alloc_weak_map(interp.gc_heap_mut()).expect("weak map");
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -2590,7 +2590,7 @@ fn call_method_weak_set_prototype_non_callable_shadows_weak_set_method() {
     );
     let weak_set = crate::collections::alloc_weak_set(interp.gc_heap_mut()).expect("weak set");
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -2643,7 +2643,7 @@ fn call_method_array_buffer_prototype_non_callable_shadows_builtin() {
         .expect("array buffer");
     let buffer = crate::binary::JsArrayBuffer::from_local_handle(buffer);
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -2698,7 +2698,7 @@ fn call_method_data_view_prototype_non_callable_shadows_builtin() {
     let view =
         crate::binary::JsDataView::new(interp.gc_heap_mut(), buffer, 0, 1).expect("data view");
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -2749,7 +2749,7 @@ fn call_method_set_prototype_non_callable_shadows_es_set_method() {
     );
     let set = crate::collections::alloc_set(interp.gc_heap_mut()).expect("set");
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -2787,7 +2787,7 @@ fn call_method_function_own_non_callable_shadows_call() {
         module_inits: Vec::new(),
     };
     let mut interp = Interpreter::new();
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -2839,7 +2839,7 @@ fn call_method_function_own_non_callable_shadows_object_method() {
         module_inits: Vec::new(),
     };
     let mut interp = Interpreter::new();
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -2894,7 +2894,7 @@ fn call_method_null_proto_object_missing_object_method_is_not_callable() {
     let obj = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("object");
     object::set_prototype(obj, interp.gc_heap_mut(), None);
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -2949,7 +2949,7 @@ fn call_method_native_function_object_prototype_non_callable_shadows_builtin() {
     );
     let native = native_value_static(interp.gc_heap_mut(), "target", 0, noop).expect("native");
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -2999,7 +2999,7 @@ fn call_method_primitive_object_prototype_non_callable_shadows_builtin() {
         Value::number_i32(1),
     );
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -3063,7 +3063,7 @@ fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
     let repl =
         native_value_static(interp.gc_heap_mut(), "replacement", 1, replacement).expect("repl");
 
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -3094,8 +3094,8 @@ fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
 #[test]
 fn array_symbol_iterator_factory_uses_native_rooted_iterator_allocation() {
     let module = module_with(Vec::new(), 2);
-    let context = ExecutionContext::from_module(module);
     let mut interp = Interpreter::new();
+    let context = interp.link_module(module);
     let source = crate::array::from_elements_old_for_fixture(
         interp.gc_heap_mut(),
         [Value::number(NumberValue::from_i32(21))],
@@ -3131,8 +3131,8 @@ fn array_symbol_iterator_factory_uses_native_rooted_iterator_allocation() {
 #[test]
 fn iterator_to_list_map_pairs_use_runtime_rooted_array_allocation() {
     let module = module_with(Vec::new(), 4);
-    let context = ExecutionContext::from_module(module);
     let mut interp = Interpreter::new();
+    let context = interp.link_module(module);
     let map = crate::collections::alloc_map(interp.gc_heap_mut()).unwrap();
     crate::collections::map_set(
         map,
@@ -3218,7 +3218,7 @@ fn new_collection_map_uses_root_aware_allocation_with_frame_roots() {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     };
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -3279,7 +3279,7 @@ fn bytecode_new_error_uses_young_allocation_with_frame_roots() {
     );
     let mut interp = Interpreter::new();
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     let Some(obj) = (interp.run(&context).unwrap()).as_object() else {
         panic!("NewError should return an object");
     };
@@ -3408,7 +3408,7 @@ fn bytecode_new_weak_ref_uses_young_allocation_with_frame_roots() {
     );
     let mut interp = Interpreter::new();
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     assert!(interp.run(&context).unwrap().is_weak_ref());
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
     assert!(
@@ -3448,7 +3448,7 @@ fn bytecode_new_finalization_registry_uses_young_allocation_with_frame_roots() {
     };
     let mut interp = Interpreter::new();
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     assert!(interp.run(&context).unwrap().is_finalization_registry());
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
     assert!(
@@ -3508,7 +3508,7 @@ fn direct_bytecode_async_call_window_populates_parameters() {
         module_inits: Vec::new(),
     };
     let mut interp = Interpreter::new();
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     let Some(promise) = (interp.run(&context).unwrap()).as_promise() else {
         panic!("expected async function call to return a promise");
     };
@@ -3554,8 +3554,8 @@ fn async_generator_method_uses_stack_rooted_capability_allocation() {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     };
-    let context = ExecutionContext::from_module(module);
     let mut interp = Interpreter::new();
+    let context = interp.link_module(module);
     let body_frame = interp.test_frame_for_function(&generator_body).unwrap();
     let body_frame = interp.park_active_frame(body_frame);
     let generator =
@@ -3603,8 +3603,8 @@ fn primitive_wrapper_boxing_uses_stack_rooted_young_allocation() {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     };
-    let context = ExecutionContext::from_module(module);
     let mut interp = Interpreter::new();
+    let context = interp.link_module(module);
     let mut stack: ActivationStack = ActivationStack::new();
     stack.push(interp.test_frame_for_function(&main).unwrap());
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -3665,7 +3665,7 @@ fn top_level_async_entry_returns_the_awaited_completion() {
         module_inits: Vec::new(),
     };
     let mut interp = Interpreter::new();
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     assert_eq!(
         interp.run(&context).unwrap(),
         Value::number(NumberValue::Smi(512))
@@ -3701,7 +3701,7 @@ fn promise_fulfilled_of_allocates_the_body_in_old_space() {
         module_inits: Vec::new(),
     };
     let mut interp = Interpreter::new();
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     let Some(promise) = (interp.run(&context).unwrap()).as_promise() else {
         panic!("expected promise");
     };
@@ -3742,7 +3742,7 @@ fn await_non_promise_uses_stack_rooted_wrapper_allocation() {
     interp.frame_set_async_state(&mut frame, AsyncFrameState { result_promise });
     let mut stack: ActivationStack = ActivationStack::new();
     stack.push(frame);
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
@@ -3766,8 +3766,8 @@ fn promise_new_uses_stack_rooted_capability_allocation() {
     }
 
     let module = module_with(Vec::new(), 3);
-    let context = ExecutionContext::from_module(module.clone());
     let mut interp = Interpreter::new();
+    let context = interp.link_module(module.clone());
     let executor_value =
         native_value_static(interp.gc_heap_mut(), "executor", 2, executor).expect("executor");
     let mut stack: ActivationStack = ActivationStack::new();
@@ -3799,8 +3799,8 @@ fn promise_new_uses_stack_rooted_capability_allocation() {
 #[test]
 fn dynamic_import_rejection_uses_stack_rooted_promise_allocation() {
     let module = module_with(Vec::new(), 2);
-    let context = ExecutionContext::from_module(module.clone());
     let mut interp = Interpreter::new();
+    let context = interp.link_module(module.clone());
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
@@ -3909,7 +3909,7 @@ fn direct_bytecode_construct_window_populates_arguments_object() {
         module_inits: Vec::new(),
     };
     let mut interp = Interpreter::new();
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     let Some(args) = (interp.run(&context).unwrap()).as_object() else {
         panic!("expected constructor-returned arguments object");
     };
@@ -3975,7 +3975,7 @@ fn direct_bytecode_construct_receiver_uses_young_allocation_with_frame_roots() {
     };
     let mut interp = Interpreter::new();
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     assert!(interp.run(&context).unwrap().is_object());
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
     assert!(
@@ -4051,7 +4051,7 @@ fn bound_bytecode_construct_receiver_uses_young_allocation_with_frame_roots() {
     };
     let mut interp = Interpreter::new();
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     assert!(interp.run(&context).unwrap().is_object());
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
     assert!(
@@ -4082,7 +4082,7 @@ fn runtime_budget_stats_record_reductions_and_budget_observations() {
         max_reductions_per_turn: Some(1),
         ..RuntimeBudget::default()
     });
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     assert_eq!(interp.run(&context).unwrap(), Value::undefined());
     let stats = interp.runtime_budget_stats();
     assert_eq!(stats.turns_started, 1);
@@ -4116,7 +4116,7 @@ fn runtime_budget_can_reject_on_reduction_limit() {
         max_reductions_per_turn: Some(0),
         ..RuntimeBudget::default()
     });
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     let err = interp.run(&context).unwrap_err();
     assert!(matches!(err.error, VmError::BudgetExceeded));
     let stats = interp.runtime_budget_stats();
@@ -4142,7 +4142,7 @@ fn runtime_budget_stats_record_heap_allocations() {
         1,
     );
     let mut interp = Interpreter::new();
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     assert!(interp.run(&context).unwrap().is_object());
     let stats = interp.runtime_budget_stats();
     assert!(stats.allocated_objects_observed >= 1);
@@ -4170,7 +4170,7 @@ fn bytecode_new_object_uses_young_allocation_with_frame_roots() {
     );
     let mut interp = Interpreter::new();
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     assert!(interp.run(&context).unwrap().is_object());
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
     assert!(
@@ -4207,7 +4207,7 @@ fn bytecode_new_array_uses_young_allocation_with_frame_roots() {
     );
     let mut interp = Interpreter::new();
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     assert!(interp.run(&context).unwrap().is_array());
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
     assert!(
@@ -4272,7 +4272,7 @@ fn bytecode_array_push_uses_root_aware_growth_with_frame_roots() {
     );
     let mut interp = Interpreter::new();
     let before = interp.gc_heap_mut().stats().reserved_bytes;
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     let result = interp.run(&context).unwrap();
     let Some(array) = (result).as_array() else {
         panic!("ArrayPush program should return the grown array");
@@ -4353,7 +4353,7 @@ fn bytecode_store_element_uses_root_aware_growth_with_frame_roots() {
     );
     let mut interp = Interpreter::new();
     let before = interp.gc_heap_mut().stats().reserved_bytes;
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     let result = interp.run(&context).unwrap();
     let Some(array) = (result).as_array() else {
         panic!("StoreElement program should return the grown array");
@@ -4402,7 +4402,7 @@ fn missing_return_errors() {
         0,
     );
     let mut interp = Interpreter::new();
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     assert_eq!(
         interp.run(&context).unwrap_err().error,
         VmError::MissingReturn
@@ -4459,7 +4459,7 @@ fn unwind_throw_pops_frames_until_handler_or_uncaught() {
     // Push a second frame on top — should be popped during
     // unwinding and not absorb the throw.
     stack.push(interp.test_frame_for_function(&main).unwrap());
-    let context = ExecutionContext::from_module(module_with(
+    let context = interp.link_module(module_with(
         vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
@@ -4534,7 +4534,7 @@ fn unwind_throw_lands_in_catch_handler() {
             exc_register: 1,
         });
     stack.push(frame);
-    let context = ExecutionContext::from_module(module_with(
+    let context = interp.link_module(module_with(
         vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
@@ -4595,7 +4595,7 @@ fn native_call_context_receives_method_receiver() {
             .test_frame_for_function(&module.functions[0])
             .unwrap(),
     );
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
 
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
         interp.invoke(stack, &context, &callee, receiver, SmallVec::new(), 0)
@@ -4638,7 +4638,7 @@ fn native_construct_context_walks_the_live_caller_stack() {
         .expect("caller frame");
     frame.registers[0] = callee;
     stack.push(frame);
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     let operands = vec![
         Operand::Register(1),
         Operand::Register(0),
@@ -4688,7 +4688,7 @@ fn direct_native_call_uses_contiguous_argument_window() {
     frame.registers[1] = Value::number(NumberValue::Smi(8));
     frame.registers[2] = Value::number(NumberValue::Smi(13));
     stack.push(frame);
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let operands = vec![
         Operand::Register(3),
         Operand::Register(0),
@@ -4733,7 +4733,7 @@ fn proxy_call_argv_array_uses_young_allocation_with_frame_roots() {
     frame.registers[1] = Value::number(NumberValue::Smi(7));
     frame.registers[2] = Value::number(NumberValue::Smi(11));
     stack.push(frame);
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let operands = vec![
         Operand::Register(3),
         Operand::Register(0),
@@ -4819,7 +4819,7 @@ fn proxy_construct_argv_array_uses_young_allocation_with_frame_roots() {
         .unwrap();
     frame.registers[1] = proxy;
     stack.push(frame);
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     let operands = vec![
         Operand::Register(0),
         Operand::Register(1),
@@ -4851,8 +4851,8 @@ fn run_callable_sync_proxy_argv_array_uses_runtime_rooted_young_allocation() {
     }
 
     let module = module_with(Vec::new(), 1);
-    let context = ExecutionContext::from_module(module);
     let mut interp = Interpreter::new();
+    let context = interp.link_module(module);
     let apply = native_value_static(interp.gc_heap_mut(), "apply", 3, return_argv_array).unwrap();
     let target = native_value_static(interp.gc_heap_mut(), "target", 0, target_noop).unwrap();
     let mut handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
@@ -4917,8 +4917,8 @@ fn rooted_construct_receiver_uses_shared_turn_young_allocation() {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     };
-    let context = ExecutionContext::from_module(module);
     let mut interp = Interpreter::new();
+    let context = interp.link_module(module);
     let mut stack = ActivationStack::new();
     let target = Value::function(1);
 
@@ -4969,8 +4969,8 @@ fn rooted_construct_proxy_argv_array_uses_shared_turn_young_allocation() {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     };
-    let context = ExecutionContext::from_module(module);
     let mut interp = Interpreter::new();
+    let context = interp.link_module(module);
     let construct =
         native_value_static(interp.gc_heap_mut(), "construct", 3, return_argv_array).unwrap();
     let mut handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
@@ -5132,7 +5132,7 @@ fn arrow_closure_overrides_call_site_this() {
             .test_frame_for_function(&module.functions[0])
             .unwrap(),
     );
-    let context = ExecutionContext::from_module(module.clone());
+    let context = interp.link_module(module.clone());
     // Caller-supplied this is `Null` — the closure must override.
     interp
         .invoke(
@@ -5196,7 +5196,7 @@ fn interrupt_handle_breaks_loop() {
     let mut interp = Interpreter::new();
     let handle = interp.interrupt_handle();
     handle.interrupt();
-    let context = ExecutionContext::from_module(module);
+    let context = interp.link_module(module);
     assert_eq!(
         interp.run(&context).unwrap_err().error,
         VmError::Interrupted

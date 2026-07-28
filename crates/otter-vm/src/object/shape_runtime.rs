@@ -13,8 +13,11 @@
 //!
 //! # Invariants
 //! - Side-table keys never contain `Gc` offsets; moving GC may rewrite handles,
-//!   so keys use stable [`super::ShapeId`] plus interned
-//!   [`crate::string::JsStringId`] values.
+//!   so keys use stable [`super::ShapeId`] plus isolate-global
+//!   [`crate::property_atom::AtomId`] values.
+//! - A name's atom comes from the isolate's interner; this module's
+//!   `interned_keys` map only caches that answer next to the name's GC string
+//!   body, so a repeated transition never takes the interner lock.
 //! - Every `Gc` stored in the tables is yielded by [`Self::trace_roots`].
 //! - Caches are derived data and can be cleared without semantic changes.
 //! - Shape bodies themselves remain mutation-free after allocation.
@@ -26,25 +29,27 @@
 
 use rustc_hash::FxHashMap;
 use std::cell::Cell;
+use std::sync::Arc;
 
 use otter_gc::GcHeap;
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
 
 use crate::inspect::{ShapeTransitionEvent, ShapeTransitionObserver};
-use crate::string::{JsStringBody, JsStringHandle, JsStringId, alloc_flat_string_body_with_roots};
+use crate::property_atom::{AtomId, NameInterner};
+use crate::string::{JsStringHandle, JsStringId, alloc_flat_string_body_with_roots};
 
 use super::ShapeId;
 use super::descriptor::PropertyFlags;
 use super::shape_body::{
     ShapeBody, ShapeHandle, alloc_child_shape_body_with_roots, alloc_root_shape_body_with_roots,
-    shape_keys_ordered,
+    shape_atoms_ordered,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TransitionKey {
     parent: ShapeId,
-    key: JsStringId,
+    atom: AtomId,
     /// Attribute bits of the appended slot. Keying transitions by attributes
     /// (not just the key) keeps a `define`-with-non-default-attributes append
     /// on a distinct shape from an ordinary default-data append of the same
@@ -55,14 +60,30 @@ struct TransitionKey {
     is_accessor: bool,
 }
 
+/// One property name as the shape layer needs it: the isolate-global atom that
+/// keys transitions and shape nodes, plus the GC string body shape nodes and
+/// key enumeration hold.
+#[derive(Debug)]
+struct ShapeKey {
+    handle: Cell<JsStringHandle>,
+    atom: AtomId,
+}
+
 /// Mutable side tables for GC-managed hidden classes.
 pub(crate) struct ShapeRuntime {
     root: Cell<ShapeHandle>,
     handles_by_id: FxHashMap<ShapeId, Cell<ShapeHandle>>,
     next_string_id: u32,
-    interned_keys: FxHashMap<String, Cell<JsStringHandle>>,
+    /// Names this shape layer has already seen, spelling → (string body, atom).
+    /// The isolate interner is the identity authority; this map is the layer's
+    /// own cache of it, so taking a known transition costs one hash of the
+    /// spelling and never the interner lock.
+    interned_keys: FxHashMap<Box<str>, ShapeKey>,
     transitions: FxHashMap<TransitionKey, Cell<ShapeHandle>>,
-    offset_cache: FxHashMap<ShapeId, FxHashMap<JsStringId, u32>>,
+    offset_cache: FxHashMap<ShapeId, FxHashMap<AtomId, u32>>,
+    /// This isolate's property-name interner, shared with the interpreter that
+    /// owns this runtime.
+    names: Arc<NameInterner>,
     observer: Option<Box<dyn ShapeTransitionObserver>>,
 }
 
@@ -81,7 +102,10 @@ impl std::fmt::Debug for ShapeRuntime {
 
 impl ShapeRuntime {
     /// Allocate a fresh root shape and empty side tables.
-    pub(crate) fn new(heap: &mut GcHeap) -> Result<Self, otter_gc::OutOfMemory> {
+    pub(crate) fn new(
+        heap: &mut GcHeap,
+        names: Arc<NameInterner>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
         let mut roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
         let root = alloc_root_shape_body_with_roots(heap, &mut roots)?;
         let root_id = heap.read_payload(root, ShapeBody::id);
@@ -94,6 +118,7 @@ impl ShapeRuntime {
             interned_keys: FxHashMap::default(),
             transitions: FxHashMap::default(),
             offset_cache: FxHashMap::default(),
+            names,
             observer: None,
         })
     }
@@ -140,7 +165,7 @@ impl ShapeRuntime {
             visitor(p);
         }
         for key in self.interned_keys.values() {
-            let p = key.as_ptr() as *mut RawGc;
+            let p = key.handle.as_ptr() as *mut RawGc;
             visitor(p);
         }
         for shape in self.transitions.values() {
@@ -159,15 +184,15 @@ impl ShapeRuntime {
         self.handles_by_id.get(&id).map(Cell::get)
     }
 
-    /// Intern a property key as a GC-managed string body.
+    /// Intern a property key as a GC-managed string body plus its global atom.
     pub(crate) fn intern_key_with_roots(
         &mut self,
         heap: &mut GcHeap,
         key: &str,
         external_visit: &mut RootSlotVisitor<'_>,
-    ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
+    ) -> Result<(JsStringHandle, AtomId), otter_gc::OutOfMemory> {
         if let Some(existing) = self.interned_keys.get(key) {
-            return Ok(existing.get());
+            return Ok((existing.handle.get(), existing.atom));
         }
         let units: Vec<u16> = key.encode_utf16().collect();
         let id = JsStringId::new(self.next_string_id);
@@ -177,8 +202,15 @@ impl ShapeRuntime {
         };
         let handle = alloc_flat_string_body_with_roots(heap, id, &units, &mut visit_roots)?;
         self.next_string_id = self.next_string_id.saturating_add(1);
-        self.interned_keys.insert(key.to_owned(), Cell::new(handle));
-        Ok(handle)
+        let atom = self.names.intern(key);
+        self.interned_keys.insert(
+            key.into(),
+            ShapeKey {
+                handle: Cell::new(handle),
+                atom,
+            },
+        );
+        Ok((handle, atom))
     }
 
     /// Return the cached transition for appending `key` to `parent`, or
@@ -200,12 +232,11 @@ impl ShapeRuntime {
         flags: PropertyFlags,
         is_accessor: bool,
     ) -> Option<ShapeHandle> {
-        let key_handle = self.interned_keys.get(key)?.get();
+        let atom = self.interned_keys.get(key)?.atom;
         let parent_id = heap.read_payload(parent, ShapeBody::id);
-        let key_id = heap.read_payload(key_handle, JsStringBody::id);
         let transition_key = TransitionKey {
             parent: parent_id,
-            key: key_id,
+            atom,
             flags,
             is_accessor,
         };
@@ -229,12 +260,11 @@ impl ShapeRuntime {
             visitor(p);
             external_visit(visitor);
         };
-        let key_handle = self.intern_key_with_roots(heap, key, &mut visit_parent)?;
+        let (key_handle, atom) = self.intern_key_with_roots(heap, key, &mut visit_parent)?;
         let parent_id = heap.read_payload(parent, ShapeBody::id);
-        let key_id = heap.read_payload(key_handle, JsStringBody::id);
         let transition_key = TransitionKey {
             parent: parent_id,
-            key: key_id,
+            atom,
             flags,
             is_accessor,
         };
@@ -252,6 +282,7 @@ impl ShapeRuntime {
             heap,
             parent,
             key_handle,
+            atom,
             flags,
             is_accessor,
             &mut visit_child_roots,
@@ -291,21 +322,17 @@ impl ShapeRuntime {
         shape: ShapeHandle,
         key: &str,
     ) -> Option<u32> {
-        let key_id = self
-            .interned_keys
-            .get(key)
-            .map(|handle| heap.read_payload(handle.get(), JsStringBody::id))?;
+        let atom = self.interned_keys.get(key)?.atom;
         let shape_id = heap.read_payload(shape, ShapeBody::id);
         if let Some(cache) = self.offset_cache.get(&shape_id) {
-            return cache.get(&key_id).copied();
+            return cache.get(&atom).copied();
         }
 
         let mut cache = FxHashMap::default();
-        for (key_handle, offset) in shape_keys_ordered(heap, shape) {
-            let id = heap.read_payload(key_handle, JsStringBody::id);
-            cache.insert(id, offset);
+        for (atom, offset) in shape_atoms_ordered(heap, shape) {
+            cache.insert(atom, offset);
         }
-        let result = cache.get(&key_id).copied();
+        let result = cache.get(&atom).copied();
         self.offset_cache.insert(shape_id, cache);
         result
     }
@@ -325,7 +352,7 @@ mod tests {
     #[test]
     fn reuses_child_transition_and_interned_key() {
         let mut heap = GcHeap::new().expect("heap");
-        let mut runtime = ShapeRuntime::new(&mut heap).expect("runtime");
+        let mut runtime = ShapeRuntime::new(&mut heap, Arc::default()).expect("runtime");
         let mut roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
 
         let flags = PropertyFlags::data_default();

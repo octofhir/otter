@@ -102,7 +102,7 @@ pub(crate) fn capture_store_property_transition(
     let kind = transition_kind(obj, heap, key)?;
     let from_shape_id = super::shape_id(obj, heap);
     let existing_offset =
-        heap.read_payload(obj, |body| super::body_offset_of(heap, body, key.name()));
+        heap.read_payload(obj, |body| super::body_offset_of_atom(heap, body, key));
     let index = heap.read_payload(obj, |body| super::body_property_count(heap, body));
     let slot = u16::try_from(index).ok()?;
     let transition = heap.with_payload(obj, |body| {
@@ -147,7 +147,7 @@ pub(crate) fn capture_store_property_transition_with_shape(
     let (to_shape_id, to_shape_count) =
         heap.read_payload(next_shape, |s| (s.id(), s.property_count()));
     let existing_offset =
-        heap.read_payload(obj, |body| super::body_offset_of(heap, body, key.name()));
+        heap.read_payload(obj, |body| super::body_offset_of_atom(heap, body, key));
     // The appended slot's flat index is the new shape's last offset.
     let index = to_shape_count as usize - 1;
     let slot = u16::try_from(index).ok()?;
@@ -207,7 +207,7 @@ pub(crate) fn replay_store_property_transition(
     // confirmed in debug builds only.
     #[cfg(debug_assertions)]
     let existing_offset =
-        heap.read_payload(obj, |body| super::body_offset_of(heap, body, key.name()));
+        heap.read_payload(obj, |body| super::body_offset_of_atom(heap, body, key));
     #[cfg(debug_assertions)]
     let current_count = heap.read_payload(obj, |body| super::body_property_count(heap, body));
     let guard_matches = heap.read_payload(obj, |body| {

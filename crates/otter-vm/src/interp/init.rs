@@ -166,7 +166,8 @@ impl Interpreter {
                 global_this,
             );
         }
-        let shape_runtime = object::ShapeRuntime::new(&mut gc_heap)
+        let names = std::sync::Arc::new(crate::property_atom::NameInterner::default());
+        let shape_runtime = object::ShapeRuntime::new(&mut gc_heap, std::sync::Arc::clone(&names))
             .expect("shape root fits within any positive cap");
         startup_timer.mark("vm_shape_runtime");
         // No GC allocation occurs between these drops and the struct move.
@@ -194,7 +195,7 @@ impl Interpreter {
             jit_backedge_fuel: Self::JIT_BACKEDGE_POLL_BATCH,
             gc_heap,
             code_space: std::sync::Arc::new(code_space::CodeSpace::default()),
-            names: std::sync::Arc::new(crate::property_atom::NameInterner::default()),
+            names,
             realm_context: None,
             shape_runtime,
             shape_epoch: 0,

@@ -104,8 +104,10 @@ impl Interpreter {
                 .as_object()
                 .unwrap_or(obj);
             // The shared table answers first, so a site re-learning after a
-            // guard miss pays a probe instead of another chain walk; only a
-            // pair the isolate has never resolved walks.
+            // guard miss pays a probe instead of another chain walk, and a
+            // saturated one — which will never build a program of its own —
+            // walks at most once per receiver class and name before its answer,
+            // positive or negative, is on record.
             if let Some(resolved) = self.resolve_property_data_slot(obj, atomized_key) {
                 if !site_disabled {
                     let ic = cache_ir::CacheStub::from_resolved_load(

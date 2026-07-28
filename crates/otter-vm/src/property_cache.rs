@@ -50,19 +50,37 @@ struct Entry {
     receiver_shape: ShapeId,
     /// Property name this answer is for.
     atom: AtomId,
-    /// `0` when the receiver owns the slot, `1` when its direct prototype does.
+    /// `0` when the receiver owns the slot, `1` when its direct prototype
+    /// does, [`Entry::UNRESOLVABLE`] when no data slot describes this pair.
     hops: u8,
     /// The holder's own-slot hit, revalidated on every read.
     hit: AtomOwnPropertyHit,
 }
 
 impl Entry {
+    /// Recorded when the walk found no cacheable data slot — an accessor, a
+    /// deeper holder, or nothing at all. Purely a hint: acting on it only ever
+    /// means "take the full ladder", which is always correct, so a prototype
+    /// that later grows the property costs a slow read, never a wrong one.
+    const UNRESOLVABLE: u8 = u8::MAX;
+
     const EMPTY: Self = Self {
         receiver_shape: ShapeId::UNASSIGNED,
         atom: AtomId::NONE,
         hops: 0,
         hit: AtomOwnPropertyHit::PLACEHOLDER,
     };
+}
+
+/// What the shared table knows about one `(receiver shape, atom)` pair.
+#[derive(Debug)]
+pub(crate) enum PropertyProbe {
+    /// The pair resolves to this data slot.
+    Resolved(cache_ir::ResolvedDataSlot),
+    /// A walk already proved this pair has no cacheable data slot.
+    Unresolvable,
+    /// Nothing recorded, or the recorded answer's guards no longer hold.
+    Unknown,
 }
 
 /// Direct-mapped `(shape, atom)` → resolved data slot table.
@@ -106,35 +124,47 @@ impl PropertyLookupCache {
         (entry.receiver_shape == receiver_shape && entry.atom == atom).then_some(entry)
     }
 
-    /// Resolve a named data property for `obj` from the table, or `None` when
-    /// this pair is not cached or its guards no longer hold.
+    /// Everything the table knows about this pair.
     ///
-    /// Returns the same shape of answer a fresh walk would, so a hit serves
-    /// both the read and any per-site stub the caller still wants to install.
+    /// A [`PropertyProbe::Resolved`] answer has the same shape a fresh walk
+    /// would return, so a hit serves both the read and any per-site stub the
+    /// caller still wants to install.
     #[must_use]
-    pub(crate) fn load(
+    pub(crate) fn probe(
         &self,
         obj: JsObject,
         heap: &otter_gc::GcHeap,
         key: AtomizedPropertyKey<'_>,
-    ) -> Option<cache_ir::ResolvedDataSlot> {
-        let entry = self.entry_for(obj, heap, key)?;
+    ) -> PropertyProbe {
+        let Some(entry) = self.entry_for(obj, heap, key) else {
+            return PropertyProbe::Unknown;
+        };
         let holder = match entry.hops {
             0 => obj,
-            _ => {
-                let proto = object::prototype(obj, heap)?;
-                if !object::supports_fast_property_ic(proto, heap) {
-                    return None;
-                }
-                proto
+            // A negative answer depends on the prototype as well as the
+            // receiver's class, and only the receiver's class is in the key.
+            // Pinning the prototype's own class makes the answer expire the
+            // moment that prototype grows the property.
+            Entry::UNRESOLVABLE => {
+                return if entry.hit.shape_id == proto_shape_id(obj, heap) {
+                    PropertyProbe::Unresolvable
+                } else {
+                    PropertyProbe::Unknown
+                };
             }
+            _ => match object::prototype(obj, heap) {
+                Some(proto) if object::supports_fast_property_ic(proto, heap) => proto,
+                _ => return PropertyProbe::Unknown,
+            },
         };
-        let value = object::load_own_data_slot_atom(holder, heap, key, entry.hit)?;
-        Some(cache_ir::ResolvedDataSlot {
-            hops: entry.hops,
-            hit: entry.hit,
-            value,
-        })
+        match object::load_own_data_slot_atom(holder, heap, key, entry.hit) {
+            Some(value) => PropertyProbe::Resolved(cache_ir::ResolvedDataSlot {
+                hops: entry.hops,
+                hit: entry.hit,
+                value,
+            }),
+            None => PropertyProbe::Unknown,
+        }
     }
 
     /// Record a resolution so any site asking for this `(shape, atom)` pair
@@ -146,7 +176,7 @@ impl PropertyLookupCache {
         obj: JsObject,
         heap: &otter_gc::GcHeap,
         key: AtomizedPropertyKey<'_>,
-        resolved: &cache_ir::ResolvedDataSlot,
+        resolved: Option<&cache_ir::ResolvedDataSlot>,
     ) {
         if object::shape(obj, heap).is_null() {
             return;
@@ -156,10 +186,22 @@ impl PropertyLookupCache {
         self.ways[Self::index(receiver_shape, atom)].set(Entry {
             receiver_shape,
             atom,
-            hops: resolved.hops,
-            hit: resolved.hit,
+            hops: resolved.map_or(Entry::UNRESOLVABLE, |resolved| resolved.hops),
+            hit: resolved.map_or(
+                AtomOwnPropertyHit {
+                    shape_id: proto_shape_id(obj, heap),
+                    ..AtomOwnPropertyHit::PLACEHOLDER
+                },
+                |resolved| resolved.hit,
+            ),
         });
     }
+}
+
+/// The class of `obj`'s prototype, or [`ShapeId::UNASSIGNED`] when it has none.
+#[must_use]
+fn proto_shape_id(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeId {
+    object::prototype(obj, heap).map_or(ShapeId::UNASSIGNED, |proto| object::shape_id(proto, heap))
 }
 
 impl crate::Interpreter {
@@ -176,13 +218,15 @@ impl crate::Interpreter {
         obj: JsObject,
         key: AtomizedPropertyKey<'_>,
     ) -> Option<cache_ir::ResolvedDataSlot> {
-        if let Some(cached) = self.property_cache.load(obj, &self.gc_heap, key) {
-            return Some(cached);
+        match self.property_cache.probe(obj, &self.gc_heap, key) {
+            PropertyProbe::Resolved(resolved) => return Some(resolved),
+            PropertyProbe::Unresolvable => return None,
+            PropertyProbe::Unknown => {}
         }
-        let resolved = cache_ir::resolve_atom_data_slot(obj, &self.gc_heap, key)?;
+        let resolved = cache_ir::resolve_atom_data_slot(obj, &self.gc_heap, key);
         self.property_cache
-            .record(obj, &self.gc_heap, key, &resolved);
-        Some(resolved)
+            .record(obj, &self.gc_heap, key, resolved.as_ref());
+        resolved
     }
 }
 
@@ -216,6 +260,9 @@ mod tests {
         let atom = crate::property_atom::PropertyAtom::new(names.intern("x"));
         let key = AtomizedPropertyKey::new(atom, "x");
         let cache = PropertyLookupCache::default();
-        assert!(cache.load(obj, interp.gc_heap(), key).is_none());
+        assert!(matches!(
+            cache.probe(obj, interp.gc_heap(), key),
+            PropertyProbe::Unknown
+        ));
     }
 }

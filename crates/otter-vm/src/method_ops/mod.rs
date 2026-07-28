@@ -1695,7 +1695,12 @@ impl Interpreter {
             .property_is_megamorphic(site, PropertyIcKind::Load)
             != Some(false)
         {
-            return None;
+            // The site has given up, but the receiver's class and the method
+            // name still name one slot. Answer from the shared table rather
+            // than sending a megamorphic call site down the `[[Get]]` ladder.
+            return self
+                .resolve_property_data_slot(obj, key)
+                .map(|resolved| resolved.value);
         }
         if let Some(value) = self
             .feedback_directory
@@ -1717,17 +1722,20 @@ impl Interpreter {
             self.feedback_directory
                 .record_property_uncached_miss(site, PropertyIcKind::Load);
         }
+        let resolved = self.resolve_property_data_slot(obj, key)?;
         if self
             .feedback_directory
             .property_is_megamorphic(site, PropertyIcKind::Load)
             == Some(false)
-            && let Some((ic, value)) = cache_ir::CacheStub::install_load(obj, &self.gc_heap, key)
         {
+            let ic = cache_ir::CacheStub::from_resolved_load(
+                crate::object::shape_id(obj, &self.gc_heap),
+                &resolved,
+            );
             self.feedback_directory
                 .install_property_stub(site, PropertyIcKind::Load, ic);
-            return Some(value);
         }
-        None
+        Some(resolved.value)
     }
 
     fn callable_has_own_function_method_shadow(

@@ -1063,7 +1063,8 @@ mod tests {
         let mut obj = object::alloc_object_old_for_fixture(&mut heap).expect("object");
         object::set(&mut obj, &mut heap, "x", Value::number_i32(1));
         let key = AtomizedPropertyKey::new(PropertyAtom::new(AtomId::from_global(1)), "x");
-        let (stub, _) = CacheStub::install_load(obj, &heap, key).expect("load stub");
+        let resolved = crate::cache_ir::resolve_atom_data_slot(obj, &heap, key).expect("load stub");
+        let stub = CacheStub::from_resolved_load(object::shape_id(obj, &heap), &resolved);
         let mut entry = PropertyIcEntry::Empty;
         entry.install(stub);
 

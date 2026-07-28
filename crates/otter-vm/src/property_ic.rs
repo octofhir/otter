@@ -427,9 +427,13 @@ mod tests {
         object::set(&mut proto, &mut heap, "y", Value::null());
         let receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
         object::set_prototype(receiver, &mut heap, Some(proto));
-        let (ic, value) =
-            crate::cache_ir::CacheStub::install_load(receiver, &heap, key("x")).expect("load ic");
-        assert_eq!(value, Value::boolean(true));
+        let resolved =
+            crate::cache_ir::resolve_atom_data_slot(receiver, &heap, key("x")).expect("load ic");
+        let ic = crate::cache_ir::CacheStub::from_resolved_load(
+            object::shape_id(receiver, &heap),
+            &resolved,
+        );
+        assert_eq!(resolved.value, Value::boolean(true));
 
         assert!(object::delete(proto, &mut heap, "y"));
 

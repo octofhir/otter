@@ -103,13 +103,19 @@ impl Interpreter {
             let obj = read_register(&stack[top_idx], obj_reg)?
                 .as_object()
                 .unwrap_or(obj);
-            if !site_disabled
-                && let Some((ic, value)) =
-                    cache_ir::CacheStub::install_load(obj, &self.gc_heap, atomized_key)
-            {
-                self.feedback_directory
-                    .install_property_stub(site, PropertyIcKind::Load, ic);
-                Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)?;
+            // The shared table answers first, so a site re-learning after a
+            // guard miss pays a probe instead of another chain walk; only a
+            // pair the isolate has never resolved walks.
+            if let Some(resolved) = self.resolve_property_data_slot(obj, atomized_key) {
+                if !site_disabled {
+                    let ic = cache_ir::CacheStub::from_resolved_load(
+                        object::shape_id(obj, &self.gc_heap),
+                        &resolved,
+                    );
+                    self.feedback_directory
+                        .install_property_stub(site, PropertyIcKind::Load, ic);
+                }
+                Self::finish_property_fast_path_value(&mut stack[top_idx], dst, resolved.value)?;
                 return Ok(true);
             }
             let key = VmPropertyKey::atom(atomized_key);

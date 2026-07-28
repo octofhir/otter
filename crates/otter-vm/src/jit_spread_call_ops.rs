@@ -137,24 +137,34 @@ impl Interpreter {
         }
 
         let collect = |interp: &mut Self| {
-            let iterator_method = crate::object::get(interp.global_this, &interp.gc_heap, "Array")
-                .and_then(|value| {
-                    if let Some(ctor) = value.as_object() {
-                        crate::object::get(ctor, &interp.gc_heap, "prototype")
-                    } else if let Some(native) = value.as_native_function() {
-                        native
-                            .own_property_descriptor(&mut interp.gc_heap, "prototype")
-                            .ok()
-                            .flatten()
-                            .and_then(|descriptor| match descriptor.kind {
-                                crate::object::DescriptorKind::Data { value } => Some(value),
-                                _ => None,
-                            })
-                    } else {
-                        None
-                    }
+            // The typed intrinsic slot resolves `%Array.prototype%` without
+            // walking the global object; the chain below only serves embedders
+            // whose bootstrap omitted Array.
+            let iterator_method = interp
+                .realm_intrinsics
+                .array_prototype
+                .or_else(|| {
+                    crate::object::get(interp.global_this, &interp.gc_heap, "Array")
+                        .and_then(|value| {
+                            if let Some(ctor) = value.as_object() {
+                                crate::object::get(ctor, &interp.gc_heap, "prototype")
+                            } else if let Some(native) = value.as_native_function() {
+                                native
+                                    .own_property_descriptor(&mut interp.gc_heap, "prototype")
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|descriptor| match descriptor.kind {
+                                        crate::object::DescriptorKind::Data { value } => {
+                                            Some(value)
+                                        }
+                                        _ => None,
+                                    })
+                            } else {
+                                None
+                            }
+                        })
+                        .and_then(|value| value.as_object())
                 })
-                .and_then(|value| value.as_object())
                 .and_then(|prototype| crate::object::get(prototype, &interp.gc_heap, "values"));
             let iterator_symbol = interp
                 .well_known_symbols

@@ -175,6 +175,7 @@ pub mod promise_dispatch;
 mod promise_ops;
 pub mod promise_rejection;
 mod property_atom;
+mod property_cache;
 mod property_dispatch;
 mod property_ic;
 pub mod proxy;
@@ -887,6 +888,12 @@ pub struct Interpreter {
     /// the object model is then a `u32` compare. Shared with `shape_runtime`,
     /// which stores an atom on each shape node it creates.
     names: std::sync::Arc<property_atom::NameInterner>,
+    /// Shared `(receiver shape, property atom)` answers. A per-site inline
+    /// cache stops answering once its site goes megamorphic; this table does
+    /// not care which site asks, so a dispatch loop over sibling classes keeps
+    /// resolving properties in one probe instead of re-entering the `[[Get]]`
+    /// ladder. See [`property_cache`].
+    property_cache: property_cache::PropertyLookupCache,
     /// The most recent top-level [`ExecutionContext`] this interpreter ran.
     /// Every chunk links into the shared [`code_space`], so this context
     /// resolves function ids for any closure reachable in the realm — it is the

@@ -63,6 +63,15 @@ impl Interpreter {
             .property_is_megamorphic(site, PropertyIcKind::Load)
             != Some(false)
         {
+            // A saturated site still reads one slot per receiver class. The
+            // shared `(shape, atom)` table answers it without the ladder; only
+            // a pair nothing has resolved falls through.
+            if let Some(resolved) = self.resolve_property_data_slot(obj, atomized_key) {
+                self.feedback_directory
+                    .record_property_hit(PropertyIcKind::Load);
+                frame.write(dst, resolved.value)?;
+                return Ok(None);
+            }
             return full_get(self, frame, stack);
         }
         if let Some(value) =
@@ -98,15 +107,19 @@ impl Interpreter {
         let mut migrating = obj;
         self.migrate_slow_to_fast(&mut migrating);
         let obj = migrating;
-        if self
-            .feedback_directory
-            .property_is_megamorphic(site, PropertyIcKind::Load)
-            == Some(false)
-            && let Some((ic, value)) =
-                cache_ir::CacheStub::install_load(obj, &self.gc_heap, atomized_key)
-        {
-            self.feedback_directory
-                .install_property_stub(site, PropertyIcKind::Load, ic);
+        if let Some(resolved) = self.resolve_property_data_slot(obj, atomized_key) {
+            if self
+                .feedback_directory
+                .property_is_megamorphic(site, PropertyIcKind::Load)
+                == Some(false)
+            {
+                let ic = cache_ir::CacheStub::from_resolved_load(
+                    object::shape_id(obj, &self.gc_heap),
+                    &resolved,
+                );
+                self.feedback_directory
+                    .install_property_stub(site, PropertyIcKind::Load, ic);
+            }
             // `dst` may alias the receiver in an optimized register window;
             // capture its relocated object identity before the commit.
             let current_obj = frame
@@ -114,7 +127,7 @@ impl Interpreter {
                 .as_object()
                 .ok_or(VmError::InvalidOperand)?;
             let fill = self.whisker_load_cell_fill(site, current_obj, atomized_key);
-            frame.write(dst, value)?;
+            frame.write(dst, resolved.value)?;
             return Ok(fill);
         }
         // Not cache-representable (accessor, deep prototype, absent):

@@ -604,6 +604,18 @@ pub(crate) struct AtomOwnPropertyHit {
     pub(crate) is_data: bool,
 }
 
+impl AtomOwnPropertyHit {
+    /// Filler for an empty cache way. Its shape id matches no object, so it
+    /// can only ever be read after the owning entry's own key compare fails.
+    pub(crate) const PLACEHOLDER: Self = Self {
+        shape_id: ShapeId::UNASSIGNED,
+        shape: ShapeHandle::null(),
+        atom_id: AtomId::NONE,
+        slot: 0,
+        is_data: false,
+    };
+}
+
 /// Own-property slot metadata for non-atomized named-property ICs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OwnPropertySlotHit {

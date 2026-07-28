@@ -196,6 +196,7 @@ impl Interpreter {
             gc_heap,
             code_space: std::sync::Arc::new(code_space::CodeSpace::default()),
             names,
+            property_cache: crate::property_cache::PropertyLookupCache::default(),
             realm_context: None,
             shape_runtime,
             shape_epoch: 0,

@@ -298,42 +298,16 @@ impl CacheStub {
         None
     }
 
-    /// Build a `LoadProperty` stub for the current receiver/key pair, returning
-    /// the stub and the value it would have loaded. `None` when the access is
-    /// not IC-eligible.
+    /// The load program for an already-resolved data slot.
     #[must_use]
-    pub(crate) fn install_load(
-        obj: JsObject,
-        heap: &otter_gc::GcHeap,
-        key: AtomizedPropertyKey<'_>,
-    ) -> Option<(Self, Value)> {
-        if !object::supports_fast_property_ic(obj, heap) {
-            return None;
+    pub(crate) fn from_resolved_load(
+        receiver_shape_id: ShapeId,
+        resolved: &ResolvedDataSlot,
+    ) -> Self {
+        match resolved.hops {
+            0 => Self::load_own_data(resolved.hit),
+            _ => Self::load_direct_prototype_data(receiver_shape_id, resolved.hit),
         }
-        let receiver_shape_id = object::shape_id(obj, heap);
-        let atom_lookup = object::lookup_own_atom(obj, heap, key);
-        if let (Some(hit), object::PropertyLookup::Data { value, .. }) =
-            (atom_lookup.hit, atom_lookup.lookup)
-        {
-            return Some((Self::load_own_data(hit), value));
-        }
-        if atom_lookup.hit.is_some() {
-            return None;
-        }
-        let proto = object::prototype(obj, heap)?;
-        if !object::supports_fast_property_ic(proto, heap) {
-            return None;
-        }
-        let proto_lookup = object::lookup_own_atom(proto, heap, key);
-        if let (Some(hit), object::PropertyLookup::Data { value, .. }) =
-            (proto_lookup.hit, proto_lookup.lookup)
-        {
-            return Some((
-                Self::load_direct_prototype_data(receiver_shape_id, hit),
-                value,
-            ));
-        }
-        None
     }
 
     /// The own-data hit when this is a single-op own-data load stub. Lets the
@@ -630,6 +604,65 @@ impl CacheStub {
         }
         None
     }
+}
+
+/// Where a named data property lives relative to the receiver, and what it
+/// currently holds.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResolvedDataSlot {
+    /// Prototype hops from the receiver to the holder: `0` own, `1` the
+    /// receiver's direct prototype. Deeper holders are not resolved here —
+    /// proving the property absent on every object in between costs a guard
+    /// per link, which is exactly the boundary the cache stubs already draw.
+    pub(crate) hops: u8,
+    /// The holder's own-slot hit, guarded by its shape.
+    pub(crate) hit: AtomOwnPropertyHit,
+    /// The value the slot holds right now.
+    pub(crate) value: Value,
+}
+
+/// Resolve a named property to a plain data slot on the receiver or its direct
+/// prototype.
+///
+/// This is the one resolution both consumers share: the per-site stub builder
+/// above, and the isolate-wide `(shape, atom)` cache that answers sites the
+/// stub layer has given up on. `None` for accessors, deeper holders, absent
+/// properties, and any receiver hidden classes cannot describe.
+#[must_use]
+pub(crate) fn resolve_atom_data_slot(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    key: AtomizedPropertyKey<'_>,
+) -> Option<ResolvedDataSlot> {
+    if !object::supports_fast_property_ic(obj, heap) {
+        return None;
+    }
+    let own = object::lookup_own_atom(obj, heap, key);
+    if let (Some(hit), object::PropertyLookup::Data { value, .. }) = (own.hit, own.lookup) {
+        return Some(ResolvedDataSlot {
+            hops: 0,
+            hit,
+            value,
+        });
+    }
+    if own.hit.is_some() {
+        return None;
+    }
+    let proto = object::prototype(obj, heap)?;
+    if !object::supports_fast_property_ic(proto, heap) {
+        return None;
+    }
+    let inherited = object::lookup_own_atom(proto, heap, key);
+    if let (Some(hit), object::PropertyLookup::Data { value, .. }) =
+        (inherited.hit, inherited.lookup)
+    {
+        return Some(ResolvedDataSlot {
+            hops: 1,
+            hit,
+            value,
+        });
+    }
+    None
 }
 
 /// Byte offset of a string-keyed own slot inside the object's value slab.

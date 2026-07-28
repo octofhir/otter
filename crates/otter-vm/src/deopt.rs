@@ -416,6 +416,52 @@ impl DeoptTable {
     }
 }
 
+/// One inlined-frame reification step of a deopt exit's chain: the caller's
+/// call instruction and the PC the rebuilt callee frame fast-forwards to.
+/// Both are logical (canonical instruction-index) PCs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeoptChainCall {
+    /// The caller's call instruction, one before where it resumes.
+    pub call_pc: u32,
+    /// Where the rebuilt callee frame resumes.
+    pub callee_pc: u32,
+}
+
+/// Everything one generated exit site needs beyond its [`FrameState`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeoptExitDescriptor {
+    /// The frame state this site rebuilds, an index into the owning table.
+    pub state: DeoptExitId,
+    /// Logical PC the compiled function's own frame resumes at. Meaningful
+    /// only for a single-frame exit; a chain leaves each caller advanced past
+    /// its call and stamps no PC.
+    pub resume_pc: u32,
+    /// Reification steps for inlined frames, outermost caller first. Empty for
+    /// a single-frame exit.
+    pub chain: Box<[DeoptChainCall]>,
+}
+
+/// Deopt metadata a generated exit reads at run time.
+///
+/// A generated exit site is two instructions: an exit index and a branch to
+/// one shared handler, which dumps the machine registers and calls the
+/// writeback stub with this record's baked address. Interpreter-state
+/// reconstruction is therefore data walked by the stub, never per-exit code.
+/// The allocation's address is baked into the generated handler, so it must
+/// live exactly as long as the code — the same ownership contract as the
+/// property-IC cells.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeoptRuntime {
+    /// Frame states indexed by [`DeoptExitId`].
+    pub table: DeoptTable,
+    /// Per-exit-site descriptors, indexed by the site index generated code
+    /// passes to the writeback stub.
+    pub exits: Box<[DeoptExitDescriptor]>,
+    /// GPR budget of the allocation the table's register ids refer to; ids at
+    /// or past it name FP registers.
+    pub gpr_budget: u16,
+}
+
 /// A compact bitset over a safepoint's compiled slots: bit `i` set means slot
 /// `i` holds a tagged pointer the moving collector must find and relocate.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

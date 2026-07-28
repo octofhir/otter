@@ -433,7 +433,7 @@ pub(super) fn emit_load_parameter(ops: &mut Assembler, index: u32, scratch: u8) 
     }
 }
 
-/// Inverse of [`emit_deopt_writeback`] for a loop-header live set.
+/// Reload a loop-header live set from its interpreter-window slots.
 ///
 /// The interpreter window is still the canonical rooted state on entry. Each
 /// live frame-state value is loaded from its bytecode register, checked and
@@ -468,76 +468,6 @@ pub(super) fn emit_osr_materialization(
                 )?;
             }
         }
-    }
-    Ok(())
-}
-
-/// Restore one interpreter frame's registers from an exit's slots.
-///
-/// `window` addresses the frame being rebuilt: `x19` for the compiled function's
-/// own frame, or the window a reify handed back for an inlined callee's.
-pub(super) fn emit_deopt_writeback(
-    ops: &mut Assembler,
-    allocation: &Allocation,
-    frame: &DeoptFrame,
-    window: u8,
-) -> Result<(), Unsupported> {
-    for (register, slot) in frame.slots.iter().enumerate() {
-        match slot.location {
-            DeoptLocation::Register(machine_register) => match slot.repr {
-                DeoptRepr::Int32 | DeoptRepr::Tagged => {
-                    let physical = VALUE_REGISTERS
-                        .get(machine_register as usize)
-                        .copied()
-                        .ok_or(Unsupported::OperandShape("optimizing deopt GPR mapping"))?;
-                    if slot.repr == DeoptRepr::Int32 {
-                        dynasm!(ops ; .arch aarch64 ; mov w9, W(physical));
-                    } else {
-                        dynasm!(ops ; .arch aarch64 ; mov x9, X(physical));
-                    }
-                }
-                DeoptRepr::Float64 => {
-                    let fp_index = machine_register
-                        .checked_sub(u16::from(allocation.register_budget.gpr))
-                        .ok_or(Unsupported::OperandShape(
-                            "optimizing deopt FP register class",
-                        ))?;
-                    let physical = FP_REGISTERS
-                        .get(fp_index as usize)
-                        .copied()
-                        .ok_or(Unsupported::OperandShape("optimizing deopt FP mapping"))?;
-                    dynasm!(ops ; .arch aarch64 ; fmov D(FP_SCRATCH), D(physical));
-                }
-            },
-            DeoptLocation::StackSlot(offset) => {
-                let offset = u32::try_from(offset).map_err(|_| {
-                    Unsupported::OperandShape("optimizing negative deopt spill offset")
-                })?;
-                match slot.repr {
-                    DeoptRepr::Int32 => emit_sp_ldr_w(ops, 9, offset),
-                    DeoptRepr::Tagged => emit_sp_ldr_x(ops, 9, offset),
-                    DeoptRepr::Float64 => {
-                        emit_sp_ldr_d(ops, FP_SCRATCH, offset);
-                    }
-                }
-            }
-            DeoptLocation::Literal(raw) => {
-                emit_load_u64(ops, 9, raw);
-                if slot.repr == DeoptRepr::Float64 {
-                    dynasm!(ops ; .arch aarch64 ; fmov D(FP_SCRATCH), x9);
-                }
-            }
-        }
-        match slot.repr {
-            DeoptRepr::Tagged => {}
-            DeoptRepr::Int32 => dynasm!(ops
-                ; .arch aarch64
-                ; movz x10, NUMBER_TAG_HI16, lsl #48
-                ; orr x9, x10, x9
-            ),
-            DeoptRepr::Float64 => emit_box_double(ops, FP_SCRATCH, 9),
-        }
-        emit_store_frame_register_in(ops, window, register as u32, 9)?;
     }
     Ok(())
 }

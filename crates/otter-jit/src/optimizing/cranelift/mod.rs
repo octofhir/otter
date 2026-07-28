@@ -149,7 +149,11 @@ impl NumericLeafBackend {
         let code = OptimizedCode::new(
             code,
             Some(lowered.generated_stack_frame_bytes),
-            deopt_table,
+            Box::new(otter_vm::deopt::DeoptRuntime {
+                table: deopt_table,
+                exits: Box::default(),
+                gpr_budget: 0,
+            }),
             safepoints,
             frame_maps,
             frame_map_bitmap_words,

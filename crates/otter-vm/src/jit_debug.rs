@@ -320,12 +320,46 @@ pub enum JitStaticNativeCallLoweringOutcome {
     },
 }
 
+/// Final optimizing-tier decision for one budget-admitted inline candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum JitInlineLoweringOutcome {
+    /// The complete optimizing pipeline accepted and spliced the body.
+    Inlined,
+    /// A named splicer, analysis, or backend contract declined the body.
+    Rejected {
+        /// Exact typed failure rendered by the owning stage.
+        reason: String,
+    },
+}
+
 /// Typed cold diagnostic returned by one compiler-hook invocation.
 ///
 /// The VM supplies caller identity and tier from the compile request rather
 /// than trusting an external backend to repeat them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JitCompilerDiagnostic {
+    /// Final decision for one budget-admitted inline body.
+    InlineLowered {
+        /// Function containing the replaced call instruction.
+        parent_function_id: u32,
+        /// Logical PC of the call instruction in the parent body.
+        instruction_pc: u32,
+        /// Encoded byte PC in the parent body.
+        byte_pc: u32,
+        /// Exact guarded callee function id.
+        callee_function_id: u32,
+        /// Depth below the optimized unit's root.
+        depth: u32,
+        /// Weighted cost charged by the inline budget.
+        cost: u32,
+        /// Complete pipeline decision.
+        outcome: JitInlineLoweringOutcome,
+    },
     /// Final backend lowering for one available direct-call plan.
     DirectCallLowered {
         /// Source opcode represented by this generated linkage.
@@ -458,6 +492,29 @@ pub enum JitDebugEvent {
         /// made available to the backend, which may still reject it for final
         /// size, arity, or tier-specific eligibility constraints.
         bake_rejection: Option<JitInlineRejectionReason>,
+    },
+    /// Final optimizing-tier decision for one budget-admitted inline body.
+    InlineLowered {
+        /// Outermost function whose code object owns the inline unit.
+        function_id: u32,
+        /// Exact generated code object containing the decision.
+        code_object_id: u64,
+        /// Tier that made the inline decision.
+        tier: JitDebugTier,
+        /// Function containing the replaced call instruction.
+        parent_function_id: u32,
+        /// Logical PC of the call instruction in the parent body.
+        instruction_pc: u32,
+        /// Encoded byte PC in the parent body.
+        byte_pc: u32,
+        /// Exact guarded callee function id.
+        callee_function_id: u32,
+        /// Depth below the optimized unit's root.
+        depth: u32,
+        /// Weighted cost charged by the inline budget.
+        cost: u32,
+        /// Final splice result.
+        outcome: JitInlineLoweringOutcome,
     },
     /// One observed call target was made available to the backend or rejected
     /// during VM planning.
@@ -957,6 +1014,37 @@ mod tests {
         assert_eq!(value["callerFunctionId"], 3);
         assert_eq!(value["calleeFunctionId"], 4);
         assert!(value["bakeRejection"].is_null());
+    }
+
+    #[test]
+    fn inline_lowering_names_the_complete_pipeline_rejection() {
+        let value = serde_json::to_value(JitDebugEvent::InlineLowered {
+            function_id: 3,
+            code_object_id: 8,
+            tier: JitDebugTier::Optimizing,
+            parent_function_id: 4,
+            instruction_pc: 9,
+            byte_pc: 72,
+            callee_function_id: 5,
+            depth: 2,
+            cost: 41,
+            outcome: JitInlineLoweringOutcome::Rejected {
+                reason: "SsaConstruction(RegisterOutOfRange)".to_string(),
+            },
+        })
+        .expect("serialize inline lowering");
+
+        assert_eq!(value["type"], "inlineLowered");
+        assert_eq!(value["functionId"], 3);
+        assert_eq!(value["parentFunctionId"], 4);
+        assert_eq!(value["calleeFunctionId"], 5);
+        assert_eq!(value["depth"], 2);
+        assert_eq!(value["cost"], 41);
+        assert_eq!(value["outcome"]["kind"], "rejected");
+        assert_eq!(
+            value["outcome"]["reason"],
+            "SsaConstruction(RegisterOutOfRange)"
+        );
     }
 
     #[test]

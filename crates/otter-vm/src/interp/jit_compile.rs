@@ -215,11 +215,31 @@ impl Interpreter {
         let Ok(jit::JitCompileStatus::Compiled { diagnostics, .. }) = status else {
             return;
         };
-        for diagnostic in diagnostics {
+        for diagnostic in diagnostics.iter().cloned() {
             if !self.reserve_jit_debug_event() {
                 break;
             }
-            let event = match *diagnostic {
+            let event = match diagnostic {
+                jit_debug::JitCompilerDiagnostic::InlineLowered {
+                    parent_function_id,
+                    instruction_pc,
+                    byte_pc,
+                    callee_function_id,
+                    depth,
+                    cost,
+                    outcome,
+                } => jit_debug::JitDebugEvent::InlineLowered {
+                    function_id: fid,
+                    code_object_id,
+                    parent_function_id,
+                    instruction_pc,
+                    byte_pc,
+                    tier,
+                    callee_function_id,
+                    depth,
+                    cost,
+                    outcome,
+                },
                 jit_debug::JitCompilerDiagnostic::DirectCallLowered {
                     call_kind,
                     instruction_pc,

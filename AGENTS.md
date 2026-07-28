@@ -359,7 +359,9 @@ Pure Rust implementation - no external JavaScript engine dependencies.
   - The current report contains typed compile,
     inlining, direct-call plan/final-lowering, bail, generated-call-deopt, and
     inline-deopt events. Bounded method chains expose `targetIndex` /
-    `targetCount`; `compilePrepared` reports `directMethodSites` and
+    `targetCount`; `inlineLowered` reports the parent/callee, depth, weighted
+    budget cost, and exact complete-pipeline rejection when a candidate cannot
+    be spliced; `compilePrepared` reports `directMethodSites` and
     `directMethodTargets` separately from body-inline candidate counts, while
     `globalLoadSites` counts analyzed global reads, `globalLexicalLoads`
     counts permanent global-declarative cells, and `globalObjectLoads` counts

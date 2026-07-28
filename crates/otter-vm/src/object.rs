@@ -1920,6 +1920,21 @@ pub(super) fn body_offset_of(heap: &otter_gc::GcHeap, body: &ObjectBody, key: &s
     body.dictionary_index_get(key)
 }
 
+/// [`body_offset_of`] for a key whose storage is isolate-pinned (an atom
+/// table): the shape walk answers through the head shape's lookup memo.
+pub(super) fn body_offset_of_pinned(
+    heap: &otter_gc::GcHeap,
+    body: &ObjectBody,
+    key: &str,
+) -> Option<u16> {
+    if !body.shape.is_null() {
+        debug_assert_object_shape_handle(body.shape, "property offset lookup");
+        return shape_body::shape_offset_of_pinned_str(heap, body.shape, key)
+            .and_then(|offset| u16::try_from(offset).ok());
+    }
+    body.dictionary_index_get(key)
+}
+
 /// Number of own string-keyed properties recorded in a fast-mode
 /// shape (`0` for the null/dictionary shape). Used to decide when an
 /// object should normalize to dictionary storage.
@@ -2143,29 +2158,31 @@ pub(crate) fn lookup_own_atom(
     heap: &otter_gc::GcHeap,
     key: AtomizedPropertyKey<'_>,
 ) -> AtomPropertyLookup {
-    heap.read_payload(obj, |body| match body_offset_of(heap, body, key.name()) {
-        Some(offset) => {
-            let mut lookup = body.slot_lookup_at(heap, offset as usize);
-            if let Some(cell) = mapped_argument_cell(body, key.name())
-                && let PropertyLookup::Data { value, .. } = &mut lookup
-            {
-                *value = read_upvalue(heap, cell);
+    heap.read_payload(obj, |body| {
+        match body_offset_of_pinned(heap, body, key.name()) {
+            Some(offset) => {
+                let mut lookup = body.slot_lookup_at(heap, offset as usize);
+                if let Some(cell) = mapped_argument_cell(body, key.name())
+                    && let PropertyLookup::Data { value, .. } = &mut lookup
+                {
+                    *value = read_upvalue(heap, cell);
+                }
+                AtomPropertyLookup {
+                    hit: Some(AtomOwnPropertyHit {
+                        shape_id: body_shape_id(heap, body),
+                        shape: body.shape,
+                        atom_id: key.atom().id(),
+                        slot: offset,
+                        is_data: matches!(lookup, PropertyLookup::Data { .. }),
+                    }),
+                    lookup,
+                }
             }
-            AtomPropertyLookup {
-                hit: Some(AtomOwnPropertyHit {
-                    shape_id: body_shape_id(heap, body),
-                    shape: body.shape,
-                    atom_id: key.atom().id(),
-                    slot: offset,
-                    is_data: matches!(lookup, PropertyLookup::Data { .. }),
-                }),
-                lookup,
-            }
+            None => AtomPropertyLookup {
+                hit: None,
+                lookup: PropertyLookup::Absent,
+            },
         }
-        None => AtomPropertyLookup {
-            hit: None,
-            lookup: PropertyLookup::Absent,
-        },
     })
 }
 
@@ -3858,6 +3875,16 @@ impl otter_gc::GcStore for PropertyDescriptor {
     }
 }
 
+/// The [`resolve_set`] variant for a key in isolate-pinned storage: every
+/// own-lookup on the walk answers through the shape lookup memos.
+pub(crate) fn resolve_set_atomized(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    key: AtomizedPropertyKey<'_>,
+) -> SetOutcome {
+    resolve_set_inner(obj, heap, key.name(), true)
+}
+
 /// Resolve a `[[Set]]` against `obj` as receiver — walks the
 /// prototype chain to detect inherited accessors and
 /// non-writable shadows, but writes happen on `obj` (the
@@ -3870,9 +3897,39 @@ impl otter_gc::GcStore for PropertyDescriptor {
 /// - <https://tc39.es/ecma262/#sec-ordinaryset>
 /// - <https://tc39.es/ecma262/#sec-ordinarysetwithowndescriptor>
 pub fn resolve_set(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> SetOutcome {
+    resolve_set_inner(obj, heap, key, false)
+}
+
+fn resolve_set_inner(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    key: &str,
+    key_is_pinned: bool,
+) -> SetOutcome {
+    let lookup = |target: JsObject| {
+        heap.read_payload(target, |body| {
+            let offset = if key_is_pinned {
+                body_offset_of_pinned(heap, body, key)
+            } else {
+                body_offset_of(heap, body, key)
+            };
+            match offset {
+                Some(offset) => {
+                    let mut found = body.slot_lookup_at(heap, offset as usize);
+                    if let Some(cell) = mapped_argument_cell(body, key)
+                        && let PropertyLookup::Data { value, .. } = &mut found
+                    {
+                        *value = read_upvalue(heap, cell);
+                    }
+                    found
+                }
+                None => PropertyLookup::Absent,
+            }
+        })
+    };
     // Walk own + prototype chain looking for an accessor or a
     // non-writable shadow.
-    let own = lookup_own(obj, heap, key);
+    let own = lookup(obj);
     match own {
         PropertyLookup::Data { flags, .. } => {
             if flags.writable() {
@@ -3904,7 +3961,7 @@ pub fn resolve_set(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> SetOutc
             break;
         }
         hops += 1;
-        match lookup_own(proto, heap, key) {
+        match lookup(proto) {
             PropertyLookup::Data { flags, .. } => {
                 if flags.writable() {
                     if !is_extensible(obj, heap) {

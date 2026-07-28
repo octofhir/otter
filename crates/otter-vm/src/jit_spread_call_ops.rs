@@ -33,6 +33,7 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         function_id: u32,
+        call_pc: u32,
         receiver: Value,
         name_index: u32,
         args: SmallVec<[Value; 8]>,
@@ -59,12 +60,55 @@ impl Interpreter {
                 };
                 return Err(interp.err_type((format!("Cannot read properties of {label}")).into()));
             }
-            let name = context
-                .string_constant_str_for_function(function_id, name_index)
-                .ok_or(VmError::InvalidOperand)?;
-            let method = interp
-                .get_method_value_for_call(context, stack, receiver, name)?
-                .unwrap_or_else(Value::undefined);
+            // The compiled site shares the interpreter's method-resolution
+            // caches: a shape-guarded own-slot hit, then the load-IC-backed
+            // resolution (which serves prototype methods), and only then the
+            // per-call `[[Get]]` chain walk.
+            let method_site = context
+                .property_ic_site(function_id, call_pc)
+                .unwrap_or(usize::MAX);
+            let mut method = Value::undefined();
+            if method_site != usize::MAX
+                && let Some(obj) = receiver.as_object()
+            {
+                if let Some(crate::method_ops::MethodCallIc::Ordinary(hit)) =
+                    interp.feedback_directory.method_ic(method_site)
+                {
+                    if let Some(cached) =
+                        crate::object::load_own_data_slot_by_shape(obj, &interp.gc_heap, hit)
+                        && interp.is_callable_runtime(&cached)
+                    {
+                        method = cached;
+                    } else {
+                        interp.feedback_directory.clear_method_ic(method_site);
+                    }
+                }
+                if method.is_undefined()
+                    && let Some(atomized_key) =
+                        context.property_atom_for_function(function_id, name_index)
+                    && let Some(resolved) = interp.resolve_method_ic(obj, atomized_key, method_site)
+                    && interp.is_callable_runtime(&resolved)
+                {
+                    if let Some(hit) = interp
+                        .feedback_directory
+                        .mono_load_own_data_hit(method_site)
+                    {
+                        interp.feedback_directory.install_method_ic(
+                            method_site,
+                            crate::method_ops::MethodCallIc::Ordinary(hit),
+                        );
+                    }
+                    method = resolved;
+                }
+            }
+            if method.is_undefined() {
+                let name = context
+                    .string_constant_str_for_function(function_id, name_index)
+                    .ok_or(VmError::InvalidOperand)?;
+                method = interp
+                    .get_method_value_for_call(context, stack, receiver, name)?
+                    .unwrap_or_else(Value::undefined);
+            }
             if !interp.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
             }
@@ -457,6 +501,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let receiver = *read_register(&stack[frame_index], receiver_reg)?;
         let function_id = stack[frame_index].function_id;
+        let call_pc = stack[frame_index].pc;
         let mut args = SmallVec::with_capacity(arg_regs.len());
         for &reg in arg_regs {
             args.push(*read_register(&stack[frame_index], reg)?);
@@ -465,6 +510,7 @@ impl Interpreter {
             context,
             stack,
             function_id,
+            call_pc,
             receiver,
             name_index,
             args,

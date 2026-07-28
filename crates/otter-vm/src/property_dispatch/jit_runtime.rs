@@ -202,7 +202,7 @@ impl Interpreter {
             // A store IC is not authority to bypass an inherited accessor,
             // non-writable, or exotic `[[Set]]` outcome it has no stub for.
             // Prove the miss is an ordinary data assignment before installing.
-            let set_outcome = object::resolve_set(obj, &self.gc_heap, atomized_key.name());
+            let set_outcome = object::resolve_set_atomized(obj, &self.gc_heap, atomized_key);
             if !matches!(set_outcome, object::SetOutcome::AssignData) {
                 return full_set(self, frame, stack);
             }

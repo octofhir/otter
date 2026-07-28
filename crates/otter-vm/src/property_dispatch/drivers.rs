@@ -1191,7 +1191,7 @@ impl Interpreter {
         } else {
             return Ok(false);
         };
-        let outcome = crate::object::resolve_set(obj, &self.gc_heap, name);
+        let outcome = crate::object::resolve_set_atomized(obj, &self.gc_heap, atomized_key);
         match outcome {
             // §10.1.9.2 step 2 — an exotic prototype owns [[Set]]:
             // continue through the value-level funnel (TypedArray

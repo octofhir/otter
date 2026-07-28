@@ -194,6 +194,7 @@ impl Interpreter {
             jit_backedge_fuel: Self::JIT_BACKEDGE_POLL_BATCH,
             gc_heap,
             code_space: std::sync::Arc::new(code_space::CodeSpace::default()),
+            names: std::sync::Arc::new(crate::property_atom::NameInterner::default()),
             realm_context: None,
             shape_runtime,
             shape_epoch: 0,

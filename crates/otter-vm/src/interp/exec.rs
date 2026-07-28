@@ -79,11 +79,14 @@ impl Interpreter {
     /// space. Rebases the module's function ids onto the global id
     /// space so function values created by this chunk stay callable
     /// after they escape to frames executing other chunks (the
-    /// `eval` / `new Function` / dynamic-import escape paths).
+    /// `eval` / `new Function` / dynamic-import escape paths), and
+    /// resolves the chunk's string constants to this isolate's global
+    /// property-name atoms.
     pub fn link_module(&mut self, module: otter_bytecode::BytecodeModule) -> ExecutionContext {
         let function_count = u32::try_from(module.functions.len())
             .expect("linked module function table exceeds u32 range");
         let context = self.code_space.link_module(module);
+        context.resolve_atoms(&self.names);
         if self.active_realm_id != 0 {
             let base = context.function_base();
             for function_id in base..base + function_count {
@@ -105,8 +108,14 @@ impl Interpreter {
         // this run (eval / new Function bodies) land in the same
         // function-id space as the running script. No-op for contexts
         // produced by `link_module`.
+        //
+        // The adopted chunks' property-name atoms were minted by whatever
+        // interner linked them, which is not this isolate's. Re-resolve the
+        // whole space so every atom id this run compares — against shape
+        // nodes, IC guards, transition records — comes from `self.names`.
         if !std::sync::Arc::ptr_eq(&self.code_space, context.space()) {
             self.code_space = std::sync::Arc::clone(context.space());
+            self.code_space.resolve_atoms(&self.names);
         }
         // Remember the realm's dispatch context as the universal microtask
         // fallback. It shares the code space adopted above, so it resolves

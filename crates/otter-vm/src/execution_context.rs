@@ -111,6 +111,15 @@ impl ExecutionContext {
         }
     }
 
+    /// Resolve this chunk's property-name atoms against an isolate's interner.
+    ///
+    /// A chunk is linked with no atom ids; the interpreter that links it (or
+    /// adopts its code space) publishes the ids, so every id a running isolate
+    /// sees comes from that isolate's interner.
+    pub(crate) fn resolve_atoms(&self, names: &crate::property_atom::NameInterner) {
+        self.atoms.resolve(names);
+    }
+
     /// Resolve the immutable sibling chunk owning a foreign `function_id`.
     /// Registry nodes never move or disappear, so their tables borrow directly
     /// from the shared code-space chain without a per-context cache.
@@ -682,7 +691,8 @@ mod tests {
 
     #[test]
     fn string_constants_have_stable_property_atoms() {
-        let context = ExecutionContext::from_module(module_with(
+        let mut interp = Interpreter::new();
+        let context = interp.link_module(module_with(
             vec![instr(0, Op::ReturnUndefined, [])],
             vec![string_constant("foo")],
             1,

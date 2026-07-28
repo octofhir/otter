@@ -179,6 +179,22 @@ impl CodeSpace {
         None
     }
 
+    /// Resolve every linked chunk's property-name atoms against `names`.
+    ///
+    /// Called when an interpreter adopts a code space it did not link: the
+    /// chunks' atom tables may carry no ids at all (a standalone
+    /// [`ExecutionContext::from_module`]) or ids from another isolate's
+    /// interner, and either would compare wrongly against shapes keyed by the
+    /// adopting interpreter's atoms. Resolution is idempotent, so the walk is
+    /// safe to repeat.
+    pub(crate) fn resolve_atoms(&self, names: &crate::property_atom::NameInterner) {
+        let mut chunk = self.first.get();
+        while let Some(current) = chunk {
+            current.tables.atoms.resolve(names);
+            chunk = current.next.get();
+        }
+    }
+
     /// Read one function's material-feedback epoch without requiring an
     /// ambient execution context. Used only by the explicit optimizing-tier
     /// policy query; baseline compilation and dispatch do not call it.

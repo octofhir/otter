@@ -880,6 +880,13 @@ pub struct Interpreter {
     /// frame; every linked [`ExecutionContext`] resolves foreign ids
     /// through this shared registry.
     code_space: std::sync::Arc<code_space::CodeSpace>,
+    /// This isolate's property-name interner: the single authority for what
+    /// name a given [`property_atom::AtomId`] means. Chunk atom tables resolve
+    /// their string constants through it at link time, hidden-class transitions
+    /// intern runtime-built names through it, and every hot name comparison in
+    /// the object model is then a `u32` compare. Shared with `shape_runtime`,
+    /// which stores an atom on each shape node it creates.
+    names: std::sync::Arc<property_atom::NameInterner>,
     /// The most recent top-level [`ExecutionContext`] this interpreter ran.
     /// Every chunk links into the shared [`code_space`], so this context
     /// resolves function ids for any closure reachable in the realm — it is the

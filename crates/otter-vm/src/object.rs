@@ -4847,7 +4847,7 @@ mod tests {
     fn runtime_store_transition_invalidates_shape() {
         let mut interp = crate::Interpreter::new();
         let key = AtomizedPropertyKey::new(
-            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
         );
         let first = interp
@@ -4993,7 +4993,7 @@ mod tests {
         set(&mut o, &mut heap, "x", Value::boolean(true));
         let shape = shape_id(o, &heap);
         let key = AtomizedPropertyKey::new(
-            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
         );
 
@@ -5023,7 +5023,7 @@ mod tests {
         let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(&mut o, &mut heap, "x", Value::boolean(true));
         let key = AtomizedPropertyKey::new(
-            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
         );
         let hit = lookup_own_atom(o, &heap, key).hit.expect("atom hit");
@@ -5043,7 +5043,7 @@ mod tests {
         let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(&mut o, &mut heap, "x", Value::boolean(true));
         let key = AtomizedPropertyKey::new(
-            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
         );
         let hit = lookup_own_atom(o, &heap, key).hit.expect("atom hit");
@@ -5085,7 +5085,7 @@ mod tests {
         let first = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(first, &mut heap, Some(proto));
         let key = AtomizedPropertyKey::new(
-            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
         );
         let transition =
@@ -5119,7 +5119,7 @@ mod tests {
         let first = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(first, &mut heap, Some(proto));
         let key = AtomizedPropertyKey::new(
-            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
         );
         let transition =
@@ -5155,7 +5155,7 @@ mod tests {
         let first = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(first, &mut heap, Some(proto));
         let key = AtomizedPropertyKey::new(
-            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
         );
         let transition =
@@ -5187,7 +5187,7 @@ mod tests {
         let first = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(first, &mut heap, Some(proto));
         let key = AtomizedPropertyKey::new(
-            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
         );
         let transition =
@@ -5217,7 +5217,7 @@ mod tests {
         let first = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(first, &mut heap, Some(proto));
         let key = AtomizedPropertyKey::new(
-            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
         );
         let transition =
@@ -5252,7 +5252,7 @@ mod tests {
         let receiver = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(receiver, &mut heap, Some(proto));
         let key = AtomizedPropertyKey::new(
-            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
         );
 

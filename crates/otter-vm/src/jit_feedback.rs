@@ -1062,7 +1062,7 @@ mod tests {
         let mut heap = otter_gc::GcHeap::new().expect("heap");
         let mut obj = object::alloc_object_old_for_fixture(&mut heap).expect("object");
         object::set(&mut obj, &mut heap, "x", Value::number_i32(1));
-        let key = AtomizedPropertyKey::new(PropertyAtom::new(AtomId::from_constant_index(1)), "x");
+        let key = AtomizedPropertyKey::new(PropertyAtom::new(AtomId::from_global(1)), "x");
         let (stub, _) = CacheStub::install_load(obj, &heap, key).expect("load stub");
         let mut entry = PropertyIcEntry::Empty;
         entry.install(stub);

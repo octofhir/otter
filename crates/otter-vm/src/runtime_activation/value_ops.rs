@@ -26,6 +26,7 @@ impl RuntimeCall<'_> {
             args.push(self.read(register)?);
         }
         let function_id = self.function_id();
+        let call_pc = self.pc();
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = unsafe { self.context.as_ref() };
@@ -33,6 +34,7 @@ impl RuntimeCall<'_> {
             context,
             stack,
             function_id,
+            call_pc,
             receiver,
             name_index,
             args,

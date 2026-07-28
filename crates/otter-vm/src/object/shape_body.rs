@@ -28,6 +28,7 @@
 use otter_gc::GcHeap;
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
+use std::cell::Cell;
 
 use crate::string::{JsStringHandle, eq_str};
 
@@ -66,6 +67,27 @@ pub struct ShapeBody {
     /// `true` when the slot added by this transition is an accessor rather
     /// than a data property. Meaningless for the root.
     own_is_accessor: bool,
+    /// Two-way memo of the latest own-offset queries answered with this shape
+    /// as the chain head. An entry is keyed by the query string's address and
+    /// length: callers opting in guarantee the string lives in isolate-pinned
+    /// storage (the per-chunk atom tables), so pointer identity is string
+    /// identity for exactly the queries that repeat. The answer is pure — a
+    /// shape's own-key set never changes — so the memo never invalidates; a
+    /// key outside pinned storage simply never probes or fills it.
+    lookup_memo: [Cell<ShapeLookupMemo>; 2],
+}
+
+/// One memoized own-offset answer. `key_ptr == 0` marks an empty way;
+/// `offset == ShapeLookupMemo::ABSENT` records a proven-absent key.
+#[derive(Debug, Clone, Copy, Default)]
+struct ShapeLookupMemo {
+    key_ptr: usize,
+    key_len: u32,
+    offset: u32,
+}
+
+impl ShapeLookupMemo {
+    const ABSENT: u32 = u32::MAX;
 }
 
 impl ShapeBody {
@@ -79,6 +101,7 @@ impl ShapeBody {
             own_offset: 0,
             own_flags: PropertyFlags::data_default(),
             own_is_accessor: false,
+            lookup_memo: Default::default(),
         }
     }
 
@@ -108,6 +131,7 @@ impl ShapeBody {
             own_offset: parent_property_count,
             own_flags,
             own_is_accessor,
+            lookup_memo: Default::default(),
         }
     }
 
@@ -254,6 +278,49 @@ pub(crate) fn shape_offset_of_key(
 /// using the runtime cache; this helper lets legacy object code read ShapeBody
 /// state without interning or mutating side tables.
 #[must_use]
+/// Own-offset lookup for a key in isolate-pinned storage (a per-chunk atom
+/// table). Probes and fills the head shape's lookup memo, so a repeating
+/// site answers in three compares instead of a per-link string walk. Callers
+/// must not pass strings whose storage can move or be freed — pointer
+/// identity is the memo's key.
+pub(crate) fn shape_offset_of_pinned_str(
+    heap: &GcHeap,
+    shape: ShapeHandle,
+    key: &str,
+) -> Option<u32> {
+    if shape.is_null() {
+        return None;
+    }
+    let key_ptr = key.as_ptr() as usize;
+    let key_len = key.len() as u32;
+    let probed = heap.read_payload(shape, |body| {
+        for way in &body.lookup_memo {
+            let entry = way.get();
+            if entry.key_ptr == key_ptr && entry.key_len == key_len {
+                return Some(if entry.offset == ShapeLookupMemo::ABSENT {
+                    None
+                } else {
+                    Some(entry.offset)
+                });
+            }
+        }
+        None
+    });
+    if let Some(answer) = probed {
+        return answer;
+    }
+    let answer = shape_offset_of_str(heap, shape, key);
+    heap.read_payload(shape, |body| {
+        body.lookup_memo[1].set(body.lookup_memo[0].get());
+        body.lookup_memo[0].set(ShapeLookupMemo {
+            key_ptr,
+            key_len,
+            offset: answer.unwrap_or(ShapeLookupMemo::ABSENT),
+        });
+    });
+    answer
+}
+
 pub(crate) fn shape_offset_of_str(heap: &GcHeap, mut shape: ShapeHandle, key: &str) -> Option<u32> {
     while !shape.is_null() {
         let (parent, transition_key, own_offset) = heap.read_payload(shape, |body| {

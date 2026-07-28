@@ -356,7 +356,7 @@ pub struct AccessorCellBody {
 /// array. `obj` is rooted across the allocation: the cell alloc is a GC
 /// safepoint that can relocate young objects, so the receiver handle is
 /// yielded as a rewriteable root and read back relocated.
-fn alloc_accessor_cell(
+pub(crate) fn alloc_accessor_cell(
     heap: &mut GcHeap,
     obj: &mut JsObject,
     getter: Option<Value>,

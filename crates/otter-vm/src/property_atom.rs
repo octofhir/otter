@@ -174,6 +174,18 @@ impl<'a> AtomizedPropertyKey<'a> {
     }
 }
 
+/// One constant-pool slot as dispatch reads it: the decoded spelling of a
+/// string constant and its global atom id, side by side so resolving a named
+/// property touches one entry rather than two parallel arrays.
+#[derive(Debug)]
+struct AtomSlot {
+    /// Decoded UTF-8 spelling, `None` for non-string constants.
+    text: Option<String>,
+    /// Global atom id, [`AtomId::UNRESOLVED`] until an interpreter resolves
+    /// the chunk against its interner. Non-string slots keep the sentinel.
+    id: AtomicU32,
+}
+
 /// Transient builder for [`AtomTable`].
 ///
 /// The builder may allocate and decode freely while an
@@ -181,7 +193,7 @@ impl<'a> AtomizedPropertyKey<'a> {
 /// only the frozen table.
 #[derive(Debug, Default)]
 pub(crate) struct AtomTableBuilder {
-    decoded_strings: Vec<Option<String>>,
+    slots: Vec<AtomSlot>,
 }
 
 impl AtomTableBuilder {
@@ -189,7 +201,7 @@ impl AtomTableBuilder {
     #[must_use]
     pub(crate) fn from_constants(constants: &[Constant]) -> Self {
         let mut builder = Self {
-            decoded_strings: Vec::with_capacity(constants.len()),
+            slots: Vec::with_capacity(constants.len()),
         };
         for constant in constants {
             builder.push(constant);
@@ -198,26 +210,22 @@ impl AtomTableBuilder {
     }
 
     fn push(&mut self, constant: &Constant) {
-        match constant {
-            Constant::String { utf16 } => self
-                .decoded_strings
-                .push(Some(String::from_utf16_lossy(utf16))),
-            _ => self.decoded_strings.push(None),
-        }
+        let text = match constant {
+            Constant::String { utf16 } => Some(String::from_utf16_lossy(utf16)),
+            _ => None,
+        };
+        self.slots.push(AtomSlot {
+            text,
+            id: AtomicU32::new(AtomId::UNRESOLVED),
+        });
     }
 
     /// Seal the transient buffers into an immutable execution table whose atom
     /// ids are still unresolved.
     #[must_use]
     pub(crate) fn freeze(self) -> AtomTable {
-        let atom_ids = self
-            .decoded_strings
-            .iter()
-            .map(|_| AtomicU32::new(AtomId::UNRESOLVED))
-            .collect();
         AtomTable {
-            decoded_strings: self.decoded_strings.into_boxed_slice(),
-            atom_ids,
+            slots: self.slots.into_boxed_slice(),
         }
     }
 }
@@ -225,11 +233,7 @@ impl AtomTableBuilder {
 /// Frozen atom table published with an [`crate::ExecutionContext`].
 #[derive(Debug)]
 pub(crate) struct AtomTable {
-    decoded_strings: Box<[Option<String>]>,
-    /// Global atom id per constant slot, [`AtomId::UNRESOLVED`] until an
-    /// interpreter resolves the chunk against its interner. Non-string slots
-    /// keep the sentinel forever and are filtered by `decoded_strings`.
-    atom_ids: Box<[AtomicU32]>,
+    slots: Box<[AtomSlot]>,
 }
 
 impl AtomTable {
@@ -246,9 +250,9 @@ impl AtomTable {
     /// That is what makes adopting a foreign code space sound — the adopting
     /// interpreter's ids are the only ones its shapes ever see.
     pub(crate) fn resolve(&self, names: &NameInterner) {
-        for (slot, text) in self.atom_ids.iter().zip(self.decoded_strings.iter()) {
-            if let Some(text) = text {
-                slot.store(names.intern(text).raw(), Ordering::Relaxed);
+        for slot in &self.slots {
+            if let Some(text) = slot.text.as_deref() {
+                slot.id.store(names.intern(text).raw(), Ordering::Relaxed);
             }
         }
     }
@@ -256,17 +260,20 @@ impl AtomTable {
     /// Resolve a string constant as a borrowed UTF-8 string.
     #[must_use]
     pub(crate) fn string_constant_str(&self, idx: u32) -> Option<&str> {
-        self.decoded_strings
-            .get(idx as usize)
-            .and_then(Option::as_deref)
+        self.slots.get(idx as usize)?.text.as_deref()
     }
 
     /// Resolve a string constant as an atomized property key.
     #[must_use]
     pub(crate) fn property_atom(&self, idx: u32) -> Option<AtomizedPropertyKey<'_>> {
-        let text = self.string_constant_str(idx)?;
-        let id = self.atom_ids[idx as usize].load(Ordering::Relaxed);
-        assert_ne!(
+        let slot = self.slots.get(idx as usize)?;
+        let text = slot.text.as_deref()?;
+        let id = slot.id.load(Ordering::Relaxed);
+        // Every named-property dispatch passes here, so the check that the
+        // chunk was linked or adopted is a debug-build invariant. In release
+        // an unresolved id simply matches no shape and no cache entry, which
+        // degrades to the slow path rather than answering wrongly.
+        debug_assert_ne!(
             id,
             AtomId::UNRESOLVED,
             "named-property dispatch reached an atom table no interpreter has linked or adopted",

@@ -1733,6 +1733,27 @@ pub fn is_arguments_object(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
     heap.read_payload(obj, |body| body.is_arguments_object())
 }
 
+/// Snapshot for the apply/spread argv fast path: the current shape and the
+/// arity it encodes, provided the object is an arguments exotic with no
+/// mapped parameter aliases and a live (non-null) shape holding the built
+/// `argc + 2` slots.
+#[must_use]
+pub(crate) fn arguments_direct_snapshot(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+) -> Option<(ShapeHandle, usize)> {
+    heap.read_payload(obj, |body| {
+        if !body.is_arguments_object() || body.host_data_ref().is_some() {
+            return None;
+        }
+        if body.shape.is_null() {
+            return None;
+        }
+        let count = shape_body::shape_property_count(heap, body.shape) as usize;
+        count.checked_sub(2).map(|argc| (body.shape, argc))
+    })
+}
+
 pub(crate) fn install_mapped_arguments(
     obj: JsObject,
     heap: &mut otter_gc::GcHeap,

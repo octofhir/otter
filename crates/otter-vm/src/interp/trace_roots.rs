@@ -182,11 +182,14 @@ impl Interpreter {
         &self.shape_runtime
     }
 
-    /// Borrow cached simple-constructor final shapes for root tracing.
+    /// Borrow cached simple-constructor and arguments final shapes for root
+    /// tracing.
     pub(crate) fn simple_constructor_shapes_for_trace(
         &self,
     ) -> impl Iterator<Item = &object::ShapeHandle> {
-        self.simple_constructor_shape_cache.values()
+        self.simple_constructor_shape_cache
+            .values()
+            .chain(self.arguments_shape_cache.values())
     }
 
     /// Borrow store-property ICs for root tracing of cached GC shape handles.

@@ -31,9 +31,7 @@ use otter_gc::raw::RawGc;
 
 use crate::Value;
 use crate::number::NumberValue;
-use crate::object::{
-    self, JsObject, MappedArgumentEntry, PartialPropertyDescriptor, PropertyDescriptor,
-};
+use crate::object::{self, JsObject, MappedArgumentEntry, PartialPropertyDescriptor};
 use crate::rooting::RootScopeExt;
 use crate::symbol::JsSymbol;
 
@@ -50,6 +48,7 @@ pub(crate) fn initialize_unmapped(
     mut args: SmallVec<[Value; 4]>,
     mut throw_type_error: Value,
     iterator: Option<(JsSymbol, Value)>,
+    shape: crate::object::ShapeHandle,
 ) -> JsObject {
     let (iterator_symbol, mut iterator_method) = match iterator {
         Some((symbol, method)) => (Some(symbol), method),
@@ -65,26 +64,22 @@ pub(crate) fn initialize_unmapped(
     }
 
     object::mark_as_arguments_object(obj, heap);
-    let mut key_buffer = itoa::Buffer::new();
-    for index in 0..args.len() {
-        let key = key_buffer.format(index);
-        let descriptor = PropertyDescriptor::data(args[index], true, true, true);
-        object::define_own_property(obj, heap, &key, descriptor);
-    }
-
-    let length = Value::number(NumberValue::from_i32(args.len() as i32));
-    object::define_own_property(
-        obj,
+    // The shape already names every slot: indices, then `length`, then the
+    // `callee` accessor. One shape install plus a flat slab fill replaces a
+    // dictionary insert per key.
+    let callee_cell = object::alloc_accessor_cell(
         heap,
-        "length",
-        PropertyDescriptor::data(length, true, false, true),
-    );
-    object::define_own_property(
-        obj,
-        heap,
-        "callee",
-        PropertyDescriptor::accessor(Some(throw_type_error), Some(throw_type_error), false, false),
-    );
+        &mut obj,
+        Some(throw_type_error),
+        Some(throw_type_error),
+    )
+    .expect("arguments callee accessor cell allocation");
+    let mut slab: SmallVec<[Value; 8]> = SmallVec::with_capacity(args.len() + 2);
+    slab.extend(args.iter().copied());
+    slab.push(Value::number(NumberValue::from_i32(args.len() as i32)));
+    slab.push(callee_cell);
+    object::set_fresh_object_shape(obj, heap, shape);
+    object::initialize_shaped_data_slots(obj, heap, &slab);
     if let Some(symbol) = iterator_symbol {
         object::define_own_symbol_property_partial(
             obj,
@@ -115,6 +110,7 @@ pub(crate) fn initialize_mapped(
     mut callee: Value,
     mut mapped_entries: Vec<MappedArgumentEntry>,
     iterator: Option<(JsSymbol, Value)>,
+    shape: crate::object::ShapeHandle,
 ) -> JsObject {
     let (iterator_symbol, mut iterator_method) = match iterator {
         Some((symbol, method)) => (Some(symbol), method),
@@ -135,26 +131,15 @@ pub(crate) fn initialize_mapped(
     }
 
     object::mark_as_arguments_object(obj, heap);
-    let mut key_buffer = itoa::Buffer::new();
-    for index in 0..args.len() {
-        let key = key_buffer.format(index);
-        let descriptor = PropertyDescriptor::data(args[index], true, true, true);
-        object::define_own_property(obj, heap, &key, descriptor);
-    }
-
-    let length = Value::number(NumberValue::from_i32(args.len() as i32));
-    object::define_own_property(
-        obj,
-        heap,
-        "length",
-        PropertyDescriptor::data(length, true, false, true),
-    );
-    object::define_own_property(
-        obj,
-        heap,
-        "callee",
-        PropertyDescriptor::data(callee, true, false, true),
-    );
+    // The shape already names every slot: indices, then `length`, then
+    // `callee`. One shape install plus a flat slab fill replaces a dictionary
+    // insert per key.
+    let mut slab: SmallVec<[Value; 8]> = SmallVec::with_capacity(args.len() + 2);
+    slab.extend(args.iter().copied());
+    slab.push(Value::number(NumberValue::from_i32(args.len() as i32)));
+    slab.push(callee);
+    object::set_fresh_object_shape(obj, heap, shape);
+    object::initialize_shaped_data_slots(obj, heap, &slab);
     if let Some(symbol) = iterator_symbol {
         object::define_own_symbol_property_partial(
             obj,

@@ -903,6 +903,9 @@ pub struct Interpreter {
     /// These handles are traced explicitly because a moving GC must rewrite the
     /// cache slot, not only the owning `shape_runtime` transition table.
     simple_constructor_shape_cache: rustc_hash::FxHashMap<u32, object::ShapeHandle>,
+    /// Final hidden class of an arguments object, keyed by argument count and
+    /// mapped-ness. Same tracing contract as the constructor cache above.
+    arguments_shape_cache: rustc_hash::FxHashMap<(u32, bool), object::ShapeHandle>,
     max_stack_depth: u32,
     /// Active synchronous host/interpreter JavaScript re-entry depth. Generated
     /// calls use the immutable effective activation limit computed when their

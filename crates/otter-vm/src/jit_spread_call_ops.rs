@@ -80,6 +80,93 @@ impl Interpreter {
         result
     }
 
+    /// Final hidden class of an `arguments` object: index keys, `length`,
+    /// and `callee`, built through the ordinary transition table so every
+    /// arguments object of one arity shares a shape and stays IC-cacheable.
+    /// Uncached above the arity cap, but still shaped — the transition chain
+    /// itself is interned by the shape runtime.
+    fn arguments_object_shape(
+        &mut self,
+        stack: &ActivationStack,
+        argc: usize,
+        mapped: bool,
+    ) -> Result<crate::object::ShapeHandle, VmError> {
+        const CACHED_ARGC_MAX: usize = 64;
+        let key = (argc as u32, mapped);
+        if argc <= CACHED_ARGC_MAX
+            && let Some(shape) = self.arguments_shape_cache.get(&key)
+        {
+            return Ok(*shape);
+        }
+        let mut shape = self.shape_root();
+        let roots = self.collect_allocation_roots(stack);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+        };
+        let mut key_buffer = itoa::Buffer::new();
+        let hidden = crate::object::PropertyFlags::new(true, false, true);
+        for index in 0..argc {
+            let name = key_buffer.format(index);
+            shape = if let Some(child) = self.shape_runtime.child_if_cached(
+                &self.gc_heap,
+                shape,
+                name,
+                crate::object::PropertyFlags::data_default(),
+                false,
+            ) {
+                child
+            } else {
+                self.shape_runtime
+                    .child_with_roots(
+                        &mut self.gc_heap,
+                        shape,
+                        name,
+                        crate::object::PropertyFlags::data_default(),
+                        false,
+                        &mut external_visit,
+                    )
+                    .map_err(VmError::from)?
+            };
+        }
+        let tail: [(&str, crate::object::PropertyFlags, bool); 2] = [
+            ("length", hidden, false),
+            if mapped {
+                ("callee", hidden, false)
+            } else {
+                (
+                    "callee",
+                    crate::object::PropertyFlags::new(false, false, false),
+                    true,
+                )
+            },
+        ];
+        for (name, flags, is_accessor) in tail {
+            shape = if let Some(child) =
+                self.shape_runtime
+                    .child_if_cached(&self.gc_heap, shape, name, flags, is_accessor)
+            {
+                child
+            } else {
+                self.shape_runtime
+                    .child_with_roots(
+                        &mut self.gc_heap,
+                        shape,
+                        name,
+                        flags,
+                        is_accessor,
+                        &mut external_visit,
+                    )
+                    .map_err(VmError::from)?
+            };
+        }
+        if argc <= CACHED_ARGC_MAX {
+            self.arguments_shape_cache.insert(key, shape);
+        }
+        Ok(shape)
+    }
+
     /// §10.4.4 Arguments exotic object construction shared by interpreter and
     /// compiled dispatch.
     pub(crate) fn run_collect_arguments_reg(
@@ -172,6 +259,7 @@ impl Interpreter {
             let iterator_anchor =
                 interp.push_iteration_anchor(iterator_method.unwrap_or(Value::undefined())) - 1;
             let obj = if kind == ArgumentsObjectKind::Mapped {
+                let shape = interp.arguments_object_shape(stack, elements_len, true)?;
                 let callee = interp.iteration_anchor(callee_anchor);
                 let iterator_root = interp.iteration_anchor(iterator_anchor);
                 let elements: SmallVec<[Value; 4]> = (elements_start
@@ -194,8 +282,10 @@ impl Interpreter {
                     callee,
                     mapped_entries,
                     iterator_descriptor,
+                    shape,
                 )
             } else {
+                let shape = interp.arguments_object_shape(stack, elements_len, false)?;
                 let thrower = interp.restricted_throw_type_error()?;
                 let iterator_root = interp.iteration_anchor(iterator_anchor);
                 let elements: SmallVec<[Value; 4]> = (elements_start
@@ -217,6 +307,7 @@ impl Interpreter {
                     elements,
                     thrower,
                     iterator_descriptor,
+                    shape,
                 )
             };
             let frame = &mut stack[frame_index];

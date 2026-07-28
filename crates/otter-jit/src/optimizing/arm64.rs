@@ -94,10 +94,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_bytecode::{Op, Operand};
-use otter_vm::deopt::{DeoptExitId, DeoptFrame, DeoptLocation, DeoptRepr, DeoptTable};
+use otter_vm::deopt::{DeoptChainCall, DeoptExitDescriptor, DeoptExitId, DeoptRuntime, DeoptTable};
 use otter_vm::native_abi::{
     FrameMap, NO_FRAME_STATE, RuntimeStubDescriptor, STUB_JIT_BACKEDGE_POLL, STUB_JIT_CONSTRUCT,
-    STUB_JIT_DEOPT_REIFY_FRAME, STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_LOAD_ELEMENT,
+    STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_LOAD_ELEMENT,
     STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROPERTY, STUB_JIT_LOAD_STRING, STUB_JIT_LOAD_UPVALUE,
     STUB_JIT_LOOSE_EQ, STUB_JIT_SPREAD_CALL_OP, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY,
     STUB_JIT_STORE_UPVALUE, STUB_JIT_STORE_UPVALUE_CHECKED, STUB_JIT_WRITE_BARRIER, SafepointId,
@@ -287,8 +287,8 @@ struct EmissionPlan<'a> {
     construct_entry: ResolvedRuntimeEntry,
     /// Completes a method-call guard miss through canonical `GetMethod + Call`.
     method_call_entry: ResolvedRuntimeEntry,
-    /// Rebuilds a spliced callee's interpreter frame at a deopt exit.
-    reify_frame_entry: ResolvedRuntimeEntry,
+    /// Rebuilds every owed interpreter frame from deopt metadata at an exit.
+    deopt_writeback_entry: ResolvedRuntimeEntry,
     /// Refills the back-edge budget and reports raised interrupts.
     poll_entry: ResolvedRuntimeEntry,
     /// Resumes an already-entered generated stack callee after native bailout.
@@ -387,6 +387,13 @@ pub(super) fn compile_with_artifacts(
         .count();
     let mut store_ic_cells =
         vec![crate::entry::WhiskerIcCell::default(); store_property_sites].into_boxed_slice();
+    // The allocation's address is baked into the shared deopt handler, so it
+    // exists before emission and lives exactly as long as the code.
+    let mut deopt_runtime = Box::new(DeoptRuntime {
+        table: unit.deopt.table().clone(),
+        exits: Box::default(),
+        gpr_budget: u16::from(REGISTER_BUDGET.gpr),
+    });
     let mut emission = emit(
         view,
         &unit.cfg,
@@ -394,6 +401,7 @@ pub(super) fn compile_with_artifacts(
         &unit.ssa,
         &mut load_ic_cells,
         &mut store_ic_cells,
+        &mut deopt_runtime,
         EmissionPlan {
             reprs: &unit.reprs,
             allocation: &unit.allocation,
@@ -437,9 +445,9 @@ pub(super) fn compile_with_artifacts(
                 STUB_JIT_SPREAD_CALL_OP,
                 transitions.variadic_entry(STUB_JIT_SPREAD_CALL_OP),
             ),
-            reify_frame_entry: ResolvedRuntimeEntry::new(
-                STUB_JIT_DEOPT_REIFY_FRAME,
-                transitions.variadic_entry(STUB_JIT_DEOPT_REIFY_FRAME),
+            deopt_writeback_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_DEOPT_WRITEBACK,
+                transitions.variadic_entry(STUB_JIT_DEOPT_WRITEBACK),
             ),
             poll_entry: ResolvedRuntimeEntry::new(
                 STUB_JIT_BACKEDGE_POLL,
@@ -527,7 +535,7 @@ pub(super) fn compile_with_artifacts(
     let code = OptimizedCode::new(
         emission.code,
         None,
-        unit.deopt.table().clone(),
+        deopt_runtime,
         safepoint_records,
         frame_maps,
         eligibility.element_transitions.bitmap_words,
@@ -730,6 +738,7 @@ fn emit(
     ssa: &SsaFunction,
     load_ic_cells: &mut [WhiskerIcCell],
     store_ic_cells: &mut [WhiskerIcCell],
+    deopt_runtime: &mut DeoptRuntime,
     plan: EmissionPlan<'_>,
     capture_artifacts: bool,
     capture_events: bool,
@@ -751,7 +760,7 @@ fn emit(
         loose_eq_entry,
         construct_entry,
         method_call_entry,
-        reify_frame_entry,
+        deopt_writeback_entry,
         poll_entry,
         deopt_stack_call_entry,
         resolve_direct_entry,
@@ -3680,40 +3689,18 @@ fn emit(
         ));
     }
 
+    // A deopt exit site is an index and a branch. One shared handler dumps
+    // the allocatable registers and calls the writeback stub, which walks the
+    // code object's deopt metadata; interpreter-state reconstruction is data,
+    // never per-exit code.
+    let shared_deopt = ops.new_dynamic_label();
+    let mut exit_descriptors = Vec::with_capacity(deopt_exits.len());
     for (label, exit, resume_pc) in deopt_exits {
         let deopt_start = ops.offset().0;
-        dynasm!(ops ; .arch aarch64 ; =>label);
         let frame_state = deopt_table.lookup(exit).ok_or(Unsupported::OperandShape(
             "optimizing deopt exit missing frame state",
         ))?;
-        // The compiled function's own frame is always rebuilt first, in the
-        // window it already runs on.
-        emit_deopt_writeback(&mut ops, allocation, frame_state.outermost(), 19)?;
-        if frame_state.is_single_frame() {
-            emit_load_u32(&mut ops, 9, resume_pc);
-            dynasm!(ops
-                ; .arch aarch64
-                ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-                ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
-                ; mov x0, xzr
-                ; movz x1, STATUS_BAILED as u32
-            );
-            emit_epilogue(&mut ops, spill_frame_bytes);
-            if let Some(code_map) = code_map.as_mut() {
-                code_map.record(CodeRegion::deopt(
-                    deopt_start,
-                    ops.offset().0,
-                    exit.0,
-                    resume_pc,
-                ));
-            }
-            continue;
-        }
-
-        // The exit was inside a spliced callee, so the interpreter is owed that
-        // callee's frame too. Reify rewinds the just-restored caller to its call
-        // and lets the interpreter's own call path build the frame — which also
-        // leaves the caller advanced past the call, so no PC is stamped here.
+        let mut chain = Vec::with_capacity(frame_state.frames.len().saturating_sub(1));
         for (depth, frame) in frame_state.frames.iter().enumerate().skip(1) {
             // The reify stub speaks logical PCs — a frame's `pc` is a canonical
             // instruction index — while the chain records byte PCs. The caller
@@ -3725,24 +3712,23 @@ fn emit(
                     "optimizing chain caller resumes at its entry",
                 ))?;
             let callee_pc = logical_pc(tree, frame.function_id, frame.byte_pc)?;
-            dynasm!(ops ; .arch aarch64 ; mov x0, x20);
-            emit_load_u64(&mut ops, 1, u64::from(call_pc));
-            emit_load_u64(&mut ops, 2, u64::from(callee_pc));
-            emit_runtime_entry(&mut ops, &mut relocations, 16, reify_frame_entry);
-            dynasm!(ops
-                ; .arch aarch64
-                ; blr x16
-                ; cbz x0, =>threw
-                ; mov x13, x0
-            );
-            emit_deopt_writeback(&mut ops, allocation, frame, 13)?;
+            chain.push(DeoptChainCall { call_pc, callee_pc });
         }
+        let index = u32::try_from(exit_descriptors.len())
+            .ok()
+            .filter(|&index| index <= u32::from(u16::MAX))
+            .ok_or(Unsupported::OperandShape("optimizing deopt exit count"))?;
+        exit_descriptors.push(DeoptExitDescriptor {
+            state: exit,
+            resume_pc,
+            chain: chain.into_boxed_slice(),
+        });
         dynasm!(ops
             ; .arch aarch64
-            ; mov x0, xzr
-            ; movz x1, STATUS_BAILED as u32
+            ; =>label
+            ; movz w17, index
+            ; b =>shared_deopt
         );
-        emit_epilogue(&mut ops, spill_frame_bytes);
         if let Some(code_map) = code_map.as_mut() {
             code_map.record(CodeRegion::deopt(
                 deopt_start,
@@ -3751,6 +3737,55 @@ fn emit(
                 resume_pc,
             ));
         }
+    }
+    deopt_runtime.exits = exit_descriptors.into_boxed_slice();
+
+    let handler_start = ops.offset().0;
+    // Dump layout the stub indexes: ascending addresses hold x21..x28 then
+    // d8..d15, matching allocation register-id order.
+    dynasm!(ops
+        ; .arch aarch64
+        ; =>shared_deopt
+        ; stp d14, d15, [sp, #-16]!
+        ; stp d12, d13, [sp, #-16]!
+        ; stp d10, d11, [sp, #-16]!
+        ; stp d8, d9, [sp, #-16]!
+        ; stp x27, x28, [sp, #-16]!
+        ; stp x25, x26, [sp, #-16]!
+        ; stp x23, x24, [sp, #-16]!
+        ; stp x21, x22, [sp, #-16]!
+        ; mov x0, x20
+        ; mov w1, w17
+    );
+    emit_load_symbolic_u64(
+        &mut ops,
+        &mut relocations,
+        2,
+        std::ptr::from_ref::<DeoptRuntime>(deopt_runtime) as u64,
+        RelocationTarget::DeoptRuntimeData,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; add x3, sp, #0
+        ; add x4, sp, #128
+        ; mov x5, x19
+    );
+    emit_runtime_entry(&mut ops, &mut relocations, 16, deopt_writeback_entry);
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; add sp, sp, #128
+        ; cbz x0, =>threw
+        ; mov x0, xzr
+        ; movz x1, STATUS_BAILED as u32
+    );
+    emit_epilogue(&mut ops, spill_frame_bytes);
+    if let Some(code_map) = code_map.as_mut() {
+        code_map.record(CodeRegion::structural(
+            "deoptSharedHandler",
+            handler_start,
+            ops.offset().0,
+        ));
     }
 
     let buffer = ops

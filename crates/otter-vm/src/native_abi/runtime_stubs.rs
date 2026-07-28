@@ -1099,19 +1099,18 @@ pub const STUB_JIT_RESOLVE_THREW: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
 );
 
-/// Rebuild the interpreter frame of an inlined callee at a deopt exit.
+/// Rebuild every interpreter frame a deopt exit owes, from deopt metadata.
 ///
-/// Optimized code that splices a callee body owes the interpreter that callee's
-/// frame when it exits inside it. Rather than reproduce the call's frame setup
-/// — upvalue spine, `this`, argument binding — the stub rewinds the already
-/// written-back caller to its call and lets the interpreter's own call path
-/// build the frame, so the result is exactly the frame a real call would have
-/// produced. The emitted code then fast-forwards that frame's registers and PC
-/// to where the optimized code actually was.
+/// A generated exit site passes its site index; the shared handler dumps the
+/// allocatable machine registers and calls this with the code object's baked
+/// [`crate::deopt::DeoptRuntime`], the dump, the frame's stack pointer and its
+/// register window. The stub reconstitutes every slot of every owed frame —
+/// reifying inlined callee frames through the ordinary call path — so exit
+/// sites carry no reconstruction code at all.
 ///
-/// Returns the new frame's register-window pointer, or `0` when the call path
-/// raised (a stack overflow the interpreter would also have raised).
-pub const STUB_JIT_DEOPT_REIFY_FRAME: RuntimeStubDescriptor = descriptor(
+/// Returns 1 on success and 0 when a reification raised (error parked for the
+/// throw epilogue).
+pub const STUB_JIT_DEOPT_WRITEBACK: RuntimeStubDescriptor = descriptor(
     65,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
@@ -1448,7 +1447,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_CLASS_VALUE_OP,
     STUB_JIT_MODULE_OP,
     STUB_JIT_RESOLVE_THREW,
-    STUB_JIT_DEOPT_REIFY_FRAME,
+    STUB_JIT_DEOPT_WRITEBACK,
     STUB_JIT_DEOPT_STACK_CALL,
     STUB_JIT_RESOLVE_DIRECT_ENTRY,
     STUB_STRING_CHAR_CODE_AT_LEAF,

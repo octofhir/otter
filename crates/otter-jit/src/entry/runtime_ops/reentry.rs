@@ -103,35 +103,105 @@ fn try_materialize_compiled_error(ctx: &mut JitCtx, err: VmError) -> Result<bool
     Ok(true)
 }
 
-/// Rebuild an inlined callee's interpreter frame at a deopt exit.
+/// Rebuild every interpreter frame a deopt exit owes, from deopt metadata.
 ///
-/// The optimized code has already restored the caller's registers into its
-/// window; this hands the caller back to the interpreter's own ordinary- or
-/// method-call path at `call_pc`, so the frame is rebuilt with canonical
-/// argument and `this` semantics, then fast-forwarded to `callee_pc`.
+/// The generated exit site is an index and a branch; the shared handler dumps
+/// the allocatable registers (GPRs in allocation order, then FP registers) at
+/// `dump`, and this walks the code object's [`DeoptRuntime`] to reconstitute
+/// every slot of every owed frame. Inlined callee frames are reified through
+/// the interpreter's own call path, exactly as the removed per-exit generated
+/// code did; that path must not allocate on the GC heap, since chain values
+/// still waiting in the dump are not traced.
 ///
-/// Returns the new frame's register-window base, or `0` when the call path
-/// raised — a stack overflow the interpreter would have raised at this same
-/// call — with the error parked for the throw epilogue.
-pub(crate) extern "C" fn jit_deopt_reify_frame_stub(
+/// Returns 1 on success, 0 when a reification raised (error parked for the
+/// throw epilogue).
+pub(crate) extern "C" fn jit_deopt_writeback_stub(
     ctx: *mut JitCtx,
-    call_pc: u64,
-    callee_pc: u64,
+    exit_index: u64,
+    deopt_runtime: *const otter_vm::deopt::DeoptRuntime,
+    dump: *const u64,
+    frame_sp: u64,
+    window: u64,
 ) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
+    use otter_vm::deopt::{DeoptFrame, DeoptLocation, DeoptRuntime};
+
+    // SAFETY: the live `JitCtx` reentry contract; the deopt-runtime allocation
+    // lives exactly as long as the code that baked its address.
     let ctx = unsafe { &mut *ctx };
+    let runtime: &DeoptRuntime = unsafe { &*deopt_runtime };
+    let Some(exit) = runtime.exits.get(exit_index as usize) else {
+        park_jit_error(ctx, VmError::InvalidOperand);
+        return 0;
+    };
+    let Some(state) = runtime.table.lookup(exit.state) else {
+        park_jit_error(ctx, VmError::InvalidOperand);
+        return 0;
+    };
+
+    let slot_raw = |location: DeoptLocation| -> u64 {
+        match location {
+            DeoptLocation::Register(register) => {
+                let index = if register < runtime.gpr_budget {
+                    usize::from(register)
+                } else {
+                    usize::from(runtime.gpr_budget) + usize::from(register - runtime.gpr_budget)
+                };
+                // SAFETY: the handler dumps every allocatable register in this
+                // exact order before calling in.
+                unsafe { *dump.add(index) }
+            }
+            DeoptLocation::StackSlot(offset) => {
+                let address = frame_sp.wrapping_add(offset as i64 as u64);
+                // SAFETY: the verified deopt table bounds every stack-slot
+                // offset inside the live spill frame.
+                unsafe { *(address as *const u64) }
+            }
+            DeoptLocation::Literal(raw) => raw,
+        }
+    };
+    let write_frame = |frame: &DeoptFrame, window: *mut otter_vm::Value| {
+        for (register, slot) in frame.slots.iter().enumerate() {
+            let value = slot.repr.reconstitute(slot_raw(slot.location));
+            // SAFETY: the window spans exactly the frame's declared registers
+            // and stays rooted for the writeback.
+            unsafe {
+                window.add(register).write(value);
+            }
+        }
+    };
+
+    write_frame(state.outermost(), window as *mut otter_vm::Value);
+
+    if exit.chain.is_empty() {
+        // SAFETY: runtime-capable JIT contexts publish this native frame for
+        // the full compiled entry dynamic extent.
+        let Some(native_frame) = (unsafe { ctx.native_frame.as_mut() }) else {
+            park_jit_error(ctx, VmError::InvalidOperand);
+            return 0;
+        };
+        native_frame.header.pc = exit.resume_pc;
+        return 1;
+    }
+
+    // SAFETY: the live `JitCtx` reentry contract.
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
     let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let context = unsafe { &*ctx.activation().context_ptr() };
-    match unsafe {
-        vm.jit_deopt_reify_inlined_frame(context, stack, call_pc as u32, callee_pc as u32)
-    } {
-        Ok(registers) => registers as u64,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            0
-        }
+    for (step, frame) in exit.chain.iter().zip(state.frames.iter().skip(1)) {
+        // SAFETY: caller frames below this one are already written back, so
+        // the interpreter's call path sees exactly the frame a real call has.
+        let callee_window = match unsafe {
+            vm.jit_deopt_reify_inlined_frame(context, stack, step.call_pc, step.callee_pc)
+        } {
+            Ok(registers) => registers,
+            Err(err) => {
+                park_jit_error(ctx, err);
+                return 0;
+            }
+        };
+        write_frame(frame, callee_window);
     }
+    1
 }
 
 /// Shared throw-epilogue resolver.

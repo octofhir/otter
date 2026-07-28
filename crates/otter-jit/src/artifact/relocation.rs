@@ -50,6 +50,7 @@ const TARGET_GUARDED_BUILTIN_FUNCTION: u8 = 7;
 const TARGET_DIRECT_CALL_ENTRY_CELL: u8 = 8;
 const TARGET_NATIVE_LEAF_BUILTIN_FUNCTION: u8 = 9;
 const TARGET_GLOBAL_LEXICAL_CELL: u8 = 10;
+const TARGET_DEOPT_RUNTIME_DATA: u8 = 11;
 
 /// Whether a property inline-cache cell serves a load or a store site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -102,6 +103,10 @@ pub(crate) enum RelocationTarget {
         signature: &'static str,
     },
     GcCageBase,
+    /// The code object's [`otter_vm::deopt::DeoptRuntime`] allocation, read by
+    /// the shared deopt handler. The process address is deliberately absent;
+    /// the code object owns exactly one.
+    DeoptRuntimeData,
     /// Permanent global-declarative cell read by one `LoadGlobalOrThrow`.
     GlobalLexicalCell {
         byte_pc: u32,
@@ -982,6 +987,7 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             put_text(output, "runtimeStub.signature", signature)?;
         }
         RelocationTarget::GcCageBase => output.push(TARGET_GC_CAGE_BASE),
+        RelocationTarget::DeoptRuntimeData => output.push(TARGET_DEOPT_RUNTIME_DATA),
         RelocationTarget::GlobalLexicalCell { byte_pc } => {
             output.push(TARGET_GLOBAL_LEXICAL_CELL);
             put_u32(output, *byte_pc);

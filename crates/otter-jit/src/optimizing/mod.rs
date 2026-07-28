@@ -98,7 +98,9 @@ pub struct OptimizedCode {
     /// Exact persistent native-stack reservation for generated entry, or
     /// `None` when this backend has not proven stack-owned cold deoptimization.
     generated_stack_frame_bytes: Option<u32>,
-    deopt_table: DeoptTable,
+    /// Deopt metadata whose address is baked into the shared exit handler; the
+    /// allocation must live exactly as long as the code.
+    deopt: Box<otter_vm::deopt::DeoptRuntime>,
     safepoint_records: Box<[SafepointRecord]>,
     frame_maps: Box<[FrameMap]>,
     frame_map_bitmap_words: Box<[u64]>,
@@ -121,7 +123,7 @@ impl OptimizedCode {
     pub(super) fn new(
         code: CompiledCode,
         generated_stack_frame_bytes: Option<u32>,
-        deopt_table: DeoptTable,
+        deopt: Box<otter_vm::deopt::DeoptRuntime>,
         safepoint_records: Box<[SafepointRecord]>,
         frame_maps: Box<[FrameMap]>,
         frame_map_bitmap_words: Box<[u64]>,
@@ -144,7 +146,7 @@ impl OptimizedCode {
         Self {
             code,
             generated_stack_frame_bytes,
-            deopt_table,
+            deopt,
             safepoint_records,
             frame_maps,
             frame_map_bitmap_words,
@@ -166,7 +168,7 @@ impl OptimizedCode {
     /// Borrow the verified exact-byte-PC deoptimization table.
     #[must_use]
     pub fn deopt_table(&self) -> &DeoptTable {
-        &self.deopt_table
+        &self.deopt.table
     }
 
     /// Return deterministic allocation and source identity metadata.
@@ -204,7 +206,7 @@ impl std::fmt::Debug for OptimizedCode {
                 "generated_stack_frame_bytes",
                 &self.generated_stack_frame_bytes,
             )
-            .field("deopt_points", &self.deopt_table.len())
+            .field("deopt_points", &self.deopt.table.len())
             .field("safepoints", &self.safepoint_records.len())
             .field("frame_maps", &self.frame_maps.len())
             .field("osr_entries", &self.osr_entries.len())

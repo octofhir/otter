@@ -181,6 +181,12 @@ impl ExecutionContext {
         self.module.main()
     }
 
+    /// Shared executable chunk this context runs, for identity comparisons.
+    #[must_use]
+    pub(crate) fn executable_module(&self) -> &Arc<ExecutableModule> {
+        &self.executable
+    }
+
     /// Entry executable function for a script/module turn.
     #[must_use]
     pub(crate) fn exec_main(&self) -> &CodeBlock {

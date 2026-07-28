@@ -45,10 +45,26 @@ pub(crate) struct FeedbackDirectory {
     has_ics: Vec<ExecutablePropertyIc>,
     method_ics: Vec<Option<MethodCallIc>>,
     property_stats: PropertyIcStats,
+    /// Chunks whose slot addresses are already installed. A chunk's sites are
+    /// immutable once linked, so installation happens once per chunk, not once
+    /// per dispatch entry. Held weakly: the allocation behind a `Weak` is
+    /// never reused while the `Weak` lives, so pointer identity cannot alias a
+    /// later chunk.
+    installed_chunks: Vec<std::sync::Weak<crate::executable::ExecutableModule>>,
 }
 
 impl FeedbackDirectory {
     fn install_context(&mut self, context: &ExecutionContext) {
+        let executable = context.executable_module();
+        if self
+            .installed_chunks
+            .iter()
+            .any(|chunk| std::ptr::eq(chunk.as_ptr(), std::sync::Arc::as_ptr(executable)))
+        {
+            return;
+        }
+        self.installed_chunks
+            .push(std::sync::Arc::downgrade(executable));
         let site_count = context.property_ic_site_end();
         if self.slots.len() < site_count {
             self.slots.resize_with(site_count, || None);

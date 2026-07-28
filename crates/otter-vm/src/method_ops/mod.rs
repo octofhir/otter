@@ -458,9 +458,13 @@ impl Interpreter {
             write_register(&mut stack[top_idx], dst, value)?;
             return Ok(());
         }
-        let name = context
-            .string_constant_str_for_function(stack[top_idx].function_id, name_idx)
+        // One atomized key for the whole slow path: the builtin arms read its
+        // spelling, and every `[[Get]]` fallback below carries the atom so the
+        // shape walk compares ids instead of string content.
+        let method_key = context
+            .property_atom_for_function(stack[top_idx].function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
+        let name = method_key.name();
         if let Some(result) = self.try_fast_array_proto_method(
             stack,
             context,
@@ -496,7 +500,7 @@ impl Interpreter {
         let recv_value = *read_register(&stack[top_idx], recv_reg)?;
         if recv_value.is_set() && bootstrap_collections::is_set_method_name(name) {
             let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
+                .get_method_value_for_call(context, stack, recv_value, method_key)?
                 .unwrap_or_else(Value::undefined);
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
@@ -519,7 +523,7 @@ impl Interpreter {
             && iterator_dispatch_method_name(name)
         {
             let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
+                .get_method_value_for_call(context, stack, recv_value, method_key)?
                 .unwrap_or_else(Value::undefined);
             let route_to_invoke = if generator_resumption {
                 method.as_native_function().is_none() && self.is_callable_runtime(&method)
@@ -703,7 +707,7 @@ impl Interpreter {
         // §7.3.11 GetMethod + §7.3.14 Call.
         if recv_value.is_array() {
             let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
+                .get_method_value_for_call(context, stack, recv_value, method_key)?
                 .unwrap_or_else(Value::undefined);
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
@@ -789,7 +793,7 @@ impl Interpreter {
                 }
             }
             let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
+                .get_method_value_for_call(context, stack, recv_value, method_key)?
                 .unwrap_or_else(Value::undefined);
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
@@ -811,7 +815,7 @@ impl Interpreter {
         // §7.3.11 GetMethod + §7.3.14 Call.
         if recv_value.is_typed_array() {
             let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
+                .get_method_value_for_call(context, stack, recv_value, method_key)?
                 .unwrap_or_else(Value::undefined);
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
@@ -844,7 +848,7 @@ impl Interpreter {
         {
             if recv_value.as_object().is_some() {
                 let method = self
-                    .get_method_value_for_call(context, stack, recv_value, name)?
+                    .get_method_value_for_call(context, stack, recv_value, method_key)?
                     .unwrap_or_else(Value::undefined);
                 if method.as_native_function().is_none() {
                     if !self.is_callable_runtime(&method) {
@@ -934,7 +938,7 @@ impl Interpreter {
             let is_function_intrinsic = function_prototype_intrinsic_name(name);
             if is_function_intrinsic || object_prototype_dispatch_method_name(name) {
                 let method = self
-                    .get_method_value_for_call(context, stack, recv_value, name)?
+                    .get_method_value_for_call(context, stack, recv_value, method_key)?
                     .unwrap_or_else(Value::undefined);
                 if !self.is_callable_runtime(&method) {
                     return Err(VmError::NotCallable);
@@ -969,7 +973,7 @@ impl Interpreter {
         });
         if fn_id_for_proto.is_some() && object_prototype_dispatch_method_name(name) {
             let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
+                .get_method_value_for_call(context, stack, recv_value, method_key)?
                 .unwrap_or_else(Value::undefined);
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
@@ -1010,7 +1014,7 @@ impl Interpreter {
                 || recv_value.is_big_int())
         {
             let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
+                .get_method_value_for_call(context, stack, recv_value, method_key)?
                 .unwrap_or_else(Value::undefined);
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
@@ -1025,7 +1029,7 @@ impl Interpreter {
             && self.callable_has_own_function_method_shadow(context, recv_value, name)?
         {
             let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
+                .get_method_value_for_call(context, stack, recv_value, method_key)?
                 .unwrap_or_else(Value::undefined);
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
@@ -1054,7 +1058,9 @@ impl Interpreter {
         // scavenge then relocates the receiver, leaving the cached `recv_value`
         // pointing at a moved-from object whose prototype walk misses the method.
         let recv_value = *read_register(&stack[top_idx], recv_reg)?;
-        if let Some(method) = self.get_method_value_for_call(context, stack, recv_value, name)? {
+        if let Some(method) =
+            self.get_method_value_for_call(context, stack, recv_value, method_key)?
+        {
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
             }
@@ -1820,8 +1826,9 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         recv_value: Value,
-        name: &str,
+        method_key: AtomizedPropertyKey<'_>,
     ) -> Result<Option<Value>, VmError> {
+        let name = method_key.name();
         let is_property_bearing = recv_value.is_object()
             || recv_value.is_proxy()
             || recv_value.is_array()
@@ -1843,7 +1850,7 @@ impl Interpreter {
             // Property-bearing exotic receivers route through
             // `ordinary_get_value` so user-installed own properties
             // shadow the builtin fallback path.
-            let key = VmPropertyKey::String(name);
+            let key = VmPropertyKey::atom(method_key);
             return match self.ordinary_get_value(stack, context, recv_value, recv_value, &key, 0)? {
                 VmGetOutcome::Value(value) => Ok(Some(value)),
                 VmGetOutcome::InvokeGetter { getter } => {
@@ -1861,7 +1868,7 @@ impl Interpreter {
                 // Go through the full `[[Get]]` ladder so accessor
                 // descriptors on static members invoke their getter.
                 let statics = Value::object(c.statics(&self.gc_heap));
-                let key = VmPropertyKey::String(name);
+                let key = VmPropertyKey::atom(method_key);
                 match self.ordinary_get_value(stack, context, statics, statics, &key, 0)? {
                     VmGetOutcome::Value(v) => v,
                     VmGetOutcome::InvokeGetter { getter } => {

@@ -10,10 +10,14 @@
 //! - [`ShapeBody`] — immutable hidden-class layout node.
 //! - [`alloc_root_shape_body_with_roots`] — allocate the empty root shape.
 //! - [`alloc_child_shape_body_with_roots`] — allocate one append transition.
-//! - [`shape_offset_of_str`] / [`shape_keys_ordered`] — parent-chain readers.
+//! - [`shape_offset_of_atom`] / [`shape_offset_of_str`] / [`shape_keys_ordered`]
+//!   — parent-chain readers.
 //!
 //! # Invariants
-//! - `parent == Gc::null()` and `transition_key == Gc::null()` only for root.
+//! - `parent == Gc::null()` and `transition_key == Gc::null()` only for root,
+//!   which is also the only node whose `transition_atom` is [`AtomId::NONE`].
+//! - A node's `transition_atom` is the isolate-global atom of its
+//!   `transition_key`; the two never disagree.
 //! - Non-root `own_offset` is the parent's `property_count`.
 //! - `property_count` is the number of string-keyed own slots represented by
 //!   the full parent chain.
@@ -28,8 +32,8 @@
 use otter_gc::GcHeap;
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
-use std::cell::Cell;
 
+use crate::property_atom::AtomId;
 use crate::string::{JsStringHandle, eq_str};
 
 use super::descriptor::PropertyFlags;
@@ -53,6 +57,10 @@ pub struct ShapeBody {
     parent: ShapeHandle,
     /// Key added by this transition, or `Gc::null()` for root.
     transition_key: JsStringHandle,
+    /// Isolate-global atom of [`Self::transition_key`], or [`AtomId::NONE`]
+    /// for the root. This is the identity every chain walk compares: one
+    /// `u32` per link instead of a string content compare per link.
+    transition_atom: AtomId,
     /// Number of string-keyed slots represented by this shape.
     property_count: u32,
     /// Slot assigned to [`Self::transition_key`]. Zero for root.
@@ -67,27 +75,6 @@ pub struct ShapeBody {
     /// `true` when the slot added by this transition is an accessor rather
     /// than a data property. Meaningless for the root.
     own_is_accessor: bool,
-    /// Two-way memo of the latest own-offset queries answered with this shape
-    /// as the chain head. An entry is keyed by the query string's address and
-    /// length: callers opting in guarantee the string lives in isolate-pinned
-    /// storage (the per-chunk atom tables), so pointer identity is string
-    /// identity for exactly the queries that repeat. The answer is pure — a
-    /// shape's own-key set never changes — so the memo never invalidates; a
-    /// key outside pinned storage simply never probes or fills it.
-    lookup_memo: [Cell<ShapeLookupMemo>; 2],
-}
-
-/// One memoized own-offset answer. `key_ptr == 0` marks an empty way;
-/// `offset == ShapeLookupMemo::ABSENT` records a proven-absent key.
-#[derive(Debug, Clone, Copy, Default)]
-struct ShapeLookupMemo {
-    key_ptr: usize,
-    key_len: u32,
-    offset: u32,
-}
-
-impl ShapeLookupMemo {
-    const ABSENT: u32 = u32::MAX;
 }
 
 impl ShapeBody {
@@ -97,11 +84,11 @@ impl ShapeBody {
             id,
             parent: ShapeHandle::null(),
             transition_key: JsStringHandle::null(),
+            transition_atom: AtomId::NONE,
             property_count: 0,
             own_offset: 0,
             own_flags: PropertyFlags::data_default(),
             own_is_accessor: false,
-            lookup_memo: Default::default(),
         }
     }
 
@@ -109,6 +96,7 @@ impl ShapeBody {
     fn child(
         parent: ShapeHandle,
         key: JsStringHandle,
+        atom: AtomId,
         parent_property_count: u32,
         own_flags: PropertyFlags,
         own_is_accessor: bool,
@@ -123,15 +111,20 @@ impl ShapeBody {
             "misaligned shape key at child creation: key={:?}",
             key
         );
+        debug_assert_ne!(
+            atom,
+            AtomId::NONE,
+            "a non-root shape node names the key it adds",
+        );
         Self {
             id: next_shape_id(),
             parent,
             transition_key: key,
+            transition_atom: atom,
             property_count: parent_property_count + 1,
             own_offset: parent_property_count,
             own_flags,
             own_is_accessor,
-            lookup_memo: Default::default(),
         }
     }
 
@@ -151,6 +144,12 @@ impl ShapeBody {
     #[must_use]
     pub(crate) const fn transition_key(&self) -> JsStringHandle {
         self.transition_key
+    }
+
+    /// Isolate-global atom added by this transition, [`AtomId::NONE`] for root.
+    #[must_use]
+    pub(crate) const fn transition_atom(&self) -> AtomId {
+        self.transition_atom
     }
 
     /// Number of string-keyed own slots represented by this shape.
@@ -220,6 +219,7 @@ pub(crate) fn alloc_child_shape_body_with_roots(
     heap: &mut GcHeap,
     parent: ShapeHandle,
     key: JsStringHandle,
+    atom: AtomId,
     own_flags: PropertyFlags,
     own_is_accessor: bool,
     external_visit: &mut RootSlotVisitor<'_>,
@@ -229,6 +229,7 @@ pub(crate) fn alloc_child_shape_body_with_roots(
         ShapeBody::child(
             parent,
             key,
+            atom,
             parent_property_count,
             own_flags,
             own_is_accessor,
@@ -277,48 +278,28 @@ pub(crate) fn shape_offset_of_key(
 /// mutable [`super::shape_runtime::ShapeRuntime`] borrow. Hot paths should keep
 /// using the runtime cache; this helper lets legacy object code read ShapeBody
 /// state without interning or mutating side tables.
+/// Walk `shape`'s parent chain and return the slot for an interned atom.
+///
+/// This is the lookup the whole named-property path runs: one `u32` compare
+/// per link, no heap string touched, no per-link `eq_str`. The root's
+/// [`AtomId::NONE`] matches no interned name, so the walk needs no root test.
 #[must_use]
-/// Own-offset lookup for a key in isolate-pinned storage (a per-chunk atom
-/// table). Probes and fills the head shape's lookup memo, so a repeating
-/// site answers in three compares instead of a per-link string walk. Callers
-/// must not pass strings whose storage can move or be freed — pointer
-/// identity is the memo's key.
-pub(crate) fn shape_offset_of_pinned_str(
+pub(crate) fn shape_offset_of_atom(
     heap: &GcHeap,
-    shape: ShapeHandle,
-    key: &str,
+    mut shape: ShapeHandle,
+    atom: AtomId,
 ) -> Option<u32> {
-    if shape.is_null() {
-        return None;
-    }
-    let key_ptr = key.as_ptr() as usize;
-    let key_len = key.len() as u32;
-    let probed = heap.read_payload(shape, |body| {
-        for way in &body.lookup_memo {
-            let entry = way.get();
-            if entry.key_ptr == key_ptr && entry.key_len == key_len {
-                return Some(if entry.offset == ShapeLookupMemo::ABSENT {
-                    None
-                } else {
-                    Some(entry.offset)
-                });
-            }
-        }
-        None
-    });
-    if let Some(answer) = probed {
-        return answer;
-    }
-    let answer = shape_offset_of_str(heap, shape, key);
-    heap.read_payload(shape, |body| {
-        body.lookup_memo[1].set(body.lookup_memo[0].get());
-        body.lookup_memo[0].set(ShapeLookupMemo {
-            key_ptr,
-            key_len,
-            offset: answer.unwrap_or(ShapeLookupMemo::ABSENT),
+    debug_assert_ne!(atom, AtomId::NONE, "the root atom names no property");
+    while !shape.is_null() {
+        let (parent, transition_atom, own_offset) = heap.read_payload(shape, |body| {
+            (body.parent(), body.transition_atom(), body.own_offset())
         });
-    });
-    answer
+        if transition_atom == atom {
+            return Some(own_offset);
+        }
+        shape = parent;
+    }
+    None
 }
 
 pub(crate) fn shape_offset_of_str(heap: &GcHeap, mut shape: ShapeHandle, key: &str) -> Option<u32> {
@@ -418,6 +399,22 @@ pub(crate) fn shape_key_matches_str(
     !actual.is_null() && eq_str(heap, actual, key)
 }
 
+/// Return transition atoms with their slot offsets, root-first.
+#[must_use]
+pub(crate) fn shape_atoms_ordered(heap: &GcHeap, mut shape: ShapeHandle) -> Vec<(AtomId, u32)> {
+    let mut atoms = Vec::new();
+    while !shape.is_null() {
+        let (parent, transition_atom, own_offset) = heap.read_payload(shape, |body| {
+            (body.parent(), body.transition_atom(), body.own_offset())
+        });
+        if transition_atom != AtomId::NONE {
+            atoms.push((transition_atom, own_offset));
+        }
+        shape = parent;
+    }
+    atoms
+}
+
 /// Return transition keys in ordinary insertion order with their slot offsets.
 #[must_use]
 pub(crate) fn shape_keys_ordered(
@@ -478,13 +475,23 @@ mod tests {
         let y = alloc_key(&mut heap, 2, "y");
 
         let flags = PropertyFlags::data_default();
-        let sx = alloc_child_shape_body_with_roots(&mut heap, root, x, flags, false, &mut roots)
-            .expect("sx");
-        let sxy = alloc_child_shape_body_with_roots(&mut heap, sx, y, flags, false, &mut roots)
-            .expect("sxy");
+        let atom_x = AtomId::from_global(1);
+        let atom_y = AtomId::from_global(2);
+        let sx =
+            alloc_child_shape_body_with_roots(&mut heap, root, x, atom_x, flags, false, &mut roots)
+                .expect("sx");
+        let sxy =
+            alloc_child_shape_body_with_roots(&mut heap, sx, y, atom_y, flags, false, &mut roots)
+                .expect("sxy");
 
         assert_eq!(shape_offset_of_key(&heap, sxy, x), Some(0));
         assert_eq!(shape_offset_of_key(&heap, sxy, y), Some(1));
+        assert_eq!(shape_offset_of_atom(&heap, sxy, atom_x), Some(0));
+        assert_eq!(shape_offset_of_atom(&heap, sxy, atom_y), Some(1));
+        assert_eq!(
+            shape_offset_of_atom(&heap, sxy, AtomId::from_global(3)),
+            None
+        );
 
         let keys = shape_keys_ordered(&heap, sxy);
         assert_eq!(keys.len(), 2);

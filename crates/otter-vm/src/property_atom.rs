@@ -52,6 +52,11 @@ impl AtomId {
     /// [`NameInterner::intern`].
     const UNRESOLVED: u32 = u32::MAX;
 
+    /// The atom of a shape node that adds no key — the hidden-class root.
+    /// Shares the reserved id, so it equals no interned name and a chain walk
+    /// needs no separate root test.
+    pub(crate) const NONE: Self = Self(Self::UNRESOLVED);
+
     /// Wrap a global id minted by an isolate's [`NameInterner`].
     #[must_use]
     pub(crate) const fn from_global(id: u32) -> Self {

@@ -29,7 +29,7 @@ use std::collections::BTreeSet;
 use super::{
     cfg::{BlockId, ControlFlowGraph},
     dom::{DomError, DominatorTree},
-    regalloc::is_dead_phi,
+    regalloc::MergeLiveness,
     ssa::{SsaFunction, ValueDef, ValueId},
 };
 
@@ -142,7 +142,8 @@ impl Liveness {
     /// Compute SSA liveness to a fixpoint over normal control edges.
     #[must_use]
     pub fn compute(ssa: &SsaFunction, cfg: &ControlFlowGraph) -> Self {
-        let facts = block_facts(ssa);
+        let merges = MergeLiveness::compute(ssa);
+        let facts = block_facts(ssa, &merges);
         let block_count = cfg.blocks.len();
         let mut result = Self {
             live_in: vec![BTreeSet::new(); block_count].into_boxed_slice(),
@@ -155,6 +156,7 @@ impl Liveness {
                 ssa,
                 cfg,
                 &facts,
+                &merges,
                 normal_dom.reverse_postorder(),
                 &mut result.live_in,
                 &mut result.live_out,
@@ -245,13 +247,14 @@ impl Liveness {
             }
         }
 
-        let facts = block_facts(ssa);
+        let merges = MergeLiveness::compute(ssa);
+        let facts = block_facts(ssa, &merges);
 
         // This is deliberately separate from `backward_pass`: it directly
         // reconstructs only the successor equation from the stored live-ins.
         for block_index in 0..block_count {
             let block = BlockId(block_index as u32);
-            let expected = recompute_live_out(ssa, cfg, &facts, &self.live_in, block);
+            let expected = recompute_live_out(ssa, cfg, &facts, &merges, &self.live_in, block);
             if expected != self.live_out[block_index] {
                 return Err(LivenessError::LiveOutInconsistent {
                     block,
@@ -268,6 +271,7 @@ impl Liveness {
             ssa,
             cfg,
             &facts,
+            &merges,
             normal_dom.reverse_postorder(),
             &mut next_live_in,
             &mut next_live_out,
@@ -323,7 +327,7 @@ impl Liveness {
     }
 }
 
-fn block_facts(ssa: &SsaFunction) -> Vec<BlockFacts> {
+fn block_facts(ssa: &SsaFunction, merges: &MergeLiveness) -> Vec<BlockFacts> {
     ssa.blocks
         .iter()
         .map(|block| {
@@ -336,7 +340,7 @@ fn block_facts(ssa: &SsaFunction) -> Vec<BlockFacts> {
                 .phis
                 .iter()
                 .copied()
-                .filter(|&phi| !is_dead_phi(ssa, phi))
+                .filter(|&phi| !merges.is_dead_phi(phi))
                 .collect();
             let mut defined: BTreeSet<_> = block.phis.iter().copied().collect();
             let mut instr_defs = BTreeSet::new();
@@ -365,6 +369,7 @@ fn backward_pass(
     ssa: &SsaFunction,
     cfg: &ControlFlowGraph,
     facts: &[BlockFacts],
+    merges: &MergeLiveness,
     reverse_postorder: &[BlockId],
     live_in: &mut [BTreeSet<ValueId>],
     live_out: &mut [BTreeSet<ValueId>],
@@ -372,7 +377,7 @@ fn backward_pass(
     let mut changed = false;
     for &block in reverse_postorder.iter().rev() {
         let block_index = block.0 as usize;
-        let new_live_out = recompute_live_out(ssa, cfg, facts, live_in, block);
+        let new_live_out = recompute_live_out(ssa, cfg, facts, merges, live_in, block);
         let mut new_live_in = facts[block_index].phi_defs.clone();
         new_live_in.extend(facts[block_index].uses.iter().copied());
         new_live_in.extend(
@@ -400,6 +405,7 @@ fn recompute_live_out(
     ssa: &SsaFunction,
     cfg: &ControlFlowGraph,
     facts: &[BlockFacts],
+    merges: &MergeLiveness,
     live_in: &[BTreeSet<ValueId>],
     block: BlockId,
 ) -> BTreeSet<ValueId> {
@@ -411,7 +417,7 @@ fn recompute_live_out(
                 .difference(&facts[successor_index].phi_defs)
                 .copied(),
         );
-        result.extend(phi_uses(ssa, cfg, block, successor));
+        result.extend(phi_uses(ssa, cfg, merges, block, successor));
     }
     result
 }
@@ -419,6 +425,7 @@ fn recompute_live_out(
 fn phi_uses(
     ssa: &SsaFunction,
     cfg: &ControlFlowGraph,
+    merges: &MergeLiveness,
     predecessor: BlockId,
     successor: BlockId,
 ) -> BTreeSet<ValueId> {
@@ -430,7 +437,7 @@ fn phi_uses(
         .iter()
         // A phi nothing reads takes no edge move, so its incoming value is not
         // a use of this edge either.
-        .filter(|&&phi| !is_dead_phi(ssa, phi))
+        .filter(|&&phi| !merges.is_dead_phi(phi))
         .filter_map(|&phi| match &ssa.values[phi.0 as usize].def {
             // A spliced call's result merges the callee's returned values, so
             // like a phi it uses one input per predecessor edge.

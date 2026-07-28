@@ -1340,6 +1340,7 @@ pub(super) fn build_osr_entry_sites(
     frame_states: &FrameStateTable,
     hoisted_loops: &BTreeMap<BlockId, HoistedGroup>,
 ) -> Result<BTreeMap<BlockId, OsrEntrySite>, Unsupported> {
+    let merges = MergeLiveness::compute(ssa);
     let mut sites = BTreeMap::new();
     // Only the root frame's headers are OSR targets: the interpreter requests
     // OSR by the root function's PC, and a PC inside a spliced callee is not in
@@ -1379,7 +1380,7 @@ pub(super) fn build_osr_entry_sites(
             .filter_map(|instruction| instruction.result)
             .collect();
         if live_in.iter().any(|value| {
-            has_non_dead_use(ssa, *value)
+            merges.has_non_dead_use(*value)
                 && !register_by_value.contains_key(value)
                 && !recovered.contains(value)
         }) {
@@ -1459,6 +1460,7 @@ pub(super) fn build_element_transition_sites(
     frame_states: &FrameStateTable,
     instructions: Vec<(u32, BlockId, usize)>,
 ) -> Result<ElementTransitionSafepoints, Unsupported> {
+    let merges = MergeLiveness::compute(ssa);
     let bitmap_word_count = usize::from(ssa.register_count).div_ceil(u64::BITS as usize);
     let bitmap_word_count_u16 = u16::try_from(bitmap_word_count)
         .map_err(|_| Unsupported::OperandShape("optimizing frame-map word count overflow"))?;
@@ -1498,7 +1500,7 @@ pub(super) fn build_element_transition_sites(
             // move. Materializing one would publish uninitialized native-stack
             // bits into an interpreter register slot the collector traces, and
             // reloading one would overwrite a home nothing ever established.
-            if rematerialized_deopt_slot(ssa, reprs, Some(value)).is_some() {
+            if rematerialized_deopt_slot(ssa, reprs, &merges, Some(value)).is_some() {
                 continue;
             }
             let register =

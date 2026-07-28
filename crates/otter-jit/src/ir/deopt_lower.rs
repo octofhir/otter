@@ -37,7 +37,7 @@ use otter_vm::{
 use super::{
     frame_state::{AbstractFrameState, FrameStateTable},
     inline::{InlineFrame, InlineId, InlineTree},
-    regalloc::{Allocation, Location, RegClass, is_dead_phi},
+    regalloc::{Allocation, Location, MergeLiveness, RegClass},
     repr::{ReprError, ReprMap, Representation},
     ssa::{SsaFunction, ValueDef, ValueId},
 };
@@ -244,7 +244,8 @@ impl DeoptLowering {
         allocation: &Allocation,
         reprs: &ReprMap,
     ) -> Result<Self, DeoptLoweringError> {
-        let table = lower_table(tree, ssa, frame_states, allocation, reprs)?;
+        let merges = MergeLiveness::compute(ssa);
+        let table = lower_table(tree, ssa, frame_states, allocation, reprs, &merges)?;
         let lowering = Self { table };
         lowering.verify(view, tree, ssa, frame_states, allocation, reprs)?;
         Ok(lowering)
@@ -284,7 +285,8 @@ impl DeoptLowering {
         allocation: &Allocation,
         reprs: &ReprMap,
     ) -> Result<(), DeoptLoweringError> {
-        validate_inputs(tree, ssa, frame_states, allocation, reprs)?;
+        let merges = MergeLiveness::compute(ssa);
+        validate_inputs(tree, ssa, frame_states, allocation, reprs, &merges)?;
         self.table
             .verify(verify_limits(ssa, allocation)?)
             .map_err(DeoptLoweringError::InvalidDeoptTable)?;
@@ -371,7 +373,8 @@ impl DeoptLowering {
             }
             for (register, &value) in state.registers.iter().enumerate() {
                 let register = register as u16;
-                let expected = lower_slot(register, value, ssa, allocation, reprs, state.pc)?;
+                let expected =
+                    lower_slot(register, value, ssa, allocation, reprs, &merges, state.pc)?;
                 let actual = concrete.slots[usize::from(register)];
                 if actual.location != expected.location {
                     return Err(DeoptLoweringError::SlotLocationMismatch {
@@ -392,8 +395,8 @@ impl DeoptLowering {
             }
         }
 
-        let first = lower_table(tree, ssa, frame_states, allocation, reprs)?;
-        let second = lower_table(tree, ssa, frame_states, allocation, reprs)?;
+        let first = lower_table(tree, ssa, frame_states, allocation, reprs, &merges)?;
+        let second = lower_table(tree, ssa, frame_states, allocation, reprs, &merges)?;
         if first != second || self.table != first {
             return Err(DeoptLoweringError::NonDeterministic);
         }
@@ -407,6 +410,7 @@ fn validate_inputs(
     frame_states: &FrameStateTable,
     allocation: &Allocation,
     reprs: &ReprMap,
+    merges: &MergeLiveness,
 ) -> Result<(), DeoptLoweringError> {
     reprs
         .verify(tree, ssa)
@@ -466,7 +470,15 @@ fn validate_inputs(
             });
         }
         for (register, &value) in state.registers.iter().enumerate() {
-            lower_slot(register as u16, value, ssa, allocation, reprs, state.pc)?;
+            lower_slot(
+                register as u16,
+                value,
+                ssa,
+                allocation,
+                reprs,
+                merges,
+                state.pc,
+            )?;
         }
     }
     Ok(())
@@ -478,8 +490,9 @@ fn lower_table(
     frame_states: &FrameStateTable,
     allocation: &Allocation,
     reprs: &ReprMap,
+    merges: &MergeLiveness,
 ) -> Result<DeoptTable, DeoptLoweringError> {
-    validate_inputs(tree, ssa, frame_states, allocation, reprs)?;
+    validate_inputs(tree, ssa, frame_states, allocation, reprs, merges)?;
     let mut states = Vec::with_capacity(frame_states.states().len());
     for state in frame_states.states() {
         // Rebuild the whole chain this exit owes the interpreter: the outermost
@@ -491,7 +504,9 @@ fn lower_table(
         let mut current = Some(state);
         let mut resume = ResumeAt::Instruction;
         while let Some(state) = current {
-            chain.push(lower_frame(tree, state, ssa, allocation, reprs, resume)?);
+            chain.push(lower_frame(
+                tree, state, ssa, allocation, reprs, merges, resume,
+            )?);
             current = state.caller.map(|index| &frame_states.states()[index]);
             resume = ResumeAt::AfterCall;
         }
@@ -522,6 +537,7 @@ fn lower_frame(
     ssa: &SsaFunction,
     allocation: &Allocation,
     reprs: &ReprMap,
+    merges: &MergeLiveness,
     resume: ResumeAt,
 ) -> Result<DeoptFrame, DeoptLoweringError> {
     let frame = &tree.frames[state.inline.0 as usize];
@@ -530,7 +546,15 @@ fn lower_frame(
         .iter()
         .enumerate()
         .map(|(register, &value)| {
-            lower_slot(register as u16, value, ssa, allocation, reprs, state.pc)
+            lower_slot(
+                register as u16,
+                value,
+                ssa,
+                allocation,
+                reprs,
+                merges,
+                state.pc,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     let pc = match resume {
@@ -550,9 +574,10 @@ fn lower_slot(
     ssa: &SsaFunction,
     allocation: &Allocation,
     reprs: &ReprMap,
+    merges: &MergeLiveness,
     pc: u32,
 ) -> Result<DeoptSlot, DeoptLoweringError> {
-    if let Some(slot) = rematerialized_deopt_slot(ssa, reprs, value) {
+    if let Some(slot) = rematerialized_deopt_slot(ssa, reprs, merges, value) {
         return Ok(slot);
     }
     let value = value.expect("non-rematerialized deopt slot owns an SSA value");
@@ -636,6 +661,7 @@ fn lower_slot(
 pub(crate) fn rematerialized_deopt_slot(
     ssa: &SsaFunction,
     reprs: &ReprMap,
+    merges: &MergeLiveness,
     value: Option<ValueId>,
 ) -> Option<DeoptSlot> {
     let representation = match value {
@@ -648,7 +674,7 @@ pub(crate) fn rematerialized_deopt_slot(
         {
             Representation::Tagged
         }
-        Some(value) if is_dead_phi(ssa, value) => reprs.representation(value),
+        Some(value) if merges.is_dead_phi(value) => reprs.representation(value),
         Some(_) => return None,
     };
     let (raw, repr) = match representation {
@@ -862,6 +888,7 @@ mod tests {
                 &pipeline.ssa,
                 &pipeline.allocation,
                 &pipeline.reprs,
+                &MergeLiveness::compute(&pipeline.ssa),
                 1
             )
             .unwrap()
@@ -1030,6 +1057,7 @@ mod tests {
             &pipeline.ssa,
             &pipeline.allocation,
             &pipeline.reprs,
+            &MergeLiveness::compute(&pipeline.ssa),
             1,
         )
         .expect("a dead register lowers without reading allocation state");
@@ -1085,6 +1113,7 @@ mod tests {
                 &pipeline.ssa,
                 &pipeline.allocation,
                 &pipeline.reprs,
+                &MergeLiveness::compute(&pipeline.ssa),
                 1
             )
             .unwrap()
@@ -1097,6 +1126,7 @@ mod tests {
                 &pipeline.ssa,
                 &pipeline.allocation,
                 &pipeline.reprs,
+                &MergeLiveness::compute(&pipeline.ssa),
                 3
             )
             .unwrap()

@@ -13,12 +13,11 @@
 //! - [`StackMap`], [`Safepoint`], and [`SafepointTable`] — compiled-frame GC
 //!   root metadata.
 //!
-//! 1. **Frame-state table** ([`DeoptTable`]) — keyed by interpreter byte-PC.
-//!    For each deopt point it records, per interpreter virtual register, where
-//!    the value lives ([`DeoptLocation`]) and how to turn its raw bits back
-//!    into a full tagged [`Value`] ([`DeoptRepr`]). A guard failure or lazy
-//!    deopt reconstructs the exact interpreter frame at the right PC by walking
-//!    the matching [`FrameState`].
+//! 1. **Frame-state table** ([`DeoptTable`]) — densely indexed by generated
+//!    exit identity. For each exit it records an outermost-first chain of
+//!    interpreter frames, each at its exact byte-PC, and for every virtual
+//!    register says where the value lives ([`DeoptLocation`]) and how to turn
+//!    its raw bits back into a full tagged [`Value`] ([`DeoptRepr`]).
 //!
 //! 2. **Safepoint stack maps** ([`SafepointTable`]) — one [`StackMap`] per
 //!    GC-safe point (every call and allocation site), marking which compiled
@@ -36,12 +35,13 @@
 //!
 //! # Invariants
 //!
-//! - A [`DeoptTable`] / [`SafepointTable`] is sorted by byte-PC; lookups are an
-//!   exact-match binary search. A point with no entry is not a valid deopt /
-//!   safepoint and lookups return `None`.
+//! - A [`DeoptTable`] is dense in [`DeoptExitId`] order. A
+//!   [`SafepointTable`] is sorted by byte-PC and uses exact-match lookup. An
+//!   out-of-range exit or an absent safepoint returns `None`.
 //! - A [`FrameState`] carries one [`DeoptSlot`] per interpreter virtual
 //!   register the frame defines, in register-index order, matching the windowed
-//!   register numbering the frame ABI fixes.
+//!   register numbering the frame ABI fixes. Its frames are ordered outermost
+//!   first and retain their own function identity and exact resume PC.
 //! - Literal recipes are not physical locations and may be shared by any
 //!   number of slots. They let optimized code omit values needed only by deopt.
 //! - A [`StackMap`] indexes the same compiled slots the frame state locates;
@@ -432,9 +432,10 @@ pub struct DeoptChainCall {
 pub struct DeoptExitDescriptor {
     /// The frame state this site rebuilds, an index into the owning table.
     pub state: DeoptExitId,
-    /// Logical PC the compiled function's own frame resumes at. Meaningful
-    /// only for a single-frame exit; a chain leaves each caller advanced past
-    /// its call and stamps no PC.
+    /// Exact logical PC the compiled function's outermost frame resumes at.
+    /// For an inline chain this is the instruction after the first spliced
+    /// call; publishing it prevents the native entry boundary from overwriting
+    /// the caller PC advanced by reification with a stale entry PC.
     pub resume_pc: u32,
     /// Reification steps for inlined frames, outermost caller first. Empty for
     /// a single-frame exit.

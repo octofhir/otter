@@ -3,7 +3,7 @@
 //! # Contents
 //! - Which inline bodies and method splices the backend can lower.
 //! - Per-instruction operand, representation and constant checks.
-//! - OSR entry sites and element-transition safepoint sites.
+//! - OSR entry sites, root-frame safepoints, and spliced-frame chain exits.
 //!
 //! # Invariants
 //! - Nothing here emits machine code. A function that answers "can this be
@@ -334,6 +334,7 @@ pub(super) fn check_eligibility(
     let mut guarded_uses = BTreeMap::<(u32, ValueId), Option<u32>>::new();
     let mut allowed_conversions = BTreeSet::<(InlineId, u32, usize)>::new();
     let mut element_transition_instructions = Vec::new();
+    let mut inline_transitions = BTreeSet::new();
     let mut insufficient_feedback = BTreeSet::new();
     for block in dom.reverse_postorder().iter().copied() {
         for (instruction_index, instruction) in
@@ -406,7 +407,7 @@ pub(super) fn check_eligibility(
             }
             match op {
                 Op::LoadInt32 => check_constant_result(instruction, reprs)?,
-                Op::LoadNumber => check_number_constant_result(view, instruction, reprs)?,
+                Op::LoadNumber => check_number_constant_result(tree, instruction, reprs)?,
                 Op::LoadUndefined => check_tagged_constant_result(instruction, reprs)?,
                 Op::LoadNull => check_tagged_constant_result(instruction, reprs)?,
                 Op::LoadThis if instruction.inline != InlineId::ROOT => {
@@ -726,8 +727,7 @@ pub(super) fn check_eligibility(
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("construct result"))?;
-                    let argc = view.instructions[instruction.pc as usize]
-                        .const_index(view.code_block.as_ref(), 2)
+                    let argc = frame_const_index(tree, instruction, 2)
                         .ok_or(Unsupported::OperandShape("construct argument count"))?;
                     require(
                         instruction.result_register.is_some()
@@ -1088,6 +1088,9 @@ pub(super) fn check_eligibility(
                         "upvalue store shape",
                     )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
+                    if instruction.inline != InlineId::ROOT {
+                        inline_transitions.insert((instruction.inline, instruction.pc));
+                    }
                 }
                 // A captured-binding read is a leaf: it reaches the upvalue
                 // cell through pointers, never allocates or runs JS, and only
@@ -1104,6 +1107,9 @@ pub(super) fn check_eligibility(
                         op,
                         "upvalue load shape",
                     )?;
+                    if instruction.inline != InlineId::ROOT {
+                        inline_transitions.insert((instruction.inline, instruction.pc));
+                    }
                 }
                 Op::Jump => {
                     if instruction.result.is_some() || !instruction.inputs.is_empty() {
@@ -1193,18 +1199,19 @@ pub(super) fn check_eligibility(
     }
     guarded_numeric_uses.sort_by_key(|guarded| guarded.use_pc);
     guarded_numeric_uses.dedup_by_key(|guarded| guarded.use_pc);
-    // A reentrant stub addresses its operands as indices into the *caller's*
-    // interpreter register window. A spliced callee has no window of its own
-    // until its frame is reified at a deopt exit, so those indices would name
-    // the caller's registers and corrupt them. Splicing is therefore confined
-    // to bodies the tier lowers entirely into machine registers.
-    for &(_, block, _) in &element_transition_instructions {
-        if cfg.blocks[block.0 as usize].inline != InlineId::ROOT {
-            return Err(Unsupported::OperandShape(
-                "optimizing subset rejects a spliced frame that needs a register window",
-            ));
+    // A reentrant stub addresses operands through a physical interpreter
+    // window. The root owns one; a spliced frame deliberately does not.
+    // Reentrant bytecodes in a spliced frame therefore become exact-PC exits
+    // before effects, while root sites retain the precise safepoint transition.
+    element_transition_instructions.retain(|&(pc, block, _)| {
+        let inline = cfg.blocks[block.0 as usize].inline;
+        if inline == InlineId::ROOT {
+            true
+        } else {
+            inline_transitions.insert((inline, pc));
+            false
         }
-    }
+    });
     element_transition_instructions.sort_unstable_by_key(|&(pc, _, _)| pc);
     element_transition_instructions.dedup_by_key(|instruction| instruction.0);
     let element_transitions = build_element_transition_sites(
@@ -1221,6 +1228,7 @@ pub(super) fn check_eligibility(
         back_edges,
         osr_entries,
         element_transitions,
+        inline_transitions,
         insufficient_feedback,
         cached_method_guard,
     })
@@ -1782,14 +1790,14 @@ pub(super) fn check_constant_result(
 }
 
 pub(super) fn check_number_constant_result(
-    view: &JitCompileSnapshot,
+    tree: &InlineTree,
     instruction: &SsaInstr,
     reprs: &ReprMap,
 ) -> Result<(), Unsupported> {
     let result = instruction.result.ok_or(Unsupported::OperandShape(
         "optimizing number constant result",
     ))?;
-    let number = load_number(view, instruction.pc)?;
+    let number = load_number(tree, instruction)?;
     let expected = if is_exact_i32(number) {
         Representation::Int32
     } else {
@@ -1833,11 +1841,48 @@ pub(super) fn check_tagged_constant_result(
     Ok(())
 }
 
-pub(super) fn load_number(view: &JitCompileSnapshot, pc: u32) -> Result<f64, Unsupported> {
-    view.instructions
-        .get(pc as usize)
+pub(super) fn load_number(tree: &InlineTree, instruction: &SsaInstr) -> Result<f64, Unsupported> {
+    tree.frames
+        .get(instruction.inline.0 as usize)
+        .and_then(|frame| frame.instructions.get(instruction.pc as usize))
         .and_then(|instruction| instruction.load_number)
         .ok_or(Unsupported::OperandShape("optimizing LoadNumber metadata"))
+}
+
+pub(super) fn frame_operand(
+    tree: &InlineTree,
+    instruction: &SsaInstr,
+    operand: usize,
+) -> Option<Operand> {
+    let frame = tree.frames.get(instruction.inline.0 as usize)?;
+    frame
+        .instructions
+        .get(instruction.pc as usize)?
+        .operand(frame.code_block.as_ref(), operand)
+}
+
+pub(super) fn frame_imm32(
+    tree: &InlineTree,
+    instruction: &SsaInstr,
+    operand: usize,
+) -> Option<i32> {
+    let frame = tree.frames.get(instruction.inline.0 as usize)?;
+    frame
+        .instructions
+        .get(instruction.pc as usize)?
+        .imm32(frame.code_block.as_ref(), operand)
+}
+
+pub(super) fn frame_const_index(
+    tree: &InlineTree,
+    instruction: &SsaInstr,
+    operand: usize,
+) -> Option<u32> {
+    let frame = tree.frames.get(instruction.inline.0 as usize)?;
+    frame
+        .instructions
+        .get(instruction.pc as usize)?
+        .const_index(frame.code_block.as_ref(), operand)
 }
 
 pub(super) fn is_exact_i32(number: f64) -> bool {

@@ -187,11 +187,24 @@ pub(crate) extern "C" fn jit_deopt_writeback_stub(
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
     let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let context = unsafe { &*ctx.activation().context_ptr() };
-    for (step, frame) in exit.chain.iter().zip(state.frames.iter().skip(1)) {
+    let chain_total = u32::try_from(state.frames.len()).unwrap_or(u32::MAX);
+    for (depth, (step, frame)) in exit
+        .chain
+        .iter()
+        .zip(state.frames.iter().skip(1))
+        .enumerate()
+    {
         // SAFETY: caller frames below this one are already written back, so
         // the interpreter's call path sees exactly the frame a real call has.
         let callee_window = match unsafe {
-            vm.jit_deopt_reify_inlined_frame(context, stack, step.call_pc, step.callee_pc)
+            vm.jit_deopt_reify_inlined_frame(
+                context,
+                stack,
+                step.call_pc,
+                step.callee_pc,
+                u32::try_from(depth + 1).unwrap_or(u32::MAX),
+                chain_total,
+            )
         } {
             Ok(registers) => registers,
             Err(err) => {
@@ -201,6 +214,15 @@ pub(crate) extern "C" fn jit_deopt_writeback_stub(
         };
         write_frame(frame, callee_window);
     }
+    // The reify path advanced the materialized outermost caller past its call.
+    // The compiled-entry boundary still derives its `Bailed` outcome from the
+    // canonical NativeFrame, so publish the same exact resume point there or
+    // it would overwrite the caller with the stale entry PC on return.
+    let Some(native_frame) = (unsafe { ctx.native_frame.as_mut() }) else {
+        park_jit_error(ctx, VmError::InvalidOperand);
+        return 0;
+    };
+    native_frame.header.pc = exit.resume_pc;
     1
 }
 

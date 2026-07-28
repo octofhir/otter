@@ -620,12 +620,8 @@ pub(super) fn emit_store_frame_register_in(
     Ok(())
 }
 
-pub(super) fn load_int32(view: &JitCompileSnapshot, pc: u32) -> Result<i32, Unsupported> {
-    match view
-        .instructions
-        .get(pc as usize)
-        .and_then(|instruction| instruction.operand(&view.code_block, 1))
-    {
+pub(super) fn load_int32(tree: &InlineTree, instruction: &SsaInstr) -> Result<i32, Unsupported> {
+    match frame_operand(tree, instruction, 1) {
         Some(Operand::Imm32(value)) => Ok(value),
         _ => Err(Unsupported::OperandShape("optimizing LoadInt32 operands")),
     }

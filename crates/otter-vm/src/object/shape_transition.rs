@@ -199,12 +199,15 @@ pub(crate) fn replay_store_property_transition(
     } else {
         Some(heap.read_payload(to_shape, super::shape_body::ShapeBody::id))
     };
+    // The shape-id guard below already pins both invariants the asserts
+    // check: a receiver whose current shape equals `from_shape_id` has
+    // exactly that shape's own keys (so the appended key is absent) and
+    // exactly that shape's count of own properties (the appended slot's
+    // offset). Verifying either costs a shape-chain walk, so both are
+    // confirmed in debug builds only.
+    #[cfg(debug_assertions)]
     let existing_offset =
         heap.read_payload(obj, |body| super::body_offset_of(heap, body, key.name()));
-    // The shape-id guard below already pins the property count: a receiver whose
-    // current shape equals `from_shape_id` has exactly that shape's count of own
-    // properties, which is the appended slot's offset. Verifying it costs a
-    // shape walk, so confirm the invariant in debug builds only.
     #[cfg(debug_assertions)]
     let current_count = heap.read_payload(obj, |body| super::body_property_count(heap, body));
     let guard_matches = heap.read_payload(obj, |body| {
@@ -216,6 +219,7 @@ pub(crate) fn replay_store_property_transition(
         {
             return false;
         }
+        #[cfg(debug_assertions)]
         debug_assert_eq!(existing_offset, None);
         #[cfg(debug_assertions)]
         debug_assert_eq!(

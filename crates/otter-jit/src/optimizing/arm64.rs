@@ -176,6 +176,9 @@ const VALUE_REGISTERS: [u8; ALLOCATABLE_REGISTER_COUNT as usize] = [21, 22, 23, 
 const HEADER_SCRATCH: u8 = 13;
 const FP_REGISTERS: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
 const FP_SCRATCH: u8 = 16;
+/// Transient register dump the shared deopt handler pushes below the spill
+/// frame before calling the writeback stub.
+const DEOPT_HANDLER_DUMP_BYTES: u32 = 128;
 const FP_SCRATCH_2: u8 = 17;
 const STACK_SLOT_BYTES: u32 = 8;
 const OPTIMIZED_POLL_BATCH: u32 = 16;
@@ -318,6 +321,12 @@ struct OptimizedEmission {
     direct_call_events: Option<BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
     code_map: Option<CodeMapCapture>,
     relocations: RelocationCapture,
+    /// Persistent machine-stack reservation of this generation's prologue
+    /// plus its deepest fixed transient (the shared deopt handler's register
+    /// dump). Declaring it makes the generation eligible for generated direct
+    /// entry: callers validate this exact bound against the native-stack
+    /// limit before entering.
+    generated_stack_frame_bytes: u32,
 }
 
 #[cfg(test)]
@@ -534,7 +543,7 @@ pub(super) fn compile_with_artifacts(
     });
     let code = OptimizedCode::new(
         emission.code,
-        None,
+        (emission.generated_stack_frame_bytes != 0).then_some(emission.generated_stack_frame_bytes),
         deopt_runtime,
         safepoint_records,
         frame_maps,
@@ -795,6 +804,7 @@ fn emit(
         .checked_add(15)
         .map(|bytes| bytes & !15)
         .ok_or(Unsupported::OperandShape("optimizing spill frame overflow"))?;
+    let saved_frame = SavedFrame::from_allocation(allocation, spill_frame_bytes);
     if spill_frame_bytes > MAX_SPILL_FRAME_BYTES {
         return Err(Unsupported::OperandShape(
             "optimizing property loop cache frame exceeds arm64 immediates",
@@ -889,7 +899,7 @@ fn emit(
         .map(|_| ops.new_dynamic_label())
         .collect();
     let entry = ops.offset();
-    emit_prologue(&mut ops, spill_frame_bytes);
+    emit_prologue(&mut ops, saved_frame);
     if eligibility.cached_method_guard.is_some() {
         dynasm!(ops ; .arch aarch64 ; mov x9, xzr);
         let receiver_slot = fused_method_receiver_slot.expect("cached guard reserves a slot");
@@ -2113,54 +2123,142 @@ fn emit(
                         let lhs = instruction.input_registers[0];
                         let rhs = instruction.input_registers[1];
                         let negate = u64::from(op == Op::LooseNotEqual);
-                        let site = eligibility
-                            .element_transitions
-                            .sites
-                            .get(&instruction.pc)
-                            .ok_or(Unsupported::OperandShape(
+                        let lhs_value = instruction.inputs[0];
+                        let rhs_value = instruction.inputs[1];
+                        let result_location = allocation.location(
+                            instruction
+                                .result
+                                .expect("eligibility checked loose-eq result"),
+                        );
+                        let store_flag_result = |ops: &mut Assembler| {
+                            // Flags hold the comparison; produce the tagged
+                            // boolean, inverted for the not-equal form.
+                            emit_load_u32(ops, 9, VALUE_TRUE as u32);
+                            emit_load_u32(ops, 10, VALUE_FALSE as u32);
+                            if negate == 0 {
+                                dynasm!(ops ; .arch aarch64 ; csel x9, x9, x10, eq);
+                            } else {
+                                dynasm!(ops ; .arch aarch64 ; csel x9, x9, x10, ne);
+                            }
+                        };
+                        let is_nullish_literal = |value: ValueId| {
+                            matches!(
+                                ssa.values[value.0 as usize].def,
+                                ValueDef::Op {
+                                    op: SsaOp::Bytecode(Op::LoadNull | Op::LoadUndefined),
+                                    ..
+                                }
+                            )
+                        };
+                        let lhs_repr = reprs.representation(lhs_value);
+                        let rhs_repr = reprs.representation(rhs_value);
+                        if lhs_repr == Representation::Int32 && rhs_repr == Representation::Int32 {
+                            // Both operands are proven unboxed int32: loose
+                            // equality is one machine compare, no runtime.
+                            emit_load_location(&mut ops, allocation.location(lhs_value), 9)?;
+                            emit_load_location(&mut ops, allocation.location(rhs_value), 10)?;
+                            dynasm!(ops ; .arch aarch64 ; cmp w9, w10);
+                            store_flag_result(&mut ops);
+                            emit_store_tagged_location(&mut ops, result_location, 9)?;
+                        } else if (is_nullish_literal(rhs_value)
+                            && lhs_repr == Representation::Tagged)
+                            || (is_nullish_literal(lhs_value) && rhs_repr == Representation::Tagged)
+                        {
+                            // `x == null` / `x == undefined`: true exactly for
+                            // the two nullish values (§7.2.14 steps 2-3), so
+                            // the comparison is two immediate tests.
+                            let tagged = if is_nullish_literal(rhs_value) {
+                                lhs_value
+                            } else {
+                                rhs_value
+                            };
+                            emit_load_tagged_location(&mut ops, allocation.location(tagged), 9)?;
+                            emit_load_u32(&mut ops, 10, VALUE_NULL as u32);
+                            emit_load_u32(&mut ops, 11, VALUE_UNDEFINED as u32);
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; cmp x9, x10
+                                ; ccmp x9, x11, #0b0100, ne
+                            );
+                            store_flag_result(&mut ops);
+                            emit_store_tagged_location(&mut ops, result_location, 9)?;
+                        } else {
+                            let site = eligibility
+                                .element_transitions
+                                .sites
+                                .get(&instruction.pc)
+                                .ok_or(Unsupported::OperandShape(
                                 "optimizing loose-eq missing site",
                             ))?;
-                        debug_assert_eq!(site.safepoint_id, site.frame_map.id);
-                        emit_materialize_element_transition(
-                            &mut ops,
-                            reprs,
-                            allocation,
-                            instruction,
-                            site,
-                        )?;
-                        emit_load_u32(&mut ops, 9, instruction.pc);
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-                            ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
-                            ; mov x0, x20
-                            ; movz x1, dst as u32
-                            ; movz x2, lhs as u32
-                            ; movz x3, rhs as u32
-                        );
-                        emit_load_u64(&mut ops, 4, negate);
-                        emit_runtime_entry(&mut ops, &mut relocations, 16, loose_eq_entry);
-                        let succeeded = ops.new_dynamic_label();
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; blr x16
-                            ; cbz x0, =>succeeded
-                            ; b =>threw
-                            ; =>succeeded
-                        );
-                        emit_reload_element_transition(
-                            &mut ops,
-                            allocation,
-                            site,
-                            Some((
-                                dst,
-                                allocation.location(
-                                    instruction
-                                        .result
-                                        .expect("eligibility checked loose-eq result"),
-                                ),
-                            )),
-                        )?;
+                            debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                            let slow = ops.new_dynamic_label();
+                            let merged = ops.new_dynamic_label();
+                            let tagged_pair = lhs_repr == Representation::Tagged
+                                && rhs_repr == Representation::Tagged;
+                            if tagged_pair {
+                                // Two boxed numbers compare as f64 — exactly
+                                // §7.2.14 step 1 for the number/number case,
+                                // with `fcmp` giving NaN its unequal answer.
+                                // Anything non-numeric keeps the reentrant
+                                // completion below.
+                                emit_load_tagged_location(
+                                    &mut ops,
+                                    allocation.location(lhs_value),
+                                    9,
+                                )?;
+                                emit_load_tagged_location(
+                                    &mut ops,
+                                    allocation.location(rhs_value),
+                                    10,
+                                )?;
+                                crate::template::arm64::values::emit_num_to_double(
+                                    &mut ops, 9, 0, slow,
+                                );
+                                crate::template::arm64::values::emit_num_to_double(
+                                    &mut ops, 10, 1, slow,
+                                );
+                                dynasm!(ops ; .arch aarch64 ; fcmp d0, d1);
+                                store_flag_result(&mut ops);
+                                emit_store_tagged_location(&mut ops, result_location, 9)?;
+                                dynasm!(ops ; .arch aarch64 ; b =>merged ; =>slow);
+                            }
+                            emit_materialize_element_transition(
+                                &mut ops,
+                                reprs,
+                                allocation,
+                                instruction,
+                                site,
+                            )?;
+                            emit_load_u32(&mut ops, 9, instruction.pc);
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                                ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+                                ; mov x0, x20
+                                ; movz x1, dst as u32
+                                ; movz x2, lhs as u32
+                                ; movz x3, rhs as u32
+                            );
+                            emit_load_u64(&mut ops, 4, negate);
+                            emit_runtime_entry(&mut ops, &mut relocations, 16, loose_eq_entry);
+                            let succeeded = ops.new_dynamic_label();
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; blr x16
+                                ; cbz x0, =>succeeded
+                                ; b =>threw
+                                ; =>succeeded
+                            );
+                            emit_reload_element_transition(
+                                &mut ops,
+                                allocation,
+                                site,
+                                Some((dst, result_location)),
+                            )?;
+                            if tagged_pair {
+                                dynasm!(ops ; .arch aarch64 ; =>merged);
+                            }
+                        }
                     }
                     Op::CallMethodValue if is_spliced_call(cfg, block_id, instruction) => {
                         let Terminator::InlineCall { callee_entry, .. } =
@@ -3531,12 +3629,12 @@ fn emit(
                             ; mov x0, x9
                             ; movz x1, STATUS_RETURNED as u32
                         );
-                        emit_epilogue(&mut ops, spill_frame_bytes);
+                        emit_epilogue(&mut ops, saved_frame);
                     }
                     Op::ReturnUndefined => {
                         emit_load_u32(&mut ops, 0, otter_vm::Value::undefined().to_bits() as u32);
                         dynasm!(ops ; .arch aarch64 ; movz x1, STATUS_RETURNED as u32);
-                        emit_epilogue(&mut ops, spill_frame_bytes);
+                        emit_epilogue(&mut ops, saved_frame);
                     }
                     _ => return Err(Unsupported::Opcode(op)),
                 },
@@ -3597,7 +3695,7 @@ fn emit(
         ; mov x0, xzr
         ; movz x1, STATUS_THREW as u32
     );
-    emit_epilogue(&mut ops, spill_frame_bytes);
+    emit_epilogue(&mut ops, saved_frame);
     if let Some(code_map) = code_map.as_mut() {
         code_map.record(CodeRegion::structural(
             "throwEpilogue",
@@ -3611,7 +3709,7 @@ fn emit(
         let target = block_labels[block.0 as usize];
         let offset = ops.offset().0;
         let representation_bail = ops.new_dynamic_label();
-        emit_prologue(&mut ops, spill_frame_bytes);
+        emit_prologue(&mut ops, saved_frame);
         if eligibility.cached_method_guard.is_some() {
             dynasm!(ops ; .arch aarch64 ; mov x9, xzr);
             let receiver_slot = fused_method_receiver_slot.expect("cached guard reserves a slot");
@@ -3665,7 +3763,7 @@ fn emit(
             ; mov x0, xzr
             ; movz x1, STATUS_BAILED as u32
         );
-        emit_epilogue(&mut ops, spill_frame_bytes);
+        emit_epilogue(&mut ops, saved_frame);
         if let Some(code_map) = code_map.as_mut() {
             code_map.record_osr(site.logical_pc, offset, ops.offset().0);
         }
@@ -3779,7 +3877,7 @@ fn emit(
         ; mov x0, xzr
         ; movz x1, STATUS_BAILED as u32
     );
-    emit_epilogue(&mut ops, spill_frame_bytes);
+    emit_epilogue(&mut ops, saved_frame);
     if let Some(code_map) = code_map.as_mut() {
         code_map.record(CodeRegion::structural(
             "deoptSharedHandler",
@@ -3797,5 +3895,16 @@ fn emit(
         direct_call_events,
         code_map,
         relocations,
+        generated_stack_frame_bytes: if tree.frames.len() == 1 {
+            saved_frame
+                .persistent_bytes()
+                .saturating_add(DEOPT_HANDLER_DUMP_BYTES)
+        } else {
+            // A spliced body's deopt may owe the interpreter a frame chain,
+            // and chain reification rewinds an interpreter caller frame that
+            // a generated direct entry never pushes. Such a body stays
+            // reachable through the interpreter dispatch path only.
+            0
+        },
     })
 }

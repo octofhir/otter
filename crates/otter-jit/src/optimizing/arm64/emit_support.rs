@@ -1207,20 +1207,76 @@ pub(super) fn emit_runtime_entry(
     );
 }
 
-pub(super) fn emit_prologue(ops: &mut Assembler, spill_frame_bytes: u32) {
+/// The callee-saved machine state one compiled body actually touches, and
+/// therefore the exact save/restore set its prologue and epilogue move.
+/// Registers are allocated lowest-index first, so the used set is a prefix of
+/// the allocatable file; an unused suffix is never saved. Entry cost is what a
+/// generated call pays per invocation, so the frame carries nothing idle.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SavedFrame {
+    /// Used prefix of the allocatable GPR file (`x21..`), 0..=8.
+    pub(super) gpr_count: u8,
+    /// Used prefix of the allocatable FP file (`d8..`), 0..=8.
+    pub(super) fp_count: u8,
+    /// Spill-area reservation below the saved registers, 16-aligned.
+    pub(super) spill_frame_bytes: u32,
+}
+
+impl SavedFrame {
+    pub(super) fn from_allocation(allocation: &Allocation, spill_frame_bytes: u32) -> Self {
+        let mut gpr_count = 0u8;
+        let mut fp_count = 0u8;
+        for &location in allocation.locations.iter() {
+            if let Location::Register(class, index) = location {
+                match class {
+                    RegClass::Gpr => gpr_count = gpr_count.max(index + 1),
+                    RegClass::Fp => fp_count = fp_count.max(index + 1),
+                }
+            }
+        }
+        Self {
+            gpr_count: gpr_count.min(8),
+            fp_count: fp_count.min(8),
+            spill_frame_bytes,
+        }
+    }
+
+    /// Persistent prologue reservation: frame record, context pair, used
+    /// register saves (16-aligned per class), and the spill area.
+    pub(super) fn persistent_bytes(&self) -> u32 {
+        32 + Self::save_bytes(self.gpr_count)
+            + Self::save_bytes(self.fp_count)
+            + self.spill_frame_bytes
+    }
+
+    fn save_bytes(count: u8) -> u32 {
+        (u32::from(count) * 8).next_multiple_of(16)
+    }
+}
+
+pub(super) fn emit_prologue(ops: &mut Assembler, saved: SavedFrame) {
     dynasm!(ops
         ; .arch aarch64
         ; stp x29, x30, [sp, #-16]!
-        ; stp x19, x20, [sp, #-80]!
-        ; stp x21, x22, [sp, #16]
-        ; stp x23, x24, [sp, #32]
-        ; stp x25, x26, [sp, #48]
-        ; stp x27, x28, [sp, #64]
-        ; stp d8, d9, [sp, #-64]!
-        ; stp d10, d11, [sp, #16]
-        ; stp d12, d13, [sp, #32]
-        ; stp d14, d15, [sp, #48]
+        ; stp x19, x20, [sp, #-16]!
     );
+    for pair in 0..(saved.gpr_count / 2) {
+        let first = 21 + pair * 2;
+        dynasm!(ops ; .arch aarch64 ; stp X(first), X(first + 1), [sp, #-16]!);
+    }
+    if !saved.gpr_count.is_multiple_of(2) {
+        let last = 21 + saved.gpr_count - 1;
+        dynasm!(ops ; .arch aarch64 ; str X(last), [sp, #-16]!);
+    }
+    for pair in 0..(saved.fp_count / 2) {
+        let first = 8 + pair * 2;
+        dynasm!(ops ; .arch aarch64 ; stp D(first), D(first + 1), [sp, #-16]!);
+    }
+    if !saved.fp_count.is_multiple_of(2) {
+        let last = 8 + saved.fp_count - 1;
+        dynasm!(ops ; .arch aarch64 ; str D(last), [sp, #-16]!);
+    }
+    let spill_frame_bytes = saved.spill_frame_bytes;
     if spill_frame_bytes != 0 {
         if spill_frame_bytes <= 4095 {
             dynasm!(ops ; .arch aarch64 ; sub sp, sp, spill_frame_bytes);
@@ -1231,7 +1287,8 @@ pub(super) fn emit_prologue(ops: &mut Assembler, spill_frame_bytes: u32) {
     }
 }
 
-pub(super) fn emit_epilogue(ops: &mut Assembler, spill_frame_bytes: u32) {
+pub(super) fn emit_epilogue(ops: &mut Assembler, saved: SavedFrame) {
+    let spill_frame_bytes = saved.spill_frame_bytes;
     if spill_frame_bytes != 0 {
         if spill_frame_bytes <= 4095 {
             dynasm!(ops ; .arch aarch64 ; add sp, sp, spill_frame_bytes);
@@ -1240,17 +1297,25 @@ pub(super) fn emit_epilogue(ops: &mut Assembler, spill_frame_bytes: u32) {
             dynasm!(ops ; .arch aarch64 ; add sp, sp, x12);
         }
     }
+    if !saved.fp_count.is_multiple_of(2) {
+        let last = 8 + saved.fp_count - 1;
+        dynasm!(ops ; .arch aarch64 ; ldr D(last), [sp], #16);
+    }
+    for pair in (0..(saved.fp_count / 2)).rev() {
+        let first = 8 + pair * 2;
+        dynasm!(ops ; .arch aarch64 ; ldp D(first), D(first + 1), [sp], #16);
+    }
+    if !saved.gpr_count.is_multiple_of(2) {
+        let last = 21 + saved.gpr_count - 1;
+        dynasm!(ops ; .arch aarch64 ; ldr X(last), [sp], #16);
+    }
+    for pair in (0..(saved.gpr_count / 2)).rev() {
+        let first = 21 + pair * 2;
+        dynasm!(ops ; .arch aarch64 ; ldp X(first), X(first + 1), [sp], #16);
+    }
     dynasm!(ops
         ; .arch aarch64
-        ; ldp d14, d15, [sp, #48]
-        ; ldp d12, d13, [sp, #32]
-        ; ldp d10, d11, [sp, #16]
-        ; ldp d8, d9, [sp], #64
-        ; ldp x27, x28, [sp, #64]
-        ; ldp x25, x26, [sp, #48]
-        ; ldp x23, x24, [sp, #32]
-        ; ldp x21, x22, [sp, #16]
-        ; ldp x19, x20, [sp], #80
+        ; ldp x19, x20, [sp], #16
         ; ldp x29, x30, [sp], #16
         ; ret
     );

@@ -941,6 +941,37 @@ impl Interpreter {
         self.ordinary_has_instance(stack, context, target, v)
     }
 
+    /// Direct argv read for an untouched `arguments` object.
+    ///
+    /// Sound exactly when nothing observable diverged from construction: the
+    /// current hidden class is still the canonical arity shape (any add,
+    /// delete, redefine, or attribute change moves or nulls it), no mapped
+    /// parameter aliases exist, and the `length` slot still holds the arity.
+    /// Value writes through the untouched shape land in the slab this reads.
+    fn arguments_object_direct_list(&self, value: Value) -> Option<SmallVec<[Value; 8]>> {
+        let obj = value.as_object()?;
+        let (shape, argc) = crate::object::arguments_direct_snapshot(obj, &self.gc_heap)?;
+        let canonical = [true, false].into_iter().any(|mapped| {
+            self.arguments_shape_cache
+                .get(&(argc as u32, mapped))
+                .is_some_and(|cached| cached.offset() == shape.offset())
+        });
+        if !canonical {
+            return None;
+        }
+        let length_slot = u16::try_from(argc).ok()?;
+        if crate::object::data_value_at(obj, &self.gc_heap, length_slot)
+            != Value::number(crate::NumberValue::from_i32(argc as i32))
+        {
+            return None;
+        }
+        Some(
+            (0..argc)
+                .map(|index| crate::object::data_value_at(obj, &self.gc_heap, index as u16))
+                .collect(),
+        )
+    }
+
     pub(crate) fn create_list_from_array_like(
         &mut self,
         stack: &mut ActivationStack,
@@ -959,6 +990,9 @@ impl Interpreter {
                         .collect()
                 },
             ));
+        }
+        if let Some(values) = self.arguments_object_direct_list(value) {
+            return Ok(values);
         }
         // §7.3.18 — `Type(obj) must be Object`. Cover every shape
         // the VM models as a JS Object: ordinary objects, arrays,

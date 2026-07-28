@@ -164,18 +164,14 @@ impl Interpreter {
         if !object::supports_fast_property_ic(obj, &self.gc_heap) {
             return full_set(self, frame, stack);
         }
-        // A store IC may describe the receiver's shaped own-data layout, but it
-        // is not authority to bypass an inherited accessor/non-writable/exotic
-        // `[[Set]]` outcome. Prove the operation is an ordinary data assignment
-        // before consulting any cached store entry.
-        let set_outcome = object::resolve_set(obj, &self.gc_heap, atomized_key.name());
-        if !matches!(set_outcome, object::SetOutcome::AssignData) {
-            return full_set(self, frame, stack);
-        }
         if let Some(entries_len) = self
             .feedback_directory
             .property_entry_count(site, PropertyIcKind::Store)
         {
+            // An installed stub's guards are the authority for its own outcome
+            // — an own writable data slot or a captured add-transition — so a
+            // probe hit needs no semantic resolution, exactly as on the
+            // interpreter's store path.
             if self.feedback_directory.probe_store(
                 site,
                 obj,
@@ -202,6 +198,13 @@ impl Interpreter {
             } else {
                 self.feedback_directory
                     .record_property_uncached_miss(site, PropertyIcKind::Store);
+            }
+            // A store IC is not authority to bypass an inherited accessor,
+            // non-writable, or exotic `[[Set]]` outcome it has no stub for.
+            // Prove the miss is an ordinary data assignment before installing.
+            let set_outcome = object::resolve_set(obj, &self.gc_heap, atomized_key.name());
+            if !matches!(set_outcome, object::SetOutcome::AssignData) {
+                return full_set(self, frame, stack);
             }
             if self
                 .feedback_directory

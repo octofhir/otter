@@ -744,7 +744,7 @@ pub struct ObjectBody {
 /// dominant `{}` / class-instance case included — 8 bytes of always-present
 /// slack it usually does not use. Two inline slots cover the large majority of
 /// objects with ≤2 own string-keyed properties at half the slack.
-pub(crate) const INLINE_SLOT_CAP: usize = 2;
+pub(crate) const INLINE_SLOT_CAP: usize = 6;
 
 /// Rarely-used `ObjectBody` slots, boxed out of the hot object so plain
 /// objects stay small. Every field here is absent on a plain `{}` / class
@@ -847,17 +847,18 @@ const _: () = assert!(OBJECT_BODY_VALUES_PTR_OFFSET == 8);
 const _: () = assert!(OBJECT_BODY_DICTIONARY_SHAPE_ID_OFFSET == 40);
 const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET == 52);
 const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET == 72);
-const _: () = assert!(OBJECT_BODY_SLAB_LEN_OFFSET == 80);
+const _: () = assert!(OBJECT_BODY_SLAB_LEN_OFFSET == 96);
 // The shape guard word must sit at offset 0 (single-compare guard) and the
 // slab base must stay 8-aligned for the JIT's pointer load.
 const _: () = assert!(OBJECT_BODY_VALUES_PTR_OFFSET.is_multiple_of(8));
 
 // Pin the hot object footprint. Per-slot metadata lives out of line only for
 // dictionary-mode / attribute-overridden objects, while string-keyed values use
-// one contiguous slab addressed from a cached pointer. Shrinking
-// `INLINE_SLOT_CAP` 4 -> 2 dropped two inline `CompressedValue`s (8 bytes) off
-// the tail.
-const _: () = assert!(std::mem::size_of::<ObjectBody>() == 88);
+// one contiguous slab addressed from a cached pointer. Six inline slots cover
+// the common constructor-built object (a 3-6 field instance) without an
+// out-of-line allocation; measured on allocation-heavy workloads, the malloc
+// per spilled object cost more than the 16 extra body bytes.
+const _: () = assert!(std::mem::size_of::<ObjectBody>() == 104);
 
 impl ObjectBody {
     /// Number of live string-keyed slots.

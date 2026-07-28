@@ -327,7 +327,7 @@ pub(crate) fn emit_slab_base(ops: &mut Assembler, view: &JitCompileSnapshot, reg
     // inline slab capacity and the header-relative offset of the in-body
     // inline slab, checked against the values otter-vm baked from the live
     // `#[repr(C)]` layout so a field reorder trips in tests.
-    const INLINE_SLOT_CAP: u32 = 2;
+    const INLINE_SLOT_CAP: u32 = 6;
     const INLINE_VALUES_BYTE: u32 = 80;
     debug_assert_eq!(INLINE_SLOT_CAP, view.object_inline_slot_cap);
     debug_assert_eq!(INLINE_VALUES_BYTE, view.object_inline_values_byte);

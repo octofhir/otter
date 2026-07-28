@@ -379,10 +379,23 @@ impl<'a> Visit<'a> for OwnNameCollector {
     }
 }
 
-/// Own names (params, `arguments` for non-arrows, and top-level locals /
-/// nested declaration names) of one nested function — the bindings that
-/// shadow any equally-named outer variable within it. Excludes anything
-/// declared inside a further-nested function (that has its own scope).
+/// The names a nested function shadows *everywhere inside itself*.
+///
+/// Used to decide whether a reference inside a nested function is a capture of
+/// an outer binding. Only bindings that cover the whole nested function belong
+/// here: its parameters, its `arguments`, the `var`s it declares at any depth
+/// (those are function-scoped), and the lexical declarations at the top level
+/// of its body.
+///
+/// A `let` inside a *block* deliberately does not count. It shadows within its
+/// block and nowhere else, so counting it would suppress the capture of the
+/// outer binding that the rest of the function still refers to — and that
+/// binding would then have no upvalue cell, which is a `ReferenceError` at the
+/// first reference outside the block.
+///
+/// The set is deliberately minimal. Naming one name too few costs an upvalue
+/// cell that nothing reads; naming one too many costs a reference that resolves
+/// to nothing.
 fn nested_function_own_names(
     params: Option<&FormalParameters<'_>>,
     body: Option<&FunctionBody<'_>>,
@@ -395,10 +408,72 @@ fn nested_function_own_names(
     if !is_arrow {
         own.names.insert("arguments".to_string());
     }
-    if let Some(b) = body {
-        own.visit_function_body(b);
+    let Some(body) = body else {
+        return own.names;
+    };
+
+    // The top level of the body: every declaration here covers the whole
+    // function, whatever its kind.
+    for statement in &body.statements {
+        match statement {
+            Statement::VariableDeclaration(declaration) => {
+                for declarator in &declaration.declarations {
+                    own.collect_pattern_leaves(&declarator.id);
+                }
+            }
+            Statement::FunctionDeclaration(function) => {
+                if let Some(id) = function.id.as_ref() {
+                    own.names.insert(id.name.as_str().to_string());
+                }
+            }
+            Statement::ClassDeclaration(class) => {
+                if let Some(id) = class.id.as_ref() {
+                    own.names.insert(id.name.as_str().to_string());
+                }
+            }
+            _ => {}
+        }
     }
+
+    // And `var`, wherever it is written: a `var` in a block is a binding of the
+    // function, not of the block.
+    let mut vars = VarNameCollector::default();
+    vars.visit_function_body(body);
+    own.names.extend(vars.names);
     own.names
+}
+
+/// Every `var` a function declares, at any block depth, excluding those of
+/// nested functions.
+#[derive(Default)]
+struct VarNameCollector {
+    names: HashSet<String>,
+    nested_depth: u32,
+}
+
+impl<'a> Visit<'a> for VarNameCollector {
+    fn visit_function(&mut self, it: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
+        self.nested_depth = self.nested_depth.saturating_add(1);
+        walk::walk_function(self, it, flags);
+        self.nested_depth = self.nested_depth.saturating_sub(1);
+    }
+
+    fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+        self.nested_depth = self.nested_depth.saturating_add(1);
+        walk::walk_arrow_function_expression(self, it);
+        self.nested_depth = self.nested_depth.saturating_sub(1);
+    }
+
+    fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
+        if self.nested_depth == 0 && it.kind.is_var() {
+            let mut leaves = OwnNameCollector::default();
+            for declarator in &it.declarations {
+                leaves.collect_pattern_leaves(&declarator.id);
+            }
+            self.names.extend(leaves.names);
+        }
+        walk::walk_variable_declaration(self, it);
+    }
 }
 
 /// Walks a function body and collects the free variables of every nested

@@ -28,7 +28,7 @@
 
 use std::collections::BTreeMap;
 
-use otter_vm::{JitCompileSnapshot, JitInlineCallee};
+use otter_vm::JitCompileSnapshot;
 
 use super::unit::OptimizedUnit;
 use crate::{
@@ -114,14 +114,15 @@ impl OptimizationPipeline {
         Self { register_budget }
     }
 
-    /// Analyze and verify one immutable snapshot for a machine backend.
-    pub(crate) fn analyze(
+    /// Analyze and verify one already-decided inline tree.
+    ///
+    /// Backends use this entry point to test a budget-admitted frame against
+    /// the complete splicer and analysis contract before retaining it.
+    pub(crate) fn analyze_tree(
         self,
         view: &JitCompileSnapshot,
-        accept_inline: impl Fn(&JitInlineCallee) -> bool,
-        accept_method_inline: impl Fn(&otter_vm::JitInlineMethod) -> bool,
+        tree: InlineTree,
     ) -> Result<OptimizedUnit, OptimizationError> {
-        let tree = InlineTree::build_where(view, accept_inline, accept_method_inline);
         tree.verify()
             .map_err(OptimizationError::InlineTreeVerification)?;
 

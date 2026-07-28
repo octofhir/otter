@@ -278,7 +278,7 @@ pub use jit_debug::{
     JIT_DEBUG_EVENT_LIMIT, JitCompilerDiagnostic, JitDebugCompileOutcome, JitDebugEvent,
     JitDebugReport, JitDebugRequest, JitDebugTarget, JitDebugTier, JitDirectCallLoweringOutcome,
     JitDirectCallLoweringRejectionReason, JitDirectCallPlanOutcome, JitDirectCallRejectionReason,
-    JitInlineRejectionReason, JitStaticNativeCallLoweringOutcome,
+    JitInlineLoweringOutcome, JitInlineRejectionReason, JitStaticNativeCallLoweringOutcome,
     JitStaticNativeCallLoweringRejectionReason,
 };
 pub use js_surface::{

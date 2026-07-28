@@ -486,7 +486,8 @@ invariants.
 - [x] Bounded owned JIT events and current-format JIT artifact bundles with
   machine code, normalized code, annotated ARM64, relocations, code maps,
   deopt metadata, and safepoints.
-- [x] Direct-call/method/global-load/static-native lowering and deopt events.
+- [x] Budgeted-inline/direct-call/method/global-load/static-native lowering and
+  deopt events, including named complete-pipeline inline declines.
 - [x] Benchmark idle-memory and complete JIT runtime-stat deltas.
 
 ### Active Diagnostics Work

@@ -2,17 +2,19 @@
 //!
 //! The optimizing tier compiles one outermost function plus the callee bodies
 //! it decides to splice into it. This module owns that decision and nothing
-//! else: it turns the VM-baked monomorphic call-site candidates into a verified
-//! tree of frames, each naming the exact caller instruction it replaces and the
-//! callee body that replaces it. Graph construction, renaming, deopt frame
-//! chaining, and emission consume the tree; none of them re-derive it.
+//! else: it turns the VM-baked monomorphic call-site candidates into a
+//! cost-bounded, verified tree of frames, each naming the exact caller
+//! instruction it replaces and the callee body that replaces it. Graph
+//! construction, renaming, deopt frame chaining, and emission consume the tree;
+//! none of them re-derive it.
 //!
 //! # Contents
 //! - [`InlineId`] — dense identity of one frame; [`InlineId::ROOT`] is the
 //!   compiled function itself.
 //! - [`InlineFrame`] — one frame: its parent, the parent call site it replaces,
 //!   and the callee body to build.
-//! - [`InlineTree`] — the whole decision, with [`InlineTree::verify`].
+//! - [`InlineCost`] — one candidate's bytecode, depth, call, and loop cost.
+//! - [`InlineTree`] — the whole budgeted decision, with [`InlineTree::verify`].
 //!
 //! # Invariants
 //! - Frame ids are dense and ascending, and a frame's parent always precedes
@@ -24,6 +26,8 @@
 //!   (parent, call_pc).
 //! - No function id repeats along a root-to-leaf path, so a recursive cycle can
 //!   never be spliced into itself.
+//! - Every accepted call fits the per-call budget and the sum of accepted costs
+//!   fits the cumulative unit budget.
 //! - Splicing is a speculation, not a proof: the emitter still guards the
 //!   callee's identity at the call site and deoptimizes when it fails.
 //!
@@ -34,18 +38,37 @@
 
 use std::sync::Arc;
 
-use otter_bytecode::Op;
+use otter_bytecode::{Op, Operand};
 use otter_vm::jit::JitMethodGuard;
 use otter_vm::{CodeBlock, JitCompileSnapshot, JitInlineMethod, JitInstructionMetadata};
 
-/// Maximum callee instruction count accepted for splicing.
-///
-/// Bounds emitted code growth per call site. A body larger than this keeps its
-/// ordinary call.
-pub const MAX_INLINE_INSTRUCTIONS: usize = 64;
-
 /// Maximum depth of spliced frames below the root.
-pub const MAX_INLINE_DEPTH: u32 = 1;
+pub const MAX_INLINE_DEPTH: u32 = 5;
+
+/// Maximum weighted cost admitted at one monomorphic call site.
+pub const MAX_INLINE_CALL_COST: u32 = 170;
+
+/// Maximum weighted cost of every callee spliced into one optimized unit.
+pub const MAX_INLINE_UNIT_COST: u32 = 920;
+
+const INLINE_DEPTH_COST: u32 = 6;
+const INLINE_LOOP_COST: u32 = 24;
+const INLINE_NESTED_CALL_COST: u32 = 8;
+
+/// Weighted bytecode cost of one accepted inline frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InlineCost {
+    /// Number of bytecode instructions in the body.
+    pub bytecodes: u32,
+    /// Depth below the optimized unit's root.
+    pub depth: u32,
+    /// Number of call-like instructions left in the body.
+    pub nested_calls: u32,
+    /// Whether the body contains a backward control-flow edge.
+    pub has_loop: bool,
+    /// Weighted cost charged to the unit budget.
+    pub total: u32,
+}
 
 /// Dense identity of one frame in an [`InlineTree`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -108,6 +131,8 @@ pub struct InlineMethodData {
     pub prop_offsets: rustc_hash::FxHashMap<u32, u32>,
     /// Non-receiver body byte PC to required object shape.
     pub prop_shapes: rustc_hash::FxHashMap<u32, u32>,
+    /// Monomorphic nested method candidates keyed by body byte PC.
+    pub nested_methods: rustc_hash::FxHashMap<u32, JitInlineMethod>,
 }
 
 /// One function body in the compiled unit.
@@ -125,6 +150,8 @@ pub struct InlineFrame {
     pub instructions: Vec<JitInstructionMetadata>,
     /// Direct property facts for a method frame; absent for root/plain bodies.
     pub method: Option<InlineMethodData>,
+    /// Weighted budget charge; zero only for the root frame.
+    pub cost: u32,
 }
 
 impl InlineFrame {
@@ -205,12 +232,14 @@ pub enum InlineError {
         /// Function id already on the path.
         function_id: u32,
     },
-    /// A frame's body exceeds [`MAX_INLINE_INSTRUCTIONS`].
-    BodyTooLarge {
+    /// A frame's stored budget charge does not match its body and depth.
+    CostMismatch {
         /// Offending frame.
         id: InlineId,
-        /// Instruction count of its body.
-        instructions: usize,
+        /// Charge stored with the frame.
+        stored: u32,
+        /// Charge recomputed by the verifier.
+        computed: u32,
     },
     /// A frame is deeper than [`MAX_INLINE_DEPTH`].
     TooDeep {
@@ -218,6 +247,18 @@ pub enum InlineError {
         id: InlineId,
         /// Depth below the root.
         depth: u32,
+    },
+    /// One accepted frame exceeds the per-call cost ceiling.
+    CallBudgetExceeded {
+        /// Offending frame.
+        id: InlineId,
+        /// Recomputed weighted cost.
+        cost: u32,
+    },
+    /// Accepted frames exceed the cumulative unit cost ceiling.
+    UnitBudgetExceeded {
+        /// Sum through the offending frame.
+        cost: u32,
     },
     /// A frame's instruction overlays are not in canonical PC order.
     InstructionOrder {
@@ -235,41 +276,37 @@ impl InlineTree {
     ///
     /// Splices a call site only when the VM baked a monomorphic candidate for
     /// it, the callee's formal arity matches the call exactly (no argument
-    /// padding or dropping is modelled), the body fits the size and depth
-    /// bounds, and the callee does not already appear on the path. Everything
-    /// else keeps its ordinary call.
+    /// padding or dropping is modelled), its weighted cost fits the per-call
+    /// and cumulative budgets, and the callee does not already appear on the
+    /// path. Everything else keeps its ordinary call.
     #[must_use]
     pub fn build(view: &JitCompileSnapshot) -> Self {
-        Self::build_where(view, |_| true, |_| true)
-    }
-
-    /// Decide the inline tree, splicing only callees `accept` approves.
-    ///
-    /// The backend passes its own lowering test here so a body it cannot splice
-    /// never enters the unit: an unsuitable callee would otherwise make the
-    /// whole unit ineligible and cost a previously-compiled function its code.
-    #[must_use]
-    pub fn build_where(
-        view: &JitCompileSnapshot,
-        accept_plain: impl Fn(&otter_vm::JitInlineCallee) -> bool,
-        accept_method: impl Fn(&JitInlineMethod) -> bool,
-    ) -> Self {
         let mut frames = Self::trivial(view).frames;
-        let accept_plain = &accept_plain;
-        let accept_method = &accept_method;
+        let mut unit_cost = 0_u32;
         // Breadth-first over the frames already accepted, so `MAX_INLINE_DEPTH`
         // is enforced by construction and every parent precedes its callees.
         let mut next = 0usize;
         while next < frames.len() {
             let parent_id = InlineId(next as u32);
-            let depth = frames[next].depth(&frames_view(&frames));
+            let depth = frame_depth(&frames, parent_id);
             if depth >= MAX_INLINE_DEPTH {
                 next += 1;
                 continue;
             }
-            let candidates =
-                Self::candidates_in(view, &frames, parent_id, accept_plain, accept_method);
+            let candidates = Self::candidates_in(view, &frames, parent_id);
             for candidate in candidates {
+                let candidate_depth = depth + 1;
+                let cost = inline_cost(
+                    candidate.code_block.as_ref(),
+                    &candidate.instructions,
+                    candidate_depth,
+                );
+                let Some(next_unit_cost) = unit_cost.checked_add(cost.total) else {
+                    continue;
+                };
+                if cost.total > MAX_INLINE_CALL_COST || next_unit_cost > MAX_INLINE_UNIT_COST {
+                    continue;
+                }
                 let id = InlineId(frames.len() as u32);
                 frames.push(InlineFrame {
                     id,
@@ -278,7 +315,9 @@ impl InlineTree {
                     code_block: candidate.code_block,
                     instructions: candidate.instructions,
                     method: candidate.method,
+                    cost: cost.total,
                 });
+                unit_cost = next_unit_cost;
             }
             next += 1;
         }
@@ -296,40 +335,34 @@ impl InlineTree {
                 code_block: Arc::clone(&view.code_block),
                 instructions: view.instructions.clone(),
                 method: None,
+                cost: 0,
             }],
         }
     }
 
     /// Collect the acceptable call sites of one already-accepted frame.
     ///
-    /// Only the root's call sites are consulted. The VM bakes candidates into a
-    /// map keyed by byte PC, and a byte PC is unique only within one body, so
-    /// the map can only be read against the body it was baked for. Splicing
-    /// below the root therefore needs per-frame candidates baked by the VM, and
-    /// [`MAX_INLINE_DEPTH`] is held at one until it provides them.
+    /// The root reads candidates from the compile snapshot. An accepted method
+    /// frame owns the recursively baked candidates for its byte-PC namespace,
+    /// so deeper method calls never consult the root's maps by accident.
     fn candidates_in(
         view: &JitCompileSnapshot,
         frames: &[InlineFrame],
         parent_id: InlineId,
-        accept_plain: impl Fn(&otter_vm::JitInlineCallee) -> bool,
-        accept_method: impl Fn(&JitInlineMethod) -> bool,
     ) -> Vec<InlineCandidate> {
-        if parent_id != InlineId::ROOT {
-            return Vec::new();
-        }
         let parent = &frames[parent_id.0 as usize];
         let code_block = parent.code_block.as_ref();
         let mut accepted = Vec::new();
         for instruction in &parent.instructions {
             match instruction.op(code_block) {
                 Op::Call => {
+                    if parent_id != InlineId::ROOT {
+                        continue;
+                    }
                     let Some(callee) = view.inline_callees.get(&instruction.byte_pc) else {
                         continue;
                     };
-                    if callee.instructions.len() > MAX_INLINE_INSTRUCTIONS
-                        || !accept_plain(callee)
-                        || Self::path_contains(frames, parent_id, callee.function_id)
-                    {
+                    if Self::path_contains(frames, parent_id, callee.function_id) {
                         continue;
                     }
                     let Some(call_site) =
@@ -349,13 +382,18 @@ impl InlineTree {
                     });
                 }
                 Op::CallMethodValue => {
-                    let Some(method) = view.inline_methods.get(&instruction.byte_pc) else {
+                    let method = if parent_id == InlineId::ROOT {
+                        view.inline_methods.get(&instruction.byte_pc)
+                    } else {
+                        parent
+                            .method
+                            .as_ref()
+                            .and_then(|method| method.nested_methods.get(&instruction.byte_pc))
+                    };
+                    let Some(method) = method else {
                         continue;
                     };
-                    if method.instructions.len() > MAX_INLINE_INSTRUCTIONS
-                        || !accept_method(method)
-                        || Self::path_contains(frames, parent_id, method.guard.method_fid)
-                    {
+                    if Self::path_contains(frames, parent_id, method.guard.method_fid) {
                         continue;
                     }
                     let Some(call_site) =
@@ -374,6 +412,7 @@ impl InlineTree {
                         method: Some(InlineMethodData {
                             prop_offsets: method.prop_offsets.clone(),
                             prop_shapes: method.prop_shapes.clone(),
+                            nested_methods: method.nested_methods.clone(),
                         }),
                     });
                 }
@@ -501,15 +540,16 @@ impl InlineTree {
                     });
                 }
             }
-            if frame.instructions.len() > MAX_INLINE_INSTRUCTIONS && frame.id != InlineId::ROOT {
-                return Err(InlineError::BodyTooLarge {
-                    id: frame.id,
-                    instructions: frame.instructions.len(),
-                });
-            }
             let Some(call_site) = frame.call_site.as_ref() else {
                 if index != 0 {
                     return Err(InlineError::RootShape { id: frame.id });
+                }
+                if frame.cost != 0 {
+                    return Err(InlineError::CostMismatch {
+                        id: frame.id,
+                        stored: frame.cost,
+                        computed: 0,
+                    });
                 }
                 continue;
             };
@@ -564,6 +604,24 @@ impl InlineTree {
                     depth,
                 });
             }
+            let computed = inline_cost(frame.code_block.as_ref(), &frame.instructions, depth).total;
+            if frame.cost != computed {
+                return Err(InlineError::CostMismatch {
+                    id: frame.id,
+                    stored: frame.cost,
+                    computed,
+                });
+            }
+            if computed > MAX_INLINE_CALL_COST {
+                return Err(InlineError::CallBudgetExceeded {
+                    id: frame.id,
+                    cost: computed,
+                });
+            }
+        }
+        let unit_cost = self.frames.iter().map(|frame| frame.cost).sum::<u32>();
+        if unit_cost > MAX_INLINE_UNIT_COST {
+            return Err(InlineError::UnitBudgetExceeded { cost: unit_cost });
         }
         Ok(())
     }
@@ -583,10 +641,57 @@ struct InlineCandidate {
     method: Option<InlineMethodData>,
 }
 
-/// Borrow an in-progress frame list as a tree for depth queries.
-fn frames_view(frames: &[InlineFrame]) -> InlineTree {
-    InlineTree {
-        frames: frames.to_vec(),
+fn frame_depth(frames: &[InlineFrame], from: InlineId) -> u32 {
+    let mut depth = 0;
+    let mut current = &frames[from.0 as usize];
+    while let Some(call_site) = current.call_site.as_ref() {
+        depth += 1;
+        current = &frames[call_site.parent.0 as usize];
+    }
+    depth
+}
+
+fn inline_cost(
+    code_block: &CodeBlock,
+    instructions: &[JitInstructionMetadata],
+    depth: u32,
+) -> InlineCost {
+    let bytecodes = u32::try_from(instructions.len()).unwrap_or(u32::MAX);
+    let nested_calls = u32::try_from(
+        instructions
+            .iter()
+            .filter(|instruction| {
+                matches!(
+                    instruction.op(code_block),
+                    Op::Call | Op::CallMethodValue | Op::New
+                )
+            })
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    let has_loop = instructions.iter().any(|instruction| {
+        if !matches!(
+            instruction.op(code_block),
+            Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue | Op::JumpIfNullish | Op::JumpViaFinally
+        ) {
+            return false;
+        }
+        let Some(Operand::Imm32(relative)) = instruction.operand_view(code_block).first() else {
+            return false;
+        };
+        i64::from(instruction.instruction_pc(code_block)) + 1 + i64::from(relative)
+            <= i64::from(instruction.instruction_pc(code_block))
+    });
+    let total = bytecodes
+        .saturating_add(depth.saturating_mul(INLINE_DEPTH_COST))
+        .saturating_add(nested_calls.saturating_mul(INLINE_NESTED_CALL_COST))
+        .saturating_add(if has_loop { INLINE_LOOP_COST } else { 0 });
+    InlineCost {
+        bytecodes,
+        depth,
+        nested_calls,
+        has_loop,
+        total,
     }
 }
 
@@ -615,6 +720,30 @@ mod tests {
         }
     }
 
+    fn method(
+        fid: u32,
+        param_count: u16,
+        instructions: Vec<JitTestInstruction>,
+        nested_methods: rustc_hash::FxHashMap<u32, JitInlineMethod>,
+    ) -> JitInlineMethod {
+        let view = JitCompileSnapshot::without_feedback(fid, param_count, 8, instructions);
+        JitInlineMethod {
+            code_block: Arc::clone(&view.code_block),
+            guard: JitMethodGuard {
+                method_fid: fid,
+                recv_shape: fid + 100,
+                proto_chain: Vec::new(),
+                method_value_byte: 0,
+            },
+            param_count,
+            register_count: view.code_block.register_count,
+            instructions: view.instructions,
+            prop_offsets: rustc_hash::FxHashMap::default(),
+            prop_shapes: rustc_hash::FxHashMap::default(),
+            nested_methods,
+        }
+    }
+
     /// `r0 = r1(r2)` at pc 0, then `return r0`.
     fn caller_with_one_call() -> Vec<JitTestInstruction> {
         vec![
@@ -630,6 +759,25 @@ mod tests {
                 ],
             ),
             JitTestInstruction::new(Op::ReturnValue, 1, 8, vec![Operand::Register(0)]),
+        ]
+    }
+
+    /// `r0 = r1.m(r2)` at pc 0, then `return r0`.
+    fn caller_with_one_method_call() -> Vec<JitTestInstruction> {
+        vec![
+            JitTestInstruction::new(
+                Op::CallMethodValue,
+                0,
+                0,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(1),
+                    Operand::Register(2),
+                ],
+            ),
+            JitTestInstruction::new(Op::ReturnValue, 1, 10, vec![Operand::Register(0)]),
         ]
     }
 
@@ -696,15 +844,15 @@ mod tests {
     }
 
     #[test]
-    fn oversized_body_keeps_the_ordinary_call() {
+    fn over_budget_body_keeps_the_ordinary_call() {
         let mut view = snapshot(7, caller_with_one_call());
         let call_byte_pc = view.instructions[0].byte_pc;
-        let mut body: Vec<JitTestInstruction> = (0..MAX_INLINE_INSTRUCTIONS as u32 + 1)
+        let mut body: Vec<JitTestInstruction> = (0..MAX_INLINE_CALL_COST + 1)
             .map(|pc| JitTestInstruction::new(Op::Nop, pc, pc * 8, Vec::new()))
             .collect();
         body.push(JitTestInstruction::new(
             Op::ReturnValue,
-            MAX_INLINE_INSTRUCTIONS as u32 + 1,
+            MAX_INLINE_CALL_COST + 1,
             0,
             vec![Operand::Register(0)],
         ));
@@ -727,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_root_body_consults_the_baked_candidate_map() {
+    fn a_plain_nested_call_does_not_reuse_the_roots_byte_pc_map() {
         // The root calls 9, whose own body calls something at a byte PC that
         // also has a baked candidate. That candidate belongs to the root's byte
         // PC space, so the spliced frame must not consult it and 11 must not
@@ -746,7 +894,27 @@ mod tests {
         assert_eq!(tree.frames.len(), 2);
         assert_eq!(tree.frames[1].function_id, 9);
         assert_eq!(tree.frames[1].depth(&tree), 1);
-        assert_eq!(MAX_INLINE_DEPTH, 1);
+        assert_eq!(MAX_INLINE_DEPTH, 5);
+    }
+
+    #[test]
+    fn recursively_baked_method_candidates_form_a_budgeted_chain() {
+        let mut view = snapshot(7, caller_with_one_method_call());
+        let leaf = method(11, 1, identity_body(), rustc_hash::FxHashMap::default());
+        let mut nested_methods = rustc_hash::FxHashMap::default();
+        nested_methods.insert(0, leaf);
+        let middle = method(9, 1, caller_with_one_method_call(), nested_methods);
+        view.inline_methods.insert(0, middle);
+
+        let tree = InlineTree::build(&view);
+        tree.verify()
+            .expect("a recursively baked method chain is well formed");
+        assert_eq!(tree.frames.len(), 3);
+        assert_eq!(tree.frames[1].function_id, 9);
+        assert_eq!(tree.frames[1].depth(&tree), 1);
+        assert_eq!(tree.frames[2].function_id, 11);
+        assert_eq!(tree.frames[2].depth(&tree), 2);
+        assert!(tree.frames.iter().map(|frame| frame.cost).sum::<u32>() <= MAX_INLINE_UNIT_COST);
     }
 
     #[test]

@@ -50,7 +50,7 @@ global-object dictionary slots. `directCallees`, `directMethodSites`, and
 `directMethodTargets` report stable function links whose current generations
 were available for generated plain and bounded polymorphic method linkage,
 separately from `inlineCallees` /
-`inlineMethods`, which count bodies offered to the leaf inliner. A
+`inlineMethods`, which count bodies offered to the inliner. A
 `directCallPlan` event records every observed call target inspected.
 `targetIndex` / `targetCount` identify its position in the bounded chain.
 `callKind` is `plain` or `method`. Its typed result is either
@@ -70,6 +70,14 @@ publication switches the selected generation without recompiling the caller.
 `callerCodeObjectId` identifies the exact successful caller generation.
 Planning and lowering are separate events so diagnostics never claim a native
 call edge that the backend did not emit.
+
+For every monomorphic body admitted by the optimizing tier's inline budget,
+`inlineLowered` records the owning code object, parent/callee function ids,
+parent logical and byte PCs, inline depth, and weighted cost. Its outcome is
+`inlined` only after the complete CFG, SSA, frame-state, register-allocation,
+and backend eligibility pipeline accepts the candidate subtree. A `rejected`
+outcome owns the exact typed stage failure, so an opcode or frame shape the
+splicer cannot represent is visible instead of silently filtered.
 
 Exact artifacts represent a baked global-declarative cell as a
 `globalLexicalCell` relocation keyed by byte PC. The raw pointer is redacted

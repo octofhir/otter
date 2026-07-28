@@ -113,6 +113,7 @@ use super::{
     pipeline::{
         OptimizationError, OptimizationPipeline, total_spill_slots as analyzed_spill_slot_count,
     },
+    unit::OptimizedUnit,
 };
 use crate::{
     CompiledCode,
@@ -351,30 +352,90 @@ pub(super) fn compile_with_artifacts(
     artifact_request: Option<ArtifactRequest>,
     capture_events: bool,
 ) -> Result<NativeCompileOutput<OptimizedCode>, Unsupported> {
-    // The unit is the root function plus every callee body the inline tree
-    // splices into it, from the VM-baked monomorphic candidates. Only bodies
-    // this backend lowers entirely into machine registers are spliced: a
-    // reentrant transition inside a callee would need an interpreter window the
-    // spliced frame does not have, and one unsuitable callee would otherwise
-    // cost the whole unit its compilation.
-    let unit = OptimizationPipeline::new(REGISTER_BUDGET)
-        .analyze(view, splice_lowerable, splice_lowerable_method)
+    // Budgeting decides what is worth attempting. The complete optimizing
+    // pipeline then proves each candidate in call-site order against all
+    // previously accepted frames. A body the splicer or backend cannot
+    // represent declines at that one site with its typed reason; it never
+    // makes the caller's otherwise-valid optimized unit disappear.
+    let pipeline = OptimizationPipeline::new(REGISTER_BUDGET);
+    let planned_tree = InlineTree::build(view);
+    let mut selected_tree = InlineTree {
+        frames: vec![planned_tree.frames[0].clone()],
+    };
+    let mut selected_ids = vec![None; planned_tree.frames.len()];
+    selected_ids[0] = Some(InlineId::ROOT);
+    let mut unit = pipeline
+        .analyze_tree(view, selected_tree.clone())
         .map_err(OptimizationError::into_unsupported)?;
-
-    let eligibility = check_eligibility(
-        view,
-        &unit.tree,
-        &unit.cfg,
-        &unit.dom,
-        &unit.ssa,
-        &unit.hoisted_loops,
-        EligibilityAnalyses {
-            liveness: &unit.liveness,
-            reprs: &unit.reprs,
-            allocation: &unit.allocation,
-            frame_states: &unit.frame_states,
-        },
-    )?;
+    let mut eligibility = check_unit_eligibility(view, &unit)?;
+    let mut inline_diagnostics = Vec::new();
+    for root_candidate in planned_tree.frames.iter().skip(1).filter(|frame| {
+        frame
+            .call_site
+            .as_ref()
+            .is_some_and(|call_site| call_site.parent == InlineId::ROOT)
+    }) {
+        let mut trial_tree = selected_tree.clone();
+        let mut trial_ids = selected_ids.clone();
+        let subtree = planned_tree
+            .frames
+            .iter()
+            .skip(1)
+            .filter(|frame| top_level_inline_parent(&planned_tree, frame.id) == root_candidate.id)
+            .collect::<Vec<_>>();
+        for planned_frame in &subtree {
+            let mut trial_frame = (*planned_frame).clone();
+            let call_site = trial_frame
+                .call_site
+                .as_mut()
+                .expect("a non-root inline frame has one call site");
+            call_site.parent = trial_ids[call_site.parent.0 as usize]
+                .expect("a budgeted subtree lists every parent before its children");
+            trial_frame.id = InlineId(trial_tree.frames.len() as u32);
+            trial_ids[planned_frame.id.0 as usize] = Some(trial_frame.id);
+            trial_tree.frames.push(trial_frame);
+        }
+        let trial_unit = match pipeline.analyze_tree(view, trial_tree.clone()) {
+            Ok(unit) => unit,
+            Err(error) => {
+                if capture_events {
+                    record_inline_subtree_diagnostics(
+                        &mut inline_diagnostics,
+                        &planned_tree,
+                        &subtree,
+                        Err(format!("{error:?}")),
+                    )?;
+                }
+                continue;
+            }
+        };
+        let trial_eligibility = match check_unit_eligibility(view, &trial_unit) {
+            Ok(eligibility) => eligibility,
+            Err(error) => {
+                if capture_events {
+                    record_inline_subtree_diagnostics(
+                        &mut inline_diagnostics,
+                        &planned_tree,
+                        &subtree,
+                        Err(format!("{error:?}")),
+                    )?;
+                }
+                continue;
+            }
+        };
+        if capture_events {
+            record_inline_subtree_diagnostics(
+                &mut inline_diagnostics,
+                &planned_tree,
+                &subtree,
+                Ok(()),
+            )?;
+        }
+        selected_ids = trial_ids;
+        selected_tree = trial_tree;
+        unit = trial_unit;
+        eligibility = trial_eligibility;
+    }
     let load_property_sites = unit
         .dom
         .reverse_postorder()
@@ -569,22 +630,83 @@ pub(super) fn compile_with_artifacts(
             spill_slot_count: unit.spill_slot_count,
         },
     );
+    let mut diagnostics = inline_diagnostics;
+    if let Some(events) = emission.direct_call_events {
+        diagnostics.extend(events.into_values());
+    }
     Ok(NativeCompileOutput {
         code,
         artifact,
-        diagnostics: emission
-            .direct_call_events
-            .map(|events| events.into_values().collect::<Vec<_>>().into_boxed_slice())
-            .unwrap_or_default(),
+        diagnostics: diagnostics.into_boxed_slice(),
     })
 }
 
-/// `true` when every instruction of `callee` lowers into machine registers.
-///
-/// This is the backend's own splice test, mirrored ahead of tree construction:
-/// arithmetic, compares, branches, moves, constants, and returns qualify;
-/// anything that calls, allocates, or reaches the heap through a reentrant
-/// window transition does not.
+fn check_unit_eligibility(
+    view: &JitCompileSnapshot,
+    unit: &OptimizedUnit,
+) -> Result<Eligibility, Unsupported> {
+    check_eligibility(
+        view,
+        &unit.tree,
+        &unit.cfg,
+        &unit.dom,
+        &unit.ssa,
+        &unit.hoisted_loops,
+        EligibilityAnalyses {
+            liveness: &unit.liveness,
+            reprs: &unit.reprs,
+            allocation: &unit.allocation,
+            frame_states: &unit.frame_states,
+        },
+    )
+}
+
+fn top_level_inline_parent(tree: &InlineTree, mut frame: InlineId) -> InlineId {
+    loop {
+        let call_site = tree.frames[frame.0 as usize]
+            .call_site
+            .as_ref()
+            .expect("a non-root inline frame has one call site");
+        if call_site.parent == InlineId::ROOT {
+            return frame;
+        }
+        frame = call_site.parent;
+    }
+}
+
+fn record_inline_subtree_diagnostics(
+    diagnostics: &mut Vec<otter_vm::JitCompilerDiagnostic>,
+    tree: &InlineTree,
+    subtree: &[&InlineFrame],
+    outcome: Result<(), String>,
+) -> Result<(), Unsupported> {
+    for frame in subtree {
+        let call_site = frame
+            .call_site
+            .as_ref()
+            .expect("a non-root inline frame has one call site");
+        let parent = &tree.frames[call_site.parent.0 as usize];
+        let instruction = parent.instructions.get(call_site.call_pc as usize).ok_or(
+            Unsupported::OperandShape("budgeted inline call PC outside parent body"),
+        )?;
+        diagnostics.push(otter_vm::JitCompilerDiagnostic::InlineLowered {
+            parent_function_id: parent.function_id,
+            instruction_pc: call_site.call_pc,
+            byte_pc: instruction.byte_pc,
+            callee_function_id: frame.function_id,
+            depth: frame.depth(tree),
+            cost: frame.cost,
+            outcome: match &outcome {
+                Ok(()) => otter_vm::JitInlineLoweringOutcome::Inlined,
+                Err(reason) => otter_vm::JitInlineLoweringOutcome::Rejected {
+                    reason: reason.clone(),
+                },
+            },
+        });
+    }
+    Ok(())
+}
+
 /// The allocatable register a holder address occupies, or `None` when the
 /// allocator spilled it.
 fn header_register(allocation: &Allocation, header: ValueId) -> Result<Option<u8>, Unsupported> {

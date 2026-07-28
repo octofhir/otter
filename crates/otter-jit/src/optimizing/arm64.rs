@@ -144,7 +144,7 @@ use crate::{
         licm::HoistedGroup,
         liveness::Liveness,
         regalloc::{
-            Allocation, EdgeMoves, Location, Move, RegClass, RegisterBudget, has_non_dead_use,
+            Allocation, EdgeMoves, Location, MergeLiveness, Move, RegClass, RegisterBudget,
         },
         repr::{ConversionKind, ReprMap, Representation},
         ssa::{SsaFunction, SsaInstr, SsaOp, ValueDef, ValueId},
@@ -734,6 +734,7 @@ fn emit(
     capture_artifacts: bool,
     capture_events: bool,
 ) -> Result<OptimizedEmission, Unsupported> {
+    let merges = MergeLiveness::compute(ssa);
     let EmissionPlan {
         reprs,
         allocation,
@@ -908,7 +909,7 @@ fn emit(
                 emit_load_parameter(&mut ops, index, 9);
                 emit_store_tagged_location(&mut ops, allocation.location(value.id), 9)?;
             }
-            ValueDef::Uninitialized { .. } if has_non_dead_use(ssa, value.id) => {
+            ValueDef::Uninitialized { .. } if merges.has_non_dead_use(value.id) => {
                 emit_load_u32(&mut ops, 9, otter_vm::Value::undefined().to_bits() as u32);
                 emit_store_tagged_location(&mut ops, allocation.location(value.id), 9)?;
             }
@@ -939,7 +940,7 @@ fn emit(
                 if matches!(
                     ssa.values[head.0 as usize].def,
                     ValueDef::Uninitialized { .. } | ValueDef::InlineUndefinedReturn { .. }
-                ) && has_non_dead_use(ssa, head)
+                ) && merges.has_non_dead_use(head)
                 {
                     emit_load_u32(&mut ops, 9, otter_vm::Value::undefined().to_bits() as u32);
                     emit_store_tagged_location(&mut ops, allocation.location(head), 9)?;

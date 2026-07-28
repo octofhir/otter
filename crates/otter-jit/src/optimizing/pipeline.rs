@@ -176,7 +176,9 @@ impl OptimizationPipeline {
             .map_err(OptimizationError::FrameStateVerification)?;
 
         let linear_scan_spill_slot_count = total_spill_slots(&allocation)?;
-        let mut allocation = legalize_deopt_locations(&allocation, &frame_states, &ssa, &reprs)?;
+        let merges = crate::ir::regalloc::MergeLiveness::compute(&ssa);
+        let mut allocation =
+            legalize_deopt_locations(&allocation, &frame_states, &ssa, &reprs, &merges)?;
         allocation
             .rebuild_edge_moves(&ssa, &cfg, &reprs)
             .map_err(OptimizationError::LegalizedPhiMoves)?;
@@ -222,12 +224,13 @@ fn legalize_deopt_locations(
     frame_states: &FrameStateTable,
     ssa: &SsaFunction,
     reprs: &ReprMap,
+    merges: &crate::ir::regalloc::MergeLiveness,
 ) -> Result<Allocation, OptimizationError> {
     let mut legalized = allocation.clone();
     for state in frame_states.states() {
         let mut owners = BTreeMap::<Location, ValueId>::new();
         for value in state.registers.iter().flatten().copied() {
-            if rematerialized_deopt_slot(ssa, reprs, Some(value)).is_some() {
+            if rematerialized_deopt_slot(ssa, reprs, merges, Some(value)).is_some() {
                 continue;
             }
             let location = legalized.location(value);

@@ -477,10 +477,11 @@ impl Allocation {
         reprs: &ReprMap,
         register_budget: RegisterBudget,
     ) -> Result<Self, RegallocError> {
+        let merges = MergeLiveness::compute(ssa);
         let linear = linearize(ssa, cfg)?;
-        let intervals = build_intervals(ssa, cfg, liveness, &linear)?;
+        let intervals = build_intervals(ssa, cfg, liveness, &linear, &merges)?;
         let (locations, spill_slot_counts) = linear_scan(&intervals, reprs, register_budget)?;
-        let edge_moves = build_edge_moves(ssa, cfg, reprs, &locations, register_budget)?;
+        let edge_moves = build_edge_moves(ssa, cfg, reprs, &locations, register_budget, &merges)?;
         Ok(Self {
             locations: locations.into_boxed_slice(),
             intervals: intervals.into_boxed_slice(),
@@ -507,8 +508,16 @@ impl Allocation {
         cfg: &ControlFlowGraph,
         reprs: &ReprMap,
     ) -> Result<(), RegallocError> {
-        self.edge_moves = build_edge_moves(ssa, cfg, reprs, &self.locations, self.register_budget)?
-            .into_boxed_slice();
+        let merges = MergeLiveness::compute(ssa);
+        self.edge_moves = build_edge_moves(
+            ssa,
+            cfg,
+            reprs,
+            &self.locations,
+            self.register_budget,
+            &merges,
+        )?
+        .into_boxed_slice();
         Ok(())
     }
 
@@ -534,8 +543,9 @@ impl Allocation {
             });
         }
 
+        let merges = MergeLiveness::compute(ssa);
         let linear = linearize(ssa, cfg)?;
-        verify_intervals(&self.intervals, ssa, cfg, liveness, &linear)?;
+        verify_intervals(&self.intervals, ssa, cfg, liveness, &linear, &merges)?;
         self.verify_locations(reprs)?;
         self.verify_interference()?;
         self.verify_spills()?;
@@ -567,7 +577,7 @@ impl Allocation {
             }
         }
 
-        self.verify_edge_moves(ssa, cfg, reprs)
+        self.verify_edge_moves(ssa, cfg, reprs, &merges)
     }
 
     fn verify_locations(&self, reprs: &ReprMap) -> Result<(), RegallocError> {
@@ -676,6 +686,7 @@ impl Allocation {
         ssa: &SsaFunction,
         cfg: &ControlFlowGraph,
         reprs: &ReprMap,
+        merges: &MergeLiveness,
     ) -> Result<(), RegallocError> {
         let expected_edges = normal_edges(cfg);
         let edge_count = expected_edges.len().max(self.edge_moves.len());
@@ -702,6 +713,7 @@ impl Allocation {
                 &self.locations,
                 edge.predecessor,
                 edge.block,
+                merges,
             )?;
             for movement in &edge.moves {
                 validate_move_shape(*movement, edge.predecessor, edge.block)?;
@@ -737,6 +749,7 @@ impl Allocation {
                 &self.locations,
                 edge.predecessor,
                 edge.block,
+                merges,
             )? {
                 let actual = contents.get(&movement.dst).copied();
                 if actual != Some(movement.src) {
@@ -872,6 +885,7 @@ fn build_intervals(
     cfg: &ControlFlowGraph,
     liveness: &Liveness,
     linear: &Linearization,
+    merges: &MergeLiveness,
 ) -> Result<Vec<LiveInterval>, RegallocError> {
     let mut intervals = Vec::with_capacity(ssa.values.len());
     for (index, &position) in linear.definition_positions.iter().enumerate() {
@@ -885,7 +899,7 @@ fn build_intervals(
         });
     }
 
-    extend_simultaneous_block_heads(ssa, linear, &mut intervals)?;
+    extend_simultaneous_block_heads(ssa, linear, merges, &mut intervals)?;
 
     for point in &linear.points {
         let PointKind::Instruction(instruction_index) = point.kind else {
@@ -904,6 +918,7 @@ fn build_intervals(
 fn extend_simultaneous_block_heads(
     ssa: &SsaFunction,
     linear: &Linearization,
+    merges: &MergeLiveness,
     intervals: &mut [LiveInterval],
 ) -> Result<(), RegallocError> {
     for block in &ssa.blocks {
@@ -911,13 +926,13 @@ fn extend_simultaneous_block_heads(
         // destinations. A phi nothing reads receives no copy, so it is not one
         // of them: holding a register across the whole head run for each would
         // reserve the file for values no code ever writes or loads.
-        let Some(&last_head) = block.phis.iter().rfind(|&&phi| !is_dead_phi(ssa, phi)) else {
+        let Some(&last_head) = block.phis.iter().rfind(|&&phi| !merges.is_dead_phi(phi)) else {
             continue;
         };
         let last_position = linear.definition_positions[value_index(last_head, ssa.values.len())?]
             .ok_or(RegallocError::MissingDefinition { value: last_head })?;
         for &head in &block.phis {
-            if is_dead_phi(ssa, head) {
+            if merges.is_dead_phi(head) {
                 continue;
             }
             extend_interval(intervals, head, last_position, ssa.values.len())?;
@@ -973,6 +988,7 @@ fn verify_intervals(
     cfg: &ControlFlowGraph,
     liveness: &Liveness,
     linear: &Linearization,
+    merges: &MergeLiveness,
 ) -> Result<(), RegallocError> {
     let value_count = ssa.values.len();
     let mut required_ends = Vec::with_capacity(value_count);
@@ -999,13 +1015,13 @@ fn verify_intervals(
     for block in &ssa.blocks {
         // Mirrors construction: only destinations the parallel copy writes are
         // simultaneous, and a structurally dead phi receives no copy.
-        let Some(&last_head) = block.phis.iter().rfind(|&&phi| !is_dead_phi(ssa, phi)) else {
+        let Some(&last_head) = block.phis.iter().rfind(|&&phi| !merges.is_dead_phi(phi)) else {
             continue;
         };
         let last_position = linear.definition_positions[value_index(last_head, value_count)?]
             .ok_or(RegallocError::MissingDefinition { value: last_head })?;
         for &head in &block.phis {
-            if is_dead_phi(ssa, head) {
+            if merges.is_dead_phi(head) {
                 continue;
             }
             let index = value_index(head, value_count)?;
@@ -1204,11 +1220,13 @@ fn build_edge_moves(
     reprs: &ReprMap,
     locations: &[Location],
     register_budget: RegisterBudget,
+    merges: &MergeLiveness,
 ) -> Result<Vec<EdgeMoves>, RegallocError> {
     normal_edges(cfg)
         .into_iter()
         .map(|(predecessor, block)| {
-            let parallel = parallel_phi_moves(ssa, cfg, reprs, locations, predecessor, block)?;
+            let parallel =
+                parallel_phi_moves(ssa, cfg, reprs, locations, predecessor, block, merges)?;
             let moves =
                 sequentialize_parallel_moves(parallel, register_budget, predecessor, block)?;
             Ok(EdgeMoves {
@@ -1238,9 +1256,10 @@ fn parallel_phi_moves(
     locations: &[Location],
     predecessor: BlockId,
     block: BlockId,
+    merges: &MergeLiveness,
 ) -> Result<Vec<Move>, RegallocError> {
     Ok(
-        phi_move_requirements(ssa, cfg, reprs, locations, predecessor, block)?
+        phi_move_requirements(ssa, cfg, reprs, locations, predecessor, block, merges)?
             .into_iter()
             .map(|(_, movement)| movement)
             .filter(|movement| movement.src != movement.dst || movement.conversion.is_some())
@@ -1255,6 +1274,7 @@ fn phi_move_requirements(
     locations: &[Location],
     predecessor: BlockId,
     block: BlockId,
+    merges: &MergeLiveness,
 ) -> Result<Vec<(ValueId, Move)>, RegallocError> {
     let predecessors = normal_predecessors(cfg, block);
     let predecessor_index = predecessors
@@ -1263,7 +1283,7 @@ fn phi_move_requirements(
         .expect("normal edge source is a normal predecessor");
     let mut requirements = Vec::new();
     for &phi in &ssa.blocks[block.0 as usize].phis {
-        if is_dead_phi(ssa, phi) {
+        if merges.is_dead_phi(phi) {
             continue;
         }
         let phi_index = value_index(phi, ssa.values.len())?;
@@ -1320,66 +1340,121 @@ fn phi_move_requirements(
     Ok(requirements)
 }
 
-/// Return whether `value` is a block-head merge — an ordinary phi or a spliced
-/// call's result — with no SSA instruction or merge-input use. Such a value can
-/// only name compiler scratch state retained for complete frame reconstruction,
-/// or a call result the caller ignores; it cannot affect JavaScript execution.
-pub(crate) fn is_dead_phi(ssa: &SsaFunction, value: ValueId) -> bool {
-    if !matches!(
-        ssa.values.get(value.0 as usize).map(|data| &data.def),
-        Some(ValueDef::Phi { .. } | ValueDef::InlineResult { .. })
-    ) {
-        return false;
-    }
-    // Reaching a phi is not being read: construction gives a loop's header and
-    // its body a phi per written register, and the two feed each other, so a
-    // register nothing computes with still has a cycle of live-looking merges.
-    // The question is whether any *instruction* reads the value, directly or
-    // through merges that are themselves only read by merges.
-    let mut visited = BTreeSet::from([value]);
-    let mut pending = vec![value];
-    while let Some(current) = pending.pop() {
+/// Liveness of block-head merges, computed in one pass over the unit.
+///
+/// A block-head merge — an ordinary phi or a spliced call's result — that no
+/// SSA instruction reads can only name compiler scratch state retained for
+/// complete frame reconstruction, or a call result the caller ignores; it
+/// cannot affect JavaScript execution. Reaching a phi is not being read:
+/// construction gives a loop's header and its body a phi per written register,
+/// and the two feed each other, so a register nothing computes with still has
+/// a cycle of live-looking merges. A merge is live only when an *instruction*
+/// reads it, directly or through merges that are themselves live.
+///
+/// The answers are a pure function of the graph, so a pass computes this once
+/// over a graph it no longer mutates and queries it per value.
+pub(crate) struct MergeLiveness {
+    dead_merge: Box<[bool]>,
+    non_dead_use: Box<[bool]>,
+}
+
+impl MergeLiveness {
+    pub(crate) fn compute(ssa: &SsaFunction) -> Self {
+        let count = ssa.values.len();
+        let is_merge = |value: ValueId| {
+            matches!(
+                ssa.values.get(value.0 as usize).map(|data| &data.def),
+                Some(ValueDef::Phi { .. } | ValueDef::InlineResult { .. })
+            )
+        };
+        let mut read_by_instruction = vec![false; count];
         for block in &ssa.blocks {
-            if block
-                .instrs
-                .iter()
-                .any(|instruction| instruction.inputs.contains(&current))
-            {
-                return false;
-            }
-            for phi in block.phis.iter().copied() {
-                if matches!(
-                    &ssa.values[phi.0 as usize].def,
-                    ValueDef::Phi { inputs, .. } | ValueDef::InlineResult { inputs, .. }
-                        if inputs.contains(&current)
-                ) && visited.insert(phi)
-                {
-                    pending.push(phi);
+            for instruction in &block.instrs {
+                for &input in &instruction.inputs {
+                    if let Some(flag) = read_by_instruction.get_mut(input.0 as usize) {
+                        *flag = true;
+                    }
                 }
             }
         }
-    }
-    true
-}
-
-/// Return whether `value` reaches an instruction or a non-dead phi. Inputs
-/// consumed only by a structurally dead compiler-scratch phi are not semantic
-/// live-outs and require no transition reload.
-pub(crate) fn has_non_dead_use(ssa: &SsaFunction, value: ValueId) -> bool {
-    ssa.blocks.iter().any(|block| {
-        block
-            .instrs
-            .iter()
-            .any(|instruction| instruction.inputs.contains(&value))
-            || block.phis.iter().copied().any(|phi| {
-                !is_dead_phi(ssa, phi)
-                    && matches!(
-                        &ssa.values[phi.0 as usize].def,
-                        ValueDef::Phi { inputs, .. } | ValueDef::InlineResult { inputs, .. }
-                            if inputs.contains(&value)
-                    )
+        // Seed with merges an instruction reads directly, then propagate
+        // liveness to their merge inputs: a value feeding a live merge is
+        // itself read through it.
+        let mut live_merge = vec![false; count];
+        let mut pending = Vec::new();
+        for block in &ssa.blocks {
+            for &head in &block.phis {
+                let index = head.0 as usize;
+                if is_merge(head) && read_by_instruction[index] && !live_merge[index] {
+                    live_merge[index] = true;
+                    pending.push(head);
+                }
+            }
+        }
+        while let Some(current) = pending.pop() {
+            let (ValueDef::Phi { inputs, .. } | ValueDef::InlineResult { inputs, .. }) =
+                &ssa.values[current.0 as usize].def
+            else {
+                continue;
+            };
+            for &input in inputs {
+                let index = input.0 as usize;
+                if is_merge(input) && !live_merge[index] {
+                    live_merge[index] = true;
+                    pending.push(input);
+                }
+            }
+        }
+        let mut non_dead_use = read_by_instruction;
+        for block in &ssa.blocks {
+            for &head in &block.phis {
+                if !live_merge[head.0 as usize] {
+                    continue;
+                }
+                let (ValueDef::Phi { inputs, .. } | ValueDef::InlineResult { inputs, .. }) =
+                    &ssa.values[head.0 as usize].def
+                else {
+                    continue;
+                };
+                for &input in inputs {
+                    if let Some(flag) = non_dead_use.get_mut(input.0 as usize) {
+                        *flag = true;
+                    }
+                }
+            }
+        }
+        let dead_merge = (0..count)
+            .map(|index| {
+                let value = ValueId(index as u32);
+                is_merge(value) && !live_merge[index]
             })
-    })
+            .collect();
+        Self {
+            dead_merge,
+            non_dead_use: non_dead_use.into_boxed_slice(),
+        }
+    }
+
+    /// Return whether `value` is a block-head merge with no SSA instruction or
+    /// live-merge-input use.
+    #[must_use]
+    pub(crate) fn is_dead_phi(&self, value: ValueId) -> bool {
+        self.dead_merge
+            .get(value.0 as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Return whether `value` reaches an instruction or a non-dead phi. Inputs
+    /// consumed only by a structurally dead compiler-scratch phi are not
+    /// semantic live-outs and require no transition reload.
+    #[must_use]
+    pub(crate) fn has_non_dead_use(&self, value: ValueId) -> bool {
+        self.non_dead_use
+            .get(value.0 as usize)
+            .copied()
+            .unwrap_or(false)
+    }
 }
 
 fn sequentialize_parallel_moves(
@@ -1687,9 +1762,16 @@ mod tests {
         let phi = phi_for(&ssa, join, 1);
         assert!(phi.0 < ssa.values.len() as u32);
         for predecessor in [left, right] {
-            let requirements =
-                phi_move_requirements(&ssa, &cfg, &reprs, &allocation.locations, predecessor, join)
-                    .expect("phi requirements");
+            let requirements = phi_move_requirements(
+                &ssa,
+                &cfg,
+                &reprs,
+                &allocation.locations,
+                predecessor,
+                join,
+                &MergeLiveness::compute(&ssa),
+            )
+            .expect("phi requirements");
             assert_eq!(requirements.len(), 1);
             let required = requirements[0].1;
             let edge = edge_moves(&allocation, predecessor, join);
@@ -1740,9 +1822,16 @@ mod tests {
             allocation.intervals[carried.0 as usize].end
                 >= allocation.intervals[phi.0 as usize].start
         );
-        let requirements =
-            phi_move_requirements(&ssa, &cfg, &reprs, &allocation.locations, latch, header)
-                .expect("backedge phi requirement");
+        let requirements = phi_move_requirements(
+            &ssa,
+            &cfg,
+            &reprs,
+            &allocation.locations,
+            latch,
+            header,
+            &MergeLiveness::compute(&ssa),
+        )
+        .expect("backedge phi requirement");
         assert_eq!(requirements.len(), 1);
         let edge = edge_moves(&allocation, latch, header);
         if requirements[0].1.src == requirements[0].1.dst {

@@ -104,10 +104,23 @@
   def('DOMException', DOMException);
 
   // ---- Event / CustomEvent (DOM § Events) ----
-  const kStop = Symbol('stopPropagation');
-  const kStopImmediate = Symbol('stopImmediate');
-  const kTarget = Symbol('target');
-  const kDispatch = Symbol('dispatching');
+  // Registered symbols, not module-private ones. An `Event` is constructed by
+  // the page and dispatched by whoever owns the tree it travels through — in a
+  // browser embedding, that is the embedder, because only it knows what the
+  // path from a node to the window is. Such a dispatcher has to read the
+  // propagation flags this class writes and write the target this class
+  // reports, and a `Symbol()` nobody else holds makes that impossible: it would
+  // have to keep a second, shadowing set of flags and the two would disagree
+  // the first time a page called `stopPropagation` through one and read
+  // `cancelBubble` through the other.
+  //
+  // `Symbol.for` is the whole of the fix. The slots stay unenumerable and
+  // unreachable by name; what changes is that a host which knows the well-known
+  // key can drive the same state this class does.
+  const kStop = Symbol.for('otter.event.stopPropagation');
+  const kStopImmediate = Symbol.for('otter.event.stopImmediate');
+  const kTarget = Symbol.for('otter.event.target');
+  const kDispatch = Symbol.for('otter.event.dispatching');
 
   function invalidArgTypeHelper(input) {
     if (input == null) return ` Received ${input}`;

@@ -35,6 +35,7 @@
 //! # See also
 //! - [Frontend and compilation](../../../docs/book/src/engine/frontend.md)
 
+pub mod binary;
 pub mod disasm;
 pub mod dump;
 pub mod encoding;

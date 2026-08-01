@@ -19,6 +19,8 @@ otter-vm = { workspace = true }
 oxc_ast = { workspace = true }
 oxc_ast_visit = { workspace = true }
 oxc_resolver = { workspace = true }
+blake3 = { workspace = true }
+dirs = { workspace = true }
 json5 = { workspace = true }
 jsonc-parser = { workspace = true }
 reqwest = { workspace = true }

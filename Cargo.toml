@@ -73,6 +73,7 @@ tokio               = { version = "1", features = ["rt-multi-thread", "sync", "t
 
 # Collections / utilities.
 smallvec    = "1"
+blake3      = "1"
 dirs        = "6"
 dotenvy     = "0.15"
 notify      = "8"

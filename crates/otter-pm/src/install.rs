@@ -1,43 +1,53 @@
 //! Package extraction and project materialization.
 //!
 //! This module owns the install layout side of package management. It consumes
-//! already enriched lockfile registry tarball sources, reuses the tarball cache,
-//! extracts package archives into a content-addressed store, materializes
-//! `node_modules`, and links package binaries.
+//! already enriched lockfile registry tarball sources, reuses the tarball
+//! cache, extracts package archives into the content-addressed store,
+//! materializes `node_modules` by linking to stored content, and links package
+//! binaries.
+//!
+//! Extraction happens once per tarball across every project on the machine:
+//! the archive becomes hashed files plus an index describing the tree, and
+//! installing is then a walk over that index. A second project installing the
+//! same package writes no package bytes at all.
 //!
 //! # Contents
-//! - [`FsPackageStore`] is the extracted package cache plus materializer.
-//! - [`ExtractedPackage`] describes a package cache entry.
+//! - [`FsPackageStore`] is the tarball cache, content store, and materializer.
+//! - [`ExtractedPackage`] describes a package's stored tree.
 //! - [`InstalledPackage`] describes one project-local materialized package.
 //!
 //! # Invariants
 //! - Lifecycle scripts are not executed.
 //! - Install roots are refreshed through temporary directories before rename.
 //! - Archive paths are normalized and may not escape the package root.
+//! - A materialized file is a link to stored content wherever the filesystem
+//!   allows it, and a copy of the same bytes where it does not.
 //! - Bin links point at the project-local `node_modules/.bin` layout.
 //!
 //! # See also
 //! - [`crate::install_local_project`] for the full resolve/fetch/write flow.
+//! - [`crate::store`] for the content store and package index.
 //! - [`crate::tarball`] for byte fetch and integrity verification.
 
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use flate2::read::GzDecoder;
 use otter_pm_lockfile::{LockedPackage, Lockfile, ResolvedSource, ResolvedSourceKind};
 use otter_pm_manifest::{PACKAGE_JSON, PackageBinManifest, PackageManifest};
 
+use crate::store::{ContentStore, PackageIndex};
 use crate::tarball::tarball_cache_key;
 use crate::{
     CachedTarball, FsTarballCache, PackageBin, PackageId, PackageManagerError, TarballFetchClient,
-    TarballSource, binary_name_from_package_name, cache_key, install_fingerprint,
-    package_name_path,
+    TarballSource, binary_name_from_package_name, cache_key, package_name_path,
 };
 
-/// Extracted package cache and project install materializer.
+/// Tarball cache, content-addressed package store, and project materializer.
 #[derive(Debug, Clone)]
 pub struct FsPackageStore {
     tarballs: FsTarballCache,
-    packages_root: PathBuf,
+    content: ContentStore,
 }
 
 impl FsPackageStore {
@@ -47,63 +57,57 @@ impl FsPackageStore {
         let cache_root = cache_root.into();
         Self {
             tarballs: FsTarballCache::new(cache_root.join("tarballs")),
-            packages_root: cache_root.join("packages"),
+            content: ContentStore::new(cache_root.join("store")),
         }
     }
 
-    /// Return the deterministic extracted package cache root for a tarball.
+    /// Create the package store shared by every project for this user.
+    ///
+    /// Sharing is the point: a package extracted for one checkout is already
+    /// stored for the next one, and the two trees link to the same bytes.
     #[must_use]
-    pub fn extracted_package_path(&self, source: &TarballSource) -> PathBuf {
-        self.packages_root.join(tarball_cache_key(source))
+    pub fn user_default() -> Self {
+        Self::new(crate::user_cache_root())
     }
 
-    /// Fetch, verify, and extract one package into the content-addressed cache.
+    /// Borrow the content store backing this package store.
+    #[must_use]
+    pub fn content_store(&self) -> &ContentStore {
+        &self.content
+    }
+
+    /// Fetch, verify, and extract one package into the content store.
     pub async fn get_or_fetch_and_extract(
         &self,
         source: &TarballSource,
         client: &impl TarballFetchClient,
     ) -> Result<ExtractedPackage, PackageManagerError> {
         let cached_tarball = self.tarballs.get_or_fetch(source, client).await?;
-        tokio::fs::create_dir_all(&self.packages_root)
-            .await
-            .map_err(|err| PackageManagerError::Io {
-                path: self.packages_root.clone(),
-                message: err.to_string(),
-            })?;
-        let root = self.extracted_package_path(source);
-        if tokio::fs::try_exists(root.join(PACKAGE_JSON))
-            .await
-            .map_err(|err| PackageManagerError::Io {
-                path: root.clone(),
-                message: err.to_string(),
-            })?
-        {
+        let key = tarball_cache_key(source);
+        if let Some(index) = self.content.read_index(&key).await? {
             return Ok(ExtractedPackage {
-                root,
+                index,
                 tarball: cached_tarball,
                 reused: true,
             });
         }
 
-        let tmp = self.packages_root.join(format!(
-            ".tmp-{}-{}",
-            tarball_cache_key(source),
-            std::process::id()
-        ));
         let archive_path = cached_tarball.path.clone();
-        let root_for_task = root.clone();
-        let tmp_for_task = tmp.clone();
-        tokio::task::spawn_blocking(move || {
-            extract_tgz_package(&archive_path, &tmp_for_task, &root_for_task)
+        let content = self.content.clone();
+        let key_for_task = key.clone();
+        let index = tokio::task::spawn_blocking(move || {
+            let index = store_tgz_package(&content, &archive_path)?;
+            content.write_index(&key_for_task, &index)?;
+            Ok::<_, PackageManagerError>(index)
         })
         .await
         .map_err(|err| PackageManagerError::Archive {
-            path: root.clone(),
+            path: cached_tarball.path.clone(),
             message: err.to_string(),
         })??;
 
         Ok(ExtractedPackage {
-            root,
+            index,
             tarball: cached_tarball,
             reused: false,
         })
@@ -127,12 +131,17 @@ impl FsPackageStore {
                 .join(package_name_path(&package.name));
             let state_root = project_root.join("node_modules").join(".otter-state");
             let marker = state_root.join(format!("{}.source", cache_key(&id)));
-            let fingerprint = install_fingerprint(&source);
+            let fingerprint = extracted.index.fingerprint();
             let reused_install =
                 existing_install_matches(&install_root, &marker, &fingerprint).await?;
             if !reused_install {
-                materialize_install_root(&extracted.root, &install_root, &marker, &fingerprint)
-                    .await?;
+                self.materialize_install_root(
+                    &extracted.index,
+                    &install_root,
+                    &marker,
+                    &fingerprint,
+                )
+                .await?;
             }
             let linked_bins = link_package_bins(project_root, &PackageId::new(&id), &install_root)
                 .await?
@@ -141,7 +150,6 @@ impl FsPackageStore {
                 package_id: id,
                 name: package.name,
                 source,
-                cache_root: extracted.root,
                 installed_root: install_root,
                 reused_cache: extracted.reused && extracted.tarball.reused,
                 reused_install,
@@ -149,6 +157,41 @@ impl FsPackageStore {
             });
         }
         Ok(installed)
+    }
+
+    async fn materialize_install_root(
+        &self,
+        index: &PackageIndex,
+        install_root: &Path,
+        marker: &Path,
+        fingerprint: &str,
+    ) -> Result<(), PackageManagerError> {
+        let content = self.content.clone();
+        let index = index.clone();
+        let install_root = install_root.to_path_buf();
+        let install_root_for_error = install_root.clone();
+        let marker = marker.to_path_buf();
+        let fingerprint = fingerprint.to_string();
+        tokio::task::spawn_blocking(move || {
+            let temporary = install_root
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(format!(".otter-install-tmp-{}", std::process::id()));
+            if temporary.exists() {
+                std::fs::remove_dir_all(&temporary).map_err(|err| PackageManagerError::Io {
+                    path: temporary.clone(),
+                    message: err.to_string(),
+                })?;
+            }
+            content.materialize(&index, &temporary)?;
+            replace_directory(&temporary, &install_root)?;
+            write_marker(&marker, &fingerprint)
+        })
+        .await
+        .map_err(|err| PackageManagerError::Archive {
+            path: install_root_for_error,
+            message: err.to_string(),
+        })?
     }
 }
 
@@ -195,14 +238,14 @@ fn materialization_tarball_url(
     reference.to_string()
 }
 
-/// Extracted package cache entry.
+/// One package's stored tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractedPackage {
-    /// Extracted package root with npm's leading `package/` prefix stripped.
-    pub root: PathBuf,
+    /// Package tree, with npm's leading `package/` prefix stripped.
+    pub index: PackageIndex,
     /// Backing cached tarball.
     pub tarball: CachedTarball,
-    /// `true` when extraction was already present.
+    /// `true` when the package was already in the content store.
     pub reused: bool,
 }
 
@@ -215,8 +258,6 @@ pub struct InstalledPackage {
     pub name: String,
     /// Tarball source.
     pub source: TarballSource,
-    /// Content-addressed extracted cache root.
-    pub cache_root: PathBuf,
     /// Project-local install root.
     pub installed_root: PathBuf,
     /// `true` when both tarball and extracted package cache were reused.
@@ -251,63 +292,24 @@ async fn existing_install_matches(
     }
 }
 
-async fn materialize_install_root(
-    source_root: &Path,
-    install_root: &Path,
-    marker: &Path,
-    fingerprint: &str,
-) -> Result<(), PackageManagerError> {
-    let tmp_root = install_root
+fn write_marker(marker: &Path, fingerprint: &str) -> Result<(), PackageManagerError> {
+    let parent = marker
         .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!(".otter-install-tmp-{}", std::process::id()));
-    let source_root = source_root.to_path_buf();
-    let install_root = install_root.to_path_buf();
-    let install_root_for_error = install_root.clone();
-    let marker = marker.to_path_buf();
-    let fingerprint = fingerprint.to_string();
-    tokio::task::spawn_blocking(move || {
-        copy_package_tree(&source_root, &tmp_root, &install_root)?;
-        let marker_parent = marker
-            .parent()
-            .ok_or_else(|| PackageManagerError::Archive {
-                path: marker.clone(),
-                message: "marker has no parent directory".to_string(),
-            })?;
-        std::fs::create_dir_all(marker_parent).map_err(|err| PackageManagerError::Io {
-            path: marker_parent.to_path_buf(),
-            message: err.to_string(),
+        .ok_or_else(|| PackageManagerError::Archive {
+            path: marker.to_path_buf(),
+            message: "marker has no parent directory".to_string(),
         })?;
-        std::fs::write(&marker, fingerprint).map_err(|err| PackageManagerError::Io {
-            path: marker,
-            message: err.to_string(),
-        })
-    })
-    .await
-    .map_err(|err| PackageManagerError::Archive {
-        path: install_root_for_error,
+    std::fs::create_dir_all(parent).map_err(|err| PackageManagerError::Io {
+        path: parent.to_path_buf(),
         message: err.to_string(),
-    })?
+    })?;
+    std::fs::write(marker, fingerprint).map_err(|err| PackageManagerError::Io {
+        path: marker.to_path_buf(),
+        message: err.to_string(),
+    })
 }
 
-fn copy_package_tree(
-    source_root: &Path,
-    tmp_root: &Path,
-    install_root: &Path,
-) -> Result<(), PackageManagerError> {
-    if tmp_root.exists() {
-        std::fs::remove_dir_all(tmp_root).map_err(|err| PackageManagerError::Io {
-            path: tmp_root.to_path_buf(),
-            message: err.to_string(),
-        })?;
-    }
-    if let Some(parent) = tmp_root.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| PackageManagerError::Io {
-            path: parent.to_path_buf(),
-            message: err.to_string(),
-        })?;
-    }
-    copy_dir_recursive(source_root, tmp_root)?;
+fn replace_directory(temporary: &Path, install_root: &Path) -> Result<(), PackageManagerError> {
     if install_root.exists() {
         std::fs::remove_dir_all(install_root).map_err(|err| PackageManagerError::Io {
             path: install_root.to_path_buf(),
@@ -320,63 +322,20 @@ fn copy_package_tree(
             message: err.to_string(),
         })?;
     }
-    std::fs::rename(tmp_root, install_root).map_err(|err| PackageManagerError::Io {
+    std::fs::rename(temporary, install_root).map_err(|err| PackageManagerError::Io {
         path: install_root.to_path_buf(),
         message: err.to_string(),
     })
 }
 
-fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), PackageManagerError> {
-    std::fs::create_dir_all(destination).map_err(|err| PackageManagerError::Io {
-        path: destination.to_path_buf(),
-        message: err.to_string(),
-    })?;
-    for entry in std::fs::read_dir(source).map_err(|err| PackageManagerError::Io {
-        path: source.to_path_buf(),
-        message: err.to_string(),
-    })? {
-        let entry = entry.map_err(|err| PackageManagerError::Io {
-            path: source.to_path_buf(),
-            message: err.to_string(),
-        })?;
-        let file_type = entry.file_type().map_err(|err| PackageManagerError::Io {
-            path: entry.path(),
-            message: err.to_string(),
-        })?;
-        let target = destination.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_dir_recursive(&entry.path(), &target)?;
-        } else if file_type.is_file() {
-            std::fs::copy(entry.path(), &target).map_err(|err| PackageManagerError::Io {
-                path: target,
-                message: err.to_string(),
-            })?;
-        }
-    }
-    Ok(())
-}
-
-fn extract_tgz_package(
+/// Read a package archive into the content store and describe its tree.
+///
+/// Directory entries are not recorded: a file's path implies every directory
+/// above it, and materialization creates them.
+fn store_tgz_package(
+    content: &ContentStore,
     archive_path: &Path,
-    tmp_root: &Path,
-    final_root: &Path,
-) -> Result<(), PackageManagerError> {
-    if tmp_root.exists() {
-        std::fs::remove_dir_all(tmp_root).map_err(|err| PackageManagerError::Io {
-            path: tmp_root.to_path_buf(),
-            message: err.to_string(),
-        })?;
-    }
-    if final_root.exists() {
-        std::fs::remove_dir_all(final_root).map_err(|err| PackageManagerError::Io {
-            path: final_root.to_path_buf(),
-            message: err.to_string(),
-        })?;
-    }
-    std::fs::create_dir_all(tmp_root).map_err(|err| PackageManagerError::Io {
-        path: tmp_root.to_path_buf(),
-        message: err.to_string(),
-    })?;
+) -> Result<PackageIndex, PackageManagerError> {
     let file = std::fs::File::open(archive_path).map_err(|err| PackageManagerError::Io {
         path: archive_path.to_path_buf(),
         message: err.to_string(),
@@ -389,11 +348,16 @@ fn extract_tgz_package(
             path: archive_path.to_path_buf(),
             message: err.to_string(),
         })?;
+    let mut index = PackageIndex::default();
+    let mut bytes = Vec::new();
     for entry in entries {
         let mut entry = entry.map_err(|err| PackageManagerError::Archive {
             path: archive_path.to_path_buf(),
             message: err.to_string(),
         })?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
         let path = entry.path().map_err(|err| PackageManagerError::Archive {
             path: archive_path.to_path_buf(),
             message: err.to_string(),
@@ -402,38 +366,31 @@ fn extract_tgz_package(
         if relative.as_os_str().is_empty() {
             continue;
         }
-        let destination = tmp_root.join(relative);
-        let entry_type = entry.header().entry_type();
-        if entry_type.is_dir() {
-            std::fs::create_dir_all(&destination).map_err(|err| PackageManagerError::Io {
-                path: destination,
+        let executable = entry.header().mode().is_ok_and(|mode| mode & 0o111 != 0);
+        bytes.clear();
+        entry
+            .read_to_end(&mut bytes)
+            .map_err(|err| PackageManagerError::Archive {
+                path: archive_path.to_path_buf(),
                 message: err.to_string(),
             })?;
-        } else if entry_type.is_file() {
-            if let Some(parent) = destination.parent() {
-                std::fs::create_dir_all(parent).map_err(|err| PackageManagerError::Io {
-                    path: parent.to_path_buf(),
-                    message: err.to_string(),
-                })?;
-            }
-            entry
-                .unpack(&destination)
-                .map_err(|err| PackageManagerError::Archive {
-                    path: destination,
-                    message: err.to_string(),
-                })?;
-        }
+        let stored = content.add_file(&bytes, executable)?;
+        index.files.insert(index_key(&relative), stored);
     }
-    if let Some(parent) = final_root.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| PackageManagerError::Io {
-            path: parent.to_path_buf(),
-            message: err.to_string(),
-        })?;
-    }
-    std::fs::rename(tmp_root, final_root).map_err(|err| PackageManagerError::Io {
-        path: final_root.to_path_buf(),
-        message: err.to_string(),
-    })
+    Ok(index)
+}
+
+/// Package-relative path as an index key, always `/`-separated so an index
+/// written on one platform materializes the same tree on another.
+fn index_key(relative: &Path) -> String {
+    relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn archive_relative_path(path: &Path) -> Result<PathBuf, PackageManagerError> {

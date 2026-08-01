@@ -33,7 +33,17 @@ just test262-filter "Array/prototype/map"
 
 Current fast-path CLI surface:
 - enabled: `run`, direct file execution, `-e`, `-p`, package-management commands
+- also enabled: `watch` (restart on change), `x` / `dlx` and the `otterx`
+  binary (run a package binary), `doctor` (stale tree + undeclared imports),
+  `approve-builds` (dependency install-script approvals)
 - disabled: `repl`, `test`, `build`
+
+Install security is deny-by-default and configured in
+`package.json#otter.install`: dependency lifecycle scripts run only for
+approved packages, fresh releases wait out a cooling window, malicious-release
+advisories and publish-provenance continuity are checked at resolve, and
+`paranoid: true` turns the soft gates hard. `package.json#otter.run` chooses
+what a run does about a stale `node_modules`.
 
 ## Key Architecture
 

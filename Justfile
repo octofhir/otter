@@ -12,6 +12,14 @@ lint:
 test:
     cargo test --all --all-features
 
+# Type-check the workspace as Windows sees it.
+#
+# Needs `cargo install cargo-xwin`; the MSVC SDK downloads once and is cached.
+# Catches what a unix-only build cannot: `cfg(windows)` and `cfg(not(unix))`
+# code paths compile nowhere else.
+check-windows target="x86_64-pc-windows-msvc":
+    cargo xwin check --workspace --all-features --target {{target}}
+
 # Report process-risk markers without failing the build.
 process-audit:
     @echo "=== Porting debt markers ==="

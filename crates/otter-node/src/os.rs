@@ -893,11 +893,13 @@ fn user_info(ctx: &mut NativeCtx<'_>) -> UserInfo {
 
 #[cfg(not(unix))]
 fn system_home_dir() -> String {
-    std::env::var("USERPROFILE")
-        .or_else(|_| {
-            let drive = std::env::var("HOMEDRIVE")?;
-            let path = std::env::var("HOMEPATH")?;
-            Ok(format!("{drive}{path}"))
-        })
-        .unwrap_or_default()
+    // `USERPROFILE` is the whole answer when it is set; the drive/path pair is
+    // the older spelling of the same location and only stands in for it.
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        return profile;
+    }
+    match (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH")) {
+        (Ok(drive), Ok(path)) => format!("{drive}{path}"),
+        _ => String::new(),
+    }
 }

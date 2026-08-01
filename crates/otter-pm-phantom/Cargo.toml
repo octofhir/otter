@@ -1,0 +1,25 @@
+[package]
+name = "otter-pm-phantom"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Undeclared-dependency detection for Otter package management."
+
+[lints]
+workspace = true
+
+[dependencies]
+otter-pm-manifest = { workspace = true }
+otter-syntax = { workspace = true }
+oxc_allocator = { workspace = true }
+oxc_ast = { workspace = true }
+oxc_ast_visit = { workspace = true }
+oxc_parser = { workspace = true }
+oxc_span = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

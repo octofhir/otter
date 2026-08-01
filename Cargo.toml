@@ -16,6 +16,7 @@ members = [
     "crates/otter-runtime",
     "crates/otter-pm-manifest",
     "crates/otter-pm-lockfile",
+    "crates/otter-pm-phantom",
     "crates/otter-pm",
     "crates/otter-test262",
     "crates/otter-cli",
@@ -118,6 +119,7 @@ otter-modules   = { path = "crates/otter-modules" }
 otter-node      = { path = "crates/otter-node" }
 otter-pm-manifest = { path = "crates/otter-pm-manifest" }
 otter-pm-lockfile = { path = "crates/otter-pm-lockfile" }
+otter-pm-phantom = { path = "crates/otter-pm-phantom" }
 otter-pm       = { path = "crates/otter-pm" }
 otter-web       = { path = "crates/otter-web" }
 

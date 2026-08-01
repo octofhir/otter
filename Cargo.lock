@@ -2366,6 +2366,7 @@ dependencies = [
  "otter-pm",
  "otter-pm-lockfile",
  "otter-pm-manifest",
+ "otter-pm-phantom",
  "otter-runtime",
  "otter-web",
  "oxc_diagnostics",
@@ -2547,6 +2548,23 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "otter-pm-phantom"
+version = "0.1.0"
+dependencies = [
+ "otter-pm-manifest",
+ "otter-syntax",
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_ast_visit",
+ "oxc_parser",
+ "oxc_span",
+ "serde",
  "tempfile",
  "thiserror",
  "tokio",

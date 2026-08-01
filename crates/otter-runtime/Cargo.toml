@@ -19,9 +19,13 @@ otter-vm = { workspace = true }
 oxc_ast = { workspace = true }
 oxc_ast_visit = { workspace = true }
 oxc_resolver = { workspace = true }
+json5 = { workspace = true }
+jsonc-parser = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+toml = { workspace = true }
 smallvec = { workspace = true }
 sysinfo = { workspace = true }
 thiserror = { workspace = true }

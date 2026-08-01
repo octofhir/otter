@@ -43,6 +43,7 @@ pub(crate) fn install_global(
     interp: &mut Interpreter,
     process_argv: &[String],
     process_cwd: &Path,
+    process_env_overlay: &std::collections::BTreeMap<String, String>,
     capabilities: &CapabilitySet,
     hooks: &RuntimeHooks,
 ) -> Result<(), OtterError> {
@@ -131,7 +132,12 @@ pub(crate) fn install_global(
                 let undefined = scope.undefined();
                 scope.set(process, "exitCode", undefined)?;
 
-                let env = crate::process_env::build(&mut scope, capabilities, hooks)?;
+                let env = crate::process_env::build(
+                    &mut scope,
+                    process_env_overlay,
+                    capabilities,
+                    hooks,
+                )?;
                 scope.set(process, "env", env)?;
                 let allowed_flags = crate::process_flags::build(&mut scope)?;
                 scope.set(process, "allowedNodeEnvironmentFlags", allowed_flags)?;

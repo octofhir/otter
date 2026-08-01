@@ -1818,8 +1818,43 @@ fn cli_otter_builder(
         .capabilities(caps.clone())
         .with_node_apis()
         .with_otter_modules()
-        .with_web_apis();
+        .with_web_apis()
+        .process_env(project_env_files());
     execution.apply_otter_builder(builder)
+}
+
+/// Variables declared by the project's `.env` files, nearest file last.
+///
+/// Files are read in increasing precedence — `.env`, then the mode-specific
+/// file, then the `.local` variants that a working copy is expected to keep
+/// out of version control. Nothing is written to the process environment: the
+/// values are handed to the runtime, where an inherited variable of the same
+/// name still wins.
+fn project_env_files() -> Vec<(String, String)> {
+    let Ok(root) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    let mode = std::env::var("NODE_ENV").unwrap_or_default();
+    let mut names = vec![".env".to_string()];
+    if !mode.is_empty() {
+        names.push(format!(".env.{mode}"));
+    }
+    names.push(".env.local".to_string());
+    if !mode.is_empty() {
+        names.push(format!(".env.{mode}.local"));
+    }
+
+    let mut variables = Vec::new();
+    for name in names {
+        let path = root.join(name);
+        let Ok(entries) = dotenvy::from_path_iter(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            variables.push(entry);
+        }
+    }
+    variables
 }
 
 async fn cli_loader_config_for_entry(path: &Path) -> otter_runtime::module_loader::LoaderConfig {

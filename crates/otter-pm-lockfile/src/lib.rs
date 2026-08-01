@@ -241,6 +241,7 @@ fn parse_package_lock_json(text: &str) -> Result<Lockfile, LockfileError> {
             version: root_version,
             dependencies: root_deps,
             integrity: None,
+            attested: false,
             resolved: Some(ResolvedSource {
                 kind: ResolvedSourceKind::Workspace,
                 reference: ".".to_string(),
@@ -272,6 +273,7 @@ fn parse_package_lock_json(text: &str) -> Result<Lockfile, LockfileError> {
                 version: version.clone(),
                 dependencies: npm_dependency_targets(package, &version_by_name, &preferred_ids),
                 integrity: package.integrity.clone(),
+                attested: false,
                 resolved: Some(ResolvedSource {
                     kind: ResolvedSourceKind::Registry,
                     reference: package.resolved.clone().unwrap_or_default(),
@@ -442,6 +444,7 @@ fn parse_pnpm_lock_yaml(text: &str) -> Result<Lockfile, LockfileError> {
             version: "0.0.0".to_string(),
             dependencies: root_deps,
             integrity: None,
+            attested: false,
             resolved: Some(ResolvedSource {
                 kind: ResolvedSourceKind::Workspace,
                 reference: ".".to_string(),
@@ -471,6 +474,7 @@ fn parse_pnpm_lock_yaml(text: &str) -> Result<Lockfile, LockfileError> {
                 version,
                 dependencies,
                 integrity: package.resolution.integrity,
+                attested: false,
                 resolved: Some(ResolvedSource {
                     kind: ResolvedSourceKind::Registry,
                     reference: package.resolution.tarball.unwrap_or_default(),
@@ -568,6 +572,12 @@ pub struct LockedPackage {
     /// Integrity string, usually an SRI hash.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integrity: Option<String>,
+    /// Whether the registry published build provenance for this version.
+    ///
+    /// Recorded so a later install can tell a package that never had
+    /// provenance apart from one that lost it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attested: bool,
     /// Resolved package source.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved: Option<ResolvedSource>,
@@ -711,6 +721,7 @@ mod tests {
                 version: "0.1.0".to_string(),
                 dependencies: app_deps,
                 integrity: None,
+                attested: false,
                 resolved: Some(ResolvedSource {
                     kind: ResolvedSourceKind::Workspace,
                     reference: ".".to_string(),
@@ -725,6 +736,7 @@ mod tests {
                 version: "1.0.0".to_string(),
                 dependencies: BTreeMap::new(),
                 integrity: Some("sha512-alpha".to_string()),
+                attested: true,
                 resolved: Some(ResolvedSource {
                     kind: ResolvedSourceKind::Registry,
                     reference: "https://registry.npmjs.org/alpha/-/alpha-1.0.0.tgz".to_string(),

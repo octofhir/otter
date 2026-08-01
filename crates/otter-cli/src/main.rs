@@ -2095,6 +2095,7 @@ async fn run_pm_install(root: &Path, json: bool) -> Result<ExitCode, OtterError>
         &otter_pm::HttpRegistryMetadataClient::new(),
         &otter_pm::FsPackageStore::new(cache_root),
         &otter_pm::HttpTarballClient::new(),
+        &otter_pm::HttpAdvisoryClient::new(),
     )
     .await
     .map_err(map_pm_error)?;
@@ -2115,6 +2116,7 @@ fn print_install_report(root: &Path, report: &otter_pm::InstallReport, json: boo
                 "linkedBins": report.linked_bins,
                 "lifecycleScripts": report.lifecycle_scripts,
                 "pendingBuilds": pending_builds_json(&report.pending_builds),
+                "warnings": report.warnings,
                 "importedLockfile": report.imported_lockfile.map(|format| format.filename())
             })
         );
@@ -2154,6 +2156,9 @@ fn print_install_report(root: &Path, report: &otter_pm::InstallReport, json: boo
             "s"
         }
     );
+    for warning in &report.warnings {
+        println!("warning {}: {}", warning.code, warning.message);
+    }
     print_pending_builds(&report.pending_builds);
 }
 
@@ -2234,6 +2239,7 @@ async fn run_pm_add(args: AddArgs, json: bool) -> Result<ExitCode, OtterError> {
         &otter_pm::HttpRegistryMetadataClient::new(),
         &otter_pm::FsPackageStore::new(cache_root),
         &otter_pm::HttpTarballClient::new(),
+        &otter_pm::HttpAdvisoryClient::new(),
     )
     .await
     .map_err(map_pm_error)?;
@@ -2414,6 +2420,7 @@ async fn run_pm_approve_builds(
                 &otter_pm::HttpRegistryMetadataClient::new(),
                 &otter_pm::FsPackageStore::new(cache_root),
                 &otter_pm::HttpTarballClient::new(),
+                &otter_pm::HttpAdvisoryClient::new(),
             )
             .await
             .map_err(map_pm_error)?,
@@ -3092,6 +3099,7 @@ integrity = "sha512-test"
             name: name.to_string(),
             dist_tags,
             versions,
+            time: std::collections::BTreeMap::new(),
         }
     }
 

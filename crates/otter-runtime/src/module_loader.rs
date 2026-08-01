@@ -996,27 +996,28 @@ impl ModuleLoader {
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        // §16.2 JSON modules — `.json` files load as a single
-        // `export default <parsed>` module. The foundation realises
-        // this by wrapping the raw JSON text in a module shim;
-        // every JSON value (object, array, string, number, boolean,
-        // null) is a valid parenthesised JS expression. Behaviour
-        // matches the import-attributes proposal's `with { type:
-        // "json" }` form even when the attribute is omitted, so
-        // ergonomic `import data from "./x.json"` works without
-        // the host having to surface the attribute parse.
-        // <https://tc39.es/proposal-json-modules/>
-        if extension == "json" {
+        // A data file loads as a single `export default <parsed>` module. For
+        // `.json` that is §16.2 JSON modules, matching the import-attributes
+        // proposal's `with { type: "json" }` form even when the attribute is
+        // omitted (<https://tc39.es/proposal-json-modules/>); the other
+        // formats are the same shape, parsed by the host so the module body
+        // is a JSON literal either way.
+        if let Some(format) = crate::data_modules::DataFormat::from_extension(extension) {
             let raw = std::fs::read_to_string(path).map_err(|e| LoaderError::Load {
                 url: url.clone(),
                 message: e.to_string(),
             })?;
-            let wrapped = format!("export default ({raw});\n");
+            let text = crate::data_modules::data_module_source(format, &raw).map_err(|err| {
+                LoaderError::Load {
+                    url: url.clone(),
+                    message: err.message,
+                }
+            })?;
             return Ok(ResolvedSource {
                 url,
                 kind: SourceKind::JavaScript,
                 jsx: None,
-                text: wrapped,
+                text,
             });
         }
         let jsx = self.compiler_options_jsx_for_path(Path::new(path));

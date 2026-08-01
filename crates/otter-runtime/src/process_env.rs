@@ -27,11 +27,14 @@ const DEPRECATION_MESSAGE: &str = "Assigning any value other than a string, numb
 
 pub(crate) fn build<'s>(
     scope: &mut NativeScope<'s, '_>,
+    overlay: &std::collections::BTreeMap<String, String>,
     capabilities: &CapabilitySet,
     hooks: &RuntimeHooks,
 ) -> Result<Local<'s>, NativeError> {
     let target = scope.object()?;
+    let mut inherited = std::collections::BTreeSet::new();
     for (name, value) in std::env::vars() {
+        inherited.insert(name.clone());
         if crate::hooks::check_capability_with_hooks(
             hooks,
             capabilities,
@@ -40,6 +43,22 @@ pub(crate) fn build<'s>(
         ) {
             let value = scope.string(&value)?;
             scope.set(target, &name, value)?;
+        }
+    }
+    // Host-supplied variables fill gaps; a name the process already carries is
+    // the more specific answer and is left alone.
+    for (name, value) in overlay {
+        if inherited.contains(name) {
+            continue;
+        }
+        if crate::hooks::check_capability_with_hooks(
+            hooks,
+            capabilities,
+            RuntimeCapability::Env,
+            &CapabilityRequest::EnvVar(name),
+        ) {
+            let value = scope.string(value)?;
+            scope.set(target, name, value)?;
         }
     }
 

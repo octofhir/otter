@@ -62,6 +62,7 @@
 mod commonjs;
 pub use commonjs::{require_commonjs_dependency, run_builtin_cjs_shim};
 pub mod compiled_program;
+pub mod data_modules;
 pub mod diagnostics;
 pub mod embedding;
 pub mod error;
@@ -1525,6 +1526,7 @@ pub(crate) struct RuntimeConfig {
     hooks: RuntimeHooks,
     process_argv: Vec<String>,
     process_cwd: PathBuf,
+    process_env_overlay: std::collections::BTreeMap<String, String>,
     tracer_factory: Option<TracerFactory>,
     jit_selection: JitSelection,
     jit_osr_threshold: Option<u32>,
@@ -1783,6 +1785,7 @@ impl Default for RuntimeConfig {
             hooks: RuntimeHooks::default(),
             process_argv: process::default_argv(),
             process_cwd: process::default_cwd(),
+            process_env_overlay: std::collections::BTreeMap::new(),
             tracer_factory: None,
             jit_selection: JitSelection::default(),
             jit_osr_threshold: None,
@@ -2118,6 +2121,26 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Add environment variables the host supplies rather than the operating
+    /// system, such as a project's `.env` file.
+    ///
+    /// A name the process environment already carries wins: the surrounding
+    /// environment is the more specific answer, and a file must not silently
+    /// override what a shell or a deployment set. Every name still passes the
+    /// same capability check as an inherited one.
+    #[must_use]
+    pub fn process_env(
+        mut self,
+        variables: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        self.config.process_env_overlay.extend(
+            variables
+                .into_iter()
+                .map(|(name, value)| (name.into(), value.into())),
+        );
+        self
+    }
+
     /// Install a per-instruction step-trace factory. The factory
     /// runs once on the isolate runner thread immediately after the
     /// interpreter is constructed; its produced tracer routes every
@@ -2373,6 +2396,7 @@ impl Runtime {
                             &mut *interp,
                             &config.process_argv,
                             &config.process_cwd,
+                            &config.process_env_overlay,
                             &config.capabilities,
                             &config.hooks,
                         )?;
@@ -5329,6 +5353,17 @@ impl OtterBuilder {
     #[must_use]
     pub fn process_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.runtime = self.runtime.process_cwd(cwd);
+        self
+    }
+
+    /// Add host-supplied environment variables. See
+    /// [`RuntimeBuilder::process_env`].
+    #[must_use]
+    pub fn process_env(
+        mut self,
+        variables: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        self.runtime = self.runtime.process_env(variables);
         self
     }
 

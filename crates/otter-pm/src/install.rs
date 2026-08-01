@@ -526,10 +526,28 @@ async fn link_bin_file(source: &Path, target: &Path) -> Result<(), PackageManage
     }
     #[cfg(not(unix))]
     {
+        // Windows will not execute a JavaScript file by name, and creating a
+        // symbolic link needs a privilege an ordinary install does not have.
+        // Two entries stand in for one link: the script itself, so a caller
+        // that reads the entry finds the code, and a `.cmd` launcher beside
+        // it, so a shell can run the tool by name the way npm's launchers do.
         tokio::fs::copy(&source, target)
             .await
             .map_err(|err| PackageManagerError::Io {
                 path: target.to_path_buf(),
+                message: err.to_string(),
+            })?;
+        let launcher = target.with_extension("cmd");
+        let script = format!(
+            "@ECHO off\r\nSETLOCAL\r\notter run \"%~dp0\\{}\" %*\r\n",
+            target
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+        );
+        tokio::fs::write(&launcher, script)
+            .await
+            .map_err(|err| PackageManagerError::Io {
+                path: launcher,
                 message: err.to_string(),
             })?;
         Ok(())

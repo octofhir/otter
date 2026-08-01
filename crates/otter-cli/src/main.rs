@@ -364,6 +364,8 @@ enum Command {
     Remove(RemoveArgs),
     /// Check registry versions newer than the installed lockfile.
     Outdated(OutdatedArgs),
+    /// Review dependency install scripts and record approvals.
+    ApproveBuilds(ApproveBuildsArgs),
     /// Create a new `package.json`.
     Init(InitArgs),
     /// Evaluate an expression.
@@ -419,6 +421,21 @@ struct InstallArgs {
     /// Project root.
     #[arg(long, default_value = ".")]
     root: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct ApproveBuildsArgs {
+    /// Project root.
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
+    /// Record a reviewed refusal instead of an approval.
+    #[arg(long)]
+    refuse: bool,
+    /// Approve every package currently awaiting review.
+    #[arg(long, conflicts_with = "packages")]
+    all: bool,
+    /// Package names to decide on. With none, lists what awaits review.
+    packages: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -561,6 +578,7 @@ async fn main() -> ExitCode {
         (Some(Command::Add(args)), _) => run_pm_add(args, json).await,
         (Some(Command::Remove(args)), _) => run_pm_remove(args, json).await,
         (Some(Command::Outdated(args)), _) => run_pm_outdated(args, json).await,
+        (Some(Command::ApproveBuilds(args)), _) => run_pm_approve_builds(args, json).await,
         (Some(Command::Init(args)), _) => run_pm_init(args, json).await,
         (Some(Command::Eval(args)), _) => {
             run_eval(
@@ -2096,10 +2114,13 @@ fn print_install_report(root: &Path, report: &otter_pm::InstallReport, json: boo
                 "reusedPackages": report.reused_packages,
                 "linkedBins": report.linked_bins,
                 "lifecycleScripts": report.lifecycle_scripts,
+                "pendingBuilds": pending_builds_json(&report.pending_builds),
                 "importedLockfile": report.imported_lockfile.map(|format| format.filename())
             })
         );
-    } else if report.lockfile_changed {
+        return;
+    }
+    if report.lockfile_changed {
         if let Some(format) = report.imported_lockfile {
             println!("imported {}", root.join(format.filename()).display());
         }
@@ -2107,52 +2128,77 @@ fn print_install_report(root: &Path, report: &otter_pm::InstallReport, json: boo
             "wrote {}",
             root.join(otter_pm_lockfile::LOCKFILE_NAME).display()
         );
-        println!(
-            "installed {} package{}, reused {}",
-            report.added_packages,
-            if report.added_packages == 1 { "" } else { "s" },
-            report.reused_packages
-        );
-        println!(
-            "linked {} bin{}",
-            report.linked_bins,
-            if report.linked_bins == 1 { "" } else { "s" }
-        );
-        println!(
-            "ran {} lifecycle script{}",
-            report.lifecycle_scripts,
-            if report.lifecycle_scripts == 1 {
-                ""
-            } else {
-                "s"
-            }
-        );
     } else {
         println!(
             "{} is up to date",
             root.join(otter_pm_lockfile::LOCKFILE_NAME).display()
         );
-        println!(
-            "installed {} package{}, reused {}",
-            report.added_packages,
-            if report.added_packages == 1 { "" } else { "s" },
-            report.reused_packages
-        );
-        println!(
-            "linked {} bin{}",
-            report.linked_bins,
-            if report.linked_bins == 1 { "" } else { "s" }
-        );
-        println!(
-            "ran {} lifecycle script{}",
-            report.lifecycle_scripts,
-            if report.lifecycle_scripts == 1 {
-                ""
-            } else {
-                "s"
-            }
-        );
     }
+    println!(
+        "installed {} package{}, reused {}",
+        report.added_packages,
+        if report.added_packages == 1 { "" } else { "s" },
+        report.reused_packages
+    );
+    println!(
+        "linked {} bin{}",
+        report.linked_bins,
+        if report.linked_bins == 1 { "" } else { "s" }
+    );
+    println!(
+        "ran {} lifecycle script{}",
+        report.lifecycle_scripts,
+        if report.lifecycle_scripts == 1 {
+            ""
+        } else {
+            "s"
+        }
+    );
+    print_pending_builds(&report.pending_builds);
+}
+
+fn pending_builds_json(pending: &[otter_pm::PendingBuild]) -> Vec<serde_json::Value> {
+    pending
+        .iter()
+        .map(|build| {
+            serde_json::json!({
+                "name": build.name,
+                "version": build.version,
+                "hooks": build.hooks,
+                "findings": build
+                    .findings
+                    .iter()
+                    .map(|finding| serde_json::json!({
+                        "code": finding.code,
+                        "message": finding.message
+                    }))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect()
+}
+
+fn print_pending_builds(pending: &[otter_pm::PendingBuild]) {
+    if pending.is_empty() {
+        return;
+    }
+    println!(
+        "skipped install scripts for {} package{} awaiting approval:",
+        pending.len(),
+        if pending.len() == 1 { "" } else { "s" }
+    );
+    for build in pending {
+        println!(
+            "  {}@{} ({})",
+            build.name,
+            build.version,
+            build.hooks.join(", ")
+        );
+        for finding in &build.findings {
+            println!("    {}: {}", finding.code, finding.message);
+        }
+    }
+    println!("approve with: otter approve-builds <package>...");
 }
 
 async fn run_pm_add(args: AddArgs, json: bool) -> Result<ExitCode, OtterError> {
@@ -2308,6 +2354,100 @@ impl VersionBump {
             Self::Unknown => "unknown",
         }
     }
+}
+
+async fn run_pm_approve_builds(
+    args: ApproveBuildsArgs,
+    json: bool,
+) -> Result<ExitCode, OtterError> {
+    let mut manifest = PackageManifest::read_from_dir(&args.root)
+        .await
+        .map_err(map_manifest_error)?;
+    let lockfile = read_lockfile_if_present(&args.root)
+        .await?
+        .unwrap_or_else(otter_pm_lockfile::Lockfile::new);
+    let policy = otter_pm::InstallPolicy::from_manifest(&manifest);
+    let pending = otter_pm::pending_builds(&lockfile, &policy);
+
+    let decided: Vec<String> = if args.all {
+        pending.iter().map(|build| build.name.clone()).collect()
+    } else {
+        args.packages.clone()
+    };
+    if decided.is_empty() {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ok": true,
+                    "pendingBuilds": pending_builds_json(&pending)
+                })
+            );
+        } else if pending.is_empty() {
+            println!("no dependency install scripts are awaiting review");
+        } else {
+            print_pending_builds(&pending);
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let approved = !args.refuse;
+    for name in &decided {
+        manifest
+            .install_settings_mut()
+            .allow_builds
+            .insert(name.clone(), approved);
+    }
+    manifest
+        .write_to_dir(&args.root)
+        .await
+        .map_err(|err| pm_config_error(err.to_string()))?;
+
+    // An approval only means something once the scripts it unblocks have run,
+    // so approving reinstalls; a refusal has nothing left to do.
+    let report = if approved {
+        let cache_root = args.root.join(".otter").join("cache");
+        Some(
+            otter_pm::install_local_project(
+                &args.root,
+                &otter_pm::FsRegistryMetadataCache::new(cache_root.join("registry-metadata")),
+                &otter_pm::HttpRegistryMetadataClient::new(),
+                &otter_pm::FsPackageStore::new(cache_root),
+                &otter_pm::HttpTarballClient::new(),
+            )
+            .await
+            .map_err(map_pm_error)?,
+        )
+    } else {
+        None
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "approved": approved,
+                "packages": decided,
+                "lifecycleScripts": report.as_ref().map(|report| report.lifecycle_scripts),
+                "pendingBuilds": report
+                    .as_ref()
+                    .map(|report| pending_builds_json(&report.pending_builds))
+                    .unwrap_or_default()
+            })
+        );
+    } else {
+        for name in &decided {
+            println!(
+                "{} install scripts for {name}",
+                if approved { "approved" } else { "refused" }
+            );
+        }
+        if let Some(report) = &report {
+            print_install_report(&args.root, report, false);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn run_pm_outdated(args: OutdatedArgs, json: bool) -> Result<ExitCode, OtterError> {

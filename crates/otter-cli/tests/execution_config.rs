@@ -106,7 +106,7 @@ fn production_is_the_only_normal_cli_policy() {
 }
 
 #[test]
-fn jitless_selects_the_interpreter() {
+fn jitless_selects_the_tier_below_optimizing_compilation() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let info = otter_command(tmp.path())
         .arg("--jitless")
@@ -116,7 +116,7 @@ fn jitless_selects_the_interpreter() {
         .expect("report jitless tier");
     assert_success(&info);
     let info: serde_json::Value = serde_json::from_slice(&info.stdout).expect("valid info JSON");
-    assert_eq!(info["execution_mode"], "interpreter");
+    assert_eq!(info["execution_mode"], "jitless");
 
     let output = otter_command(tmp.path())
         .arg("--jitless")

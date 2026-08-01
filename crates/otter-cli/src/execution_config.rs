@@ -115,7 +115,8 @@ impl CliExecutionConfig {
     /// Stable CLI spelling for diagnostics and reproducibility metadata.
     pub(crate) const fn execution_mode_name(&self) -> &'static str {
         match self.jit_selection {
-            JitSelection::ProductionTiered | JitSelection::Template => "production",
+            JitSelection::ProductionTiered => "production",
+            JitSelection::Template => "jitless",
             JitSelection::InterpreterOnly => "interpreter",
         }
     }

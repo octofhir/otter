@@ -1,0 +1,15 @@
+# Cross-compilation to Windows from a non-Windows host.
+#
+# The Windows SDK and MSVC headers are not on a developer Mac or Linux box, and
+# several dependencies compile C — the TLS backend most of all — so a plain
+# `cargo check --target x86_64-pc-windows-msvc` dies on a missing `windows.h`.
+# `cargo xwin` supplies both: it downloads the SDK once into a cache and points
+# clang-cl and lld-link at it.
+#
+# Keeping the settings here rather than in one person's shell means a Windows
+# check is the same command for everyone: `just check-windows`.
+[target.x86_64-pc-windows-msvc]
+linker = "lld-link"
+
+[target.aarch64-pc-windows-msvc]
+linker = "lld-link"

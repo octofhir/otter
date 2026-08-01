@@ -28,18 +28,24 @@
 //! - [`otter-pm-manifest`](../../otter-pm-manifest/src/lib.rs)
 //! - [`otter-pm-lockfile`](../../otter-pm-lockfile/src/lib.rs)
 
+mod advisory;
 mod install;
 mod installed_graph;
 mod lifecycle;
 mod policy;
 mod registry;
+mod release_age;
 mod script_sniff;
 mod tarball;
+mod warning;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::time::SystemTime;
+
+use crate::release_age::ReleaseAgeGate;
 
 use otter_pm_lockfile::{
     LifecycleMetadata, LockedPackage, Lockfile, ResolvedSource, ResolvedSourceKind, TrustState,
@@ -50,19 +56,24 @@ use otter_pm_manifest::{
 };
 use serde::{Deserialize, Serialize};
 
+pub use advisory::{
+    AdvisoryClient, AdvisoryQuery, FixtureAdvisoryClient, HttpAdvisoryClient, MaliciousAdvisory,
+};
 pub use install::{ExtractedPackage, FsPackageStore, InstalledPackage};
 pub use installed_graph::{prune_removed_registry_packages, resolve_installed_project};
 pub use lifecycle::{LifecycleOutcome, LifecycleRun, PendingBuild, pending_builds};
 pub use policy::{BuildDecision, InstallPolicy};
 pub use registry::{
-    FileRegistryMetadataClient, FsRegistryMetadataCache, HttpRegistryMetadataClient, NpmDist,
-    NpmPackageVersion, NpmRegistryMetadata, RegistryMetadataClient,
+    FileRegistryMetadataClient, FsRegistryMetadataCache, HttpRegistryMetadataClient,
+    NpmAttestations, NpmDist, NpmPackageVersion, NpmProvenance, NpmRegistryMetadata,
+    RegistryMetadataClient,
 };
 pub use script_sniff::{ScriptFinding, suspicious_script_findings};
 pub use tarball::{
     CachedTarball, FileTarballClient, FsTarballCache, HttpTarballClient, TarballFetchClient,
     TarballSource,
 };
+pub use warning::InstallWarning;
 
 /// Package-manager error type.
 #[derive(Debug, thiserror::Error)]
@@ -143,6 +154,55 @@ pub enum PackageManagerError {
     Backend {
         /// Backend name.
         backend: &'static str,
+        /// Failure message.
+        message: String,
+    },
+    /// Every satisfying version is inside the minimum-release-age window.
+    #[error(
+        "`{package}@{version}` was published {age_hours}h ago, inside the \
+         {minimum_hours}h minimum release age"
+    )]
+    ReleaseTooNew {
+        /// Package name.
+        package: String,
+        /// Rejected version.
+        version: String,
+        /// Age of the rejected version in whole hours.
+        age_hours: u64,
+        /// Configured cooling window in hours.
+        minimum_hours: u64,
+    },
+    /// A package that previously carried publish provenance no longer does.
+    #[error("`{package}` lost publish provenance between `{previous_version}` and `{version}`")]
+    ProvenanceDowngrade {
+        /// Package name.
+        package: String,
+        /// Newly resolved version without provenance.
+        version: String,
+        /// Previously locked version that had provenance.
+        previous_version: String,
+    },
+    /// A registry package has no published integrity digest.
+    #[error("`{package}@{version}` has no registry-published integrity digest")]
+    MissingIntegrity {
+        /// Package name.
+        package: String,
+        /// Package version.
+        version: String,
+    },
+    /// A resolved package version is a confirmed-malicious release.
+    #[error("`{package}@{version}` is a known-malicious release ({advisory})")]
+    MaliciousPackage {
+        /// Package name.
+        package: String,
+        /// Package version.
+        version: String,
+        /// Advisory identifier.
+        advisory: String,
+    },
+    /// The advisory database could not be consulted.
+    #[error("malicious-package advisory lookup failed: {message}")]
+    AdvisoryUnavailable {
         /// Failure message.
         message: String,
     },
@@ -373,6 +433,8 @@ pub struct InstallReport {
     pub lifecycle_scripts: usize,
     /// Packages whose install scripts were skipped pending approval.
     pub pending_builds: Vec<PendingBuild>,
+    /// Non-fatal findings raised by the security gates.
+    pub warnings: Vec<InstallWarning>,
     /// Whether the lockfile changed.
     pub lockfile_changed: bool,
     /// Source lockfile format imported during this install, if any.
@@ -399,43 +461,58 @@ pub struct LocalResolution {
 
 /// Resolve, cache metadata, download/extract registry tarballs, materialize
 /// `node_modules`, and write a deterministic `otter.lock`.
+///
+/// Security gates run before any dependency code executes: versions inside the
+/// cooling window are held back, a package that loses publish provenance fails
+/// resolution, confirmed-malicious releases are refused, and install scripts
+/// run only for packages the project approved.
 pub async fn install_local_project(
     project_root: impl AsRef<Path>,
     metadata_cache: &FsRegistryMetadataCache,
     metadata_client: &impl RegistryMetadataClient,
     package_store: &FsPackageStore,
     tarball_client: &impl TarballFetchClient,
+    advisory_client: &impl AdvisoryClient,
 ) -> Result<InstallReport, PackageManagerError> {
     let project_root = project_root.as_ref();
-    let (mut resolution, imported_lockfile) =
-        if !tokio::fs::try_exists(project_root.join(otter_pm_lockfile::LOCKFILE_NAME))
-            .await
-            .map_err(|err| PackageManagerError::Io {
-                path: project_root.join(otter_pm_lockfile::LOCKFILE_NAME),
-                message: err.to_string(),
-            })?
-            && let Some((format, mut lockfile)) = read_migration_lockfile(project_root).await?
-        {
-            enrich_imported_lockfile_with_registry_metadata(
-                &mut lockfile,
+    let policy = InstallPolicy::from_manifest(&PackageManifest::read_from_dir(project_root).await?);
+    let previous_lockfile = read_project_lockfile(project_root).await?;
+    let mut warnings = Vec::new();
+    let (mut resolution, imported_lockfile) = if previous_lockfile.is_none()
+        && let Some((format, mut lockfile)) = read_migration_lockfile(project_root).await?
+    {
+        enrich_imported_lockfile_with_registry_metadata(
+            &mut lockfile,
+            metadata_cache,
+            metadata_client,
+        )
+        .await?;
+        let mut resolution = resolve_local_project(project_root).await?;
+        resolution.lockfile = lockfile;
+        (resolution, Some(format))
+    } else {
+        (
+            resolve_local_project_with_registry_metadata(
+                project_root,
                 metadata_cache,
                 metadata_client,
+                &policy,
+                &mut warnings,
             )
-            .await?;
-            let mut resolution = resolve_local_project(project_root).await?;
-            resolution.lockfile = lockfile;
-            (resolution, Some(format))
-        } else {
-            (
-                resolve_local_project_with_registry_metadata(
-                    project_root,
-                    metadata_cache,
-                    metadata_client,
-                )
-                .await?,
-                None,
-            )
-        };
+            .await?,
+            None,
+        )
+    };
+    check_provenance_continuity(previous_lockfile.as_ref(), &resolution.lockfile, &policy)?;
+    check_advisories(
+        &resolution.lockfile,
+        advisory_client,
+        &policy,
+        &mut warnings,
+    )
+    .await?;
+    check_store_integrity(&resolution.lockfile, &policy, &mut warnings)?;
+
     let mut final_installed = BTreeMap::new();
     let mut added_package_ids = BTreeSet::new();
     let mut completed = false;
@@ -453,8 +530,14 @@ pub async fn install_local_project(
             completed = true;
             break;
         }
-        enrich_resolution_with_registry_metadata(&mut resolution, metadata_cache, metadata_client)
-            .await?;
+        enrich_resolution_with_registry_metadata(
+            &mut resolution,
+            metadata_cache,
+            metadata_client,
+            &policy,
+            &mut warnings,
+        )
+        .await?;
     }
     if !completed {
         return Err(PackageManagerError::Backend {
@@ -463,7 +546,6 @@ pub async fn install_local_project(
                 .to_string(),
         });
     }
-    let policy = InstallPolicy::from_manifest(&PackageManifest::read_from_dir(project_root).await?);
     let lifecycle_outcome = lifecycle::run_install_lifecycle_scripts(
         project_root,
         &mut resolution.lockfile,
@@ -483,9 +565,146 @@ pub async fn install_local_project(
             .sum(),
         lifecycle_scripts: lifecycle_outcome.runs.len(),
         pending_builds: lifecycle_outcome.pending,
+        warnings,
         lockfile_changed,
         imported_lockfile,
     })
+}
+
+async fn read_project_lockfile(
+    project_root: &Path,
+) -> Result<Option<Lockfile>, PackageManagerError> {
+    let path = project_root.join(otter_pm_lockfile::LOCKFILE_NAME);
+    match tokio::fs::read_to_string(&path).await {
+        Ok(text) => Lockfile::parse_toml(&text).map(Some).map_err(Into::into),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(PackageManagerError::Io {
+            path,
+            message: err.to_string(),
+        }),
+    }
+}
+
+/// Refuse a resolution in which a package that previously shipped publish
+/// provenance no longer does.
+///
+/// Losing provenance is how a compromised publish looks from the outside: the
+/// name and the range still match, but the chain back to a build no longer
+/// exists. Gaining provenance, or never having had it, is not a downgrade.
+fn check_provenance_continuity(
+    previous: Option<&Lockfile>,
+    current: &Lockfile,
+    policy: &InstallPolicy,
+) -> Result<(), PackageManagerError> {
+    if policy.trust_policy == otter_pm_manifest::TrustPolicy::Off {
+        return Ok(());
+    }
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    let mut attested_before = BTreeMap::<&str, &str>::new();
+    for package in previous.packages.values() {
+        if package.attested {
+            attested_before.insert(package.name.as_str(), package.version.as_str());
+        }
+    }
+    for package in current.packages.values() {
+        if package.attested {
+            continue;
+        }
+        let Some(previous_version) = attested_before.get(package.name.as_str()) else {
+            continue;
+        };
+        return Err(PackageManagerError::ProvenanceDowngrade {
+            package: package.name.clone(),
+            version: package.version.clone(),
+            previous_version: (*previous_version).to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Refuse any resolved version the advisory database calls malicious.
+async fn check_advisories(
+    lockfile: &Lockfile,
+    client: &impl AdvisoryClient,
+    policy: &InstallPolicy,
+    warnings: &mut Vec<InstallWarning>,
+) -> Result<(), PackageManagerError> {
+    if policy.advisory_check == otter_pm_manifest::AdvisoryCheck::Off {
+        return Ok(());
+    }
+    let mut queries = lockfile
+        .packages
+        .values()
+        .filter(|package| {
+            matches!(
+                package.resolved.as_ref().map(|source| source.kind),
+                Some(ResolvedSourceKind::Registry)
+            )
+        })
+        .map(|package| AdvisoryQuery {
+            name: package.name.clone(),
+            version: package.version.clone(),
+        })
+        .collect::<Vec<_>>();
+    queries.sort();
+    queries.dedup();
+    if queries.is_empty() {
+        return Ok(());
+    }
+    match client.query_malicious(&queries).await {
+        Ok(advisories) => {
+            if let Some(advisory) = advisories.first() {
+                return Err(PackageManagerError::MaliciousPackage {
+                    package: advisory.name.clone(),
+                    version: advisory.version.clone(),
+                    advisory: advisory.id.clone(),
+                });
+            }
+            Ok(())
+        }
+        Err(err) if policy.advisory_check == otter_pm_manifest::AdvisoryCheck::Required => Err(err),
+        Err(err) => {
+            warnings.push(InstallWarning::new(
+                "PM_ADVISORY_LOOKUP_FAILED",
+                format!("malicious-package advisories were not consulted: {err}"),
+            ));
+            Ok(())
+        }
+    }
+}
+
+/// Report registry packages the registry published without an integrity
+/// digest, so nothing verifies the bytes that arrive.
+fn check_store_integrity(
+    lockfile: &Lockfile,
+    policy: &InstallPolicy,
+    warnings: &mut Vec<InstallWarning>,
+) -> Result<(), PackageManagerError> {
+    for package in lockfile.packages.values() {
+        let is_registry = matches!(
+            package.resolved.as_ref().map(|source| source.kind),
+            Some(ResolvedSourceKind::Registry)
+        );
+        if !is_registry || package.integrity.is_some() {
+            continue;
+        }
+        if policy.strict_store_integrity {
+            return Err(PackageManagerError::MissingIntegrity {
+                package: package.name.clone(),
+                version: package.version.clone(),
+            });
+        }
+        warnings.push(InstallWarning::new(
+            "PM_MISSING_INTEGRITY",
+            format!(
+                "`{}@{}` has no registry-published integrity digest",
+                package.name, package.version
+            ),
+        ));
+    }
+    Ok(())
 }
 
 async fn read_migration_lockfile(
@@ -553,6 +772,7 @@ async fn enrich_imported_lockfile_with_registry_metadata(
                 .clone()
                 .or_else(|| version.dist.shasum.as_ref().map(|s| format!("sha1-{s}")));
         }
+        package.attested = version.has_provenance();
         package.lifecycle = LifecycleMetadata::from_scripts(&version.scripts, TrustState::Unknown);
     }
     Ok(())
@@ -738,10 +958,13 @@ pub async fn write_local_lockfile_with_registry_metadata(
     project_root: impl AsRef<Path>,
     cache: &FsRegistryMetadataCache,
     client: &impl RegistryMetadataClient,
+    policy: &InstallPolicy,
+    warnings: &mut Vec<InstallWarning>,
 ) -> Result<bool, PackageManagerError> {
     let project_root = project_root.as_ref();
     let resolution =
-        resolve_local_project_with_registry_metadata(project_root, cache, client).await?;
+        resolve_local_project_with_registry_metadata(project_root, cache, client, policy, warnings)
+            .await?;
     write_lockfile_if_changed(project_root, &resolution.lockfile).await
 }
 
@@ -780,9 +1003,12 @@ pub async fn resolve_local_project_with_registry_metadata(
     project_root: impl AsRef<Path>,
     cache: &FsRegistryMetadataCache,
     client: &impl RegistryMetadataClient,
+    policy: &InstallPolicy,
+    warnings: &mut Vec<InstallWarning>,
 ) -> Result<LocalResolution, PackageManagerError> {
     let mut resolution = resolve_local_project(project_root).await?;
-    enrich_resolution_with_registry_metadata(&mut resolution, cache, client).await?;
+    enrich_resolution_with_registry_metadata(&mut resolution, cache, client, policy, warnings)
+        .await?;
     Ok(resolution)
 }
 
@@ -791,7 +1017,10 @@ pub async fn enrich_resolution_with_registry_metadata(
     resolution: &mut LocalResolution,
     cache: &FsRegistryMetadataCache,
     client: &impl RegistryMetadataClient,
+    policy: &InstallPolicy,
+    warnings: &mut Vec<InstallWarning>,
 ) -> Result<(), PackageManagerError> {
+    let gate = ReleaseAgeGate::new(policy, SystemTime::now());
     let project_root = infer_project_root(&resolution.graph);
     let mut processed = BTreeMap::new();
     while let Some((id, name, range)) =
@@ -799,7 +1028,7 @@ pub async fn enrich_resolution_with_registry_metadata(
     {
         processed.insert(id.clone(), ());
         let metadata = cache.get_or_fetch(&name, client).await?;
-        let version = select_registry_version(&metadata, &range)?;
+        let version = select_registry_version(&metadata, &range, &gate, warnings)?;
         let graph_id = PackageId::new(id.clone());
         let mut dependency_edges = Vec::new();
         let package = resolution
@@ -817,6 +1046,7 @@ pub async fn enrich_resolution_with_registry_metadata(
             kind: ResolvedSourceKind::Registry,
             reference: tarball.clone(),
         });
+        package.attested = version.has_provenance();
         package.lifecycle = LifecycleMetadata::from_scripts(&version.scripts, TrustState::Unknown);
         for (dep_name, dep_range, dependency_kind) in registry_dependency_edges(&version) {
             let dep_id = PackageId::registry(&dep_name, &dep_range);
@@ -943,17 +1173,19 @@ pub trait PackageResolver {
 fn select_registry_version(
     metadata: &NpmRegistryMetadata,
     range: &str,
+    gate: &ReleaseAgeGate,
+    warnings: &mut Vec<InstallWarning>,
 ) -> Result<NpmPackageVersion, PackageManagerError> {
     if let Some(version) = metadata.versions.get(range) {
-        return Ok(version.clone());
+        return accept_sole_candidate(metadata, version, gate, warnings);
     }
     if matches!(range, "*" | "latest")
         && let Some(latest) = metadata.dist_tags.get("latest")
         && let Some(version) = metadata.versions.get(latest)
     {
-        return Ok(version.clone());
+        return accept_sole_candidate(metadata, version, gate, warnings);
     }
-    if let Some(version) = select_semver_version(metadata, range) {
+    if let Some(version) = select_semver_version(metadata, range, gate, warnings)? {
         return Ok(version);
     }
     Err(PackageManagerError::NoMatchingVersion {
@@ -962,9 +1194,49 @@ fn select_registry_version(
     })
 }
 
-fn select_semver_version(metadata: &NpmRegistryMetadata, range: &str) -> Option<NpmPackageVersion> {
-    let req = normalize_npm_range(range)
-        .and_then(|normalized| semver::VersionReq::parse(&normalized).ok())?;
+/// Apply the age gate where the range leaves exactly one candidate.
+///
+/// There is nothing to fall back to, so a non-strict gate warns and proceeds
+/// rather than failing an install whose version the project itself pinned.
+fn accept_sole_candidate(
+    metadata: &NpmRegistryMetadata,
+    version: &NpmPackageVersion,
+    gate: &ReleaseAgeGate,
+    warnings: &mut Vec<InstallWarning>,
+) -> Result<NpmPackageVersion, PackageManagerError> {
+    if gate.is_disabled() || gate.admits(metadata, &version.version) {
+        return Ok(version.clone());
+    }
+    let age_hours = gate.version_age_hours(metadata, &version.version);
+    if gate.is_strict() {
+        return Err(PackageManagerError::ReleaseTooNew {
+            package: metadata.name.clone(),
+            version: version.version.clone(),
+            age_hours,
+            minimum_hours: gate.window_hours(),
+        });
+    }
+    warnings.push(InstallWarning::new(
+        "PM_RELEASE_INSIDE_COOLING_WINDOW",
+        format!(
+            "`{}@{}` was published {age_hours}h ago and is the only version the range allows",
+            metadata.name, version.version
+        ),
+    ));
+    Ok(version.clone())
+}
+
+fn select_semver_version(
+    metadata: &NpmRegistryMetadata,
+    range: &str,
+    gate: &ReleaseAgeGate,
+    warnings: &mut Vec<InstallWarning>,
+) -> Result<Option<NpmPackageVersion>, PackageManagerError> {
+    let Some(req) = normalize_npm_range(range)
+        .and_then(|normalized| semver::VersionReq::parse(&normalized).ok())
+    else {
+        return Ok(None);
+    };
     let mut versions = metadata
         .versions
         .keys()
@@ -972,9 +1244,46 @@ fn select_semver_version(metadata: &NpmRegistryMetadata, range: &str) -> Option<
         .filter(|version| req.matches(version))
         .collect::<Vec<_>>();
     versions.sort();
-    versions
-        .pop()
-        .and_then(|version| metadata.versions.get(&version.to_string()).cloned())
+    let Some(newest) = versions.pop() else {
+        return Ok(None);
+    };
+    let newest = newest.to_string();
+    if gate.is_disabled() || gate.admits(metadata, &newest) {
+        return Ok(metadata.versions.get(&newest).cloned());
+    }
+
+    let age_hours = gate.version_age_hours(metadata, &newest);
+    if gate.is_strict() {
+        return Err(PackageManagerError::ReleaseTooNew {
+            package: metadata.name.clone(),
+            version: newest,
+            age_hours,
+            minimum_hours: gate.window_hours(),
+        });
+    }
+    // The newest match is still inside the cooling window, so fall back to the
+    // newest match that has cleared it.
+    while let Some(candidate) = versions.pop() {
+        let candidate = candidate.to_string();
+        if gate.admits(metadata, &candidate) {
+            warnings.push(InstallWarning::new(
+                "PM_RELEASE_HELD_BACK",
+                format!(
+                    "`{}` resolved to {candidate}: {newest} was published {age_hours}h ago, \
+                     inside the {}h minimum release age",
+                    metadata.name,
+                    gate.window_hours()
+                ),
+            ));
+            return Ok(metadata.versions.get(&candidate).cloned());
+        }
+    }
+    Err(PackageManagerError::ReleaseTooNew {
+        package: metadata.name.clone(),
+        version: newest,
+        age_hours,
+        minimum_hours: gate.window_hours(),
+    })
 }
 
 fn normalize_npm_range(range: &str) -> Option<String> {
@@ -1301,6 +1610,7 @@ fn locked_package(
         version: version.to_string(),
         dependencies: BTreeMap::new(),
         integrity: None,
+        attested: false,
         resolved: Some(ResolvedSource {
             kind,
             reference: reference.to_string(),
@@ -1572,9 +1882,15 @@ mod tests {
         let mut resolution = resolve_local_project(tmp.path().join("project"))
             .await
             .unwrap();
-        enrich_resolution_with_registry_metadata(&mut resolution, &cache, &client)
-            .await
-            .unwrap();
+        enrich_resolution_with_registry_metadata(
+            &mut resolution,
+            &cache,
+            &client,
+            &InstallPolicy::default(),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
 
         assert!(cache.metadata_path("left-pad").is_file());
         let package = resolution
@@ -1660,6 +1976,7 @@ mod tests {
             &FileRegistryMetadataClient::new(tmp.path().join("registry")),
             &FsPackageStore::new(tmp.path().join("package-cache")),
             &FileTarballClient::new(tmp.path().join("tarballs")),
+            &FixtureAdvisoryClient::default(),
         )
         .await
         .unwrap();
@@ -1774,6 +2091,8 @@ mod tests {
             &mut resolution,
             &FsRegistryMetadataCache::new(tmp.path().join("cache")),
             &FileRegistryMetadataClient::new(&fixture),
+            &InstallPolicy::default(),
+            &mut Vec::new(),
         )
         .await
         .unwrap();
@@ -1879,6 +2198,7 @@ mod tests {
                 version: "1.3.0".to_string(),
                 dependencies: BTreeMap::new(),
                 integrity: Some(integrity),
+                attested: false,
                 resolved: Some(ResolvedSource {
                     kind: ResolvedSourceKind::Registry,
                     reference: url.to_string(),
@@ -1925,6 +2245,7 @@ mod tests {
                 version: "1.0.0".to_string(),
                 dependencies: BTreeMap::new(),
                 integrity: Some(integrity),
+                attested: false,
                 resolved: Some(ResolvedSource {
                     kind: ResolvedSourceKind::Registry,
                     reference: url.to_string(),
@@ -2025,6 +2346,7 @@ mod tests {
             &FileRegistryMetadataClient::new(&registry),
             &FsPackageStore::new(tmp.path().join("package-cache")),
             &FileTarballClient::new(&tarballs),
+            &FixtureAdvisoryClient::default(),
         )
         .await
         .unwrap();
@@ -2100,6 +2422,7 @@ mod tests {
             &FileRegistryMetadataClient::new(&registry),
             &FsPackageStore::new(tmp.path().join("package-cache")),
             &FileTarballClient::new(&tarballs),
+            &FixtureAdvisoryClient::default(),
         )
         .await
         .unwrap();
@@ -2178,6 +2501,7 @@ mod tests {
             &FileRegistryMetadataClient::new(&registry),
             &package_store,
             &FileTarballClient::new(&tarballs),
+            &FixtureAdvisoryClient::default(),
         )
         .await
         .unwrap();
@@ -2190,6 +2514,7 @@ mod tests {
             &FileRegistryMetadataClient::new(&registry),
             &package_store,
             &FileTarballClient::new(&tarballs),
+            &FixtureAdvisoryClient::default(),
         )
         .await
         .unwrap();
@@ -2288,6 +2613,7 @@ mod tests {
             &FileRegistryMetadataClient::new(tmp.path().join("registry")),
             &FsPackageStore::new(tmp.path().join("package-cache")),
             &FileTarballClient::new(&tarballs),
+            &FixtureAdvisoryClient::default(),
         )
         .await
         .unwrap();
@@ -2372,6 +2698,7 @@ mod tests {
             &FileRegistryMetadataClient::new(&registry),
             &FsPackageStore::new(tmp.path().join("package-cache")),
             &FileTarballClient::new(&tarballs),
+            &FixtureAdvisoryClient::default(),
         )
         .await
         .unwrap();
@@ -2416,6 +2743,7 @@ mod tests {
             &FileRegistryMetadataClient::new(tmp.path().join("registry")),
             &FsPackageStore::new(tmp.path().join("package-cache")),
             &HttpTarballClient::new(),
+            &FixtureAdvisoryClient::default(),
         )
         .await
         .unwrap();
@@ -2455,6 +2783,7 @@ mod tests {
                 version: "1.0.0".to_string(),
                 dependencies: BTreeMap::new(),
                 integrity: Some("sha512-test".to_string()),
+                attested: false,
                 resolved: Some(ResolvedSource {
                     kind: ResolvedSourceKind::Registry,
                     reference: "https://registry.npmjs.org/tool/-/tool-1.0.0.tgz".to_string(),
@@ -2557,6 +2886,277 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tarball, b"tgz bytes");
+    }
+
+    /// Project + registry fixture with one old and one freshly published
+    /// version of `tool`, both satisfying `^1`.
+    async fn release_age_fixture(root: &Path) {
+        let fresh = chrono::Utc::now().to_rfc3339();
+        write(
+            &root.join("project/package.json"),
+            r#"{"name":"app","dependencies":{"tool":"^1.0.0"}}"#,
+        )
+        .await;
+        write(
+            &root.join("registry/tool.json"),
+            &format!(
+                r#"{{
+                  "name": "tool",
+                  "dist-tags": {{ "latest": "1.5.0" }},
+                  "versions": {{
+                    "1.0.0": {{
+                      "name": "tool",
+                      "version": "1.0.0",
+                      "dist": {{ "tarball": "https://registry.npmjs.org/tool/-/tool-1.0.0.tgz", "integrity": "sha512-old" }}
+                    }},
+                    "1.5.0": {{
+                      "name": "tool",
+                      "version": "1.5.0",
+                      "dist": {{ "tarball": "https://registry.npmjs.org/tool/-/tool-1.5.0.tgz", "integrity": "sha512-new" }}
+                    }}
+                  }},
+                  "time": {{
+                    "1.0.0": "2020-01-01T00:00:00.000Z",
+                    "1.5.0": "{fresh}"
+                  }}
+                }}"#
+            ),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_release_inside_the_cooling_window_falls_back_to_an_older_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        release_age_fixture(tmp.path()).await;
+        let mut warnings = Vec::new();
+        let resolution = resolve_local_project_with_registry_metadata(
+            tmp.path().join("project"),
+            &FsRegistryMetadataCache::new(tmp.path().join("metadata-cache")),
+            &FileRegistryMetadataClient::new(tmp.path().join("registry")),
+            &InstallPolicy::default(),
+            &mut warnings,
+        )
+        .await
+        .unwrap();
+
+        let tool = resolution
+            .lockfile
+            .packages
+            .values()
+            .find(|package| package.name == "tool")
+            .unwrap();
+        assert_eq!(tool.version, "1.0.0");
+        assert_eq!(
+            warnings
+                .iter()
+                .map(|warning| warning.code)
+                .collect::<Vec<_>>(),
+            ["PM_RELEASE_HELD_BACK"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_strict_cooling_window_fails_instead_of_falling_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        release_age_fixture(tmp.path()).await;
+        let policy = InstallPolicy::from_settings(
+            &serde_json::from_str(r#"{"minimumReleaseAgeStrict":true}"#).unwrap(),
+        );
+        let error = resolve_local_project_with_registry_metadata(
+            tmp.path().join("project"),
+            &FsRegistryMetadataCache::new(tmp.path().join("metadata-cache")),
+            &FileRegistryMetadataClient::new(tmp.path().join("registry")),
+            &policy,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                PackageManagerError::ReleaseTooNew { package, version, .. }
+                    if package == "tool" && version == "1.5.0"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_cooling_window_takes_the_newest_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        release_age_fixture(tmp.path()).await;
+        let policy = InstallPolicy::from_settings(
+            &serde_json::from_str(r#"{"minimumReleaseAgeHours":0}"#).unwrap(),
+        );
+        let mut warnings = Vec::new();
+        let resolution = resolve_local_project_with_registry_metadata(
+            tmp.path().join("project"),
+            &FsRegistryMetadataCache::new(tmp.path().join("metadata-cache")),
+            &FileRegistryMetadataClient::new(tmp.path().join("registry")),
+            &policy,
+            &mut warnings,
+        )
+        .await
+        .unwrap();
+
+        let tool = resolution
+            .lockfile
+            .packages
+            .values()
+            .find(|package| package.name == "tool")
+            .unwrap();
+        assert_eq!(tool.version, "1.5.0");
+        assert!(warnings.is_empty());
+    }
+
+    fn registry_lockfile(name: &str, version: &str, attested: bool) -> Lockfile {
+        let mut lockfile = Lockfile::new();
+        lockfile.packages.insert(
+            format!("{name}@npm:^{version}"),
+            LockedPackage {
+                name: name.to_string(),
+                version: version.to_string(),
+                dependencies: BTreeMap::new(),
+                integrity: Some("sha512-test".to_string()),
+                attested,
+                resolved: Some(ResolvedSource {
+                    kind: ResolvedSourceKind::Registry,
+                    reference: format!("https://registry.npmjs.org/{name}/-/{name}-{version}.tgz"),
+                }),
+                lifecycle: LifecycleMetadata::default(),
+            },
+        );
+        lockfile
+    }
+
+    #[test]
+    fn losing_publish_provenance_fails_resolution() {
+        let previous = registry_lockfile("tool", "1.0.0", true);
+        let current = registry_lockfile("tool", "1.1.0", false);
+        let error =
+            check_provenance_continuity(Some(&previous), &current, &InstallPolicy::default())
+                .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                PackageManagerError::ProvenanceDowngrade { package, previous_version, .. }
+                    if package == "tool" && previous_version == "1.0.0"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_package_that_never_had_provenance_is_not_a_downgrade() {
+        let previous = registry_lockfile("tool", "1.0.0", false);
+        let current = registry_lockfile("tool", "1.1.0", false);
+        check_provenance_continuity(Some(&previous), &current, &InstallPolicy::default()).unwrap();
+    }
+
+    #[test]
+    fn an_off_trust_policy_admits_a_provenance_downgrade() {
+        let previous = registry_lockfile("tool", "1.0.0", true);
+        let current = registry_lockfile("tool", "1.1.0", false);
+        let policy = InstallPolicy::from_settings(
+            &serde_json::from_str(r#"{"trustPolicy":"off"}"#).unwrap(),
+        );
+        check_provenance_continuity(Some(&previous), &current, &policy).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_known_malicious_release_fails_the_install() {
+        let lockfile = registry_lockfile("tool", "1.0.0", false);
+        let client = FixtureAdvisoryClient::new(vec![MaliciousAdvisory {
+            name: "tool".to_string(),
+            version: "1.0.0".to_string(),
+            id: "MAL-2026-42".to_string(),
+        }]);
+        let error = check_advisories(
+            &lockfile,
+            &client,
+            &InstallPolicy::default(),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                PackageManagerError::MaliciousPackage { package, advisory, .. }
+                    if package == "tool" && advisory == "MAL-2026-42"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_advisory_database_warns_by_default_and_fails_when_required() {
+        let lockfile = registry_lockfile("tool", "1.0.0", false);
+        let client = FixtureAdvisoryClient::unavailable("connection refused");
+
+        let mut warnings = Vec::new();
+        check_advisories(&lockfile, &client, &InstallPolicy::default(), &mut warnings)
+            .await
+            .unwrap();
+        assert_eq!(
+            warnings
+                .iter()
+                .map(|warning| warning.code)
+                .collect::<Vec<_>>(),
+            ["PM_ADVISORY_LOOKUP_FAILED"]
+        );
+
+        let required = InstallPolicy::from_settings(
+            &serde_json::from_str(r#"{"advisoryCheck":"required"}"#).unwrap(),
+        );
+        let error = check_advisories(&lockfile, &client, &required, &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PackageManagerError::AdvisoryUnavailable { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_off_advisory_check_never_queries_the_database() {
+        let lockfile = registry_lockfile("tool", "1.0.0", false);
+        let client = FixtureAdvisoryClient::unavailable("connection refused");
+        let policy = InstallPolicy::from_settings(
+            &serde_json::from_str(r#"{"advisoryCheck":"off"}"#).unwrap(),
+        );
+        check_advisories(&lockfile, &client, &policy, &mut Vec::new())
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn a_package_without_an_integrity_digest_warns_and_can_be_made_fatal() {
+        let mut lockfile = registry_lockfile("tool", "1.0.0", false);
+        for package in lockfile.packages.values_mut() {
+            package.integrity = None;
+        }
+
+        let mut warnings = Vec::new();
+        check_store_integrity(&lockfile, &InstallPolicy::default(), &mut warnings).unwrap();
+        assert_eq!(
+            warnings
+                .iter()
+                .map(|warning| warning.code)
+                .collect::<Vec<_>>(),
+            ["PM_MISSING_INTEGRITY"]
+        );
+
+        let strict = InstallPolicy::from_settings(
+            &serde_json::from_str(r#"{"strictStoreIntegrity":true}"#).unwrap(),
+        );
+        let error = check_store_integrity(&lockfile, &strict, &mut Vec::new()).unwrap_err();
+        assert!(matches!(
+            error,
+            PackageManagerError::MissingIntegrity { .. }
+        ));
     }
 
     async fn write(path: &Path, text: &str) {

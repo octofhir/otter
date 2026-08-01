@@ -45,6 +45,12 @@ pub struct NpmRegistryMetadata {
     /// Published versions keyed by semver version.
     #[serde(default)]
     pub versions: BTreeMap<String, NpmPackageVersion>,
+    /// Publish timestamps in RFC 3339, keyed by version.
+    ///
+    /// npm also puts its own `created` / `modified` bookkeeping keys in this
+    /// map; they are kept verbatim and ignored by version lookups.
+    #[serde(default)]
+    pub time: BTreeMap<String, String>,
 }
 
 /// One npm package version metadata entry.
@@ -74,6 +80,20 @@ pub struct NpmPackageVersion {
     pub dist: NpmDist,
 }
 
+impl NpmPackageVersion {
+    /// `true` when the registry published build provenance for this version.
+    #[must_use]
+    pub fn has_provenance(&self) -> bool {
+        self.dist.attestations.as_ref().is_some_and(|attestations| {
+            attestations.url.is_some()
+                || attestations
+                    .provenance
+                    .as_ref()
+                    .is_some_and(|provenance| provenance.predicate_type.is_some())
+        })
+    }
+}
+
 /// npm `dist` metadata for a version.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NpmDist {
@@ -86,6 +106,32 @@ pub struct NpmDist {
     /// Legacy SHA1 shasum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shasum: Option<String>,
+    /// Publish attestations recorded by the registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestations: Option<NpmAttestations>,
+}
+
+/// Publish attestations recorded by the registry for one version.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NpmAttestations {
+    /// Location the attestation bundle is served from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Build provenance summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<NpmProvenance>,
+}
+
+/// Build provenance summary for one version.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NpmProvenance {
+    /// Attestation predicate type, for example the SLSA provenance predicate.
+    #[serde(
+        rename = "predicateType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub predicate_type: Option<String>,
 }
 
 /// Source of npm registry metadata.

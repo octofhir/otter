@@ -9,12 +9,16 @@
 //! - [`PackageManifest`] — typed `package.json` surface.
 //! - [`DependencySet`] — dependency buckets from npm manifests.
 //! - [`PackageBinManifest`] — `package.json#bin` representation.
+//! - [`OtterManifestSection`] — declared install-security settings.
 //! - [`WorkspacePackage`] — discovered workspace package.
 //! - [`discover_workspaces`] — combined npm + pnpm workspace discovery.
 //!
 //! # Invariants
 //! - Observable manifest maps use [`std::collections::BTreeMap`] so serialized
 //!   output is stable across platforms and process runs.
+//! - Keys this crate does not model are preserved verbatim through a
+//!   parse/serialize round trip, so rewriting a manifest never drops a user's
+//!   own fields.
 //! - Workspace discovery returns packages in deterministic path order.
 //! - This crate is filesystem/manifest only; runtime capability checks apply
 //!   when user code or runtime APIs consume the package graph.
@@ -23,11 +27,15 @@
 //! - [`otter-pm-lockfile`](../../otter-pm-lockfile/src/lib.rs)
 //! - [`otter-pm`](../../otter-pm/src/lib.rs)
 
+mod install_settings;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
+
+pub use install_settings::{AdvisoryCheck, InstallSettings, OtterManifestSection, TrustPolicy};
 
 /// `package.json` filename.
 pub const PACKAGE_JSON: &str = "package.json";
@@ -182,6 +190,13 @@ pub struct PackageManifest {
     /// Workspace patterns in npm format.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspaces: Option<PackageJsonWorkspaces>,
+    /// Otter-specific project settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otter: Option<OtterManifestSection>,
+    /// Keys this crate does not model, preserved verbatim so a rewrite never
+    /// drops fields owned by other tools or by the user.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl PackageManifest {
@@ -218,6 +233,22 @@ impl PackageManifest {
                 path,
                 message: err.to_string(),
             })
+    }
+
+    /// Borrow declared install-security settings, or the empty set when the
+    /// manifest declares none.
+    #[must_use]
+    pub fn install_settings(&self) -> InstallSettings {
+        self.otter
+            .as_ref()
+            .map(|section| section.install.clone())
+            .unwrap_or_default()
+    }
+
+    /// Mutably borrow declared install-security settings, creating the `otter`
+    /// section on first use.
+    pub fn install_settings_mut(&mut self) -> &mut InstallSettings {
+        &mut self.otter.get_or_insert_with(Default::default).install
     }
 
     /// Serialize as stable, pretty JSON.
@@ -543,6 +574,37 @@ mod tests {
         let reparsed = PackageManifest::parse_json(&stable).unwrap();
         assert_eq!(manifest, reparsed);
         assert_eq!(stable, reparsed.to_stable_json().unwrap());
+    }
+
+    #[test]
+    fn unmodeled_keys_survive_a_rewrite() {
+        let manifest = PackageManifest::parse_json(
+            r#"{
+              "name": "app",
+              "license": "MIT",
+              "publishConfig": { "access": "public" }
+            }"#,
+        )
+        .unwrap();
+        let rewritten = manifest.to_stable_json().unwrap();
+        assert!(rewritten.contains(r#""license": "MIT""#));
+        assert!(rewritten.contains(r#""access": "public""#));
+    }
+
+    #[test]
+    fn install_settings_are_created_on_first_approval() {
+        let mut manifest = PackageManifest::parse_json(r#"{"name":"app"}"#).unwrap();
+        assert!(manifest.install_settings().is_empty());
+        manifest
+            .install_settings_mut()
+            .allow_builds
+            .insert("esbuild".to_string(), true);
+        let rewritten = manifest.to_stable_json().unwrap();
+        let reparsed = PackageManifest::parse_json(&rewritten).unwrap();
+        assert_eq!(
+            reparsed.install_settings().allow_builds.get("esbuild"),
+            Some(&true)
+        );
     }
 
     #[test]

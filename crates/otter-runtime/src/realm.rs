@@ -160,7 +160,7 @@ impl<'a> RuntimeRealmContext<'a> {
     /// This surface is for extension installation. Page code should use
     /// [`crate::Runtime::run_script_in_realm`] or the corresponding handle API.
     pub fn install_script(&mut self, source: SourceInput) -> Result<(), OtterError> {
-        let compiled = if let Some(hook) = self.hooks.compile_hook() {
+        let bytecode = if let Some(hook) = self.hooks.compile_hook() {
             let resolved = crate::module_loader::ResolvedSource {
                 url: "<realm-installer>".to_string(),
                 kind: source.kind,
@@ -168,15 +168,30 @@ impl<'a> RuntimeRealmContext<'a> {
                 text: source.text,
             };
             hook.compile(crate::RuntimeCompileRequest { source: &resolved })?
+                .bytecode
         } else {
-            otter_compiler::compile_script_source_to_module(
-                &source.text,
-                source.kind,
-                "<realm-installer>",
-            )
-            .map_err(|error| crate::map_compile_error(error, "<realm-installer>"))?
+            // The same bootstrap sources on every launch, so the same cache.
+            let cache = crate::compile_cache::CompileCache::user_default();
+            let key = cache.as_ref().map(|_| {
+                crate::compile_cache::cache_key(&source.text, source.kind, "<realm-installer>")
+            });
+            match (&cache, &key) {
+                (Some(cache), Some(key)) if let Some(bytecode) = cache.load(key) => bytecode,
+                _ => {
+                    let compiled = otter_compiler::compile_script_source_to_module(
+                        &source.text,
+                        source.kind,
+                        "<realm-installer>",
+                    )
+                    .map_err(|error| crate::map_compile_error(error, "<realm-installer>"))?;
+                    if let (Some(cache), Some(key)) = (&cache, &key) {
+                        cache.store(key, &compiled.bytecode);
+                    }
+                    compiled.bytecode
+                }
+            }
         };
-        let context = self.interp.link_module(compiled.bytecode);
+        let context = self.interp.link_module(bytecode);
         self.interp.run(&context).map_err(crate::map_vm_error)?;
         self.interp
             .drain_microtasks(&context)

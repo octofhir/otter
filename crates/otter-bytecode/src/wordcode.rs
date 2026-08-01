@@ -45,6 +45,31 @@ const _: [(); 24] = [(); std::mem::size_of::<Instruction>()];
 const _: [(); 4] = [(); std::mem::align_of::<Instruction>()];
 
 impl Instruction {
+    /// Rebuild an instruction from the words a flat encoding stores.
+    pub(crate) const fn from_raw_parts(
+        op: Op,
+        operand_count: u8,
+        inline_operand_words: [u32; INLINE_OPERAND_WORDS],
+        overflow_operand_offset: u32,
+    ) -> Self {
+        Self {
+            op,
+            operand_count,
+            inline_operand_words,
+            overflow_operand_offset,
+        }
+    }
+
+    /// The words a flat encoding stores, in the order it stores them.
+    pub(crate) const fn raw_parts(self) -> (Op, u8, [u32; INLINE_OPERAND_WORDS], u32) {
+        (
+            self.op,
+            self.operand_count,
+            self.inline_operand_words,
+            self.overflow_operand_offset,
+        )
+    }
+
     /// Number of schema-typed operand words.
     #[must_use]
     pub const fn operand_count(self) -> usize {
@@ -78,6 +103,22 @@ pub struct FunctionCode {
 }
 
 impl FunctionCode {
+    /// Rebuild a body from the two arrays a flat encoding stores.
+    pub(crate) fn from_raw_parts(
+        instructions: Vec<Instruction>,
+        overflow_operand_words: Vec<u32>,
+    ) -> Self {
+        Self {
+            instructions: instructions.into_boxed_slice(),
+            overflow_operand_words: overflow_operand_words.into_boxed_slice(),
+        }
+    }
+
+    /// The two arrays a flat encoding stores.
+    pub(crate) fn raw_parts(&self) -> (&[Instruction], &[u32]) {
+        (&self.instructions, &self.overflow_operand_words)
+    }
+
     /// Number of logical instructions.
     #[must_use]
     pub fn len(&self) -> usize {

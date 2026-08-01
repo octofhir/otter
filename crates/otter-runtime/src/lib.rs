@@ -61,6 +61,7 @@
 
 mod commonjs;
 pub use commonjs::{require_commonjs_dependency, run_builtin_cjs_shim};
+pub mod compile_cache;
 pub mod compiled_program;
 pub mod data_modules;
 pub mod diagnostics;
@@ -2517,7 +2518,7 @@ impl Runtime {
         // frame — keeps every object it allocates rooted through GC.
         for (name, source) in pending_extension_js {
             runtime
-                .eval(SourceInput::from_javascript(source))
+                .run_bootstrap_script(&name, source)
                 .map_err(|err| OtterError::Internal {
                     code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
                     message: format!("extension `{name}` globals failed: {err}"),
@@ -2529,7 +2530,7 @@ impl Runtime {
         // can reference any global (including lazy ones) safely.
         for (name, source) in pending_class_js {
             runtime
-                .eval(SourceInput::from_javascript(source))
+                .run_bootstrap_script(name, source)
                 .map_err(|err| OtterError::Internal {
                     code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
                     message: format!("class `{name}` attached JS glue failed: {err}"),
@@ -4329,6 +4330,40 @@ impl Runtime {
     /// See [`OtterError`] variants.
     pub fn dump(&self, source: SourceInput, specifier: &str) -> Result<CompiledModule, OtterError> {
         self.compile_source(&source, specifier)
+    }
+
+    /// Run one trusted bootstrap source under its own specifier, so a stack
+    /// trace through a builtin names the extension it came from.
+    fn run_bootstrap_script(
+        &mut self,
+        name: &str,
+        source: impl Into<String>,
+    ) -> Result<ExecutionResult, OtterError> {
+        let specifier = format!("<bootstrap:{name}>");
+        let source = SourceInput::from_javascript(source.into());
+        let start = std::time::Instant::now();
+        // Bootstrap sources are byte-identical on every launch, which is what
+        // makes them worth caching. Ordinary script evaluation is deliberately
+        // left alone: its sources are one-offs, and an entry per snippet is a
+        // directory that grows without ever being read again.
+        let cache = compile_cache::CompileCache::user_default();
+        let key = cache
+            .as_ref()
+            .map(|_| compile_cache::cache_key(&source.text, source.kind, &specifier));
+        let bytecode = match (&cache, &key) {
+            (Some(cache), Some(key)) if let Some(bytecode) = cache.load(key) => bytecode,
+            _ => {
+                let compiled = self.compile_source(&source, &specifier)?;
+                self.source_maps
+                    .record_compiled_metadata(&compiled.metadata);
+                if let (Some(cache), Some(key)) = (&cache, &key) {
+                    cache.store(key, &compiled.bytecode);
+                }
+                compiled.bytecode
+            }
+        };
+        self.run_compiled_script_with_context_since(bytecode, start)
+            .map(|(result, _context)| result)
     }
 
     fn compile_source(

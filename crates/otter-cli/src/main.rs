@@ -366,6 +366,8 @@ enum Command {
     Outdated(OutdatedArgs),
     /// Review dependency install scripts and record approvals.
     ApproveBuilds(ApproveBuildsArgs),
+    /// Report dependency problems a run would otherwise hit later.
+    Doctor(DoctorArgs),
     /// Create a new `package.json`.
     Init(InitArgs),
     /// Evaluate an expression.
@@ -418,6 +420,13 @@ struct CpuProfileOptions {
 
 #[derive(Debug, Args)]
 struct InstallArgs {
+    /// Project root.
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
     /// Project root.
     #[arg(long, default_value = ".")]
     root: PathBuf,
@@ -579,6 +588,7 @@ async fn main() -> ExitCode {
         (Some(Command::Remove(args)), _) => run_pm_remove(args, json).await,
         (Some(Command::Outdated(args)), _) => run_pm_outdated(args, json).await,
         (Some(Command::ApproveBuilds(args)), _) => run_pm_approve_builds(args, json).await,
+        (Some(Command::Doctor(args)), _) => run_pm_doctor(args, json).await,
         (Some(Command::Init(args)), _) => run_pm_init(args, json).await,
         (Some(Command::Eval(args)), _) => {
             run_eval(
@@ -2420,6 +2430,102 @@ impl VersionBump {
             Self::Major => "major",
             Self::Unknown => "unknown",
         }
+    }
+}
+
+/// Report what would break a run: an installed tree that no longer matches the
+/// manifest, and imports of packages the project never declared.
+async fn run_pm_doctor(args: DoctorArgs, json: bool) -> Result<ExitCode, OtterError> {
+    let state = otter_pm::inspect_installed_dependencies(&args.root).await;
+    let scan = otter_pm_phantom::scan_project(&args.root)
+        .await
+        .map_err(|err| pm_config_error(err.to_string()))?;
+
+    let stale = match &state {
+        otter_pm::DependencyState::Stale(stale) => stale.as_slice(),
+        otter_pm::DependencyState::Fresh | otter_pm::DependencyState::Undetermined => &[],
+    };
+    let healthy = stale.is_empty() && scan.undeclared.is_empty();
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": healthy,
+                "scannedFiles": scan.scanned_files,
+                "staleDependencies": stale
+                    .iter()
+                    .map(|dependency| match &dependency.reason {
+                        otter_pm::StaleReason::Missing => serde_json::json!({
+                            "name": dependency.name,
+                            "range": dependency.range,
+                            "reason": "missing"
+                        }),
+                        otter_pm::StaleReason::OutOfRange { installed } => serde_json::json!({
+                            "name": dependency.name,
+                            "range": dependency.range,
+                            "reason": "out-of-range",
+                            "installed": installed
+                        }),
+                    })
+                    .collect::<Vec<_>>(),
+                "undeclaredImports": scan.undeclared
+            })
+        );
+        return Ok(exit_code_for_findings(healthy));
+    }
+
+    if healthy {
+        println!(
+            "no dependency problems found ({} file{} scanned)",
+            scan.scanned_files,
+            if scan.scanned_files == 1 { "" } else { "s" }
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !stale.is_empty() {
+        println!("node_modules does not match package.json:");
+        for dependency in stale {
+            match &dependency.reason {
+                otter_pm::StaleReason::Missing => {
+                    println!(
+                        "  {} ({}) is not installed",
+                        dependency.name, dependency.range
+                    );
+                }
+                otter_pm::StaleReason::OutOfRange { installed } => {
+                    println!(
+                        "  {} is installed at {installed}, outside {}",
+                        dependency.name, dependency.range
+                    );
+                }
+            }
+        }
+        println!("run: otter install");
+    }
+    if !scan.undeclared.is_empty() {
+        println!("imported but not declared in package.json:");
+        for dependency in &scan.undeclared {
+            let state = match (dependency.installed, dependency.guarded) {
+                (true, _) => "resolves today through another dependency",
+                (false, true) => "not installed, every import is guarded",
+                (false, false) => "not installed",
+            };
+            println!("  {} — {state}", dependency.package);
+            for file in &dependency.files {
+                println!("    {}", file.display());
+            }
+        }
+        println!("declare them with: otter add <package>...");
+    }
+    Ok(exit_code_for_findings(false))
+}
+
+fn exit_code_for_findings(healthy: bool) -> ExitCode {
+    if healthy {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
     }
 }
 

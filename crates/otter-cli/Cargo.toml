@@ -20,6 +20,7 @@ otter-node = { workspace = true }
 otter-pm = { workspace = true }
 otter-pm-lockfile = { workspace = true }
 otter-pm-manifest = { workspace = true }
+otter-pm-phantom = { workspace = true }
 otter-runtime = { workspace = true }
 otter-web = { workspace = true }
 clap = { workspace = true }

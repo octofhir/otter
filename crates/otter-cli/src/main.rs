@@ -2159,7 +2159,7 @@ async fn run_pm_init(args: InitArgs, json: bool) -> Result<ExitCode, OtterError>
 }
 
 async fn run_pm_install(root: &Path, json: bool) -> Result<ExitCode, OtterError> {
-    let cache_root = root.join(".otter").join("cache");
+    let cache_root = otter_pm::user_cache_root();
     let report = otter_pm::install_local_project(
         root,
         &otter_pm::FsRegistryMetadataCache::new(cache_root.join("registry-metadata")),
@@ -2303,7 +2303,7 @@ async fn run_pm_add(args: AddArgs, json: bool) -> Result<ExitCode, OtterError> {
         .write_to_dir(&args.root)
         .await
         .map_err(|err| pm_config_error(err.to_string()))?;
-    let cache_root = args.root.join(".otter").join("cache");
+    let cache_root = otter_pm::user_cache_root();
     let report = otter_pm::install_local_project(
         &args.root,
         &otter_pm::FsRegistryMetadataCache::new(cache_root.join("registry-metadata")),
@@ -2579,7 +2579,7 @@ async fn run_pm_approve_builds(
     // An approval only means something once the scripts it unblocks have run,
     // so approving reinstalls; a refusal has nothing left to do.
     let report = if approved {
-        let cache_root = args.root.join(".otter").join("cache");
+        let cache_root = otter_pm::user_cache_root();
         Some(
             otter_pm::install_local_project(
                 &args.root,
@@ -2631,7 +2631,7 @@ async fn run_pm_outdated(args: OutdatedArgs, json: bool) -> Result<ExitCode, Ott
     let lockfile = read_lockfile_if_present(&args.root)
         .await?
         .unwrap_or_else(otter_pm_lockfile::Lockfile::new);
-    let cache_root = args.root.join(".otter").join("cache");
+    let cache_root = otter_pm::user_cache_root();
     let cache = otter_pm::FsRegistryMetadataCache::new(cache_root.join("registry-metadata"));
     let client = otter_pm::HttpRegistryMetadataClient::new();
     let rows = collect_outdated_packages(&manifest, &lockfile, &cache, &client, &args).await?;

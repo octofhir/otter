@@ -37,6 +37,7 @@ mod policy;
 mod registry;
 mod release_age;
 mod script_sniff;
+mod store;
 mod tarball;
 mod warning;
 
@@ -73,6 +74,7 @@ pub use registry::{
     RegistryMetadataClient,
 };
 pub use script_sniff::{ScriptFinding, suspicious_script_findings};
+pub use store::{ContentStore, PackageIndex, StoredFile};
 pub use tarball::{
     CachedTarball, FileTarballClient, FsTarballCache, HttpTarballClient, TarballFetchClient,
     TarballSource,
@@ -1356,12 +1358,15 @@ fn is_tarball_reference(reference: &str) -> bool {
         || reference.starts_with("https://")
 }
 
-pub(crate) fn install_fingerprint(source: &TarballSource) -> String {
-    format!(
-        "{}\n{}\n",
-        source.url,
-        source.integrity.as_deref().unwrap_or("")
-    )
+/// Cache root shared by every project belonging to this user.
+///
+/// The content store only pays off when checkouts share it, so it lives beside
+/// the user's other caches rather than inside one project.
+#[must_use]
+pub fn user_cache_root() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("otter")
 }
 
 pub(crate) fn cache_key(package: &str) -> String {
@@ -2222,6 +2227,80 @@ mod tests {
 
         assert_eq!(cached.len(), 1);
         assert!(!cached[0].reused);
+    }
+
+    #[tokio::test]
+    async fn two_projects_share_one_copy_of_a_package_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tarball = npm_tgz(&[
+            (
+                "package/package.json",
+                r#"{"name":"left-pad","version":"1.0.0"}"#,
+            ),
+            ("package/index.js", "module.exports = 1;\n"),
+        ]);
+        let integrity = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&tarball))
+        );
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.0.0.tgz";
+        let fixture = tmp.path().join("tarballs");
+        write_bytes(&fixture.join(cache_key(url)), &tarball).await;
+        let mut lockfile = Lockfile::new();
+        lockfile.packages.insert(
+            "left-pad@npm:^1.0.0".to_string(),
+            LockedPackage {
+                name: "left-pad".to_string(),
+                version: "1.0.0".to_string(),
+                dependencies: BTreeMap::new(),
+                integrity: Some(integrity),
+                attested: false,
+                resolved: Some(ResolvedSource {
+                    kind: ResolvedSourceKind::Registry,
+                    reference: url.to_string(),
+                }),
+                lifecycle: LifecycleMetadata::default(),
+            },
+        );
+
+        let store = FsPackageStore::new(tmp.path().join("cache"));
+        let first = store
+            .materialize_registry_packages(
+                tmp.path().join("one"),
+                &lockfile,
+                &FileTarballClient::new(&fixture),
+            )
+            .await
+            .unwrap();
+        let second = store
+            .materialize_registry_packages(
+                tmp.path().join("two"),
+                &lockfile,
+                &FileTarballClient::new(&fixture),
+            )
+            .await
+            .unwrap();
+
+        assert!(!first[0].reused_cache);
+        assert!(
+            second[0].reused_cache,
+            "the second project must not re-extract the archive"
+        );
+        let one = tmp.path().join("one/node_modules/left-pad/index.js");
+        let two = tmp.path().join("two/node_modules/left-pad/index.js");
+        assert_eq!(std::fs::read(&one).unwrap(), std::fs::read(&two).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let one = std::fs::metadata(&one).unwrap();
+            let two = std::fs::metadata(&two).unwrap();
+            assert_eq!(
+                one.ino(),
+                two.ino(),
+                "both trees must link to the same stored bytes"
+            );
+        }
     }
 
     #[tokio::test]

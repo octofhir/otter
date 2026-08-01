@@ -29,6 +29,7 @@
 //! - [`otter-pm-lockfile`](../../otter-pm-lockfile/src/lib.rs)
 
 mod advisory;
+mod freshness;
 mod install;
 mod installed_graph;
 mod lifecycle;
@@ -58,6 +59,9 @@ use serde::{Deserialize, Serialize};
 
 pub use advisory::{
     AdvisoryClient, AdvisoryQuery, FixtureAdvisoryClient, HttpAdvisoryClient, MaliciousAdvisory,
+};
+pub use freshness::{
+    DependencyState, StaleDependency, StaleReason, inspect_installed_dependencies,
 };
 pub use install::{ExtractedPackage, FsPackageStore, InstalledPackage};
 pub use installed_graph::{prune_removed_registry_packages, resolve_installed_project};

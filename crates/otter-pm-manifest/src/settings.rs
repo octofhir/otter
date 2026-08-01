@@ -1,10 +1,10 @@
-//! Declared install-security settings from `package.json#otter`.
+//! Declared project settings from `package.json#otter`.
 //!
-//! This module owns the *syntax* of the project's install policy: what a user
-//! may write, how it serializes, and nothing else. Every field is optional so a
-//! manifest that omits the section round-trips byte-identically, and so the
-//! consumer can tell "not configured" apart from "configured to the default".
-//! Resolving these declarations into an effective policy — including the
+//! This module owns the *syntax* of those settings: what a user may write, how
+//! it serializes, and nothing else. Every field is optional so a manifest that
+//! omits the section round-trips byte-identically, and so the consumer can tell
+//! "not configured" apart from "configured to the default". Resolving these
+//! declarations into effective behaviour — including the
 //! [`InstallSettings::paranoid`] bundle — belongs to the package manager.
 //!
 //! # Contents
@@ -13,6 +13,8 @@
 //! - [`AdvisoryCheck`] — how a malicious-package advisory lookup failure is
 //!   treated.
 //! - [`TrustPolicy`] — how a loss of publish provenance is treated.
+//! - [`RunSettings`] — settings that apply when running project code.
+//! - [`VerifyDependencies`] — what a run does about a stale install.
 //!
 //! # Invariants
 //! - Every setting is `Option`-shaped except [`InstallSettings::allow_builds`],
@@ -36,14 +38,47 @@ pub struct OtterManifestSection {
     /// Install-security settings.
     #[serde(default, skip_serializing_if = "InstallSettings::is_empty")]
     pub install: InstallSettings,
+    /// Settings that apply when running project code.
+    #[serde(default, skip_serializing_if = "RunSettings::is_empty")]
+    pub run: RunSettings,
 }
 
 impl OtterManifestSection {
     /// `true` when the section carries no declarations at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.install.is_empty()
+        self.install.is_empty() && self.run.is_empty()
     }
+}
+
+/// Settings that apply when running project code.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunSettings {
+    /// What to do when the installed tree does not match the manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_dependencies: Option<VerifyDependencies>,
+}
+
+impl RunSettings {
+    /// `true` when nothing at all is declared.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// What a run does when the installed tree does not match the manifest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VerifyDependencies {
+    /// Do not look.
+    Off,
+    /// Report the mismatch and run anyway.
+    #[default]
+    Warn,
+    /// Install the missing dependencies, then run.
+    Install,
 }
 
 /// Declared install-security settings.

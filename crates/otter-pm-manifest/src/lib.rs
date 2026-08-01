@@ -27,7 +27,7 @@
 //! - [`otter-pm-lockfile`](../../otter-pm-lockfile/src/lib.rs)
 //! - [`otter-pm`](../../otter-pm/src/lib.rs)
 
-mod install_settings;
+mod settings;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -35,7 +35,10 @@ use std::path::{Path, PathBuf};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
-pub use install_settings::{AdvisoryCheck, InstallSettings, OtterManifestSection, TrustPolicy};
+pub use settings::{
+    AdvisoryCheck, InstallSettings, OtterManifestSection, RunSettings, TrustPolicy,
+    VerifyDependencies,
+};
 
 /// `package.json` filename.
 pub const PACKAGE_JSON: &str = "package.json";

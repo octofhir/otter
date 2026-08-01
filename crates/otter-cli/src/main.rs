@@ -1176,6 +1176,7 @@ async fn run_target(
     startup_timer: &CliStartupTimer,
 ) -> Result<ExitCode, OtterError> {
     let project_root = std::env::current_dir().map_err(|err| pm_config_error(err.to_string()))?;
+    verify_project_dependencies(&project_root).await?;
     let target_args = args.args.clone();
     let max_heap_bytes = args.max_heap_bytes;
     let cpu_profile = args.cpu_prof.then(|| CpuProfileOptions {
@@ -1260,6 +1261,66 @@ async fn run_target(
             .await
         }
     }
+}
+
+/// Report — or repair — an installed tree that no longer matches the manifest,
+/// before the program that depends on it starts.
+///
+/// A run that a lifecycle script started is skipped: the install that spawned
+/// it is mid-flight, so its tree is expected to be incomplete.
+async fn verify_project_dependencies(project_root: &Path) -> Result<(), OtterError> {
+    if std::env::var_os("npm_lifecycle_event").is_some() {
+        return Ok(());
+    }
+    let Ok(manifest) = PackageManifest::read_from_dir(project_root).await else {
+        return Ok(());
+    };
+    let policy = manifest
+        .otter
+        .as_ref()
+        .and_then(|section| section.run.verify_dependencies)
+        .unwrap_or_default();
+    if policy == otter_pm_manifest::VerifyDependencies::Off {
+        return Ok(());
+    }
+    let otter_pm::DependencyState::Stale(stale) =
+        otter_pm::inspect_installed_dependencies(project_root).await
+    else {
+        return Ok(());
+    };
+
+    if policy == otter_pm_manifest::VerifyDependencies::Install {
+        eprintln!(
+            "installing {} dependenc{} missing from node_modules",
+            stale.len(),
+            if stale.len() == 1 { "y" } else { "ies" }
+        );
+        run_pm_install(project_root, false).await?;
+        return Ok(());
+    }
+    eprintln!(
+        "warning: node_modules does not match package.json ({} dependenc{}):",
+        stale.len(),
+        if stale.len() == 1 { "y" } else { "ies" }
+    );
+    for dependency in &stale {
+        match &dependency.reason {
+            otter_pm::StaleReason::Missing => {
+                eprintln!(
+                    "  {} ({}) is not installed",
+                    dependency.name, dependency.range
+                );
+            }
+            otter_pm::StaleReason::OutOfRange { installed } => {
+                eprintln!(
+                    "  {} is installed at {installed}, outside {}",
+                    dependency.name, dependency.range
+                );
+            }
+        }
+    }
+    eprintln!("run: otter install");
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3146,6 +3207,30 @@ integrity = "sha512-test"
             .await
             .unwrap();
         assert!(lockfile.contains("file-tool@file:tools/file-tool"));
+    }
+
+    #[tokio::test]
+    async fn a_stale_tree_is_reported_but_does_not_stop_a_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            &tmp.path().join("package.json"),
+            r#"{"name":"app","dependencies":{"left-pad":"^1.3.0"}}"#,
+        );
+        verify_project_dependencies(tmp.path()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_project_that_turned_the_check_off_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            &tmp.path().join("package.json"),
+            r#"{
+              "name": "app",
+              "dependencies": { "left-pad": "^1.3.0" },
+              "otter": { "run": { "verifyDependencies": "off" } }
+            }"#,
+        );
+        verify_project_dependencies(tmp.path()).await.unwrap();
     }
 
     #[tokio::test]

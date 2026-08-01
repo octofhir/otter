@@ -40,11 +40,15 @@ use otter_runtime::{
 use otter_web::WebApiBuilderExt;
 use semver::{Version, VersionReq};
 
+mod dlx;
 mod error_render;
 mod execution_config;
+mod watch;
 
+use dlx::DlxArgs;
 use error_render::emit_error;
 use execution_config::CliExecutionConfig;
+use watch::WatchArgs;
 
 /// Otter — JS/TS engine (foundation phase).
 #[derive(Debug, Parser)]
@@ -368,6 +372,11 @@ enum Command {
     ApproveBuilds(ApproveBuildsArgs),
     /// Report dependency problems a run would otherwise hit later.
     Doctor(DoctorArgs),
+    /// Run a target, restarting it whenever a project source changes.
+    Watch(WatchArgs),
+    /// Run a package binary, fetching the package only when it is absent.
+    #[command(name = "x", alias = "dlx")]
+    Dlx(DlxArgs),
     /// Create a new `package.json`.
     Init(InitArgs),
     /// Evaluate an expression.
@@ -589,6 +598,10 @@ async fn main() -> ExitCode {
         (Some(Command::Outdated(args)), _) => run_pm_outdated(args, json).await,
         (Some(Command::ApproveBuilds(args)), _) => run_pm_approve_builds(args, json).await,
         (Some(Command::Doctor(args)), _) => run_pm_doctor(args, json).await,
+        (Some(Command::Watch(args)), _) => watch::run_watch(args),
+        (Some(Command::Dlx(args)), _) => {
+            run_dlx(args, json, &caps, &execution, &startup_timer).await
+        }
         (Some(Command::Init(args)), _) => run_pm_init(args, json).await,
         (Some(Command::Eval(args)), _) => {
             run_eval(
@@ -1808,6 +1821,40 @@ async fn run_eval(
         );
     }
     Ok(ExitCode::from(result.exit_code()))
+}
+
+/// Run a package binary, fetching the package only when the project does not
+/// already provide it.
+async fn run_dlx(
+    args: DlxArgs,
+    json: bool,
+    caps: &CapabilitySet,
+    execution: &CliExecutionConfig,
+    startup_timer: &CliStartupTimer,
+) -> Result<ExitCode, OtterError> {
+    let project_root = std::env::current_dir().map_err(|err| pm_config_error(err.to_string()))?;
+    let target = dlx::resolve_dlx_target(&project_root, &args).await?;
+    // Resolve through the providing package's graph rather than running the
+    // `.bin` entry directly: the entry is a launcher whose name carries no
+    // source kind, and the package's own manifest names the real file. A tree
+    // with no lockfile to resolve against still has the launcher itself.
+    let path = match resolve_run_bin(&target.root, &target.bin).await {
+        Ok(RunTarget::Bin(bin)) => bin.path,
+        Ok(_) => unreachable!("resolve_run_bin only returns Bin"),
+        Err(err) => dlx::launcher_source_path(&target).await.ok_or(err)?,
+    };
+    run_file(
+        &path,
+        &args.args,
+        json,
+        None,
+        caps,
+        execution,
+        startup_timer,
+        None,
+        None,
+    )
+    .await
 }
 
 fn cli_otter_builder(
@@ -3038,7 +3085,7 @@ fn pm_io_error(path: &Path, err: std::io::Error) -> OtterError {
     pm_config_error(format!("I/O failed for `{}`: {err}", path.display()))
 }
 
-fn pm_config_error(message: impl Into<String>) -> OtterError {
+pub(crate) fn pm_config_error(message: impl Into<String>) -> OtterError {
     OtterError::Config {
         reason: otter_runtime::ConfigError::ConflictingCapabilities {
             message: message.into(),

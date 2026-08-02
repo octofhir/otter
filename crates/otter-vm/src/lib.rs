@@ -162,6 +162,7 @@ pub mod microtask;
 mod module_ops;
 mod module_records;
 pub mod native_abi;
+pub mod native_census;
 pub mod native_function;
 pub mod number;
 pub mod object;

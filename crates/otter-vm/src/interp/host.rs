@@ -434,6 +434,22 @@ impl Interpreter {
         inspect::HeapSnapshotSummary::from_snapshot(&raw)
     }
 
+    /// Per-space, per-type-tag census of the live heap. Cheaper than
+    /// [`Self::heap_snapshot_summary`] — a linear page walk with no
+    /// edge graph — and it separates old space from the nursery, which
+    /// is what a bootstrap snapshot writer needs to size its dump.
+    #[must_use]
+    pub fn heap_census(&self) -> otter_gc::HeapCensus {
+        self.gc_heap.census()
+    }
+
+    /// Census of every live native callable by dispatch storage. See
+    /// [`crate::native_census`].
+    #[must_use]
+    pub fn native_census(&self) -> crate::native_census::NativeCensus {
+        crate::native_census::native_census(&self.gc_heap)
+    }
+
     /// Write a Chrome DevTools `.heapsnapshot` JSON document for the
     /// current heap state. The output matches the format documented
     /// at

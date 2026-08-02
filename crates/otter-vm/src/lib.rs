@@ -185,6 +185,7 @@ pub mod reflect;
 pub mod regexp;
 pub mod regexp_prototype;
 mod register_stack;
+pub mod root_census;
 #[doc(hidden)]
 pub mod rooting;
 pub mod run_control;

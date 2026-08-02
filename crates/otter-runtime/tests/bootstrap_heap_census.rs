@@ -11,13 +11,10 @@
 //!   bucket, and static function pointers dominate;
 //! - the closure-backed natives — the ones no dumped page can carry —
 //!   are few enough to enumerate and re-install by name;
-//! - **the bootstrap graph is not confined to old space.** The
-//!   interpreter builds the whole ECMAScript builtin surface in
-//!   `Interpreter::with_string_heap_cap` before the runtime turns on
-//!   `set_tenure_all`, so that surface is allocated young. Only the
-//!   extension, global-class, and JS-shim half of the build is
-//!   tenured. A snapshot that dumps old-space pages alone would miss
-//!   the builtins.
+//! - a built runtime leaves the nursery empty, so the set a snapshot
+//!   dumps is old space;
+//! - only a handful of the interpreter's root sources are filled by a
+//!   build, so only those need representing in a snapshot.
 
 use otter_modules::OtterModulesBuilderExt;
 use otter_node::NodeApiBuilderExt;
@@ -217,5 +214,26 @@ fn a_built_runtime_leaves_nothing_in_the_nursery() {
     assert!(
         full.2.in_old_space > rows[0].2.in_old_space,
         "the full surface must add natives on top of the base runtime",
+    );
+}
+
+/// The root sources a finished build actually filled. Everything a
+/// snapshot has to reproduce is in this list; everything absent from it
+/// starts life after the build and needs no representation at all.
+#[test]
+fn build_fills_only_a_handful_of_root_sources() {
+    let runtime = full_surface_runtime();
+    let roots = runtime.root_census();
+    println!("{}", roots.render_text());
+
+    let occupied = roots.occupied();
+    assert!(!occupied.is_empty(), "a build fills some root source");
+    assert!(
+        occupied.iter().any(|s| s.name == "global_this"),
+        "globalThis is always a root",
+    );
+    assert!(
+        occupied.len() < roots.sources.len(),
+        "some root sources must still be empty after a build",
     );
 }

@@ -256,8 +256,6 @@ fn only_the_known_body_types_are_not_yet_self_contained() {
     /// entry when its storage lands; never add one.
     const NOT_YET_SELF_CONTAINED: &[&str] = &[
         // `entries: Vec<..>` plus an `FxHashMap` index.
-        "SetBody",
-        "MapBody",
         "WeakMapBody",
         // `exotic: Option<Box<..>>`.
         "ObjectBody",

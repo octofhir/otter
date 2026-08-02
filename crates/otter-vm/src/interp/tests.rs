@@ -3227,12 +3227,12 @@ fn new_collection_map_uses_root_aware_allocation_with_frame_roots() {
     stack.push(frame);
 
     let before_alloc = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let before_reserved = interp.gc_heap_mut().stats().reserved_bytes;
+    let before_reserved = interp.gc_heap_mut().stats().old_allocated_bytes;
     interp
         .run_new_collection_regs(&context, &mut stack, 0, 0, 0, 1)
         .unwrap();
     let after_alloc = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let after_reserved = interp.gc_heap_mut().stats().reserved_bytes;
+    let after_reserved = interp.gc_heap_mut().stats().old_allocated_bytes;
 
     assert!(
         after_alloc > before_alloc,
@@ -3240,7 +3240,7 @@ fn new_collection_map_uses_root_aware_allocation_with_frame_roots() {
     );
     assert!(
         after_reserved > before_reserved,
-        "NewCollection Map should reserve backing storage through the root-aware path"
+        "NewCollection Map should grow backing storage through the root-aware path"
     );
     let Some(map) = (stack[0].registers[0]).as_map() else {
         panic!("NewCollection Map should write a Map");

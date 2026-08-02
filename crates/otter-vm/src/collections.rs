@@ -53,6 +53,13 @@ pub const WEAK_MAP_BODY_TYPE_TAG: u8 = 0x15;
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`WeakSetBody`].
 pub const WEAK_SET_BODY_TYPE_TAG: u8 = 0x16;
 
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for a `Map`'s entry table.
+pub const MAP_TABLE_BODY_TYPE_TAG: u8 = 0x34;
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for a `Set`'s entry table.
+pub const SET_TABLE_BODY_TYPE_TAG: u8 = 0x35;
+
+pub mod table;
+
 /// Equality key for [`JsMap`] / [`JsSet`].
 ///
 /// Implements ECMA-262 SameValueZero (§7.2.12): `+0` and `-0` map
@@ -216,21 +223,15 @@ pub struct MapBody {
     /// full method path otherwise.
     #[pelt(skip)]
     jit_guard_flags: u32,
-    entries: Vec<MapEntry>,
+    /// Insertion-ordered `[[MapData]]` and its collision chains, in one
+    /// GC body so the map owns nothing outside the heap. Null until the
+    /// first insertion.
+    table: table::TableHandle<MapEntry>,
     prototype_override: Option<Value>,
     /// Lazy ordinary own-property bag. Maps are ordinary extensible
     /// objects, so `m.x = 1` / `Object.defineProperty(m, …)` install here
     /// (the `[[MapData]]` entries are NOT own properties).
     expando: Option<crate::object::JsObject>,
-    /// Hash index: structural-key hash → live entry indices, turning
-    /// `get`/`has`/`set`/`delete` from O(n) linear scans into ~O(1).
-    /// Only hashable, GC-stable keys are indexed (number / string-by-
-    /// content / bool / null / undefined); symbol & object-identity keys
-    /// fall back to a linear scan because their hash moves under GC.
-    /// `#[pelt(skip)]`: holds no `Gc` slot (only `u64` hashes + `u32`
-    /// entry indices), so the collector never traces it.
-    #[pelt(skip)]
-    index: rustc_hash::FxHashMap<u64, smallvec::SmallVec<[u32; 2]>>,
 }
 
 pub(crate) const MAP_BODY_JIT_GUARD_FLAGS_OFFSET: usize =
@@ -238,11 +239,43 @@ pub(crate) const MAP_BODY_JIT_GUARD_FLAGS_OFFSET: usize =
 
 const _: () = assert!(MAP_BODY_JIT_GUARD_FLAGS_OFFSET.is_multiple_of(4));
 
-#[derive(Debug)]
-struct MapEntry {
+#[derive(Debug, Clone)]
+pub(crate) struct MapEntry {
     key_hash: Option<MapKey>,
     key: Option<Value>,
     value: Option<Value>,
+    /// Next entry in the same bucket, or [`table::EMPTY`]. The chain
+    /// lives in the entries themselves so the table needs no side index.
+    next: u32,
+}
+
+impl table::TableEntry for MapEntry {
+    const TABLE_TYPE_TAG: u8 = MAP_TABLE_BODY_TYPE_TAG;
+
+    fn trace_entry(&mut self, visitor: &mut SlotVisitor<'_>) {
+        <Self as crate::pelt::PeltField>::pelt_trace(self, visitor);
+    }
+
+    fn entry_hash(&self) -> Option<u64> {
+        map_key_hash(self.key_hash.as_ref()?)
+    }
+
+    fn next(&self) -> u32 {
+        self.next
+    }
+
+    fn set_next(&mut self, next: u32) {
+        self.next = next;
+    }
+
+    fn vacant() -> Self {
+        Self {
+            key_hash: None,
+            key: None,
+            value: None,
+            next: table::EMPTY,
+        }
+    }
 }
 
 impl crate::pelt::PeltField for MapEntry {
@@ -265,6 +298,7 @@ impl MapEntry {
             key_hash: Some(key_hash),
             key: Some(key),
             value: Some(value),
+            next: table::EMPTY,
         }
     }
 
@@ -284,6 +318,92 @@ impl MapEntry {
         self.key_hash = None;
         self.key = None;
         self.value = None;
+    }
+}
+
+impl MapKey {
+    /// Remember every GC reference this key holds against `parent`.
+    ///
+    /// Used when entries are copied into a fresh table behind the
+    /// mutator's back, where no ordinary store barrier ran.
+    fn record_into<T: ?Sized>(&self, heap: &mut otter_gc::GcHeap, parent: otter_gc::Gc<T>) {
+        match self {
+            Self::Undefined | Self::Null | Self::Boolean(_) | Self::Number(_) => {}
+            Self::BigInt(value) => heap.record_write(parent, &Value::big_int(*value)),
+            Self::String(value) => heap.record_write(parent, &Value::string(*value)),
+            Self::Symbol(value) => heap.record_write(parent, &Value::symbol(*value)),
+            Self::ObjectValue(value) => heap.record_write(parent, value),
+        }
+    }
+}
+
+impl MapBody {
+    /// The appended entries, tombstones included.
+    pub(crate) fn entries(&self) -> &[MapEntry] {
+        table::body_of(self.table).map_or(&[], |body| {
+            // SAFETY: the handle names a live table payload whose entry
+            // prefix outlives this borrow of the map body.
+            unsafe { std::slice::from_raw_parts((*body).entries().as_ptr(), (*body).len()) }
+        })
+    }
+
+    /// The appended entries, mutably.
+    pub(crate) fn entries_mut(&mut self) -> &mut [MapEntry] {
+        table::body_of(self.table).map_or(&mut [], |body| {
+            // SAFETY: as in `entries`; `&mut self` rules out an aliasing
+            // read of the same map body.
+            unsafe {
+                std::slice::from_raw_parts_mut((*body).entries_mut().as_mut_ptr(), (*body).len())
+            }
+        })
+    }
+
+    /// Entries the table can take before it must grow.
+    pub(crate) fn entry_capacity(&self) -> usize {
+        table::body_of(self.table).map_or(0, |body| {
+            // SAFETY: the handle names a live table payload.
+            unsafe { (*body).capacity() }
+        })
+    }
+
+    fn table_mut(&mut self) -> Option<&mut table::OrderedTableBody<MapEntry>> {
+        // SAFETY: the handle names a live table payload, and `&mut self`
+        // rules out another borrow of it through this map.
+        table::body_of(self.table).map(|body| unsafe { &mut *body })
+    }
+}
+
+impl SetBody {
+    /// The appended entries, tombstones included.
+    pub(crate) fn entries(&self) -> &[SetEntry] {
+        table::body_of(self.table).map_or(&[], |body| {
+            // SAFETY: the handle names a live table payload whose entry
+            // prefix outlives this borrow of the set body.
+            unsafe { std::slice::from_raw_parts((*body).entries().as_ptr(), (*body).len()) }
+        })
+    }
+
+    /// The appended entries, mutably.
+    pub(crate) fn entries_mut(&mut self) -> &mut [SetEntry] {
+        table::body_of(self.table).map_or(&mut [], |body| {
+            // SAFETY: as in `entries`.
+            unsafe {
+                std::slice::from_raw_parts_mut((*body).entries_mut().as_mut_ptr(), (*body).len())
+            }
+        })
+    }
+
+    /// Entries the table can take before it must grow.
+    pub(crate) fn entry_capacity(&self) -> usize {
+        table::body_of(self.table).map_or(0, |body| {
+            // SAFETY: the handle names a live table payload.
+            unsafe { (*body).capacity() }
+        })
+    }
+
+    fn table_mut(&mut self) -> Option<&mut table::OrderedTableBody<SetEntry>> {
+        // SAFETY: as in `MapBody::table_mut`.
+        table::body_of(self.table).map(|body| unsafe { &mut *body })
     }
 }
 
@@ -331,35 +451,31 @@ fn map_key_hash(key: &MapKey) -> Option<u64> {
 /// (which is append-plus-tombstone, so indices are stable for the life of
 /// the entry).
 fn map_find_entry(body: &MapBody, key: &MapKey, heap: &otter_gc::GcHeap) -> Option<usize> {
-    if let Some(hash) = map_key_hash(key) {
-        let bucket = body.index.get(&hash)?;
-        bucket.iter().map(|&i| i as usize).find(|&i| {
-            body.entries
-                .get(i)
-                .is_some_and(|e| e.key_matches(key, heap))
-        })
-    } else {
-        body.entries.iter().position(|e| e.key_matches(key, heap))
+    let entries = body.entries();
+    let Some(hash) = map_key_hash(key) else {
+        return entries.iter().position(|e| e.key_matches(key, heap));
+    };
+    let table = table::body_of(body.table)?;
+    // SAFETY: the handle names a live table payload.
+    let mut current = unsafe { (*table).bucket_head(hash) };
+    while current != table::EMPTY {
+        let index = current as usize;
+        let entry = entries.get(index)?;
+        if entry.key_matches(key, heap) {
+            return Some(index);
+        }
+        current = entry.next;
     }
+    None
 }
 
-/// Add a freshly-appended entry index to the hash index (no-op for
-/// non-indexable keys).
-fn map_index_insert(body: &mut MapBody, key: &MapKey, entry_idx: usize) {
-    if let Some(hash) = map_key_hash(key) {
-        body.index.entry(hash).or_default().push(entry_idx as u32);
-    }
-}
-
-/// Drop a now-tombstoned entry index from the hash index.
+/// Unlink a now-tombstoned entry from its collision chain (no-op for
+/// non-indexable keys, which were never chained).
 fn map_index_remove(body: &mut MapBody, key: &MapKey, entry_idx: usize) {
     if let Some(hash) = map_key_hash(key)
-        && let Some(bucket) = body.index.get_mut(&hash)
+        && let Some(table) = body.table_mut()
     {
-        bucket.retain(|i| *i as usize != entry_idx);
-        if bucket.is_empty() {
-            body.index.remove(&hash);
-        }
+        table.unlink(hash, entry_idx);
     }
 }
 
@@ -421,7 +537,7 @@ pub(crate) fn map_set_expando(
 #[must_use]
 pub fn map_len(map: JsMap, heap: &otter_gc::GcHeap) -> usize {
     heap.read_payload(map, |body| {
-        body.entries
+        body.entries()
             .iter()
             .filter(|entry| entry.value.is_some())
             .count()
@@ -439,7 +555,7 @@ pub fn map_is_empty(map: JsMap, heap: &otter_gc::GcHeap) -> bool {
 pub fn map_get(map: JsMap, heap: &otter_gc::GcHeap, key: &Value) -> Option<Value> {
     let k = MapKey::from_value(key, heap);
     heap.read_payload(map, |body| {
-        map_find_entry(body, &k, heap).and_then(|idx| body.entries[idx].value)
+        map_find_entry(body, &k, heap).and_then(|idx| body.entries()[idx].value)
     })
 }
 
@@ -463,7 +579,7 @@ pub fn map_set(
         map_find_entry(body, &lookup_key, heap).is_none()
     });
     if needs_insert {
-        let target_len = heap.read_payload(map, |body| body.entries.len().saturating_add(1));
+        let target_len = heap.read_payload(map, |body| body.entries().len().saturating_add(1));
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             key.trace_value_slot_mut(visitor);
             value.trace_value_slot_mut(visitor);
@@ -478,17 +594,17 @@ pub fn map_set(
     let existing_idx = heap.read_payload(map, |body| map_find_entry(body, &k, heap));
     let exists = existing_idx.is_some();
     heap.with_payload(map, |body| match existing_idx {
-        Some(idx) => body.entries[idx].value = Some(value),
+        Some(idx) => body.entries_mut()[idx].value = Some(value),
         None => {
-            let new_idx = body.entries.len();
-            map_index_insert(body, &k, new_idx);
-            body.entries.push(MapEntry::live(k, key, value));
+            if let Some(table) = body.table_mut() {
+                table.push(MapEntry::live(k, key, value));
+            }
         }
     });
     if !exists {
-        heap.record_write(map, &key);
+        record_map_write(heap, map, &key);
     }
-    heap.record_write(map, &value);
+    record_map_write(heap, map, &value);
     Ok(())
 }
 
@@ -510,8 +626,8 @@ pub fn map_set_existing(
     let Some(idx) = heap.read_payload(map, |body| map_find_entry(body, &k, heap)) else {
         return false;
     };
-    heap.with_payload(map, |body| body.entries[idx].value = Some(value));
-    heap.record_write(map, &value);
+    heap.with_payload(map, |body| body.entries_mut()[idx].value = Some(value));
+    record_map_write(heap, map, &value);
     true
 }
 
@@ -528,7 +644,7 @@ pub(crate) fn map_set_with_roots(
         map_find_entry(body, &lookup_key, heap).is_none()
     });
     if needs_insert {
-        let target_len = heap.read_payload(*map, |body| body.entries.len().saturating_add(1));
+        let target_len = heap.read_payload(*map, |body| body.entries().len().saturating_add(1));
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
             key.trace_value_slot_mut(visitor);
@@ -541,17 +657,17 @@ pub(crate) fn map_set_with_roots(
     let existing_idx = heap.read_payload(*map, |body| map_find_entry(body, &k, heap));
     let exists = existing_idx.is_some();
     heap.with_payload(*map, |body| match existing_idx {
-        Some(idx) => body.entries[idx].value = Some(value),
+        Some(idx) => body.entries_mut()[idx].value = Some(value),
         None => {
-            let new_idx = body.entries.len();
-            map_index_insert(body, &k, new_idx);
-            body.entries.push(MapEntry::live(k, key, value));
+            if let Some(table) = body.table_mut() {
+                table.push(MapEntry::live(k, key, value));
+            }
         }
     });
     if !exists {
-        heap.record_write(*map, &key);
+        record_map_write(heap, *map, &key);
     }
-    heap.record_write(*map, &value);
+    record_map_write(heap, *map, &value);
     Ok(())
 }
 
@@ -564,7 +680,7 @@ pub fn map_delete(map: JsMap, heap: &mut otter_gc::GcHeap, key: &Value) -> bool 
         Some(idx) => {
             heap.with_payload(map, |body| {
                 map_index_remove(body, &k, idx);
-                body.entries[idx].clear();
+                body.entries_mut()[idx].clear();
             });
             true
         }
@@ -575,10 +691,12 @@ pub fn map_delete(map: JsMap, heap: &mut otter_gc::GcHeap, key: &Value) -> bool 
 /// `Map.prototype.clear` — Spec §24.1.3.2.
 pub fn map_clear(map: JsMap, heap: &mut otter_gc::GcHeap) {
     heap.with_payload(map, |body| {
-        for entry in &mut body.entries {
+        for entry in body.entries_mut() {
             entry.clear();
         }
-        body.index.clear();
+        if let Some(table) = body.table_mut() {
+            table.clear();
+        }
     });
 }
 
@@ -586,7 +704,10 @@ pub fn map_clear(map: JsMap, heap: &mut otter_gc::GcHeap) {
 #[must_use]
 pub fn map_keys(map: JsMap, heap: &otter_gc::GcHeap) -> Vec<Value> {
     heap.read_payload(map, |body| {
-        body.entries.iter().filter_map(|entry| entry.key).collect()
+        body.entries()
+            .iter()
+            .filter_map(|entry| entry.key)
+            .collect()
     })
 }
 
@@ -594,7 +715,7 @@ pub fn map_keys(map: JsMap, heap: &otter_gc::GcHeap) -> Vec<Value> {
 #[must_use]
 pub fn map_values(map: JsMap, heap: &otter_gc::GcHeap) -> Vec<Value> {
     heap.read_payload(map, |body| {
-        body.entries
+        body.entries()
             .iter()
             .filter_map(|entry| entry.value)
             .collect()
@@ -605,14 +726,14 @@ pub fn map_values(map: JsMap, heap: &otter_gc::GcHeap) -> Vec<Value> {
 #[must_use]
 pub fn map_entries(map: JsMap, heap: &otter_gc::GcHeap) -> Vec<(Value, Value)> {
     heap.read_payload(map, |body| {
-        body.entries.iter().filter_map(MapEntry::pair).collect()
+        body.entries().iter().filter_map(MapEntry::pair).collect()
     })
 }
 
 /// Raw backing-list length, including deleted tombstone slots.
 #[must_use]
 pub(crate) fn map_raw_len(map: JsMap, heap: &otter_gc::GcHeap) -> usize {
-    heap.read_payload(map, |body| body.entries.len())
+    heap.read_payload(map, |body| body.entries().len())
 }
 
 /// Read the raw entry currently at `index` in insertion order.
@@ -622,7 +743,9 @@ pub(crate) fn map_entry_at(
     heap: &otter_gc::GcHeap,
     index: usize,
 ) -> Option<(Value, Value)> {
-    heap.read_payload(map, |body| body.entries.get(index).and_then(MapEntry::pair))
+    heap.read_payload(map, |body| {
+        body.entries().get(index).and_then(MapEntry::pair)
+    })
 }
 
 /// Identity comparison.
@@ -647,17 +770,14 @@ pub struct SetBody {
     /// flags) ignore all Set mutators, including prototype-borrowed calls.
     #[pelt(skip)]
     readonly: bool,
-    /// Insertion-ordered `[[SetData]]` list. Deleted entries become
-    /// tombstones so active iterators and `forEach` observe later
-    /// additions before exhaustion.
-    entries: Vec<SetEntry>,
+    /// Insertion-ordered `[[SetData]]` and its collision chains, in one
+    /// GC body. Deleted entries become tombstones so active iterators and
+    /// `forEach` observe later additions before exhaustion. Null until
+    /// the first insertion.
+    table: table::TableHandle<SetEntry>,
     prototype_override: Option<Value>,
     /// Lazy ordinary own-property bag (see [`MapBody::expando`]).
     expando: Option<crate::object::JsObject>,
-    /// Hash index: structural-key hash → live entry indices (see
-    /// [`MapBody::index`]). `#[pelt(skip)]`: holds no `Gc` slot.
-    #[pelt(skip)]
-    index: rustc_hash::FxHashMap<u64, smallvec::SmallVec<[u32; 2]>>,
 }
 
 pub(crate) const SET_BODY_JIT_GUARD_FLAGS_OFFSET: usize =
@@ -665,10 +785,40 @@ pub(crate) const SET_BODY_JIT_GUARD_FLAGS_OFFSET: usize =
 
 const _: () = assert!(SET_BODY_JIT_GUARD_FLAGS_OFFSET == MAP_BODY_JIT_GUARD_FLAGS_OFFSET);
 
-#[derive(Debug)]
-struct SetEntry {
+#[derive(Debug, Clone)]
+pub(crate) struct SetEntry {
     key_hash: Option<MapKey>,
     value: Option<Value>,
+    /// Next entry in the same bucket, or [`table::EMPTY`].
+    next: u32,
+}
+
+impl table::TableEntry for SetEntry {
+    const TABLE_TYPE_TAG: u8 = SET_TABLE_BODY_TYPE_TAG;
+
+    fn trace_entry(&mut self, visitor: &mut SlotVisitor<'_>) {
+        <Self as crate::pelt::PeltField>::pelt_trace(self, visitor);
+    }
+
+    fn entry_hash(&self) -> Option<u64> {
+        map_key_hash(self.key_hash.as_ref()?)
+    }
+
+    fn next(&self) -> u32 {
+        self.next
+    }
+
+    fn set_next(&mut self, next: u32) {
+        self.next = next;
+    }
+
+    fn vacant() -> Self {
+        Self {
+            key_hash: None,
+            value: None,
+            next: table::EMPTY,
+        }
+    }
 }
 
 impl crate::pelt::PeltField for SetEntry {
@@ -687,6 +837,7 @@ impl SetEntry {
         Self {
             key_hash: Some(key_hash),
             value: Some(value),
+            next: table::EMPTY,
         }
     }
 
@@ -708,31 +859,30 @@ impl SetEntry {
 /// fallback for identity keys.
 fn set_find_entry(body: &SetBody, key: &MapKey, heap: &otter_gc::GcHeap) -> Option<usize> {
     if let Some(hash) = map_key_hash(key) {
-        let bucket = body.index.get(&hash)?;
-        bucket.iter().map(|&i| i as usize).find(|&i| {
-            body.entries
-                .get(i)
-                .is_some_and(|e| e.key_matches(key, heap))
-        })
+        let entries = body.entries();
+        let table = table::body_of(body.table)?;
+        // SAFETY: the handle names a live table payload.
+        let mut current = unsafe { (*table).bucket_head(hash) };
+        while current != table::EMPTY {
+            let index = current as usize;
+            let entry = entries.get(index)?;
+            if entry.key_matches(key, heap) {
+                return Some(index);
+            }
+            current = entry.next;
+        }
+        None
     } else {
-        body.entries.iter().position(|e| e.key_matches(key, heap))
+        body.entries().iter().position(|e| e.key_matches(key, heap))
     }
 }
 
-fn set_index_insert(body: &mut SetBody, key: &MapKey, entry_idx: usize) {
-    if let Some(hash) = map_key_hash(key) {
-        body.index.entry(hash).or_default().push(entry_idx as u32);
-    }
-}
-
+/// Unlink a now-tombstoned entry from its collision chain.
 fn set_index_remove(body: &mut SetBody, key: &MapKey, entry_idx: usize) {
     if let Some(hash) = map_key_hash(key)
-        && let Some(bucket) = body.index.get_mut(&hash)
+        && let Some(table) = body.table_mut()
     {
-        bucket.retain(|i| *i as usize != entry_idx);
-        if bucket.is_empty() {
-            body.index.remove(&hash);
-        }
+        table.unlink(hash, entry_idx);
     }
 }
 
@@ -794,7 +944,7 @@ pub(crate) fn set_set_prototype_override(
 #[must_use]
 pub fn set_len(set: JsSet, heap: &otter_gc::GcHeap) -> usize {
     heap.read_payload(set, |body| {
-        body.entries
+        body.entries()
             .iter()
             .filter(|entry| entry.value.is_some())
             .count()
@@ -828,7 +978,7 @@ pub fn set_add(
         set_find_entry(body, &lookup_key, heap).is_none()
     });
     if needs_insert {
-        let target_len = heap.read_payload(set, |body| body.entries.len().saturating_add(1));
+        let target_len = heap.read_payload(set, |body| body.entries().len().saturating_add(1));
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             value.trace_value_slot_mut(visitor);
         };
@@ -839,11 +989,11 @@ pub fn set_add(
     let exists = heap.read_payload(set, |body| set_find_entry(body, &k, heap).is_some());
     if !exists {
         heap.with_payload(set, |body| {
-            let new_idx = body.entries.len();
-            set_index_insert(body, &k, new_idx);
-            body.entries.push(SetEntry::live(k, value));
+            if let Some(table) = body.table_mut() {
+                table.push(SetEntry::live(k, value));
+            }
         });
-        heap.record_write(set, &value);
+        record_set_write(heap, set, &value);
     }
     Ok(())
 }
@@ -863,7 +1013,7 @@ pub(crate) fn set_add_with_roots(
         set_find_entry(body, &lookup_key, heap).is_none()
     });
     if needs_insert {
-        let target_len = heap.read_payload(*set, |body| body.entries.len().saturating_add(1));
+        let target_len = heap.read_payload(*set, |body| body.entries().len().saturating_add(1));
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
             value.trace_value_slot_mut(visitor);
@@ -875,11 +1025,11 @@ pub(crate) fn set_add_with_roots(
     let exists = heap.read_payload(*set, |body| set_find_entry(body, &k, heap).is_some());
     if !exists {
         heap.with_payload(*set, |body| {
-            let new_idx = body.entries.len();
-            set_index_insert(body, &k, new_idx);
-            body.entries.push(SetEntry::live(k, value));
+            if let Some(table) = body.table_mut() {
+                table.push(SetEntry::live(k, value));
+            }
         });
-        heap.record_write(*set, &value);
+        record_set_write(heap, *set, &value);
     }
     Ok(())
 }
@@ -895,7 +1045,7 @@ pub fn set_delete(set: JsSet, heap: &mut otter_gc::GcHeap, value: &Value) -> boo
         Some(idx) => {
             heap.with_payload(set, |body| {
                 set_index_remove(body, &k, idx);
-                body.entries[idx].clear();
+                body.entries_mut()[idx].clear();
             });
             true
         }
@@ -909,10 +1059,12 @@ pub fn set_clear(set: JsSet, heap: &mut otter_gc::GcHeap) {
         return;
     }
     heap.with_payload(set, |body| {
-        for entry in &mut body.entries {
+        for entry in body.entries_mut() {
             entry.clear();
         }
-        body.index.clear();
+        if let Some(table) = body.table_mut() {
+            table.clear();
+        }
     });
 }
 
@@ -937,7 +1089,7 @@ pub fn set_make_readonly(set: JsSet, heap: &mut otter_gc::GcHeap) {
 #[must_use]
 pub fn set_values(set: JsSet, heap: &otter_gc::GcHeap) -> Vec<Value> {
     heap.read_payload(set, |body| {
-        body.entries
+        body.entries()
             .iter()
             .filter_map(|entry| entry.value)
             .collect()
@@ -947,14 +1099,14 @@ pub fn set_values(set: JsSet, heap: &otter_gc::GcHeap) -> Vec<Value> {
 /// Raw backing-list length, including deleted tombstone slots.
 #[must_use]
 pub(crate) fn set_raw_len(set: JsSet, heap: &otter_gc::GcHeap) -> usize {
-    heap.read_payload(set, |body| body.entries.len())
+    heap.read_payload(set, |body| body.entries().len())
 }
 
 /// Read the raw set value currently at `index` in insertion order.
 #[must_use]
 pub(crate) fn set_value_at(set: JsSet, heap: &otter_gc::GcHeap, index: usize) -> Option<Value> {
     heap.read_payload(set, |body| {
-        body.entries.get(index).and_then(|entry| entry.value)
+        body.entries().get(index).and_then(|entry| entry.value)
     })
 }
 
@@ -1613,56 +1765,156 @@ impl crate::pelt::PeltField for MapKey {
     }
 }
 
+/// Remember a write against the table that actually holds the entry.
+///
+/// A collection's entries live in a separate old-space table, so the map
+/// is not the parent of its own keys and values. Remembering only the map
+/// would leave the scavenger re-tracing a body whose sole outgoing edge
+/// is the table handle — and it stops there, because the table is old.
+/// The map is remembered too: the same call sites also write the expando
+/// and prototype override, which the map does own.
+fn record_map_write<V>(heap: &mut otter_gc::GcHeap, map: JsMap, value: &V)
+where
+    V: otter_gc::GcStore + ?Sized,
+{
+    heap.record_write(map, value);
+    let table = heap.read_payload(map, |body| body.table);
+    if !table.is_null() {
+        heap.record_write(table, value);
+    }
+}
+
+/// Remember a write against the table that holds the set's entries. See
+/// [`record_map_write`].
+fn record_set_write<V>(heap: &mut otter_gc::GcHeap, set: JsSet, value: &V)
+where
+    V: otter_gc::GcStore + ?Sized,
+{
+    heap.record_write(set, value);
+    let table = heap.read_payload(set, |body| body.table);
+    if !table.is_null() {
+        heap.record_write(table, value);
+    }
+}
+
+/// Make room for `target_len` entries, growing the table if the current
+/// one is too small.
+///
+/// Growth is the collection's one allocation point on the insert path and
+/// is deliberately separate from the insert: the insert runs inside a
+/// payload borrow with no heap available, and allocating there could move
+/// the map being written. So callers reserve first — which roots the map
+/// across the allocation — and then mutate.
+///
+/// Capacity doubles, so a run of inserts pays for growth a logarithmic
+/// number of times. The replacement table rebuilds its chains as it takes
+/// the old entries in order, which keeps every index a live iterator is
+/// holding valid.
 fn reserve_map_for_target_len_with_roots(
     map: &mut JsMap,
     heap: &mut otter_gc::GcHeap,
     target_len: usize,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let capacity = heap.read_payload(*map, |body| body.entries.capacity());
+    let capacity = heap.read_payload(*map, |body| body.entry_capacity());
     if target_len <= capacity {
         return Ok(());
     }
-    let before = map_capacity_bytes(capacity);
-    let after = map_capacity_bytes(target_len);
-    if after > before {
-        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            external_visit(visitor);
-            visitor(std::ptr::addr_of_mut!(*map) as *mut RawGc);
-        };
-        heap.reserve_bytes_with_roots((after - before) as u64, &mut reserve_roots)?;
-    }
-    heap.with_payload(*map, |body| {
-        body.entries
-            .reserve(target_len.saturating_sub(body.entries.len()));
+    let grown = target_len.max(capacity.saturating_mul(2)).max(4);
+    let owner_slot = std::ptr::addr_of_mut!(*map);
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
+        visitor(owner_slot.cast::<RawGc>());
+    };
+    let table = table::alloc_table::<MapEntry>(heap, grown, &mut visit)?;
+    let owner = *map;
+    heap.with_payload(owner, |body| {
+        let carried: Vec<MapEntry> = body.entries().to_vec();
+        // SAFETY: the handle names the table just allocated, which no
+        // other borrow reaches.
+        unsafe { (*table::body_of(table).expect("fresh table")).refill_from(&carried) };
+        body.table = table;
+        true
     });
+    // The table handle was installed by a raw payload write, and the
+    // entries were copied in behind the mutator's back, so record both
+    // edges the barrier would have.
+    heap.record_write(owner, &table);
+    record_map_table_contents(heap, table);
     Ok(())
 }
 
+/// Remember every value a freshly filled map table holds.
+///
+/// The entries are the table's own children now, not the map's, so a
+/// scavenge that only re-traces the map would stop at an old child and
+/// leave every young key and value in the table unmarked.
+fn record_map_table_contents(heap: &mut otter_gc::GcHeap, table: table::TableHandle<MapEntry>) {
+    let Some(body) = table::body_of(table) else {
+        return;
+    };
+    // SAFETY: the handle names a live table payload.
+    let entries: Vec<MapEntry> = unsafe { (*body).entries().to_vec() };
+    for entry in entries {
+        if let Some(key) = entry.key {
+            heap.record_write(table, &key);
+        }
+        if let Some(value) = entry.value {
+            heap.record_write(table, &value);
+        }
+        if let Some(key_hash) = entry.key_hash {
+            key_hash.record_into(heap, table);
+        }
+    }
+}
+
+/// Make room for `target_len` entries. See
+/// [`reserve_map_for_target_len_with_roots`].
 fn reserve_set_for_target_len_with_roots(
     set: &mut JsSet,
     heap: &mut otter_gc::GcHeap,
     target_len: usize,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let capacity = heap.read_payload(*set, |body| body.entries.capacity());
+    let capacity = heap.read_payload(*set, |body| body.entry_capacity());
     if target_len <= capacity {
         return Ok(());
     }
-    let before = set_capacity_bytes(capacity);
-    let after = set_capacity_bytes(target_len);
-    if after > before {
-        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            external_visit(visitor);
-            visitor(std::ptr::addr_of_mut!(*set) as *mut RawGc);
-        };
-        heap.reserve_bytes_with_roots((after - before) as u64, &mut reserve_roots)?;
-    }
-    heap.with_payload(*set, |body| {
-        body.entries
-            .reserve(target_len.saturating_sub(body.entries.len()));
+    let grown = target_len.max(capacity.saturating_mul(2)).max(4);
+    let owner_slot = std::ptr::addr_of_mut!(*set);
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
+        visitor(owner_slot.cast::<RawGc>());
+    };
+    let table = table::alloc_table::<SetEntry>(heap, grown, &mut visit)?;
+    let owner = *set;
+    heap.with_payload(owner, |body| {
+        let carried: Vec<SetEntry> = body.entries().to_vec();
+        // SAFETY: as in the map path.
+        unsafe { (*table::body_of(table).expect("fresh table")).refill_from(&carried) };
+        body.table = table;
+        true
     });
+    heap.record_write(owner, &table);
+    record_set_table_contents(heap, table);
     Ok(())
+}
+
+/// Remember every value a freshly filled set table holds.
+fn record_set_table_contents(heap: &mut otter_gc::GcHeap, table: table::TableHandle<SetEntry>) {
+    let Some(body) = table::body_of(table) else {
+        return;
+    };
+    // SAFETY: the handle names a live table payload.
+    let entries: Vec<SetEntry> = unsafe { (*body).entries().to_vec() };
+    for entry in entries {
+        if let Some(value) = entry.value {
+            heap.record_write(table, &value);
+        }
+        if let Some(key_hash) = entry.key_hash {
+            key_hash.record_into(heap, table);
+        }
+    }
 }
 
 fn reserve_weak_map_for_target_len_with_roots(
@@ -1715,14 +1967,6 @@ fn reserve_weak_set_for_target_len_with_roots(
             .reserve(target_len.saturating_sub(body.entries.len()));
     });
     Ok(())
-}
-
-fn map_capacity_bytes(capacity: usize) -> usize {
-    capacity.saturating_mul(std::mem::size_of::<MapEntry>())
-}
-
-fn set_capacity_bytes(capacity: usize) -> usize {
-    capacity.saturating_mul(std::mem::size_of::<SetEntry>())
 }
 
 fn weak_map_capacity_bytes(capacity: usize) -> usize {

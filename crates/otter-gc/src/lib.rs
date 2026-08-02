@@ -79,6 +79,7 @@ pub mod frame_roots;
 pub mod handle;
 pub mod header;
 pub mod heap;
+pub mod heap_image;
 #[doc(hidden)]
 pub mod marking;
 pub mod oom;
@@ -104,6 +105,7 @@ pub use frame_roots::{FrameRootProviders, FrameRoots, FrameRootsGuard, RawFrameR
 pub use handle::{EscapableHandleScope, HandleScope, HandleStack, Local};
 pub use header::{GcHeader, MarkColor};
 pub use heap::{EmptyRoots, GcHeap, HeapStats};
+pub use heap_image::{HeapImage, ImageError, Relocation};
 pub use oom::OutOfMemory;
 pub use page::{CARD_SIZE, PAGE_SIZE, Page, SpaceKind};
 pub use root_scope::{ErasedSlotTracer, RootScope};

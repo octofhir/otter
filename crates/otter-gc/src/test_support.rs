@@ -13,11 +13,13 @@
 //!
 //! - [`OpaqueLeaf`] — payload-only Traceable with no outgoing
 //!   references; type tag [`OPAQUE_LEAF_TAG`].
+//! - [`OpaquePair`] — two outgoing references, so pointer-rewriting
+//!   paths have something to rewrite; type tag [`OPAQUE_PAIR_TAG`].
 //!
 //! # Invariants
 //!
-//! - [`OPAQUE_LEAF_TAG`] is reserved for this leaf type.
-//!   Production GC types must pick a different tag.
+//! - [`OPAQUE_LEAF_TAG`] and [`OPAQUE_PAIR_TAG`] are reserved for these
+//!   types. Production GC types must pick different tags.
 //!
 //! # See also
 //!
@@ -48,4 +50,30 @@ pub struct OpaqueLeaf {
 impl Traceable for OpaqueLeaf {
     const TYPE_TAG: u8 = OPAQUE_LEAF_TAG;
     unsafe fn trace_slots(_this: *mut Self, _v: &mut SlotVisitor<'_>) {}
+}
+
+/// Reserved `type_tag` for [`OpaquePair`].
+pub const OPAQUE_PAIR_TAG: u8 = 0xFD;
+
+/// Two-slot GC object, the smallest body that exercises pointer
+/// rewriting: relocation, evacuation, and image restore all have to
+/// find both slots through the trace table.
+#[derive(Debug, Clone, Copy)]
+pub struct OpaquePair {
+    /// First outgoing reference.
+    pub first: crate::compressed::RawGc,
+    /// Second outgoing reference.
+    pub second: crate::compressed::RawGc,
+}
+
+impl Traceable for OpaquePair {
+    const TYPE_TAG: u8 = OPAQUE_PAIR_TAG;
+    unsafe fn trace_slots(this: *mut Self, v: &mut SlotVisitor<'_>) {
+        // SAFETY: `this` precedes a valid `OpaquePair` payload, so both
+        // slot addresses are inside the same allocation.
+        unsafe {
+            v(std::ptr::addr_of_mut!((*this).first));
+            v(std::ptr::addr_of_mut!((*this).second));
+        }
+    }
 }

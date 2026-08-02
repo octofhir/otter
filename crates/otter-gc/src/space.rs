@@ -359,6 +359,15 @@ impl OldSpace {
         self.standby.clear();
     }
 
+    /// Take ownership of a page whose objects are already live.
+    ///
+    /// Used by the image restore path, which fills a page from a captured
+    /// byte image and relocates its pointers before handing it over. The
+    /// free list is untouched: the page arrives fully bump-allocated.
+    pub(crate) fn adopt_page(&mut self, page: Page) {
+        self.pages.push(page);
+    }
+
     /// Total old-space pages.
     pub fn page_count(&self) -> usize {
         self.pages.len()

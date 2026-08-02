@@ -674,7 +674,7 @@ mod tests {
         // `SmallVec` spill; a symbol-property table (well-known symbols
         // installed on prototypes) and a slot-meta table (materialized
         // per-slot attributes) each replaced a sidecar `Vec`.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 2380;
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 2620;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 560 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");

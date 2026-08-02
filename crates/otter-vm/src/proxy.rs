@@ -52,26 +52,136 @@ pub struct ProxyBodyGc {
     #[pelt(skip)]
     pub callable: bool,
     /// §6.2.12 [[PrivateElements]] — private names attach to the
-    /// proxy itself and never route through traps. `(name, value)`
-    /// pairs; linear scan (private name counts are tiny). Values are
-    /// traced via `trace_proxy_private_elements`; the symbol keys
-    /// stay alive through the class capture cells.
-    #[pelt(via = trace_proxy_private_elements)]
-    pub private_elements: Option<Vec<(crate::symbol::JsSymbol, Value)>>,
+    /// proxy itself and never route through traps. The `(name, value)`
+    /// pairs live in their own GC body so the proxy owns nothing outside
+    /// the heap; null until the first private field is installed. Linear
+    /// scan, because private name counts are tiny.
+    pub private_elements: PrivateSlotsHandle,
 }
 
-/// Trace helper for proxy [[PrivateElements]]: visit both the symbol
-/// handle and the stored value of every entry.
-fn trace_proxy_private_elements(
-    entries: &Option<Vec<(crate::symbol::JsSymbol, Value)>>,
-    visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc),
-) {
-    if let Some(entries) = entries {
-        for (sym, value) in entries {
-            sym.trace_value_slots(visit);
-            value.trace_value_slots(visit);
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`PrivateSlotsBody`].
+pub const PRIVATE_SLOTS_BODY_TYPE_TAG: u8 = 0x36;
+
+/// Handle to a proxy's [[PrivateElements]] storage.
+pub type PrivateSlotsHandle = otter_gc::Gc<PrivateSlotsBody>;
+
+/// One private field: the name symbol and its value.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct PrivateSlot {
+    /// Private name.
+    pub name: crate::symbol::JsSymbol,
+    /// Stored value.
+    pub value: Value,
+}
+
+/// Count header for a proxy's private fields. The pairs follow it in the
+/// same cell.
+///
+/// A private field list never shrinks and grows one entry at a time, so
+/// an upsert that adds a name allocates a body one slot larger and copies
+/// — the counts are small enough that doubling would waste more than the
+/// copy costs.
+#[repr(C, align(8))]
+pub struct PrivateSlotsBody {
+    /// Pairs the trailing array holds.
+    len: u32,
+}
+
+impl PrivateSlotsBody {
+    /// Trailing bytes a body of `len` pairs needs.
+    #[must_use]
+    pub fn trailing_bytes(len: usize) -> usize {
+        len * std::mem::size_of::<PrivateSlot>()
+    }
+
+    /// Header for a body of `len` pairs.
+    #[must_use]
+    pub fn new(len: usize) -> Self {
+        Self {
+            len: u32::try_from(len).expect("private field count exceeds u32"),
         }
     }
+
+    /// Pairs this body holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// `true` when the proxy has no private fields.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn slots_ptr(&self) -> *mut PrivateSlot {
+        // SAFETY: the allocation reserved `trailing_bytes(len)`
+        // immediately after this header.
+        unsafe {
+            (self as *const Self as *mut u8)
+                .add(std::mem::size_of::<Self>())
+                .cast()
+        }
+    }
+
+    /// The stored pairs.
+    #[must_use]
+    pub fn slots(&self) -> &[PrivateSlot] {
+        // SAFETY: the trailing array holds exactly `len` pairs, written
+        // before the body became reachable.
+        unsafe { std::slice::from_raw_parts(self.slots_ptr().cast_const(), self.len()) }
+    }
+
+    /// The stored pairs, mutably.
+    pub fn slots_mut(&mut self) -> &mut [PrivateSlot] {
+        // SAFETY: as in `slots`.
+        unsafe { std::slice::from_raw_parts_mut(self.slots_ptr(), self.len()) }
+    }
+}
+
+impl otter_gc::SafeTraceable for PrivateSlotsBody {
+    const TYPE_TAG: u8 = PRIVATE_SLOTS_BODY_TYPE_TAG;
+
+    fn trace_slots_safe(&mut self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        for slot in self.slots_mut() {
+            slot.name.trace_value_slots(visitor);
+            slot.value.trace_value_slot_mut(visitor);
+        }
+    }
+}
+
+/// The private-slots payload behind `slots`, or `None` for a null handle.
+#[must_use]
+pub fn private_slots_body(slots: PrivateSlotsHandle) -> Option<*mut PrivateSlotsBody> {
+    if slots.is_null() {
+        return None;
+    }
+    let header = slots.as_header_ptr();
+    // SAFETY: a non-null handle names a live cell whose payload is a
+    // `PrivateSlotsBody` one header past the start.
+    Some(unsafe {
+        header
+            .cast::<u8>()
+            .add(std::mem::size_of::<otter_gc::GcHeader>())
+            .cast::<PrivateSlotsBody>()
+    })
+}
+
+/// Allocate private-field storage for `len` pairs.
+///
+/// # Errors
+/// Propagates [`otter_gc::OutOfMemory`].
+pub fn alloc_private_slots(
+    heap: &mut otter_gc::GcHeap,
+    len: usize,
+    external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+) -> Result<PrivateSlotsHandle, otter_gc::OutOfMemory> {
+    heap.alloc_variable_with_roots(
+        PrivateSlotsBody::new(len),
+        PrivateSlotsBody::trailing_bytes(len),
+        external_visit,
+    )
 }
 
 /// 4-byte compressed GC handle to a [`ProxyBodyGc`]. `Copy`.
@@ -109,7 +219,7 @@ pub fn alloc_proxy_with_roots(
             handler,
             revoked: false,
             callable,
-            private_elements: None,
+            private_elements: PrivateSlotsHandle::null(),
         },
         external_visit,
     )

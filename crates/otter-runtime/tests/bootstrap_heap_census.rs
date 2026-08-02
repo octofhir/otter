@@ -263,7 +263,6 @@ fn only_the_known_body_types_are_not_yet_self_contained() {
         // `SmallVec` captures, `Arc` closure payloads and trace hooks.
         "NativeFunctionBody",
         "JsRegExpBody",
-        "ProxyBodyGc",
     ];
 
     let mut runtime = full_surface_runtime();

@@ -3960,6 +3960,21 @@ impl Runtime {
         self.interp.heap_snapshot_summary()
     }
 
+    /// Per-space, per-type-tag census of the live heap. Separates old
+    /// space (what a bootstrap snapshot would dump) from the nursery.
+    #[must_use]
+    pub fn heap_census(&self) -> otter_gc::HeapCensus {
+        self.interp.heap_census()
+    }
+
+    /// Census of every live native callable by dispatch storage —
+    /// static function pointers, VM intrinsics, and the closure-backed
+    /// natives a snapshot restore would have to re-install by name.
+    #[must_use]
+    pub fn native_census(&self) -> otter_vm::native_census::NativeCensus {
+        self.interp.native_census()
+    }
+
     /// Write a Chrome DevTools `.heapsnapshot` for the current heap
     /// state. The output is JSON; the DevTools "Memory" panel
     /// accepts it as-is.

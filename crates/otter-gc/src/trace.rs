@@ -201,6 +201,10 @@ pub struct TraceTable {
     /// Sweep-time finalizers for bodies that impl [`SafeFinalize`].
     /// `None` for every other tag. Fires *before* `drop_table`.
     finalize_table: [Option<unsafe fn(*mut GcHeader)>; 256],
+    /// Rust type name behind each tag, captured at registration.
+    /// Diagnostics only — [`crate::census`] renders it so a heap
+    /// table reads as type names rather than bare tag bytes.
+    name_table: [Option<&'static str>; 256],
 }
 
 impl Default for TraceTable {
@@ -217,6 +221,7 @@ impl TraceTable {
             ephemeron_table: [None; 256],
             drop_table: [None; 256],
             finalize_table: [None; 256],
+            name_table: [None; 256],
         }
     }
 
@@ -272,6 +277,7 @@ impl TraceTable {
         }
         self.table[tag] = Some(trace_wrapper::<T>);
         self.ephemeron_table[tag] = Some(ephemeron_wrapper::<T>);
+        self.name_table[tag] = Some(std::any::type_name::<T>());
         // Only set drop if needed — saves one indirect call per
         // dead object on plain-old-data types.
         if std::mem::needs_drop::<T>() {
@@ -283,6 +289,14 @@ impl TraceTable {
     #[inline]
     pub fn get(&self, tag: u8) -> Option<TraceFn> {
         self.table[tag as usize]
+    }
+
+    /// Rust type name registered under `tag`, or `None` when no
+    /// type has been registered there yet.
+    #[inline]
+    #[must_use]
+    pub fn name(&self, tag: u8) -> Option<&'static str> {
+        self.name_table[tag as usize]
     }
 
     /// Look up the drop function for a given type tag.

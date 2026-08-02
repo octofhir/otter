@@ -2080,6 +2080,17 @@ impl GcHeap {
         }
     }
 
+    /// Page lists for every space, in census order: old, young
+    /// from-space, large. Lets [`crate::census`] attribute objects
+    /// to a space without opening up the space fields.
+    pub(crate) fn census_spaces(&self) -> [(crate::page::SpaceKind, &[crate::page::Page]); 3] {
+        [
+            (crate::page::SpaceKind::Old, self.old_space.pages()),
+            (crate::page::SpaceKind::NewFrom, self.new_space.from_pages()),
+            (crate::page::SpaceKind::Large, self.large_space.pages()),
+        ]
+    }
+
     /// Trace the slots of a single object — exposed for the
     /// snapshot writer.
     ///

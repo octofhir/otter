@@ -255,6 +255,32 @@ pub(crate) const NATIVE_FUNCTION_BODY_JIT_STATIC_FN_OFFSET: usize =
 
 const _: () = assert!(NATIVE_FUNCTION_BODY_JIT_STATIC_FN_OFFSET == 0);
 
+impl NativeFunctionBody {
+    /// Describe this body's non-GC payload for
+    /// [`crate::native_census`]. Lives here because the storage enum
+    /// and the raw entry address are module-private; the census
+    /// itself is pure aggregation over what this returns.
+    pub(crate) fn census_facts(&self) -> crate::native_census::NativeBodyFacts {
+        use crate::native_census::{NativeBodyFacts, NativeStorageKind};
+        let (kind, static_addr) = match &self.call {
+            NativeCallStorage::Static(f) => {
+                (NativeStorageKind::Static, Some(*f as *const () as usize))
+            }
+            NativeCallStorage::VmIntrinsic(_) => (NativeStorageKind::VmIntrinsic, None),
+            NativeCallStorage::Dynamic(_) => (NativeStorageKind::Dynamic, None),
+            NativeCallStorage::LocalDynamic(_) => (NativeStorageKind::LocalDynamic, None),
+        };
+        NativeBodyFacts {
+            name: self.name,
+            kind,
+            static_addr,
+            jit_static_fn: self.jit_static_fn,
+            capture_count: self.captures.len(),
+            has_trace_hook: self.trace.is_some(),
+        }
+    }
+}
+
 fn trace_native_trace_hook(trace: &Option<Arc<NativeTraceFn>>, visitor: &mut SlotVisitor<'_>) {
     if let Some(t) = trace {
         t(visitor);

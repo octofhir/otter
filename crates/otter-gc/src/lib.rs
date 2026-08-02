@@ -30,6 +30,7 @@
 //! - [`oom`] — `OutOfMemory` error.
 //! - [`stats`] — per-heap counters and per-type rows.
 //! - [`snapshot`] — Rust-side heap snapshot + retained-size walker.
+//! - [`census`] — per-space, per-type-tag heap census.
 //! - [`test_support`] — public Traceable helpers for downstream
 //!   tests that keep `forbid(unsafe_code)`.
 //! - [`devtools_snapshot`] — Chrome `.heapsnapshot` writer.
@@ -61,6 +62,7 @@ pub const OBJECT_ALIGNMENT: usize = 8;
 #[doc(hidden)]
 pub mod barrier;
 pub mod branded;
+pub mod census;
 #[doc(hidden)]
 pub mod compressed;
 pub mod devtools_snapshot;
@@ -90,6 +92,7 @@ pub mod test_support;
 pub mod trace;
 
 pub use branded::{GcSession, MutationSession, Root, Weak, with_gc_session};
+pub use census::{HeapCensus, SpaceCensus, TagRow};
 pub use compressed::{CageStats, Gc, cage_base, cage_size, cage_stats, init_cage_with_size};
 pub use external::{ExternalMemory, SharedExternalMemory};
 pub use extra_roots::{ExtraRootSource, ExtraRoots, ExtraRootsGuard};

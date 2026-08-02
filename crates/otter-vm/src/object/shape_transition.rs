@@ -118,6 +118,10 @@ pub(crate) fn capture_store_property_transition(
     let slot_metas = super::slot_metas_for_shape_transition(heap, obj, existing_offset);
     let slot_meta_table =
         super::slot_meta_table_for_install(&mut obj, heap, &slot_metas, index + 1, &mut []).ok()?;
+    let dictionary_keys = super::dictionary_keys_for_shape_transition(heap, obj, existing_offset);
+    let dict_table =
+        super::dict_keys_table_for_install(&mut obj, heap, &dictionary_keys, key.name(), &mut [])
+            .ok()?;
     let transition = heap.with_payload(obj, |body| {
         if !is_fast_shape_body(body)
             || !body.extensible
@@ -130,6 +134,9 @@ pub(crate) fn capture_store_property_transition(
         }
         let to_shape_id = super::next_shape_id();
         body.dictionary_shape_id = to_shape_id;
+        if let Some(table) = dict_table {
+            body.exotic_mut().dictionary_keys = table;
+        }
         if let Some(table) = slot_meta_table {
             body.exotic_mut().slots = table;
         }
@@ -258,6 +265,7 @@ pub(crate) fn replay_store_property_transition(
     // fallback holding a forwarded cell.
     let mut obj = obj;
     let mut slot_meta_table = None;
+    let mut dict_table = None;
     if to_shape.is_null() {
         // The dictionary arm below appends through `dict_push_key`,
         // which writes the sidecar and materializes per-slot metadata;
@@ -269,6 +277,15 @@ pub(crate) fn replay_store_property_transition(
             heap,
             &slot_metas,
             usize::from(transition.slot) + 1,
+            &mut [],
+        )
+        .ok()?;
+        let dictionary_keys = super::dictionary_keys_for_shape_transition(heap, obj, None);
+        dict_table = super::dict_keys_table_for_install(
+            &mut obj,
+            heap,
+            &dictionary_keys,
+            key.name(),
             &mut [],
         )
         .ok()?;
@@ -284,6 +301,9 @@ pub(crate) fn replay_store_property_transition(
         let offset = usize::from(transition.slot);
         if to_shape.is_null() {
             body.dictionary_shape_id = transition.to_shape_id;
+            if let Some(table) = dict_table {
+                body.exotic_mut().dictionary_keys = table;
+            }
             if let Some(table) = slot_meta_table {
                 body.exotic_mut().slots = table;
             }

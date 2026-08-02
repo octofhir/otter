@@ -827,13 +827,10 @@ pub struct ExoticSlots {
     /// common Null / ordinary-object prototype, which is encoded entirely by
     /// `ObjectBody::jit_proto` (null handle == `null` prototype).
     proto_override: Option<ObjectPrototype>,
-    /// Dictionary (slow-mode) string-key order — only present when the object
-    /// has left fast-shape mode (delete-shaped objects, raw fixtures, failed
-    /// transitions). Fast-shape objects never allocate it.
-    dictionary_keys: Vec<String>,
-    /// O(1) `key → slot offset` index mirroring `dictionary_keys` in dictionary
-    /// mode. Owned `String` keys only (no GC refs) → no tracing.
-    dictionary_index: rustc_hash::FxHashMap<String, u16>,
+    /// Insertion-ordered dictionary keys with their content-hash index,
+    /// in a [`DictKeysBody`] of their own — null until the object leaves
+    /// fast-shape mode.
+    dictionary_keys: DictKeysHandle,
     /// Materialized per-slot metadata (flags + `is_accessor` discriminator),
     /// index-aligned with the flat value array. Present and authoritative only
     /// for dictionary-mode objects (null shape) and attribute-overridden
@@ -899,6 +896,10 @@ impl otter_gc::SafeTraceable for ExoticSlots {
             let slot = &mut self.slots as *mut SlotMetaHandle as *mut RawGc;
             v(slot);
         }
+        if !self.dictionary_keys.is_null() {
+            let slot = &mut self.dictionary_keys as *mut DictKeysHandle as *mut RawGc;
+            v(slot);
+        }
         if let Some(native) = &mut self.call_native {
             native.trace_value_slot_mut(v);
         }
@@ -939,6 +940,338 @@ fn exotic_body_of(handle: ExoticHandle) -> Option<*mut ExoticSlots> {
             .add(std::mem::size_of::<otter_gc::GcHeader>())
             .cast::<ExoticSlots>()
     })
+}
+
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`DictKeysBody`].
+pub const DICT_KEYS_BODY_TYPE_TAG: u8 = 0x3d;
+
+/// Handle to a dictionary-mode object's key table.
+pub(crate) type DictKeysHandle = otter_gc::Gc<DictKeysBody>;
+
+/// One dictionary key record: where its UTF-8 bytes sit in the table's
+/// byte arena, and the next entry in its hash chain.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DictKeyEntry {
+    byte_offset: u32,
+    byte_len: u32,
+    /// Next entry index in the same bucket, or `u32::MAX`.
+    next: u32,
+}
+
+/// Header for a dictionary-mode object's insertion-ordered key table.
+///
+/// The trailing storage holds, in order: the bucket array (one `u32`
+/// head per bucket), the entry records, and a byte arena the keys'
+/// UTF-8 lives in. Everything the old `Vec<String>` +
+/// `FxHashMap<String, u16>` pair provided, in one cell the page image
+/// carries whole. Keys hash by content, which no collection changes,
+/// so the chains never go stale — unlike identity-keyed tables.
+///
+/// Slot offsets are entry indices: the table is append-only between
+/// wholesale rebuilds (delete compaction replaces the table), exactly
+/// like the `Vec` it replaces.
+#[repr(C, align(8))]
+pub struct DictKeysBody {
+    /// Entries the table can hold.
+    capacity: u32,
+    /// Entries written.
+    len: u32,
+    /// `bucket_count - 1`; bucket count is a power of two.
+    bucket_mask: u32,
+    /// Bytes of key arena capacity.
+    byte_capacity: u32,
+    /// Bytes of key arena used.
+    byte_len: u32,
+    _pad: u32,
+}
+
+/// End of a dictionary hash chain.
+const DICT_CHAIN_END: u32 = u32::MAX;
+
+/// Content hash for dictionary keys — stable across collections.
+fn dict_key_hash(key: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    key.as_bytes().hash(&mut hasher);
+    hasher.finish()
+}
+
+impl DictKeysBody {
+    fn bucket_count_for(capacity: usize) -> usize {
+        capacity.max(1).next_power_of_two()
+    }
+
+    /// Trailing bytes for `capacity` entries and `byte_capacity` bytes
+    /// of key arena.
+    fn trailing_bytes(capacity: usize, byte_capacity: usize) -> usize {
+        Self::bucket_count_for(capacity) * std::mem::size_of::<u32>()
+            + capacity * std::mem::size_of::<DictKeyEntry>()
+            + byte_capacity
+    }
+
+    fn new(capacity: usize, byte_capacity: usize) -> Self {
+        Self {
+            capacity: u32::try_from(capacity).expect("dict key capacity exceeds u32"),
+            len: 0,
+            bucket_mask: u32::try_from(Self::bucket_count_for(capacity) - 1)
+                .expect("bucket count exceeds u32"),
+            byte_capacity: u32::try_from(byte_capacity).expect("dict key bytes exceed u32"),
+            byte_len: 0,
+            _pad: 0,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity as usize
+    }
+
+    fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    fn bucket_count(&self) -> usize {
+        self.bucket_mask as usize + 1
+    }
+
+    fn buckets_ptr(&self) -> *mut u32 {
+        // SAFETY: the allocation reserved the bucket array immediately
+        // after this header.
+        unsafe {
+            (self as *const Self as *mut u8)
+                .add(std::mem::size_of::<Self>())
+                .cast()
+        }
+    }
+
+    fn entries_ptr(&self) -> *mut DictKeyEntry {
+        // SAFETY: the entry records follow the bucket array; both start
+        // 4-aligned inside an 8-aligned cell.
+        unsafe {
+            self.buckets_ptr()
+                .add(self.bucket_count())
+                .cast::<DictKeyEntry>()
+        }
+    }
+
+    fn bytes_ptr(&self) -> *mut u8 {
+        // SAFETY: the key arena follows the entry records.
+        unsafe { self.entries_ptr().add(self.capacity()).cast::<u8>() }
+    }
+
+    /// Point every bucket at nothing. Trailing storage is not zeroed.
+    fn init_buckets(&mut self) {
+        for i in 0..self.bucket_count() {
+            // SAFETY: `i < bucket_count`.
+            unsafe { *self.buckets_ptr().add(i) = DICT_CHAIN_END };
+        }
+    }
+
+    /// The key at entry `index`.
+    fn key_at(&self, index: usize) -> &str {
+        debug_assert!(index < self.len());
+        // SAFETY: the entry was written before the table became
+        // reachable, and its bytes are valid UTF-8 copied from a `&str`.
+        unsafe {
+            let entry = *self.entries_ptr().add(index);
+            let bytes = std::slice::from_raw_parts(
+                self.bytes_ptr()
+                    .add(entry.byte_offset as usize)
+                    .cast_const(),
+                entry.byte_len as usize,
+            );
+            std::str::from_utf8_unchecked(bytes)
+        }
+    }
+
+    /// Entry index of `key`, or `None`.
+    fn find(&self, key: &str) -> Option<u16> {
+        let bucket = (dict_key_hash(key) as u32 & self.bucket_mask) as usize;
+        // SAFETY: `bucket < bucket_count`; buckets were initialised.
+        let mut current = unsafe { *self.buckets_ptr().add(bucket) };
+        while current != DICT_CHAIN_END {
+            let index = current as usize;
+            if self.key_at(index) == key {
+                return Some(index as u16);
+            }
+            // SAFETY: chain indices always name written entries.
+            current = unsafe { (*self.entries_ptr().add(index)).next };
+        }
+        None
+    }
+
+    /// Append `key`. The caller must have reserved entry and byte room:
+    /// growth allocates, and a payload borrow has no heap.
+    fn push(&mut self, key: &str) {
+        let index = self.len();
+        debug_assert!(
+            index < self.capacity(),
+            "dict key push without a reservation"
+        );
+        debug_assert!(
+            self.byte_len as usize + key.len() <= self.byte_capacity as usize,
+            "dict key bytes push without a reservation"
+        );
+        let byte_offset = self.byte_len;
+        // SAFETY: the reservation above covers `key.len()` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                key.as_ptr(),
+                self.bytes_ptr().add(byte_offset as usize),
+                key.len(),
+            );
+        }
+        self.byte_len += key.len() as u32;
+        let bucket = (dict_key_hash(key) as u32 & self.bucket_mask) as usize;
+        // SAFETY: `bucket < bucket_count`; `index < capacity`.
+        unsafe {
+            let head = *self.buckets_ptr().add(bucket);
+            self.entries_ptr().add(index).write(DictKeyEntry {
+                byte_offset,
+                byte_len: key.len() as u32,
+                next: head,
+            });
+            *self.buckets_ptr().add(bucket) = index as u32;
+        }
+        self.len += 1;
+    }
+
+    /// Drop every entry and byte.
+    fn clear(&mut self) {
+        self.len = 0;
+        self.byte_len = 0;
+        self.init_buckets();
+    }
+}
+
+const _: () =
+    assert!(std::mem::size_of::<DictKeysBody>().is_multiple_of(std::mem::align_of::<u32>()));
+
+impl otter_gc::SafeTraceable for DictKeysBody {
+    const TYPE_TAG: u8 = DICT_KEYS_BODY_TYPE_TAG;
+
+    /// Deliberately empty: the table holds only key bytes and indices.
+    fn trace_slots_safe(&mut self, _v: &mut SlotVisitor<'_>) {}
+}
+
+/// The table payload behind `handle`, or `None` for a null handle.
+#[must_use]
+fn dict_keys_body_of(handle: DictKeysHandle) -> Option<*mut DictKeysBody> {
+    if handle.is_null() {
+        return None;
+    }
+    let header = handle.as_header_ptr();
+    // SAFETY: a non-null handle names a live cell whose payload is a
+    // `DictKeysBody` one header past the start.
+    Some(unsafe {
+        header
+            .cast::<u8>()
+            .add(std::mem::size_of::<otter_gc::GcHeader>())
+            .cast::<DictKeysBody>()
+    })
+}
+
+/// Allocate a key table holding `keys` (in order) with headroom for
+/// `extra_entries` more entries and `extra_bytes` more key bytes.
+fn dict_keys_table_from(
+    heap: &mut otter_gc::GcHeap,
+    keys: &[String],
+    extra_entries: usize,
+    extra_bytes: usize,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<DictKeysHandle, otter_gc::OutOfMemory> {
+    let capacity = (keys.len() + extra_entries).max(4);
+    let byte_capacity = (keys.iter().map(String::len).sum::<usize>() + extra_bytes)
+        .next_multiple_of(8)
+        .max(32);
+    let table: DictKeysHandle = heap.alloc_variable_with_roots(
+        DictKeysBody::new(capacity, byte_capacity),
+        DictKeysBody::trailing_bytes(capacity, byte_capacity),
+        external_visit,
+    )?;
+    // SAFETY: the handle names the table just allocated.
+    let body = dict_keys_body_of(table).expect("fresh table");
+    unsafe {
+        (*body).init_buckets();
+        for key in keys {
+            (*body).push(key);
+        }
+    }
+    Ok(table)
+}
+
+/// Pre-build the key table a mutation is about to need.
+///
+/// `keys: Some(existing)` — the caller is demoting a shaped object and
+/// will install a table holding `existing` plus the key it is about to
+/// push. `keys: None` — the object is already dictionary-mode; make
+/// sure its table has room for one more `pending_key`, growing by copy
+/// when it does not. Either way, `Some(table)` out means the payload
+/// borrow must install it before pushing.
+fn dict_keys_table_for_install(
+    object: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    keys: &Option<Vec<String>>,
+    pending_key: &str,
+    pending: &mut [CompressedValue],
+) -> Result<Option<DictKeysHandle>, otter_gc::OutOfMemory> {
+    let object_slot = (object as *mut JsObject).cast::<otter_gc::raw::RawGc>();
+    let pending_base = pending.as_mut_ptr();
+    let pending_len = pending.len();
+    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        visitor(object_slot);
+        for index in 0..pending_len {
+            // SAFETY: `index < pending_len`, and the slice outlives this
+            // call; forward tagged words as the slab reserve does.
+            let word = unsafe { pending_base.add(index) };
+            let slot = unsafe { *word };
+            if !slot.is_gc_offset() {
+                continue;
+            }
+            if slot.0 & 0b111 == 0 {
+                visitor(word.cast::<otter_gc::raw::RawGc>());
+            } else {
+                let tag = slot.0 & 0b111;
+                let mut raw = otter_gc::raw::RawGc(slot.0 & !0b111);
+                visitor(std::ptr::addr_of_mut!(raw));
+                // SAFETY: same in-range word as above.
+                unsafe { *word = CompressedValue(raw.0 | tag) };
+            }
+        }
+    };
+    if let Some(keys) = keys {
+        let table = dict_keys_table_from(heap, keys, 1, pending_key.len(), &mut visit)?;
+        return Ok(Some(table));
+    }
+    // Already dictionary-mode: grow the existing table when the pending
+    // key does not fit.
+    let current = heap.read_payload(*object, |body| {
+        body.exotic().map(|e| e.dictionary_keys).unwrap_or_default()
+    });
+    let (fits, existing) = match dict_keys_body_of(current) {
+        // SAFETY: a non-null handle names a live table.
+        Some(table) => unsafe {
+            let fits = (*table).len() < (*table).capacity()
+                && (*table).byte_len as usize + pending_key.len()
+                    <= (*table).byte_capacity as usize;
+            if fits {
+                (true, Vec::new())
+            } else {
+                let keys: Vec<String> = (0..(*table).len())
+                    .map(|i| (*table).key_at(i).to_owned())
+                    .collect();
+                (false, keys)
+            }
+        },
+        None => (false, Vec::new()),
+    };
+    if fits {
+        return Ok(None);
+    }
+    let extra_entries = existing.len().max(4);
+    let extra_bytes = (existing.iter().map(String::len).sum::<usize>() + pending_key.len()).max(32);
+    let table = dict_keys_table_from(heap, &existing, extra_entries, extra_bytes, &mut visit)?;
+    Ok(Some(table))
 }
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`SymbolPropsBody`].
@@ -1887,8 +2220,16 @@ impl ObjectBody {
     }
     /// Dictionary-mode string keys as a slice (`&[]` when no box / fast-shape).
     #[inline]
-    fn dictionary_keys(&self) -> &[String] {
-        self.exotic().map_or(&[], |e| e.dictionary_keys.as_slice())
+    fn dict_keys(&self) -> Option<&DictKeysBody> {
+        self.exotic()
+            .and_then(|e| dict_keys_body_of(e.dictionary_keys))
+            // SAFETY: a non-null handle names a live table whose prefix
+            // outlives this borrow of the object body.
+            .map(|table| unsafe { &*table })
+    }
+
+    fn dict_key_count(&self) -> usize {
+        self.dict_keys().map_or(0, DictKeysBody::len)
     }
     /// Dictionary-mode `key → slot offset`, or `None`.
     ///
@@ -1898,15 +2239,7 @@ impl ObjectBody {
     /// `JSON.parse`, which builds large numbers of small dictionary objects.
     #[inline]
     fn dictionary_index_get(&self, key: &str) -> Option<u16> {
-        let exotic = self.exotic()?;
-        if exotic.dictionary_index.is_empty() {
-            return exotic
-                .dictionary_keys
-                .iter()
-                .position(|k| k == key)
-                .map(|i| i as u16);
-        }
-        exotic.dictionary_index.get(key).copied()
+        self.dict_keys().and_then(|table| table.find(key))
     }
 
     /// `true` when per-slot metadata is materialized in [`ExoticSlots::slots`]
@@ -1950,7 +2283,7 @@ impl std::fmt::Debug for ObjectBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ObjectBody")
             .field("has_shape", &!self.shape.is_null())
-            .field("dictionary_len", &self.dictionary_keys().len())
+            .field("dictionary_len", &self.dict_key_count())
             .field("shape_cache_mode", &self.shape_cache_mode)
             .field("slot_count", &self.slots().len())
             .field(
@@ -2832,7 +3165,7 @@ fn body_property_count(heap: &otter_gc::GcHeap, body: &ObjectBody) -> usize {
     if !body.shape.is_null() {
         return shape_body::shape_property_count(heap, body.shape) as usize;
     }
-    body.dictionary_keys().len()
+    body.dict_key_count()
 }
 
 pub(super) fn body_offset_of(heap: &otter_gc::GcHeap, body: &ObjectBody, key: &str) -> Option<u16> {
@@ -2880,56 +3213,17 @@ pub(crate) fn shape_property_count(shape: ShapeHandle, heap: &otter_gc::GcHeap) 
 /// O(1). Mirrors the fast-property cap used by production engines.
 pub(crate) const MAX_FAST_PROPERTIES: u32 = 128;
 
-/// A dictionary object with at most this many own string keys keeps no hash
-/// index ([`ObjectBody::dictionary_index`] stays empty) and resolves keys by
-/// linear scan. Past it, the index is built once and maintained, keeping bulk
-/// addition and lookup O(1). Small objects — the common `JSON.parse` record —
-/// then never allocate the per-object index. Lookup over this many short
-/// interned keys is cheaper than a hash probe.
-pub(super) const DICT_LINEAR_SCAN_MAX: usize = 16;
-
-/// Build the hash index from the current `dictionary_keys` order. No-op when
-/// it is already populated.
-fn dict_build_index(exotic: &mut ExoticSlots) {
-    if !exotic.dictionary_index.is_empty() {
-        return;
-    }
-    exotic
-        .dictionary_index
-        .reserve(exotic.dictionary_keys.len());
-    for (offset, key) in exotic.dictionary_keys.iter().enumerate() {
-        exotic.dictionary_index.insert(key.clone(), offset as u16);
-    }
-}
-
-/// Push a new dictionary key, keeping [`ObjectBody::dictionary_index`]
-/// in lockstep when it is active. The caller pushes the matching slot
-/// separately; the new offset is the pre-push length (slots and keys stay
-/// aligned). A small dictionary skips the index entirely (see
-/// [`DICT_LINEAR_SCAN_MAX`]); crossing the threshold builds it.
+/// Append a dictionary key. The caller pushes the matching slot
+/// separately; the new offset is the pre-push length (slots and keys
+/// stay aligned), and the caller must have reserved room in the key
+/// table — growth allocates, and a payload borrow has no heap.
 pub(super) fn dict_push_key(body: &mut ObjectBody, key: String) {
     let exotic = body.exotic_mut();
-    let offset = exotic.dictionary_keys.len() as u16;
-    if !exotic.dictionary_index.is_empty() || exotic.dictionary_keys.len() >= DICT_LINEAR_SCAN_MAX {
-        dict_build_index(exotic);
-        exotic.dictionary_index.insert(key.clone(), offset);
-    }
-    exotic.dictionary_keys.push(key);
-}
-
-/// Replace the whole dictionary key order (shape→dictionary transition
-/// or post-delete compaction) and rebuild the index from scratch. A small
-/// key set leaves the index empty for linear-scan lookup.
-pub(super) fn dict_set_keys(body: &mut ObjectBody, keys: Vec<String>) {
-    let exotic = body.exotic_mut();
-    exotic.dictionary_index.clear();
-    if keys.len() >= DICT_LINEAR_SCAN_MAX {
-        exotic.dictionary_index.reserve(keys.len());
-        for (offset, key) in keys.iter().enumerate() {
-            exotic.dictionary_index.insert(key.clone(), offset as u16);
-        }
-    }
-    exotic.dictionary_keys = keys;
+    let table = dict_keys_body_of(exotic.dictionary_keys)
+        .expect("dictionary key pushed without a reserved table");
+    // SAFETY: a non-null handle names a live table; the sidecar borrow
+    // rules out an aliasing read.
+    unsafe { (*table).push(&key) };
 }
 
 /// Clear all dictionary keys and the index together.
@@ -2938,9 +3232,10 @@ pub(super) fn dict_clear_keys(body: &mut ObjectBody) {
     if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
             // SAFETY: a non-null handle names a live sidecar payload.
             unsafe { &mut *e })
+        && let Some(table) = dict_keys_body_of(exotic.dictionary_keys)
     {
-        exotic.dictionary_keys.clear();
-        exotic.dictionary_index.clear();
+        // SAFETY: a non-null handle names a live table.
+        unsafe { (*table).clear() };
     }
 }
 
@@ -2951,7 +3246,7 @@ fn body_has_key_at(heap: &otter_gc::GcHeap, body: &ObjectBody, offset: usize) ->
             .and_then(|offset| shape_body::shape_key_at_offset(heap, body.shape, offset))
             .is_some();
     }
-    body.dictionary_keys().get(offset).is_some()
+    body.dict_keys().is_some_and(|table| offset < table.len())
 }
 
 fn body_key_matches(heap: &otter_gc::GcHeap, body: &ObjectBody, offset: usize, key: &str) -> bool {
@@ -2960,7 +3255,8 @@ fn body_key_matches(heap: &otter_gc::GcHeap, body: &ObjectBody, offset: usize, k
             shape_body::shape_key_matches_str(heap, body.shape, offset, key)
         });
     }
-    matches!(body.dictionary_keys().get(offset), Some(name) if name == key)
+    body.dict_keys()
+        .is_some_and(|table| offset < table.len() && table.key_at(offset) == key)
 }
 
 /// `true` when hidden-class ICs may cache this object's string-keyed slots.
@@ -4114,10 +4410,19 @@ pub fn set(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Va
     ) else {
         return;
     };
+    let Ok(dict_table) = dict_keys_table_for_install(
+        obj,
+        heap,
+        &dictionary_keys,
+        key,
+        std::slice::from_mut(&mut compressed),
+    ) else {
+        return;
+    };
     heap.with_payload(*obj, |body| {
         body.dictionary_shape_id = next_shape_id();
-        if let Some(dictionary_keys) = dictionary_keys {
-            dict_set_keys(body, dictionary_keys);
+        if let Some(table) = dict_table {
+            body.exotic_mut().dictionary_keys = table;
         }
         if let Some(table) = slot_meta_table {
             body.exotic_mut().slots = table;
@@ -4126,8 +4431,11 @@ pub fn set(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Va
         body.shape = ShapeHandle::null();
         body.push_slot(index, SlotMeta::data_default(), compressed);
     });
+    let sidecar = heap.read_payload(*obj, |body| body.exotic.get());
     if let Some(table) = slot_meta_table {
-        let sidecar = heap.read_payload(*obj, |body| body.exotic.get());
+        heap.record_write(sidecar, &table);
+    }
+    if let Some(table) = dict_table {
         heap.record_write(sidecar, &table);
     }
     record_slot_write(heap, *obj, compressed);
@@ -4422,6 +4730,17 @@ pub fn delete(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
     if existing_offset.is_some() {
         materialize_slots(obj, heap);
     }
+    let mut obj_for_table = obj;
+    let Ok(replacement_table) = dict_keys_table_for_install(
+        &mut obj_for_table,
+        heap,
+        &Some(replacement_keys),
+        "",
+        &mut [],
+    ) else {
+        return false;
+    };
+    let obj = obj_for_table;
     heap.with_payload(obj, |body| {
         let Some(offset) = existing_offset else {
             // Spec step 2: missing → true.
@@ -4432,7 +4751,9 @@ pub fn delete(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
         }
         body.remove_slot(offset as usize);
         body.dictionary_shape_id = next_shape_id();
-        dict_set_keys(body, replacement_keys);
+        if let Some(table) = replacement_table {
+            body.exotic_mut().dictionary_keys = table;
+        }
         body.shape = ShapeHandle::null();
         shape_cache::invalidate_fast_shape_assumptions(
             body,
@@ -4486,10 +4807,23 @@ pub(crate) fn delete_if_same_data(
         }
         keys
     });
+    let mut obj_for_table = obj;
+    let Ok(replacement_table) = dict_keys_table_for_install(
+        &mut obj_for_table,
+        heap,
+        &Some(replacement_keys),
+        "",
+        &mut [],
+    ) else {
+        return false;
+    };
+    let obj = obj_for_table;
     heap.with_payload(obj, |body| {
         body.remove_slot(offset as usize);
         body.dictionary_shape_id = next_shape_id();
-        dict_set_keys(body, replacement_keys);
+        if let Some(table) = replacement_table {
+            body.exotic_mut().dictionary_keys = table;
+        }
         body.shape = ShapeHandle::null();
         shape_cache::invalidate_fast_shape_assumptions(
             body,
@@ -4623,6 +4957,20 @@ pub fn define_own_property_partial(
     ) else {
         return false;
     };
+    let dict_table = if existing_offset.is_none() {
+        let Ok(table) = dict_keys_table_for_install(
+            &mut obj,
+            heap,
+            &dictionary_keys,
+            key,
+            std::slice::from_mut(&mut stored),
+        ) else {
+            return false;
+        };
+        table
+    } else {
+        None
+    };
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
             body.set_slot(offset as usize, meta, stored, None);
@@ -4632,8 +4980,8 @@ pub fn define_own_property_partial(
                 return false;
             }
             body.dictionary_shape_id = next_shape_id();
-            if let Some(dictionary_keys) = dictionary_keys {
-                dict_set_keys(body, dictionary_keys);
+            if let Some(table) = dict_table {
+                body.exotic_mut().dictionary_keys = table;
             }
             if let Some(table) = slot_meta_table {
                 body.exotic_mut().slots = table;
@@ -4644,8 +4992,11 @@ pub fn define_own_property_partial(
             true
         }
     });
+    let sidecar = heap.read_payload(obj, |body| body.exotic.get());
     if let Some(table) = slot_meta_table {
-        let sidecar = heap.read_payload(obj, |body| body.exotic.get());
+        heap.record_write(sidecar, &table);
+    }
+    if let Some(table) = dict_table {
         heap.record_write(sidecar, &table);
     }
     if success {
@@ -4872,6 +5223,20 @@ pub fn define_own_property_in_place(
     ) else {
         return false;
     };
+    let dict_table = if existing_offset.is_none() {
+        let Ok(table) = dict_keys_table_for_install(
+            &mut obj,
+            heap,
+            &dictionary_keys,
+            key,
+            std::slice::from_mut(&mut stored),
+        ) else {
+            return false;
+        };
+        table
+    } else {
+        None
+    };
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
             body.set_slot(offset as usize, meta, stored, None);
@@ -4881,8 +5246,8 @@ pub fn define_own_property_in_place(
                 return false;
             }
             body.dictionary_shape_id = next_shape_id();
-            if let Some(dictionary_keys) = dictionary_keys {
-                dict_set_keys(body, dictionary_keys);
+            if let Some(table) = dict_table {
+                body.exotic_mut().dictionary_keys = table;
             }
             if let Some(table) = slot_meta_table {
                 body.exotic_mut().slots = table;
@@ -4893,8 +5258,11 @@ pub fn define_own_property_in_place(
             true
         }
     });
+    let sidecar = heap.read_payload(obj, |body| body.exotic.get());
     if let Some(table) = slot_meta_table {
-        let sidecar = heap.read_payload(obj, |body| body.exotic.get());
+        heap.record_write(sidecar, &table);
+    }
+    if let Some(table) = dict_table {
         heap.record_write(sidecar, &table);
     }
     if success {
@@ -5527,11 +5895,11 @@ fn ordinary_string_key_entries(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Ve
             })
             .collect()
     } else {
-        body.dictionary_keys()
-            .iter()
-            .enumerate()
-            .map(|(slot, key)| (key.to_string(), slot))
-            .collect()
+        body.dict_keys().map_or_else(Vec::new, |table| {
+            (0..table.len())
+                .map(|slot| (table.key_at(slot).to_string(), slot))
+                .collect()
+        })
     };
 
     order_string_key_entries(insertion_order)
@@ -5579,15 +5947,18 @@ pub(crate) fn dictionary_ordered_slot_attrs(
         if !body.shape.is_null() || !shape_cache::supports_fast_property_ic(body) {
             return None;
         }
-        let count = body.dictionary_keys().len();
+        let count = body.dict_key_count();
         if count > MAX_FAST_PROPERTIES as usize || body.slots().len() != count {
             return None;
         }
         Some(
-            body.dictionary_keys()
-                .iter()
-                .enumerate()
-                .map(|(offset, key)| {
+            (0..count)
+                .map(|offset| {
+                    let key = body
+                        .dict_keys()
+                        .expect("counted keys imply a table")
+                        .key_at(offset)
+                        .to_string();
                     let (flags, is_accessor) = body.slot_attrs(heap, offset);
                     (key.clone(), flags, is_accessor)
                 })
@@ -5607,7 +5978,7 @@ pub(crate) fn dictionary_ordered_slot_attrs(
 pub(crate) fn adopt_fast_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, shape: ShapeHandle) {
     debug_assert_object_shape_handle(shape, "slow-to-fast migration");
     debug_assert_eq!(
-        heap.read_payload(obj, |body| body.dictionary_keys().len()),
+        heap.read_payload(obj, |body| body.dict_key_count()),
         shape_body::shape_property_count(heap, shape) as usize,
         "migrated hidden class must record every dictionary slot"
     );
@@ -5619,8 +5990,10 @@ pub(crate) fn adopt_fast_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, shape
             // SAFETY: a non-null handle names a live sidecar payload.
             unsafe { &mut *e })
         {
-            exotic.dictionary_keys.clear();
-            exotic.dictionary_index.clear();
+            if let Some(table) = dict_keys_body_of(exotic.dictionary_keys) {
+                // SAFETY: a non-null handle names a live table.
+                unsafe { (*table).clear() };
+            }
             if let Some(table) = slot_meta_body_of(exotic.slots) {
                 // SAFETY: a non-null handle names a live table.
                 unsafe { (*table).clear() };
@@ -5658,7 +6031,11 @@ fn string_keys_in_shape_order(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Vec
             .map(|(key, _)| String::from_utf16_lossy(&to_utf16_vec(heap, key)))
             .collect();
     }
-    body.dictionary_keys().to_vec()
+    body.dict_keys().map_or_else(Vec::new, |table| {
+        (0..table.len())
+            .map(|i| table.key_at(i).to_string())
+            .collect()
+    })
 }
 
 fn dictionary_keys_for_shape_transition(
@@ -5839,7 +6216,7 @@ mod tests {
         assert_eq!(
             interp
                 .gc_heap()
-                .read_payload(o, |body| body.dictionary_keys().len()),
+                .read_payload(o, |body| body.dict_key_count()),
             0
         );
     }
@@ -5864,7 +6241,7 @@ mod tests {
         assert_eq!(
             interp
                 .gc_heap()
-                .read_payload(o, |body| body.dictionary_keys().len()),
+                .read_payload(o, |body| body.dict_key_count()),
             0
         );
     }
@@ -6003,7 +6380,7 @@ mod tests {
         assert_eq!(
             interp
                 .gc_heap()
-                .read_payload(o, |body| body.dictionary_keys().len()),
+                .read_payload(o, |body| body.dict_key_count()),
             0
         );
     }

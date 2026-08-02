@@ -75,6 +75,20 @@ pub(super) fn ordinary_set_data_property(
     ) else {
         return false;
     };
+    let dict_table = if existing_offset.is_none() {
+        let Ok(table) = super::dict_keys_table_for_install(
+            &mut obj,
+            heap,
+            &dictionary_keys,
+            key,
+            std::slice::from_mut(&mut compressed),
+        ) else {
+            return false;
+        };
+        table
+    } else {
+        None
+    };
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
             let i = offset as usize;
@@ -90,8 +104,8 @@ pub(super) fn ordinary_set_data_property(
             return false;
         }
         body.dictionary_shape_id = next_shape_id();
-        if let Some(dictionary_keys) = dictionary_keys {
-            super::dict_set_keys(body, dictionary_keys);
+        if let Some(table) = dict_table {
+            body.exotic_mut().dictionary_keys = table;
         }
         if let Some(table) = slot_meta_table {
             body.exotic_mut().slots = table;
@@ -101,8 +115,11 @@ pub(super) fn ordinary_set_data_property(
         body.push_slot(append_index, SlotMeta::data_default(), compressed);
         true
     });
+    let sidecar = heap.read_payload(obj, |body| body.exotic.get());
     if let Some(table) = slot_meta_table {
-        let sidecar = heap.read_payload(obj, |body| body.exotic.get());
+        heap.record_write(sidecar, &table);
+    }
+    if let Some(table) = dict_table {
         heap.record_write(sidecar, &table);
     }
     if success {

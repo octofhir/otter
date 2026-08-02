@@ -953,11 +953,25 @@ pub fn ensure_exotic(
     object: &mut JsObject,
     heap: &mut otter_gc::GcHeap,
 ) -> Result<(), otter_gc::OutOfMemory> {
+    ensure_exotic_with_roots(object, heap, &mut |_| {})
+}
+
+/// [`ensure_exotic`], with pending caller values rooted across the
+/// sidecar allocation.
+///
+/// # Errors
+/// Propagates [`otter_gc::OutOfMemory`].
+pub(crate) fn ensure_exotic_with_roots(
+    object: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<(), otter_gc::OutOfMemory> {
     if !heap.read_payload(*object, |body| body.exotic.is_null()) {
         return Ok(());
     }
     let owner_slot = std::ptr::addr_of_mut!(*object);
     let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
         visitor(owner_slot.cast::<RawGc>());
     };
     let sidecar: ExoticHandle =

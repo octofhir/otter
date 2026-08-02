@@ -116,6 +116,11 @@ pub enum JsStringBodyRepr {
 /// enough that caching only wastes memory, so small strings stay uncached.
 const UTF16_CACHE_MIN_LEN: u32 = 256;
 
+// A cached widening is only worth taking when the subject is long, and any
+// string that long allocates its units sequentially rather than inline. That
+// is what lets `with_utf16` read a filled cache as `SeqFlat` directly.
+const _: () = assert!(UTF16_CACHE_MIN_LEN as usize > INLINE_FLAT_CAP);
+
 /// GC-managed JavaScript string body.
 ///
 /// `repr(C)` because the sequential variants keep their code units in
@@ -133,12 +138,16 @@ pub struct JsStringBody {
     pub hash: u64,
     /// Variant-specific payload.
     pub repr: JsStringBodyRepr,
-    /// Lazily-filled widened UTF-16 units for large subjects. String
-    /// content is immutable (representation may collapse rope→flat, but the
-    /// code units never change), so once filled the buffer stays valid for
-    /// the body's lifetime and moves with it under GC. Not traced: it holds
-    /// plain `u16` data, no GC handles.
-    utf16_cache: std::cell::OnceCell<Box<[u16]>>,
+    /// Lazily-filled widened view of this string, as a flat string body.
+    /// Null until [`ensure_utf16_cache`] fills it.
+    ///
+    /// The cache is a string rather than a side buffer so it owns nothing
+    /// outside the heap: it is traced, it moves with the collector, and a
+    /// page image carries it like any other body. String content is
+    /// immutable — a representation may collapse rope→flat, but the code
+    /// units never change — so once filled it stays correct for the body's
+    /// lifetime.
+    utf16_cache: JsStringHandle,
 }
 
 const _: () = assert!(std::mem::size_of::<JsStringBodyRepr>() <= 32);
@@ -243,6 +252,12 @@ impl otter_gc::SafeTraceable for JsStringBody {
     const TYPE_TAG: u8 = JS_STRING_BODY_TYPE_TAG;
 
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
+        // The widened cache is an ordinary string body, so it is traced like
+        // any other outgoing handle regardless of this body's variant.
+        if !self.utf16_cache.is_null() {
+            let p = &mut self.utf16_cache as *mut JsStringHandle as *mut RawGc;
+            visitor(p);
+        }
         match &mut self.repr {
             JsStringBodyRepr::InlineFlat(_)
             | JsStringBodyRepr::SeqFlat
@@ -289,20 +304,20 @@ pub fn alloc_flat_string_body_with_roots(
                 len,
                 hash,
                 repr: JsStringBodyRepr::InlineFlat(inline),
-                utf16_cache: std::cell::OnceCell::new(),
+                utf16_cache: JsStringHandle::null(),
             },
             external_visit,
         );
     }
     // The code units live in the same cell as the body, so they are part of
     // the GC allocation and need no separate cap reservation.
-    let handle = heap.alloc_variable_with_roots(
+    let handle = heap.alloc_trailing_with_roots(
         JsStringBody {
             id,
             len,
             hash,
             repr: JsStringBodyRepr::SeqFlat,
-            utf16_cache: std::cell::OnceCell::new(),
+            utf16_cache: JsStringHandle::null(),
         },
         JsStringBody::trailing_bytes(false, units.len()),
         external_visit,
@@ -335,19 +350,19 @@ pub fn alloc_latin1_string_body_with_roots(
                 len,
                 hash,
                 repr: JsStringBodyRepr::InlineLatin1(inline),
-                utf16_cache: std::cell::OnceCell::new(),
+                utf16_cache: JsStringHandle::null(),
             },
             external_visit,
         );
     }
     // Same as the flat path: the bytes are inside the GC allocation.
-    let handle = heap.alloc_variable_with_roots(
+    let handle = heap.alloc_trailing_with_roots(
         JsStringBody {
             id,
             len,
             hash,
             repr: JsStringBodyRepr::SeqLatin1,
-            utf16_cache: std::cell::OnceCell::new(),
+            utf16_cache: JsStringHandle::null(),
         },
         JsStringBody::trailing_bytes(true, bytes.len()),
         external_visit,
@@ -478,7 +493,7 @@ pub fn concat_string_bodies(
                 right,
                 depth: final_depth,
             },
-            utf16_cache: std::cell::OnceCell::new(),
+            utf16_cache: JsStringHandle::null(),
         },
         external_visit,
     )
@@ -558,7 +573,7 @@ pub fn slice_string_body(
                         parent: string,
                         start,
                     },
-                    utf16_cache: std::cell::OnceCell::new(),
+                    utf16_cache: JsStringHandle::null(),
                 },
                 external_visit,
             )
@@ -607,7 +622,7 @@ pub fn slice_string_body(
                         parent,
                         start: abs_start,
                     },
-                    utf16_cache: std::cell::OnceCell::new(),
+                    utf16_cache: JsStringHandle::null(),
                 },
                 external_visit,
             )
@@ -664,13 +679,12 @@ pub fn flatten_in_place(
     string: JsStringHandle,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let is_indirect = heap.read_payload(string, |b| {
-        matches!(
-            b.repr,
-            JsStringBodyRepr::Cons { .. } | JsStringBodyRepr::Sliced { .. }
-        )
-    });
-    if !is_indirect {
+    // "Already flat" means the units can be read contiguously, which a slice
+    // over a sequential parent can. Testing the variant instead would call a
+    // flattened rope indirect — it is rewritten into exactly such a view — and
+    // re-flatten it, allocating a fresh copy of the whole string on every
+    // read. That is quadratic for the `/g` loop this exists to speed up.
+    if contiguous_view(heap, string).is_some() {
         return Ok(());
     }
     let units = to_utf16_vec(heap, string);
@@ -813,9 +827,22 @@ pub fn eq_str(heap: &GcHeap, string: JsStringHandle, key: &str) -> bool {
     match fast {
         Fast::Match => true,
         Fast::Mismatch => false,
-        Fast::Rope => to_utf16_vec(heap, string)
-            .into_iter()
-            .eq(key.encode_utf16()),
+        // A slice over a contiguous parent — what a flattened rope is — still
+        // compares in place; only a genuine cons rope has to materialise.
+        Fast::Rope => match contiguous_view(heap, string) {
+            Some((target, start, len)) => {
+                heap.read_payload(target, |b| match flat_content_range(b, start, len) {
+                    Some(FlatContent::Latin1(bytes)) => {
+                        bytes.iter().map(|&x| u16::from(x)).eq(key.encode_utf16())
+                    }
+                    Some(FlatContent::Wide(units)) => units.iter().copied().eq(key.encode_utf16()),
+                    None => unreachable!("resolved view stores its units contiguously"),
+                })
+            }
+            None => to_utf16_vec(heap, string)
+                .into_iter()
+                .eq(key.encode_utf16()),
+        },
     }
 }
 
@@ -846,28 +873,128 @@ pub fn to_utf16_vec(heap: &GcHeap, string: JsStringHandle) -> Vec<u16> {
 /// out inside `f` first. Reading other bodies (e.g. the compiled regex) is
 /// fine — that is a shared borrow, not a mutation.
 pub fn with_utf16<R>(heap: &GcHeap, string: JsStringHandle, f: impl FnOnce(&[u16]) -> R) -> R {
-    let len = heap.read_payload(string, |b| b.len);
-    if len < UTF16_CACHE_MIN_LEN {
-        let units = materialize_utf16_vec(heap, string);
-        return f(&units);
-    }
-    // Fill the cache in a scope that holds no live borrow of the units, so
-    // the fill's own body walk cannot alias the borrow handed to `f`.
-    let unfilled = heap.read_payload(string, |b| b.utf16_cache.get().is_none());
-    if unfilled {
-        let widened = materialize_utf16_vec(heap, string).into_boxed_slice();
-        // No allocation happened since the read above; the handle still
-        // resolves to the same body. `set` only races a reentrant fill,
-        // impossible on the single-threaded isolate.
-        heap.read_payload(string, |b| {
-            let _ = b.utf16_cache.set(widened);
+    // Latin-1 units are one byte each and the caller wants `u16`, so only a
+    // wide view can be handed over borrowed; a Latin-1 one still widens.
+    let wide = contiguous_view(heap, string).filter(|&(target, start, len)| {
+        heap.read_payload(target, |b| {
+            matches!(
+                flat_content_range(b, start, len),
+                Some(FlatContent::Wide(_))
+            )
+        })
+    });
+    if let Some((target, start, len)) = wide {
+        return heap.read_payload(target, |b| match flat_content_range(b, start, len) {
+            Some(FlatContent::Wide(units)) => f(units),
+            _ => unreachable!("view was checked to be wide"),
         });
     }
-    heap.read_payload(string, |b| {
-        f(b.utf16_cache
-            .get()
-            .expect("utf16_cache filled above for large subject"))
+    let units = materialize_utf16_vec(heap, string);
+    f(&units)
+}
+
+/// Resolve `string` to `(body holding the units, start, len)` when its code
+/// units can be read in place, or `None` when they must be materialised.
+///
+/// Three shapes qualify. The body stores its own units contiguously. It is a
+/// slice view over one — which is what a flattened rope becomes, so the view
+/// is a range of the parent's contiguous units and needs no copy either. Or
+/// it carries a filled widened cache.
+///
+/// Missing the slice case is expensive in a specific way: since flattening
+/// rewrites a rope into a view, *every* read of an already-flattened rope
+/// would re-materialise the whole string, turning a `/g` regex loop over a
+/// long subject quadratic.
+fn contiguous_view(heap: &GcHeap, string: JsStringHandle) -> Option<(JsStringHandle, u32, u32)> {
+    let (own, len, parent, cache) = heap.read_payload(string, |b| {
+        let parent = match &b.repr {
+            JsStringBodyRepr::Sliced { parent, start } => Some((*parent, *start)),
+            _ => None,
+        };
+        (stores_units_inline(&b.repr), b.len, parent, b.utf16_cache)
+    });
+    if own {
+        return Some((string, 0, len));
+    }
+    if let Some((parent, start)) = parent
+        && heap.read_payload(parent, |p| stores_units_inline(&p.repr))
+    {
+        return Some((parent, start, len));
+    }
+    (!cache.is_null()).then_some((cache, 0, len))
+}
+
+/// Whether a body holds its own code units contiguously.
+fn stores_units_inline(repr: &JsStringBodyRepr) -> bool {
+    matches!(
+        repr,
+        JsStringBodyRepr::InlineFlat(_)
+            | JsStringBodyRepr::SeqFlat
+            | JsStringBodyRepr::InlineLatin1(_)
+            | JsStringBodyRepr::SeqLatin1
+    )
+}
+
+/// Borrow `body`'s contiguous units narrowed to `start..start + len`.
+fn flat_content_range(body: &JsStringBody, start: u32, len: u32) -> Option<FlatContent<'_>> {
+    let (s, e) = (start as usize, start as usize + len as usize);
+    Some(match flat_content(body)? {
+        FlatContent::Latin1(bytes) => FlatContent::Latin1(&bytes[s..e]),
+        FlatContent::Wide(units) => FlatContent::Wide(&units[s..e]),
     })
+}
+
+/// Fill `string`'s widened cache so later [`with_utf16`] reads are in-place.
+///
+/// Materialising a large rope or Latin-1 body into UTF-16 is O(len), and a
+/// subject re-scanned many times — a `/g` regex `exec` loop walks the same
+/// subject once per match — should pay that once. Callers that are about to
+/// re-scan a subject call this first, while they still hold `&mut GcHeap`;
+/// [`with_utf16`] itself stays a read, because widening is an allocation and
+/// its call sites hold the heap shared.
+///
+/// A no-op for short subjects, for bodies that already store their units
+/// contiguously, and for an already-filled cache.
+///
+/// # Errors
+/// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+pub fn ensure_utf16_cache(
+    heap: &mut GcHeap,
+    string: JsStringHandle,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<(), otter_gc::OutOfMemory> {
+    // Only a body whose wide units cannot already be read in place is worth
+    // caching, and only when it is long enough for the walk to matter.
+    let long_enough = heap.read_payload(string, |b| {
+        b.len >= UTF16_CACHE_MIN_LEN && b.utf16_cache.is_null()
+    });
+    let already_wide = contiguous_view(heap, string).is_some_and(|(target, start, len)| {
+        heap.read_payload(target, |b| {
+            matches!(
+                flat_content_range(b, start, len),
+                Some(FlatContent::Wide(_))
+            )
+        })
+    });
+    if !long_enough || already_wide {
+        return Ok(());
+    }
+    let units = materialize_utf16_vec(heap, string);
+    // Allocating the cache can collect, so the subject travels as a root and
+    // the handle we install into is the forwarded one.
+    let mut rooted = string;
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        let p = &mut rooted as *mut JsStringHandle as *mut RawGc;
+        visitor(p);
+        external_visit(visitor);
+    };
+    let widened = alloc_flat_string_body_with_roots(heap, JsStringId::new(0), &units, &mut visit)?;
+    heap.with_payload(rooted, |b| {
+        b.utf16_cache = widened;
+        true
+    });
+    heap.record_write(rooted, &widened);
+    Ok(())
 }
 
 /// Uncached body walk backing [`to_utf16_vec`]. Always re-materialises.
@@ -1064,7 +1191,10 @@ enum FlatContent<'a> {
 }
 
 /// Content view for the four directly-stored variants; `None` for `Cons` /
-/// `Sliced`, which carry no contiguous own buffer.
+/// `Sliced`, which carry no contiguous buffer *of their own*. A slice over
+/// a sequential parent does have contiguous units, but they belong to the
+/// parent body; reading those in place goes through
+/// [`sequential_utf16_view`], which can resolve the hop.
 fn flat_content(body: &JsStringBody) -> Option<FlatContent<'_>> {
     let len = body.len as usize;
     match &body.repr {
@@ -1145,13 +1275,28 @@ pub fn equals_string_bodies(heap: &GcHeap, a: JsStringHandle, b: JsStringHandle)
             if !a_is_cons && !b_is_cons && ba.hash != bb.hash {
                 return Some(false);
             }
-            match (flat_content(ba), flat_content(bb)) {
-                (Some(va), Some(vb)) => Some(va.content_eq(&vb)),
-                _ => None,
-            }
+            None
         })
     }) {
         return answer;
+    }
+    // Resolve each side through at most one slice hop, so a flattened rope —
+    // which is a view over a contiguous parent — compares in place instead of
+    // materialising both operands.
+    if let (Some((ta, sa, la)), Some((tb, sb, lb))) =
+        (contiguous_view(heap, a), contiguous_view(heap, b))
+    {
+        return heap.read_payload(ta, |ba| {
+            heap.read_payload(tb, |bb| {
+                match (
+                    flat_content_range(ba, sa, la),
+                    flat_content_range(bb, sb, lb),
+                ) {
+                    (Some(va), Some(vb)) => va.content_eq(&vb),
+                    _ => unreachable!("resolved views store their units contiguously"),
+                }
+            })
+        });
     }
     to_utf16_vec(heap, a) == to_utf16_vec(heap, b)
 }
@@ -1168,13 +1313,20 @@ pub fn compare_string_bodies(
     if a == b {
         return std::cmp::Ordering::Equal;
     }
-    if let Some(ordering) = heap.read_payload(a, |ba| {
-        heap.read_payload(b, |bb| match (flat_content(ba), flat_content(bb)) {
-            (Some(va), Some(vb)) => Some(va.content_cmp(&vb)),
-            _ => None,
-        })
-    }) {
-        return ordering;
+    if let (Some((ta, sa, la)), Some((tb, sb, lb))) =
+        (contiguous_view(heap, a), contiguous_view(heap, b))
+    {
+        return heap.read_payload(ta, |ba| {
+            heap.read_payload(tb, |bb| {
+                match (
+                    flat_content_range(ba, sa, la),
+                    flat_content_range(bb, sb, lb),
+                ) {
+                    (Some(va), Some(vb)) => va.content_cmp(&vb),
+                    _ => unreachable!("resolved views store their units contiguously"),
+                }
+            })
+        });
     }
     to_utf16_vec(heap, a).cmp(&to_utf16_vec(heap, b))
 }

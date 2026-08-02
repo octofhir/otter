@@ -110,6 +110,17 @@ pub(crate) fn exec_once_native(
             let text = input_value
                 .as_string(scope.context().heap())
                 .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "input is not a string"))?;
+            // A `/g` loop re-enters here once per match against the same
+            // subject. Widen it once now, while the heap is available
+            // mutably; the match below then reads the units in place. A
+            // failure here only costs speed, so it is not surfaced.
+            let _ = text.ensure_utf16_cache(scope.context().heap_mut());
+            // Filling the cache allocates, so re-resolve the subject through
+            // its root rather than reusing a possibly forwarded handle.
+            let input_value = scope.raw(input);
+            let text = input_value
+                .as_string(scope.context().heap())
+                .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "input is not a string"))?;
             let heap = scope.context().heap();
             let matched = text.with_utf16(heap, |units| re.find_one_from_utf16(heap, units, start));
             let matched = match matched {

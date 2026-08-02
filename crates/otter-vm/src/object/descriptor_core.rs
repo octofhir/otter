@@ -170,11 +170,15 @@ pub(super) fn ordinary_set_symbol_data_property(
     let mut roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         value.trace_value_slots(visitor);
     };
-    super::ensure_exotic_with_roots(&mut obj, heap, &mut roots).expect("exotic sidecar");
+    super::reserve_symbol_prop_capacity(&mut obj, heap, &mut roots).expect("symbol prop table");
     let barrier_value = value;
     let success = heap.with_payload(obj, |body| {
         if let Some(pos) = body.symbol_props().iter().position(|(k, _)| k.ptr_eq(key)) {
-            let slot = &mut body.exotic_mut().symbol_props[pos].1;
+            let slot = &mut body
+                .symbol_props_mut()
+                .expect("existing symbol slot implies a table")
+                .entries_mut()[pos]
+                .1;
             if !slot.flags.writable() || !slot.kind.is_data() {
                 return false;
             }
@@ -185,13 +189,13 @@ pub(super) fn ordinary_set_symbol_data_property(
         if !body.extensible {
             return false;
         }
-        body.exotic_mut()
-            .symbol_props
+        body.symbol_props_mut()
+            .expect("symbol table reserved before the borrow")
             .push((key, SlotData::data_default(value)));
         true
     });
     if success {
-        super::record_exotic_write(heap, obj, &barrier_value);
+        super::record_symbol_prop_write(heap, obj, &barrier_value);
     }
     success
 }

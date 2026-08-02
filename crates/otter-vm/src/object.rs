@@ -841,8 +841,9 @@ pub struct ExoticSlots {
     /// shaped object, which derives per-slot attributes from the hidden class.
     /// Holds no GC handles, so it needs no tracing.
     slots: Vec<SlotMeta>,
-    /// Symbol-keyed own properties (descriptor slot representation).
-    symbol_props: Vec<(JsSymbol, SlotData)>,
+    /// Symbol-keyed own properties, in a [`SymbolPropsBody`] of their
+    /// own — null until the first symbol property is defined.
+    symbol_props: SymbolPropsHandle,
     /// Rust-owned payload for host-backed objects and VM-internal side data.
     host_data: Option<HostData>,
     /// Native `[[Call]]` for builtin callable ordinary objects.
@@ -885,18 +886,9 @@ impl otter_gc::SafeTraceable for ExoticSlots {
             Some(ObjectPrototype::Value(value)) => value.trace_value_slot_mut(v),
             Some(ObjectPrototype::Proxy(proxy)) => proxy.trace_value_slots_mut(v),
         }
-        for (_sym, slot) in self.symbol_props.iter_mut() {
-            match &mut slot.kind {
-                SlotKind::Data => slot.value.trace_value_slot_mut(v),
-                SlotKind::Accessor(pair) => {
-                    if let Some(g) = &mut pair.getter {
-                        g.trace_value_slot_mut(v);
-                    }
-                    if let Some(s) = &mut pair.setter {
-                        s.trace_value_slot_mut(v);
-                    }
-                }
-            }
+        if !self.symbol_props.is_null() {
+            let slot = &mut self.symbol_props as *mut SymbolPropsHandle as *mut RawGc;
+            v(slot);
         }
         if let Some(native) = &mut self.call_native {
             native.trace_value_slot_mut(v);
@@ -938,6 +930,239 @@ fn exotic_body_of(handle: ExoticHandle) -> Option<*mut ExoticSlots> {
             .add(std::mem::size_of::<otter_gc::GcHeader>())
             .cast::<ExoticSlots>()
     })
+}
+
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`SymbolPropsBody`].
+pub const SYMBOL_PROPS_BODY_TYPE_TAG: u8 = 0x3b;
+
+/// Handle to an object's symbol-keyed property table.
+pub(crate) type SymbolPropsHandle = otter_gc::Gc<SymbolPropsBody>;
+
+/// One symbol-keyed own property.
+type SymbolProp = (crate::symbol::JsSymbol, SlotData);
+
+/// Header for an object's symbol-keyed own properties; the
+/// `(symbol, slot)` records follow it in the same cell. Symbols are
+/// compared by identity and kept alive by the realm's well-known /
+/// registry roots, so only each slot's values are traced — the same
+/// contract the sidecar's `Vec` had.
+#[repr(C, align(8))]
+pub struct SymbolPropsBody {
+    /// Records the trailing array can hold.
+    capacity: u32,
+    /// Records written, and therefore traced.
+    len: u32,
+}
+
+impl SymbolPropsBody {
+    /// Trailing bytes a table of `capacity` records needs.
+    #[must_use]
+    fn trailing_bytes(capacity: usize) -> usize {
+        capacity * std::mem::size_of::<SymbolProp>()
+    }
+
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: u32::try_from(capacity).expect("symbol prop capacity exceeds u32"),
+            len: 0,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity as usize
+    }
+
+    fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    fn entries_ptr(&self) -> *mut SymbolProp {
+        // SAFETY: the allocation reserved `trailing_bytes(capacity)`
+        // immediately after this header.
+        unsafe {
+            (self as *const Self as *mut u8)
+                .add(std::mem::size_of::<Self>())
+                .cast()
+        }
+    }
+
+    /// The written records.
+    fn entries(&self) -> &[SymbolProp] {
+        // SAFETY: the first `len` records were written before the table
+        // became reachable.
+        unsafe { std::slice::from_raw_parts(self.entries_ptr().cast_const(), self.len()) }
+    }
+
+    /// The written records, mutably.
+    fn entries_mut(&mut self) -> &mut [SymbolProp] {
+        // SAFETY: as in `entries`.
+        unsafe { std::slice::from_raw_parts_mut(self.entries_ptr(), self.len()) }
+    }
+
+    /// Append a record. The caller must have reserved capacity: growth
+    /// allocates, and a payload borrow has no heap to allocate from.
+    fn push(&mut self, entry: SymbolProp) {
+        let index = self.len();
+        debug_assert!(
+            index < self.capacity(),
+            "symbol prop push without a reservation"
+        );
+        // SAFETY: `index < capacity`, so the slot is inside the table.
+        unsafe { self.entries_ptr().add(index).write(entry) };
+        self.len += 1;
+    }
+
+    /// Remove the record at `index`, sliding later records down.
+    fn remove(&mut self, index: usize) {
+        let len = self.len();
+        debug_assert!(index < len);
+        for i in index..len - 1 {
+            // SAFETY: both slots are inside the written prefix.
+            unsafe {
+                let next = self.entries_ptr().add(i + 1).read();
+                self.entries_ptr().add(i).write(next);
+            }
+        }
+        self.len -= 1;
+    }
+}
+
+const _: () = assert!(
+    std::mem::size_of::<SymbolPropsBody>().is_multiple_of(std::mem::align_of::<SymbolProp>())
+);
+
+impl otter_gc::SafeTraceable for SymbolPropsBody {
+    const TYPE_TAG: u8 = SYMBOL_PROPS_BODY_TYPE_TAG;
+
+    fn trace_slots_safe(&mut self, v: &mut SlotVisitor<'_>) {
+        for (_sym, slot) in self.entries_mut() {
+            match &mut slot.kind {
+                SlotKind::Data => slot.value.trace_value_slot_mut(v),
+                SlotKind::Accessor(pair) => {
+                    if let Some(g) = &mut pair.getter {
+                        g.trace_value_slot_mut(v);
+                    }
+                    if let Some(s) = &mut pair.setter {
+                        s.trace_value_slot_mut(v);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The table payload behind `handle`, or `None` for a null handle.
+#[must_use]
+fn symbol_props_body_of(handle: SymbolPropsHandle) -> Option<*mut SymbolPropsBody> {
+    if handle.is_null() {
+        return None;
+    }
+    let header = handle.as_header_ptr();
+    // SAFETY: a non-null handle names a live cell whose payload is a
+    // `SymbolPropsBody` one header past the start.
+    Some(unsafe {
+        header
+            .cast::<u8>()
+            .add(std::mem::size_of::<otter_gc::GcHeader>())
+            .cast::<SymbolPropsBody>()
+    })
+}
+
+/// Make room for one more symbol property on `object`.
+///
+/// Ensures the sidecar and grows the symbol table when it is full, with
+/// `object` and the caller's pending values rooted across both
+/// allocations. Entries are copied behind the mutator's back, so the
+/// edges the copy creates are remembered against the new table before
+/// this returns.
+///
+/// # Errors
+/// Propagates [`otter_gc::OutOfMemory`].
+fn reserve_symbol_prop_capacity(
+    object: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<(), otter_gc::OutOfMemory> {
+    ensure_exotic_with_roots(object, heap, external_visit)?;
+    let sidecar = heap.read_payload(*object, |body| body.exotic.get());
+    // SAFETY: `ensure_exotic` above guarantees a live sidecar.
+    let (current, len, capacity) = {
+        let exotic = exotic_body_of(sidecar).expect("sidecar reserved above");
+        // SAFETY: live sidecar payload; read-only peek.
+        let handle = unsafe { (*exotic).symbol_props };
+        match symbol_props_body_of(handle) {
+            // SAFETY: non-null handle names a live table.
+            Some(table) => unsafe { (handle, (*table).len(), (*table).capacity()) },
+            None => (handle, 0, 0),
+        }
+    };
+    if len < capacity {
+        return Ok(());
+    }
+    let grown = (capacity * 2).max(2);
+    let owner_slot = std::ptr::addr_of_mut!(*object);
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
+        visitor(owner_slot.cast::<RawGc>());
+    };
+    let table: SymbolPropsHandle = heap.alloc_variable_with_roots(
+        SymbolPropsBody::new(grown),
+        SymbolPropsBody::trailing_bytes(grown),
+        &mut visit,
+    )?;
+    // Carry the old records over and install the new table. The old
+    // table did not move (old space), so `current` still names it.
+    if let Some(old) = symbol_props_body_of(current) {
+        // SAFETY: both tables are live; the new one has room for every
+        // old record.
+        unsafe {
+            let new_body = symbol_props_body_of(table).expect("fresh table");
+            for entry in (*old).entries() {
+                (*new_body).push(entry.clone());
+            }
+        }
+    }
+    let owner = *object;
+    let sidecar = heap.read_payload(owner, |body| body.exotic.get());
+    heap.with_payload(sidecar, |exotic| {
+        exotic.symbol_props = table;
+        true
+    });
+    heap.record_write(sidecar, &table);
+    // The copied-in records hold edges the barrier never saw.
+    if let Some(new_body) = symbol_props_body_of(table) {
+        // SAFETY: live table payload.
+        let entries: Vec<SymbolProp> = unsafe { (*new_body).entries().to_vec() };
+        for (_sym, slot) in entries {
+            heap.record_write(table, &slot.value);
+            if let SlotKind::Accessor(pair) = &slot.kind {
+                if let Some(g) = &pair.getter {
+                    heap.record_write(table, g);
+                }
+                if let Some(s) = &pair.setter {
+                    heap.record_write(table, s);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remember a write against the symbol table that actually holds it,
+/// and against the sidecar and object above it.
+fn record_symbol_prop_write<V>(heap: &mut otter_gc::GcHeap, object: JsObject, value: &V)
+where
+    V: otter_gc::GcStore + ?Sized,
+{
+    record_exotic_write(heap, object, value);
+    let sidecar = heap.read_payload(object, |body| body.exotic.get());
+    if let Some(exotic) = exotic_body_of(sidecar) {
+        // SAFETY: live sidecar payload; read-only peek at the handle.
+        let table = unsafe { (*exotic).symbol_props };
+        if !table.is_null() {
+            heap.record_write(table, value);
+        }
+    }
 }
 
 /// Give `object` an exotic sidecar if it does not have one.
@@ -1493,10 +1718,24 @@ impl ObjectBody {
     fn constructor_native(&self) -> Option<Value> {
         self.exotic().and_then(|e| e.constructor_native)
     }
-    /// Symbol-keyed own props as a slice (`&[]` when no box).
+    /// Symbol-keyed own props as a slice (`&[]` when no table).
     #[inline]
     fn symbol_props(&self) -> &[(JsSymbol, SlotData)] {
-        self.exotic().map_or(&[], |e| e.symbol_props.as_slice())
+        self.exotic()
+            .and_then(|e| symbol_props_body_of(e.symbol_props))
+            // SAFETY: a non-null handle names a live table whose prefix
+            // outlives this borrow of the object body.
+            .map_or(&[], |table| unsafe { (*table).entries() })
+    }
+
+    /// Symbol-keyed own props, mutably (`None` when no table).
+    #[inline]
+    fn symbol_props_mut(&mut self) -> Option<&mut SymbolPropsBody> {
+        self.exotic()
+            .and_then(|e| symbol_props_body_of(e.symbol_props))
+            // SAFETY: as in `symbol_props`; `&mut self` rules out an
+            // aliasing read through this object body.
+            .map(|table| unsafe { &mut *table })
     }
     /// Dictionary-mode string keys as a slice (`&[]` when no box / fast-shape).
     #[inline]
@@ -1789,6 +2028,7 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
         crate::upvalue::UpvalueCellBody,
         crate::upvalue_spine::UpvalueSpineBody,
         ExoticSlots,
+        SymbolPropsBody,
         crate::array::ArrayExoticSlots,
         crate::weak_refs::FinalizationRegistryBody,
         crate::weak_refs::WeakRefBody,
@@ -3977,7 +4217,9 @@ pub fn delete_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: JsSymbol) 
             if !body.symbol_props()[pos].1.flags.configurable() {
                 return false;
             }
-            body.exotic_mut().symbol_props.remove(pos);
+            body.symbol_props_mut()
+                .expect("existing symbol slot implies a table")
+                .remove(pos);
             true
         } else {
             true
@@ -4176,10 +4418,19 @@ pub fn define_own_symbol_property_partial(
     key: JsSymbol,
     descriptor: PartialPropertyDescriptor,
 ) -> bool {
-    // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj`, which is why the local is `mut`.
+    // The sidecar and the symbol table allocate, so both are reserved
+    // here, outside the payload borrow below. This may move `obj`,
+    // which is why the local is `mut`; the descriptor's values are
+    // rooted across the reservation.
     let mut obj = obj;
-    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
+    let mut descriptor = descriptor;
+    {
+        let descriptor_slot = &mut descriptor;
+        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            crate::pelt::PeltField::pelt_trace(&mut *descriptor_slot, visitor);
+        };
+        reserve_symbol_prop_capacity(&mut obj, heap, &mut roots).expect("symbol prop table");
+    }
     let completed = descriptor.complete_for_new_property();
     let barrier_descriptor = completed.clone();
     let existing_pos_and_slot = heap.read_payload(obj, |body| {
@@ -4199,14 +4450,17 @@ pub fn define_own_symbol_property_partial(
     let existing_pos = existing_pos_and_slot.as_ref().map(|(p, _)| *p);
     let success = heap.with_payload(obj, |body| {
         if let Some(pos) = existing_pos {
-            body.exotic_mut().symbol_props[pos].1 = merged_for_existing.unwrap();
+            body.symbol_props_mut()
+                .expect("existing symbol slot implies a table")
+                .entries_mut()[pos]
+                .1 = merged_for_existing.unwrap();
             true
         } else {
             if !body.extensible {
                 return false;
             }
-            body.exotic_mut()
-                .symbol_props
+            body.symbol_props_mut()
+                .expect("symbol table reserved before the borrow")
                 .push((key, SlotData::from_descriptor(completed.clone())));
             true
         }
@@ -4347,10 +4601,19 @@ pub fn define_own_symbol_property(
     key: JsSymbol,
     descriptor: PropertyDescriptor,
 ) -> bool {
-    // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj`, which is why the local is `mut`.
+    // The sidecar and the symbol table allocate, so both are reserved
+    // here, outside the payload borrow below. This may move `obj`,
+    // which is why the local is `mut`; the descriptor's values are
+    // rooted across the reservation.
     let mut obj = obj;
-    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
+    let mut descriptor = descriptor;
+    {
+        let descriptor_slot = &mut descriptor;
+        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            crate::pelt::PeltField::pelt_trace(&mut *descriptor_slot, visitor);
+        };
+        reserve_symbol_prop_capacity(&mut obj, heap, &mut roots).expect("symbol prop table");
+    }
     let barrier_descriptor = descriptor.clone();
     let existing_pos_and_slot = heap.read_payload(obj, |body| {
         body.symbol_props()
@@ -4369,14 +4632,17 @@ pub fn define_own_symbol_property(
     let existing_pos = existing_pos_and_slot.as_ref().map(|(p, _)| *p);
     let success = heap.with_payload(obj, |body| {
         if let Some(pos) = existing_pos {
-            body.exotic_mut().symbol_props[pos].1 = merged_for_existing.unwrap();
+            body.symbol_props_mut()
+                .expect("existing symbol slot implies a table")
+                .entries_mut()[pos]
+                .1 = merged_for_existing.unwrap();
             true
         } else {
             if !body.extensible {
                 return false;
             }
-            body.exotic_mut()
-                .symbol_props
+            body.symbol_props_mut()
+                .expect("symbol table reserved before the borrow")
                 .push((key, SlotData::from_descriptor(descriptor)));
             true
         }
@@ -4641,7 +4907,11 @@ pub fn seal(obj: JsObject, heap: &mut otter_gc::GcHeap) {
             for slot in exotic.slots.iter_mut() {
                 slot.flags = slot.flags.with_configurable(false);
             }
-            for (_, slot) in exotic.symbol_props.iter_mut() {
+            for (_, slot) in symbol_props_body_of(exotic.symbol_props)
+                // SAFETY: a non-null handle names a live table.
+                .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
+                .iter_mut()
+            {
                 slot.flags = slot.flags.with_configurable(false);
             }
         }
@@ -4667,7 +4937,11 @@ pub(crate) fn seal_with_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, new_sh
             for slot in exotic.slots.iter_mut() {
                 slot.flags = slot.flags.with_configurable(false);
             }
-            for (_, slot) in exotic.symbol_props.iter_mut() {
+            for (_, slot) in symbol_props_body_of(exotic.symbol_props)
+                // SAFETY: a non-null handle names a live table.
+                .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
+                .iter_mut()
+            {
                 slot.flags = slot.flags.with_configurable(false);
             }
         }
@@ -4696,7 +4970,11 @@ pub fn freeze(obj: JsObject, heap: &mut otter_gc::GcHeap) {
                     slot.flags = slot.flags.with_writable(false);
                 }
             }
-            for (_, slot) in exotic.symbol_props.iter_mut() {
+            for (_, slot) in symbol_props_body_of(exotic.symbol_props)
+                // SAFETY: a non-null handle names a live table.
+                .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
+                .iter_mut()
+            {
                 slot.flags = slot.flags.with_configurable(false);
                 if slot.kind.is_data() {
                     slot.flags = slot.flags.with_writable(false);
@@ -4731,7 +5009,11 @@ pub(crate) fn freeze_with_shape(
                     slot.flags = slot.flags.with_writable(false);
                 }
             }
-            for (_, slot) in exotic.symbol_props.iter_mut() {
+            for (_, slot) in symbol_props_body_of(exotic.symbol_props)
+                // SAFETY: a non-null handle names a live table.
+                .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
+                .iter_mut()
+            {
                 slot.flags = slot.flags.with_configurable(false);
                 if slot.kind.is_data() {
                     slot.flags = slot.flags.with_writable(false);

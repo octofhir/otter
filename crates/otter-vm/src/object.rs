@@ -869,7 +869,7 @@ pub struct ExoticSlots {
     /// `Error.captureStackTrace`. Drives `Error.prototype.stack` and
     /// `util.getCallSites`. `None` until captured; holds only owned
     /// `String`/offset data (no GC handles), so it needs no tracing.
-    error_stack_frames: Option<Vec<crate::run_control::StackFrameSnapshot>>,
+    error_stack_frames: ErrorStackHandle,
     /// `[[ParameterMap]]` presence marker for arguments-exotic objects
     /// (§10.4.4); mapping data itself lives in `host_data`.
     is_arguments_object: bool,
@@ -898,6 +898,10 @@ impl otter_gc::SafeTraceable for ExoticSlots {
         }
         if !self.dictionary_keys.is_null() {
             let slot = &mut self.dictionary_keys as *mut DictKeysHandle as *mut RawGc;
+            v(slot);
+        }
+        if !self.error_stack_frames.is_null() {
+            let slot = &mut self.error_stack_frames as *mut ErrorStackHandle as *mut RawGc;
             v(slot);
         }
         if let Some(native) = &mut self.call_native {
@@ -1272,6 +1276,114 @@ fn dict_keys_table_for_install(
     let extra_bytes = (existing.iter().map(String::len).sum::<usize>() + pending_key.len()).max(32);
     let table = dict_keys_table_from(heap, &existing, extra_entries, extra_bytes, &mut visit)?;
     Ok(Some(table))
+}
+
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`ErrorStackBody`].
+pub const ERROR_STACK_BODY_TYPE_TAG: u8 = 0x3e;
+
+/// Handle to an error object's captured stack frames.
+pub(crate) type ErrorStackHandle = otter_gc::Gc<ErrorStackBody>;
+
+/// One captured frame record; the name/module bytes live in the body's
+/// arena.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ErrorFrameRecord {
+    function_id: u32,
+    name_offset: u32,
+    name_len: u32,
+    module_offset: u32,
+    module_len: u32,
+    span_lo: u32,
+    span_hi: u32,
+}
+
+/// Captured `Error` stack frames: fixed records followed by a UTF-8
+/// arena holding every frame's function and module name. Written once
+/// at capture, never mutated, no GC references — the page image
+/// carries it whole where the old `Vec<StackFrameSnapshot>` (owned
+/// `String`s) could not ride at all.
+#[repr(C, align(8))]
+pub struct ErrorStackBody {
+    frame_count: u32,
+    byte_len: u32,
+}
+
+impl ErrorStackBody {
+    fn trailing_bytes(frames: usize, bytes: usize) -> usize {
+        frames * std::mem::size_of::<ErrorFrameRecord>() + bytes
+    }
+
+    fn records_ptr(&self) -> *mut ErrorFrameRecord {
+        // SAFETY: the records follow this header.
+        unsafe {
+            (self as *const Self as *mut u8)
+                .add(std::mem::size_of::<Self>())
+                .cast()
+        }
+    }
+
+    fn bytes_ptr(&self) -> *mut u8 {
+        // SAFETY: the arena follows the records.
+        unsafe {
+            self.records_ptr()
+                .add(self.frame_count as usize)
+                .cast::<u8>()
+        }
+    }
+
+    fn str_at(&self, offset: u32, len: u32) -> &str {
+        // SAFETY: written from `&str` at capture; inside `byte_len`.
+        unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                self.bytes_ptr().add(offset as usize).cast_const(),
+                len as usize,
+            ))
+        }
+    }
+
+    /// Reconstruct the captured frames.
+    fn to_frames(&self) -> Vec<crate::run_control::StackFrameSnapshot> {
+        (0..self.frame_count as usize)
+            .map(|i| {
+                // SAFETY: `i < frame_count`; records were fully written
+                // before the body became reachable.
+                let record = unsafe { *self.records_ptr().add(i) };
+                crate::run_control::StackFrameSnapshot {
+                    function_id: record.function_id,
+                    function_name: self.str_at(record.name_offset, record.name_len).to_owned(),
+                    module: self
+                        .str_at(record.module_offset, record.module_len)
+                        .to_owned(),
+                    span: (record.span_lo, record.span_hi),
+                }
+            })
+            .collect()
+    }
+}
+
+impl otter_gc::SafeTraceable for ErrorStackBody {
+    const TYPE_TAG: u8 = ERROR_STACK_BODY_TYPE_TAG;
+
+    /// Deliberately empty: records and name bytes hold no GC references.
+    fn trace_slots_safe(&mut self, _v: &mut SlotVisitor<'_>) {}
+}
+
+/// The payload behind `handle`, or `None` for a null handle.
+#[must_use]
+fn error_stack_body_of(handle: ErrorStackHandle) -> Option<*mut ErrorStackBody> {
+    if handle.is_null() {
+        return None;
+    }
+    let header = handle.as_header_ptr();
+    // SAFETY: a non-null handle names a live cell whose payload is an
+    // `ErrorStackBody` one header past the start.
+    Some(unsafe {
+        header
+            .cast::<u8>()
+            .add(std::mem::size_of::<otter_gc::GcHeader>())
+            .cast::<ErrorStackBody>()
+    })
 }
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`SymbolPropsBody`].
@@ -2185,7 +2297,7 @@ impl ObjectBody {
     #[inline]
     fn has_error_stack_frames(&self) -> bool {
         self.exotic()
-            .is_some_and(|e| e.error_stack_frames.is_some())
+            .is_some_and(|e| !e.error_stack_frames.is_null())
     }
     #[inline]
     fn is_arguments_object(&self) -> bool {
@@ -2648,6 +2760,8 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
         ExoticSlots,
         SymbolPropsBody,
         SlotMetaBody,
+        DictKeysBody,
+        ErrorStackBody,
         crate::array::ArrayExoticSlots,
         crate::weak_refs::FinalizationRegistryBody,
         crate::weak_refs::WeakRefBody,
@@ -3993,13 +4107,69 @@ pub fn set_error_stack_frames(
     heap: &mut otter_gc::GcHeap,
     frames: Vec<crate::run_control::StackFrameSnapshot>,
 ) {
-    // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj`, which is why the local is `mut`.
+    // The sidecar and the frame body allocate, so both happen here,
+    // outside the payload borrow below. This may move `obj`, which is
+    // why the local is `mut`. The frames are plain owned data — no
+    // rooting needed beyond the receiver.
     let mut obj = obj;
     ensure_exotic(&mut obj, heap).expect("exotic sidecar");
-    heap.with_payload(obj, |body| {
-        body.exotic_mut().error_stack_frames = Some(frames);
+    let bytes: usize = frames
+        .iter()
+        .map(|f| f.function_name.len() + f.module.len())
+        .sum();
+    let object_slot = std::ptr::addr_of_mut!(obj);
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        visitor(object_slot.cast::<RawGc>());
+    };
+    let Ok(stack) = heap.alloc_variable_with_roots::<ErrorStackBody>(
+        ErrorStackBody {
+            frame_count: frames.len() as u32,
+            byte_len: bytes as u32,
+        },
+        ErrorStackBody::trailing_bytes(frames.len(), bytes),
+        &mut visit,
+    ) else {
+        // Out of memory capturing a stack leaves the error without one;
+        // the throw itself still proceeds.
+        return;
+    };
+    // SAFETY: the handle names the body just allocated; capacity covers
+    // every record and byte written below.
+    unsafe {
+        let body = error_stack_body_of(stack).expect("fresh stack body");
+        let mut offset: u32 = 0;
+        for (i, frame) in frames.iter().enumerate() {
+            let name_offset = offset;
+            std::ptr::copy_nonoverlapping(
+                frame.function_name.as_ptr(),
+                (*body).bytes_ptr().add(offset as usize),
+                frame.function_name.len(),
+            );
+            offset += frame.function_name.len() as u32;
+            let module_offset = offset;
+            std::ptr::copy_nonoverlapping(
+                frame.module.as_ptr(),
+                (*body).bytes_ptr().add(offset as usize),
+                frame.module.len(),
+            );
+            offset += frame.module.len() as u32;
+            (*body).records_ptr().add(i).write(ErrorFrameRecord {
+                function_id: frame.function_id,
+                name_offset,
+                name_len: frame.function_name.len() as u32,
+                module_offset,
+                module_len: frame.module.len() as u32,
+                span_lo: frame.span.0,
+                span_hi: frame.span.1,
+            });
+        }
+    }
+    let owner = obj;
+    heap.with_payload(owner, |body| {
+        body.exotic_mut().error_stack_frames = stack;
     });
+    let sidecar = heap.read_payload(owner, |body| body.exotic.get());
+    heap.record_write(sidecar, &stack);
 }
 
 /// Read a clone of the captured stack frames, if any were recorded.
@@ -4009,7 +4179,10 @@ pub fn error_stack_frames(
     heap: &otter_gc::GcHeap,
 ) -> Option<Vec<crate::run_control::StackFrameSnapshot>> {
     heap.read_payload(obj, |body| {
-        body.exotic().and_then(|e| e.error_stack_frames.clone())
+        body.exotic()
+            .and_then(|e| error_stack_body_of(e.error_stack_frames))
+            // SAFETY: a non-null handle names a live body.
+            .map(|stack| unsafe { (*stack).to_frames() })
     })
 }
 

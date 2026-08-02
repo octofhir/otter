@@ -73,6 +73,7 @@ fn promotion_preflight_oom_leaves_heap_unmodified() {
             &[],
             &[],
             &mut remembered,
+            &mut otter_gc::host_refs::HostRefTable::default(),
         )
     };
 

@@ -167,6 +167,23 @@ enum NativeCallStorage {
     LocalDynamic(Arc<LocalNativeFn>),
 }
 
+/// What [`NativeFunctionBody`] stores for `[[Call]]`.
+///
+/// A dynamic closure's `Arc` never sits in the body: the body names it
+/// by index into the isolate's [`otter_gc::host_refs::HostRefTable`],
+/// which owns the payload, and the sweep releases the slot when the
+/// body dies (see the `ReleaseHostRefs` impl below). That leaves the
+/// body free of anything `Drop` — a page image carries it whole. The
+/// static function pointer stays: it is rebuilt from `native_ref`
+/// through the external-ref table at restore.
+#[derive(Clone, Copy)]
+enum NativeCallSlot {
+    Static(NativeFastFn),
+    VmIntrinsic(VmIntrinsicFunction),
+    Dynamic(u32),
+    LocalDynamic(u32),
+}
+
 impl From<NativeCall> for NativeCallStorage {
     fn from(value: NativeCall) -> Self {
         match value {
@@ -212,9 +229,9 @@ pub struct NativeFunctionBody {
     /// ECMAScript `.length` metadata.
     #[pelt(skip)]
     length: u8,
-    /// Static function pointer or dynamic closure payload.
+    /// Static function pointer or dynamic closure index.
     #[pelt(skip)]
-    call: NativeCallStorage,
+    call: NativeCallSlot,
     /// JS values owned by the native payload and therefore traced
     /// strongly while this function is reachable, in a
     /// [`crate::value_slab::ValueSlabBody`] of their own — null when
@@ -262,12 +279,12 @@ impl NativeFunctionBody {
     pub(crate) fn census_facts(&self) -> crate::native_census::NativeBodyFacts {
         use crate::native_census::{NativeBodyFacts, NativeStorageKind};
         let (kind, static_addr) = match &self.call {
-            NativeCallStorage::Static(f) => {
+            NativeCallSlot::Static(f) => {
                 (NativeStorageKind::Static, Some(*f as *const () as usize))
             }
-            NativeCallStorage::VmIntrinsic(_) => (NativeStorageKind::VmIntrinsic, None),
-            NativeCallStorage::Dynamic(_) => (NativeStorageKind::Dynamic, None),
-            NativeCallStorage::LocalDynamic(_) => (NativeStorageKind::LocalDynamic, None),
+            NativeCallSlot::VmIntrinsic(_) => (NativeStorageKind::VmIntrinsic, None),
+            NativeCallSlot::Dynamic(_) => (NativeStorageKind::Dynamic, None),
+            NativeCallSlot::LocalDynamic(_) => (NativeStorageKind::LocalDynamic, None),
         };
         NativeBodyFacts {
             name: self.name,
@@ -277,6 +294,17 @@ impl NativeFunctionBody {
             // SAFETY: `self` is a live payload borrow, which keeps the
             // slab it names reachable.
             capture_count: unsafe { crate::value_slab::live_slice(self.captures).len() },
+        }
+    }
+}
+
+impl otter_gc::trace::ReleaseHostRefs for NativeFunctionBody {
+    fn release_host_refs(&mut self, table: &mut otter_gc::host_refs::HostRefTable) {
+        match self.call {
+            NativeCallSlot::Dynamic(index) | NativeCallSlot::LocalDynamic(index) => {
+                table.release(index);
+            }
+            NativeCallSlot::Static(_) | NativeCallSlot::VmIntrinsic(_) => {}
         }
     }
 }
@@ -327,6 +355,19 @@ impl NativeFunction {
             | NativeCallStorage::Dynamic(_)
             | NativeCallStorage::LocalDynamic(_) => 0,
         });
+        // A dynamic closure's Arc moves into the isolate's host-ref
+        // table here, through the same single funnel: the body stores
+        // the index, and the sweep releases the slot when the body dies.
+        let call = match call {
+            NativeCallStorage::Static(f) => NativeCallSlot::Static(f),
+            NativeCallStorage::VmIntrinsic(intrinsic) => NativeCallSlot::VmIntrinsic(intrinsic),
+            NativeCallStorage::Dynamic(arc) => {
+                NativeCallSlot::Dynamic(heap.intern_host_ref(Box::new(arc)))
+            }
+            NativeCallStorage::LocalDynamic(arc) => {
+                NativeCallSlot::LocalDynamic(heap.intern_host_ref(Box::new(arc)))
+            }
+        };
         let mut captures = captures;
         let own_properties = {
             let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -424,7 +465,7 @@ impl NativeFunction {
     #[must_use]
     pub(crate) fn is_static_native(&self, heap: &otter_gc::GcHeap, target: NativeFastFn) -> bool {
         heap.read_payload(self.inner, |body| match &body.call {
-            NativeCallStorage::Static(f) => std::ptr::fn_addr_eq(*f, target),
+            NativeCallSlot::Static(f) => std::ptr::fn_addr_eq(*f, target),
             _ => false,
         })
     }
@@ -1030,15 +1071,25 @@ impl NativeFunction {
     /// where a stack clone would silently go stale.
     #[must_use]
     pub(crate) fn call_target(&self, heap: &otter_gc::GcHeap) -> NativeCallTarget {
-        heap.read_payload(self.inner, |body| match &body.call {
-            NativeCallStorage::Static(call) => NativeCallTarget::Static(*call),
-            NativeCallStorage::VmIntrinsic(intrinsic) => NativeCallTarget::VmIntrinsic(*intrinsic),
-            NativeCallStorage::Dynamic(call) => NativeCallTarget::Dynamic {
-                call: call.clone(),
+        heap.read_payload(self.inner, |body| match body.call {
+            NativeCallSlot::Static(call) => NativeCallTarget::Static(call),
+            NativeCallSlot::VmIntrinsic(intrinsic) => NativeCallTarget::VmIntrinsic(intrinsic),
+            NativeCallSlot::Dynamic(index) => NativeCallTarget::Dynamic {
+                call: heap
+                    .host_refs()
+                    .get(index)
+                    .and_then(|any| any.downcast_ref::<Arc<NativeFn>>())
+                    .cloned()
+                    .expect("dynamic native's host-ref index resolves to its closure"),
                 captures: body.captures,
             },
-            NativeCallStorage::LocalDynamic(call) => NativeCallTarget::LocalDynamic {
-                call: call.clone(),
+            NativeCallSlot::LocalDynamic(index) => NativeCallTarget::LocalDynamic {
+                call: heap
+                    .host_refs()
+                    .get(index)
+                    .and_then(|any| any.downcast_ref::<Arc<LocalNativeFn>>())
+                    .cloned()
+                    .expect("local dynamic native's host-ref index resolves to its closure"),
                 captures: body.captures,
             },
         })
@@ -1049,7 +1100,7 @@ impl NativeFunction {
     #[must_use]
     pub fn is_static_call(&self, heap: &otter_gc::GcHeap) -> bool {
         heap.read_payload(self.inner, |body| {
-            matches!(body.call, NativeCallStorage::Static(_))
+            matches!(body.call, NativeCallSlot::Static(_))
         })
     }
 
@@ -1057,7 +1108,7 @@ impl NativeFunction {
     #[must_use]
     pub(crate) fn is_static_fn(&self, heap: &otter_gc::GcHeap, expected: NativeFastFn) -> bool {
         heap.read_payload(self.inner, |body| match body.call {
-            NativeCallStorage::Static(call) => std::ptr::fn_addr_eq(call, expected),
+            NativeCallSlot::Static(call) => std::ptr::fn_addr_eq(call, expected),
             _ => false,
         })
     }
@@ -1081,7 +1132,7 @@ impl NativeFunction {
     pub fn is_vm_intrinsic(&self, heap: &otter_gc::GcHeap, intrinsic: VmIntrinsicFunction) -> bool {
         heap.read_payload(
             self.inner,
-            |body| matches!(body.call, NativeCallStorage::VmIntrinsic(i) if i == intrinsic),
+            |body| matches!(body.call, NativeCallSlot::VmIntrinsic(i) if i == intrinsic),
         )
     }
 
@@ -1571,6 +1622,39 @@ pub fn vm_to_native_error(
 mod tests {
     use super::*;
     use crate::NativeCallInfo;
+
+    /// A dynamic native's closure lives in the host-ref table; the
+    /// slot must be released when the body dies — young (scavenge) or
+    /// old (full sweep) — and survive while the body is rooted.
+    #[test]
+    fn dynamic_native_host_ref_slot_is_released_when_the_body_dies() {
+        let mut interp = crate::Interpreter::new();
+        let baseline = interp.gc_heap().host_refs().len();
+        let f = native_value(interp.gc_heap_mut(), "closure", |_, _, _| {
+            Ok(Value::undefined())
+        })
+        .expect("native");
+        assert_eq!(
+            interp.gc_heap().host_refs().len(),
+            baseline + 1,
+            "allocation interned the closure"
+        );
+        // Rooted across a full collection: the slot must survive. The
+        // native rides a global handle so the interpreter's own root
+        // walk keeps it, alongside the bootstrap graph.
+        interp.set_global("__host_ref_probe", f);
+        interp.force_gc().expect("force GC");
+        assert_eq!(interp.gc_heap().host_refs().len(), baseline + 1);
+        // Unrooted: the next full collection reclaims the body and the
+        // slot, while the bootstrap graph's own entries stay put.
+        interp.set_global("__host_ref_probe", Value::undefined());
+        interp.force_gc().expect("force GC");
+        assert_eq!(
+            interp.gc_heap().host_refs().len(),
+            baseline,
+            "dead body released its host-ref slot"
+        );
+    }
 
     #[test]
     fn native_value_dispatches() {

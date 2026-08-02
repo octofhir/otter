@@ -130,6 +130,18 @@ pub trait Traceable: 'static {
 /// the helper emitted alongside the derive). Unregistered bodies
 /// skip the finalize step entirely — the sweep dispatch only fires
 /// when the type-tag slot is populated.
+/// Signature of a sweep-time host-ref release wrapper.
+pub type HostReleaseFn = unsafe fn(*mut GcHeader, &mut crate::host_refs::HostRefTable);
+
+/// Sweep-time hook for bodies that name entries in the isolate's
+/// [`crate::host_refs::HostRefTable`]. A finalizer cannot release the
+/// slot — it runs against the body alone, with no heap in reach — so
+/// the sweep invokes this with the table before finalize and drop.
+pub trait ReleaseHostRefs: SafeTraceable {
+    /// Release every host-ref index this body holds.
+    fn release_host_refs(&mut self, table: &mut crate::host_refs::HostRefTable);
+}
+
 pub trait SafeFinalize: SafeTraceable {
     /// Called by the sweeper on a dead body before
     /// `core::ptr::drop_in_place` runs. Must not allocate inside
@@ -198,6 +210,9 @@ pub struct TraceTable {
     /// on dead objects (so e.g. boxed strings get their backing
     /// freed). `None` for plain-old-data types.
     drop_table: [Option<unsafe fn(*mut GcHeader)>; 256],
+    /// Sweep-time host-ref release hooks, `None` for every other tag.
+    /// Fires before `finalize_table`.
+    host_release_table: [Option<HostReleaseFn>; 256],
     /// Sweep-time finalizers for bodies that impl [`SafeFinalize`].
     /// `None` for every other tag. Fires *before* `drop_table`.
     finalize_table: [Option<unsafe fn(*mut GcHeader)>; 256],
@@ -221,6 +236,7 @@ impl TraceTable {
             ephemeron_table: [None; 256],
             drop_table: [None; 256],
             finalize_table: [None; 256],
+            host_release_table: [None; 256],
             name_table: [None; 256],
         }
     }
@@ -347,6 +363,40 @@ impl TraceTable {
     #[inline]
     pub fn get_finalize(&self, tag: u8) -> Option<unsafe fn(*mut GcHeader)> {
         self.finalize_table[tag as usize]
+    }
+
+    /// Look up the host-ref release function for a given type tag.
+    /// `None` when the tag has no [`ReleaseHostRefs`] registration.
+    #[inline]
+    pub fn get_host_release(&self, tag: u8) -> Option<HostReleaseFn> {
+        self.host_release_table[tag as usize]
+    }
+
+    /// Register the host-ref release wrapper for a type that opts into
+    /// [`ReleaseHostRefs`]. Must be paired with an earlier
+    /// [`Self::register`] call for the same type tag.
+    pub fn register_host_release<T: Traceable + ReleaseHostRefs>(&mut self) {
+        unsafe fn release_wrapper<T: Traceable + ReleaseHostRefs>(
+            header: *mut GcHeader,
+            table: &mut crate::host_refs::HostRefTable,
+        ) {
+            // SAFETY: by the [`Traceable`] safety contract,
+            // `header` precedes a valid `T` payload.
+            unsafe {
+                let payload = (header as *mut u8)
+                    .add(std::mem::size_of::<GcHeader>())
+                    .cast::<T>();
+                (*payload).release_host_refs(table);
+            }
+        }
+        let tag = <T as Traceable>::TYPE_TAG as usize;
+        if let Some(existing) = self.host_release_table[tag] {
+            debug_assert!(
+                existing as *const () == release_wrapper::<T> as *const (),
+                "host-release tag {tag} already registered with a different fn",
+            );
+        }
+        self.host_release_table[tag] = Some(release_wrapper::<T>);
     }
 
     /// Register the finalize wrapper for a type that opts into

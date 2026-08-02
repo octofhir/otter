@@ -80,6 +80,7 @@ pub mod handle;
 pub mod header;
 pub mod heap;
 pub mod heap_image;
+pub mod host_refs;
 #[doc(hidden)]
 pub mod marking;
 pub mod oom;

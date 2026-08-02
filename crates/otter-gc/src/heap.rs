@@ -152,6 +152,10 @@ pub struct GcHeap {
     /// Per-heap, not process-global, so index order is a property of
     /// this isolate's install sequence alone.
     external_refs: ExternalRefTable,
+    /// Owned host payloads (dynamic-native closures) bodies name by
+    /// index. See [`crate::host_refs`]; slots are recycled from the
+    /// sweep through [`crate::trace::ReleaseHostRefs`].
+    host_refs: crate::host_refs::HostRefTable,
     marking: MarkingState,
     /// Object-granular remembered set: the per-isolate store buffer of
     /// mutated **old/large parents** that hold an old→young edge. Fed by
@@ -338,6 +342,7 @@ impl GcHeap {
             large_space: LargeObjectSpace::new(),
             trace_table: TraceTable::new(),
             external_refs: ExternalRefTable::new(),
+            host_refs: crate::host_refs::HostRefTable::default(),
             marking: MarkingState::new(),
             remembered_parents: Vec::new(),
             handle_stack: Box::new(HandleStack::new()),
@@ -761,6 +766,25 @@ impl GcHeap {
     #[must_use]
     pub fn external_refs(&self) -> &ExternalRefTable {
         &self.external_refs
+    }
+
+    /// Store an owned host payload and return its index. See
+    /// [`crate::host_refs`].
+    pub fn intern_host_ref(&mut self, payload: Box<dyn std::any::Any>) -> u32 {
+        self.host_refs.insert(payload)
+    }
+
+    /// The heap's host-reference table.
+    #[must_use]
+    pub fn host_refs(&self) -> &crate::host_refs::HostRefTable {
+        &self.host_refs
+    }
+
+    /// Register a [`crate::trace::ReleaseHostRefs`] body so the sweep
+    /// releases its host-ref slots when it dies. Must be paired with an
+    /// earlier `register_traceable::<T>()`.
+    pub fn register_host_release<T: Traceable + crate::trace::ReleaseHostRefs>(&mut self) {
+        self.trace_table.register_host_release::<T>();
     }
 
     /// Borrow the heap's handle stack.
@@ -1504,6 +1528,7 @@ impl GcHeap {
                 &ephemeron_registry_slots,
                 &weak_registry_slots,
                 &mut self.remembered_parents,
+                &mut self.host_refs,
             )
         }?;
         stats.minor_pause_ns = scavenge_start.elapsed().as_nanos() as u64;
@@ -1888,6 +1913,9 @@ impl GcHeap {
                     page.for_each_object(|h, _| {
                         let tag_u8 = (*h).type_tag();
                         if tag_u8 != crate::header::FREE_TAG && !(*h).is_swept() {
+                            if let Some(release_fn) = self.trace_table.get_host_release(tag_u8) {
+                                release_fn(h, &mut self.host_refs);
+                            }
                             if let Some(finalize_fn) = self.trace_table.get_finalize(tag_u8) {
                                 finalize_fn(h);
                             }
@@ -1926,6 +1954,9 @@ impl GcHeap {
                         // (e.g. a string `Vec<u16>`). Fillers own nothing.
                         if !is_free_filler && !(*h).is_swept() {
                             let tag_u8 = (*h).type_tag();
+                            if let Some(release_fn) = self.trace_table.get_host_release(tag_u8) {
+                                release_fn(h, &mut self.host_refs);
+                            }
                             if let Some(finalize_fn) = self.trace_table.get_finalize(tag_u8) {
                                 finalize_fn(h);
                             }

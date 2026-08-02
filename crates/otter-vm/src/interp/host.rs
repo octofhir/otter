@@ -450,6 +450,14 @@ impl Interpreter {
         crate::native_census::native_census(&self.gc_heap)
     }
 
+    /// Which live bodies still hold GC references outside their own
+    /// cell, and so cannot survive a page image. See
+    /// [`otter_gc::SelfContainmentAudit`].
+    #[must_use]
+    pub fn self_containment_audit(&mut self) -> otter_gc::SelfContainmentAudit {
+        self.gc_heap.audit_self_containment()
+    }
+
     /// Capture this isolate's old generation as a relocatable image.
     ///
     /// # Errors

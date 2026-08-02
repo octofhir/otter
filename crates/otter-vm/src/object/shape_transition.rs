@@ -112,6 +112,12 @@ pub(crate) fn capture_store_property_transition(
     let from_shape_id = super::shape_id(obj, heap);
     let existing_offset =
         heap.read_payload(obj, |body| super::body_offset_of_atom(heap, body, key));
+    // The demotion below materializes per-slot metadata; the table is
+    // built here, outside the borrow, exactly as the runtime demote
+    // paths do.
+    let slot_metas = super::slot_metas_for_shape_transition(heap, obj, existing_offset);
+    let slot_meta_table =
+        super::slot_meta_table_for_install(&mut obj, heap, &slot_metas, index + 1, &mut []).ok()?;
     let transition = heap.with_payload(obj, |body| {
         if !is_fast_shape_body(body)
             || !body.extensible
@@ -124,6 +130,9 @@ pub(crate) fn capture_store_property_transition(
         }
         let to_shape_id = super::next_shape_id();
         body.dictionary_shape_id = to_shape_id;
+        if let Some(table) = slot_meta_table {
+            body.exotic_mut().slots = table;
+        }
         super::dict_push_key(body, key.name().to_owned());
         body.shape = super::ShapeHandle::null();
         body.push_slot(index, SlotMeta::data_default(), compressed);
@@ -248,11 +257,21 @@ pub(crate) fn replay_store_property_transition(
     // raw handle, so allocating before guard validation would leave
     // fallback holding a forwarded cell.
     let mut obj = obj;
+    let mut slot_meta_table = None;
     if to_shape.is_null() {
         // The dictionary arm below appends through `dict_push_key`,
-        // which writes the sidecar; the shape-append arm never touches
-        // it and allocates none.
+        // which writes the sidecar and materializes per-slot metadata;
+        // the shape-append arm never touches either and allocates none.
         super::ensure_exotic(&mut obj, heap).ok()?;
+        let slot_metas = super::slot_metas_for_shape_transition(heap, obj, None);
+        slot_meta_table = super::slot_meta_table_for_install(
+            &mut obj,
+            heap,
+            &slot_metas,
+            usize::from(transition.slot) + 1,
+            &mut [],
+        )
+        .ok()?;
     }
     // Reserve before boxing the value: see the append paths above.
     super::reserve_slot_capacity(&mut obj, heap, usize::from(transition.slot) + 1, &mut []).ok()?;
@@ -265,6 +284,9 @@ pub(crate) fn replay_store_property_transition(
         let offset = usize::from(transition.slot);
         if to_shape.is_null() {
             body.dictionary_shape_id = transition.to_shape_id;
+            if let Some(table) = slot_meta_table {
+                body.exotic_mut().slots = table;
+            }
             super::dict_push_key(body, key.name().to_owned());
             body.shape = super::ShapeHandle::null();
         } else {

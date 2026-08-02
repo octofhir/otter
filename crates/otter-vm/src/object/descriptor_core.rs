@@ -66,6 +66,15 @@ pub(super) fn ordinary_set_data_property(
     {
         return false;
     }
+    let Ok(slot_meta_table) = super::slot_meta_table_for_install(
+        &mut obj,
+        heap,
+        &slot_metas,
+        append_index + 1,
+        std::slice::from_mut(&mut compressed),
+    ) else {
+        return false;
+    };
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
             let i = offset as usize;
@@ -84,14 +93,18 @@ pub(super) fn ordinary_set_data_property(
         if let Some(dictionary_keys) = dictionary_keys {
             super::dict_set_keys(body, dictionary_keys);
         }
-        if let Some(slot_metas) = slot_metas {
-            body.exotic_mut().slots = slot_metas;
+        if let Some(table) = slot_meta_table {
+            body.exotic_mut().slots = table;
         }
         super::dict_push_key(body, key.to_owned());
         body.shape = ShapeHandle::null();
         body.push_slot(append_index, SlotMeta::data_default(), compressed);
         true
     });
+    if let Some(table) = slot_meta_table {
+        let sidecar = heap.read_payload(obj, |body| body.exotic.get());
+        heap.record_write(sidecar, &table);
+    }
     if success {
         super::record_slot_write(heap, obj, compressed);
     }

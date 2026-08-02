@@ -837,10 +837,11 @@ pub struct ExoticSlots {
     /// Materialized per-slot metadata (flags + `is_accessor` discriminator),
     /// index-aligned with the flat value array. Present and authoritative only
     /// for dictionary-mode objects (null shape) and attribute-overridden
-    /// objects (`ObjectBody::slot_attrs_overridden`). Empty for the common
-    /// shaped object, which derives per-slot attributes from the hidden class.
-    /// Holds no GC handles, so it needs no tracing.
-    slots: Vec<SlotMeta>,
+    /// objects (`ObjectBody::slot_attrs_overridden`). Null for the common
+    /// shaped object, which derives per-slot attributes from the hidden
+    /// class. Holds no GC handles; the handle is traced so the table
+    /// relocates with the graph.
+    slots: SlotMetaHandle,
     /// Symbol-keyed own properties, in a [`SymbolPropsBody`] of their
     /// own — null until the first symbol property is defined.
     symbol_props: SymbolPropsHandle,
@@ -888,6 +889,14 @@ impl otter_gc::SafeTraceable for ExoticSlots {
         }
         if !self.symbol_props.is_null() {
             let slot = &mut self.symbol_props as *mut SymbolPropsHandle as *mut RawGc;
+            v(slot);
+        }
+        // The metadata records hold no GC references, but the table CELL
+        // is a heap object this sidecar keeps alive — an untraced handle
+        // here is a table the next full collection frees out from under
+        // the object.
+        if !self.slots.is_null() {
+            let slot = &mut self.slots as *mut SlotMetaHandle as *mut RawGc;
             v(slot);
         }
         if let Some(native) = &mut self.call_native {
@@ -1049,6 +1058,145 @@ impl otter_gc::SafeTraceable for SymbolPropsBody {
             }
         }
     }
+}
+
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`SlotMetaBody`].
+pub const SLOT_META_BODY_TYPE_TAG: u8 = 0x3c;
+
+/// Handle to an object's materialized per-slot metadata table.
+pub(crate) type SlotMetaHandle = otter_gc::Gc<SlotMetaBody>;
+
+/// Header for materialized per-slot attribute metadata; the
+/// [`SlotMeta`] records follow it in the same cell. Metadata holds no
+/// GC references, so the body traces nothing — it exists purely so a
+/// dictionary-mode or attribute-overridden object owns its metadata
+/// inside the cage.
+#[repr(C)]
+pub struct SlotMetaBody {
+    /// Records the trailing array can hold.
+    capacity: u32,
+    /// Records written.
+    len: u32,
+}
+
+impl SlotMetaBody {
+    fn trailing_bytes(capacity: usize) -> usize {
+        capacity * std::mem::size_of::<SlotMeta>()
+    }
+
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: u32::try_from(capacity).expect("slot meta capacity exceeds u32"),
+            len: 0,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity as usize
+    }
+
+    fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    fn entries_ptr(&self) -> *mut SlotMeta {
+        // SAFETY: the allocation reserved `trailing_bytes(capacity)`
+        // immediately after this header.
+        unsafe {
+            (self as *const Self as *mut u8)
+                .add(std::mem::size_of::<Self>())
+                .cast()
+        }
+    }
+
+    fn entries(&self) -> &[SlotMeta] {
+        // SAFETY: the first `len` records were written before the table
+        // became reachable.
+        unsafe { std::slice::from_raw_parts(self.entries_ptr().cast_const(), self.len()) }
+    }
+
+    fn entries_mut(&mut self) -> &mut [SlotMeta] {
+        // SAFETY: as in `entries`.
+        unsafe { std::slice::from_raw_parts_mut(self.entries_ptr(), self.len()) }
+    }
+
+    fn push(&mut self, meta: SlotMeta) {
+        let index = self.len();
+        debug_assert!(
+            index < self.capacity(),
+            "slot meta push without a reservation"
+        );
+        // SAFETY: `index < capacity`.
+        unsafe { self.entries_ptr().add(index).write(meta) };
+        self.len += 1;
+    }
+
+    fn remove(&mut self, index: usize) {
+        let len = self.len();
+        debug_assert!(index < len);
+        for i in index..len - 1 {
+            // SAFETY: both slots are inside the written prefix.
+            unsafe {
+                let next = self.entries_ptr().add(i + 1).read();
+                self.entries_ptr().add(i).write(next);
+            }
+        }
+        self.len -= 1;
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+}
+
+impl otter_gc::SafeTraceable for SlotMetaBody {
+    const TYPE_TAG: u8 = SLOT_META_BODY_TYPE_TAG;
+
+    /// Deliberately empty: [`SlotMeta`] holds no GC references.
+    fn trace_slots_safe(&mut self, _v: &mut SlotVisitor<'_>) {}
+}
+
+/// The table payload behind `handle`, or `None` for a null handle.
+#[must_use]
+fn slot_meta_body_of(handle: SlotMetaHandle) -> Option<*mut SlotMetaBody> {
+    if handle.is_null() {
+        return None;
+    }
+    let header = handle.as_header_ptr();
+    // SAFETY: a non-null handle names a live cell whose payload is a
+    // `SlotMetaBody` one header past the start.
+    Some(unsafe {
+        header
+            .cast::<u8>()
+            .add(std::mem::size_of::<otter_gc::GcHeader>())
+            .cast::<SlotMetaBody>()
+    })
+}
+
+/// Allocate a slot-meta table holding `metas`, with the caller's roots
+/// live across the allocation. The records are plain attribute bits, so
+/// the copy needs no barriers.
+fn slot_meta_table_from(
+    heap: &mut otter_gc::GcHeap,
+    metas: &[SlotMeta],
+    capacity: usize,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<SlotMetaHandle, otter_gc::OutOfMemory> {
+    let capacity = capacity.max(metas.len()).max(1);
+    let table: SlotMetaHandle = heap.alloc_variable_with_roots(
+        SlotMetaBody::new(capacity),
+        SlotMetaBody::trailing_bytes(capacity),
+        external_visit,
+    )?;
+    if !metas.is_empty() {
+        // SAFETY: the handle names the table just allocated.
+        let body = slot_meta_body_of(table).expect("fresh table");
+        for meta in metas {
+            // SAFETY: capacity covers every record.
+            unsafe { (*body).push(*meta) };
+        }
+    }
+    Ok(table)
 }
 
 /// The table payload behind `handle`, or `None` for a null handle.
@@ -1473,7 +1621,7 @@ impl ObjectBody {
                 // materialized metadata, so keep that entry current; a
                 // non-overridden object reads the rebuilt shape and stores none.
                 if self.slot_attrs_overridden {
-                    self.slots_mut()[i] = meta;
+                    self.slots_mut().entries_mut()[i] = meta;
                 }
             }
             None => {
@@ -1484,7 +1632,7 @@ impl ObjectBody {
                     self.slots_materialized(),
                     "set_slot(None) needs materialized slots"
                 );
-                self.slots_mut()[i] = meta;
+                self.slots_mut().entries_mut()[i] = meta;
             }
         }
     }
@@ -1774,15 +1922,27 @@ impl ObjectBody {
     /// authoritative source).
     #[inline]
     fn slots(&self) -> &[SlotMeta] {
-        self.exotic().map_or(&[], |e| e.slots.as_slice())
+        self.exotic()
+            .and_then(|e| slot_meta_body_of(e.slots))
+            // SAFETY: a non-null handle names a live table whose prefix
+            // outlives this borrow of the object body.
+            .map_or(&[], |table| unsafe { (*table).entries() })
     }
 
     /// Exclusive ref to the materialized per-slot metadata vector, allocating
     /// the exotic box on first use. Callers must only reach this on a
     /// materialized object (dictionary-mode or attribute-overridden).
     #[inline]
-    fn slots_mut(&mut self) -> &mut Vec<SlotMeta> {
-        &mut self.exotic_mut().slots
+    fn slots_mut(&mut self) -> &mut SlotMetaBody {
+        let table = self
+            .exotic()
+            .map(|e| e.slots)
+            .unwrap_or_else(SlotMetaHandle::null);
+        let body = slot_meta_body_of(table)
+            .expect("materialized slot metadata written without a reserved table");
+        // SAFETY: a non-null handle names a live table; `&mut self`
+        // rules out an aliasing read through this object body.
+        unsafe { &mut *body }
     }
 }
 
@@ -1930,6 +2090,10 @@ pub(crate) fn reserve_slot_capacity(
     needed: usize,
     pending: &mut [CompressedValue],
 ) -> Result<(), otter_gc::OutOfMemory> {
+    // A materialized object appends per-slot metadata in lockstep with
+    // the value it appends, so its meta table must keep pace with the
+    // slab — including when the slab itself already has room.
+    reserve_slot_meta_capacity(object, heap, needed, pending)?;
     let capacity = heap.read_payload(*object, ObjectBody::slab_capacity);
     if needed <= capacity {
         return Ok(());
@@ -1977,6 +2141,127 @@ pub(crate) fn reserve_slot_capacity(
     // old-to-young edge the mutator barrier would have.
     heap.record_write(owner, &Value::object(owner));
     Ok(())
+}
+
+/// Make room for `needed` materialized per-slot metadata records.
+///
+/// A no-op for the shaped, non-overridden object that keeps its
+/// attributes in the hidden class. The records are plain bits, so only
+/// `object` and the caller's pending words need rooting.
+///
+/// # Errors
+/// Propagates [`otter_gc::OutOfMemory`].
+pub(crate) fn reserve_slot_meta_capacity(
+    object: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    needed: usize,
+    pending: &mut [CompressedValue],
+) -> Result<(), otter_gc::OutOfMemory> {
+    let state = heap.read_payload(*object, |body| {
+        if !body.slots_materialized() {
+            return None;
+        }
+        let table = body.exotic().map(|e| e.slots).unwrap_or_default();
+        let (len, capacity) = match slot_meta_body_of(table) {
+            // SAFETY: a non-null handle names a live table.
+            Some(body) => unsafe { ((*body).len(), (*body).capacity()) },
+            None => (0, 0),
+        };
+        Some((table, len, capacity))
+    });
+    let Some((current, len, capacity)) = state else {
+        return Ok(());
+    };
+    if needed <= capacity {
+        return Ok(());
+    }
+    let grown = needed.max(capacity.saturating_mul(2)).max(4);
+    let object_slot = (object as *mut JsObject).cast::<otter_gc::raw::RawGc>();
+    let pending_base = pending.as_mut_ptr();
+    let pending_len = pending.len();
+    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        visitor(object_slot);
+        for index in 0..pending_len {
+            // SAFETY: `index < pending_len`, and the slice outlives this
+            // call; forward tagged words the same way the slab reserve does.
+            let word = unsafe { pending_base.add(index) };
+            let slot = unsafe { *word };
+            if !slot.is_gc_offset() {
+                continue;
+            }
+            if slot.0 & 0b111 == 0 {
+                visitor(word.cast::<otter_gc::raw::RawGc>());
+            } else {
+                let tag = slot.0 & 0b111;
+                let mut raw = otter_gc::raw::RawGc(slot.0 & !0b111);
+                visitor(std::ptr::addr_of_mut!(raw));
+                // SAFETY: same in-range word as above.
+                unsafe { *word = CompressedValue(raw.0 | tag) };
+            }
+        }
+    };
+    // The old table is old space and does not move; copy after the
+    // allocation, then swap the sidecar's handle.
+    let existing: Vec<SlotMeta> = match slot_meta_body_of(current) {
+        // SAFETY: live table payload.
+        Some(body) => unsafe { (*body).entries().to_vec() },
+        None => Vec::new(),
+    };
+    let _ = len;
+    let table = slot_meta_table_from(heap, &existing, grown, &mut visit)?;
+    let owner = *object;
+    let sidecar = heap.read_payload(owner, |body| body.exotic.get());
+    debug_assert!(!sidecar.is_null(), "materialized slots imply a sidecar");
+    heap.with_payload(sidecar, |exotic| {
+        exotic.slots = table;
+        true
+    });
+    heap.record_write(sidecar, &table);
+    Ok(())
+}
+
+/// Pre-build the slot-meta table a demotion is about to install.
+///
+/// The demoting payload borrow cannot allocate, so the table holding the
+/// materialized metadata (plus room for the record the same borrow will
+/// push) is built here, with `object` and the caller's pending words
+/// rooted. `None` in, `None` out.
+fn slot_meta_table_for_install(
+    object: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    metas: &Option<Vec<SlotMeta>>,
+    capacity: usize,
+    pending: &mut [CompressedValue],
+) -> Result<Option<SlotMetaHandle>, otter_gc::OutOfMemory> {
+    let Some(metas) = metas else {
+        return Ok(None);
+    };
+    let object_slot = (object as *mut JsObject).cast::<otter_gc::raw::RawGc>();
+    let pending_base = pending.as_mut_ptr();
+    let pending_len = pending.len();
+    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        visitor(object_slot);
+        for index in 0..pending_len {
+            // SAFETY: `index < pending_len`, and the slice outlives this
+            // call; forward tagged words as the slab reserve does.
+            let word = unsafe { pending_base.add(index) };
+            let slot = unsafe { *word };
+            if !slot.is_gc_offset() {
+                continue;
+            }
+            if slot.0 & 0b111 == 0 {
+                visitor(word.cast::<otter_gc::raw::RawGc>());
+            } else {
+                let tag = slot.0 & 0b111;
+                let mut raw = otter_gc::raw::RawGc(slot.0 & !0b111);
+                visitor(std::ptr::addr_of_mut!(raw));
+                // SAFETY: same in-range word as above.
+                unsafe { *word = CompressedValue(raw.0 | tag) };
+            }
+        }
+    };
+    let table = slot_meta_table_from(heap, metas, capacity, &mut visit)?;
+    Ok(Some(table))
 }
 
 /// Register GC layouts that object allocation paths may publish without going
@@ -2029,6 +2314,7 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
         crate::upvalue_spine::UpvalueSpineBody,
         ExoticSlots,
         SymbolPropsBody,
+        SlotMetaBody,
         crate::array::ArrayExoticSlots,
         crate::weak_refs::FinalizationRegistryBody,
         crate::weak_refs::WeakRefBody,
@@ -3805,7 +4091,7 @@ pub fn set(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Va
         }
         heap.with_payload(*obj, |body| {
             if is_accessor {
-                body.slots_mut()[i].is_accessor = false;
+                body.slots_mut().entries_mut()[i].is_accessor = false;
             }
             body.set_data_value(i, compressed);
         });
@@ -3819,18 +4105,31 @@ pub fn set(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Va
     if reserve_slot_capacity(obj, heap, index + 1, std::slice::from_mut(&mut compressed)).is_err() {
         return;
     }
+    let Ok(slot_meta_table) = slot_meta_table_for_install(
+        obj,
+        heap,
+        &slot_metas,
+        index + 1,
+        std::slice::from_mut(&mut compressed),
+    ) else {
+        return;
+    };
     heap.with_payload(*obj, |body| {
         body.dictionary_shape_id = next_shape_id();
         if let Some(dictionary_keys) = dictionary_keys {
             dict_set_keys(body, dictionary_keys);
         }
-        if let Some(slot_metas) = slot_metas {
-            body.exotic_mut().slots = slot_metas;
+        if let Some(table) = slot_meta_table {
+            body.exotic_mut().slots = table;
         }
         dict_push_key(body, key.to_owned());
         body.shape = ShapeHandle::null();
         body.push_slot(index, SlotMeta::data_default(), compressed);
     });
+    if let Some(table) = slot_meta_table {
+        let sidecar = heap.read_payload(*obj, |body| body.exotic.get());
+        heap.record_write(sidecar, &table);
+    }
     record_slot_write(heap, *obj, compressed);
 }
 
@@ -3862,7 +4161,7 @@ pub(crate) fn set_with_shape(
         }
         heap.with_payload(obj, |body| {
             if is_accessor {
-                body.slots_mut()[i].is_accessor = false;
+                body.slots_mut().entries_mut()[i].is_accessor = false;
             }
             body.set_data_value(i, compressed);
         });
@@ -4315,6 +4614,15 @@ pub fn define_own_property_partial(
     {
         return false;
     }
+    let Ok(slot_meta_table) = slot_meta_table_for_install(
+        &mut obj,
+        heap,
+        &slot_metas,
+        append_index + 1,
+        std::slice::from_mut(&mut stored),
+    ) else {
+        return false;
+    };
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
             body.set_slot(offset as usize, meta, stored, None);
@@ -4327,8 +4635,8 @@ pub fn define_own_property_partial(
             if let Some(dictionary_keys) = dictionary_keys {
                 dict_set_keys(body, dictionary_keys);
             }
-            if let Some(slot_metas) = slot_metas {
-                body.exotic_mut().slots = slot_metas;
+            if let Some(table) = slot_meta_table {
+                body.exotic_mut().slots = table;
             }
             dict_push_key(body, key.to_owned());
             body.shape = ShapeHandle::null();
@@ -4336,6 +4644,10 @@ pub fn define_own_property_partial(
             true
         }
     });
+    if let Some(table) = slot_meta_table {
+        let sidecar = heap.read_payload(obj, |body| body.exotic.get());
+        heap.record_write(sidecar, &table);
+    }
     if success {
         apply_mapped_arguments_partial_define(obj, heap, key, descriptor, existing_offset);
         record_slot_write(heap, obj, stored);
@@ -4551,6 +4863,15 @@ pub fn define_own_property_in_place(
     {
         return false;
     }
+    let Ok(slot_meta_table) = slot_meta_table_for_install(
+        &mut obj,
+        heap,
+        &slot_metas,
+        append_index + 1,
+        std::slice::from_mut(&mut stored),
+    ) else {
+        return false;
+    };
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
             body.set_slot(offset as usize, meta, stored, None);
@@ -4563,8 +4884,8 @@ pub fn define_own_property_in_place(
             if let Some(dictionary_keys) = dictionary_keys {
                 dict_set_keys(body, dictionary_keys);
             }
-            if let Some(slot_metas) = slot_metas {
-                body.exotic_mut().slots = slot_metas;
+            if let Some(table) = slot_meta_table {
+                body.exotic_mut().slots = table;
             }
             dict_push_key(body, key.to_owned());
             body.shape = ShapeHandle::null();
@@ -4572,6 +4893,10 @@ pub fn define_own_property_in_place(
             true
         }
     });
+    if let Some(table) = slot_meta_table {
+        let sidecar = heap.read_payload(obj, |body| body.exotic.get());
+        heap.record_write(sidecar, &table);
+    }
     if success {
         let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
         if let Some(cell) = mapped_cell {
@@ -4904,7 +5229,11 @@ pub fn seal(obj: JsObject, heap: &mut otter_gc::GcHeap) {
             // SAFETY: a non-null handle names a live sidecar payload.
             unsafe { &mut *e })
         {
-            for slot in exotic.slots.iter_mut() {
+            for slot in slot_meta_body_of(exotic.slots)
+                // SAFETY: a non-null handle names a live table.
+                .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
+                .iter_mut()
+            {
                 slot.flags = slot.flags.with_configurable(false);
             }
             for (_, slot) in symbol_props_body_of(exotic.symbol_props)
@@ -4934,7 +5263,11 @@ pub(crate) fn seal_with_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, new_sh
             // SAFETY: a non-null handle names a live sidecar payload.
             unsafe { &mut *e })
         {
-            for slot in exotic.slots.iter_mut() {
+            for slot in slot_meta_body_of(exotic.slots)
+                // SAFETY: a non-null handle names a live table.
+                .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
+                .iter_mut()
+            {
                 slot.flags = slot.flags.with_configurable(false);
             }
             for (_, slot) in symbol_props_body_of(exotic.symbol_props)
@@ -4964,7 +5297,11 @@ pub fn freeze(obj: JsObject, heap: &mut otter_gc::GcHeap) {
             // SAFETY: a non-null handle names a live sidecar payload.
             unsafe { &mut *e })
         {
-            for slot in exotic.slots.iter_mut() {
+            for slot in slot_meta_body_of(exotic.slots)
+                // SAFETY: a non-null handle names a live table.
+                .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
+                .iter_mut()
+            {
                 slot.flags = slot.flags.with_configurable(false);
                 if !slot.is_accessor {
                     slot.flags = slot.flags.with_writable(false);
@@ -5003,7 +5340,11 @@ pub(crate) fn freeze_with_shape(
             // SAFETY: a non-null handle names a live sidecar payload.
             unsafe { &mut *e })
         {
-            for slot in exotic.slots.iter_mut() {
+            for slot in slot_meta_body_of(exotic.slots)
+                // SAFETY: a non-null handle names a live table.
+                .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
+                .iter_mut()
+            {
                 slot.flags = slot.flags.with_configurable(false);
                 if !slot.is_accessor {
                     slot.flags = slot.flags.with_writable(false);
@@ -5280,7 +5621,10 @@ pub(crate) fn adopt_fast_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, shape
         {
             exotic.dictionary_keys.clear();
             exotic.dictionary_index.clear();
-            exotic.slots.clear();
+            if let Some(table) = slot_meta_body_of(exotic.slots) {
+                // SAFETY: a non-null handle names a live table.
+                unsafe { (*table).clear() };
+            }
         }
     });
     heap.record_write(obj, &shape);
@@ -5380,10 +5724,16 @@ fn materialize_slots(obj: JsObject, heap: &mut otter_gc::GcHeap) {
         (!body.slots_materialized()).then(|| materialized_slot_metas(heap, body))
     });
     if let Some(metas) = metas {
+        let metas_for_install = Some(metas);
+        let table = slot_meta_table_for_install(&mut obj, heap, &metas_for_install, 0, &mut [])
+            .expect("slot meta table")
+            .expect("metas present");
         heap.with_payload(obj, |body| {
-            body.exotic_mut().slots = metas;
+            body.exotic_mut().slots = table;
             body.slot_attrs_overridden = true;
         });
+        let sidecar = heap.read_payload(obj, |body| body.exotic.get());
+        heap.record_write(sidecar, &table);
     }
 }
 

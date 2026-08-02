@@ -667,7 +667,11 @@ mod tests {
         // counter, not because the bootstrap does more work — the malloc
         // they used to be is gone, and every object lost the 20-byte `Vec`
         // header whether it spilled or not.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 2020;
+        // The rare/exotic sidecar is the same story: an object that needs
+        // one (a callable, a wrapper, a dictionary-mode object) allocates a
+        // GC body where it used to allocate a `Box`. Same allocation, now
+        // counted.
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 2120;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 560 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");

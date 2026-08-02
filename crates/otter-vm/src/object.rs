@@ -737,7 +737,7 @@ pub struct ObjectBody {
     /// objects and class instances (the overwhelming common case), so an
     /// ordinary object never pays for these ~140 bytes. Allocated on first
     /// write through [`ObjectBody::exotic_mut`].
-    exotic: Option<Box<ExoticSlots>>,
+    exotic: ExoticSlot,
     /// In-body storage for the first [`INLINE_SLOT_CAP`] string-keyed slots, so
     /// a small object needs no separate slab allocation and keeps its hot slots
     /// in the same cache line as the shape and `values_ptr` — the
@@ -769,8 +769,60 @@ pub(crate) const INLINE_SLOT_CAP: usize = 6;
 /// objects stay small. Every field here is absent on a plain `{}` / class
 /// instance; presence implies a wrapper object, host object, callable/
 /// constructor builtin, Date, Error, raw-JSON, or arguments exotic.
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`ExoticSlots`].
+pub const EXOTIC_SLOTS_TYPE_TAG: u8 = 0x37;
+
+/// Handle to an object's rare/exotic sidecar.
+pub type ExoticHandle = otter_gc::Gc<ExoticSlots>;
+
+/// The sidecar handle as [`ObjectBody`] stores it.
+///
+/// Eight bytes aligned to eight, exactly what the `Box` it replaced
+/// occupied, so every offset the frozen JIT ABI pins below stays put and
+/// no backend has to re-bake `INLINE_VALUES_BYTE`. The handle itself is
+/// four bytes; the rest is deliberate slack.
+#[repr(C, align(8))]
+#[derive(Clone, Copy, Default)]
+pub struct ExoticSlot {
+    handle: ExoticHandle,
+    _pad: u32,
+}
+
+impl ExoticSlot {
+    /// An object with no sidecar.
+    #[must_use]
+    pub fn null() -> Self {
+        Self::default()
+    }
+
+    /// The sidecar handle.
+    #[must_use]
+    pub fn get(self) -> ExoticHandle {
+        self.handle
+    }
+
+    /// `true` when the object has no sidecar.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.handle.is_null()
+    }
+
+    /// Install a sidecar.
+    pub fn set(&mut self, handle: ExoticHandle) {
+        self.handle = handle;
+    }
+
+    /// Address of the handle, for the tracer.
+    fn slot_ptr(&mut self) -> *mut RawGc {
+        &mut self.handle as *mut ExoticHandle as *mut RawGc
+    }
+}
+
+/// Rare/exotic object state, kept out of [`ObjectBody`] so ordinary
+/// objects stay small. Its own GC body, so an object that has one still
+/// owns nothing outside the heap.
 #[derive(Default)]
-struct ExoticSlots {
+pub struct ExoticSlots {
     /// Non-ordinary `[[Prototype]]` (a `Value` or `Proxy`). `None` for the
     /// common Null / ordinary-object prototype, which is encoded entirely by
     /// `ObjectBody::jit_proto` (null handle == `null` prototype).
@@ -822,6 +874,120 @@ struct ExoticSlots {
     /// `[[ParameterMap]]` presence marker for arguments-exotic objects
     /// (§10.4.4); mapping data itself lives in `host_data`.
     is_arguments_object: bool,
+}
+
+impl otter_gc::SafeTraceable for ExoticSlots {
+    const TYPE_TAG: u8 = EXOTIC_SLOTS_TYPE_TAG;
+
+    fn trace_slots_safe(&mut self, v: &mut SlotVisitor<'_>) {
+        match &mut self.proto_override {
+            None | Some(ObjectPrototype::Null) | Some(ObjectPrototype::Object(_)) => {}
+            Some(ObjectPrototype::Value(value)) => value.trace_value_slot_mut(v),
+            Some(ObjectPrototype::Proxy(proxy)) => proxy.trace_value_slots_mut(v),
+        }
+        for (_sym, slot) in self.symbol_props.iter_mut() {
+            match &mut slot.kind {
+                SlotKind::Data => slot.value.trace_value_slot_mut(v),
+                SlotKind::Accessor(pair) => {
+                    if let Some(g) = &mut pair.getter {
+                        g.trace_value_slot_mut(v);
+                    }
+                    if let Some(s) = &mut pair.setter {
+                        s.trace_value_slot_mut(v);
+                    }
+                }
+            }
+        }
+        if let Some(native) = &mut self.call_native {
+            native.trace_value_slot_mut(v);
+        }
+        if let Some(native) = &mut self.constructor_native {
+            native.trace_value_slot_mut(v);
+        }
+        if let Some(data) = self
+            .host_data
+            .as_mut()
+            .and_then(|data| data.downcast_mut::<MappedArgumentsData>())
+        {
+            for entry in data.entries.iter_mut() {
+                let p = &mut entry.cell as *mut UpvalueCell as *mut RawGc;
+                v(p);
+            }
+        }
+        if let Some(data) = self.host_data.as_mut() {
+            data.trace_gc_slots(v);
+        }
+    }
+}
+
+/// The sidecar payload behind `handle`, or `None` for a null handle.
+///
+/// The one place an exotic handle is decoded without going through the
+/// heap — an object body holding a payload borrow has no heap to ask.
+#[must_use]
+fn exotic_body_of(handle: ExoticHandle) -> Option<*mut ExoticSlots> {
+    if handle.is_null() {
+        return None;
+    }
+    let header = handle.as_header_ptr();
+    // SAFETY: a non-null handle names a live cell whose payload is an
+    // `ExoticSlots` one header past the start.
+    Some(unsafe {
+        header
+            .cast::<u8>()
+            .add(std::mem::size_of::<otter_gc::GcHeader>())
+            .cast::<ExoticSlots>()
+    })
+}
+
+/// Give `object` an exotic sidecar if it does not have one.
+///
+/// Creating the sidecar allocates, and an allocation can move the object,
+/// so this runs outside the payload borrow with `object` rooted — the
+/// same split property-slab growth uses. A no-op after the first call,
+/// which is every write but one.
+///
+/// # Errors
+/// Propagates [`otter_gc::OutOfMemory`].
+pub fn ensure_exotic(
+    object: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+) -> Result<(), otter_gc::OutOfMemory> {
+    if !heap.read_payload(*object, |body| body.exotic.is_null()) {
+        return Ok(());
+    }
+    let owner_slot = std::ptr::addr_of_mut!(*object);
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        visitor(owner_slot.cast::<RawGc>());
+    };
+    let sidecar: ExoticHandle =
+        heap.alloc_variable_with_roots(ExoticSlots::default(), 0, &mut visit)?;
+    let owner = *object;
+    heap.with_payload(owner, |body| {
+        body.exotic.set(sidecar);
+        true
+    });
+    // Installed by a raw payload write, so record the edge the mutator
+    // barrier would have.
+    heap.record_write(owner, &sidecar);
+    Ok(())
+}
+
+/// Remember a write against the sidecar that actually holds it.
+///
+/// The exotic slots are their own old-space body, so the object is not
+/// the parent of what they hold: a scavenge re-tracing the object finds
+/// one edge, sees an old child, and stops. The object is remembered too,
+/// because the same call sites also write slots it owns.
+pub(crate) fn record_exotic_write<V>(heap: &mut otter_gc::GcHeap, object: JsObject, value: &V)
+where
+    V: otter_gc::GcStore + ?Sized,
+{
+    heap.record_write(object, value);
+    let sidecar = heap.read_payload(object, |body| body.exotic.get());
+    if !sidecar.is_null() {
+        heap.record_write(sidecar, value);
+    }
 }
 
 /// Byte offset of the shape token within an [`ObjectBody`] payload. The
@@ -1235,15 +1401,24 @@ impl ObjectBody {
     /// Shared ref to the boxed exotic slots, if any.
     #[inline]
     fn exotic(&self) -> Option<&ExoticSlots> {
-        self.exotic.as_deref()
+        // SAFETY: a non-null handle names a live sidecar payload that
+        // outlives this borrow of the object body.
+        exotic_body_of(self.exotic.get()).map(|body| unsafe { &*body })
     }
 
-    /// Exclusive ref to the boxed exotic slots, allocating an empty box on
-    /// first use.
+    /// Exclusive ref to the exotic sidecar.
+    ///
+    /// The sidecar is a GC body, so creating one allocates and a payload
+    /// borrow has no heap. Every mutating path calls [`ensure_exotic`]
+    /// first, outside the borrow; arriving here with no sidecar is a
+    /// caller that forgot.
     #[inline]
     fn exotic_mut(&mut self) -> &mut ExoticSlots {
-        self.exotic
-            .get_or_insert_with(|| Box::new(ExoticSlots::default()))
+        let body = exotic_body_of(self.exotic.get())
+            .expect("exotic slots written without ensure_exotic reserving them");
+        // SAFETY: as in `exotic`; `&mut self` rules out an aliasing read
+        // through this object body.
+        unsafe { &mut *body }
     }
 
     #[inline]
@@ -1252,9 +1427,8 @@ impl ObjectBody {
     }
     #[inline]
     fn host_data_mut_opt(&mut self) -> Option<&mut HostData> {
-        self.exotic
-            .as_deref_mut()
-            .and_then(|e| e.host_data.as_mut())
+        // SAFETY: a non-null handle names a live sidecar payload.
+        exotic_body_of(self.exotic.get()).and_then(|body| unsafe { (*body).host_data.as_mut() })
     }
     #[inline]
     fn boolean_data(&self) -> Option<bool> {
@@ -1459,48 +1633,11 @@ impl otter_gc::SafeTraceable for ObjectBody {
                 unsafe { *word = slot.with_gc_offset(tmp.0) };
             }
         }
-        // Boxed exotic slots holding GC edges. Traced in place through the box
-        // reference so the moving collector rewrites the live slots, not a copy.
-        if let Some(exotic) = self.exotic.as_mut() {
-            // Non-ordinary prototype (Value / Proxy), traced in place.
-            match &mut exotic.proto_override {
-                None | Some(ObjectPrototype::Null) | Some(ObjectPrototype::Object(_)) => {}
-                Some(ObjectPrototype::Value(value)) => value.trace_value_slot_mut(v),
-                Some(ObjectPrototype::Proxy(proxy)) => proxy.trace_value_slots_mut(v),
-            }
-            // Symbol-keyed own properties (value inline in the slot).
-            for (_sym, slot) in exotic.symbol_props.iter_mut() {
-                match &mut slot.kind {
-                    SlotKind::Data => slot.value.trace_value_slot_mut(v),
-                    SlotKind::Accessor(pair) => {
-                        if let Some(g) = &mut pair.getter {
-                            g.trace_value_slot_mut(v);
-                        }
-                        if let Some(s) = &mut pair.setter {
-                            s.trace_value_slot_mut(v);
-                        }
-                    }
-                }
-            }
-            if let Some(native) = &mut exotic.call_native {
-                native.trace_value_slot_mut(v);
-            }
-            if let Some(native) = &mut exotic.constructor_native {
-                native.trace_value_slot_mut(v);
-            }
-            if let Some(data) = exotic
-                .host_data
-                .as_mut()
-                .and_then(|data| data.downcast_mut::<MappedArgumentsData>())
-            {
-                for entry in data.entries.iter_mut() {
-                    let p = &mut entry.cell as *mut UpvalueCell as *mut RawGc;
-                    v(p);
-                }
-            }
-            if let Some(data) = exotic.host_data.as_mut() {
-                data.trace_gc_slots(v);
-            }
+        // The exotic sidecar is its own GC body: trace the handle so a
+        // moving collection rewrites it, and let the sidecar trace its own
+        // slots through its `Traceable` impl.
+        if !self.exotic.is_null() {
+            v(self.exotic.slot_ptr());
         }
     }
 }
@@ -1633,6 +1770,7 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
         crate::temporal::payload::TemporalBody,
         crate::upvalue::UpvalueCellBody,
         crate::upvalue_spine::UpvalueSpineBody,
+        ExoticSlots,
         crate::weak_refs::FinalizationRegistryBody,
         crate::weak_refs::WeakRefBody,
         AccessorCellBody,
@@ -1654,7 +1792,7 @@ fn empty_object_body() -> ObjectBody {
         jit_proto: otter_gc::Gc::null(),
         extensible: true,
         slot_attrs_overridden: false,
-        exotic: None,
+        exotic: ExoticSlot::null(),
     }
 }
 
@@ -1827,7 +1965,16 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
     data: T,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
-    heap.alloc_with_roots(
+    let mut sidecar: ExoticHandle =
+        heap.alloc_variable_with_roots(ExoticSlots::default(), 0, external_visit)?;
+    let sidecar_slot = std::ptr::addr_of_mut!(sidecar);
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
+        visitor(sidecar_slot.cast::<RawGc>());
+    };
+    let mut slot = ExoticSlot::null();
+    slot.set(sidecar);
+    let object = heap.alloc_with_roots(
         ObjectBody {
             shape: ShapeHandle::null(),
             values_ptr: Cell::new(std::ptr::null_mut()),
@@ -1839,13 +1986,16 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
             jit_proto: otter_gc::Gc::null(),
             extensible: true,
             slot_attrs_overridden: false,
-            exotic: Some(Box::new(ExoticSlots {
-                host_data: Some(HostData::Untraced(Box::new(data))),
-                ..ExoticSlots::default()
-            })),
+            exotic: slot,
         },
-        external_visit,
-    )
+        &mut visit,
+    )?;
+    heap.with_payload(sidecar, |exotic| {
+        exotic.host_data = Some(HostData::Untraced(Box::new(data)));
+        true
+    });
+    heap.record_write(object, &sidecar);
+    Ok(object)
 }
 
 /// Allocate a fresh host-data object with the root hidden class installed.
@@ -1855,7 +2005,18 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
     data: T,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
-    heap.alloc_with_roots(
+    // The sidecar is allocated before the object exists, so installing
+    // the host payload needs no second allocation point inside a borrow.
+    let mut sidecar: ExoticHandle =
+        heap.alloc_variable_with_roots(ExoticSlots::default(), 0, external_visit)?;
+    let sidecar_slot = std::ptr::addr_of_mut!(sidecar);
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
+        visitor(sidecar_slot.cast::<RawGc>());
+    };
+    let mut slot = ExoticSlot::null();
+    slot.set(sidecar);
+    let object = heap.alloc_with_roots(
         ObjectBody {
             shape,
             values_ptr: Cell::new(std::ptr::null_mut()),
@@ -1867,13 +2028,16 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
             jit_proto: otter_gc::Gc::null(),
             extensible: true,
             slot_attrs_overridden: false,
-            exotic: Some(Box::new(ExoticSlots {
-                host_data: Some(HostData::Untraced(Box::new(data))),
-                ..ExoticSlots::default()
-            })),
+            exotic: slot,
         },
-        external_visit,
-    )
+        &mut visit,
+    )?;
+    heap.with_payload(sidecar, |exotic| {
+        exotic.host_data = Some(HostData::Untraced(Box::new(data)));
+        true
+    });
+    heap.record_write(object, &sidecar);
+    Ok(object)
 }
 
 /// Allocate a fresh host object whose payload explicitly traces JavaScript
@@ -1884,7 +2048,18 @@ pub(crate) fn alloc_traced_host_object_with_shape_roots<T: TracedHostObjectData>
     data: T,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
-    heap.alloc_with_roots(
+    // The sidecar is allocated before the object exists, so installing
+    // the host payload needs no second allocation point inside a borrow.
+    let mut sidecar: ExoticHandle =
+        heap.alloc_variable_with_roots(ExoticSlots::default(), 0, external_visit)?;
+    let sidecar_slot = std::ptr::addr_of_mut!(sidecar);
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
+        visitor(sidecar_slot.cast::<RawGc>());
+    };
+    let mut slot = ExoticSlot::null();
+    slot.set(sidecar);
+    let object = heap.alloc_with_roots(
         ObjectBody {
             shape,
             values_ptr: Cell::new(std::ptr::null_mut()),
@@ -1896,13 +2071,16 @@ pub(crate) fn alloc_traced_host_object_with_shape_roots<T: TracedHostObjectData>
             jit_proto: otter_gc::Gc::null(),
             extensible: true,
             slot_attrs_overridden: false,
-            exotic: Some(Box::new(ExoticSlots {
-                host_data: Some(HostData::Traced(Box::new(data))),
-                ..ExoticSlots::default()
-            })),
+            exotic: slot,
         },
-        external_visit,
-    )
+        &mut visit,
+    )?;
+    heap.with_payload(sidecar, |exotic| {
+        exotic.host_data = Some(HostData::Traced(Box::new(data)));
+        true
+    });
+    heap.record_write(object, &sidecar);
+    Ok(object)
 }
 
 /// Mark an object as an ECMA-262 §10.4.4 arguments-exotic object so
@@ -1911,6 +2089,10 @@ pub(crate) fn alloc_traced_host_object_with_shape_roots<T: TracedHostObjectData>
 /// Called from `arguments_object::initialize_{mapped,unmapped}` after
 /// the body's slot table is set up.
 pub fn mark_as_arguments_object(obj: JsObject, heap: &mut otter_gc::GcHeap) {
+    // The sidecar allocates, so it is reserved here, outside the payload
+    // borrow below. This may move `obj`, which is why the local is `mut`.
+    let mut obj = obj;
+    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
     heap.with_payload(obj, |body| {
         body.exotic_mut().is_arguments_object = true;
     });
@@ -1951,6 +2133,10 @@ pub(crate) fn install_mapped_arguments(
     heap: &mut otter_gc::GcHeap,
     entries: Vec<MappedArgumentEntry>,
 ) {
+    // The sidecar allocates, so it is reserved here, outside the payload
+    // borrow below. This may move `obj`, which is why the local is `mut`.
+    let mut obj = obj;
+    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
     heap.with_payload(obj, |body| {
         if !entries.is_empty() {
             body.exotic_mut().host_data = Some(HostData::Untraced(Box::new(MappedArgumentsData {
@@ -1970,7 +2156,10 @@ fn mapped_argument_cell(body: &ObjectBody, key: &str) -> Option<UpvalueCell> {
 }
 
 fn remove_mapped_argument(body: &mut ObjectBody, key: &str) {
-    let Some(data) = body.exotic.as_deref_mut().and_then(|e| e.host_data.take()) else {
+    let Some(data) = exotic_body_of(body.exotic.get()).and_then(|e|
+        // SAFETY: a non-null handle names a live sidecar payload.
+        unsafe { (*e).host_data.take() })
+    else {
         return;
     };
     match data.into_untraced::<MappedArgumentsData>() {
@@ -2201,7 +2390,10 @@ pub(super) fn dict_set_keys(body: &mut ObjectBody, keys: Vec<String>) {
 /// Clear all dictionary keys and the index together.
 #[cfg(test)]
 pub(super) fn dict_clear_keys(body: &mut ObjectBody) {
-    if let Some(exotic) = body.exotic.as_deref_mut() {
+    if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
+            // SAFETY: a non-null handle names a live sidecar payload.
+            unsafe { &mut *e })
+    {
         exotic.dictionary_keys.clear();
         exotic.dictionary_index.clear();
     }
@@ -2435,7 +2627,7 @@ pub(crate) fn load_own_data_slot_atom(
         // against this very shape handle, so a matched shape with unoverridden
         // attributes cannot have turned the slot into an accessor. Asserting
         // that keeps the release hit off the shape body entirely.
-        if shaped && hit.is_data && !body.slot_attrs_overridden && body.exotic.is_none() {
+        if shaped && hit.is_data && !body.slot_attrs_overridden && body.exotic.is_null() {
             debug_assert!(
                 !body.slot_attrs(heap, offset).1,
                 "shape-matched data hit resolved to an accessor slot"
@@ -2476,7 +2668,7 @@ pub(crate) fn load_own_data_slot_by_shape(
             || body.shape != hit.shape
             || !hit.is_data
             || body.slot_attrs_overridden
-            || body.exotic.is_some()
+            || !body.exotic.is_null()
         {
             return None;
         }
@@ -2775,10 +2967,14 @@ pub fn get_own_symbol_descriptor(
 /// Store the internal native `[[Call]]` slot for callable ordinary
 /// objects.
 pub fn set_call_native(obj: JsObject, heap: &mut otter_gc::GcHeap, native: Value) {
+    // The sidecar allocates, so it is reserved here, outside the payload
+    // borrow below. This may move `obj`, which is why the local is `mut`.
+    let mut obj = obj;
+    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
     heap.with_payload(obj, |body| {
         body.exotic_mut().call_native = Some(native);
     });
-    heap.record_write(obj, &native);
+    record_exotic_write(heap, obj, &native);
 }
 
 /// Read the internal native `[[Call]]` slot.
@@ -2791,11 +2987,15 @@ pub fn call_native(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<Value> {
 /// builtin objects. Current builtin constructor objects are callable
 /// too, so this also installs the same callback as `[[Call]]`.
 pub fn set_constructor_native(obj: JsObject, heap: &mut otter_gc::GcHeap, native: Value) {
+    // The sidecar allocates, so it is reserved here, outside the payload
+    // borrow below. This may move `obj`, which is why the local is `mut`.
+    let mut obj = obj;
+    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
     heap.with_payload(obj, |body| {
         body.exotic_mut().call_native = Some(native);
         body.exotic_mut().constructor_native = Some(native);
     });
-    heap.record_write(obj, &native);
+    record_exotic_write(heap, obj, &native);
 }
 
 /// Read the internal native `[[Construct]]` slot.
@@ -2806,6 +3006,10 @@ pub fn constructor_native(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<Valu
 
 /// Store the `[[BooleanData]]` internal slot for a Boolean wrapper.
 pub fn set_boolean_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: bool) {
+    // The sidecar allocates, so it is reserved here, outside the payload
+    // borrow below. This may move `obj`, which is why the local is `mut`.
+    let mut obj = obj;
+    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
     heap.with_payload(obj, |body| {
         body.exotic_mut().boolean_data = Some(value);
     });
@@ -2819,6 +3023,10 @@ pub fn boolean_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<bool> {
 
 /// Store the `[[NumberData]]` internal slot for a Number wrapper.
 pub fn set_number_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: NumberValue) {
+    // The sidecar allocates, so it is reserved here, outside the payload
+    // borrow below. This may move `obj`, which is why the local is `mut`.
+    let mut obj = obj;
+    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
     heap.with_payload(obj, |body| {
         body.exotic_mut().number_data = Some(value);
     });
@@ -2832,6 +3040,10 @@ pub fn number_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<NumberValue
 
 /// Store the `[[StringData]]` internal slot for a String wrapper.
 pub fn set_string_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: JsString) {
+    // The sidecar allocates, so it is reserved here, outside the payload
+    // borrow below. This may move `obj`, which is why the local is `mut`.
+    let mut obj = obj;
+    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
     heap.with_payload(obj, |body| {
         body.exotic_mut().string_data = Some(value);
     });
@@ -2845,6 +3057,10 @@ pub fn string_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<JsString> {
 
 /// Store the `[[SymbolData]]` internal slot for a Symbol wrapper.
 pub fn set_symbol_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: crate::symbol::JsSymbol) {
+    // The sidecar allocates, so it is reserved here, outside the payload
+    // borrow below. This may move `obj`, which is why the local is `mut`.
+    let mut obj = obj;
+    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
     heap.with_payload(obj, |body| {
         body.exotic_mut().symbol_data = Some(value);
     });
@@ -2858,6 +3074,10 @@ pub fn symbol_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<crate::symb
 
 /// Store the `[[BigIntData]]` internal slot for a BigInt wrapper.
 pub fn set_bigint_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: BigIntValue) {
+    // The sidecar allocates, so it is reserved here, outside the payload
+    // borrow below. This may move `obj`, which is why the local is `mut`.
+    let mut obj = obj;
+    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
     heap.with_payload(obj, |body| {
         body.exotic_mut().bigint_data = Some(value);
     });
@@ -2886,6 +3106,10 @@ pub fn clip_date_value(ms: f64) -> f64 {
 /// Store the `[[DateValue]]` internal slot for a Date instance.
 /// Applies §21.4.1.6 TimeClip before writing.
 pub fn set_date_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: f64) {
+    // The sidecar allocates, so it is reserved here, outside the payload
+    // borrow below. This may move `obj`, which is why the local is `mut`.
+    let mut obj = obj;
+    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
     let clipped = clip_date_value(value);
     heap.with_payload(obj, |body| {
         body.exotic_mut().date_data = Some(clipped);
@@ -2903,6 +3127,10 @@ pub fn date_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<f64> {
 /// Mark an object as carrying the `[[ErrorData]]` internal slot
 /// (§20.5) — set when an error constructor produces the instance.
 pub fn set_error_data(obj: JsObject, heap: &mut otter_gc::GcHeap) {
+    // The sidecar allocates, so it is reserved here, outside the payload
+    // borrow below. This may move `obj`, which is why the local is `mut`.
+    let mut obj = obj;
+    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
     heap.with_payload(obj, |body| {
         body.exotic_mut().error_data = true;
     });
@@ -2924,6 +3152,10 @@ pub fn set_error_stack_frames(
     heap: &mut otter_gc::GcHeap,
     frames: Vec<crate::run_control::StackFrameSnapshot>,
 ) {
+    // The sidecar allocates, so it is reserved here, outside the payload
+    // borrow below. This may move `obj`, which is why the local is `mut`.
+    let mut obj = obj;
+    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
     heap.with_payload(obj, |body| {
         body.exotic_mut().error_stack_frames = Some(frames);
     });
@@ -2949,6 +3181,10 @@ pub fn has_error_stack_frames(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 /// Tag an object as carrying the `[[IsRawJSON]]` internal slot
 /// (§25.5.3 `JSON.rawJSON`).
 pub fn set_is_raw_json(obj: JsObject, heap: &mut otter_gc::GcHeap, value: bool) {
+    // The sidecar allocates, so it is reserved here, outside the payload
+    // borrow below. This may move `obj`, which is why the local is `mut`.
+    let mut obj = obj;
+    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
     heap.with_payload(obj, |body| {
         body.exotic_mut().is_raw_json = value;
     });
@@ -3286,6 +3522,10 @@ fn record_slot_write(heap: &mut otter_gc::GcHeap, obj: JsObject, slot: Compresse
 /// sequence of `set` calls on a freshly-allocated object never writes through
 /// a stale handle.
 pub fn set(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) {
+    // A store can demote this object to dictionary mode, and the key list
+    // and slot metadata that demotion writes live in the sidecar. Reserved
+    // here, outside every payload borrow, because creating it allocates.
+    ensure_exotic(obj, heap).expect("exotic sidecar");
     let compressed = compress_or_abort(heap, obj, value);
     let existing_offset = heap.read_payload(*obj, |body| body_offset_of(heap, body, key));
     if let Some(offset) = existing_offset {
@@ -3469,6 +3709,10 @@ pub fn set_prototype_value(
     heap: &mut otter_gc::GcHeap,
     proto: Option<Value>,
 ) -> bool {
+    // The sidecar allocates, so it is reserved here, outside the payload
+    // borrow below. This may move `obj`, which is why the local is `mut`.
+    let mut obj = obj;
+    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
     let new_proto = if let Some(value) = proto {
         if value.is_null() {
             ObjectPrototype::Null
@@ -3531,7 +3775,10 @@ pub fn set_prototype_value(
             // Common case: encoded entirely by `jit_proto`; drop any stale
             // non-ordinary override so the object carries no exotic box for it.
             ObjectPrototype::Null | ObjectPrototype::Object(_) => {
-                if let Some(exotic) = body.exotic.as_deref_mut() {
+                if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
+            // SAFETY: a non-null handle names a live sidecar payload.
+            unsafe { &mut *e })
+                {
                     exotic.proto_override = None;
                 }
             }
@@ -3542,7 +3789,7 @@ pub fn set_prototype_value(
         }
     });
     if let Some(value) = &barrier_value {
-        heap.record_write(obj, value);
+        record_exotic_write(heap, obj, value);
     }
     true
 }
@@ -3743,7 +3990,10 @@ pub fn define_own_property_partial(
     key: &str,
     descriptor: PartialPropertyDescriptor,
 ) -> bool {
+    // The sidecar allocates, so it is reserved here, outside the payload
+    // borrow below. This may move `obj`, which is why the local is `mut`.
     let mut obj = obj;
+    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
     let completed = descriptor.complete_for_new_property();
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     let dictionary_keys = dictionary_keys_for_shape_transition(heap, obj, existing_offset);
@@ -3877,7 +4127,7 @@ pub(crate) fn define_own_property_partial_with_shape(
     if success {
         apply_mapped_arguments_partial_define(obj, heap, key, descriptor, existing_offset);
         record_slot_write(heap, obj, stored);
-        heap.record_write(obj, &next_shape);
+        record_exotic_write(heap, obj, &next_shape);
         #[cfg(debug_assertions)]
         if existing_offset.is_none() {
             debug_assert_appended_shape_slot(obj, heap);
@@ -3893,6 +4143,10 @@ pub fn define_own_symbol_property_partial(
     key: JsSymbol,
     descriptor: PartialPropertyDescriptor,
 ) -> bool {
+    // The sidecar allocates, so it is reserved here, outside the payload
+    // borrow below. This may move `obj`, which is why the local is `mut`.
+    let mut obj = obj;
+    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
     let completed = descriptor.complete_for_new_property();
     let barrier_descriptor = completed.clone();
     let existing_pos_and_slot = heap.read_payload(obj, |body| {
@@ -3925,7 +4179,7 @@ pub fn define_own_symbol_property_partial(
         }
     });
     if success {
-        heap.record_write(obj, &barrier_descriptor);
+        record_exotic_write(heap, obj, &barrier_descriptor);
     }
     success
 }
@@ -3957,6 +4211,11 @@ pub fn define_own_property_in_place(
     key: &str,
     descriptor: PropertyDescriptor,
 ) -> bool {
+    // A definition can demote this object to dictionary mode, and the key
+    // list and slot metadata that demotion writes live in the sidecar.
+    // Reserved here, outside every payload borrow, because creating it
+    // allocates.
+    ensure_exotic(obj_ref, heap).expect("exotic sidecar");
     let mut obj = *obj_ref;
     let map_descriptor = descriptor.clone();
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
@@ -4052,6 +4311,10 @@ pub fn define_own_symbol_property(
     key: JsSymbol,
     descriptor: PropertyDescriptor,
 ) -> bool {
+    // The sidecar allocates, so it is reserved here, outside the payload
+    // borrow below. This may move `obj`, which is why the local is `mut`.
+    let mut obj = obj;
+    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
     let barrier_descriptor = descriptor.clone();
     let existing_pos_and_slot = heap.read_payload(obj, |body| {
         body.symbol_props()
@@ -4083,7 +4346,7 @@ pub fn define_own_symbol_property(
         }
     });
     if success {
-        heap.record_write(obj, &barrier_descriptor);
+        record_exotic_write(heap, obj, &barrier_descriptor);
     }
     success
 }
@@ -4335,7 +4598,10 @@ pub fn seal(obj: JsObject, heap: &mut otter_gc::GcHeap) {
     materialize_slots(obj, heap);
     heap.with_payload(obj, |body| {
         body.extensible = false;
-        if let Some(exotic) = body.exotic.as_deref_mut() {
+        if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
+            // SAFETY: a non-null handle names a live sidecar payload.
+            unsafe { &mut *e })
+        {
             for slot in exotic.slots.iter_mut() {
                 slot.flags = slot.flags.with_configurable(false);
             }
@@ -4358,7 +4624,10 @@ pub(crate) fn seal_with_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, new_sh
         body.extensible = false;
         debug_assert_object_shape_handle(new_shape, "shape-slot store");
         body.shape = new_shape;
-        if let Some(exotic) = body.exotic.as_deref_mut() {
+        if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
+            // SAFETY: a non-null handle names a live sidecar payload.
+            unsafe { &mut *e })
+        {
             for slot in exotic.slots.iter_mut() {
                 slot.flags = slot.flags.with_configurable(false);
             }
@@ -4381,7 +4650,10 @@ pub fn freeze(obj: JsObject, heap: &mut otter_gc::GcHeap) {
     materialize_slots(obj, heap);
     heap.with_payload(obj, |body| {
         body.extensible = false;
-        if let Some(exotic) = body.exotic.as_deref_mut() {
+        if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
+            // SAFETY: a non-null handle names a live sidecar payload.
+            unsafe { &mut *e })
+        {
             for slot in exotic.slots.iter_mut() {
                 slot.flags = slot.flags.with_configurable(false);
                 if !slot.is_accessor {
@@ -4413,7 +4685,10 @@ pub(crate) fn freeze_with_shape(
         body.extensible = false;
         debug_assert_object_shape_handle(new_shape, "shape-slot store");
         body.shape = new_shape;
-        if let Some(exotic) = body.exotic.as_deref_mut() {
+        if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
+            // SAFETY: a non-null handle names a live sidecar payload.
+            unsafe { &mut *e })
+        {
             for slot in exotic.slots.iter_mut() {
                 slot.flags = slot.flags.with_configurable(false);
                 if !slot.is_accessor {
@@ -4681,7 +4956,10 @@ pub(crate) fn adopt_fast_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, shape
         body.shape = shape;
         body.slot_attrs_overridden = false;
         body.dictionary_shape_id = ShapeId::UNASSIGNED;
-        if let Some(exotic) = body.exotic.as_deref_mut() {
+        if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
+            // SAFETY: a non-null handle names a live sidecar payload.
+            unsafe { &mut *e })
+        {
             exotic.dictionary_keys.clear();
             exotic.dictionary_index.clear();
             exotic.slots.clear();
@@ -4776,6 +5054,10 @@ fn materialized_slot_metas(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Vec<Sl
 /// (construction accessor→data overwrite, the no-shape `defineProperty` /
 /// `freeze` / `seal` fallbacks, `delete`).
 fn materialize_slots(obj: JsObject, heap: &mut otter_gc::GcHeap) {
+    // The sidecar allocates, so it is reserved here, outside the payload
+    // borrow below. This may move `obj`, which is why the local is `mut`.
+    let mut obj = obj;
+    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
     let metas = heap.read_payload(obj, |body| {
         (!body.slots_materialized()).then(|| materialized_slot_metas(heap, body))
     });

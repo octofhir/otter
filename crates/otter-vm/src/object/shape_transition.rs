@@ -98,6 +98,10 @@ pub(crate) fn capture_store_property_transition(
     value: &Value,
 ) -> Option<StorePropertyTransition> {
     let mut obj = obj;
+    // A store can demote this object to dictionary mode, and demotion
+    // writes through the sidecar. Reserved here, outside every payload
+    // borrow, because creating it allocates.
+    super::ensure_exotic(&mut obj, heap).ok()?;
     let index = heap.read_payload(obj, |body| super::body_property_count(heap, body));
     let slot = u16::try_from(index).ok()?;
     // Reserve before boxing the value: growing the slab can collect, and a
@@ -188,7 +192,7 @@ pub(crate) fn capture_store_property_transition_with_shape(
 /// prototype, extensibility, or dictionary-mode mismatch falls back to ordinary
 /// `[[Set]]`.
 pub(crate) fn replay_store_property_transition(
-    obj: JsObject,
+    mut obj: JsObject,
     heap: &mut otter_gc::GcHeap,
     key: AtomizedPropertyKey<'_>,
     transition: &StorePropertyTransition,
@@ -197,6 +201,10 @@ pub(crate) fn replay_store_property_transition(
     if !transition_kind_matches(obj, heap, transition) {
         return None;
     }
+    // A store can demote this object to dictionary mode, and demotion
+    // writes through the sidecar. Reserved here, outside every payload
+    // borrow, because creating it allocates.
+    super::ensure_exotic(&mut obj, heap).ok()?;
     let current_shape_id = super::shape_id(obj, heap);
     let to_shape = transition.to_shape.get();
     let to_shape_id = if to_shape.is_null() {

@@ -195,6 +195,12 @@ pub struct GcHeap {
     /// production. Off by default; enabled via `OTTER_GC_STRESS=<n>`
     /// (and `=full` to also force a major GC each time). The runtime
     /// counterpart to a static rooting-hazard lint.
+    /// Route ordinary allocations straight to old-space.
+    ///
+    /// Set while the runtime builds its globals: everything allocated then is
+    /// permanent, so copying it through the nursery buys nothing and costs a
+    /// scavenge — plus every later scavenge re-traces it until it is promoted.
+    tenure_all: bool,
     gc_stress_stride: u32,
     /// Also force a full GC (not just a scavenge) on each stress tick.
     gc_stress_full: bool,
@@ -322,6 +328,7 @@ impl GcHeap {
         };
         Ok(Self {
             new_space,
+            tenure_all: false,
             old_space: OldSpace::new(),
             large_space: LargeObjectSpace::new(),
             trace_table: TraceTable::new(),
@@ -851,6 +858,22 @@ impl GcHeap {
         self.alloc_with_roots(value, &mut empty)
     }
 
+    /// Whether ordinary allocations are being routed to old-space.
+    #[must_use]
+    pub const fn tenures_all(&self) -> bool {
+        self.tenure_all
+    }
+
+    /// Route ordinary allocations to old-space until this is turned back off.
+    ///
+    /// Meant for a bootstrap phase whose objects are known to outlive every
+    /// collection: allocating them young makes the first scavenges copy the
+    /// whole set and every later one trace it again, for objects that were
+    /// never going to die.
+    pub const fn set_tenure_all(&mut self, tenure_all: bool) {
+        self.tenure_all = tenure_all;
+    }
+
     /// Try to allocate a `T` in young space without running any collection.
     ///
     /// This is the compiled-code fast-path primitive: it succeeds only when the
@@ -961,6 +984,9 @@ impl GcHeap {
         mut value: T,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<Gc<T>, OutOfMemory> {
+        if self.tenure_all {
+            return self.alloc_old_with_roots(value, external_visit);
+        }
         // A cell payload sits one `GcHeader` past an
         // `OBJECT_ALIGNMENT`-aligned cell start, so it is at most
         // `OBJECT_ALIGNMENT`-aligned. A body needing more (e.g. an

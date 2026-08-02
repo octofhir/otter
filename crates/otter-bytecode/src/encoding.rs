@@ -367,6 +367,7 @@ pub fn layout_function(instructions: &[Instruction]) -> Result<FunctionLayout, V
 /// # Errors
 /// Returns [`VerifyError`] for invalid wordcode or u32 metadata overflow.
 pub fn layout_wordcode_function(code: &FunctionCode) -> Result<FunctionLayout, VerifyError> {
+    #[cfg(debug_assertions)]
     verify_wordcode_function(code)?;
     measure_wordcode_function(code)
 }

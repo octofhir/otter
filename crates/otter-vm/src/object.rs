@@ -399,12 +399,12 @@ enum SlotKind {
     /// Data property; the value lives in the flat value array.
     Data,
     /// Accessor property; getter/setter boxed (cold path).
-    Accessor(Box<AccessorPair>),
+    Accessor(AccessorPair),
 }
 
 impl SlotKind {
     fn accessor(getter: Option<Value>, setter: Option<Value>) -> Self {
-        SlotKind::Accessor(Box::new(AccessorPair { getter, setter }))
+        SlotKind::Accessor(AccessorPair { getter, setter })
     }
 
     fn is_data(&self) -> bool {

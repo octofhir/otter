@@ -154,6 +154,12 @@ pub struct PageHeader {
     /// Compressed offset of this page's base inside the cage. Used
     /// by [`Page::cage_offset`] without touching the cage mutex.
     pub cage_offset: u32,
+    /// Consecutive cage pages this region owns. `1` for an ordinary page;
+    /// a large-object region spans as many as its single body needs, the
+    /// way V8's `LargePage` is a variable-sized chunk rather than a fixed
+    /// page. Bump allocation and the object walk both bound themselves by
+    /// `span_pages * PAGE_SIZE`.
+    pub span_pages: u32,
     /// Card-table bitmap — 1 bit per [`CARD_SIZE`]-byte card. Bit
     /// set ⇒ card may contain old→young pointers (generational
     /// remembered set).
@@ -161,7 +167,9 @@ pub struct PageHeader {
 }
 
 impl PageHeader {
-    fn init(&mut self, space: SpaceKind, cage_offset: u32) {
+    fn init(&mut self, space: SpaceKind, cage_offset: u32, span_pages: u32) {
+        debug_assert!(span_pages >= 1);
+        self.span_pages = span_pages;
         self.space = space;
         self.flags = PageFlags::empty();
         self.bump_cursor = PAGE_HEADER_SIZE;
@@ -172,9 +180,14 @@ impl PageHeader {
         self.card_bitmap = [0u8; CARD_BITMAP_BYTES];
     }
 
-    /// Bytes still available for bump allocation in this page.
+    /// Bytes this region spans in total.
+    pub const fn span_bytes(&self) -> usize {
+        self.span_pages as usize * PAGE_SIZE
+    }
+
+    /// Bytes still available for bump allocation in this region.
     pub const fn bump_remaining(&self) -> usize {
-        PAGE_SIZE.saturating_sub(self.bump_cursor)
+        self.span_bytes().saturating_sub(self.bump_cursor)
     }
 
     /// Mark the card containing `byte_offset` as dirty.
@@ -234,6 +247,8 @@ pub struct Page {
     base: *mut u8,
     /// Cage offset of the page base.
     cage_offset: u32,
+    /// Consecutive cage pages this region owns.
+    span_pages: u32,
 }
 
 // SAFETY: The page is logically owned by a single GcHeap which is
@@ -245,13 +260,35 @@ unsafe impl Send for Page {}
 impl Page {
     /// Carve a fresh page out of the cage and initialise its
     /// header for the given space.
+    /// Carve a region of `span_pages` consecutive cage pages.
+    ///
+    /// One body larger than a single page lives here; the header sits at
+    /// the start of the first page and the payload runs through the rest.
+    pub fn new_spanning(space: SpaceKind, span_pages: u32) -> Option<Self> {
+        debug_assert!(span_pages >= 1);
+        if span_pages == 1 {
+            return Self::new(space);
+        }
+        let CagePage { base, offset } = Cage::alloc_contiguous_pages(span_pages as usize)?;
+        let page = Self {
+            base,
+            cage_offset: offset,
+            span_pages,
+        };
+        page.header_mut().init(space, offset, span_pages);
+        Some(page)
+    }
+
+    /// Carve a fresh single page out of the cage and initialise its
+    /// header for the given space.
     pub fn new(space: SpaceKind) -> Option<Self> {
         let CagePage { base, offset } = Cage::alloc_page()?;
         let page = Self {
             base,
             cage_offset: offset,
+            span_pages: 1,
         };
-        page.header_mut().init(space, offset);
+        page.header_mut().init(space, offset, 1);
         Some(page)
     }
 
@@ -265,8 +302,9 @@ impl Page {
                     let page = Self {
                         base,
                         cage_offset: offset,
+                        span_pages: 1,
                     };
-                    page.header_mut().init(space, offset);
+                    page.header_mut().init(space, offset, 1);
                     page
                 })
                 .collect(),
@@ -283,6 +321,12 @@ impl Page {
     #[inline]
     pub fn cage_offset(&self) -> u32 {
         self.cage_offset
+    }
+
+    /// Consecutive cage pages this region owns.
+    #[inline]
+    pub fn span_pages(&self) -> u32 {
+        self.span_pages
     }
 
     /// Shared header reference.
@@ -322,7 +366,7 @@ impl Page {
         let header = self.header_mut();
         let cursor = header.bump_cursor;
         let new_cursor = cursor + size;
-        if new_cursor > PAGE_SIZE {
+        if new_cursor > header.span_bytes() {
             return None;
         }
         header.bump_cursor = new_cursor;
@@ -409,6 +453,15 @@ impl Page {
 
 impl Drop for Page {
     fn drop(&mut self) {
+        if self.span_pages > 1 {
+            // Give the whole run back at once: released as separate pages it
+            // could never satisfy another multi-page request.
+            // SAFETY: this region owns exactly these consecutive pages.
+            unsafe {
+                Cage::free_pages_run(self.cage_offset, self.span_pages);
+            }
+            return;
+        }
         // SAFETY: caller of Page::new owned the page; nothing
         // else holds Gc<T> into it (GcHeap drops its pages only
         // after collection completes).

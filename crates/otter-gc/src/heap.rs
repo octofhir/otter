@@ -1010,11 +1010,35 @@ impl GcHeap {
     #[inline]
     pub fn alloc_with_roots<T: Traceable>(
         &mut self,
+        value: T,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<Gc<T>, OutOfMemory> {
+        self.alloc_trailing_with_roots(value, 0, external_visit)
+    }
+
+    /// Allocate `T` followed by `extra_bytes` of zeroed trailing storage,
+    /// under the ordinary generational policy.
+    ///
+    /// This is how a body carries a variable-length array without owning
+    /// memory outside the heap. `T` stores the element count; its trace impl
+    /// reads the trailing array through that count.
+    ///
+    /// Unlike [`Self::alloc_variable_with_roots`] the result is young when
+    /// the nursery has room, so a body that dies young — a temporary string,
+    /// say — is reclaimed by a scavenge instead of waiting for a major GC.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::alloc`].
+    #[inline]
+    pub fn alloc_trailing_with_roots<T: Traceable>(
+        &mut self,
         mut value: T,
+        extra_bytes: usize,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<Gc<T>, OutOfMemory> {
         if self.tenure_all {
-            return self.alloc_old_with_roots(value, external_visit);
+            return self.alloc_old_with_roots_inner(value, true, extra_bytes, external_visit);
         }
         // A cell payload sits one `GcHeader` past an
         // `OBJECT_ALIGNMENT`-aligned cell start, so it is at most
@@ -1031,7 +1055,7 @@ impl GcHeap {
         if self.trace_table.get(T::TYPE_TAG).is_none() {
             self.trace_table.register::<T>();
         }
-        let total = std::mem::size_of::<GcHeader>() + std::mem::size_of::<T>();
+        let total = std::mem::size_of::<GcHeader>() + std::mem::size_of::<T>() + extra_bytes;
         let aligned = align_up(total, CELL_SIZE);
         debug_assert!(
             aligned <= u32::MAX as usize,
@@ -1151,6 +1175,16 @@ impl GcHeap {
             };
             std::ptr::write(header_ptr, header);
             std::ptr::write(payload_ptr, value);
+            if extra_bytes != 0 {
+                // Trailing storage starts zeroed so a body can treat it as
+                // an array of empty slots without writing every one.
+                let tail = (payload_ptr as *mut u8).add(std::mem::size_of::<T>());
+                std::ptr::write_bytes(
+                    tail,
+                    0,
+                    aligned - std::mem::size_of::<GcHeader>() - std::mem::size_of::<T>(),
+                );
+            }
             // When this object was tenured straight into old-space (large
             // object, or the nursery-deadlock overflow), the `ptr::write`
             // bypassed the mutator write barrier. Any young children in the

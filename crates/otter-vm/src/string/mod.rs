@@ -397,6 +397,20 @@ impl JsString {
         gc_body::with_utf16(heap, self.handle, f)
     }
 
+    /// Fill this string's widened cache so later [`Self::with_utf16`] reads
+    /// are in-place.
+    ///
+    /// Callers about to re-scan the same subject — a `/g` regex `exec` loop
+    /// walks it once per match — call this first, while they still hold the
+    /// heap mutably. A no-op for short subjects and for bodies that already
+    /// store their units contiguously.
+    ///
+    /// # Errors
+    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+    pub fn ensure_utf16_cache(self, heap: &mut GcHeap) -> Result<(), otter_gc::OutOfMemory> {
+        gc_body::ensure_utf16_cache(heap, self.handle, &mut |_| {})
+    }
+
     /// Render as a lossy Rust `String` for display / diagnostics.
     /// Lone surrogates round-trip via `String::from_utf16_lossy`.
     #[must_use]

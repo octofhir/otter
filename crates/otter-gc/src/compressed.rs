@@ -436,9 +436,16 @@ pub(crate) struct Cage {
     /// Layout the reservation was allocated with — required for a
     /// sound `dealloc`.
     reservation_layout: Layout,
-    /// Free page indices (page 0 is reserved so that `Gc<T>(0)`
-    /// stays null). Indices count from 1 to `size / PAGE_SIZE - 1`.
-    free_pages: Vec<u32>,
+    /// Released page runs, keyed by first index and coalesced with their
+    /// neighbours on release. A run list rather than a list of loose
+    /// indices because a body larger than one page needs consecutive
+    /// pages: with loose indices, freed space could never satisfy a
+    /// multi-page request again once the fresh tail ran out.
+    free_runs: std::collections::BTreeMap<u32, u32>,
+    /// Bump cursor over never-used pages. Page 0 is reserved so `Gc<T>(0)`
+    /// stays null, so this starts at 1; released pages come back through
+    /// [`Cage::free_page`] into `free_runs` instead.
+    next_fresh: u32,
     /// Total page count (`size / PAGE_SIZE`).
     page_count: u32,
 }
@@ -528,13 +535,15 @@ impl Cage {
         );
         let page_count = (size_bytes / PAGE_SIZE) as u32;
         // Page 0 is reserved so that Gc<T>(0) stays null.
-        let free_pages: Vec<u32> = (1..page_count).rev().collect();
+        // Page 0 stays reserved so `Gc<T>(0)` is null.
+        let free_runs: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
         let cage = Cage {
             base: ptr,
             size: size_bytes,
             reservation,
             reservation_layout,
-            free_pages,
+            free_runs,
+            next_fresh: 1,
             page_count,
         };
         CAGE_BASE.store(ptr, Ordering::Release);
@@ -549,7 +558,7 @@ impl Cage {
     pub(crate) fn alloc_page() -> Option<CagePage> {
         let mut guard = CAGE_GUARD.lock().expect("cage mutex poisoned");
         let cage = guard.as_mut().expect("cage not initialised");
-        let idx = cage.free_pages.pop()?;
+        let idx = cage.take_run(1)?;
         // SAFETY: `idx < page_count` by construction of `free_pages`,
         // and `cage.base + idx * PAGE_SIZE` is therefore inside the
         // cage region.
@@ -568,15 +577,12 @@ impl Cage {
     pub(crate) fn alloc_pages(count: usize) -> Option<Vec<CagePage>> {
         let mut guard = CAGE_GUARD.lock().expect("cage mutex poisoned");
         let cage = guard.as_mut().expect("cage not initialised");
-        if cage.free_pages.len() < count {
+        if cage.available_pages() < count {
             return None;
         }
         let mut pages = Vec::with_capacity(count);
         for _ in 0..count {
-            let idx = cage
-                .free_pages
-                .pop()
-                .expect("page count preflight guarantees a slot");
+            let idx = cage.take_run(1).expect("availability checked above");
             // SAFETY: every free-list index is inside the cage.
             let page_ptr = unsafe { cage.base.add(idx as usize * PAGE_SIZE) };
             pages.push(CagePage {
@@ -587,6 +593,76 @@ impl Cage {
         Some(pages)
     }
 
+    /// Carve `count` **consecutive** pages and return the first.
+    ///
+    /// A body larger than one page needs its bytes contiguous. Runs come
+    /// from the cage's never-used tail rather than from the free list: the
+    /// list holds pages in release order, so satisfying a run from it would
+    /// mean searching for a gap, and the whole point of a bump cursor is
+    /// that fresh space is already contiguous. This is the shape V8's
+    /// `MemoryAllocator` uses — a reservation with a bump cursor for new
+    /// chunks and a free list for recycled ones.
+    ///
+    /// Returns `None` when the tail cannot cover the run; a single-page
+    /// caller still recycles through the free list.
+    pub(crate) fn alloc_contiguous_pages(count: usize) -> Option<CagePage> {
+        debug_assert!(count > 0);
+        let mut guard = CAGE_GUARD.lock().expect("cage mutex poisoned");
+        let cage = guard.as_mut().expect("cage not initialised");
+        let first = cage.take_run(u32::try_from(count).ok()?)?;
+        // SAFETY: the run lies below `page_count`, so it is inside the cage.
+        let page_ptr = unsafe { cage.base.add(first as usize * PAGE_SIZE) };
+        Some(CagePage {
+            base: page_ptr,
+            offset: first * (PAGE_SIZE as u32),
+        })
+    }
+
+    /// Pages available to hand out: released runs plus the untouched tail.
+    fn available_pages(&self) -> usize {
+        self.free_runs.values().map(|&n| n as usize).sum::<usize>()
+            + (self.page_count - self.next_fresh) as usize
+    }
+
+    /// Take `count` consecutive pages, preferring a released run and
+    /// falling back to the untouched tail. First fit: runs are few, and a
+    /// best-fit scan would cost more than the fragmentation it saves.
+    fn take_run(&mut self, count: u32) -> Option<u32> {
+        if let Some((&start, &len)) = self.free_runs.iter().find(|entry| *entry.1 >= count) {
+            self.free_runs.remove(&start);
+            if len > count {
+                self.free_runs.insert(start + count, len - count);
+            }
+            return Some(start);
+        }
+        let end = self.next_fresh.checked_add(count)?;
+        if end > self.page_count {
+            return None;
+        }
+        let first = self.next_fresh;
+        self.next_fresh = end;
+        Some(first)
+    }
+
+    /// Return `count` consecutive pages, merging with any neighbouring
+    /// free run so the space can satisfy a large request again.
+    fn release_run(&mut self, start: u32, count: u32) {
+        let mut start = start;
+        let mut count = count;
+        if let Some((&prev_start, &prev_len)) = self.free_runs.range(..start).next_back()
+            && prev_start + prev_len == start
+        {
+            self.free_runs.remove(&prev_start);
+            start = prev_start;
+            count += prev_len;
+        }
+        if let Some(&next_len) = self.free_runs.get(&(start + count)) {
+            self.free_runs.remove(&(start + count));
+            count += next_len;
+        }
+        self.free_runs.insert(start, count);
+    }
+
     /// Return a page to the cage free-list.
     ///
     /// # Safety
@@ -594,6 +670,27 @@ impl Cage {
     /// The caller must guarantee no live `Gc<T>` still references
     /// any object on this page. Returning a still-referenced page
     /// will manifest as a use-after-free on the next alloc.
+    /// Return `count` consecutive pages starting at `offset`.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Cage::free_page`], for every page in the run.
+    pub(crate) unsafe fn free_pages_run(offset: u32, count: u32) {
+        let mut guard = CAGE_GUARD.lock().expect("cage mutex poisoned");
+        let cage = guard.as_mut().expect("cage not initialised");
+        debug_assert!(offset.is_multiple_of(PAGE_SIZE as u32));
+        let idx = offset / (PAGE_SIZE as u32);
+        debug_assert!(idx + count <= cage.page_count);
+        // SAFETY: the run is in-range, and its memory belongs to the cage
+        // while the mutex is held.
+        unsafe {
+            let page_ptr = cage.base.add(idx as usize * PAGE_SIZE);
+            core::ptr::write_bytes(page_ptr, 0, count as usize * PAGE_SIZE);
+            advise_freed_page(page_ptr);
+        }
+        cage.release_run(idx, count);
+    }
+
     pub(crate) unsafe fn free_page(offset: u32) {
         let mut guard = CAGE_GUARD.lock().expect("cage mutex poisoned");
         let cage = guard.as_mut().expect("cage not initialised");
@@ -610,20 +707,20 @@ impl Cage {
             core::ptr::write_bytes(page_ptr, 0, PAGE_SIZE);
         }
         advise_freed_page(page_ptr);
-        cage.free_pages.push(idx);
+        cage.release_run(idx, 1);
     }
 
     /// Return the cage's free-page count for diagnostics.
     #[cfg(test)]
     pub(crate) fn free_page_count() -> usize {
         let guard = CAGE_GUARD.lock().expect("cage mutex poisoned");
-        guard.as_ref().map(|c| c.free_pages.len()).unwrap_or(0)
+        guard.as_ref().map(Cage::available_pages).unwrap_or(0)
     }
 
     pub(crate) fn stats() -> Option<CageStats> {
         let guard = CAGE_GUARD.lock().expect("cage mutex poisoned");
         guard.as_ref().map(|c| {
-            let free_pages = c.free_pages.len();
+            let free_pages = c.available_pages();
             let reserved_pages = usize::from(c.page_count > 0);
             let allocated_pages = (c.page_count as usize)
                 .saturating_sub(free_pages)

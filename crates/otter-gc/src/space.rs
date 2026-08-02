@@ -7,7 +7,8 @@
 //! - [`OldSpace`] — list of pages plus a size-classed free list over
 //!   swept holes; allocation reuses holes first, then bumps, then
 //!   grows; pages get marked-and-swept on a full GC.
-//! - [`LargeObjectSpace`] — one page per oversized allocation.
+//! - [`LargeObjectSpace`] — one region per oversized allocation,
+//!   spanning as many consecutive pages as the body needs.
 //!
 //! # Invariants
 //!
@@ -26,7 +27,7 @@
 
 use crate::compressed::RawGc;
 use crate::oom::OutOfMemory;
-use crate::page::{CELL_SIZE, PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE};
+use crate::page::{CELL_SIZE, PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, PAGE_SIZE};
 use crate::page::{LARGE_OBJECT_THRESHOLD, Page, SpaceKind, align_up};
 
 /// Young-gen pages per semispace by default. With 256 KiB pages
@@ -430,19 +431,22 @@ impl LargeObjectSpace {
     /// allocation.
     pub fn alloc(&mut self, size_aligned: usize) -> Result<u32, OutOfMemory> {
         debug_assert!(size_aligned > LARGE_OBJECT_THRESHOLD);
-        if size_aligned > PAGE_PAYLOAD_SIZE {
-            return Err(OutOfMemory::AllocationTooLarge {
-                requested_bytes: size_aligned as u64,
-                max_bytes: PAGE_PAYLOAD_SIZE as u64,
-            });
-        }
-        let page = Page::new(SpaceKind::Large).ok_or(OutOfMemory::CageExhausted)?;
+        // The region is sized to the body, not the other way round: a
+        // string or backing store larger than one page spans as many as it
+        // needs, the way V8's `LargePage` is a variable-sized chunk. A
+        // fixed one-page region would make any body over ~128 KiB
+        // unallocatable, which for string storage means unrepresentable.
+        let span = size_aligned
+            .saturating_add(PAGE_HEADER_SIZE)
+            .div_ceil(PAGE_SIZE);
+        let span = u32::try_from(span.max(1)).map_err(|_| OutOfMemory::AllocationTooLarge {
+            requested_bytes: size_aligned as u64,
+            max_bytes: u64::from(u32::MAX) * PAGE_SIZE as u64,
+        })?;
+        let page = Page::new_spanning(SpaceKind::Large, span).ok_or(OutOfMemory::CageExhausted)?;
         let offset = page
             .bump_alloc(size_aligned)
-            .ok_or(OutOfMemory::AllocationTooLarge {
-                requested_bytes: size_aligned as u64,
-                max_bytes: PAGE_PAYLOAD_SIZE as u64,
-            })?;
+            .ok_or(OutOfMemory::CageExhausted)?;
         self.pages.push(page);
         Ok(offset)
     }
@@ -555,16 +559,50 @@ mod tests {
         assert_eq!(old.page_count(), pages_after_first);
     }
 
+    /// A body larger than one page gets a region spanning as many as it
+    /// needs. Refusing it would make any string over ~128 KiB
+    /// unrepresentable now that a string's characters live in its own
+    /// cell rather than in a side buffer.
     #[test]
-    fn oversized_large_object_returns_error() {
+    fn a_body_larger_than_a_page_spans_several() {
+        let _guard = CAGE_TEST_LOCK.lock().expect("cage test lock");
+        let _ = Cage::ensure_default();
         let mut space = LargeObjectSpace::new();
         let requested = PAGE_PAYLOAD_SIZE + CELL_SIZE;
+        let offset = space.alloc(requested).expect("spanning region");
+        let page = &space.pages()[0];
+        assert!(page.span_pages() >= 2, "region must cover several pages");
         assert_eq!(
-            space.alloc(requested),
-            Err(OutOfMemory::AllocationTooLarge {
-                requested_bytes: requested as u64,
-                max_bytes: PAGE_PAYLOAD_SIZE as u64,
-            })
+            offset,
+            page.cage_offset() + PAGE_HEADER_SIZE as u32,
+            "the body starts right after the first page's header",
         );
+        assert!(
+            page.header().bump_cursor <= page.header().span_bytes(),
+            "the bump cursor stays inside the region",
+        );
+    }
+
+    /// The region walk sees exactly the one body it holds.
+    #[test]
+    fn a_spanning_region_walks_to_one_body() {
+        let _guard = CAGE_TEST_LOCK.lock().expect("cage test lock");
+        let _ = Cage::ensure_default();
+        let mut space = LargeObjectSpace::new();
+        let requested = align_up(PAGE_PAYLOAD_SIZE * 2, CELL_SIZE);
+        let offset = space.alloc(requested).expect("spanning region");
+        let page = &space.pages()[0];
+        // SAFETY: the region's single header was just written by the
+        // allocation above.
+        unsafe {
+            let header = crate::page::page_base_from_offset(offset)
+                .add(offset as usize & (PAGE_SIZE - 1))
+                .cast::<crate::header::GcHeader>();
+            std::ptr::write(header, crate::header::GcHeader::new(7, requested as u32));
+        }
+        let mut seen = 0usize;
+        // SAFETY: the one header in the region is initialised above.
+        unsafe { page.for_each_object(|_, _| seen += 1) };
+        assert_eq!(seen, 1);
     }
 }

@@ -36,28 +36,27 @@ use crate::activation_stack::ActivationStack;
 use crate::error_classes::{ErrorClassRegistry, ErrorKind};
 use crate::execution_context::ExecutionContext;
 use crate::native_function::{
-    NativeError, native_value_with_captures_unchecked_with_roots, traced_native_value_with_length,
+    NativeError, local_native_value_with_length, native_value_with_captures_unchecked_with_roots,
 };
 use crate::promise::{
     JsPromise, JsPromiseHandle, PromiseCapability, PromiseSettleJobs, PromiseState,
     PromiseThenOutcome,
 };
 use crate::{Interpreter, Local, NativeCtx, Value};
-use otter_gc::raw::{RawGc, SlotVisitor};
+use otter_gc::raw::RawGc;
 use smallvec::{SmallVec, smallvec};
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::sync::Arc;
 
+/// Shared countdown for one combinator run.
+///
+/// The values / keys arrays the old struct carried in traced `Cell`s
+/// now ride each element function's capture list, where the native
+/// body traces and relocates them. The only state genuinely shared
+/// between the outer loop and the element functions is this counter —
+/// not a JS value, so the `Arc` needs no trace hook and owns nothing
+/// the GC has to know about.
 struct PromiseSlots {
-    /// `Value::array(values)` in a `Cell` so [`PromiseSlots::trace`]
-    /// rewrites the FIELD in place when the collector moves the array
-    /// body. A bare `JsArray` copy here goes stale across the very
-    /// first combinator-loop allocation (user iterators, capability
-    /// promises), and tracing a temporary `Value` copy updates the
-    /// temporary, not the field — exactly the Promise.all
-    /// use-after-move this replaces.
-    values: Cell<Value>,
-    keys: Option<Cell<Value>>,
     remaining: Cell<usize>,
 }
 
@@ -97,36 +96,36 @@ impl<'scope> CapabilityHandles<'scope> {
     }
 }
 
-struct CapabilityExecutorState {
-    resolve: RefCell<Option<Value>>,
-    reject: RefCell<Option<Value>>,
-}
+/// The GetCapabilitiesExecutor's shared state is an ordinary JS object
+/// carried in the executor's capture list, so the native body's own
+/// capture tracing covers it — no side trace hook, nothing for the GC
+/// to reach outside the heap. §27.2.1.5.1 stores `[[Resolve]]` /
+/// `[[Reject]]` as internal slots; two data properties on a plain
+/// object express the same thing.
+mod capability_executor_state {
+    use super::{NativeCtx, NativeError, Value};
 
-impl CapabilityExecutorState {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            resolve: RefCell::new(None),
-            reject: RefCell::new(None),
-        })
-    }
+    pub(super) const RESOLVE: &str = "resolve";
+    pub(super) const REJECT: &str = "reject";
 
-    fn trace(&self, visitor: &mut SlotVisitor<'_>) {
-        if let Some(value) = self.resolve.borrow().as_ref() {
-            value.trace_value_slots(visitor);
-        }
-        if let Some(value) = self.reject.borrow().as_ref() {
-            value.trace_value_slots(visitor);
-        }
-    }
-
-    fn call(&self, args: &[Value]) -> Result<Value, NativeError> {
-        if self.resolve.borrow().is_some() {
+    /// §27.2.1.5.1 GetCapabilitiesExecutor step 2-5, against the state
+    /// object in `captures[0]`.
+    pub(super) fn call(
+        ctx: &mut NativeCtx<'_>,
+        args: &[Value],
+        captures: &[Value],
+    ) -> Result<Value, NativeError> {
+        let mut state = captures[0]
+            .as_object()
+            .expect("capability executor state is an object");
+        let heap = ctx.heap_mut();
+        if crate::object::get(state, heap, RESOLVE).is_some() {
             return Err(NativeError::TypeError {
                 name: "Promise",
                 reason: "promise capability executor already has a resolve function".to_string(),
             });
         }
-        if self.reject.borrow().is_some() {
+        if crate::object::get(state, heap, REJECT).is_some() {
             return Err(NativeError::TypeError {
                 name: "Promise",
                 reason: "promise capability executor already has a reject function".to_string(),
@@ -135,204 +134,155 @@ impl CapabilityExecutorState {
         let resolve = args.first().cloned().unwrap_or(Value::undefined());
         let reject = args.get(1).cloned().unwrap_or(Value::undefined());
         if !resolve.is_undefined() {
-            *self.resolve.borrow_mut() = Some(resolve);
+            crate::object::set(&mut state, heap, RESOLVE, resolve);
         }
         if !reject.is_undefined() {
-            *self.reject.borrow_mut() = Some(reject);
+            crate::object::set(&mut state, heap, REJECT, reject);
         }
         Ok(Value::undefined())
     }
 }
 
 impl PromiseSlots {
-    fn new_scoped<'scope>(
-        interp: &mut Interpreter,
-        scope: &'scope crate::handles::HandleScope,
-    ) -> Result<(Arc<Self>, Local<'scope>), NativeError> {
-        let values = interp
-            .scoped_array(scope, 0)
-            .map_err(|_| oom_native("Promise combinator"))?;
-        let slots = Arc::new(Self {
-            values: Cell::new(interp.escape_scoped(values)),
-            keys: None,
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
             remaining: Cell::new(1),
-        });
-        Ok((slots, values))
-    }
-
-    fn new_keyed_scoped<'scope>(
-        interp: &mut Interpreter,
-        scope: &'scope crate::handles::HandleScope,
-    ) -> Result<(Arc<Self>, Local<'scope>, Local<'scope>), NativeError> {
-        let values = interp
-            .scoped_array(scope, 0)
-            .map_err(|_| oom_native("Promise keyed combinator"))?;
-        let keys = interp
-            .scoped_array(scope, 0)
-            .map_err(|_| oom_native("Promise keyed combinator"))?;
-        let slots = Arc::new(Self {
-            values: Cell::new(interp.escape_scoped(values)),
-            keys: Some(Cell::new(interp.escape_scoped(keys))),
-            remaining: Cell::new(1),
-        });
-        Ok((slots, values, keys))
-    }
-
-    fn refresh_scoped(&self, interp: &Interpreter, values: Local<'_>, keys: Option<Local<'_>>) {
-        self.values.set(interp.escape_scoped(values));
-        if let (Some(slot), Some(keys)) = (&self.keys, keys) {
-            slot.set(interp.escape_scoped(keys));
-        }
-    }
-
-    fn reserve_slot_scoped(
-        &self,
-        interp: &mut Interpreter,
-        values: Local<'_>,
-    ) -> Result<usize, NativeError> {
-        self.refresh_scoped(interp, values, None);
-        let mut no_extra_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        let len = crate::array::push_with_roots(
-            self.values_array(),
-            interp.gc_heap_mut(),
-            Value::hole(),
-            &mut no_extra_roots,
-        )
-        .map_err(|_| oom_native("Promise combinator"))?;
-        self.refresh_scoped(interp, values, None);
-        self.remaining.set(self.remaining.get().saturating_add(1));
-        Ok(len - 1)
-    }
-
-    fn reserve_keyed_slot_scoped(
-        &self,
-        interp: &mut Interpreter,
-        values: Local<'_>,
-        keys: Local<'_>,
-        key: Local<'_>,
-    ) -> Result<usize, NativeError> {
-        self.refresh_scoped(interp, values, Some(keys));
-        let key = interp.escape_scoped(key);
-        let Some(keys_array) = self.keys_array() else {
-            return Err(NativeError::TypeError {
-                name: "Promise keyed combinator",
-                reason: "missing keyed slots".to_string(),
-            });
-        };
-        let mut no_extra_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        crate::array::push_with_roots(keys_array, interp.gc_heap_mut(), key, &mut no_extra_roots)
-            .map_err(|_| oom_native("Promise keyed combinator"))?;
-        self.refresh_scoped(interp, values, Some(keys));
-        let len = crate::array::push_with_roots(
-            self.values_array(),
-            interp.gc_heap_mut(),
-            Value::hole(),
-            &mut no_extra_roots,
-        )
-        .map_err(|_| oom_native("Promise keyed combinator"))?;
-        self.refresh_scoped(interp, values, Some(keys));
-        self.remaining.set(self.remaining.get().saturating_add(1));
-        Ok(len - 1)
-    }
-
-    fn materialize_array_scoped<'scope>(
-        &self,
-        interp: &mut Interpreter,
-        scope: &'scope crate::handles::HandleScope,
-        values: Local<'scope>,
-        name: &'static str,
-    ) -> Result<Local<'scope>, NativeError> {
-        self.refresh_scoped(interp, values, None);
-        let elements = self
-            .collect_values(interp.gc_heap())
-            .into_iter()
-            .map(|value| interp.scoped_value(scope, value))
-            .collect::<Vec<_>>();
-        let result = interp
-            .scoped_array(scope, elements.len())
-            .map_err(|_| oom_native(name))?;
-        for (index, value) in elements.into_iter().enumerate() {
-            interp
-                .scoped_set_index(scope, result, index, value)
-                .map_err(|_| oom_native(name))?;
-        }
-        self.refresh_scoped(interp, values, None);
-        Ok(result)
-    }
-
-    fn trace(&self, visitor: &mut SlotVisitor<'_>) {
-        // Trace the fields in place: `Cell::as_ptr` reaches the stored
-        // `Value` itself, so a moving collection rewrites the handles
-        // this struct will read next, not a temporary copy.
-        unsafe {
-            (*self.values.as_ptr()).trace_value_slots(visitor);
-            if let Some(keys) = &self.keys {
-                (*keys.as_ptr()).trace_value_slots(visitor);
-            }
-        }
-    }
-
-    fn values_array(&self) -> crate::array::JsArray {
-        self.values
-            .get()
-            .as_array()
-            .expect("PromiseSlots::values always holds an array")
-    }
-
-    fn keys_array(&self) -> Option<crate::array::JsArray> {
-        self.keys.as_ref().map(|keys| {
-            keys.get()
-                .as_array()
-                .expect("PromiseSlots::keys always holds an array")
         })
     }
 
-    fn fill(&self, heap: &mut otter_gc::GcHeap, index: usize, value: Value) -> bool {
-        let did_fill = crate::array::with_elements_rewrite(self.values_array(), heap, |elements| {
-            let Some(slot) = elements.get_mut(index) else {
-                return false;
-            };
-            if !slot.is_hole() {
-                return false;
-            }
-            *slot = value;
-            true
-        });
-        if !did_fill {
+    /// One more pending element function.
+    fn add_pending(&self) {
+        self.remaining.set(self.remaining.get().saturating_add(1));
+    }
+
+    /// One element (or the iteration itself) settled; `true` when it
+    /// was the last.
+    fn settle_one(&self) -> bool {
+        let count = self.remaining.get().saturating_sub(1);
+        self.remaining.set(count);
+        count == 0
+    }
+}
+
+/// The array a combinator capture slot holds.
+fn capture_array(value: Value) -> crate::array::JsArray {
+    value
+        .as_array()
+        .expect("combinator capture always holds an array")
+}
+
+/// Append a hole slot to the values array and count it pending.
+fn reserve_slot_scoped(
+    slots: &PromiseSlots,
+    interp: &mut Interpreter,
+    values: Local<'_>,
+) -> Result<usize, NativeError> {
+    let mut no_extra_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+    let len = crate::array::push_with_roots(
+        capture_array(interp.escape_scoped(values)),
+        interp.gc_heap_mut(),
+        Value::hole(),
+        &mut no_extra_roots,
+    )
+    .map_err(|_| oom_native("Promise combinator"))?;
+    slots.add_pending();
+    Ok(len - 1)
+}
+
+/// Append `key` to the keys array and a hole to the values array.
+fn reserve_keyed_slot_scoped(
+    slots: &PromiseSlots,
+    interp: &mut Interpreter,
+    values: Local<'_>,
+    keys: Local<'_>,
+    key: Local<'_>,
+) -> Result<usize, NativeError> {
+    let key = interp.escape_scoped(key);
+    let mut no_extra_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+    crate::array::push_with_roots(
+        capture_array(interp.escape_scoped(keys)),
+        interp.gc_heap_mut(),
+        key,
+        &mut no_extra_roots,
+    )
+    .map_err(|_| oom_native("Promise keyed combinator"))?;
+    let len = crate::array::push_with_roots(
+        capture_array(interp.escape_scoped(values)),
+        interp.gc_heap_mut(),
+        Value::hole(),
+        &mut no_extra_roots,
+    )
+    .map_err(|_| oom_native("Promise keyed combinator"))?;
+    slots.add_pending();
+    Ok(len - 1)
+}
+
+/// Copy the values array into a fresh dense result array.
+fn materialize_array_scoped<'scope>(
+    interp: &mut Interpreter,
+    scope: &'scope crate::handles::HandleScope,
+    values: Local<'scope>,
+    name: &'static str,
+) -> Result<Local<'scope>, NativeError> {
+    let elements = collect_values(
+        interp.gc_heap(),
+        capture_array(interp.escape_scoped(values)),
+    )
+    .into_iter()
+    .map(|value| interp.scoped_value(scope, value))
+    .collect::<Vec<_>>();
+    let result = interp
+        .scoped_array(scope, elements.len())
+        .map_err(|_| oom_native(name))?;
+    for (index, value) in elements.into_iter().enumerate() {
+        interp
+            .scoped_set_index(scope, result, index, value)
+            .map_err(|_| oom_native(name))?;
+    }
+    Ok(result)
+}
+
+/// Fill one hole slot; `true` when it was the last pending element.
+fn fill_slot(
+    slots: &PromiseSlots,
+    heap: &mut otter_gc::GcHeap,
+    values: crate::array::JsArray,
+    index: usize,
+    value: Value,
+) -> bool {
+    let did_fill = crate::array::with_elements_rewrite(values, heap, |elements| {
+        let Some(slot) = elements.get_mut(index) else {
+            return false;
+        };
+        if !slot.is_hole() {
             return false;
         }
-        let count = self.remaining.get().saturating_sub(1);
-        self.remaining.set(count);
-        count == 0
+        *slot = value;
+        true
+    });
+    if !did_fill {
+        return false;
     }
+    slots.settle_one()
+}
 
-    fn finish_iteration(&self) -> bool {
-        let count = self.remaining.get().saturating_sub(1);
-        self.remaining.set(count);
-        count == 0
-    }
+fn collect_values(heap: &otter_gc::GcHeap, values: crate::array::JsArray) -> Vec<Value> {
+    crate::array::with_elements(values, heap, |elements| {
+        elements
+            .iter()
+            .map(|slot| {
+                if slot.is_hole() {
+                    Value::undefined()
+                } else {
+                    *slot
+                }
+            })
+            .collect()
+    })
+}
 
-    fn collect_values(&self, heap: &otter_gc::GcHeap) -> Vec<Value> {
-        crate::array::with_elements(self.values_array(), heap, |elements| {
-            elements
-                .iter()
-                .map(|slot| {
-                    if slot.is_hole() {
-                        Value::undefined()
-                    } else {
-                        *slot
-                    }
-                })
-                .collect()
-        })
-    }
-
-    fn collect_keys(&self, heap: &otter_gc::GcHeap) -> Vec<Value> {
-        let Some(keys) = self.keys_array() else {
-            return Vec::new();
-        };
-        crate::array::with_elements(keys, heap, |elements| elements.to_vec())
-    }
+fn collect_keys(heap: &otter_gc::GcHeap, keys: crate::array::JsArray) -> Vec<Value> {
+    crate::array::with_elements(keys, heap, |elements| elements.to_vec())
 }
 
 /// Root-aware helper for constructing ECMA-262 §27.2.1.5
@@ -691,17 +641,6 @@ where
     )
 }
 
-fn trace_captures(
-    captures: &smallvec::SmallVec<[Value; 4]>,
-) -> Arc<crate::native_function::NativeTraceFn> {
-    let captures = captures.clone();
-    Arc::new(move |visitor: &mut SlotVisitor<'_>| {
-        for capture in captures.iter() {
-            capture.trace_value_slots(visitor);
-        }
-    })
-}
-
 fn promise_native_runtime<F>(
     interp: &mut Interpreter,
     name: &'static str,
@@ -714,17 +653,15 @@ fn promise_native_runtime<F>(
 where
     F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
 {
-    let trace = trace_captures(&captures);
     let roots = interp.collect_runtime_roots();
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
     };
-    traced_native_value_with_length(
+    local_native_value_with_length(
         interp.gc_heap_mut(),
         name,
         length,
         captures,
-        trace,
         &mut external_visit,
         call,
     )
@@ -743,17 +680,15 @@ fn promise_native_stack<F>(
 where
     F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
 {
-    let trace = trace_captures(&captures);
     let roots = interp.collect_allocation_roots(stack);
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
     };
-    traced_native_value_with_length(
+    local_native_value_with_length(
         interp.gc_heap_mut(),
         name,
         length,
         captures,
-        trace,
         &mut external_visit,
         call,
     )
@@ -771,7 +706,6 @@ fn promise_native_ctx<F>(
 where
     F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
 {
-    let trace = trace_captures(&captures);
     let roots = ctx.collect_native_roots();
     let this_value = *ctx.this_value();
     let new_target = ctx.new_target().cloned();
@@ -785,12 +719,11 @@ where
             slice_roots,
         );
     };
-    traced_native_value_with_length(
+    local_native_value_with_length(
         ctx.heap_mut(),
         name,
         length,
         captures,
-        trace,
         &mut external_visit,
         call,
     )
@@ -816,19 +749,17 @@ fn promise_element_function<F>(
     name: &'static str,
     length: u8,
     captures: smallvec::SmallVec<[Value; 4]>,
-    trace: Arc<crate::native_function::NativeTraceFn>,
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
 where
     F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
 {
     let mut no_extra_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-    traced_native_value_with_length(
+    local_native_value_with_length(
         interp.gc_heap_mut(),
         name,
         length,
         captures,
-        trace,
         &mut no_extra_roots,
         call,
     )
@@ -1114,7 +1045,6 @@ fn make_then_finally(
     on_finally: Value,
 ) -> Result<Value, NativeError> {
     let captures: SmallVec<[Value; 4]> = smallvec![constructor, on_finally];
-    let trace = trace_captures(&captures);
     let exec_for_call = exec.clone();
     let constructor_root = constructor;
     let on_finally_root = on_finally;
@@ -1123,12 +1053,11 @@ fn make_then_finally(
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         visit_runtime_roots(visitor, &runtime_roots, value_roots, &[]);
     };
-    traced_native_value_with_length(
+    local_native_value_with_length(
         interp.gc_heap_mut(),
         "",
         1,
         captures,
-        trace,
         &mut external_visit,
         move |ctx, args, captures| {
             ctx.scope(|mut scope| {
@@ -1169,7 +1098,6 @@ fn make_catch_finally(
     on_finally: Value,
 ) -> Result<Value, NativeError> {
     let captures: SmallVec<[Value; 4]> = smallvec![constructor, on_finally];
-    let trace = trace_captures(&captures);
     let exec_for_call = exec.clone();
     let constructor_root = constructor;
     let on_finally_root = on_finally;
@@ -1178,12 +1106,11 @@ fn make_catch_finally(
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         visit_runtime_roots(visitor, &runtime_roots, value_roots, &[]);
     };
-    traced_native_value_with_length(
+    local_native_value_with_length(
         interp.gc_heap_mut(),
         "",
         1,
         captures,
-        trace,
         &mut external_visit,
         move |ctx, args, captures| {
             ctx.scope(|mut scope| {
@@ -1219,7 +1146,6 @@ fn make_catch_finally(
 
 fn make_value_thunk(ctx: &mut NativeCtx<'_>, value: Value) -> Result<Value, NativeError> {
     let captures: SmallVec<[Value; 4]> = smallvec![value];
-    let trace = trace_captures(&captures);
     let value_root = value;
     let (interp, _) = ctx.interp_mut_and_context();
     let runtime_roots = interp.collect_runtime_roots();
@@ -1227,12 +1153,11 @@ fn make_value_thunk(ctx: &mut NativeCtx<'_>, value: Value) -> Result<Value, Nati
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         visit_runtime_roots(visitor, &runtime_roots, value_roots, &[]);
     };
-    traced_native_value_with_length(
+    local_native_value_with_length(
         interp.gc_heap_mut(),
         "",
         0,
         captures,
-        trace,
         &mut external_visit,
         move |_ctx, _args, captures| Ok(captures[0]),
     )
@@ -1241,7 +1166,6 @@ fn make_value_thunk(ctx: &mut NativeCtx<'_>, value: Value) -> Result<Value, Nati
 
 fn make_thrower(ctx: &mut NativeCtx<'_>, reason: Value) -> Result<Value, NativeError> {
     let captures: SmallVec<[Value; 4]> = smallvec![reason];
-    let trace = trace_captures(&captures);
     let reason_root = reason;
     let (interp, _) = ctx.interp_mut_and_context();
     let runtime_roots = interp.collect_runtime_roots();
@@ -1249,12 +1173,11 @@ fn make_thrower(ctx: &mut NativeCtx<'_>, reason: Value) -> Result<Value, NativeE
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         visit_runtime_roots(visitor, &runtime_roots, value_roots, &[]);
     };
-    traced_native_value_with_length(
+    local_native_value_with_length(
         interp.gc_heap_mut(),
         "",
         0,
         captures,
-        trace,
         &mut external_visit,
         move |ctx, _args, captures| {
             let reason = captures[0];
@@ -1342,22 +1265,25 @@ fn new_generic_promise_capability(
     }
     interp.with_handle_scope(|interp, scope| {
         let constructor_handle = interp.scoped_value(scope, *constructor);
-        let state = CapabilityExecutorState::new();
-        let trace_state = {
-            let state = state.clone();
-            Arc::new(move |visitor: &mut SlotVisitor<'_>| state.trace(visitor))
+        // The executor's shared state is a plain object in its capture
+        // list; the native body traces it, so no side hook is needed.
+        let state_obj = {
+            let mut no_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+            crate::object::alloc_object_with_roots(interp.gc_heap_mut(), &mut no_roots)?
         };
-        let state_for_call = state.clone();
+        let state_handle = interp.scoped_value(scope, Value::object(state_obj));
+        let state_raw = interp.escape_scoped(state_handle);
         let mut no_extra_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        // §27.2.1.5.1 — the GetCapabilitiesExecutor has length 2.
-        let executor = crate::native_function::traced_native_value_with_length(
+        // §27.2.1.5.1 — the GetCapabilitiesExecutor has length 2. The
+        // state value rides the capture list, which the allocation
+        // itself roots.
+        let executor = crate::native_function::local_native_value_with_length(
             interp.gc_heap_mut(),
             "",
             2,
-            SmallVec::new(),
-            trace_state,
+            smallvec![state_raw],
             &mut no_extra_roots,
-            move |_ctx, args, _captures| state_for_call.call(args),
+            capability_executor_state::call,
         )?;
         let executor = interp.scoped_value(scope, executor);
         let constructor_raw = interp.escape_scoped(constructor_handle);
@@ -1373,8 +1299,15 @@ fn new_generic_promise_capability(
             .map_err(|err| promise_vm_error(interp, "Promise", err))?;
         let promise = interp.scoped_value(scope, promise);
         *constructor = interp.escape_scoped(constructor_handle);
-        let resolve = (*state.resolve.borrow()).unwrap_or(Value::undefined());
-        let reject = (*state.reject.borrow()).unwrap_or(Value::undefined());
+        let state = interp
+            .escape_scoped(state_handle)
+            .as_object()
+            .expect("capability executor state is an object");
+        let resolve =
+            crate::object::get(state, interp.gc_heap(), capability_executor_state::RESOLVE)
+                .unwrap_or(Value::undefined());
+        let reject = crate::object::get(state, interp.gc_heap(), capability_executor_state::REJECT)
+            .unwrap_or(Value::undefined());
         if !crate::is_callable_value(&resolve) {
             return Err(NativeError::TypeError {
                 name: "Promise",
@@ -1975,7 +1908,13 @@ fn static_all_keyed_generic(
                 return reject_capability_error(interp, stack, &mut cap, native);
             }
         };
-        let (slots, slots_handle, keys_handle) = PromiseSlots::new_keyed_scoped(interp, scope)?;
+        let slots = PromiseSlots::new();
+        let slots_handle = interp
+            .scoped_array(scope, 0)
+            .map_err(|_| oom_native("Promise keyed combinator"))?;
+        let keys_handle = interp
+            .scoped_array(scope, 0)
+            .map_err(|_| oom_native("Promise keyed combinator"))?;
 
         for key in all_keys {
             let key_raw = interp.escape_scoped(key);
@@ -2008,7 +1947,7 @@ fn static_all_keyed_generic(
                     return reject_capability_error(interp, stack, &mut cap, err);
                 }
             };
-            let i = slots.reserve_keyed_slot_scoped(interp, slots_handle, keys_handle, key)?;
+            let i = reserve_keyed_slot_scoped(&slots, interp, slots_handle, keys_handle, key)?;
             let promise_resolve_raw = interp.escape_scoped(promise_resolve);
             let constructor_raw = interp.escape_scoped(constructor);
             let next_value_raw = interp.escape_scoped(next_value);
@@ -2026,10 +1965,19 @@ fn static_all_keyed_generic(
                     return reject_capability_error(interp, stack, &mut cap, err);
                 }
             };
-            slots.refresh_scoped(interp, slots_handle, Some(keys_handle));
             let live_cap = cap_handles.current(interp, context.clone());
-            let on_fulfill =
-                keyed_element_function(interp, slots.clone(), live_cap.clone(), variant, true, i)?;
+            let values_raw = interp.escape_scoped(slots_handle);
+            let keys_raw = interp.escape_scoped(keys_handle);
+            let on_fulfill = keyed_element_function(
+                interp,
+                slots.clone(),
+                live_cap.clone(),
+                values_raw,
+                keys_raw,
+                variant,
+                true,
+                i,
+            )?;
             let on_fulfill = interp.scoped_value(scope, on_fulfill);
             let on_reject = match variant {
                 KeyedVariant::All => cap_handles.reject,
@@ -2039,6 +1987,8 @@ fn static_all_keyed_generic(
                         interp,
                         slots.clone(),
                         live_cap.clone(),
+                        values_raw,
+                        keys_raw,
                         variant,
                         false,
                         i,
@@ -2061,10 +2011,20 @@ fn static_all_keyed_generic(
                 return reject_capability_error(interp, stack, &mut cap, err);
             }
         }
-        slots.refresh_scoped(interp, slots_handle, Some(keys_handle));
-        if slots.finish_iteration() {
+        if slots.settle_one() {
             let mut cap = cap_handles.current(interp, context.clone());
-            resolve_keyed_slots_runtime(interp, stack, &mut cap, &slots, name, &[], &[])?;
+            let values_raw = interp.escape_scoped(slots_handle);
+            let keys_raw = interp.escape_scoped(keys_handle);
+            resolve_keyed_slots_runtime(
+                interp,
+                stack,
+                &mut cap,
+                values_raw,
+                keys_raw,
+                name,
+                &[],
+                &[],
+            )?;
         }
         Ok(cap_handles.current(interp, context).promise)
     })
@@ -2115,36 +2075,29 @@ fn keyed_element_function(
     interp: &mut Interpreter,
     slots: Arc<PromiseSlots>,
     cap: PromiseCapability,
+    values: Value,
+    keys: Value,
     variant: KeyedVariant,
     fulfilled: bool,
     index: usize,
 ) -> Result<Value, NativeError> {
     let name = variant.name();
-    let trace_slots = {
-        let slots = slots.clone();
-        let cap = cap.clone();
-        Arc::new(move |visitor: &mut SlotVisitor<'_>| {
-            slots.trace(visitor);
-            cap.promise.trace_value_slots(visitor);
-            cap.resolve.trace_value_slots(visitor);
-            cap.reject.trace_value_slots(visitor);
-        })
-    };
     promise_element_function(
         interp,
         "",
         1,
-        smallvec![cap.promise, cap.resolve, cap.reject],
-        trace_slots,
+        smallvec![cap.promise, cap.resolve, cap.reject, values, keys],
         move |ctx, args, captures| {
             let cap = capability_from_captures(captures, &cap);
+            let values = capture_array(captures[3]);
+            let keys = capture_array(captures[4]);
             let payload = args.first().cloned().unwrap_or(Value::undefined());
             let value = match variant {
                 KeyedVariant::All => payload,
                 KeyedVariant::AllSettled => build_settled_record(fulfilled, payload, ctx)?,
             };
-            if slots.fill(ctx.heap_mut(), index, value) {
-                resolve_keyed_slots_native(ctx, &cap, &slots, name)?;
+            if fill_slot(&slots, ctx.heap_mut(), values, index, value) {
+                resolve_keyed_slots_native(ctx, &cap, values, keys, name)?;
             }
             Ok(Value::undefined())
         },
@@ -2156,31 +2109,22 @@ fn settled_element_function(
     interp: &mut Interpreter,
     slots: Arc<PromiseSlots>,
     cap: PromiseCapability,
+    values: Value,
     fulfilled: bool,
     index: usize,
 ) -> Result<Value, NativeError> {
-    let trace_slots = {
-        let slots = slots.clone();
-        let cap = cap.clone();
-        Arc::new(move |visitor: &mut SlotVisitor<'_>| {
-            slots.trace(visitor);
-            cap.promise.trace_value_slots(visitor);
-            cap.resolve.trace_value_slots(visitor);
-            cap.reject.trace_value_slots(visitor);
-        })
-    };
     promise_element_function(
         interp,
         "",
         1,
-        smallvec![cap.promise, cap.resolve, cap.reject],
-        trace_slots,
+        smallvec![cap.promise, cap.resolve, cap.reject, values],
         move |ctx, args, captures| {
             let cap = capability_from_captures(captures, &cap);
+            let values = capture_array(captures[3]);
             let payload = args.first().cloned().unwrap_or(Value::undefined());
             let record = build_settled_record(fulfilled, payload, ctx)?;
-            if slots.fill(ctx.heap_mut(), index, record) {
-                let collected = slots.collect_values(ctx.heap());
+            if fill_slot(&slots, ctx.heap_mut(), values, index, record) {
+                let collected = collect_values(ctx.heap(), values);
                 let arr = ctx.array_from_elements_with_roots(
                     collected.iter().cloned(),
                     &[&cap.promise, &cap.resolve, &cap.reject],
@@ -2198,13 +2142,14 @@ fn resolve_keyed_slots_runtime(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
     cap: &mut PromiseCapability,
-    slots: &PromiseSlots,
+    values: Value,
+    keys: Value,
     name: &'static str,
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
 ) -> Result<(), NativeError> {
-    let keys = slots.collect_keys(interp.gc_heap());
-    let values = slots.collect_values(interp.gc_heap());
+    let keys = collect_keys(interp.gc_heap(), capture_array(keys));
+    let values = collect_values(interp.gc_heap(), capture_array(values));
     let result =
         create_keyed_result_runtime(interp, name, &keys, &values, value_roots, slice_roots)?;
     call_capability_resolve(interp, stack, cap, result)
@@ -2213,11 +2158,12 @@ fn resolve_keyed_slots_runtime(
 fn resolve_keyed_slots_native(
     ctx: &mut NativeCtx<'_>,
     cap: &PromiseCapability,
-    slots: &PromiseSlots,
+    values: crate::array::JsArray,
+    keys: crate::array::JsArray,
     name: &'static str,
 ) -> Result<(), NativeError> {
-    let keys = slots.collect_keys(ctx.heap());
-    let values = slots.collect_values(ctx.heap());
+    let keys = collect_keys(ctx.heap(), keys);
+    let values = collect_values(ctx.heap(), values);
     let result = create_keyed_result_native(ctx, name, &keys, &values)?;
     call_capability_resolve_native(ctx, cap, result)
 }
@@ -2324,7 +2270,10 @@ fn static_all_generic(
                 return reject_capability_error(interp, stack, &mut cap, native);
             }
         };
-        let (slots, slots_handle) = PromiseSlots::new_scoped(interp, scope)?;
+        let slots = PromiseSlots::new();
+        let slots_handle = interp
+            .scoped_array(scope, 0)
+            .map_err(|_| oom_native("Promise combinator"))?;
         loop {
             let iterator_raw = interp.escape_scoped(iterator);
             let next_method_raw = interp.escape_scoped(next_method);
@@ -2343,7 +2292,7 @@ fn static_all_generic(
             // loop, which an infinite iterator otherwise spins in forever.
             if let Some(settled) = interp.with_handle_scope(|interp, iteration_scope| {
                 let next_value = interp.scoped_value(iteration_scope, next_value);
-                let i = slots.reserve_slot_scoped(interp, slots_handle)?;
+                let i = reserve_slot_scoped(&slots, interp, slots_handle)?;
                 let promise_resolve_raw = interp.escape_scoped(promise_resolve);
                 let constructor_raw = interp.escape_scoped(constructor);
                 let next_value_raw = interp.escape_scoped(next_value);
@@ -2363,29 +2312,26 @@ fn static_all_generic(
                         return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                     }
                 };
-                slots.refresh_scoped(interp, slots_handle, None);
                 let live_cap = cap_handles.current(interp, context.clone());
                 let cap_for_fulfill = live_cap.clone();
-                let slots_for_trace = slots.clone();
-                let trace_slots = Arc::new(move |visitor: &mut SlotVisitor<'_>| {
-                    slots_for_trace.trace(visitor);
-                    cap_for_fulfill.promise.trace_value_slots(visitor);
-                    cap_for_fulfill.resolve.trace_value_slots(visitor);
-                    cap_for_fulfill.reject.trace_value_slots(visitor);
-                });
-                let cap_for_fulfill = live_cap.clone();
                 let slots_for_fulfill = slots.clone();
+                let values_raw = interp.escape_scoped(slots_handle);
                 let on_fulfill = promise_element_function(
                     interp,
                     "",
                     1,
-                    smallvec![live_cap.promise, live_cap.resolve, live_cap.reject],
-                    trace_slots,
+                    smallvec![
+                        live_cap.promise,
+                        live_cap.resolve,
+                        live_cap.reject,
+                        values_raw
+                    ],
                     move |ctx, args, captures| {
                         let cap = capability_from_captures(captures, &cap_for_fulfill);
+                        let values = capture_array(captures[3]);
                         let v = args.first().cloned().unwrap_or(Value::undefined());
-                        if slots_for_fulfill.fill(ctx.heap_mut(), i, v) {
-                            let collected = slots_for_fulfill.collect_values(ctx.heap());
+                        if fill_slot(&slots_for_fulfill, ctx.heap_mut(), values, i, v) {
+                            let collected = collect_values(ctx.heap(), values);
                             let arr = ctx.array_from_elements_with_roots(
                                 collected.iter().cloned(),
                                 &[&cap.promise, &cap.resolve, &cap.reject],
@@ -2413,10 +2359,8 @@ fn static_all_generic(
                 return Ok(settled);
             }
         }
-        slots.refresh_scoped(interp, slots_handle, None);
-        if slots.finish_iteration() {
-            let result =
-                slots.materialize_array_scoped(interp, scope, slots_handle, "Promise.all")?;
+        if slots.settle_one() {
+            let result = materialize_array_scoped(interp, scope, slots_handle, "Promise.all")?;
             let result = interp.escape_scoped(result);
             let mut cap = cap_handles.current(interp, context.clone());
             if let Err(err) = call_capability_resolve(interp, stack, &mut cap, result) {
@@ -2575,7 +2519,10 @@ fn static_all_settled_generic(
                 return reject_capability_error(interp, stack, &mut cap, native);
             }
         };
-        let (slots, slots_handle) = PromiseSlots::new_scoped(interp, scope)?;
+        let slots = PromiseSlots::new();
+        let slots_handle = interp
+            .scoped_array(scope, 0)
+            .map_err(|_| oom_native("Promise combinator"))?;
         loop {
             let iterator_raw = interp.escape_scoped(iterator);
             let next_method_raw = interp.escape_scoped(next_method);
@@ -2594,7 +2541,7 @@ fn static_all_settled_generic(
             // loop, which an infinite iterator otherwise spins in forever.
             if let Some(settled) = interp.with_handle_scope(|interp, iteration_scope| {
                 let next_value = interp.scoped_value(iteration_scope, next_value);
-                let i = slots.reserve_slot_scoped(interp, slots_handle)?;
+                let i = reserve_slot_scoped(&slots, interp, slots_handle)?;
                 let promise_resolve_raw = interp.escape_scoped(promise_resolve);
                 let constructor_raw = interp.escape_scoped(constructor);
                 let next_value_raw = interp.escape_scoped(next_value);
@@ -2614,14 +2561,27 @@ fn static_all_settled_generic(
                         return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                     }
                 };
-                slots.refresh_scoped(interp, slots_handle, None);
                 let live_cap = cap_handles.current(interp, context.clone());
-                let on_fulfill =
-                    settled_element_function(interp, slots.clone(), live_cap.clone(), true, i)?;
+                let values_raw = interp.escape_scoped(slots_handle);
+                let on_fulfill = settled_element_function(
+                    interp,
+                    slots.clone(),
+                    live_cap.clone(),
+                    values_raw,
+                    true,
+                    i,
+                )?;
                 let on_fulfill = interp.scoped_value(iteration_scope, on_fulfill);
                 let live_cap = cap_handles.current(interp, context.clone());
-                let on_reject =
-                    settled_element_function(interp, slots.clone(), live_cap.clone(), false, i)?;
+                let values_raw = interp.escape_scoped(slots_handle);
+                let on_reject = settled_element_function(
+                    interp,
+                    slots.clone(),
+                    live_cap.clone(),
+                    values_raw,
+                    false,
+                    i,
+                )?;
                 let on_reject = interp.scoped_value(iteration_scope, on_reject);
                 let entry_promise = interp.escape_scoped(entry_promise);
                 let on_fulfill = interp.escape_scoped(on_fulfill);
@@ -2639,14 +2599,9 @@ fn static_all_settled_generic(
                 return Ok(settled);
             }
         }
-        slots.refresh_scoped(interp, slots_handle, None);
-        if slots.finish_iteration() {
-            let result = slots.materialize_array_scoped(
-                interp,
-                scope,
-                slots_handle,
-                "Promise.allSettled",
-            )?;
+        if slots.settle_one() {
+            let result =
+                materialize_array_scoped(interp, scope, slots_handle, "Promise.allSettled")?;
             let result = interp.escape_scoped(result);
             let mut cap = cap_handles.current(interp, context.clone());
             if let Err(err) = call_capability_resolve(interp, stack, &mut cap, result) {
@@ -2849,7 +2804,10 @@ fn static_any_generic(
                 return reject_capability_error(interp, stack, &mut cap, native);
             }
         };
-        let (errors, errors_handle) = PromiseSlots::new_scoped(interp, scope)?;
+        let errors = PromiseSlots::new();
+        let errors_handle = interp
+            .scoped_array(scope, 0)
+            .map_err(|_| oom_native("Promise combinator"))?;
         loop {
             let iterator_raw = interp.escape_scoped(iterator);
             let next_method_raw = interp.escape_scoped(next_method);
@@ -2868,7 +2826,7 @@ fn static_any_generic(
             // loop, which an infinite iterator otherwise spins in forever.
             if let Some(settled) = interp.with_handle_scope(|interp, iteration_scope| {
                 let next_value = interp.scoped_value(iteration_scope, next_value);
-                let i = errors.reserve_slot_scoped(interp, errors_handle)?;
+                let i = reserve_slot_scoped(&errors, interp, errors_handle)?;
                 let promise_resolve_raw = interp.escape_scoped(promise_resolve);
                 let constructor_raw = interp.escape_scoped(constructor);
                 let next_value_raw = interp.escape_scoped(next_value);
@@ -2888,32 +2846,27 @@ fn static_any_generic(
                         return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                     }
                 };
-                errors.refresh_scoped(interp, errors_handle, None);
                 let live_cap = cap_handles.current(interp, context.clone());
                 let errors_for_call = errors.clone();
                 let registry_for_call = registry.clone();
                 let cap_for_call = live_cap.clone();
-                let trace_errors = {
-                    let errors = errors.clone();
-                    let cap = live_cap.clone();
-                    Arc::new(move |visitor: &mut SlotVisitor<'_>| {
-                        errors.trace(visitor);
-                        cap.promise.trace_value_slots(visitor);
-                        cap.resolve.trace_value_slots(visitor);
-                        cap.reject.trace_value_slots(visitor);
-                    })
-                };
+                let errors_raw = interp.escape_scoped(errors_handle);
                 let on_reject = promise_element_function(
                     interp,
                     "",
                     1,
-                    smallvec![live_cap.promise, live_cap.resolve, live_cap.reject],
-                    trace_errors,
+                    smallvec![
+                        live_cap.promise,
+                        live_cap.resolve,
+                        live_cap.reject,
+                        errors_raw
+                    ],
                     move |ctx, args, captures| {
                         let cap = capability_from_captures(captures, &cap_for_call);
+                        let errors_arr = capture_array(captures[3]);
                         let reason = args.first().cloned().unwrap_or(Value::undefined());
-                        if errors_for_call.fill(ctx.heap_mut(), i, reason) {
-                            let collected = errors_for_call.collect_values(ctx.heap());
+                        if fill_slot(&errors_for_call, ctx.heap_mut(), errors_arr, i, reason) {
+                            let collected = collect_values(ctx.heap(), errors_arr);
                             let agg = make_aggregate_error_native_rooted(
                                 ctx,
                                 &registry_for_call,
@@ -2941,9 +2894,11 @@ fn static_any_generic(
                 return Ok(settled);
             }
         }
-        errors.refresh_scoped(interp, errors_handle, None);
-        if errors.finish_iteration() {
-            let collected = errors.collect_values(interp.gc_heap());
+        if errors.settle_one() {
+            let collected = collect_values(
+                interp.gc_heap(),
+                capture_array(interp.escape_scoped(errors_handle)),
+            );
             let agg = make_aggregate_error_runtime_rooted(interp, &registry, collected)?;
             let mut cap = cap_handles.current(interp, context.clone());
             call_capability_reject(interp, stack, &mut cap, agg)?;

@@ -189,10 +189,6 @@ impl std::fmt::Debug for NativeCall {
     }
 }
 
-/// Optional tracing hook for native payloads whose Rust-side state
-/// owns JS values outside the fixed capture list.
-pub type NativeTraceFn = dyn Fn(&mut SlotVisitor<'_>);
-
 /// Heap payload for [`Value::NativeFunction`].
 #[derive(otter_macros::Pelt)]
 #[pelt(tag = NATIVE_FUNCTION_BODY_TYPE_TAG)]
@@ -219,14 +215,11 @@ pub struct NativeFunctionBody {
     #[pelt(skip)]
     call: NativeCallStorage,
     /// JS values owned by the native payload and therefore traced
-    /// strongly while this function is reachable.
+    /// strongly while this function is reachable. This is the ONLY
+    /// place a dynamic closure may keep JS values: shared Rust state
+    /// behind the closure's `Arc` must hold no `Value` (a counter is
+    /// fine), because nothing traces it.
     captures: SmallVec<[Value; 4]>,
-    /// Optional trace hook for native-owned state such as shared
-    /// Promise combinator slots. The trace closure walks the
-    /// payload's GC slots itself; the derive dispatches to a
-    /// per-field helper rather than the generic `PeltField` path.
-    #[pelt(via = trace_native_trace_hook)]
-    trace: Option<Arc<NativeTraceFn>>,
     /// Own property state for the built-in `name` property.
     name_property: NativeOwnProperty,
     /// Own property state for the built-in `length` property.
@@ -279,14 +272,7 @@ impl NativeFunctionBody {
             static_addr,
             native_ref: self.native_ref,
             capture_count: self.captures.len(),
-            has_trace_hook: self.trace.is_some(),
         }
-    }
-}
-
-fn trace_native_trace_hook(trace: &Option<Arc<NativeTraceFn>>, visitor: &mut SlotVisitor<'_>) {
-    if let Some(t) = trace {
-        t(visitor);
     }
 }
 
@@ -322,7 +308,6 @@ impl NativeFunction {
         length: u8,
         call: NativeCallStorage,
         captures: SmallVec<[Value; 4]>,
-        trace: Option<Arc<NativeTraceFn>>,
         metadata: NativeFunctionMetadata,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
@@ -343,9 +328,6 @@ impl NativeFunction {
                 for value in &captures {
                     value.trace_value_slots(visitor);
                 }
-                if let Some(trace) = &trace {
-                    trace(visitor);
-                }
             };
             crate::object::alloc_object_with_roots(heap, &mut visit)?
         };
@@ -359,9 +341,6 @@ impl NativeFunction {
             for value in &captures {
                 value.trace_value_slots(visitor);
             }
-            if let Some(trace) = &trace {
-                trace(visitor);
-            }
         };
         Ok(Self {
             inner: heap.alloc_with_roots(
@@ -371,7 +350,6 @@ impl NativeFunction {
                     length,
                     call,
                     captures: captures.clone(),
-                    trace: trace.clone(),
                     name_property: default_name_property(),
                     length_property: default_length_property(),
                     metadata,
@@ -466,7 +444,6 @@ impl NativeFunction {
             length,
             NativeCallStorage::Static(call),
             SmallVec::new(),
-            None,
             NativeFunctionMetadata::BUILTIN,
             &mut external_visit,
         )
@@ -487,7 +464,6 @@ impl NativeFunction {
             length,
             NativeCallStorage::Static(call),
             SmallVec::new(),
-            None,
             NativeFunctionMetadata::BUILTIN,
             external_visit,
         )
@@ -507,7 +483,6 @@ impl NativeFunction {
             length,
             NativeCallStorage::Static(call),
             SmallVec::new(),
-            None,
             NativeFunctionMetadata::CONSTRUCTOR,
             &mut external_visit,
         )
@@ -528,7 +503,6 @@ impl NativeFunction {
             length,
             NativeCallStorage::Static(call),
             SmallVec::new(),
-            None,
             NativeFunctionMetadata::CONSTRUCTOR,
             external_visit,
         )
@@ -549,7 +523,6 @@ impl NativeFunction {
             length,
             call.into(),
             SmallVec::new(),
-            None,
             NativeFunctionMetadata::BUILTIN,
             &mut external_visit,
         )
@@ -571,7 +544,6 @@ impl NativeFunction {
             length,
             call.into(),
             SmallVec::new(),
-            None,
             NativeFunctionMetadata::BUILTIN,
             external_visit,
         )
@@ -592,7 +564,6 @@ impl NativeFunction {
             length,
             call.into(),
             SmallVec::new(),
-            None,
             NativeFunctionMetadata::CONSTRUCTOR,
             external_visit,
         )
@@ -611,7 +582,6 @@ impl NativeFunction {
             0,
             NativeCallStorage::Static(call),
             SmallVec::new(),
-            None,
             NativeFunctionMetadata::THROW_TYPE_ERROR,
             external_visit,
         )
@@ -655,7 +625,6 @@ impl NativeFunction {
             length,
             NativeCallStorage::Dynamic(Arc::new(call)),
             captures,
-            None,
             NativeFunctionMetadata::BUILTIN,
             &mut external_visit,
         )
@@ -1235,7 +1204,6 @@ where
         length,
         NativeCallStorage::Dynamic(Arc::new(call)),
         captures,
-        None,
         NativeFunctionMetadata::BUILTIN,
         external_visit,
     )?))
@@ -1257,18 +1225,16 @@ where
         0,
         NativeCallStorage::LocalDynamic(Arc::new(call)),
         captures,
-        None,
         NativeFunctionMetadata::BUILTIN,
         external_visit,
     )?))
 }
 
-pub(crate) fn traced_native_value_with_length<F>(
+pub(crate) fn local_native_value_with_length<F>(
     heap: &mut otter_gc::GcHeap,
     name: &'static str,
     length: u8,
     captures: SmallVec<[Value; 4]>,
-    trace: Arc<NativeTraceFn>,
     external_visit: &mut RootSlotVisitor<'_>,
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
@@ -1281,7 +1247,6 @@ where
         length,
         NativeCallStorage::LocalDynamic(Arc::new(call)),
         captures,
-        Some(trace),
         NativeFunctionMetadata::BUILTIN,
         external_visit,
     )?))

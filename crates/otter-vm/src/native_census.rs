@@ -84,8 +84,6 @@ pub struct NativeBodyFacts {
     pub native_ref: u32,
     /// Traced JS values the payload owns.
     pub capture_count: usize,
-    /// Whether the body carries an `Arc<NativeTraceFn>` hook.
-    pub has_trace_hook: bool,
 }
 
 /// One closure-backed native and how many live copies exist.
@@ -128,9 +126,6 @@ pub struct NativeCensus {
     pub resolved_native_ref_count: u64,
     /// Entries in the isolate's external-reference table.
     pub external_ref_table_len: u64,
-    /// Bodies carrying an `Arc<NativeTraceFn>` hook — another
-    /// non-serializable pointer, independent of the storage kind.
-    pub trace_hook_count: u64,
     /// Bodies owning at least one traced JS capture.
     pub with_captures_count: u64,
     /// Total captured values across every body.
@@ -161,12 +156,11 @@ impl NativeCensus {
         );
         let _ = writeln!(
             out,
-            "  external refs={}/{} resolved (table {} entries), trace hooks={}, \
+            "  external refs={}/{} resolved (table {} entries), \
              bodies with captures={} (values {})",
             self.resolved_native_ref_count,
             self.native_ref_count,
             self.external_ref_table_len,
-            self.trace_hook_count,
             self.with_captures_count,
             self.capture_total,
         );
@@ -202,7 +196,6 @@ pub fn native_census(heap: &GcHeap) -> NativeCensus {
         native_ref_count: 0,
         resolved_native_ref_count: 0,
         external_ref_table_len: heap.external_refs().len() as u64,
-        trace_hook_count: 0,
         with_captures_count: 0,
         capture_total: 0,
         closures: Vec::new(),
@@ -237,9 +230,6 @@ pub fn native_census(heap: &GcHeap) -> NativeCensus {
             if heap.external_refs().address(facts.native_ref) == facts.static_addr {
                 census.resolved_native_ref_count += 1;
             }
-        }
-        if facts.has_trace_hook {
-            census.trace_hook_count += 1;
         }
         if facts.capture_count != 0 {
             census.with_captures_count += 1;

@@ -160,6 +160,14 @@ pub(super) fn ordinary_set_symbol_data_property(
     key: JsSymbol,
     value: Value,
 ) -> bool {
+    // Symbol properties live in the sidecar. Reserved here, outside the
+    // payload borrow, because creating it allocates — which may also move
+    // `obj` and the pending value's referent.
+    let mut obj = obj;
+    let mut roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        value.trace_value_slots(visitor);
+    };
+    super::ensure_exotic_with_roots(&mut obj, heap, &mut roots).expect("exotic sidecar");
     let barrier_value = value;
     let success = heap.with_payload(obj, |body| {
         if let Some(pos) = body.symbol_props().iter().position(|(k, _)| k.ptr_eq(key)) {
@@ -180,7 +188,7 @@ pub(super) fn ordinary_set_symbol_data_property(
         true
     });
     if success {
-        heap.record_write(obj, &barrier_value);
+        super::record_exotic_write(heap, obj, &barrier_value);
     }
     success
 }

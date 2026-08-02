@@ -2109,6 +2109,27 @@ impl GcHeap {
         }
     }
 
+    /// Old-space pages currently owned.
+    #[must_use]
+    pub fn old_space_page_count(&self) -> usize {
+        self.old_space.page_count()
+    }
+
+    /// Take ownership of a page already filled by
+    /// [`crate::heap_image::GcHeap::restore_old_space`].
+    ///
+    /// The page's objects are live and relocated; the sweeper treats it
+    /// like any other old page from here.
+    pub(crate) fn adopt_restored_old_page(&mut self, page: crate::page::Page) {
+        self.old_space.adopt_page(page);
+    }
+
+    /// Book the bytes a restored image brought in against the heap cap and
+    /// the growth trigger, as an ordinary old-space allocation would have.
+    pub(crate) fn account_restored_image(&mut self, live_bytes: u64) {
+        self.tracked_bytes = self.tracked_bytes.saturating_add(live_bytes);
+    }
+
     /// Page lists for every space, in census order: old, young
     /// from-space, large. Lets [`crate::census`] attribute objects
     /// to a space without opening up the space fields.

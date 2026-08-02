@@ -243,8 +243,9 @@ pub struct JitCompileSnapshot {
     /// IC guards.
     pub collection_layout: JitCollectionLayout,
     /// Byte offset from a decompressed native-function pointer to its
-    /// machine-readable static builtin identity.
-    pub native_static_fn_byte: u32,
+    /// machine-readable static builtin identity: a `u32` index into the
+    /// isolate's external-reference table, not an entry address.
+    pub native_ref_byte: u32,
     /// Instruction overlays in canonical logical-PC order.
     pub instructions: Vec<JitInstructionMetadata>,
     /// Direct reads of permanent global-lexical cells keyed by the
@@ -412,9 +413,10 @@ pub struct JitGuardedMethodCall {
     pub holder_shape: u32,
     /// Byte offset of the method slot inside the holder's value slab.
     pub method_value_byte: u32,
-    /// Exact process-local bootstrap function address guarded before the entry
-    /// runs. Never serialized into diagnostics or normalized artifacts.
-    pub builtin_fn_addr: usize,
+    /// External-reference index of the exact bootstrap function guarded before
+    /// the entry runs. Isolate-local and build-stable, so unlike a raw entry
+    /// address it can be compared by generated code without a relocation.
+    pub builtin_native_ref: u32,
     /// Declared entry invoked once every guard passes.
     pub entry_stub_id: crate::native_abi::RuntimeStubId,
     /// Safepoint published for an entry that may collect.
@@ -587,10 +589,10 @@ impl JitPropertyIcWay {
 /// second taxonomy of builtins exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JitStaticNativeCall {
-    /// Exact process-local bootstrap function address checked before the leaf
-    /// executes. This address is never serialized into diagnostics or
-    /// normalized artifacts.
-    pub builtin_fn_addr: usize,
+    /// External-reference index of the exact bootstrap function checked before
+    /// the leaf executes. Isolate-local and build-stable, so unlike a raw entry
+    /// address it can be compared by generated code without a relocation.
+    pub builtin_native_ref: u32,
     /// Declared leaf entry the call site invokes once its guards pass. The
     /// operation lives in that entry, so a new builtin needs no generated code.
     pub leaf_stub_id: crate::native_abi::RuntimeStubId,
@@ -976,7 +978,7 @@ impl JitCompileSnapshot {
             closure_call_layout: JitClosureCallLayout::default(),
             upvalue_value_byte: 0,
             collection_layout: JitCollectionLayout::default(),
-            native_static_fn_byte: 0,
+            native_ref_byte: 0,
             instructions,
             global_lexical_loads: rustc_hash::FxHashMap::default(),
             global_object_loads: rustc_hash::FxHashMap::default(),

@@ -514,14 +514,6 @@ fn symbolic_target(target: &RelocationTarget) -> String {
             "guardedHeapReference(component={},bytePc={byte_pc},runtimeStubId={runtime_stub_id})",
             heap_component_name(*component)
         ),
-        RelocationTarget::GuardedBuiltinFunction {
-            byte_pc,
-            runtime_stub_id,
-        } => format!("guardedBuiltinFunction(bytePc={byte_pc},runtimeStubId={runtime_stub_id})"),
-        RelocationTarget::NativeLeafBuiltinFunction { stub_id } => format!(
-            "nativeLeafBuiltinFunction(entry={})",
-            otter_vm::native_abi::runtime_stub_name(*stub_id)
-        ),
         RelocationTarget::DirectCallEntryCell {
             byte_pc,
             direct_call,

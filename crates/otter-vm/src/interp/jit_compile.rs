@@ -1011,6 +1011,12 @@ impl Interpreter {
             let Some(declaration) = crate::math::jit_leaf_builtin(stub_id) else {
                 continue;
             };
+            // A builtin this isolate never installed has no external-ref
+            // index, so no live receiver could carry its identity.
+            let Some(builtin_native_ref) = crate::math::jit_static_call_ref(stub_id, &self.gc_heap)
+            else {
+                continue;
+            };
             view.guarded_method_calls.insert(
                 byte_pc,
                 jit::JitGuardedMethodCall {
@@ -1019,7 +1025,7 @@ impl Interpreter {
                     },
                     holder_shape: holder_shape_offset,
                     method_value_byte,
-                    builtin_fn_addr: crate::math::jit_static_call_address(stub_id),
+                    builtin_native_ref,
                     entry_stub_id: stub_id,
                     safepoint_id: native_abi::NO_SAFEPOINT,
                     argument_count: declaration.argument_count,
@@ -1248,10 +1254,16 @@ impl Interpreter {
                     let name = crate::native_abi::runtime_stub_name(stub_id);
                     let declaration = crate::math::jit_leaf_builtin(stub_id)
                         .expect("native leaf call feedback names a declared entry");
+                    // Feedback recorded a call to this builtin, so the isolate
+                    // installed it and its external-ref index exists.
+                    let builtin_native_ref =
+                        crate::math::jit_static_call_ref(stub_id, &self.gc_heap).expect(
+                            "a builtin the site already called is interned in this isolate",
+                        );
                     view.static_native_calls.insert(
                         call_byte_pc,
                         jit::JitStaticNativeCall {
-                            builtin_fn_addr: crate::math::jit_static_call_address(stub_id),
+                            builtin_native_ref,
                             leaf_stub_id: stub_id,
                             argument_count: declaration.argument_count,
                         },

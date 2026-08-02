@@ -108,8 +108,38 @@ fn full_surface_bootstrap_census() {
         natives.dynamic_count + natives.local_dynamic_count,
     );
     assert_eq!(
-        natives.jit_static_fn_count, natives.static_count,
-        "every static body mirrors its entry address for JIT builtin guards",
+        natives.native_ref_count, natives.static_count,
+        "every static body carries an external-reference index",
+    );
+    assert_eq!(
+        natives.resolved_native_ref_count, natives.static_count,
+        "every index must resolve back to the entry address its storage holds",
+    );
+    assert_eq!(
+        natives.external_ref_table_len, natives.distinct_static_fns,
+        "the table holds exactly the distinct static entries, interned once each",
+    );
+}
+
+/// The external-reference index a body stores is a property of the install
+/// sequence, not of where the process happened to load the binary. Two runtimes
+/// built the same way in one process must agree on every index, or a snapshot
+/// written by one could not be read by the other.
+#[test]
+fn external_ref_indices_are_stable_across_runtimes() {
+    let first = full_surface_runtime().native_census();
+    let second = full_surface_runtime().native_census();
+
+    assert_eq!(first.external_ref_table_len, second.external_ref_table_len);
+    assert_eq!(first.static_count, second.static_count);
+    assert_eq!(first.distinct_static_fns, second.distinct_static_fns);
+    assert_eq!(
+        first.resolved_native_ref_count, second.resolved_native_ref_count,
+        "both runtimes must resolve the same number of indices",
+    );
+    assert_eq!(
+        first.resolved_native_ref_count, first.static_count,
+        "and all of them",
     );
 }
 

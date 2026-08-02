@@ -79,9 +79,9 @@ pub struct NativeBodyFacts {
     pub kind: NativeStorageKind,
     /// Raw entry address for [`NativeStorageKind::Static`] bodies.
     pub static_addr: Option<usize>,
-    /// Duplicate raw entry address kept for JIT builtin guards; `0`
-    /// when the body is not static-backed.
-    pub jit_static_fn: usize,
+    /// External-reference index identifying the static entry, or
+    /// [`otter_gc::NO_EXTERNAL_REF`] when the body is not static-backed.
+    pub native_ref: u32,
     /// Traced JS values the payload owns.
     pub capture_count: usize,
     /// Whether the body carries an `Arc<NativeTraceFn>` hook.
@@ -120,8 +120,14 @@ pub struct NativeCensus {
     pub dynamic_count: u64,
     /// Bodies holding an `Arc<LocalNativeFn>`.
     pub local_dynamic_count: u64,
-    /// Bodies whose `jit_static_fn` mirror address is populated.
-    pub jit_static_fn_count: u64,
+    /// Bodies carrying an external-reference index.
+    pub native_ref_count: u64,
+    /// Bodies whose index resolves to the entry address their storage
+    /// actually holds. Must equal [`Self::static_count`]: an index that
+    /// does not round-trip would restore to the wrong function.
+    pub resolved_native_ref_count: u64,
+    /// Entries in the isolate's external-reference table.
+    pub external_ref_table_len: u64,
     /// Bodies carrying an `Arc<NativeTraceFn>` hook — another
     /// non-serializable pointer, independent of the storage kind.
     pub trace_hook_count: u64,
@@ -155,8 +161,11 @@ impl NativeCensus {
         );
         let _ = writeln!(
             out,
-            "  jit_static_fn mirrors={}, trace hooks={}, bodies with captures={} (values {})",
-            self.jit_static_fn_count,
+            "  external refs={}/{} resolved (table {} entries), trace hooks={}, \
+             bodies with captures={} (values {})",
+            self.resolved_native_ref_count,
+            self.native_ref_count,
+            self.external_ref_table_len,
             self.trace_hook_count,
             self.with_captures_count,
             self.capture_total,
@@ -190,7 +199,9 @@ pub fn native_census(heap: &GcHeap) -> NativeCensus {
         vm_intrinsic_count: 0,
         dynamic_count: 0,
         local_dynamic_count: 0,
-        jit_static_fn_count: 0,
+        native_ref_count: 0,
+        resolved_native_ref_count: 0,
+        external_ref_table_len: heap.external_refs().len() as u64,
         trace_hook_count: 0,
         with_captures_count: 0,
         capture_total: 0,
@@ -221,8 +232,11 @@ pub fn native_census(heap: &GcHeap) -> NativeCensus {
         if facts.kind.needs_reinstall() {
             *closures.entry((facts.name, facts.kind)).or_default() += 1;
         }
-        if facts.jit_static_fn != 0 {
-            census.jit_static_fn_count += 1;
+        if facts.native_ref != otter_gc::NO_EXTERNAL_REF {
+            census.native_ref_count += 1;
+            if heap.external_refs().address(facts.native_ref) == facts.static_addr {
+                census.resolved_native_ref_count += 1;
+            }
         }
         if facts.has_trace_hook {
             census.trace_hook_count += 1;

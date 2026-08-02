@@ -294,8 +294,8 @@ pub(crate) fn jit_static_call_target(
     for row in JIT_LEAF_BUILTINS {
         if native.is_static_fn(heap, original_native_fn(row.method)) {
             debug_assert_eq!(
-                native.jit_static_fn_addr(heap),
-                Some(jit_static_call_address(row.leaf_stub_id)),
+                native.native_ref(heap),
+                jit_static_call_ref(row.leaf_stub_id, heap),
                 "static-native classifier and JIT identity field must agree"
             );
             return Some(row);
@@ -315,13 +315,19 @@ pub fn jit_leaf_builtin(
         .find(|row| row.leaf_stub_id == stub_id)
 }
 
-/// Exact bootstrap function address guarded before a declared leaf runs.
+/// External-reference index of the exact bootstrap function guarded before a
+/// declared leaf runs.
 ///
-/// Process-local, so it travels as a relocation rather than into any artifact.
+/// `None` when this isolate never installed the builtin, in which case no
+/// receiver can carry its identity and the site stays on the runtime path.
 #[must_use]
-pub fn jit_static_call_address(stub_id: crate::native_abi::RuntimeStubId) -> usize {
+pub fn jit_static_call_ref(
+    stub_id: crate::native_abi::RuntimeStubId,
+    heap: &otter_gc::GcHeap,
+) -> Option<u32> {
     let row = jit_leaf_builtin(stub_id).expect("guarded leaf entry has a declaration");
-    original_native_fn(row.method) as *const () as usize
+    heap.external_refs()
+        .lookup(original_native_fn(row.method) as *const () as usize)
 }
 
 fn native_call(

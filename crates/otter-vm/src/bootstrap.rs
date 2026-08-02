@@ -661,7 +661,13 @@ mod tests {
         // The 32-bit object slab boxes a property value that does not fit a
         // 4-byte slot, so each double-valued builtin constant (Math.PI, the
         // Number limits, …) allocates one HeapNumber during bootstrap.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1960;
+        // Objects that outgrow their six inline slots allocate an overflow
+        // slab, and that slab is now a GC body rather than a `Vec`. The
+        // count rises because those allocations became visible to this
+        // counter, not because the bootstrap does more work — the malloc
+        // they used to be is gone, and every object lost the 20-byte `Vec`
+        // header whether it spilled or not.
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 2020;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 560 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");

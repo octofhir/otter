@@ -98,13 +98,16 @@ pub(crate) fn capture_store_property_transition(
     value: &Value,
 ) -> Option<StorePropertyTransition> {
     let mut obj = obj;
+    let index = heap.read_payload(obj, |body| super::body_property_count(heap, body));
+    let slot = u16::try_from(index).ok()?;
+    // Reserve before boxing the value: growing the slab can collect, and a
+    // compressed word is a bare offset with nothing rooting it.
+    super::reserve_slot_capacity(&mut obj, heap, index + 1, &mut []).ok()?;
     let compressed = super::compress_or_abort(heap, &mut obj, *value);
     let kind = transition_kind(obj, heap, key)?;
     let from_shape_id = super::shape_id(obj, heap);
     let existing_offset =
         heap.read_payload(obj, |body| super::body_offset_of_atom(heap, body, key));
-    let index = heap.read_payload(obj, |body| super::body_property_count(heap, body));
-    let slot = u16::try_from(index).ok()?;
     let transition = heap.with_payload(obj, |body| {
         if !is_fast_shape_body(body)
             || !body.extensible
@@ -141,16 +144,18 @@ pub(crate) fn capture_store_property_transition_with_shape(
     next_shape: ShapeHandle,
 ) -> Option<StorePropertyTransition> {
     let mut obj = obj;
-    let compressed = super::compress_or_abort(heap, &mut obj, *value);
-    let kind = transition_kind(obj, heap, key)?;
-    let from_shape_id = super::shape_id(obj, heap);
     let (to_shape_id, to_shape_count) =
         heap.read_payload(next_shape, |s| (s.id(), s.property_count()));
-    let existing_offset =
-        heap.read_payload(obj, |body| super::body_offset_of_atom(heap, body, key));
     // The appended slot's flat index is the new shape's last offset.
     let index = to_shape_count as usize - 1;
     let slot = u16::try_from(index).ok()?;
+    // Reserve before boxing the value: see the dictionary path above.
+    super::reserve_slot_capacity(&mut obj, heap, index + 1, &mut []).ok()?;
+    let compressed = super::compress_or_abort(heap, &mut obj, *value);
+    let kind = transition_kind(obj, heap, key)?;
+    let from_shape_id = super::shape_id(obj, heap);
+    let existing_offset =
+        heap.read_payload(obj, |body| super::body_offset_of_atom(heap, body, key));
     let transition = heap.with_payload(obj, |body| {
         if !is_fast_shape_body(body)
             || !body.extensible
@@ -238,6 +243,8 @@ pub(crate) fn replay_store_property_transition(
     // retains its original raw handle, so allocating before guard validation
     // would leave fallback holding a forwarded cell.
     let mut obj = obj;
+    // Reserve before boxing the value: see the append paths above.
+    super::reserve_slot_capacity(&mut obj, heap, usize::from(transition.slot) + 1, &mut []).ok()?;
     let compressed = super::compress_or_abort(heap, &mut obj, *value);
     // Shape nodes are allocated with `alloc_old_with_roots` and pinned for the
     // isolate lifetime because JIT guards bake their offsets. `to_shape`

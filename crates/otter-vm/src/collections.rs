@@ -59,6 +59,7 @@ pub const MAP_TABLE_BODY_TYPE_TAG: u8 = 0x34;
 pub const SET_TABLE_BODY_TYPE_TAG: u8 = 0x35;
 
 pub mod table;
+pub(crate) mod weak_table;
 
 /// Equality key for [`JsMap`] / [`JsSet`].
 ///
@@ -1119,8 +1120,8 @@ pub fn set_ptr_eq(a: JsSet, b: JsSet) -> bool {
 /// JS `WeakMap` — weakly-held object / unregistered-symbol-key table.
 pub type JsWeakMap = otter_gc::Gc<WeakMapBody>;
 
-#[derive(Debug, Clone)]
-enum WeakCollectionKey {
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WeakCollectionKey {
     Object(RawGc),
     Symbol(JsSymbol),
 }
@@ -1163,100 +1164,36 @@ impl WeakCollectionKey {
     }
 }
 
-/// Identity index shared by `WeakMap` and `WeakSet`.
-///
-/// Weak collections compare keys by identity, so a linear scan made insertion
-/// and lookup quadratic — building a hundred-thousand-entry chain took seconds.
-/// The index maps an identity hash to candidate entry positions, and each
-/// candidate is still verified with `matches`.
-///
-/// A moving collection relocates the very addresses the hashes are derived
-/// from, so the ephemeron walk marks the index stale and the next access
-/// rebuilds it. Rebuilding is linear and happens at most once per collection,
-/// which is what keeps the amortized cost constant.
-#[derive(Debug, Default)]
-struct WeakIdentityIndex {
-    buckets: rustc_hash::FxHashMap<u64, smallvec::SmallVec<[u32; 2]>>,
-    valid: bool,
-}
-
-impl WeakIdentityIndex {
-    fn invalidate(&mut self) {
-        self.valid = false;
-    }
-
-    fn rebuild<'a>(&mut self, keys: impl Iterator<Item = &'a WeakCollectionKey>) {
-        self.buckets.clear();
-        for (position, key) in keys.enumerate() {
-            self.buckets
-                .entry(key.identity_hash())
-                .or_default()
-                .push(position as u32);
-        }
-        self.valid = true;
-    }
-
-    fn candidates(&self, key: &WeakCollectionKey) -> &[u32] {
-        self.buckets
-            .get(&key.identity_hash())
-            .map_or(&[][..], |bucket| bucket.as_slice())
-    }
-
-    fn insert(&mut self, key: &WeakCollectionKey, position: usize) {
-        if self.valid {
-            self.buckets
-                .entry(key.identity_hash())
-                .or_default()
-                .push(position as u32);
-        }
-    }
-}
-
-#[derive(Debug, Default, otter_macros::Pelt)]
+#[derive(Default, otter_macros::Pelt)]
 #[pelt(tag = WEAK_MAP_BODY_TYPE_TAG, ephemeron_via = weak_map_ephemeron_walk)]
 /// GC-allocated storage backing every [`JsWeakMap`] handle.
 ///
-/// Ephemeron entries are not ordinary strong edges; the derive
-/// emits an empty trace for [`entries`](Self::entries) and the
-/// `ephemeron_via` hook walks the key / value pairs through the
-/// `EphemeronVisitor` so the VM fixpoint marks values only after the
-/// key is already live.
+/// The entries live in a [`weak_table::WeakTableBody`] this body names
+/// by handle. The handle is a strong edge — the table cell must live as
+/// long as the map — but the table's own strong trace is empty:
+/// ephemeron entries are not ordinary edges, and the `ephemeron_via`
+/// hook reaches them through the handle so the fixpoint marks a value
+/// only after its key is already live.
 pub struct WeakMapBody {
-    #[pelt(skip)]
-    entries: Vec<(WeakCollectionKey, Value)>,
-    /// Identity index over [`entries`](Self::entries). See [`WeakIdentityIndex`].
-    #[pelt(skip)]
-    index: WeakIdentityIndex,
+    table: weak_table::WeakTableHandle<weak_table::MapKind>,
     prototype_override: Option<Value>,
-}
-
-impl WeakMapBody {
-    /// Position of the entry whose key is `key`, using the identity index.
-    fn position(&mut self, key: &WeakCollectionKey) -> Option<usize> {
-        if !self.index.valid {
-            let mut index = std::mem::take(&mut self.index);
-            index.rebuild(self.entries.iter().map(|(entry_key, _)| entry_key));
-            self.index = index;
-        }
-        self.index
-            .candidates(key)
-            .iter()
-            .map(|position| *position as usize)
-            .find(|position| {
-                self.entries
-                    .get(*position)
-                    .is_some_and(|(entry_key, _)| entry_key.matches(key))
-            })
-    }
 }
 
 fn weak_map_ephemeron_walk(
     body: &mut WeakMapBody,
     visitor: &mut otter_gc::trace::EphemeronVisitor<'_>,
 ) {
-    // The walk can relocate every key, and the index hashes their addresses.
-    body.index.invalidate();
-    for (key, value) in &mut body.entries {
+    let Some(table) = weak_table::body_of(body.table) else {
+        return;
+    };
+    // SAFETY: the handle names a live old-space table; entry slot
+    // addresses are stable for the duration of the walk.
+    let table = unsafe { &mut *table };
+    // The walk can relocate every key, and the chains hash their
+    // addresses.
+    table.mark_stale();
+    for entry in table.entries_mut() {
+        let weak_table::WeakEntry { key, value, .. } = entry;
         if let WeakCollectionKey::Object(raw) = key {
             let key_slot = raw as *mut RawGc;
             let mut visit_value_slots =
@@ -1304,6 +1241,25 @@ pub(crate) fn set_weak_map_prototype_override(
     }
 }
 
+/// Run `f` over the map's table, or return `default` when the map has
+/// never grown one.
+fn with_weak_map_table<R>(
+    heap: &otter_gc::GcHeap,
+    map: JsWeakMap,
+    default: R,
+    f: impl FnOnce(&mut weak_table::WeakTableBody<weak_table::MapKind>) -> R,
+) -> R {
+    heap.read_payload(map, |body| {
+        match weak_table::body_of(body.table) {
+            // SAFETY: the handle names a live old-space table no other
+            // borrow reaches — table access is funneled through the
+            // map's payload borrow.
+            Some(table) => f(unsafe { &mut *table }),
+            None => default,
+        }
+    })
+}
+
 /// `WeakMap.prototype.get` — Spec §24.3.3.3.
 pub fn weak_map_get(
     map: JsWeakMap,
@@ -1311,8 +1267,10 @@ pub fn weak_map_get(
     key: &Value,
 ) -> Result<Option<Value>, CollectionError> {
     let key = weak_collection_key(key, heap)?;
-    Ok(heap.with_payload(map, |body| {
-        body.position(&key).map(|position| body.entries[position].1)
+    Ok(with_weak_map_table(heap, map, None, |table| {
+        table
+            .position(&key)
+            .map(|position| table.entries()[position].value)
     }))
 }
 
@@ -1323,16 +1281,19 @@ pub fn weak_map_has(
     key: &Value,
 ) -> Result<bool, CollectionError> {
     let key = weak_collection_key(key, heap)?;
-    Ok(heap.with_payload(map, |body| body.position(&key).is_some()))
+    Ok(with_weak_map_table(heap, map, false, |table| {
+        table.position(&key).is_some()
+    }))
 }
 
 /// Number of weak-map entries currently stored.
 #[must_use]
 pub fn weak_map_len(map: JsWeakMap, heap: &otter_gc::GcHeap) -> usize {
-    heap.read_payload(map, |body| {
-        body.entries
+    with_weak_map_table(heap, map, 0, |table| {
+        table
+            .entries()
             .iter()
-            .filter(|(entry_key, _)| entry_key.is_live_object_key())
+            .filter(|entry| entry.key.is_live_object_key())
             .count()
     })
 }
@@ -1344,35 +1305,7 @@ pub fn weak_map_set(
     key: Value,
     value: Value,
 ) -> Result<(), CollectionError> {
-    let barrier_value = value;
-    let key_root = key;
-    let value_root = value;
-    let key_for_exists = weak_collection_key(&key, heap)?;
-    let exists = heap.with_payload(map, |body| body.position(&key_for_exists).is_some());
-    if !exists {
-        // Entry count, not the live-key count: reservation only needs an upper
-        // bound, and counting live keys is linear on every insert.
-        let target_len = heap
-            .read_payload(map, |body| body.entries.len())
-            .saturating_add(1);
-        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            key_root.trace_value_slots(visitor);
-            value_root.trace_value_slots(visitor);
-        };
-        reserve_weak_map_for_target_len_with_roots(&mut map, heap, target_len, &mut reserve_roots)?;
-    }
-    let key = weak_collection_key(&key, heap)?;
-    heap.with_payload(map, |body| {
-        if let Some(position) = body.position(&key) {
-            body.entries[position].1 = value;
-        } else {
-            let position = body.entries.len();
-            body.index.insert(&key, position);
-            body.entries.push((key, value));
-        }
-    });
-    heap.record_write(map, &barrier_value);
-    Ok(())
+    weak_map_set_with_roots(&mut map, heap, key, value, &mut |_| {})
 }
 
 /// `WeakMap.prototype.set` for stack/native-visible VM construction paths.
@@ -1387,34 +1320,27 @@ pub(crate) fn weak_map_set_with_roots(
     let key_root = key;
     let value_root = value;
     let key = weak_collection_key(&key, heap)?;
-    let exists = heap.with_payload(*map, |body| body.position(&key).is_some());
+    let exists = with_weak_map_table(heap, *map, false, |table| table.position(&key).is_some());
     if !exists {
+        let target_len = with_weak_map_table(heap, *map, 0, |table| table.len()).saturating_add(1);
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
             key_root.trace_value_slots(visitor);
             value_root.trace_value_slots(visitor);
         };
-        reserve_weak_map_for_target_len_with_roots(
-            map,
-            heap,
-            heap.read_payload(*map, |body| body.entries.len())
-                .saturating_add(1),
-            &mut reserve_roots,
-        )?;
+        reserve_weak_map_for_target_len_with_roots(map, heap, target_len, &mut reserve_roots)?;
     }
     // Reservation may have run a moving collection, which relocates the key
     // the weak entry is about to record.
     let key = weak_collection_key(&key_root, heap)?;
-    heap.with_payload(*map, |body| {
-        if let Some(position) = body.position(&key) {
-            body.entries[position].1 = value;
+    with_weak_map_table(heap, *map, (), |table| {
+        if let Some(position) = table.position(&key) {
+            table.entries_mut()[position].value = value;
         } else {
-            let position = body.entries.len();
-            body.index.insert(&key, position);
-            body.entries.push((key, value));
+            table.push(key, value);
         }
     });
-    heap.record_write(*map, &barrier_value);
+    record_weak_map_write(heap, *map, &barrier_value);
     Ok(())
 }
 
@@ -1425,12 +1351,9 @@ pub fn weak_map_delete(
     key: &Value,
 ) -> Result<bool, CollectionError> {
     let key = weak_collection_key(key, heap)?;
-    Ok(heap.with_payload(map, |body| {
-        if let Some(position) = body.position(&key) {
-            body.entries.remove(position);
-            // Removal shifts every later entry, so the recorded positions no
-            // longer address their keys.
-            body.index.invalidate();
+    Ok(with_weak_map_table(heap, map, false, |table| {
+        if let Some(position) = table.position(&key) {
+            table.swap_remove(position);
             true
         } else {
             false
@@ -1441,55 +1364,53 @@ pub fn weak_map_delete(
 /// JS `WeakSet` — weakly-held object / unregistered-symbol set.
 pub type JsWeakSet = otter_gc::Gc<WeakSetBody>;
 
-#[derive(Debug, Default, otter_macros::Pelt)]
+#[derive(Default, otter_macros::Pelt)]
 #[pelt(tag = WEAK_SET_BODY_TYPE_TAG, ephemeron_via = weak_set_ephemeron_walk)]
 /// GC-allocated storage backing every [`JsWeakSet`] handle.
 ///
-/// WeakSet keys are weak and never traced as strong edges; the
-/// derive skips [`entries`](Self::entries) and the `ephemeron_via`
-/// hook walks the keys through the `EphemeronVisitor`.
+/// The entries live in a [`weak_table::WeakTableBody`] this body names
+/// by handle, exactly as [`WeakMapBody`] does; the value slot of every
+/// entry is `undefined`.
 pub struct WeakSetBody {
-    #[pelt(skip)]
-    entries: Vec<WeakCollectionKey>,
-    /// Identity index over [`entries`](Self::entries). See [`WeakIdentityIndex`].
-    #[pelt(skip)]
-    index: WeakIdentityIndex,
+    table: weak_table::WeakTableHandle<weak_table::SetKind>,
     prototype_override: Option<Value>,
-}
-
-impl WeakSetBody {
-    /// Position of the entry whose key is `key`, using the identity index.
-    fn position(&mut self, key: &WeakCollectionKey) -> Option<usize> {
-        if !self.index.valid {
-            let mut index = std::mem::take(&mut self.index);
-            index.rebuild(self.entries.iter());
-            self.index = index;
-        }
-        self.index
-            .candidates(key)
-            .iter()
-            .map(|position| *position as usize)
-            .find(|position| {
-                self.entries
-                    .get(*position)
-                    .is_some_and(|entry_key| entry_key.matches(key))
-            })
-    }
 }
 
 fn weak_set_ephemeron_walk(
     body: &mut WeakSetBody,
     visitor: &mut otter_gc::trace::EphemeronVisitor<'_>,
 ) {
+    let Some(table) = weak_table::body_of(body.table) else {
+        return;
+    };
+    // SAFETY: as in `weak_map_ephemeron_walk`.
+    let table = unsafe { &mut *table };
     // As in [`weak_map_ephemeron_walk`]: relocation invalidates the hashes.
-    body.index.invalidate();
-    for key in &mut body.entries {
-        if let WeakCollectionKey::Object(raw) = key {
+    table.mark_stale();
+    for entry in table.entries_mut() {
+        if let WeakCollectionKey::Object(raw) = &mut entry.key {
             let key_slot = raw as *mut RawGc;
             let mut visit_value_slots = |_slot_visitor: &mut SlotVisitor<'_>| {};
             visitor(key_slot, &mut visit_value_slots);
         }
     }
+}
+
+/// Run `f` over the set's table, or return `default` when the set has
+/// never grown one. See [`with_weak_map_table`].
+fn with_weak_set_table<R>(
+    heap: &otter_gc::GcHeap,
+    set: JsWeakSet,
+    default: R,
+    f: impl FnOnce(&mut weak_table::WeakTableBody<weak_table::SetKind>) -> R,
+) -> R {
+    heap.read_payload(set, |body| {
+        match weak_table::body_of(body.table) {
+            // SAFETY: as in `with_weak_map_table`.
+            Some(table) => f(unsafe { &mut *table }),
+            None => default,
+        }
+    })
 }
 
 /// Allocate a fresh empty `WeakSet`.
@@ -1537,16 +1458,19 @@ pub fn weak_set_has(
     value: &Value,
 ) -> Result<bool, CollectionError> {
     let key = weak_collection_key(value, heap)?;
-    Ok(heap.with_payload(set, |body| body.position(&key).is_some()))
+    Ok(with_weak_set_table(heap, set, false, |table| {
+        table.position(&key).is_some()
+    }))
 }
 
 /// Number of weak-set entries currently stored.
 #[must_use]
 pub fn weak_set_len(set: JsWeakSet, heap: &otter_gc::GcHeap) -> usize {
-    heap.read_payload(set, |body| {
-        body.entries
+    with_weak_set_table(heap, set, 0, |table| {
+        table
+            .entries()
             .iter()
-            .filter(|entry_key| entry_key.is_live_object_key())
+            .filter(|entry| entry.key.is_live_object_key())
             .count()
     })
 }
@@ -1557,28 +1481,7 @@ pub fn weak_set_add(
     heap: &mut otter_gc::GcHeap,
     value: Value,
 ) -> Result<(), CollectionError> {
-    let value_root = value;
-    let key_for_exists = weak_collection_key(&value, heap)?;
-    let exists = heap.with_payload(set, |body| body.position(&key_for_exists).is_some());
-    if !exists {
-        // Upper bound; see the matching note in `weak_map_set`.
-        let target_len = heap
-            .read_payload(set, |body| body.entries.len())
-            .saturating_add(1);
-        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            value_root.trace_value_slots(visitor);
-        };
-        reserve_weak_set_for_target_len_with_roots(&mut set, heap, target_len, &mut reserve_roots)?;
-    }
-    let key = weak_collection_key(&value, heap)?;
-    heap.with_payload(set, |body| {
-        if body.position(&key).is_none() {
-            let position = body.entries.len();
-            body.index.insert(&key, position);
-            body.entries.push(key);
-        }
-    });
-    Ok(())
+    weak_set_add_with_roots(&mut set, heap, value, &mut |_| {})
 }
 
 /// `WeakSet.prototype.add` for stack/native-visible VM construction paths.
@@ -1590,25 +1493,21 @@ pub(crate) fn weak_set_add_with_roots(
 ) -> Result<(), CollectionError> {
     let value_root = value;
     let key = weak_collection_key(&value, heap)?;
-    let exists = heap.with_payload(*set, |body| body.position(&key).is_some());
+    let exists = with_weak_set_table(heap, *set, false, |table| table.position(&key).is_some());
     if !exists {
+        let target_len = with_weak_set_table(heap, *set, 0, |table| table.len()).saturating_add(1);
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
             value_root.trace_value_slots(visitor);
         };
-        reserve_weak_set_for_target_len_with_roots(
-            set,
-            heap,
-            heap.read_payload(*set, |body| body.entries.len())
-                .saturating_add(1),
-            &mut reserve_roots,
-        )?;
+        reserve_weak_set_for_target_len_with_roots(set, heap, target_len, &mut reserve_roots)?;
     }
-    heap.with_payload(*set, |body| {
-        if body.position(&key).is_none() {
-            let position = body.entries.len();
-            body.index.insert(&key, position);
-            body.entries.push(key);
+    // Reservation may have run a moving collection, which relocates the
+    // key the weak entry is about to record.
+    let key = weak_collection_key(&value_root, heap)?;
+    with_weak_set_table(heap, *set, (), |table| {
+        if table.position(&key).is_none() {
+            table.push(key, Value::undefined());
         }
     });
     Ok(())
@@ -1621,11 +1520,9 @@ pub fn weak_set_delete(
     value: &Value,
 ) -> Result<bool, CollectionError> {
     let key = weak_collection_key(value, heap)?;
-    Ok(heap.with_payload(set, |body| {
-        if let Some(position) = body.position(&key) {
-            body.entries.remove(position);
-            // Removal shifts every later entry; see `weak_map_delete`.
-            body.index.invalidate();
+    Ok(with_weak_set_table(heap, set, false, |table| {
+        if let Some(position) = table.position(&key) {
+            table.swap_remove(position);
             true
         } else {
             false
@@ -1641,31 +1538,27 @@ pub fn run_ephemeron_fixpoint(heap: &mut otter_gc::GcHeap) {
             if !heap.is_marked(raw) {
                 continue;
             }
-            match heap.raw_type_tag(raw) {
-                Some(WEAK_MAP_BODY_TYPE_TAG) => {
-                    let Some(map) = heap.cast_raw_if_type::<WeakMapBody>(raw) else {
-                        continue;
-                    };
-                    heap.read_payload(map, |body| {
-                        for (key, value) in &body.entries {
-                            match key {
-                                WeakCollectionKey::Object(raw) if heap.is_marked(*raw) => {
-                                    if let Some(value_raw) = value.as_raw_gc() {
-                                        additions.push(value_raw);
-                                    }
+            if heap.raw_type_tag(raw) == Some(WEAK_MAP_BODY_TYPE_TAG) {
+                let Some(map) = heap.cast_raw_if_type::<WeakMapBody>(raw) else {
+                    continue;
+                };
+                with_weak_map_table(heap, map, (), |table| {
+                    for entry in table.entries() {
+                        match entry.key {
+                            WeakCollectionKey::Object(raw) if heap.is_marked(raw) => {
+                                if let Some(value_raw) = entry.value.as_raw_gc() {
+                                    additions.push(value_raw);
                                 }
-                                WeakCollectionKey::Symbol(_) => {
-                                    if let Some(value_raw) = value.as_raw_gc() {
-                                        additions.push(value_raw);
-                                    }
-                                }
-                                _ => {}
                             }
+                            WeakCollectionKey::Symbol(_) => {
+                                if let Some(value_raw) = entry.value.as_raw_gc() {
+                                    additions.push(value_raw);
+                                }
+                            }
+                            _ => {}
                         }
-                    });
-                }
-                Some(WEAK_SET_BODY_TYPE_TAG) => {}
-                _ => {}
+                    }
+                });
             }
         }
         if !heap.mark_additional(additions) {
@@ -1673,48 +1566,30 @@ pub fn run_ephemeron_fixpoint(heap: &mut otter_gc::GcHeap) {
         }
     }
 
+    // Prune dead-key entries.
     for raw in heap.ephemeron_tables_snapshot() {
         if !heap.is_marked(raw) {
             continue;
         }
+        let keep = |key: &WeakCollectionKey| match *key {
+            WeakCollectionKey::Object(raw) => !raw.is_null() && heap.is_marked(raw),
+            WeakCollectionKey::Symbol(_) => true,
+        };
         match heap.raw_type_tag(raw) {
             Some(WEAK_MAP_BODY_TYPE_TAG) => {
                 let Some(map) = heap.cast_raw_if_type::<WeakMapBody>(raw) else {
                     continue;
                 };
-                let live_keys = heap
-                    .read_payload(map, |body| {
-                        body.entries
-                            .iter()
-                            .map(|(key, _)| key.clone())
-                            .collect::<Vec<_>>()
-                    })
-                    .into_iter()
-                    .filter(|key| match key {
-                        WeakCollectionKey::Object(raw) => !raw.is_null() && heap.is_marked(*raw),
-                        WeakCollectionKey::Symbol(_) => true,
-                    })
-                    .collect::<Vec<_>>();
-                heap.with_payload(map, |body| {
-                    body.entries
-                        .retain(|(key, _)| live_keys.iter().any(|live| live.matches(key)));
+                with_weak_map_table(heap, map, (), |table| {
+                    table.retain(|entry| keep(&entry.key));
                 });
             }
             Some(WEAK_SET_BODY_TYPE_TAG) => {
                 let Some(set) = heap.cast_raw_if_type::<WeakSetBody>(raw) else {
                     continue;
                 };
-                let live_keys = heap
-                    .read_payload(set, |body| body.entries.clone())
-                    .into_iter()
-                    .filter(|key| match key {
-                        WeakCollectionKey::Object(raw) => !raw.is_null() && heap.is_marked(*raw),
-                        WeakCollectionKey::Symbol(_) => true,
-                    })
-                    .collect::<Vec<_>>();
-                heap.with_payload(set, |body| {
-                    body.entries
-                        .retain(|key| live_keys.iter().any(|live| live.matches(key)));
+                with_weak_set_table(heap, set, (), |table| {
+                    table.retain(|entry| keep(&entry.key));
                 });
             }
             _ => {}
@@ -1917,64 +1792,88 @@ fn record_set_table_contents(heap: &mut otter_gc::GcHeap, table: table::TableHan
     }
 }
 
+/// Make room for `target_len` entries by allocating a larger table and
+/// carrying the entries over. The entries are ephemerons, so no strong
+/// barrier pass follows the copy: every scavenge walks every registered
+/// collection's entries through the `ephemeron_via` hook regardless of
+/// remembered sets.
 fn reserve_weak_map_for_target_len_with_roots(
     map: &mut JsWeakMap,
     heap: &mut otter_gc::GcHeap,
     target_len: usize,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let capacity = heap.read_payload(*map, |body| body.entries.capacity());
+    let capacity = with_weak_map_table(heap, *map, 0, |table| table.capacity());
     if target_len <= capacity {
         return Ok(());
     }
-    let before = weak_map_capacity_bytes(capacity);
-    let after = weak_map_capacity_bytes(target_len);
-    if after > before {
-        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            external_visit(visitor);
-            visitor(std::ptr::addr_of_mut!(*map) as *mut RawGc);
-        };
-        heap.reserve_bytes_with_roots((after - before) as u64, &mut reserve_roots)?;
-    }
-    heap.with_payload(*map, |body| {
-        body.entries
-            .reserve(target_len.saturating_sub(body.entries.len()));
+    let grown = target_len.max(capacity.saturating_mul(2)).max(4);
+    let owner_slot = std::ptr::addr_of_mut!(*map);
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
+        visitor(owner_slot.cast::<RawGc>());
+    };
+    let table = weak_table::alloc_weak_table::<weak_table::MapKind>(heap, grown, &mut visit)?;
+    let owner = *map;
+    let carried: Vec<weak_table::WeakEntry> =
+        with_weak_map_table(heap, owner, Vec::new(), |old| old.entries().to_vec());
+    heap.with_payload(owner, |body| {
+        // SAFETY: the handle names the table just allocated, which no
+        // other borrow reaches.
+        unsafe { (*weak_table::body_of(table).expect("fresh table")).refill_from(&carried) };
+        body.table = table;
+        true
     });
+    heap.record_write(owner, &table);
     Ok(())
 }
 
+/// See [`reserve_weak_map_for_target_len_with_roots`].
 fn reserve_weak_set_for_target_len_with_roots(
     set: &mut JsWeakSet,
     heap: &mut otter_gc::GcHeap,
     target_len: usize,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let capacity = heap.read_payload(*set, |body| body.entries.capacity());
+    let capacity = with_weak_set_table(heap, *set, 0, |table| table.capacity());
     if target_len <= capacity {
         return Ok(());
     }
-    let before = weak_set_capacity_bytes(capacity);
-    let after = weak_set_capacity_bytes(target_len);
-    if after > before {
-        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            external_visit(visitor);
-            visitor(std::ptr::addr_of_mut!(*set) as *mut RawGc);
-        };
-        heap.reserve_bytes_with_roots((after - before) as u64, &mut reserve_roots)?;
-    }
-    heap.with_payload(*set, |body| {
-        body.entries
-            .reserve(target_len.saturating_sub(body.entries.len()));
+    let grown = target_len.max(capacity.saturating_mul(2)).max(4);
+    let owner_slot = std::ptr::addr_of_mut!(*set);
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
+        visitor(owner_slot.cast::<RawGc>());
+    };
+    let table = weak_table::alloc_weak_table::<weak_table::SetKind>(heap, grown, &mut visit)?;
+    let owner = *set;
+    let carried: Vec<weak_table::WeakEntry> =
+        with_weak_set_table(heap, owner, Vec::new(), |old| old.entries().to_vec());
+    heap.with_payload(owner, |body| {
+        // SAFETY: as in the map path.
+        unsafe { (*weak_table::body_of(table).expect("fresh table")).refill_from(&carried) };
+        body.table = table;
+        true
     });
+    heap.record_write(owner, &table);
     Ok(())
 }
 
-fn weak_map_capacity_bytes(capacity: usize) -> usize {
-    capacity.saturating_mul(std::mem::size_of::<(WeakCollectionKey, Value)>())
-}
-
-fn weak_set_capacity_bytes(capacity: usize) -> usize {
-    capacity.saturating_mul(std::mem::size_of::<WeakCollectionKey>())
+/// Remember a value write against the map and its table.
+///
+/// The value slot lives in the table's own old-space cell; the map is
+/// remembered too because the same call sites also write slots it owns.
+/// Keys need no barrier: weak entries are reached through the ephemeron
+/// registry on every collection, not through remembered sets.
+fn record_weak_map_write<V>(heap: &mut otter_gc::GcHeap, map: JsWeakMap, value: &V)
+where
+    V: otter_gc::GcStore + ?Sized,
+{
+    heap.record_write(map, value);
+    let table = heap.read_payload(map, |body| body.table);
+    if !table.is_null() {
+        heap.record_write(table, value);
+    }
 }
 
 #[cfg(test)]
@@ -2234,5 +2133,81 @@ mod tests {
         let key = Value::string(JsString::from_str("k", &mut gc_heap).unwrap());
         map_set(m, &mut gc_heap, key, n(1)).unwrap();
         assert_eq!(map_get(m, &gc_heap, &key), Some(n(1)),);
+    }
+
+    /// Growth carries every entry across table generations, swap-remove
+    /// keeps the survivors findable through re-threaded chains, and a
+    /// minor collection in the middle (which relocates the addresses
+    /// every identity hash derives from) does not lose an entry.
+    #[test]
+    fn weakmap_survives_growth_deletion_and_relocation() {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let mut wm = alloc_weak_map(&mut heap).unwrap();
+        let mut keys: Vec<Value> = Vec::new();
+        for i in 0..64 {
+            let key =
+                Value::object(crate::object::alloc_object_old_for_fixture(&mut heap).unwrap());
+            weak_map_set(wm, &mut heap, key, n(i)).unwrap();
+            keys.push(key);
+        }
+        assert_eq!(weak_map_len(wm, &heap), 64);
+        // Delete every other key; swap-remove reorders and staleness must
+        // not lose the survivors.
+        for key in keys.iter().step_by(2) {
+            assert!(weak_map_delete(wm, &mut heap, key).unwrap());
+        }
+        assert_eq!(weak_map_len(wm, &heap), 32);
+        // Relocation invalidates the identity hashes behind the chains.
+        let keys_base = keys.as_mut_ptr();
+        let keys_len = keys.len();
+        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visitor(std::ptr::addr_of_mut!(wm) as *mut RawGc);
+            for index in 0..keys_len {
+                // SAFETY: `index < keys_len`, and the vec outlives the walk.
+                unsafe { (*keys_base.add(index)).trace_value_slot_mut(visitor) };
+            }
+        };
+        heap.collect_minor_with_roots(&mut roots).expect("minor GC");
+        for (i, key) in keys.iter().enumerate() {
+            let got = weak_map_get(wm, &mut heap, key).unwrap();
+            if i % 2 == 0 {
+                assert_eq!(got, None, "deleted key {i} resurfaced");
+            } else {
+                assert_eq!(got, Some(n(i as i32)), "surviving key {i} lost");
+            }
+        }
+    }
+
+    /// The set variant of the growth / deletion / relocation walk.
+    #[test]
+    fn weakset_survives_growth_deletion_and_relocation() {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let mut ws = alloc_weak_set(&mut heap).unwrap();
+        let mut keys: Vec<Value> = Vec::new();
+        for _ in 0..64 {
+            let key =
+                Value::object(crate::object::alloc_object_old_for_fixture(&mut heap).unwrap());
+            weak_set_add(ws, &mut heap, key).unwrap();
+            keys.push(key);
+        }
+        assert_eq!(weak_set_len(ws, &heap), 64);
+        for key in keys.iter().step_by(2) {
+            assert!(weak_set_delete(ws, &mut heap, key).unwrap());
+        }
+        assert_eq!(weak_set_len(ws, &heap), 32);
+        let keys_base = keys.as_mut_ptr();
+        let keys_len = keys.len();
+        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visitor(std::ptr::addr_of_mut!(ws) as *mut RawGc);
+            for index in 0..keys_len {
+                // SAFETY: `index < keys_len`, and the vec outlives the walk.
+                unsafe { (*keys_base.add(index)).trace_value_slot_mut(visitor) };
+            }
+        };
+        heap.collect_minor_with_roots(&mut roots).expect("minor GC");
+        for (i, key) in keys.iter().enumerate() {
+            let has = weak_set_has(ws, &mut heap, key).unwrap();
+            assert_eq!(has, i % 2 != 0, "wrong membership for key {i}");
+        }
     }
 }

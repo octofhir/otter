@@ -670,8 +670,9 @@ mod tests {
         // The rare/exotic sidecar is the same story: an object that needs
         // one (a callable, a wrapper, a dictionary-mode object) allocates a
         // GC body where it used to allocate a `Box`. Same allocation, now
-        // counted.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 2120;
+        // counted. A dynamic native's capture slab likewise replaced a
+        // `SmallVec` spill.
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 2140;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 560 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");

@@ -102,7 +102,11 @@ pub fn promise_fulfill_reaction_debug(
 pub fn native_function_captures(native: NativeFunction, heap: &otter_gc::GcHeap) -> Vec<Value> {
     match native.call_target(heap) {
         NativeCallTarget::Dynamic { captures, .. }
-        | NativeCallTarget::LocalDynamic { captures, .. } => captures.into_iter().collect(),
+        | NativeCallTarget::LocalDynamic { captures, .. } => {
+            // SAFETY: `native` is live for the duration of this call and
+            // names the slab.
+            unsafe { crate::value_slab::live_slice(captures) }.to_vec()
+        }
         NativeCallTarget::Static(_) | NativeCallTarget::VmIntrinsic(_) => Vec::new(),
     }
 }

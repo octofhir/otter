@@ -1,19 +1,21 @@
-//! Dense element storage for arrays, allocated inside the GC heap.
+//! Flat `Value` storage allocated inside the GC heap.
 //!
-//! An array's dense elements were a `Vec<Value>`: malloc memory the
-//! collector does not own. That made an array unrestorable — a page image
-//! could not carry the buffer, a restored copy would alias the original,
-//! and the tracer handed the collector slot addresses outside the heap.
+//! A backing store of JS values was a `Vec<Value>` or a `SmallVec`:
+//! malloc memory the collector does not own. That made its owner
+//! unrestorable — a page image could not carry the buffer, a restored
+//! copy would alias the original, and the tracer handed the collector
+//! slot addresses outside the heap.
 //!
-//! So the elements live in a GC body with the values in trailing storage
-//! in the same cell — V8's `FixedArray` elements store, reached from the
-//! array by handle, for the same reason.
+//! So the values live in a GC body with the payload in trailing storage
+//! in the same cell — V8's `FixedArray`, reached from the owner by
+//! handle. An array's dense elements and a native function's captures
+//! are the two current owners.
 //!
 //! # Contents
 //!
-//! - [`ElementSlabBody`] — capacity header followed by its values.
-//! - [`ElementSlabHandle`] — handle type stored by an array body.
-//! - [`alloc_element_slab`] — allocate one, with the caller's roots live
+//! - [`ValueSlabBody`] — capacity header followed by its values.
+//! - [`ValueSlabHandle`] — handle type stored by an array body.
+//! - [`alloc_value_slab`] — allocate one, with the caller's roots live
 //!   across the allocation.
 //!
 //! # Invariants
@@ -41,11 +43,11 @@ use otter_gc::raw::SlotVisitor;
 
 use crate::Value;
 
-/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`ElementSlabBody`].
-pub const ELEMENT_SLAB_BODY_TYPE_TAG: u8 = 0x33;
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`ValueSlabBody`].
+pub const VALUE_SLAB_BODY_TYPE_TAG: u8 = 0x33;
 
 /// Handle to an array's dense element storage.
-pub type ElementSlabHandle = otter_gc::Gc<ElementSlabBody>;
+pub type ValueSlabHandle = otter_gc::Gc<ValueSlabBody>;
 
 /// Capacity header for dense element storage. The values follow it in
 /// the same cell.
@@ -55,7 +57,7 @@ pub type ElementSlabHandle = otter_gc::Gc<ElementSlabBody>;
 /// four bytes the capacity needs, because an unaligned element read is
 /// undefined behaviour.
 #[repr(C, align(8))]
-pub struct ElementSlabBody {
+pub struct ValueSlabBody {
     /// Values the trailing array can hold.
     capacity: u32,
     /// Values actually initialised, and therefore traced. The array body
@@ -64,7 +66,7 @@ pub struct ElementSlabBody {
     len: u32,
 }
 
-impl ElementSlabBody {
+impl ValueSlabBody {
     /// Trailing bytes a slab of `capacity` values needs.
     #[must_use]
     pub fn trailing_bytes(capacity: usize) -> usize {
@@ -125,10 +127,10 @@ impl ElementSlabBody {
 // The trailing values must land on their own alignment, so the header has
 // to be a whole number of `Value` slots wide.
 const _: () =
-    assert!(std::mem::size_of::<ElementSlabBody>().is_multiple_of(std::mem::align_of::<Value>()));
+    assert!(std::mem::size_of::<ValueSlabBody>().is_multiple_of(std::mem::align_of::<Value>()));
 
-impl otter_gc::SafeTraceable for ElementSlabBody {
-    const TYPE_TAG: u8 = ELEMENT_SLAB_BODY_TYPE_TAG;
+impl otter_gc::SafeTraceable for ValueSlabBody {
+    const TYPE_TAG: u8 = VALUE_SLAB_BODY_TYPE_TAG;
 
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
         let base = self.values_ptr();
@@ -147,7 +149,7 @@ impl otter_gc::SafeTraceable for ElementSlabBody {
 /// place that decodes a slab handle without going through the heap — the
 /// array's tracer needs it while it already holds the body.
 #[must_use]
-pub fn values_base(slab: ElementSlabHandle) -> *mut Value {
+pub fn values_base(slab: ValueSlabHandle) -> *mut Value {
     if slab.is_null() {
         return std::ptr::null_mut();
     }
@@ -158,7 +160,7 @@ pub fn values_base(slab: ElementSlabHandle) -> *mut Value {
 
 /// Values `slab` can hold, or zero for a null handle.
 #[must_use]
-pub fn capacity_of(slab: ElementSlabHandle) -> usize {
+pub fn capacity_of(slab: ValueSlabHandle) -> usize {
     body_of(slab).map_or(0, |body| {
         // SAFETY: `body_of` returns a pointer to a live slab payload.
         unsafe { (*body).capacity() }
@@ -170,18 +172,18 @@ pub fn capacity_of(slab: ElementSlabHandle) -> usize {
 /// The array body reaches its slab this way while holding a payload
 /// borrow, where there is no heap to ask.
 #[must_use]
-pub fn body_of(slab: ElementSlabHandle) -> Option<*mut ElementSlabBody> {
+pub fn body_of(slab: ValueSlabHandle) -> Option<*mut ValueSlabBody> {
     if slab.is_null() {
         return None;
     }
     let header = slab.as_header_ptr();
     // SAFETY: a non-null handle names a live cell whose payload is an
-    // `ElementSlabBody` one header past the start.
+    // `ValueSlabBody` one header past the start.
     Some(unsafe {
         header
             .cast::<u8>()
             .add(std::mem::size_of::<otter_gc::GcHeader>())
-            .cast::<ElementSlabBody>()
+            .cast::<ValueSlabBody>()
     })
 }
 
@@ -197,16 +199,76 @@ pub fn body_of(slab: ElementSlabHandle) -> Option<*mut ElementSlabBody> {
 ///
 /// # Errors
 /// Propagates [`otter_gc::OutOfMemory`].
-pub fn alloc_element_slab(
+pub fn alloc_value_slab(
     heap: &mut otter_gc::GcHeap,
     capacity: usize,
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
-) -> Result<ElementSlabHandle, otter_gc::OutOfMemory> {
+) -> Result<ValueSlabHandle, otter_gc::OutOfMemory> {
     heap.alloc_variable_with_roots(
-        ElementSlabBody::new(capacity),
-        ElementSlabBody::trailing_bytes(capacity),
+        ValueSlabBody::new(capacity),
+        ValueSlabBody::trailing_bytes(capacity),
         external_visit,
     )
+}
+
+/// Allocate a slab holding exactly `values`, in order.
+///
+/// The pending values are rooted across the allocation — they are
+/// ordinary `Value`s on the caller's stack, and a collection here would
+/// otherwise leave the copies naming pre-move objects. The copy happens
+/// behind the mutator's back, so every old→young edge it creates is
+/// remembered against the slab before this returns.
+///
+/// # Errors
+/// Propagates [`otter_gc::OutOfMemory`].
+pub fn slab_from_values(
+    heap: &mut otter_gc::GcHeap,
+    values: &mut [Value],
+    external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+) -> Result<ValueSlabHandle, otter_gc::OutOfMemory> {
+    if values.is_empty() {
+        return Ok(ValueSlabHandle::null());
+    }
+    let count = values.len();
+    let base = values.as_mut_ptr();
+    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        external_visit(visitor);
+        for index in 0..count {
+            // SAFETY: `index < count` and the caller's slice outlives
+            // this call, so the entry is a live slot to rewrite.
+            let value = unsafe { &mut *base.add(index) };
+            value.trace_value_slot_mut(visitor);
+        }
+    };
+    let slab = alloc_value_slab(heap, count, &mut visit)?;
+    let slab_base = values_base(slab);
+    for index in 0..count {
+        // SAFETY: `index < count = capacity`; source and destination do
+        // not overlap.
+        unsafe { *slab_base.add(index) = *base.add(index) };
+    }
+    // SAFETY: the handle names the slab just allocated.
+    unsafe { (*body_of(slab).expect("fresh slab")).set_len(count) };
+    for index in 0..count {
+        // SAFETY: `index < count`.
+        let value = unsafe { *base.add(index) };
+        heap.record_write(slab, &value);
+    }
+    Ok(slab)
+}
+
+/// The initialised values of `slab` as a slice, empty for a null handle.
+///
+/// # Safety
+/// The caller must keep the slab reachable for `'a` — in practice, the
+/// owner naming it must be rooted for the duration.
+pub unsafe fn live_slice<'a>(slab: ValueSlabHandle) -> &'a [Value] {
+    let Some(body) = body_of(slab) else {
+        return &[];
+    };
+    // SAFETY: caller keeps the slab live; the first `len` values were
+    // initialised before the slab became reachable.
+    unsafe { std::slice::from_raw_parts((*body).values_ptr().cast_const(), (*body).len()) }
 }
 
 #[cfg(test)]
@@ -217,15 +279,15 @@ mod tests {
     #[test]
     fn a_fresh_slab_is_empty_and_sized() {
         let mut interp = Interpreter::new();
-        let slab = alloc_element_slab(interp.gc_heap_mut(), 8, &mut |_| {}).expect("slab");
+        let slab = alloc_value_slab(interp.gc_heap_mut(), 8, &mut |_| {}).expect("slab");
         assert_eq!(capacity_of(slab), 8);
-        assert_eq!(interp.gc_heap().read_payload(slab, ElementSlabBody::len), 0);
+        assert_eq!(interp.gc_heap().read_payload(slab, ValueSlabBody::len), 0);
     }
 
     #[test]
     fn values_round_trip_through_the_trailing_array() {
         let mut interp = Interpreter::new();
-        let slab = alloc_element_slab(interp.gc_heap_mut(), 4, &mut |_| {}).expect("slab");
+        let slab = alloc_value_slab(interp.gc_heap_mut(), 4, &mut |_| {}).expect("slab");
         let base = values_base(slab);
         // SAFETY: the slab is live and has room for four values.
         unsafe { (*body_of(slab).expect("slab body")).set_len(4) };

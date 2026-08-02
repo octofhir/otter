@@ -31,8 +31,9 @@
 //!   call time. That keeps embedders from hiding isolate-local
 //!   `Gc<T>` / `Value` handles inside a long-lived closure.
 //! - Crate-internal unchecked constructors are reserved for audited
-//!   isolate-local VM helpers whose payload-specific trace hook covers
-//!   every hidden JS value.
+//!   isolate-local VM helpers. Their closures keep JS values in the
+//!   capture slab and nowhere else: shared Rust state behind the
+//!   closure's `Arc` must hold no `Value`, because nothing traces it.
 //!
 //! # See also
 //! - [GC API](../../../docs/book/src/engine/gc-api.md)
@@ -215,11 +216,13 @@ pub struct NativeFunctionBody {
     #[pelt(skip)]
     call: NativeCallStorage,
     /// JS values owned by the native payload and therefore traced
-    /// strongly while this function is reachable. This is the ONLY
-    /// place a dynamic closure may keep JS values: shared Rust state
-    /// behind the closure's `Arc` must hold no `Value` (a counter is
-    /// fine), because nothing traces it.
-    captures: SmallVec<[Value; 4]>,
+    /// strongly while this function is reachable, in a
+    /// [`crate::value_slab::ValueSlabBody`] of their own — null when
+    /// the callable captures nothing, which is every static builtin.
+    /// This is the ONLY place a dynamic closure may keep JS values:
+    /// shared Rust state behind the closure's `Arc` must hold no
+    /// `Value` (a counter is fine), because nothing traces it.
+    captures: crate::value_slab::ValueSlabHandle,
     /// Own property state for the built-in `name` property.
     name_property: NativeOwnProperty,
     /// Own property state for the built-in `length` property.
@@ -271,7 +274,9 @@ impl NativeFunctionBody {
             kind,
             static_addr,
             native_ref: self.native_ref,
-            capture_count: self.captures.len(),
+            // SAFETY: `self` is a live payload borrow, which keeps the
+            // slab it names reachable.
+            capture_count: unsafe { crate::value_slab::live_slice(self.captures).len() },
         }
     }
 }
@@ -322,6 +327,7 @@ impl NativeFunction {
             | NativeCallStorage::Dynamic(_)
             | NativeCallStorage::LocalDynamic(_) => 0,
         });
+        let mut captures = captures;
         let own_properties = {
             let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                 external_visit(visitor);
@@ -335,12 +341,21 @@ impl NativeFunction {
             crate::object::prevent_extensions(own_properties, heap);
         }
         let own_properties_root = Value::object(own_properties);
+        // The captures move into a slab body of their own; the shell
+        // below names it by handle. `slab_from_values` roots the pending
+        // values itself and remembers the copied-in edges.
+        let mut captures_slab = {
+            let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                external_visit(visitor);
+                own_properties_root.trace_value_slots(visitor);
+            };
+            crate::value_slab::slab_from_values(heap, &mut captures, &mut visit)?
+        };
+        let captures_slot = std::ptr::addr_of_mut!(captures_slab);
         let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
             own_properties_root.trace_value_slots(visitor);
-            for value in &captures {
-                value.trace_value_slots(visitor);
-            }
+            visitor(captures_slot.cast::<RawGc>());
         };
         Ok(Self {
             inner: heap.alloc_with_roots(
@@ -349,7 +364,7 @@ impl NativeFunction {
                     name,
                     length,
                     call,
-                    captures: captures.clone(),
+                    captures: captures_slab,
                     name_property: default_name_property(),
                     length_property: default_length_property(),
                     metadata,
@@ -1008,8 +1023,11 @@ impl NativeFunction {
         crate::object::delete_symbol(own_properties, heap, key)
     }
 
-    /// Clone the call target and captures so the caller can invoke
-    /// it after releasing the heap borrow.
+    /// Clone the call target so the caller can invoke it after
+    /// releasing the heap borrow. Captures stay in their slab: the
+    /// target carries the handle, and the invoked closure reads the
+    /// live storage — which a collection mid-call rewrites in place,
+    /// where a stack clone would silently go stale.
     #[must_use]
     pub(crate) fn call_target(&self, heap: &otter_gc::GcHeap) -> NativeCallTarget {
         heap.read_payload(self.inner, |body| match &body.call {
@@ -1017,11 +1035,11 @@ impl NativeFunction {
             NativeCallStorage::VmIntrinsic(intrinsic) => NativeCallTarget::VmIntrinsic(*intrinsic),
             NativeCallStorage::Dynamic(call) => NativeCallTarget::Dynamic {
                 call: call.clone(),
-                captures: body.captures.clone(),
+                captures: body.captures,
             },
             NativeCallStorage::LocalDynamic(call) => NativeCallTarget::LocalDynamic {
                 call: call.clone(),
-                captures: body.captures.clone(),
+                captures: body.captures,
             },
         })
     }
@@ -1085,20 +1103,26 @@ pub(crate) enum NativeCallTarget {
     Dynamic {
         /// Closure payload.
         call: Arc<NativeFn>,
-        /// Traced JS captures.
-        captures: SmallVec<[Value; 4]>,
+        /// The callee body's capture slab.
+        captures: crate::value_slab::ValueSlabHandle,
     },
     /// Local VM-only closure path.
     LocalDynamic {
         /// Closure payload.
         call: Arc<LocalNativeFn>,
-        /// Traced JS captures.
-        captures: SmallVec<[Value; 4]>,
+        /// The callee body's capture slab.
+        captures: crate::value_slab::ValueSlabHandle,
     },
 }
 
 impl NativeCallTarget {
     /// Invoke the target.
+    ///
+    /// The captures slice aliases the callee's live slab storage: the
+    /// callee is rooted for the duration of its own call, the slab is
+    /// old space and does not move, and a collection mid-call rewrites
+    /// the slots in place — so the closure always reads current
+    /// handles, never a pre-move copy.
     pub(crate) fn invoke(
         self,
         ctx: &mut NativeCtx<'_>,
@@ -1110,8 +1134,14 @@ impl NativeCallTarget {
                 name: intrinsic.name(),
                 reason: "VM intrinsic requires interpreter dispatch".to_string(),
             }),
-            Self::Dynamic { call, captures } => call(ctx, args, &captures),
-            Self::LocalDynamic { call, captures } => call(ctx, args, &captures),
+            // SAFETY: see the doc above — the callee roots the slab
+            // across the call.
+            Self::Dynamic { call, captures } => call(ctx, args, unsafe {
+                crate::value_slab::live_slice(captures)
+            }),
+            Self::LocalDynamic { call, captures } => call(ctx, args, unsafe {
+                crate::value_slab::live_slice(captures)
+            }),
         }
     }
 }

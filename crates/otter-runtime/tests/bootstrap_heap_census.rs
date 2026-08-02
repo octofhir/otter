@@ -255,8 +255,6 @@ fn only_the_known_body_types_are_not_yet_self_contained() {
     /// Body types that still own storage outside the heap. Delete an
     /// entry when its storage lands; never add one.
     const NOT_YET_SELF_CONTAINED: &[&str] = &[
-        // `entries: Vec<..>` plus an `FxHashMap` index.
-        "WeakMapBody",
         // The object sidecar itself: `Vec<String>` dictionary keys, an
         // `FxHashMap` index, `Vec<SlotMeta>`, and host payloads.
         "ExoticSlots",

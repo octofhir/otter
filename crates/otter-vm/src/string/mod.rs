@@ -430,7 +430,7 @@ impl JsString {
     {
         heap.read_payload(self.handle, |body| match &body.repr {
             JsStringBodyRepr::InlineLatin1(bytes) => Some(f(&bytes[..body.len as usize])),
-            JsStringBodyRepr::Latin1(bytes) => Some(f(bytes)),
+            JsStringBodyRepr::SeqLatin1 => Some(f(body.seq_latin1_bytes())),
             _ => None,
         })
     }
@@ -443,9 +443,9 @@ impl JsString {
             matches!(
                 body.repr,
                 JsStringBodyRepr::InlineFlat(_)
-                    | JsStringBodyRepr::Flat(_)
+                    | JsStringBodyRepr::SeqFlat
                     | JsStringBodyRepr::InlineLatin1(_)
-                    | JsStringBodyRepr::Latin1(_)
+                    | JsStringBodyRepr::SeqLatin1
             )
         })
     }
@@ -466,11 +466,13 @@ impl JsString {
         loop {
             let step = heap.read_payload(handle, |body| match &body.repr {
                 JsStringBodyRepr::InlineFlat(units) => Step::Found(units[idx as usize]),
-                JsStringBodyRepr::Flat(units) => Step::Found(units[idx as usize]),
+                JsStringBodyRepr::SeqFlat => Step::Found(body.seq_flat_units()[idx as usize]),
                 JsStringBodyRepr::InlineLatin1(bytes) => {
                     Step::Found(u16::from(bytes[idx as usize]))
                 }
-                JsStringBodyRepr::Latin1(bytes) => Step::Found(u16::from(bytes[idx as usize])),
+                JsStringBodyRepr::SeqLatin1 => {
+                    Step::Found(u16::from(body.seq_latin1_bytes()[idx as usize]))
+                }
                 JsStringBodyRepr::Sliced { parent, start } => Step::Descend(*parent, *start + idx),
                 JsStringBodyRepr::Cons { left, right, .. } => {
                     let left_len = heap.read_payload(*left, |b| b.len);
@@ -644,13 +646,13 @@ where
     heap.read_payload(a.handle, |a_body| {
         let a_bytes = match &a_body.repr {
             JsStringBodyRepr::InlineLatin1(bytes) => &bytes[..a_body.len as usize],
-            JsStringBodyRepr::Latin1(bytes) => bytes.as_slice(),
+            JsStringBodyRepr::SeqLatin1 => a_body.seq_latin1_bytes(),
             _ => return None,
         };
         heap.read_payload(b.handle, |b_body| {
             let b_bytes = match &b_body.repr {
                 JsStringBodyRepr::InlineLatin1(bytes) => &bytes[..b_body.len as usize],
-                JsStringBodyRepr::Latin1(bytes) => bytes.as_slice(),
+                JsStringBodyRepr::SeqLatin1 => b_body.seq_latin1_bytes(),
                 _ => return None,
             };
             Some(f(a_bytes, b_bytes))
@@ -875,7 +877,8 @@ mod tests {
         let s = JsString::from_utf16_units(&units, &mut heap).unwrap();
         assert_eq!(s.to_utf16_vec(&heap), units);
         heap.read_payload(s.handle, |body| match &body.repr {
-            JsStringBodyRepr::Latin1(bytes) => {
+            JsStringBodyRepr::SeqLatin1 => {
+                let bytes = body.seq_latin1_bytes();
                 assert_eq!(bytes.len(), 64);
                 assert!(bytes.iter().all(|&b| b == 0xe9));
             }

@@ -323,6 +323,19 @@ impl TraceTable {
         u64::from(offset) + u64::from(size_bytes) <= crate::compressed::cage_size() as u64
     }
 
+    /// Whether the type registered under `tag` needs dropping.
+    ///
+    /// A GC body needs dropping exactly when it owns something the heap
+    /// does not — a `Vec`, a `Box`, an `Arc`, a hash table. That makes
+    /// this the completeness check the slot walk cannot do: a field with
+    /// no GC handles in it still holds a buffer a page image cannot
+    /// carry, and a restored copy would be its second owner.
+    #[inline]
+    #[must_use]
+    pub fn owns_outside_storage(&self, tag: u8) -> bool {
+        self.drop_table[tag as usize].is_some()
+    }
+
     /// Look up the drop function for a given type tag.
     #[inline]
     pub fn get_drop(&self, tag: u8) -> Option<unsafe fn(*mut GcHeader)> {

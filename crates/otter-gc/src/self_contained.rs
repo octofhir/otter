@@ -39,6 +39,12 @@
 //!
 //! # Invariants
 //!
+//! - A body is restorable only if it neither keeps references outside
+//!   the cage nor needs dropping. The second half is what the slot walk
+//!   cannot see: a `Vec<String>` holds no GC handles, so no tracer ever
+//!   mentions it, and a restored copy is still a second owner of the
+//!   same buffer. `needs_drop` is exactly that property, and the trace
+//!   table already records it.
 //! - A slot counts as contained when its address lies inside the pointer
 //!   cage. Trailing storage and another body's cell both qualify; a
 //!   `Vec` buffer does not.
@@ -74,6 +80,9 @@ pub struct EscapeRow {
     pub escaping_objects: u64,
     /// References those bodies keep in memory the heap does not own.
     pub escaping_slots: u64,
+    /// Whether the type needs dropping, and so owns storage outside the
+    /// heap whether or not any GC reference lives in it.
+    pub owns_outside_storage: bool,
 }
 
 /// Whole-heap self-containment result.
@@ -91,6 +100,10 @@ pub struct SelfContainmentAudit {
     /// back. Sound, and reported so the count is not mistaken for zero
     /// out-of-cage addresses.
     pub forwarded_slots: u64,
+    /// Live bodies whose type needs dropping. These own storage outside
+    /// the heap even when every GC reference they hold is inside it, so
+    /// they are unrestorable for a reason the slot walk cannot see.
+    pub owning_objects: u64,
 }
 
 impl SelfContainmentAudit {
@@ -98,7 +111,7 @@ impl SelfContainmentAudit {
     /// so the heap could be captured and restored as page bytes.
     #[must_use]
     pub fn is_self_contained(&self) -> bool {
-        self.escaping_slots == 0
+        self.escaping_slots == 0 && self.owning_objects == 0
     }
 
     /// Render the offending tags as a deterministic text table.
@@ -107,8 +120,12 @@ impl SelfContainmentAudit {
         let mut out = String::with_capacity(1024);
         let _ = writeln!(
             out,
-            "; self-containment — objects={} slots={} escaping={} forwarded={}",
-            self.objects_audited, self.slots_audited, self.escaping_slots, self.forwarded_slots,
+            "; self-containment — objects={} slots={} escaping={} forwarded={} owning={}",
+            self.objects_audited,
+            self.slots_audited,
+            self.escaping_slots,
+            self.forwarded_slots,
+            self.owning_objects,
         );
         if self.rows.is_empty() {
             let _ = writeln!(out, "  every reference lives in memory the heap owns");
@@ -116,17 +133,22 @@ impl SelfContainmentAudit {
         }
         let _ = writeln!(
             out,
-            "  {:>4}  {:>9}  {:>9}  {:>9}  type",
-            "tag", "objects", "escaping", "slots"
+            "  {:>4}  {:>9}  {:>9}  {:>9}  {:>5}  type",
+            "tag", "objects", "escaping", "slots", "owns"
         );
         for row in &self.rows {
             let _ = writeln!(
                 out,
-                "  {:#04x}  {:>9}  {:>9}  {:>9}  {}",
+                "  {:#04x}  {:>9}  {:>9}  {:>9}  {:>5}  {}",
                 row.type_tag,
                 row.objects,
                 row.escaping_objects,
                 row.escaping_slots,
+                if row.owns_outside_storage {
+                    "yes"
+                } else {
+                    "no"
+                },
                 short_type_name(row.type_name),
             );
         }
@@ -271,19 +293,30 @@ impl GcHeap {
             }
         }
 
+        for (tag, &count) in objects.iter().enumerate() {
+            if count != 0 && self.trace_table().owns_outside_storage(tag as u8) {
+                audit.owning_objects += count;
+            }
+        }
         let mut rows: Vec<EscapeRow> = (0..256usize)
-            .filter(|&tag| escaping_slots[tag] != 0)
+            .filter(|&tag| {
+                objects[tag] != 0
+                    && (escaping_slots[tag] != 0
+                        || self.trace_table().owns_outside_storage(tag as u8))
+            })
             .map(|tag| EscapeRow {
                 type_tag: tag as u8,
                 type_name: self.trace_table().name(tag as u8).unwrap_or("?"),
                 objects: objects[tag],
                 escaping_objects: escaping_objects[tag],
                 escaping_slots: escaping_slots[tag],
+                owns_outside_storage: self.trace_table().owns_outside_storage(tag as u8),
             })
             .collect();
         rows.sort_by(|a, b| {
             b.escaping_slots
                 .cmp(&a.escaping_slots)
+                .then_with(|| b.objects.cmp(&a.objects))
                 .then_with(|| a.type_tag.cmp(&b.type_tag))
         });
         audit.rows = rows;

@@ -238,22 +238,35 @@ fn build_fills_only_a_handful_of_root_sources() {
     );
 }
 
-/// Which bodies still keep GC references in memory the heap does not own.
+/// Which bodies are not yet self-contained.
 ///
-/// A page image carries page bytes and nothing else, so a body holding a
-/// `Vec`, a `Box`, or a hash table restores as a second owner of the
-/// original buffer and hands the collector slot addresses the image never
-/// carried. Capture is unsound until this reports nothing.
+/// A page image carries page bytes and nothing else, so a body is
+/// restorable only if it both keeps every GC reference inside the cage and
+/// owns no storage the heap did not allocate. The second half is the one
+/// a slot walk cannot see: a `Vec<String>` holds no GC handles, so no
+/// tracer ever mentions it, and a restored copy is still a second owner of
+/// the same buffer.
 ///
 /// The allow-list below is the remaining work, and it only ever shrinks:
 /// a type that appears here without being listed is a new way to make the
 /// bootstrap graph unrestorable.
 #[test]
-fn only_the_known_body_types_still_own_memory_outside_the_heap() {
-    /// Body types whose out-of-heap storage has not moved into the heap
-    /// yet. Delete an entry when its storage lands; never add one.
-    const STILL_OWNS_OUTSIDE_STORAGE: &[&str] =
-        &["JsClosureBody", "SetBody", "ObjectBody", "ArrayBody"];
+fn only_the_known_body_types_are_not_yet_self_contained() {
+    /// Body types that still own storage outside the heap. Delete an
+    /// entry when its storage lands; never add one.
+    const NOT_YET_SELF_CONTAINED: &[&str] = &[
+        // `entries: Vec<..>` plus an `FxHashMap` index.
+        "SetBody",
+        "MapBody",
+        "WeakMapBody",
+        // `exotic: Option<Box<..>>`.
+        "ObjectBody",
+        "ArrayBody",
+        // `SmallVec` captures, `Arc` closure payloads and trace hooks.
+        "NativeFunctionBody",
+        "JsRegExpBody",
+        "ProxyBodyGc",
+    ];
 
     let mut runtime = full_surface_runtime();
     let audit = runtime.self_containment_audit();
@@ -267,10 +280,12 @@ fn only_the_known_body_types_still_own_memory_outside_the_heap() {
     for row in &audit.rows {
         let leaf = row.type_name.rsplit("::").next().unwrap_or(row.type_name);
         assert!(
-            STILL_OWNS_OUTSIDE_STORAGE.contains(&leaf),
-            "`{leaf}` keeps {} references outside the heap; either move that \
-             storage into the heap or the bootstrap image cannot carry it",
+            NOT_YET_SELF_CONTAINED.contains(&leaf),
+            "`{leaf}` is not self-contained ({} references outside the heap, \
+             owns outside storage: {}); either move that storage into the heap \
+             or the bootstrap image cannot carry it",
             row.escaping_slots,
+            row.owns_outside_storage,
         );
     }
 }

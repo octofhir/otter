@@ -351,6 +351,7 @@ fn gc_verify_enabled() -> bool {
 /// [`gc_verify_enabled`]. Never mutates heap state — pure diagnostic.
 #[cold]
 unsafe fn verify_child_slot(
+    table: &TraceTable,
     slot: *mut RawGc,
     raw: u32,
     header_ptr: *const GcHeader,
@@ -359,7 +360,7 @@ unsafe fn verify_child_slot(
     // SAFETY: `header_ptr` is an in-cage address by construction; reading the
     // header word is safe even if the object is stale (still mapped memory).
     let (size, tag) = unsafe { ((*header_ptr).size_bytes(), (*header_ptr).type_tag()) };
-    if size != 0 && size <= (1u32 << 20) && tag != 0 {
+    if table.header_could_be_live(raw, size, tag) {
         return; // plausible object
     }
     let slot_off = (slot as usize).wrapping_sub(cage_base() as usize);
@@ -379,10 +380,19 @@ unsafe fn verify_child_slot(
             )
         }
     });
+    let parent_dump = parent_header.map_or(String::new(), |parent| {
+        // SAFETY: the parent header is live and `parent_size` bounds its cell.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(parent.cast::<u8>(), (*parent).size_bytes() as usize)
+        };
+        let at = (slot as usize).wrapping_sub(parent as usize);
+        let hex: String = bytes.iter().take(64).map(|b| format!("{b:02x}")).collect();
+        format!(" slot_in_parent={at} parent_bytes={hex}")
+    });
     eprintln!(
         "OTTER_GC_VERIFY: corrupt slot -> raw_offset={raw:#x} target_size={size} target_tag={tag} \
          slot={slot:p} region={region} parent_offset={parent_offset:#x} \
-         parent_size={parent_size} parent_tag={parent_tag}"
+         parent_size={parent_size} parent_tag={parent_tag}{parent_dump}"
     );
 }
 
@@ -401,7 +411,13 @@ unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc, parent_header: Optio
         // SAFETY: raw is a valid in-cage offset by precondition.
         let header_ptr = cage_base().add(raw as usize) as *mut GcHeader;
         if gc_verify_enabled() {
-            verify_child_slot(slot, raw, header_ptr, parent_header);
+            verify_child_slot(
+                ctx.trace_table.as_ref(),
+                slot,
+                raw,
+                header_ptr,
+                parent_header,
+            );
         }
         if !(*header_ptr).is_young() {
             return; // old / large objects do not move on scavenge.

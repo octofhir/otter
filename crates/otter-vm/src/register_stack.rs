@@ -314,9 +314,9 @@ impl RegisterStack {
         for segment in &self.segments[..self.active_segments] {
             let base = segment.slots.as_ptr();
             for (offset, value) in segment.slots[..segment.used].iter().enumerate() {
-                if let Some((size, tag, forwarded)) = value.debug_gc_target_header(heap)
+                if let Some((target, size, tag, forwarded)) = value.debug_gc_target_header(heap)
                     && !forwarded
-                    && (size == 0 || size > (1_u32 << 20) || tag == 0)
+                    && !heap.header_could_be_live(target, size, tag)
                 {
                     let index = segment.logical_base + offset;
                     eprintln!(

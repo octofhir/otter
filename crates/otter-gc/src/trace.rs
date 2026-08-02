@@ -299,6 +299,30 @@ impl TraceTable {
         self.name_table[tag as usize]
     }
 
+    /// Whether a header could belong to a live body of a registered
+    /// type.
+    ///
+    /// The debug verifiers use this to decide whether a slot holds a real
+    /// reference or a stale word, so it must reject garbage without ever
+    /// rejecting a body the heap can actually produce. The load-bearing
+    /// test is the type tag: every allocated body registers one, and an
+    /// arbitrary byte pattern almost never lands on a registered tag.
+    ///
+    /// Size is only checked for the two things it cannot be — zero, or
+    /// running past the end of the cage. It deliberately carries no
+    /// upper bound beyond that: a large-object region is sized to its
+    /// body, so a string that owns its code units is legitimately
+    /// megabytes long, and a fixed ceiling here would report every one of
+    /// them as corruption.
+    #[inline]
+    #[must_use]
+    pub fn header_could_be_live(&self, offset: u32, size_bytes: u32, type_tag: u8) -> bool {
+        if size_bytes == 0 || self.get(type_tag).is_none() {
+            return false;
+        }
+        u64::from(offset) + u64::from(size_bytes) <= crate::compressed::cage_size() as u64
+    }
+
     /// Look up the drop function for a given type tag.
     #[inline]
     pub fn get_drop(&self, tag: u8) -> Option<unsafe fn(*mut GcHeader)> {

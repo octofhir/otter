@@ -1937,7 +1937,7 @@ impl Value {
     pub(crate) fn debug_gc_target_header(
         &self,
         _heap: &otter_gc::GcHeap,
-    ) -> Option<(u32, u8, bool)> {
+    ) -> Option<(u32, u32, u8, bool)> {
         if !is_cell_bits(self.0) {
             return None;
         }
@@ -1947,6 +1947,7 @@ impl Value {
         unsafe {
             let header = otter_gc::cage_base().add(offset) as *const otter_gc::GcHeader;
             Some((
+                offset as u32,
                 (*header).size_bytes(),
                 (*header).type_tag(),
                 (*header).is_forwarded(),

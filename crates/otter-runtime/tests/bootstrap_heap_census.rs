@@ -261,8 +261,8 @@ fn only_the_known_body_types_are_not_yet_self_contained() {
         // The array sidecar: sparse/named/accessor tables and JSON
         // source bytes, in `HashMap`/`IndexMap`/`Vec`/`Arc` containers.
         "ArrayExoticSlots",
-        // `SmallVec` captures, `Arc` closure payloads and trace hooks.
-        "NativeFunctionBody",
+        // Compiled `Regex`, pattern text, source text. A snapshot-format
+        // decision: restore recompiles from the pattern.
         "JsRegExpBody",
     ];
 

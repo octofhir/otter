@@ -112,6 +112,9 @@ struct ScavCtx {
     /// local snapshot; [`remember_parent`] pushes fresh old→young parents
     /// here so they survive to the next scavenge.
     remembered: NonNull<Vec<RawGc>>,
+    /// The heap's host-ref table, for sweep-time release of dead young
+    /// bodies that name owned host payloads.
+    host_refs: NonNull<crate::host_refs::HostRefTable>,
     /// Cage offsets of objects promoted to old-space this scavenge and not
     /// yet Cheney-scanned. An explicit worklist — not a bump-cursor
     /// watermark — because promotion allocates through the old-space free
@@ -169,6 +172,7 @@ pub unsafe fn scavenge(
     ephemeron_registry_slots: &[*mut RawGc],
     weak_registry_slots: &[*mut RawGc],
     remembered_parents: &mut Vec<RawGc>,
+    host_refs: &mut crate::host_refs::HostRefTable,
 ) -> Result<ScavengeStats, OutOfMemory> {
     // Reserve every page promotion/fallback can need before forwarding the
     // first object. After a forwarding write, cage exhaustion cannot be
@@ -221,6 +225,7 @@ pub unsafe fn scavenge(
         stats: ScavengeStats::default(),
         in_dirty_scan: false,
         remembered: unsafe { NonNull::new_unchecked(remembered_parents as *mut _) },
+        host_refs: unsafe { NonNull::new_unchecked(host_refs as *mut _) },
         promoted_unscanned: Vec::new(),
     };
 
@@ -304,12 +309,16 @@ unsafe fn finalize_and_drop_dead_from_space(ctx: &mut ScavCtx) {
     // SAFETY: per docstring; the trace table matches every allocated tag.
     unsafe {
         let trace_table = &*ctx.trace_table.as_ptr();
+        let mut host_refs = ctx.host_refs;
         for page in ctx.new_space().from_pages() {
             page.for_each_object(|header, _| {
                 if (*header).is_forwarded() {
                     return;
                 }
                 let tag = (*header).type_tag();
+                if let Some(release) = trace_table.get_host_release(tag) {
+                    release(header, host_refs.as_mut());
+                }
                 if let Some(finalize) = trace_table.get_finalize(tag) {
                     finalize(header);
                 }
@@ -942,6 +951,7 @@ mod tests {
                 &[],
                 &[],
                 &mut remembered,
+                &mut crate::host_refs::HostRefTable::default(),
             )
         }
         .expect("promotion preflight");

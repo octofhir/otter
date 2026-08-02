@@ -1752,6 +1752,7 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
     // walked by type tag before anything has been allocated into it.
     // `every_allocated_type_tag_is_registered` fails if this list falls
     // behind the types a real build produces.
+    heap.register_host_release::<crate::native_function::NativeFunctionBody>();
     register! {
         crate::array::ArrayBody,
         crate::value_slab::ValueSlabBody,

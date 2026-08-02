@@ -578,13 +578,10 @@ impl Interpreter {
             .as_raw_gc()
             .and_then(|raw| raw.checked_cast::<crate::closure::JsClosureBody>())
         {
-            let (function_id, upvalues, bound_this, bound_new_target, bound_derived_this, eval_env) =
-                heap.read_payload(handle, |body| {
-                    let ups: crate::frame_state::UpvalueSpine =
-                        body.upvalues.clone().into_boxed_slice();
+            let (function_id, bound_this, bound_new_target, bound_derived_this, eval_env) = heap
+                .read_payload(handle, |body| {
                     (
                         body.call_header.function_id,
-                        ups,
                         body.bound_this_option(),
                         body.bound_new_target_option(),
                         body.bound_derived_this_option(),
@@ -592,6 +589,8 @@ impl Interpreter {
                     )
                 });
             let c = crate::closure::JsClosure::from_parts(handle, function_id);
+            let upvalues: crate::frame_state::UpvalueSpine =
+                c.upvalues_snapshot(heap).into_boxed_slice();
             let this_value = bound_this.unwrap_or(effective_this);
             return Ok((
                 function_id,

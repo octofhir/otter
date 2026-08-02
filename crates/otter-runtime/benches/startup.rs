@@ -7,7 +7,10 @@
 use std::time::{Duration, Instant};
 
 use criterion::{Bencher, Criterion, criterion_group, criterion_main};
+use otter_modules::OtterModulesBuilderExt;
+use otter_node::NodeApiBuilderExt;
 use otter_runtime::{CapabilitySet, ExecutionResult, Otter, Runtime, SourceInput};
+use otter_web::WebApiBuilderExt;
 
 fn iter_startup_bench<T>(bencher: &mut Bencher<'_>, mut f: impl FnMut() -> T) {
     bencher.iter_custom(|iters| {
@@ -62,6 +65,35 @@ fn bench_runtime_startup(c: &mut Criterion) {
     });
     build.bench_function("otter_builder_default", |b| {
         iter_startup_bench(b, || Otter::builder().build().expect("otter"));
+    });
+    build.bench_function("otter_builder_node_apis", |b| {
+        iter_startup_bench(b, || {
+            Otter::builder().with_node_apis().build().expect("otter")
+        });
+    });
+    build.bench_function("otter_builder_web_apis", |b| {
+        iter_startup_bench(b, || {
+            Otter::builder().with_web_apis().build().expect("otter")
+        });
+    });
+    build.bench_function("otter_builder_otter_modules", |b| {
+        iter_startup_bench(b, || {
+            Otter::builder()
+                .with_otter_modules()
+                .build()
+                .expect("otter")
+        });
+    });
+    // What a CLI run actually pays for: every API surface a program can see.
+    build.bench_function("otter_builder_full_surface", |b| {
+        iter_startup_bench(b, || {
+            Otter::builder()
+                .with_node_apis()
+                .with_otter_modules()
+                .with_web_apis()
+                .build()
+                .expect("otter")
+        });
     });
     build.finish();
 

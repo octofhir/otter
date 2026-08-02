@@ -48,6 +48,17 @@ pub(super) fn ordinary_set_data_property(
     // which `with_payload` cannot walk, so resolve it under a read borrow first.
     let existing_attrs = existing_offset
         .map(|offset| heap.read_payload(obj, |body| body.slot_attrs(heap, offset as usize)));
+    let mut compressed = compressed;
+    if super::reserve_slot_capacity(
+        &mut obj,
+        heap,
+        append_index + 1,
+        std::slice::from_mut(&mut compressed),
+    )
+    .is_err()
+    {
+        return false;
+    }
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
             let i = offset as usize;
@@ -93,10 +104,9 @@ pub(super) fn ordinary_set_data_property_with_shape(
     // post-store reads (write barriers, the debug shape-slot check) observe the
     // live cell instead of a forwarded one.
     let compressed = super::compress_or_abort(heap, obj, value);
-    let obj = *obj;
-    let existing_offset = heap.read_payload(obj, |body| super::body_offset_of(heap, body, key));
+    let existing_offset = heap.read_payload(*obj, |body| super::body_offset_of(heap, body, key));
     let existing_attrs = existing_offset
-        .map(|offset| heap.read_payload(obj, |body| body.slot_attrs(heap, offset as usize)));
+        .map(|offset| heap.read_payload(*obj, |body| body.slot_attrs(heap, offset as usize)));
     // `append_index` (the slot the new property occupies) is supplied by the
     // caller from the shape it transitioned from, so the hot path adds no shape
     // read; verify the invariant in debug builds.
@@ -104,7 +114,18 @@ pub(super) fn ordinary_set_data_property_with_shape(
         append_index,
         super::shape_property_count(next_shape, heap) as usize - 1
     );
-    let success = heap.with_payload(obj, |body| {
+    let mut compressed = compressed;
+    if super::reserve_slot_capacity(
+        obj,
+        heap,
+        append_index + 1,
+        std::slice::from_mut(&mut compressed),
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let success = heap.with_payload(*obj, |body| {
         if let Some(offset) = existing_offset {
             let i = offset as usize;
             let (flags, is_accessor) = existing_attrs.expect("attrs read for existing slot");
@@ -123,8 +144,8 @@ pub(super) fn ordinary_set_data_property_with_shape(
         true
     });
     if success {
-        super::record_slot_write(heap, obj, compressed);
-        heap.record_write(obj, &next_shape);
+        super::record_slot_write(heap, *obj, compressed);
+        heap.record_write(*obj, &next_shape);
     }
     success
 }

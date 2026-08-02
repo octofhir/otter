@@ -701,21 +701,21 @@ mod tests {
                 .unwrap(),
         );
         let before_alloc = interp.gc_heap().stats().new_allocated_bytes;
-        let before_reserved = interp.gc_heap().stats().reserved_bytes;
+        let before_reserved = interp.gc_heap().stats().allocated_bytes;
 
         let result = interp
             .array_construct_stack_rooted(&stack, &[Value::number_i32(8)])
             .expect("Array constructor");
 
         let after_alloc = interp.gc_heap().stats().new_allocated_bytes;
-        let after_reserved = interp.gc_heap().stats().reserved_bytes;
+        let after_reserved = interp.gc_heap().stats().allocated_bytes;
         assert!(
             after_alloc > before_alloc,
             "Array(length) should allocate the array shell in young space"
         );
         assert!(
             after_reserved > before_reserved,
-            "Array(length) should grow backing storage through root-aware reservation"
+            "Array(length) should grow backing storage through root-aware growth"
         );
         let Some(array) = result.as_array() else {
             panic!("expected array");
@@ -735,16 +735,16 @@ mod tests {
                 .test_frame_for_function(&module.functions[0])
                 .unwrap(),
         );
-        let before_reserved = interp.gc_heap().stats().reserved_bytes;
+        let before_reserved = interp.gc_heap().stats().allocated_bytes;
 
         let result = interp
             .array_construct_stack_rooted(&stack, &[Value::number_i32(20_000)])
             .expect("Array constructor");
 
-        let after_reserved = interp.gc_heap().stats().reserved_bytes;
+        let after_reserved = interp.gc_heap().stats().allocated_bytes;
         assert!(
-            after_reserved > before_reserved,
-            "moderate Array(length) should reserve dense hole storage"
+            after_reserved - before_reserved >= 20_000 * std::mem::size_of::<Value>(),
+            "moderate Array(length) should allocate dense hole storage"
         );
         let Some(array) = result.as_array() else {
             panic!("expected array");

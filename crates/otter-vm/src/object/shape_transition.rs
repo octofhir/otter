@@ -192,7 +192,7 @@ pub(crate) fn capture_store_property_transition_with_shape(
 /// prototype, extensibility, or dictionary-mode mismatch falls back to ordinary
 /// `[[Set]]`.
 pub(crate) fn replay_store_property_transition(
-    mut obj: JsObject,
+    obj: JsObject,
     heap: &mut otter_gc::GcHeap,
     key: AtomizedPropertyKey<'_>,
     transition: &StorePropertyTransition,
@@ -201,10 +201,6 @@ pub(crate) fn replay_store_property_transition(
     if !transition_kind_matches(obj, heap, transition) {
         return None;
     }
-    // A store can demote this object to dictionary mode, and demotion
-    // writes through the sidecar. Reserved here, outside every payload
-    // borrow, because creating it allocates.
-    super::ensure_exotic(&mut obj, heap).ok()?;
     let current_shape_id = super::shape_id(obj, heap);
     let to_shape = transition.to_shape.get();
     let to_shape_id = if to_shape.is_null() {
@@ -246,11 +242,18 @@ pub(crate) fn replay_store_property_transition(
         return None;
     }
 
-    // Only a confirmed hit may box the RHS. `compress_or_abort` roots and
-    // refreshes this local receiver if boxing scavenges; on a miss the caller
-    // retains its original raw handle, so allocating before guard validation
-    // would leave fallback holding a forwarded cell.
+    // Only a confirmed hit may allocate. `compress_or_abort` (and the
+    // sidecar reservation) root and refresh this local receiver if the
+    // allocation scavenges; on a miss the caller retains its original
+    // raw handle, so allocating before guard validation would leave
+    // fallback holding a forwarded cell.
     let mut obj = obj;
+    if to_shape.is_null() {
+        // The dictionary arm below appends through `dict_push_key`,
+        // which writes the sidecar; the shape-append arm never touches
+        // it and allocates none.
+        super::ensure_exotic(&mut obj, heap).ok()?;
+    }
     // Reserve before boxing the value: see the append paths above.
     super::reserve_slot_capacity(&mut obj, heap, usize::from(transition.slot) + 1, &mut []).ok()?;
     let compressed = super::compress_or_abort(heap, &mut obj, *value);

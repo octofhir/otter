@@ -39,12 +39,15 @@ pub(super) fn ordinary_set_data_property(
     value: Value,
 ) -> bool {
     let mut obj = obj;
-    // A store can demote this object to dictionary mode, and demotion
-    // writes through the sidecar. Reserved here, outside every payload
-    // borrow, because creating it allocates.
-    super::ensure_exotic(&mut obj, heap).expect("exotic sidecar");
-    let compressed = super::compress_or_abort(heap, &mut obj, value);
     let existing_offset = heap.read_payload(obj, |body| super::body_offset_of(heap, body, key));
+    if existing_offset.is_none() {
+        // A fresh key demotes this object to dictionary mode, and
+        // demotion writes through the sidecar. Reserved here, outside
+        // every payload borrow, because creating it allocates — and only
+        // for the append that will actually write it.
+        super::ensure_exotic(&mut obj, heap).expect("exotic sidecar");
+    }
+    let compressed = super::compress_or_abort(heap, &mut obj, value);
     let dictionary_keys = super::dictionary_keys_for_shape_transition(heap, obj, existing_offset);
     let slot_metas = super::slot_metas_for_shape_transition(heap, obj, existing_offset);
     let append_index = heap.read_payload(obj, |body| super::body_property_count(heap, body));

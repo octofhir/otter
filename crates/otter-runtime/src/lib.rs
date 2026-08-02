@@ -3975,6 +3975,13 @@ impl Runtime {
         self.interp.native_census()
     }
 
+    /// Inventory of the interpreter's GC root sources — which of them a
+    /// finished build actually filled, and how much they hold.
+    #[must_use]
+    pub fn root_census(&self) -> otter_vm::root_census::RootCensus {
+        self.interp.root_census()
+    }
+
     /// Write a Chrome DevTools `.heapsnapshot` for the current heap
     /// state. The output is JSON; the DevTools "Memory" panel
     /// accepts it as-is.

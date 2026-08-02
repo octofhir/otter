@@ -15,6 +15,9 @@
 //!   references; type tag [`OPAQUE_LEAF_TAG`].
 //! - [`OpaquePair`] — two outgoing references, so pointer-rewriting
 //!   paths have something to rewrite; type tag [`OPAQUE_PAIR_TAG`].
+//! - [`OpaqueVector`] — a body whose references live in trailing
+//!   storage allocated in the same cell; type tag
+//!   [`OPAQUE_VECTOR_TAG`].
 //!
 //! # Invariants
 //!
@@ -74,6 +77,93 @@ impl Traceable for OpaquePair {
         unsafe {
             v(std::ptr::addr_of_mut!((*this).first));
             v(std::ptr::addr_of_mut!((*this).second));
+        }
+    }
+}
+
+/// Reserved `type_tag` for [`OpaqueVector`].
+pub const OPAQUE_VECTOR_TAG: u8 = 0xFC;
+
+/// Body with a variable-length reference array stored in the same cell.
+///
+/// The elements follow the header field in memory rather than living in
+/// a `Vec`, which is what makes the object self-contained: the whole
+/// thing is one GC cell, so a page image carries it and a relocation
+/// pass can find every slot.
+#[derive(Debug)]
+pub struct OpaqueVector {
+    /// Elements in the trailing array.
+    len: u32,
+}
+
+impl OpaqueVector {
+    /// Trailing bytes needed for `len` elements.
+    #[must_use]
+    pub fn trailing_bytes(len: usize) -> usize {
+        len * std::mem::size_of::<crate::compressed::RawGc>()
+    }
+
+    /// A header for `len` elements. Pass [`Self::trailing_bytes`] as the
+    /// extra size to [`crate::heap::GcHeap::alloc_variable_with_roots`].
+    #[must_use]
+    pub fn new(len: usize) -> Self {
+        Self { len: len as u32 }
+    }
+
+    /// Elements in the trailing array.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// Whether the array is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn elements(&self) -> *mut crate::compressed::RawGc {
+        // SAFETY: the allocation reserved `trailing_bytes(len)` after the
+        // header field, so the array starts one `Self` past `self`.
+        unsafe {
+            (self as *const Self as *mut u8)
+                .add(std::mem::size_of::<Self>())
+                .cast()
+        }
+    }
+
+    /// Read element `index`.
+    ///
+    /// # Panics
+    /// If `index` is out of range.
+    #[must_use]
+    pub fn get(&self, index: usize) -> crate::compressed::RawGc {
+        assert!(index < self.len(), "index out of range");
+        // SAFETY: bounds checked above; the array is live for `len`.
+        unsafe { *self.elements().add(index) }
+    }
+
+    /// Write element `index`.
+    ///
+    /// # Panics
+    /// If `index` is out of range.
+    pub fn set(&mut self, index: usize, value: crate::compressed::RawGc) {
+        assert!(index < self.len(), "index out of range");
+        // SAFETY: bounds checked above; the array is live for `len`.
+        unsafe { *self.elements().add(index) = value };
+    }
+}
+
+impl Traceable for OpaqueVector {
+    const TYPE_TAG: u8 = OPAQUE_VECTOR_TAG;
+    unsafe fn trace_slots(this: *mut Self, v: &mut SlotVisitor<'_>) {
+        // SAFETY: `this` precedes a valid header plus its trailing array.
+        unsafe {
+            let len = (*this).len();
+            let base = (*this).elements();
+            for index in 0..len {
+                v(base.add(index));
+            }
         }
     }
 }

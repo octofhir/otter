@@ -1205,7 +1205,7 @@ impl GcHeap {
     #[inline]
     pub fn alloc_old<T: Traceable>(&mut self, value: T) -> Result<Gc<T>, OutOfMemory> {
         let mut empty = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        self.alloc_old_with_roots_inner(value, true, &mut empty)
+        self.alloc_old_with_roots_inner(value, true, 0, &mut empty)
     }
 
     /// Allocate a `T` directly in old-space while keeping caller-supplied
@@ -1223,7 +1223,7 @@ impl GcHeap {
         value: T,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<Gc<T>, OutOfMemory> {
-        self.alloc_old_with_roots_inner(value, true, external_visit)
+        self.alloc_old_with_roots_inner(value, true, 0, external_visit)
     }
 
     /// Allocate a diagnostic object directly in old-space without
@@ -1242,7 +1242,7 @@ impl GcHeap {
     #[inline]
     pub fn alloc_old_diagnostic<T: Traceable>(&mut self, value: T) -> Result<Gc<T>, OutOfMemory> {
         let mut empty = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        let out = self.alloc_old_with_roots_inner(value, false, &mut empty)?;
+        let out = self.alloc_old_with_roots_inner(value, false, 0, &mut empty)?;
         if self.max_heap_bytes != 0 {
             self.drain_shared_external_releases();
             self.tracked_bytes = self.live_bytes_total().saturating_add(self.reserved_bytes);
@@ -1256,6 +1256,7 @@ impl GcHeap {
         &mut self,
         mut value: T,
         enforce_cap: bool,
+        extra_bytes: usize,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<Gc<T>, OutOfMemory> {
         // See `alloc_with_roots`: payloads are at most
@@ -1269,7 +1270,7 @@ impl GcHeap {
         if self.trace_table.get(T::TYPE_TAG).is_none() {
             self.trace_table.register::<T>();
         }
-        let total = std::mem::size_of::<GcHeader>() + std::mem::size_of::<T>();
+        let total = std::mem::size_of::<GcHeader>() + std::mem::size_of::<T>() + extra_bytes;
         let aligned = align_up(total, CELL_SIZE);
         debug_assert!(
             aligned <= u32::MAX as usize,
@@ -1310,6 +1311,16 @@ impl GcHeap {
             };
             std::ptr::write(header_ptr, header);
             std::ptr::write(payload_ptr, value);
+            if extra_bytes != 0 {
+                // Trailing storage starts zeroed so a body can treat it as
+                // an array of empty slots without writing every one.
+                let tail = (payload_ptr as *mut u8).add(std::mem::size_of::<T>());
+                std::ptr::write_bytes(
+                    tail,
+                    0,
+                    aligned - std::mem::size_of::<GcHeader>() - std::mem::size_of::<T>(),
+                );
+            }
             // The payload was installed with `ptr::write`, bypassing the
             // mutator write barrier. Any young children it carries are
             // old→young edges the next scavenge can only discover through
@@ -2107,6 +2118,31 @@ impl GcHeap {
                 page.for_each_object(|h, _| visitor(h));
             }
         }
+    }
+
+    /// Allocate a body followed by `extra_bytes` of zeroed trailing
+    /// storage, in old space.
+    ///
+    /// This is how a body carries a variable-length array without owning
+    /// memory outside the heap: the elements live in the same cell, so
+    /// the object is self-contained and a page image can carry it. `T`
+    /// stores the element count; its trace impl reads the trailing array
+    /// through that count.
+    ///
+    /// Old space, not the nursery, because a backing store lives as long
+    /// as the object that owns it and a semispace copy of it would be
+    /// pure overhead.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::alloc_old_with_roots`].
+    pub fn alloc_variable_with_roots<T: Traceable>(
+        &mut self,
+        value: T,
+        extra_bytes: usize,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<Gc<T>, OutOfMemory> {
+        self.alloc_old_with_roots_inner(value, true, extra_bytes, external_visit)
     }
 
     /// Old-space pages currently owned.

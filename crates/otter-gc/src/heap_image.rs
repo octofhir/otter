@@ -476,3 +476,84 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod self_contained_tests {
+    use super::*;
+    use crate::compressed::{CAGE_TEST_LOCK, Gc};
+    use crate::test_support::{OpaqueLeaf, OpaqueVector};
+
+    /// A body whose references live in trailing storage inside its own
+    /// cell restores completely: the array travels with the object, and
+    /// relocation rewrites every element.
+    ///
+    /// This is the property the VM's own bodies do not yet have. An
+    /// object that keeps its overflow slab in a `Vec` restores as a
+    /// second owner of the original buffer; this one owns nothing
+    /// outside the heap, so the image is the whole truth about it.
+    #[test]
+    fn a_body_with_trailing_storage_restores_whole() {
+        let _guard = CAGE_TEST_LOCK.lock().expect("cage test lock");
+        let mut source = GcHeap::new().expect("heap");
+        source.set_tenure_all(true);
+
+        const LEN: usize = 64;
+        let mut leaves = Vec::with_capacity(LEN);
+        for payload in 0..LEN as u64 {
+            leaves.push(source.alloc(OpaqueLeaf { payload }).expect("leaf"));
+        }
+        let vector: Gc<OpaqueVector> = source
+            .alloc_variable_with_roots(
+                OpaqueVector::new(LEN),
+                OpaqueVector::trailing_bytes(LEN),
+                &mut |_| {},
+            )
+            .expect("vector");
+        for (index, leaf) in leaves.iter().enumerate() {
+            source.with_payload(vector, |v| {
+                v.set(index, leaf.raw());
+                true
+            });
+        }
+        source.set_tenure_all(false);
+
+        let image = source.capture_old_space().expect("capture");
+        let mut target = GcHeap::new().expect("target heap");
+        target.register_traceable::<OpaqueLeaf>();
+        target.register_traceable::<OpaqueVector>();
+        let relocation = target.restore_old_space(&image).expect("restore");
+
+        let restored = relocation.relocate_gc(vector).expect("vector was captured");
+        assert_eq!(target.read_payload(restored, OpaqueVector::len), LEN);
+        for (index, source_leaf) in leaves.iter().enumerate() {
+            let element = target.read_payload(restored, |v| v.get(index));
+            let leaf: Gc<OpaqueLeaf> = relocation
+                .relocate_gc(*source_leaf)
+                .expect("leaf was captured");
+            assert_eq!(element, leaf.raw(), "element {index} must be relocated");
+            assert_eq!(
+                target.read_payload(leaf, |l| l.payload),
+                index as u64,
+                "and must still name the right object",
+            );
+        }
+    }
+
+    /// Trailing storage starts zeroed, so a body may treat it as empty
+    /// slots without writing each one.
+    #[test]
+    fn trailing_storage_starts_zeroed() {
+        let _guard = CAGE_TEST_LOCK.lock().expect("cage test lock");
+        let mut heap = GcHeap::new().expect("heap");
+        let vector: Gc<OpaqueVector> = heap
+            .alloc_variable_with_roots(
+                OpaqueVector::new(16),
+                OpaqueVector::trailing_bytes(16),
+                &mut |_| {},
+            )
+            .expect("vector");
+        for index in 0..16 {
+            assert!(heap.read_payload(vector, |v| v.get(index)).is_null());
+        }
+    }
+}

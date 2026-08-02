@@ -90,6 +90,7 @@ mod shape_body;
 mod shape_cache;
 mod shape_runtime;
 mod shape_transition;
+pub mod slot_slab;
 
 pub use descriptor::{
     DescriptorKind, PartialPropertyDescriptor, PropertyDescriptor, PropertyFlags,
@@ -1504,6 +1505,7 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
         AccessorCellBody,
         ObjectBody,
         shape_body::ShapeBody,
+        slot_slab::SlotSlabBody,
     }
 }
 

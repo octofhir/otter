@@ -1626,6 +1626,7 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
         crate::native_function::NativeFunctionBody,
         crate::promise::PurePromiseBody,
         crate::proxy::ProxyBodyGc,
+        crate::proxy::PrivateSlotsBody,
         crate::regexp::JsRegExpBody,
         crate::string::gc_body::JsStringBody,
         crate::symbol::SymbolBody,

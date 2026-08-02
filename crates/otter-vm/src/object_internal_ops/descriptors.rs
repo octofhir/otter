@@ -717,13 +717,17 @@ impl Interpreter {
         proxy: &crate::proxy::JsProxy,
         sym: crate::symbol::JsSymbol,
     ) -> Option<Value> {
-        self.gc_heap.read_payload(proxy.handle(), |body| {
-            body.private_elements.as_ref().and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|(s, _)| s.handle() == sym.handle())
-                    .map(|(_, v)| *v)
-            })
+        let slots = self
+            .gc_heap
+            .read_payload(proxy.handle(), |body| body.private_elements);
+        if slots.is_null() {
+            return None;
+        }
+        self.gc_heap.read_payload(slots, |body| {
+            body.slots()
+                .iter()
+                .find(|slot| slot.name.handle() == sym.handle())
+                .map(|slot| slot.value)
         })
     }
 
@@ -734,13 +738,90 @@ impl Interpreter {
         sym: crate::symbol::JsSymbol,
         value: Value,
     ) {
-        self.gc_heap.with_payload(proxy.handle(), |body| {
-            let entries = body.private_elements.get_or_insert_with(Vec::new);
-            match entries.iter_mut().find(|(s, _)| s.handle() == sym.handle()) {
-                Some(slot) => slot.1 = value,
-                None => entries.push((sym, value)),
+        let slots = self
+            .gc_heap
+            .read_payload(proxy.handle(), |body| body.private_elements);
+        // Overwriting an existing name needs no allocation.
+        if !slots.is_null() {
+            let overwritten = self.gc_heap.with_payload(slots, |body| {
+                match body
+                    .slots_mut()
+                    .iter_mut()
+                    .find(|slot| slot.name.handle() == sym.handle())
+                {
+                    Some(slot) => {
+                        slot.value = value;
+                        true
+                    }
+                    None => false,
+                }
+            });
+            if overwritten {
+                self.gc_heap.record_write(slots, &value);
+                return;
             }
+        }
+        // A new name grows the list, which allocates. The proxy, the name
+        // and the value are all live roots across it.
+        let previous = self
+            .gc_heap
+            .read_payload(proxy.handle(), |body| body.private_elements);
+        let existing = if previous.is_null() {
+            Vec::new()
+        } else {
+            self.gc_heap
+                .read_payload(previous, |body| body.slots().to_vec())
+        };
+        let mut proxy_handle = proxy.handle();
+        let mut name_value = crate::Value::symbol(sym);
+        let mut stored = value;
+        let grown = {
+            let proxy_slot = std::ptr::addr_of_mut!(proxy_handle);
+            let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                visitor(proxy_slot.cast::<otter_gc::raw::RawGc>());
+                name_value.trace_value_slot_mut(visitor);
+                stored.trace_value_slot_mut(visitor);
+                for slot in &existing {
+                    slot.name.trace_value_slots(visitor);
+                    slot.value.trace_value_slots(visitor);
+                }
+            };
+            match crate::proxy::alloc_private_slots(
+                &mut self.gc_heap,
+                existing.len() + 1,
+                &mut visit,
+            ) {
+                Ok(handle) => handle,
+                // Out of memory installing a private field leaves the
+                // proxy exactly as it was; the caller's operation fails
+                // through the ordinary allocation path instead.
+                Err(_) => return,
+            }
+        };
+        self.gc_heap.with_payload(grown, |body| {
+            let slots = body.slots_mut();
+            for (target, source) in slots.iter_mut().zip(existing.iter()) {
+                *target = *source;
+            }
+            let last = slots.len() - 1;
+            slots[last] = crate::proxy::PrivateSlot {
+                name: sym,
+                value: stored,
+            };
+            true
         });
+        self.gc_heap
+            .with_payload(proxy_handle, |body| body.private_elements = grown);
+        // The list handle and every pair were installed by raw payload
+        // writes, so record the edges the barrier would have.
+        self.gc_heap.record_write(proxy_handle, &grown);
+        for slot in &existing {
+            self.gc_heap
+                .record_write(grown, &crate::Value::symbol(slot.name));
+            self.gc_heap.record_write(grown, &slot.value);
+        }
+        self.gc_heap.record_write(grown, &name_value);
+        self.gc_heap.record_write(grown, &stored);
     }
 
     pub(crate) fn private_element_lookup(
@@ -771,18 +852,20 @@ impl Interpreter {
                 // Brand entries are copied out under a non-allocating heap
                 // borrow, then immediately parked as handles before any
                 // descriptor lookup can allocate or invoke user code.
-                let brand_protos: Vec<Value> = interp.gc_heap.read_payload(p.handle(), |body| {
-                    body.private_elements
-                        .as_ref()
-                        .map(|entries| {
-                            entries
-                                .iter()
-                                .filter(|(_, v)| v.is_object())
-                                .map(|(_, v)| *v)
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                });
+                let private_slots = interp
+                    .gc_heap
+                    .read_payload(p.handle(), |body| body.private_elements);
+                let brand_protos: Vec<Value> = if private_slots.is_null() {
+                    Vec::new()
+                } else {
+                    interp.gc_heap.read_payload(private_slots, |body| {
+                        body.slots()
+                            .iter()
+                            .filter(|slot| slot.value.is_object())
+                            .map(|slot| slot.value)
+                            .collect()
+                    })
+                };
                 let brand_protos: Vec<_> = brand_protos
                     .into_iter()
                     .map(|proto| interp.scoped_value(scope, proto))

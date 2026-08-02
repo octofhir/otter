@@ -3541,12 +3541,18 @@ fn record_slot_write(heap: &mut otter_gc::GcHeap, obj: JsObject, slot: Compresse
 /// sequence of `set` calls on a freshly-allocated object never writes through
 /// a stale handle.
 pub fn set(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) {
-    // A store can demote this object to dictionary mode, and the key list
-    // and slot metadata that demotion writes live in the sidecar. Reserved
-    // here, outside every payload borrow, because creating it allocates.
-    ensure_exotic(obj, heap).expect("exotic sidecar");
-    let compressed = compress_or_abort(heap, obj, value);
     let existing_offset = heap.read_payload(*obj, |body| body_offset_of(heap, body, key));
+    if existing_offset.is_none() {
+        // A fresh key demotes this object to dictionary mode, and the
+        // key list and slot metadata demotion writes live in the
+        // sidecar. Reserved here, outside every payload borrow, because
+        // creating it allocates — and only for the append that will
+        // actually write it: an in-place update never touches the
+        // sidecar, and reserving on every store gave most of the
+        // bootstrap graph a sidecar it never used.
+        ensure_exotic(obj, heap).expect("exotic sidecar");
+    }
+    let compressed = compress_or_abort(heap, obj, value);
     if let Some(offset) = existing_offset {
         let i = offset as usize;
         // Overwriting an accessor slot with a data value diverges this slot
@@ -3728,10 +3734,7 @@ pub fn set_prototype_value(
     heap: &mut otter_gc::GcHeap,
     proto: Option<Value>,
 ) -> bool {
-    // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj`, which is why the local is `mut`.
     let mut obj = obj;
-    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
     let new_proto = if let Some(value) = proto {
         if value.is_null() {
             ObjectPrototype::Null
@@ -3747,6 +3750,17 @@ pub fn set_prototype_value(
     } else {
         ObjectPrototype::Null
     };
+    if matches!(
+        new_proto,
+        ObjectPrototype::Value(_) | ObjectPrototype::Proxy(_)
+    ) {
+        // Only a non-ordinary prototype lives in the sidecar; Null and
+        // ordinary objects are encoded entirely by `jit_proto`, and
+        // clearing a stale override needs no sidecar to exist. Reserved
+        // here, outside the payload borrow, because creating it
+        // allocates — and this may move `obj`, hence the `mut` local.
+        ensure_exotic(&mut obj, heap).expect("exotic sidecar");
+    }
     // §10.1.2.1 step 4 — `SameValue(V, current) is true → return true`.
     let current = heap.read_payload(obj, |body| body.prototype());
     if prototype_same(&current, &new_proto) {
@@ -4230,14 +4244,17 @@ pub fn define_own_property_in_place(
     key: &str,
     descriptor: PropertyDescriptor,
 ) -> bool {
-    // A definition can demote this object to dictionary mode, and the key
-    // list and slot metadata that demotion writes live in the sidecar.
-    // Reserved here, outside every payload borrow, because creating it
-    // allocates.
-    ensure_exotic(obj_ref, heap).expect("exotic sidecar");
+    let existing_offset = heap.read_payload(*obj_ref, |body| body_offset_of(heap, body, key));
+    if existing_offset.is_none() {
+        // A fresh key demotes this object to dictionary mode, and the
+        // key list and slot metadata demotion writes live in the
+        // sidecar. Reserved here, outside every payload borrow, because
+        // creating it allocates. Redefinition of an existing slot goes
+        // through `materialize_slots`, which reserves for itself.
+        ensure_exotic(obj_ref, heap).expect("exotic sidecar");
+    }
     let mut obj = *obj_ref;
     let map_descriptor = descriptor.clone();
-    let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     let dictionary_keys = dictionary_keys_for_shape_transition(heap, obj, existing_offset);
     let slot_metas = slot_metas_for_shape_transition(heap, obj, existing_offset);
     let append_index = heap.read_payload(obj, |body| body_property_count(heap, body));

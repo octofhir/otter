@@ -38,8 +38,6 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 use std::cell::Cell;
 
-pub mod element_slab;
-
 use crate::Value;
 use crate::number::NumberValue;
 use crate::object::PropertyFlags;
@@ -60,7 +58,7 @@ pub type JsArray = otter_gc::Gc<ArrayBody>;
 #[derive(Debug, otter_macros::Pelt)]
 #[pelt(tag = ARRAY_BODY_TYPE_TAG)]
 pub struct ArrayBody {
-    /// Dense element storage: an [`element_slab::ElementSlabBody`] whose
+    /// Dense element storage: an [`crate::value_slab::ValueSlabBody`] whose
     /// values live in its own GC cell, so the array owns nothing outside
     /// the heap. Null while the array has no dense storage.
     ///
@@ -69,7 +67,7 @@ pub struct ArrayBody {
     /// fast paths read the cached [`Self::elements_ptr`]/[`Self::dense_len`]
     /// pair instead, and everything else goes through classified runtime
     /// stubs.
-    pub(crate) slab: element_slab::ElementSlabHandle,
+    pub(crate) slab: crate::value_slab::ValueSlabHandle,
     /// Logical `length` property. This may be larger than dense
     /// storage when `length` is assigned directly or when sparse
     /// elements are written.
@@ -103,7 +101,7 @@ pub struct ArrayBody {
 impl Default for ArrayBody {
     fn default() -> Self {
         Self {
-            slab: element_slab::ElementSlabHandle::null(),
+            slab: crate::value_slab::ValueSlabHandle::null(),
             length: 0,
             exotic: ArrayExoticHandle::null(),
             elements_ptr: Cell::new(std::ptr::null_mut()),
@@ -120,9 +118,10 @@ impl ArrayBody {
     /// and adopting a larger slab must not change it.
     #[inline]
     pub(crate) fn refresh_element_cache(&self) {
-        self.elements_ptr.set(element_slab::values_base(self.slab));
+        self.elements_ptr
+            .set(crate::value_slab::values_base(self.slab));
         self.dense_cap
-            .set(u32::try_from(element_slab::capacity_of(self.slab)).unwrap_or(u32::MAX));
+            .set(u32::try_from(crate::value_slab::capacity_of(self.slab)).unwrap_or(u32::MAX));
     }
 
     /// Debug verifier for the always-current element cache: the cached
@@ -130,12 +129,12 @@ impl ArrayBody {
     /// path that forgets to refresh fails deterministically.
     #[cfg(debug_assertions)]
     pub(crate) fn element_cache_is_current(&self) -> bool {
-        let slab_len = element_slab::body_of(self.slab).map_or(0, |body| {
+        let slab_len = crate::value_slab::body_of(self.slab).map_or(0, |body| {
             // SAFETY: the handle names a live slab payload.
             unsafe { (*body).len() }
         });
-        self.elements_ptr.get() == element_slab::values_base(self.slab)
-            && self.dense_cap.get() as usize == element_slab::capacity_of(self.slab)
+        self.elements_ptr.get() == crate::value_slab::values_base(self.slab)
+            && self.dense_cap.get() as usize == crate::value_slab::capacity_of(self.slab)
             && self.dense_len.get() as usize == slab_len
     }
 
@@ -177,7 +176,7 @@ impl ArrayBody {
     /// Adopt `slab` as this array's dense storage, with its first `len`
     /// values already written.
     #[inline]
-    pub(crate) fn adopt_slab(&mut self, slab: element_slab::ElementSlabHandle, len: usize) {
+    pub(crate) fn adopt_slab(&mut self, slab: crate::value_slab::ValueSlabHandle, len: usize) {
         self.slab = slab;
         self.refresh_element_cache();
         self.set_dense_len(len);
@@ -190,7 +189,7 @@ impl ArrayBody {
     /// two must never be written apart.
     #[inline]
     pub(crate) fn set_dense_len(&self, len: usize) {
-        if let Some(body) = element_slab::body_of(self.slab) {
+        if let Some(body) = crate::value_slab::body_of(self.slab) {
             // SAFETY: the handle names a live slab, and no other borrow
             // of its payload is open while this body holds it.
             unsafe { (*body).set_len(len) };
@@ -728,9 +727,9 @@ fn slab_from_values(
     heap: &mut GcHeap,
     values: &mut [Value],
     external_visit: &mut RootSlotVisitor<'_>,
-) -> Result<element_slab::ElementSlabHandle, otter_gc::OutOfMemory> {
+) -> Result<crate::value_slab::ValueSlabHandle, otter_gc::OutOfMemory> {
     if values.is_empty() {
-        return Ok(element_slab::ElementSlabHandle::null());
+        return Ok(crate::value_slab::ValueSlabHandle::null());
     }
     let count = values.len();
     let base = values.as_mut_ptr();
@@ -743,7 +742,7 @@ fn slab_from_values(
             value.trace_value_slot_mut(visitor);
         }
     };
-    element_slab::alloc_element_slab(heap, count, &mut visit)
+    crate::value_slab::alloc_value_slab(heap, count, &mut visit)
 }
 
 /// Copy `values` into a body that has already adopted a slab big enough
@@ -2527,11 +2526,11 @@ where
 ///
 /// Construction and growth copy values in behind the mutator's back, so
 /// the edges they create need recording in one pass afterwards.
-fn record_slab_contents(heap: &mut GcHeap, slab: element_slab::ElementSlabHandle, len: usize) {
+fn record_slab_contents(heap: &mut GcHeap, slab: crate::value_slab::ValueSlabHandle, len: usize) {
     if slab.is_null() {
         return;
     }
-    let base = element_slab::values_base(slab);
+    let base = crate::value_slab::values_base(slab);
     for index in 0..len {
         // SAFETY: `index < len`, the prefix the caller just wrote.
         let value = unsafe { *base.add(index) };
@@ -2571,12 +2570,12 @@ fn reserve_dense_capacity(
         external_visit(visitor);
         visitor(owner_slot.cast::<RawGc>());
     };
-    let slab = element_slab::alloc_element_slab(heap, grown, &mut visit)?;
+    let slab = crate::value_slab::alloc_value_slab(heap, grown, &mut visit)?;
 
     let owner = *arr;
     heap.with_payload(owner, |body| {
         let old_base = body.elements_ptr.get();
-        let new_base = element_slab::values_base(slab);
+        let new_base = crate::value_slab::values_base(slab);
         if !old_base.is_null() && live_len != 0 {
             // SAFETY: the outgoing slab holds `live_len` values and the
             // incoming one has room for at least that many; the two cells

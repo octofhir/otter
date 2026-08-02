@@ -39,7 +39,7 @@
 //!
 //! # See also
 //!
-//! - [`crate::array::element_slab`] — the same shape for dense elements.
+//! - [`crate::value_slab`] — the same shape for dense elements.
 
 use std::marker::PhantomData;
 

@@ -4271,7 +4271,7 @@ fn bytecode_array_push_uses_root_aware_growth_with_frame_roots() {
         6,
     );
     let mut interp = Interpreter::new();
-    let before = interp.gc_heap_mut().stats().reserved_bytes;
+    let before = interp.gc_heap_mut().stats().old_allocated_bytes;
     let context = interp.link_module(module);
     let result = interp.run(&context).unwrap();
     let Some(array) = (result).as_array() else {
@@ -4281,10 +4281,10 @@ fn bytecode_array_push_uses_root_aware_growth_with_frame_roots() {
         crate::array::with_elements(array, interp.gc_heap_mut(), |elements| elements.to_vec());
     assert_eq!(values.len(), 5);
     assert_eq!(values[4], Value::number(NumberValue::from_i32(5)));
-    let after = interp.gc_heap_mut().stats().reserved_bytes;
+    let after = interp.gc_heap_mut().stats().old_allocated_bytes;
     assert!(
         after > before,
-        "ArrayPush should reserve dense backing storage through the root-aware path"
+        "ArrayPush should grow dense backing storage through the root-aware path"
     );
 }
 
@@ -4352,7 +4352,7 @@ fn bytecode_store_element_uses_root_aware_growth_with_frame_roots() {
         8,
     );
     let mut interp = Interpreter::new();
-    let before = interp.gc_heap_mut().stats().reserved_bytes;
+    let before = interp.gc_heap_mut().stats().old_allocated_bytes;
     let context = interp.link_module(module);
     let result = interp.run(&context).unwrap();
     let Some(array) = (result).as_array() else {
@@ -4362,10 +4362,10 @@ fn bytecode_store_element_uses_root_aware_growth_with_frame_roots() {
         crate::array::with_elements(array, interp.gc_heap_mut(), |elements| elements.to_vec());
     assert_eq!(values.len(), 5);
     assert_eq!(values[4], Value::number(NumberValue::from_i32(99)));
-    let after = interp.gc_heap_mut().stats().reserved_bytes;
+    let after = interp.gc_heap_mut().stats().old_allocated_bytes;
     assert!(
         after > before,
-        "StoreElement should reserve dense backing storage through the root-aware path"
+        "StoreElement should grow dense backing storage through the root-aware path"
     );
 }
 

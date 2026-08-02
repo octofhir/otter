@@ -33,11 +33,12 @@
 
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap};
-use std::mem;
 use std::sync::Arc;
 
 use smallvec::SmallVec;
 use std::cell::Cell;
+
+pub mod element_slab;
 
 use crate::Value;
 use crate::number::NumberValue;
@@ -59,14 +60,16 @@ pub type JsArray = otter_gc::Gc<ArrayBody>;
 #[derive(Debug, otter_macros::Pelt)]
 #[pelt(tag = ARRAY_BODY_TYPE_TAG)]
 pub struct ArrayBody {
-    /// Dense element storage. Crate-internal callers must go through
-    /// this module's helpers so growth is heap-accounted.
+    /// Dense element storage: an [`element_slab::ElementSlabBody`] whose
+    /// values live in its own GC cell, so the array owns nothing outside
+    /// the heap. Null while the array has no dense storage.
     ///
-    /// This Rust container is deliberately private to the VM. Native code
-    /// never observes `Vec` field layout: compiled fast paths read the cached
-    /// [`Self::elements_ptr`]/[`Self::dense_len`] pair instead, and everything
-    /// else goes through classified runtime stubs.
-    pub(crate) elements: Vec<Value>,
+    /// Crate-internal callers must go through this module's helpers so
+    /// growth allocates. Native code never observes the handle: compiled
+    /// fast paths read the cached [`Self::elements_ptr`]/[`Self::dense_len`]
+    /// pair instead, and everything else goes through classified runtime
+    /// stubs.
+    pub(crate) slab: element_slab::ElementSlabHandle,
     /// Logical `length` property. This may be larger than dense
     /// storage when `length` is assigned directly or when sparse
     /// elements are written.
@@ -79,69 +82,194 @@ pub struct ArrayBody {
     #[pelt(via = trace_array_exotic_slots)]
     pub(crate) exotic: Option<Box<ArrayExoticSlots>>,
     /// Always-current base of the dense element buffer, kept in a fixed body
-    /// field so compiled code can address elements without knowing `Vec`
-    /// layout. The buffer is a plain Rust allocation, so a moving collection
-    /// of the body leaves it valid; only growth, shrinkage, and reallocation
-    /// change it, and every mutating helper in this module refreshes it.
+    /// field so compiled code can address elements without knowing where the
+    /// slab lives. The slab is an old-space body, so a scavenge leaves the
+    /// base valid; only growth and a restore change it, and both refresh it.
     #[pelt(skip)]
     elements_ptr: Cell<*mut Value>,
-    /// Always-current `elements.len()`, mirrored next to the base pointer for
-    /// the same reason: a compiled bounds check reads it as one 32-bit load.
-    /// Dense storage beyond `u32::MAX` elements is unreachable in practice —
-    /// growth helpers cap dense storage far below it.
+    /// Live dense length. Authoritative, and sited next to the base pointer
+    /// so a compiled bounds check reads it as one 32-bit load. Dense storage
+    /// beyond `u32::MAX` elements is unreachable in practice — growth helpers
+    /// cap dense storage far below it.
     #[pelt(skip)]
     dense_len: Cell<u32>,
+    /// Values the current slab can hold. Cached beside the base for the same
+    /// reason the length is: a push under a payload borrow has no heap to ask.
+    #[pelt(skip)]
+    dense_cap: Cell<u32>,
 }
 
 impl Default for ArrayBody {
     fn default() -> Self {
         Self {
-            elements: Vec::new(),
+            slab: element_slab::ElementSlabHandle::null(),
             length: 0,
             exotic: None,
             elements_ptr: Cell::new(std::ptr::null_mut()),
             dense_len: Cell::new(0),
+            dense_cap: Cell::new(0),
         }
     }
 }
 
 impl ArrayBody {
-    /// Recompute the JIT-visible element cache after any dense mutation.
+    /// Recompute the base and capacity the slab currently provides.
+    ///
+    /// The live length is not derived here — it is this body's own state,
+    /// and adopting a larger slab must not change it.
     #[inline]
     pub(crate) fn refresh_element_cache(&self) {
-        self.elements_ptr.set(self.elements.as_ptr().cast_mut());
-        self.dense_len
-            .set(u32::try_from(self.elements.len()).unwrap_or(u32::MAX));
+        self.elements_ptr.set(element_slab::values_base(self.slab));
+        self.dense_cap
+            .set(u32::try_from(element_slab::capacity_of(self.slab)).unwrap_or(u32::MAX));
     }
 
-    /// Debug verifier for the always-current element cache: the cached pair
-    /// must equal what [`Self::refresh_element_cache`] would recompute now, so
-    /// any new mutation path that forgets to refresh fails deterministically.
+    /// Debug verifier for the always-current element cache: the cached
+    /// triple must agree with the slab the body holds, so any new mutation
+    /// path that forgets to refresh fails deterministically.
     #[cfg(debug_assertions)]
     pub(crate) fn element_cache_is_current(&self) -> bool {
-        // An empty buffer's base is never dereferenced (every access guards
-        // `index < dense_len` first), so a fresh body's null base is as
-        // current as an empty `Vec`'s dangling one.
-        if self.elements.is_empty() {
-            return self.dense_len.get() == 0;
+        let slab_len = element_slab::body_of(self.slab).map_or(0, |body| {
+            // SAFETY: the handle names a live slab payload.
+            unsafe { (*body).len() }
+        });
+        self.elements_ptr.get() == element_slab::values_base(self.slab)
+            && self.dense_cap.get() as usize == element_slab::capacity_of(self.slab)
+            && self.dense_len.get() as usize == slab_len
+    }
+
+    /// Live dense elements.
+    #[inline]
+    pub(crate) fn elements(&self) -> &[Value] {
+        let base = self.elements_ptr.get();
+        if base.is_null() {
+            return &[];
         }
-        self.elements_ptr.get() == self.elements.as_ptr().cast_mut()
-            && self.dense_len.get() as usize == self.elements.len().min(u32::MAX as usize)
+        // SAFETY: the cache names the live slab's trailing array, and
+        // `dense_len <= dense_cap` bounds the live prefix.
+        unsafe { std::slice::from_raw_parts(base.cast_const(), self.dense_len.get() as usize) }
+    }
+
+    /// Live dense elements, mutably.
+    #[inline]
+    pub(crate) fn elements_mut(&mut self) -> &mut [Value] {
+        let base = self.elements_ptr.get();
+        if base.is_null() {
+            return &mut [];
+        }
+        // SAFETY: as in `elements`; `&mut self` rules out an aliasing read.
+        unsafe { std::slice::from_raw_parts_mut(base, self.dense_len.get() as usize) }
+    }
+
+    /// Number of live dense elements.
+    #[inline]
+    pub(crate) fn dense_len(&self) -> usize {
+        self.dense_len.get() as usize
+    }
+
+    /// Values the current slab can hold without growing.
+    #[inline]
+    pub(crate) fn dense_capacity(&self) -> usize {
+        self.dense_cap.get() as usize
+    }
+
+    /// Adopt `slab` as this array's dense storage, with its first `len`
+    /// values already written.
+    #[inline]
+    pub(crate) fn adopt_slab(&mut self, slab: element_slab::ElementSlabHandle, len: usize) {
+        self.slab = slab;
+        self.refresh_element_cache();
+        self.set_dense_len(len);
+    }
+
+    /// Publish a new live length to both the slab and the cache.
+    ///
+    /// The slab is the authority — it is what the collector consults —
+    /// and the body's copy is what a compiled bounds check reads, so the
+    /// two must never be written apart.
+    #[inline]
+    pub(crate) fn set_dense_len(&self, len: usize) {
+        if let Some(body) = element_slab::body_of(self.slab) {
+            // SAFETY: the handle names a live slab, and no other borrow
+            // of its payload is open while this body holds it.
+            unsafe { (*body).set_len(len) };
+        } else {
+            debug_assert_eq!(len, 0, "an array with no slab has no dense elements");
+        }
+        self.dense_len
+            .set(u32::try_from(len).expect("dense length exceeds u32"));
     }
 }
 
-/// Push one dense element and keep the JIT-visible cache current.
+/// Push one dense element. The slab must already have room — growth
+/// allocates, and a payload borrow has no heap to allocate from, so every
+/// caller reserves before it mutates.
 #[inline]
 fn body_elements_push(body: &mut ArrayBody, value: Value) {
-    body.elements.push(value);
-    body.refresh_element_cache();
+    let len = body.dense_len();
+    debug_assert!(
+        len < body.dense_capacity(),
+        "dense push without a reservation: len={len} cap={}",
+        body.dense_capacity(),
+    );
+    if len >= body.dense_capacity() {
+        return;
+    }
+    // SAFETY: `len < capacity`, so the slot is inside the slab.
+    unsafe { *body.elements_ptr.get().add(len) = value };
+    body.set_dense_len(len + 1);
 }
 
-/// Truncate dense elements and keep the JIT-visible cache current.
+/// Truncate dense elements, clearing the values that leave the live
+/// prefix so the slab's tracer stops keeping them alive.
 #[inline]
 fn body_elements_truncate(body: &mut ArrayBody, len: usize) {
-    body.elements.truncate(len);
-    body.refresh_element_cache();
+    let current = body.dense_len();
+    if len >= current {
+        return;
+    }
+    let base = body.elements_ptr.get();
+    for index in len..current {
+        // SAFETY: `index < current <= capacity`.
+        unsafe { *base.add(index) = Value::undefined() };
+    }
+    body.set_dense_len(len);
+}
+
+/// Insert one dense element at `index`, shifting the tail up. The slab
+/// must already have room.
+#[inline]
+fn body_elements_insert(body: &mut ArrayBody, index: usize, value: Value) {
+    let len = body.dense_len();
+    debug_assert!(index <= len && len < body.dense_capacity());
+    if index > len || len >= body.dense_capacity() {
+        return;
+    }
+    let base = body.elements_ptr.get();
+    // SAFETY: the source range is live and the destination is inside the
+    // slab because `len < capacity`; the ranges may overlap, so this is a
+    // `copy`, not `copy_nonoverlapping`.
+    unsafe { std::ptr::copy(base.add(index), base.add(index + 1), len - index) };
+    // SAFETY: `index <= len < capacity`.
+    unsafe { *base.add(index) = value };
+    body.set_dense_len(len + 1);
+}
+
+/// Remove the dense element at `index`, shifting the tail down.
+#[inline]
+fn body_elements_remove(body: &mut ArrayBody, index: usize) -> Value {
+    let len = body.dense_len();
+    assert!(index < len, "dense remove out of range");
+    let base = body.elements_ptr.get();
+    // SAFETY: `index < len <= capacity`.
+    let removed = unsafe { *base.add(index) };
+    // SAFETY: source and destination are both inside the live prefix.
+    unsafe { std::ptr::copy(base.add(index + 1), base.add(index), len - index - 1) };
+    // SAFETY: the vacated last slot is inside the slab; clearing it stops
+    // the tracer from keeping a value the array no longer holds.
+    unsafe { *base.add(len - 1) = Value::undefined() };
+    body.set_dense_len(len - 1);
+    removed
 }
 
 /// Byte offset of the cached dense-element base within [`ArrayBody`].
@@ -219,9 +347,11 @@ pub(crate) struct ArrayExoticSlots {
 /// guarding the receiver body tag.
 pub const ARRAY_BODY_LENGTH_OFFSET: usize = std::mem::offset_of!(ArrayBody, length);
 
-// Keep the JIT-visible dense array shell small and offset-stable: cold array
-// state must stay in `ArrayExoticSlots`, not creep back into `ArrayBody`.
-const _: () = assert!(std::mem::offset_of!(ArrayBody, elements) == 0);
+// Keep the JIT-visible dense array shell small: cold array state must stay in
+// `ArrayExoticSlots`, not creep back into `ArrayBody`. The element base and
+// length do not need a fixed position — compiled code reads them at the
+// offsets `ARRAY_BODY_ELEMENTS_PTR_OFFSET` / `ARRAY_BODY_DENSE_LEN_OFFSET`
+// publish — but they do need to stay in the shell rather than behind a hop.
 const _: () = assert!(std::mem::size_of::<ArrayBody>() <= 64);
 
 /// Trace helper for symbol-keyed own properties: only `Value` parts
@@ -391,7 +521,7 @@ pub(crate) fn set_prototype_override(arr: JsArray, heap: &mut GcHeap, proto: Opt
         body.exotic_mut().prototype_override = proto;
     });
     if let Some(value) = &barrier_value {
-        heap.record_write(arr, value);
+        record_array_write(heap, arr, value);
     }
 }
 
@@ -427,12 +557,16 @@ pub(crate) fn from_elements_old_for_fixture(
     heap: &mut GcHeap,
     values: impl IntoIterator<Item = Value>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
-    let collected: Vec<Value> = values.into_iter().collect();
-    let mut body = ArrayBody::default();
-    reserve_elements_for_len(&mut body, heap, collected.len())?;
-    body.length = collected.len();
-    body.elements.extend(collected);
-    body.refresh_element_cache();
+    let mut collected: Vec<Value> = values.into_iter().collect();
+    let length = collected.len();
+    let slab = slab_from_values(heap, &mut collected, &mut |_| {})?;
+    let mut body = ArrayBody {
+        length,
+        ..Default::default()
+    };
+    body.adopt_slab(slab, length);
+    copy_values_into(&mut body, &collected);
+    record_slab_contents(heap, slab, length);
     heap.alloc_old(body)
 }
 
@@ -463,12 +597,51 @@ pub(crate) fn from_vec_with_roots(
     collected: Vec<Value>,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
-    let body = ArrayBody {
-        length: collected.len(),
-        elements: collected,
+    let length = collected.len();
+    let mut collected = collected;
+    let slab = slab_from_values(heap, &mut collected, external_visit)?;
+    let mut body = ArrayBody {
+        length,
         ..Default::default()
     };
+    body.adopt_slab(slab, length);
+    copy_values_into(&mut body, &collected);
+    record_slab_contents(heap, slab, length);
     alloc_body_with_adopted_elements(heap, body, external_visit)
+}
+
+/// Allocate a slab sized to `values` and copy them in.
+///
+/// The values are rooted across the allocation — they are ordinary
+/// `Value`s on the caller's stack, and a collection here would otherwise
+/// leave the copies naming pre-move objects.
+fn slab_from_values(
+    heap: &mut GcHeap,
+    values: &mut [Value],
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<element_slab::ElementSlabHandle, otter_gc::OutOfMemory> {
+    if values.is_empty() {
+        return Ok(element_slab::ElementSlabHandle::null());
+    }
+    let count = values.len();
+    let base = values.as_mut_ptr();
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
+        for index in 0..count {
+            // SAFETY: `index < count` and the caller's slice outlives
+            // this call, so the entry is a live slot to rewrite.
+            let value = unsafe { &mut *base.add(index) };
+            value.trace_value_slot_mut(visitor);
+        }
+    };
+    element_slab::alloc_element_slab(heap, count, &mut visit)
+}
+
+/// Copy `values` into a body that has already adopted a slab big enough
+/// for them.
+fn copy_values_into(body: &mut ArrayBody, values: &[Value]) {
+    debug_assert!(body.dense_capacity() >= values.len());
+    body.elements_mut().copy_from_slice(values);
 }
 
 /// Allocate an [`ArrayBody`] whose dense element vector has already been
@@ -480,31 +653,15 @@ pub(crate) fn from_vec_with_roots(
 /// the rooted allocator, which traces the pending body and its dense elements.
 fn alloc_body_with_adopted_elements(
     heap: &mut GcHeap,
-    mut body: ArrayBody,
+    body: ArrayBody,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
-    body.refresh_element_cache();
-    let element_bytes = spilled_capacity_bytes(body.elements.capacity());
-    let can_reserve_without_collect = heap.max_heap_bytes() == 0;
-    let elements_reserved = element_bytes == 0
-        || (can_reserve_without_collect
-            && heap.reserve_bytes_no_collect(element_bytes as u64).is_ok());
-    if elements_reserved {
-        match heap.try_alloc_no_collect_or_return(body) {
-            Ok(array) => return Ok(array),
-            Err(returned) => body = returned,
-        }
-    } else {
-        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            external_visit(visitor);
-            for value in &body.elements {
-                value.trace_value_slots(visitor);
-            }
-        };
-        heap.reserve_bytes_with_roots(element_bytes as u64, &mut reserve_roots)?;
+    // The elements are a GC body of their own now, so they were counted
+    // when they were allocated. All that is left is the array shell.
+    match heap.try_alloc_no_collect_or_return(body) {
+        Ok(array) => Ok(array),
+        Err(returned) => heap.alloc_with_roots(returned, external_visit),
     }
-
-    heap.alloc_with_roots(body, external_visit)
 }
 
 /// Construct an array from initial elements **and** attach the
@@ -527,9 +684,11 @@ fn from_elements_with_source_old_for_fixture(
     values: impl IntoIterator<Item = Value>,
     source_bytes: Arc<[u8]>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
-    let collected: Vec<Value> = values.into_iter().collect();
+    let mut collected: Vec<Value> = values.into_iter().collect();
+    let length = collected.len();
+    let slab = slab_from_values(heap, &mut collected, &mut |_| {})?;
     let mut body = ArrayBody {
-        length: collected.len(),
+        length,
         exotic: Some(Box::new(ArrayExoticSlots {
             source_bytes: Some(source_bytes),
             dirty: false,
@@ -537,9 +696,9 @@ fn from_elements_with_source_old_for_fixture(
         })),
         ..Default::default()
     };
-    reserve_elements_for_len(&mut body, heap, collected.len())?;
-    body.elements.extend(collected);
-    body.refresh_element_cache();
+    body.adopt_slab(slab, length);
+    copy_values_into(&mut body, &collected);
+    record_slab_contents(heap, slab, length);
     heap.alloc_old(body)
 }
 
@@ -553,17 +712,21 @@ pub(crate) fn from_elements_with_source_and_roots(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
     let collected: Vec<Value> = values.into_iter().collect();
-    let body = ArrayBody {
-        length: collected.len(),
-        elements: collected,
+    let length = collected.len();
+    let mut collected = collected;
+    let slab = slab_from_values(heap, &mut collected, external_visit)?;
+    let mut body = ArrayBody {
+        length,
         exotic: Some(Box::new(ArrayExoticSlots {
             source_bytes: Some(source_bytes),
             dirty: false,
             ..ArrayExoticSlots::default()
         })),
-        elements_ptr: Cell::new(std::ptr::null_mut()),
-        dense_len: Cell::new(0),
+        ..Default::default()
     };
+    body.adopt_slab(slab, length);
+    copy_values_into(&mut body, &collected);
+    record_slab_contents(heap, slab, length);
     alloc_body_with_adopted_elements(heap, body, external_visit)
 }
 
@@ -591,7 +754,7 @@ pub fn get(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> Value {
             "stale dense-element cache on array read",
         );
         let raw = body
-            .elements
+            .elements()
             .get(idx)
             .cloned()
             .or_else(|| {
@@ -615,7 +778,7 @@ pub fn get(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> Value {
 #[must_use]
 pub fn has_own_element(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> bool {
     heap.read_payload(arr, |body| {
-        if let Some(slot) = body.elements.get(idx) {
+        if let Some(slot) = body.elements().get(idx) {
             return !slot.is_hole();
         }
         body.sparse_elements()
@@ -638,7 +801,7 @@ pub(crate) fn own_data_element_without_accessors(
         if body.accessors().is_some() {
             return None;
         }
-        let value = body.elements.get(idx).cloned().or_else(|| {
+        let value = body.elements().get(idx).cloned().or_else(|| {
             body.sparse_elements()
                 .and_then(|sparse| sparse.get(&idx).cloned())
         })?;
@@ -662,7 +825,7 @@ pub(crate) fn plain_dense_element(
         if body.exotic.is_some() || body.accessors().is_some() {
             return None;
         }
-        let value = *body.elements.get(idx)?;
+        let value = *body.elements().get(idx)?;
         if value.is_hole() { None } else { Some(value) }
     })
 }
@@ -674,7 +837,11 @@ pub(crate) fn plain_dense_element(
 #[must_use]
 pub(crate) fn is_plain_dense_hole(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> bool {
     heap.read_payload(arr, |body| {
-        body.exotic.is_none() && body.elements.get(idx).is_some_and(|value| value.is_hole())
+        body.exotic.is_none()
+            && body
+                .elements()
+                .get(idx)
+                .is_some_and(|value| value.is_hole())
     })
 }
 
@@ -694,7 +861,7 @@ pub(crate) fn set_plain_dense_slot(
         if body.exotic.is_some() {
             return false;
         }
-        let Some(slot) = body.elements.get_mut(idx) else {
+        let Some(slot) = body.elements_mut().get_mut(idx) else {
             return false;
         };
         if slot.is_hole() && !allow_hole {
@@ -706,7 +873,7 @@ pub(crate) fn set_plain_dense_slot(
         true
     });
     if stored {
-        heap.record_write(arr, &value);
+        record_array_write(heap, arr, &value);
     }
     stored
 }
@@ -740,7 +907,7 @@ pub(crate) fn define_index_value(
 }
 
 fn set_index_value(
-    arr: JsArray,
+    mut arr: JsArray,
     heap: &mut otter_gc::GcHeap,
     idx: usize,
     value: Value,
@@ -767,28 +934,26 @@ fn set_index_value(
             body.length = body.length.max(target_len);
             body.mark_dirty();
         });
-        heap.record_write(arr, &barrier_value);
+        record_array_write(heap, arr, &barrier_value);
         return Ok(());
     }
-    reserve_for_target_len(arr, heap, target_len)?;
+    reserve_dense_capacity(&mut arr, heap, target_len, &mut |_| {})?;
     heap.with_payload(arr, |body| {
-        if idx < body.elements.len() {
-            body.elements[idx] = value;
+        if idx < body.dense_len() {
+            body.elements_mut()[idx] = value;
             body.length = body.length.max(target_len);
             body.mark_dirty();
             return;
         }
-        body.elements
-            .reserve_exact(target_len.saturating_sub(body.elements.len()));
         body.refresh_element_cache();
-        while body.elements.len() < idx {
+        while body.dense_len() < idx {
             body_elements_push(body, Value::hole());
         }
         body_elements_push(body, value);
         body.length = body.length.max(target_len);
         body.mark_dirty();
     });
-    heap.record_write(arr, &barrier_value);
+    record_array_write(heap, arr, &barrier_value);
     Ok(())
 }
 
@@ -825,7 +990,7 @@ pub(crate) fn set_with_roots(
             body.length = body.length.max(target_len);
             body.mark_dirty();
         });
-        heap.record_write(arr, &barrier_value);
+        record_array_write(heap, arr, &barrier_value);
         return Ok(());
     }
     {
@@ -833,26 +998,24 @@ pub(crate) fn set_with_roots(
             external_visit(visitor);
             value.trace_value_slots(visitor);
         };
-        reserve_for_target_len_with_roots(&mut arr, heap, target_len, &mut reserve_roots)?;
+        reserve_dense_capacity(&mut arr, heap, target_len, &mut reserve_roots)?;
     }
     heap.with_payload(arr, |body| {
-        if idx < body.elements.len() {
-            body.elements[idx] = value;
+        if idx < body.dense_len() {
+            body.elements_mut()[idx] = value;
             body.length = body.length.max(target_len);
             body.mark_dirty();
             return;
         }
-        body.elements
-            .reserve_exact(target_len.saturating_sub(body.elements.len()));
         body.refresh_element_cache();
-        while body.elements.len() < idx {
+        while body.dense_len() < idx {
             body_elements_push(body, Value::hole());
         }
         body_elements_push(body, value);
         body.length = body.length.max(target_len);
         body.mark_dirty();
     });
-    heap.record_write(arr, &barrier_value);
+    record_array_write(heap, arr, &barrier_value);
     Ok(())
 }
 
@@ -877,7 +1040,7 @@ pub(crate) fn can_fast_fill_dense_range(
         if !body.extensible() || body.prototype_override().is_some() || end > MAX_DENSE_INDEX {
             return false;
         }
-        if start.saturating_sub(body.elements.len()) > 1024 {
+        if start.saturating_sub(body.dense_len()) > 1024 {
             return false;
         }
         let in_range = |key: &str| {
@@ -921,26 +1084,24 @@ pub(crate) fn fill_dense_range_with_roots(
             external_visit(visitor);
             value.trace_value_slots(visitor);
         };
-        reserve_for_target_len_with_roots(&mut arr, heap, end, &mut reserve_roots)?;
+        reserve_dense_capacity(&mut arr, heap, end, &mut reserve_roots)?;
     }
     heap.with_payload(arr, |body| {
-        body.elements
-            .reserve_exact(end.saturating_sub(body.elements.len()));
         body.refresh_element_cache();
-        while body.elements.len() < start {
+        while body.dense_len() < start {
             body_elements_push(body, Value::hole());
         }
-        let existing_end = end.min(body.elements.len());
+        let existing_end = end.min(body.dense_len());
         for idx in start..existing_end {
-            body.elements[idx] = value;
+            body.elements_mut()[idx] = value;
         }
-        while body.elements.len() < end {
+        while body.dense_len() < end {
             body_elements_push(body, value);
         }
         body.length = body.length.max(end);
         body.mark_dirty();
     });
-    heap.record_write(arr, &value);
+    record_array_write(heap, arr, &value);
     Ok(())
 }
 
@@ -951,18 +1112,16 @@ pub(crate) fn fill_dense_range_with_roots(
 /// Returns [`otter_gc::OutOfMemory`] if growing dense storage would
 /// exceed the configured heap cap.
 pub fn push(
-    arr: JsArray,
+    mut arr: JsArray,
     heap: &mut otter_gc::GcHeap,
     value: Value,
 ) -> Result<usize, otter_gc::OutOfMemory> {
     let barrier_value = value;
     let target_len = len(arr, heap).saturating_add(1);
-    reserve_for_target_len(arr, heap, target_len)?;
+    reserve_dense_capacity(&mut arr, heap, target_len, &mut |_| {})?;
     let new_len = heap.with_payload(arr, |body| {
-        body.elements
-            .reserve_exact(target_len.saturating_sub(body.elements.len()));
         body.refresh_element_cache();
-        while body.elements.len() + 1 < target_len {
+        while body.dense_len() + 1 < target_len {
             body_elements_push(body, Value::hole());
         }
         body_elements_push(body, value);
@@ -970,7 +1129,7 @@ pub fn push(
         body.mark_dirty();
         body.length
     });
-    heap.record_write(arr, &barrier_value);
+    record_array_write(heap, arr, &barrier_value);
     Ok(new_len)
 }
 
@@ -994,13 +1153,11 @@ pub(crate) fn push_with_roots(
             external_visit(visitor);
             value.trace_value_slots(visitor);
         };
-        reserve_for_target_len_with_roots(&mut arr, heap, target_len, &mut reserve_roots)?;
+        reserve_dense_capacity(&mut arr, heap, target_len, &mut reserve_roots)?;
     }
     let new_len = heap.with_payload(arr, |body| {
-        body.elements
-            .reserve_exact(target_len.saturating_sub(body.elements.len()));
         body.refresh_element_cache();
-        while body.elements.len() + 1 < target_len {
+        while body.dense_len() + 1 < target_len {
             body_elements_push(body, Value::hole());
         }
         body_elements_push(body, value);
@@ -1008,7 +1165,7 @@ pub(crate) fn push_with_roots(
         body.mark_dirty();
         body.length
     });
-    heap.record_write(arr, &barrier_value);
+    record_array_write(heap, arr, &barrier_value);
     Ok(new_len)
 }
 
@@ -1022,7 +1179,7 @@ pub(crate) fn push_with_roots(
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-arraysetlength>
 pub fn set_length(
-    arr: JsArray,
+    mut arr: JsArray,
     heap: &mut otter_gc::GcHeap,
     new_len: usize,
 ) -> Result<(), otter_gc::OutOfMemory> {
@@ -1064,14 +1221,12 @@ pub fn set_length(
     }
     const MAX_DENSE_LENGTH_GROWTH: usize = 1 << 20;
     if new_len <= MAX_DENSE_LENGTH_GROWTH {
-        reserve_for_target_len(arr, heap, new_len)?;
+        reserve_dense_capacity(&mut arr, heap, new_len, &mut |_| {})?;
     }
     heap.with_payload(arr, |body| {
         if new_len <= MAX_DENSE_LENGTH_GROWTH {
-            body.elements
-                .reserve_exact(new_len.saturating_sub(body.elements.len()));
             body.refresh_element_cache();
-            while body.elements.len() < new_len {
+            while body.dense_len() < new_len {
                 body_elements_push(body, Value::hole());
             }
         }
@@ -1104,9 +1259,9 @@ pub(crate) fn set_length_checked(
         // whole `[new_len, cur)` range — a sparse `length` (e.g. `2**32-1`)
         // would otherwise spin over billions of holes.
         let mut present: Vec<usize> = Vec::new();
-        let dense_hi = body.elements.len().min(cur);
+        let dense_hi = body.dense_len().min(cur);
         for idx in new_len..dense_hi {
-            if !body.elements[idx].is_hole() {
+            if !body.elements()[idx].is_hole() {
                 present.push(idx);
             }
         }
@@ -1160,7 +1315,7 @@ pub(crate) fn set_length_writable(arr: JsArray, heap: &mut otter_gc::GcHeap, wri
 }
 
 fn delete_array_body_index(body: &mut ArrayBody, idx: usize) {
-    if let Some(slot) = body.elements.get_mut(idx) {
+    if let Some(slot) = body.elements_mut().get_mut(idx) {
         *slot = Value::hole();
     }
     if let Some(exotic) = body.exotic.as_deref_mut()
@@ -1235,11 +1390,11 @@ fn array_index_at_or_above(key: &str, limit: usize) -> bool {
 pub(crate) fn dense_shift(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
     heap.with_payload(arr, |body| {
         debug_assert!(body.exotic.is_none(), "dense shift over an exotic array");
-        if body.elements.is_empty() {
+        if body.elements().is_empty() {
             return Value::undefined();
         }
-        let head = body.elements.remove(0);
-        body.length = body.elements.len();
+        let head = body_elements_remove(body, 0);
+        body.length = body.dense_len();
         body.refresh_element_cache();
         if head.is_hole() {
             Value::undefined()
@@ -1271,18 +1426,16 @@ pub(crate) fn dense_unshift_with_roots(
             external_visit(visitor);
             value.trace_value_slots(visitor);
         };
-        reserve_for_target_len_with_roots(&mut arr, heap, target_len, &mut reserve_roots)?;
+        reserve_dense_capacity(&mut arr, heap, target_len, &mut reserve_roots)?;
     }
     let new_len = heap.with_payload(arr, |body| {
         debug_assert!(body.exotic.is_none(), "dense unshift over an exotic array");
-        body.elements
-            .reserve_exact(target_len.saturating_sub(body.elements.len()));
-        body.elements.insert(0, value);
-        body.length = body.elements.len();
+        body_elements_insert(body, 0, value);
+        body.length = body.dense_len();
         body.refresh_element_cache();
         body.length
     });
-    heap.record_write(arr, &barrier_value);
+    record_array_write(heap, arr, &barrier_value);
     Ok(new_len)
 }
 
@@ -1297,8 +1450,8 @@ pub(crate) fn dense_unshift_with_roots(
 pub(crate) fn is_fully_dense(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
     heap.read_payload(arr, |body| {
         body.exotic.is_none()
-            && body.length == body.elements.len()
-            && !body.elements.iter().any(|value| value.is_hole())
+            && body.length == body.dense_len()
+            && !body.elements().iter().any(|value| value.is_hole())
     })
 }
 
@@ -1311,8 +1464,8 @@ pub fn pop(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
             return Value::undefined();
         }
         let idx = body.length - 1;
-        let popped = if idx < body.elements.len() {
-            body.elements.get(idx).cloned()
+        let popped = if idx < body.dense_len() {
+            body.elements().get(idx).cloned()
         } else {
             body.exotic
                 .as_deref_mut()
@@ -1342,7 +1495,7 @@ pub fn set_integrity_level(arr: JsArray, heap: &mut otter_gc::GcHeap, frozen: bo
     prevent_extensions(arr, heap);
     heap.with_payload(arr, |body| {
         let mut keys: Vec<(String, bool)> = Vec::new();
-        for (i, v) in body.elements.iter().enumerate() {
+        for (i, v) in body.elements().iter().enumerate() {
             if !v.is_hole() {
                 keys.push((i.to_string(), false));
             }
@@ -1380,7 +1533,7 @@ pub fn test_integrity_level(arr: JsArray, heap: &otter_gc::GcHeap, frozen: bool)
     }
     heap.read_payload(arr, |body| {
         let mut keys: Vec<String> = Vec::new();
-        for (i, v) in body.elements.iter().enumerate() {
+        for (i, v) in body.elements().iter().enumerate() {
             if !v.is_hole() {
                 keys.push(i.to_string());
             }
@@ -1465,7 +1618,7 @@ pub fn set_symbol_property(
         }
         body.mark_dirty();
     });
-    heap.record_write(arr, &barrier_value);
+    record_array_write(heap, arr, &barrier_value);
 }
 
 /// Install a symbol-keyed accessor descriptor, removing any data slot
@@ -1498,10 +1651,10 @@ pub fn set_symbol_accessor(
         body.mark_dirty();
     });
     if let Some(g) = &getter {
-        heap.record_write(arr, g);
+        record_array_write(heap, arr, g);
     }
     if let Some(s) = &setter {
-        heap.record_write(arr, s);
+        record_array_write(heap, arr, s);
     }
 }
 
@@ -1638,7 +1791,7 @@ pub fn set_named_property(
         map.insert(key.to_string(), value);
         body.mark_dirty();
     });
-    heap.record_write(arr, &barrier_value);
+    record_array_write(heap, arr, &barrier_value);
     Ok(true)
 }
 
@@ -1668,9 +1821,9 @@ pub fn set_match_result_props(
         map.insert("groups".to_string(), groups);
         body.mark_dirty();
     });
-    heap.record_write(arr, &index);
-    heap.record_write(arr, &input);
-    heap.record_write(arr, &groups);
+    record_array_write(heap, arr, &index);
+    record_array_write(heap, arr, &input);
+    record_array_write(heap, arr, &groups);
     Ok(())
 }
 
@@ -1695,7 +1848,7 @@ pub(crate) fn define_named_data_property(
         map.insert(key.to_string(), value);
         body.mark_dirty();
     });
-    heap.record_write(arr, &barrier_value);
+    record_array_write(heap, arr, &barrier_value);
 }
 
 /// Read descriptor flags installed for a string-keyed array own property.
@@ -1740,7 +1893,7 @@ pub fn get_named_property(arr: JsArray, heap: &otter_gc::GcHeap, key: &str) -> O
     if let Some(idx) = crate::object::array_index_property_name(key) {
         let idx = idx as usize;
         return heap.read_payload(arr, |body| {
-            body.elements
+            body.elements()
                 .get(idx)
                 .filter(|v| !v.is_hole())
                 .cloned()
@@ -1793,7 +1946,7 @@ pub fn set_accessor(
         // previous data value.
         if let Some(idx) = crate::object::array_index_property_name(key) {
             let idx = idx as usize;
-            if let Some(slot) = body.elements.get_mut(idx) {
+            if let Some(slot) = body.elements_mut().get_mut(idx) {
                 *slot = Value::hole();
             }
             if let Some(exotic) = body.exotic.as_deref_mut()
@@ -1810,10 +1963,10 @@ pub fn set_accessor(
         body.mark_dirty();
     });
     if let Some(g) = &getter {
-        heap.record_write(arr, g);
+        record_array_write(heap, arr, g);
     }
     if let Some(s) = &setter {
-        heap.record_write(arr, s);
+        record_array_write(heap, arr, s);
     }
 }
 
@@ -1875,7 +2028,7 @@ pub fn delete_named_property(arr: JsArray, heap: &mut otter_gc::GcHeap, key: &st
                     exotic.accessors = None;
                 }
             }
-            if let Some(slot) = body.elements.get_mut(idx) {
+            if let Some(slot) = body.elements_mut().get_mut(idx) {
                 *slot = Value::hole();
             }
             if let Some(exotic) = body.exotic.as_deref_mut()
@@ -1936,7 +2089,7 @@ pub(crate) fn own_index_and_string_keys(
 ) -> (BTreeSet<usize>, Vec<String>) {
     heap.read_payload(arr, |body| {
         let mut indices = BTreeSet::new();
-        for (idx, value) in body.elements.iter().enumerate() {
+        for (idx, value) in body.elements().iter().enumerate() {
             if !value.is_hole() {
                 indices.insert(idx);
             }
@@ -1990,7 +2143,7 @@ fn can_delete_array_property(arr: JsArray, heap: &otter_gc::GcHeap, key: &str) -
 /// Read-only access to dense elements for call sites that need to
 /// derive an aggregate result without exposing the body borrow.
 pub fn with_elements<R>(arr: JsArray, heap: &otter_gc::GcHeap, f: impl FnOnce(&[Value]) -> R) -> R {
-    heap.read_payload(arr, |body| f(&body.elements))
+    heap.read_payload(arr, |body| f(body.elements()))
 }
 
 /// Clone a proven plain dense prefix for builtin fast paths.
@@ -2004,10 +2157,10 @@ pub(crate) fn plain_dense_prefix_values(
     len: usize,
 ) -> Option<Vec<Value>> {
     heap.read_payload(arr, |body| {
-        if body.exotic.is_some() || body.length != len || body.elements.len() < len {
+        if body.exotic.is_some() || body.length != len || body.dense_len() < len {
             return None;
         }
-        let prefix = &body.elements[..len];
+        let prefix = &body.elements()[..len];
         if prefix.iter().any(|value| value.is_hole()) {
             return None;
         }
@@ -2036,17 +2189,15 @@ pub(crate) fn write_dense_range_with_roots(
                 value.trace_value_slots(visitor);
             }
         };
-        reserve_for_target_len_with_roots(&mut arr, heap, end, &mut reserve_roots)?;
+        reserve_dense_capacity(&mut arr, heap, end, &mut reserve_roots)?;
     }
     heap.with_payload(arr, |body| {
-        body.elements
-            .reserve_exact(end.saturating_sub(body.elements.len()));
         body.refresh_element_cache();
-        while body.elements.len() < start {
+        while body.dense_len() < start {
             body_elements_push(body, Value::hole());
         }
-        let existing_end = end.min(body.elements.len());
-        for (slot, value) in body.elements[start..existing_end]
+        let existing_end = end.min(body.dense_len());
+        for (slot, value) in body.elements_mut()[start..existing_end]
             .iter_mut()
             .zip(values.iter().copied())
         {
@@ -2059,7 +2210,7 @@ pub(crate) fn write_dense_range_with_roots(
         body.mark_dirty();
     });
     for value in values {
-        heap.record_write(arr, value);
+        record_array_write(heap, arr, value);
     }
     Ok(())
 }
@@ -2078,13 +2229,13 @@ pub(crate) fn with_elements_rewrite<R>(
     f: impl FnOnce(&mut [Value]) -> R,
 ) -> R {
     let (out, children) = heap.with_payload(arr, |body| {
-        let out = f(body.elements.as_mut_slice());
+        let out = f(body.elements_mut());
         body.mark_dirty();
-        let children: SmallVec<[Value; 8]> = body.elements.iter().cloned().collect();
+        let children: SmallVec<[Value; 8]> = body.elements().iter().cloned().collect();
         (out, children)
     });
     for child in children {
-        heap.record_write(arr, &child);
+        record_array_write(heap, arr, &child);
     }
     out
 }
@@ -2113,7 +2264,7 @@ pub fn clean_source_bytes(arr: JsArray, heap: &otter_gc::GcHeap) -> Option<Arc<[
             return None;
         }
         let source = exotic.source_bytes.as_ref()?;
-        if !body.elements.iter().all(is_render_stable_primitive) {
+        if !body.elements().iter().all(is_render_stable_primitive) {
             return None;
         }
         Some(Arc::clone(source))
@@ -2149,69 +2300,93 @@ pub fn identity_addr(arr: JsArray) -> *const () {
     (arr.offset() as usize) as *const ()
 }
 
-#[cfg(test)]
-fn reserve_elements_for_len(
-    body: &mut ArrayBody,
-    heap: &mut otter_gc::GcHeap,
-    target_len: usize,
-) -> Result<(), otter_gc::OutOfMemory> {
-    if target_len <= body.elements.capacity() {
-        return Ok(());
+/// Remember an element write against the body that actually holds it.
+///
+/// Dense elements live in a separate old-space slab, so the array is not
+/// the parent of its own elements. Remembering only the array would leave
+/// the scavenger re-tracing a body whose sole outgoing edge is the slab
+/// handle — and it stops there, because the slab is old. The array is
+/// remembered too: the same call sites also write exotic state that the
+/// array does own.
+fn record_array_write<V>(heap: &mut GcHeap, arr: JsArray, value: &V)
+where
+    V: otter_gc::GcStore + ?Sized,
+{
+    heap.record_write(arr, value);
+    let slab = heap.read_payload(arr, |body| body.slab);
+    if !slab.is_null() {
+        heap.record_write(slab, value);
     }
-
-    let before = spilled_capacity_bytes(body.elements.capacity());
-    let after = spilled_capacity_bytes(target_len);
-    if after > before {
-        heap.reserve_bytes_no_collect((after - before) as u64)?;
-    }
-    body.elements
-        .reserve_exact(target_len.saturating_sub(body.elements.len()));
-    body.refresh_element_cache();
-    Ok(())
 }
 
-fn reserve_for_target_len(
-    arr: JsArray,
-    heap: &mut otter_gc::GcHeap,
-    target_len: usize,
-) -> Result<(), otter_gc::OutOfMemory> {
-    let current_capacity = heap.read_payload(arr, |body| body.elements.capacity());
-    if target_len <= current_capacity {
-        return Ok(());
+/// Remember every value a freshly filled slab holds.
+///
+/// Construction and growth copy values in behind the mutator's back, so
+/// the edges they create need recording in one pass afterwards.
+fn record_slab_contents(heap: &mut GcHeap, slab: element_slab::ElementSlabHandle, len: usize) {
+    if slab.is_null() {
+        return;
     }
-
-    let before = spilled_capacity_bytes(current_capacity);
-    let after = spilled_capacity_bytes(target_len);
-    if after > before {
-        heap.reserve_bytes_no_collect((after - before) as u64)?;
+    let base = element_slab::values_base(slab);
+    for index in 0..len {
+        // SAFETY: `index < len`, the prefix the caller just wrote.
+        let value = unsafe { *base.add(index) };
+        heap.record_write(slab, &value);
     }
-    // The actual reserve is performed under `with_payload` after the
-    // cap check succeeds; keep this helper allocation-free.
-    Ok(())
 }
 
-fn reserve_for_target_len_with_roots(
+/// Make room for `target_len` dense elements, growing the slab if the
+/// current one is too small.
+///
+/// Growth is the array's one allocation point on the element-store path
+/// and is deliberately separate from the store: a store runs inside a
+/// payload borrow with no heap available, and allocating there could move
+/// the array being written. So callers reserve first — which roots the
+/// array across the allocation — and then mutate.
+///
+/// Capacity doubles, so a run of appends pays for growth a logarithmic
+/// number of times.
+fn reserve_dense_capacity(
     arr: &mut JsArray,
     heap: &mut otter_gc::GcHeap,
     target_len: usize,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let current_capacity = heap.read_payload(*arr, |body| body.elements.capacity());
+    let (current_capacity, live_len) =
+        heap.read_payload(*arr, |body| (body.dense_capacity(), body.dense_len()));
     if target_len <= current_capacity {
         return Ok(());
     }
+    let grown = target_len.max(current_capacity.saturating_mul(2)).max(4);
 
-    let before = spilled_capacity_bytes(current_capacity);
-    let after = spilled_capacity_bytes(target_len);
-    if after > before {
-        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            external_visit(visitor);
-            visitor(std::ptr::addr_of_mut!(*arr) as *mut RawGc);
-        };
-        heap.reserve_bytes_with_roots((after - before) as u64, &mut reserve_roots)?;
-    }
-    // The actual reserve is performed under `with_payload` after the
-    // cap check succeeds; keep this helper allocation-free.
+    // The array roots the outgoing slab, and the slab roots every value in
+    // it, so rooting the array is enough to carry the elements being
+    // copied across this allocation.
+    let owner_slot = std::ptr::addr_of_mut!(*arr);
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
+        visitor(owner_slot.cast::<RawGc>());
+    };
+    let slab = element_slab::alloc_element_slab(heap, grown, &mut visit)?;
+
+    let owner = *arr;
+    heap.with_payload(owner, |body| {
+        let old_base = body.elements_ptr.get();
+        let new_base = element_slab::values_base(slab);
+        if !old_base.is_null() && live_len != 0 {
+            // SAFETY: the outgoing slab holds `live_len` values and the
+            // incoming one has room for at least that many; the two cells
+            // are distinct allocations.
+            unsafe { std::ptr::copy_nonoverlapping(old_base, new_base, live_len) };
+        }
+        body.adopt_slab(slab, live_len);
+        true
+    });
+    // The slab handle was installed by a raw payload write, and the values
+    // were copied in behind the mutator's back, so record both edges the
+    // barrier would have.
+    heap.record_write(owner, &slab);
+    record_slab_contents(heap, slab, live_len);
     Ok(())
 }
 
@@ -2220,23 +2395,14 @@ fn should_store_sparse(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> boo
     const MAX_DENSE_INDEX: usize = 1 << 20;
 
     heap.read_payload(arr, |body| {
-        idx >= MAX_DENSE_INDEX || idx.saturating_sub(body.elements.len()) > MAX_DENSE_GAP
+        idx >= MAX_DENSE_INDEX || idx.saturating_sub(body.dense_len()) > MAX_DENSE_GAP
     })
-}
-
-fn spilled_capacity_bytes(capacity: usize) -> usize {
-    let inline = 4;
-    if capacity <= inline {
-        0
-    } else {
-        capacity.saturating_mul(mem::size_of::<Value>())
-    }
 }
 
 impl ArrayBody {
     /// Iterate over elements.
     pub fn iter(&self) -> impl Iterator<Item = &Value> {
-        self.elements.iter()
+        self.elements().iter()
     }
 }
 

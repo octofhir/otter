@@ -1603,6 +1603,7 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
     // behind the types a real build produces.
     register! {
         crate::array::ArrayBody,
+        crate::array::element_slab::ElementSlabBody,
         crate::bigint::gc_body::BigIntBody,
         crate::binary::array_buffer::LocalArrayBufferBodyGc,
         crate::binary::array_buffer::SharedArrayBufferBodyGc,

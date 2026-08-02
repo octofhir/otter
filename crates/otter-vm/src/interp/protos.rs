@@ -312,7 +312,7 @@ impl Interpreter {
 
     pub(crate) fn object_prototype_object_opt(&self) -> Option<JsObject> {
         // Fast path: typed slot populated by RealmIntrinsics::populate.
-        if let Some(proto) = self.realm_intrinsics.object_prototype {
+        if let Some(proto) = self.realm_intrinsics.object_prototype() {
             return Some(proto);
         }
         // Fallback for embedders that build a non-default global
@@ -324,7 +324,7 @@ impl Interpreter {
 
     pub(crate) fn function_prototype_object(&self) -> Result<JsObject, VmError> {
         // Fast path: typed slot.
-        if let Some(proto) = self.realm_intrinsics.function_prototype {
+        if let Some(proto) = self.realm_intrinsics.function_prototype() {
             return Ok(proto);
         }
         let function_ctor = object::get(self.global_this, &self.gc_heap, "Function")

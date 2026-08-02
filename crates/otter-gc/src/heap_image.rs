@@ -41,6 +41,13 @@
 //!   holds (a Rust `fn` entry, a `&'static str` into rodata) is copied
 //!   verbatim too. Those are the caller's to fix — see
 //!   [`Relocation::image_pointer_slide`].
+//! - **Bodies must be self-contained.** An image carries page bytes and
+//!   nothing else, so a body that owns storage outside the heap — a
+//!   `Vec` slab, a `Box<[u16]>` cache — restores as a second owner of
+//!   the original buffer, and a trace walk over it yields slot addresses
+//!   the image does not own. Restoring such a body is unsound. The VM's
+//!   own object and string bodies are not yet self-contained; moving
+//!   their storage into the heap is what makes them restorable.
 //!
 //! # See also
 //!
@@ -204,6 +211,24 @@ impl Relocation {
             return Some(raw);
         }
         self.relocate(raw.0).map(RawGc)
+    }
+
+    /// Rewrite a typed handle to where its object now lives.
+    ///
+    /// Safe: the offset stays inside the same object the caller already
+    /// held, so the payload type behind it is unchanged.
+    #[must_use]
+    pub fn relocate_gc<T: ?Sized>(
+        &self,
+        handle: crate::compressed::Gc<T>,
+    ) -> Option<crate::compressed::Gc<T>> {
+        if handle.is_null() {
+            return Some(handle);
+        }
+        // SAFETY: the relocated offset names the same object at its new
+        // page, so it still precedes a `T` payload.
+        self.relocate(handle.offset())
+            .map(|offset| unsafe { crate::compressed::Gc::from_offset(offset) })
     }
 
     /// How far the binary image moved between the capture process and

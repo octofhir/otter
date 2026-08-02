@@ -74,7 +74,7 @@ impl Interpreter {
             Tag::Unshift => (STUB_ARRAY_UNSHIFT_ALLOC.id, alloc_safepoint_id, 1),
             _ => return None,
         };
-        let proto = self.realm_intrinsics.array_prototype?;
+        let proto = self.realm_intrinsics.array_prototype()?;
         let method = crate::object::data_slot_value_at(proto, &self.gc_heap, ic.proto_slot)?;
         if !ic.tag.matches_builtin(method, &self.gc_heap) {
             return None;
@@ -123,7 +123,7 @@ impl Interpreter {
             JitMethodHint::StringEndsWith => ("endsWith", STUB_STRING_ENDS_WITH_LEAF.id),
             JitMethodHint::None | JitMethodHint::NumberToString => return None,
         };
-        let proto = self.realm_intrinsics.string_prototype?;
+        let proto = self.realm_intrinsics.string_prototype()?;
         let (hit, lookup) = crate::object::lookup_own_slot(proto, &self.gc_heap, name);
         let hit = hit?;
         let method = match lookup {
@@ -184,12 +184,12 @@ impl Interpreter {
         };
         let (proto, receiver_type_tag) = if ic.op.is_map() {
             (
-                self.realm_intrinsics.map_prototype?,
+                self.realm_intrinsics.map_prototype()?,
                 crate::collections::MAP_BODY_TYPE_TAG,
             )
         } else {
             (
-                self.realm_intrinsics.set_prototype?,
+                self.realm_intrinsics.set_prototype()?,
                 crate::collections::SET_BODY_TYPE_TAG,
             )
         };

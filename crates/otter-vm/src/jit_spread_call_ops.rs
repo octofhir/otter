@@ -273,7 +273,7 @@ impl Interpreter {
             // whose bootstrap omitted Array.
             let iterator_method = interp
                 .realm_intrinsics
-                .array_prototype
+                .array_prototype()
                 .or_else(|| {
                     crate::object::get(interp.global_this, &interp.gc_heap, "Array")
                         .and_then(|value| {

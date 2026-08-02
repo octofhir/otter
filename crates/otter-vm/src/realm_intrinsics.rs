@@ -7,21 +7,25 @@
 //! (global → ctor → prototype) on every call.
 //!
 //! # Contents
-//! - [`RealmIntrinsics`] — typed slots for `%Object.prototype%`,
-//!   `%Function.prototype%`, `%Array.prototype%`, `%Promise.prototype%`,
-//!   and other runtime brands used by non-observable internal builders.
-//!   Native-function-shaped constructors that
-//!   are not on hot object-dispatch paths still resolve through
+//! - [`Intrinsic`] — which prototype a slot holds.
+//! - [`RealmIntrinsics`] — one nullable [`JsObject`] per [`Intrinsic`],
+//!   plus a named accessor for each. Native-function-shaped constructors
+//!   that are not on hot object-dispatch paths still resolve through
 //!   `NativeFunction::own_property_descriptor`.
 //!
 //! # Invariants
 //! - Slots are populated by reading the `globalThis` graph **after**
-//!   `BOOTSTRAP_ENTRIES` finishes running. Each slot is `None` until
-//!   populate runs.
-//! - The dispatch path treats `None` as a cache miss and falls back to
-//!   the original string-lookup helper.
-//! - Slots hold `JsObject` handles and are traced as runtime roots so
-//!   moving GC rewrites the cached handles in place.
+//!   `BOOTSTRAP_ENTRIES` finishes running. Each slot is the null handle
+//!   until populate runs.
+//! - Absence is the null handle, not an `Option` discriminant. That keeps
+//!   a slot a plain 32-bit cage offset, so the same address is writable by
+//!   the collector rewriting a moved handle and by a snapshot restore
+//!   writing a relocated one. The accessors still hand callers an
+//!   `Option`.
+//! - The dispatch path treats a null slot as a cache miss and falls back
+//!   to the original string-lookup helper.
+//! - Slots are traced as runtime roots so moving GC rewrites the cached
+//!   handles in place.
 
 use crate::gc_trace::{GcRootVisitor, GcTrace};
 use crate::object::{self, JsObject};
@@ -52,83 +56,168 @@ fn resolve_prototype(
     }
 }
 
-/// Resolved well-known prototype handles for one realm.
-#[derive(Debug, Default, Clone)]
-pub(crate) struct RealmIntrinsics {
+/// One cached realm prototype. The discriminant is the slot index, so the
+/// slot order is the declaration order here and nowhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+#[allow(clippy::enum_variant_names)]
+pub(crate) enum Intrinsic {
     /// `%Object.prototype%`.
-    pub object_prototype: Option<JsObject>,
+    ObjectPrototype,
     /// `%Function.prototype%`.
-    pub function_prototype: Option<JsObject>,
+    FunctionPrototype,
     /// `%Array.prototype%`.
-    pub array_prototype: Option<JsObject>,
+    ArrayPrototype,
     /// `%Promise.prototype%`.
-    pub promise_prototype: Option<JsObject>,
+    PromisePrototype,
     /// `%RegExp.prototype%`. Needed so the flag accessors (§22.2.6.x
     /// step 3a) can return `undefined` instead of throwing when invoked
     /// with the prototype itself as the `this` value.
-    pub regexp_prototype: Option<JsObject>,
+    RegExpPrototype,
     /// `%Date.prototype%`. Internal clone/materialization paths use this
     /// canonical slot instead of consulting a mutable global constructor.
-    pub date_prototype: Option<JsObject>,
-    /// `%String.prototype%`. Lets a primitive-string method call resolve its
-    /// builtin method through the shape-guarded own-data IC on this object
-    /// instead of re-walking the constructor → prototype chain every call.
-    pub string_prototype: Option<JsObject>,
+    DatePrototype,
+    /// `%String.prototype%`. Lets a primitive-string method call resolve
+    /// its builtin method through the shape-guarded own-data IC on this
+    /// object instead of re-walking the constructor → prototype chain
+    /// every call.
+    StringPrototype,
     /// `%Number.prototype%`, for the same primitive-method IC on numbers.
-    pub number_prototype: Option<JsObject>,
+    NumberPrototype,
     /// `%Map.prototype%`. Lets `map.get/set/has/delete` on an ordinary Map
     /// dispatch the builtin directly once the slot is confirmed pristine,
     /// skipping the per-call method-resolution walk and the native bridge.
-    pub map_prototype: Option<JsObject>,
-    /// `%Set.prototype%`, for the same direct dispatch of `set.add/has/delete`.
-    pub set_prototype: Option<JsObject>,
+    MapPrototype,
+    /// `%Set.prototype%`, for the same direct dispatch of
+    /// `set.add/has/delete`.
+    SetPrototype,
+}
+
+impl Intrinsic {
+    /// Every slot, in slot order.
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::ObjectPrototype,
+        Self::FunctionPrototype,
+        Self::ArrayPrototype,
+        Self::PromisePrototype,
+        Self::RegExpPrototype,
+        Self::DatePrototype,
+        Self::StringPrototype,
+        Self::NumberPrototype,
+        Self::MapPrototype,
+        Self::SetPrototype,
+    ];
+
+    /// Number of slots.
+    pub(crate) const COUNT: usize = 10;
+
+    /// Global constructor whose `.prototype` fills this slot.
+    const fn constructor_name(self) -> &'static str {
+        match self {
+            Self::ObjectPrototype => "Object",
+            Self::FunctionPrototype => "Function",
+            Self::ArrayPrototype => "Array",
+            Self::PromisePrototype => "Promise",
+            Self::RegExpPrototype => "RegExp",
+            Self::DatePrototype => "Date",
+            Self::StringPrototype => "String",
+            Self::NumberPrototype => "Number",
+            Self::MapPrototype => "Map",
+            Self::SetPrototype => "Set",
+        }
+    }
+}
+
+/// Resolved well-known prototype handles for one realm.
+///
+/// A slot is the null handle until bootstrap fills it. The accessors
+/// below map that back to `None`.
+#[derive(Debug, Clone)]
+pub(crate) struct RealmIntrinsics {
+    slots: [JsObject; Intrinsic::COUNT],
+}
+
+impl Default for RealmIntrinsics {
+    fn default() -> Self {
+        Self {
+            slots: [JsObject::null(); Intrinsic::COUNT],
+        }
+    }
+}
+
+/// Emit one accessor per slot, so call sites keep reading a named
+/// prototype rather than indexing an array.
+macro_rules! intrinsic_accessors {
+    ($($method:ident => $variant:ident,)*) => {
+        impl RealmIntrinsics {
+            $(
+                #[doc = concat!("Cached `", stringify!($variant), "`, or `None` before bootstrap fills it.")]
+                #[must_use]
+                pub(crate) fn $method(&self) -> Option<JsObject> {
+                    self.get(Intrinsic::$variant)
+                }
+            )*
+        }
+    };
+}
+
+intrinsic_accessors! {
+    object_prototype => ObjectPrototype,
+    function_prototype => FunctionPrototype,
+    array_prototype => ArrayPrototype,
+    promise_prototype => PromisePrototype,
+    regexp_prototype => RegExpPrototype,
+    date_prototype => DatePrototype,
+    string_prototype => StringPrototype,
+    number_prototype => NumberPrototype,
+    map_prototype => MapPrototype,
+    set_prototype => SetPrototype,
 }
 
 impl RealmIntrinsics {
+    /// Read one slot, mapping the null handle to `None`.
+    #[must_use]
+    pub(crate) fn get(&self, slot: Intrinsic) -> Option<JsObject> {
+        let handle = self.slots[slot as usize];
+        (!handle.is_null()).then_some(handle)
+    }
+
     /// Populate every slot by walking `global_this`. Called once at the
     /// end of `build_global_this_impl` after every `BuiltinIntrinsic`
     /// has run.
     pub(crate) fn populate(&mut self, heap: &mut otter_gc::GcHeap, global: JsObject) {
-        self.object_prototype = resolve_prototype(global, heap, "Object");
-        self.function_prototype = resolve_prototype(global, heap, "Function");
-        self.array_prototype = resolve_prototype(global, heap, "Array");
-        self.promise_prototype = resolve_prototype(global, heap, "Promise");
-        self.regexp_prototype = resolve_prototype(global, heap, "RegExp");
-        self.date_prototype = resolve_prototype(global, heap, "Date");
-        self.string_prototype = resolve_prototype(global, heap, "String");
-        self.number_prototype = resolve_prototype(global, heap, "Number");
-        self.map_prototype = resolve_prototype(global, heap, "Map");
-        self.set_prototype = resolve_prototype(global, heap, "Set");
+        for slot in Intrinsic::ALL {
+            self.slots[slot as usize] = resolve_prototype(global, heap, slot.constructor_name())
+                .unwrap_or_else(JsObject::null);
+        }
+    }
+
+    /// Visit every slot address, filled or not.
+    ///
+    /// Unlike [`Self::trace_roots`] this does not skip empties: the walk
+    /// has a fixed length and a fixed order, which is what lets a
+    /// snapshot capture the slots into a list and write them back in the
+    /// same order.
+    pub(crate) fn visit_slots(&self, visitor: &mut GcRootVisitor<'_>) {
+        for handle in &self.slots {
+            let p = handle as *const JsObject as *mut otter_gc::raw::RawGc;
+            visitor(p);
+        }
     }
 
     /// Trace cached prototype handles as root slots.
     pub(crate) fn trace_roots(&self, visitor: &mut GcRootVisitor<'_>) {
-        for object in [
-            &self.object_prototype,
-            &self.function_prototype,
-            &self.array_prototype,
-            &self.promise_prototype,
-            &self.regexp_prototype,
-            &self.date_prototype,
-            &self.string_prototype,
-            &self.number_prototype,
-            &self.map_prototype,
-            &self.set_prototype,
-        ]
-        .into_iter()
-        .filter_map(Option::as_ref)
-        {
-            object.trace_gc_roots(visitor);
+        for handle in &self.slots {
+            if !handle.is_null() {
+                handle.trace_gc_roots(visitor);
+            }
         }
     }
 
     /// All slots empty?
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.object_prototype.is_none()
-            && self.function_prototype.is_none()
-            && self.array_prototype.is_none()
-            && self.promise_prototype.is_none()
+        self.slots.iter().all(|handle| handle.is_null())
     }
 }
 
@@ -155,22 +244,40 @@ mod tests {
     fn bootstrap_populates_well_known_slots() {
         let interp = Interpreter::new();
         let slots = &interp.realm_intrinsics();
-        assert!(slots.object_prototype.is_some(), "Object.prototype cached");
         assert!(
-            slots.function_prototype.is_some(),
+            slots.object_prototype().is_some(),
+            "Object.prototype cached"
+        );
+        assert!(
+            slots.function_prototype().is_some(),
             "Function.prototype cached"
         );
-        assert!(slots.array_prototype.is_some(), "Array.prototype cached");
+        assert!(slots.array_prototype().is_some(), "Array.prototype cached");
         assert!(
-            slots.promise_prototype.is_some(),
+            slots.promise_prototype().is_some(),
             "Promise.prototype cached"
         );
     }
 
     #[test]
+    fn every_slot_is_visited_even_when_empty() {
+        let empty = RealmIntrinsics::default();
+        let mut visited = 0usize;
+        empty.visit_slots(&mut |_| visited += 1);
+        assert_eq!(
+            visited,
+            Intrinsic::COUNT,
+            "a fixed-shape walk must not depend on which slots are filled"
+        );
+        let mut traced = 0usize;
+        empty.trace_roots(&mut |_| traced += 1);
+        assert_eq!(traced, 0, "the collector still skips empty slots");
+    }
+
+    #[test]
     fn slot_matches_string_lookup_for_object_prototype() {
         let mut interp = Interpreter::new();
-        let slot_proto = interp.realm_intrinsics().object_prototype.unwrap();
+        let slot_proto = interp.realm_intrinsics().object_prototype().unwrap();
         let global = *interp.global_this();
         let walked = resolve_prototype(global, &mut interp.gc_heap, "Object").unwrap();
         assert_eq!(
@@ -183,7 +290,7 @@ mod tests {
     #[test]
     fn slot_matches_string_lookup_for_function_prototype() {
         let mut interp = Interpreter::new();
-        let slot_proto = interp.realm_intrinsics().function_prototype.unwrap();
+        let slot_proto = interp.realm_intrinsics().function_prototype().unwrap();
         let global = *interp.global_this();
         let walked = resolve_prototype(global, &mut interp.gc_heap, "Function").unwrap();
         assert_eq!(
@@ -200,10 +307,10 @@ mod tests {
 
         collect_minor_with_runtime_roots(&mut interp);
 
-        let object_slot = interp.realm_intrinsics().object_prototype.unwrap();
-        let function_slot = interp.realm_intrinsics().function_prototype.unwrap();
-        let array_slot = interp.realm_intrinsics().array_prototype.unwrap();
-        let promise_slot = interp.realm_intrinsics().promise_prototype.unwrap();
+        let object_slot = interp.realm_intrinsics().object_prototype().unwrap();
+        let function_slot = interp.realm_intrinsics().function_prototype().unwrap();
+        let array_slot = interp.realm_intrinsics().array_prototype().unwrap();
+        let promise_slot = interp.realm_intrinsics().promise_prototype().unwrap();
         assert_eq!(
             object_slot,
             resolve_prototype(global, &mut interp.gc_heap, "Object").unwrap(),

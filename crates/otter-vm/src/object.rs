@@ -1462,8 +1462,49 @@ pub const PROTO_CHAIN_HARD_CAP: usize = 1024;
 
 /// Register GC layouts that object allocation paths may publish without going
 /// through `GcHeap::alloc<T>`.
-pub(crate) fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
-    heap.register_traceable::<ObjectBody>();
+pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
+    macro_rules! register {
+        ($($body:ty,)*) => {$( heap.register_traceable::<$body>(); )*};
+    }
+    // Every GC body type this VM can allocate. Registering the whole set
+    // up front rather than on first allocation is what lets a heap
+    // describe objects it did not itself create — a restored image is
+    // walked by type tag before anything has been allocated into it.
+    // `every_allocated_type_tag_is_registered` fails if this list falls
+    // behind the types a real build produces.
+    register! {
+        crate::array::ArrayBody,
+        crate::bigint::gc_body::BigIntBody,
+        crate::binary::array_buffer::LocalArrayBufferBodyGc,
+        crate::binary::array_buffer::SharedArrayBufferBodyGc,
+        crate::binary::data_view::DataViewBodyGc,
+        crate::binary::typed_array::TypedArrayBodyGc,
+        crate::bound_function::BoundFunctionBody,
+        crate::class_constructor::ClassConstructorBody,
+        crate::closure::JsClosureBody,
+        crate::collections::MapBody,
+        crate::collections::SetBody,
+        crate::collections::WeakMapBody,
+        crate::eval_env::EvalEnvBody,
+        crate::generator::GeneratorBody,
+        crate::generator::ParkedFrameBody,
+        crate::heap_number::HeapNumberBody,
+        crate::intl::payload::IntlBody,
+        crate::iterator_state::IteratorState,
+        crate::native_function::NativeFunctionBody,
+        crate::promise::PurePromiseBody,
+        crate::proxy::ProxyBodyGc,
+        crate::regexp::JsRegExpBody,
+        crate::string::gc_body::JsStringBody,
+        crate::symbol::SymbolBody,
+        crate::temporal::payload::TemporalBody,
+        crate::upvalue::UpvalueCellBody,
+        crate::weak_refs::FinalizationRegistryBody,
+        crate::weak_refs::WeakRefBody,
+        AccessorCellBody,
+        ObjectBody,
+        shape_body::ShapeBody,
+    }
 }
 
 fn empty_object_body() -> ObjectBody {

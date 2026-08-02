@@ -73,7 +73,7 @@ fn native_is_array(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
     })?;
     if !result
         && let Some(obj) = value.as_object()
-        && let Some(array_prototype) = ctx.cx.interp.realm_intrinsics.array_prototype
+        && let Some(array_prototype) = ctx.cx.interp.realm_intrinsics.array_prototype()
     {
         result = obj == array_prototype;
     }

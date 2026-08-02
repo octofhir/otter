@@ -879,8 +879,8 @@ impl Interpreter {
             return false;
         };
         [
-            self.realm_intrinsics.array_prototype,
-            self.realm_intrinsics.object_prototype,
+            self.realm_intrinsics.array_prototype(),
+            self.realm_intrinsics.object_prototype(),
         ]
         .into_iter()
         .flatten()

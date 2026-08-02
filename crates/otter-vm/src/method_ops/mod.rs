@@ -1186,7 +1186,7 @@ impl Interpreter {
         if !crate::array::is_ordinary_dense(arr, &self.gc_heap) {
             return None;
         }
-        let proto = self.realm_intrinsics.array_prototype?;
+        let proto = self.realm_intrinsics.array_prototype()?;
         let (hit, lookup) = crate::object::lookup_own_slot(proto, &self.gc_heap, name);
         let method = match lookup {
             crate::object::PropertyLookup::Data { value, .. } => value,
@@ -1244,7 +1244,7 @@ impl Interpreter {
         if !crate::array::is_ordinary_dense(arr, &self.gc_heap) {
             return None;
         }
-        let proto = self.realm_intrinsics.array_prototype?;
+        let proto = self.realm_intrinsics.array_prototype()?;
         if crate::object::shape_id(proto, &self.gc_heap) != ic.proto_shape {
             return None;
         }
@@ -1286,7 +1286,7 @@ impl Interpreter {
                 self.feedback_directory.clear_method_ic(site);
                 return None;
             }
-            let proto = self.realm_intrinsics.map_prototype?;
+            let proto = self.realm_intrinsics.map_prototype()?;
             if !prototype_override_is(
                 crate::collections::map_prototype_override(map, &self.gc_heap),
                 proto,
@@ -1300,7 +1300,7 @@ impl Interpreter {
                 self.feedback_directory.clear_method_ic(site);
                 return None;
             }
-            let proto = self.realm_intrinsics.set_prototype?;
+            let proto = self.realm_intrinsics.set_prototype()?;
             if !prototype_override_is(
                 crate::collections::set_prototype_override(set, &self.gc_heap),
                 proto,
@@ -1349,7 +1349,7 @@ impl Interpreter {
     ) -> Option<Result<Value, VmError>> {
         use crate::object::PropertyLookup;
         let (hit, op) = if let Some(map) = recv.as_map() {
-            let proto = self.realm_intrinsics.map_prototype?;
+            let proto = self.realm_intrinsics.map_prototype()?;
             // Accept the canonical prototype whether it is the implicit default
             // (`None`) or the explicit `[[Prototype]]` recorded at construction;
             // a user-installed prototype is a different object and bails.
@@ -1371,7 +1371,7 @@ impl Interpreter {
             let op = CollectionFastOp::from_map_name(name)?;
             (hit, op)
         } else if let Some(set) = recv.as_set() {
-            let proto = self.realm_intrinsics.set_prototype?;
+            let proto = self.realm_intrinsics.set_prototype()?;
             if !prototype_override_is(
                 crate::collections::set_prototype_override(set, &self.gc_heap),
                 proto,
@@ -1676,9 +1676,9 @@ impl Interpreter {
     /// primitive-method IC applies).
     fn primitive_method_proto(&self, recv: Value) -> Option<crate::object::JsObject> {
         if recv.is_string() {
-            self.realm_intrinsics.string_prototype
+            self.realm_intrinsics.string_prototype()
         } else if recv.is_number() {
-            self.realm_intrinsics.number_prototype
+            self.realm_intrinsics.number_prototype()
         } else {
             None
         }

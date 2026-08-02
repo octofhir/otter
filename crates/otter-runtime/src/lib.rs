@@ -3982,6 +3982,28 @@ impl Runtime {
         self.interp.root_census()
     }
 
+    /// Capture this runtime's old generation as a relocatable image.
+    ///
+    /// # Errors
+    /// Propagates [`otter_gc::ImageError`].
+    pub fn capture_heap_image(&self) -> Result<otter_gc::HeapImage, otter_gc::ImageError> {
+        self.interp.capture_heap_image()
+    }
+
+    /// The root slots a snapshot has to carry, in the fixed walk order a
+    /// restore writes them back in.
+    #[must_use]
+    pub fn capture_snapshot_roots(&self) -> Vec<otter_gc::raw::RawGc> {
+        self.interp.capture_snapshot_roots()
+    }
+
+    /// This realm's `globalThis` as a GC handle, for callers that need
+    /// the object identity rather than a JS value.
+    #[must_use]
+    pub fn global_this_object(&self) -> otter_vm::object::JsObject {
+        *self.interp.global_this()
+    }
+
     /// Write a Chrome DevTools `.heapsnapshot` for the current heap
     /// state. The output is JSON; the DevTools "Memory" panel
     /// accepts it as-is.

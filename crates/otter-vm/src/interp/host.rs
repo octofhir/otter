@@ -450,6 +450,38 @@ impl Interpreter {
         crate::native_census::native_census(&self.gc_heap)
     }
 
+    /// Capture this isolate's old generation as a relocatable image.
+    ///
+    /// # Errors
+    /// Propagates [`otter_gc::ImageError`]; a build leaves the nursery
+    /// empty, so a capture taken right after one succeeds.
+    pub fn capture_heap_image(&self) -> Result<otter_gc::HeapImage, otter_gc::ImageError> {
+        self.gc_heap.capture_old_space()
+    }
+
+    /// Fixed-shape walk over the root slots a snapshot has to carry.
+    ///
+    /// Unlike the collector's root walk this visits every slot whether or
+    /// not it is filled, so the sequence has the same length and order on
+    /// a built isolate and on an empty one. That is what lets a capture
+    /// collect the slots into a list and a restore write them back.
+    pub fn visit_snapshot_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
+        let global =
+            &self.global_this as *const crate::object::JsObject as *mut otter_gc::raw::RawGc;
+        visitor(global);
+        self.realm_intrinsics.visit_slots(visitor);
+    }
+
+    /// Collect the snapshot root slots in walk order.
+    #[must_use]
+    pub fn capture_snapshot_roots(&self) -> Vec<otter_gc::raw::RawGc> {
+        let mut out = Vec::new();
+        // SAFETY: every slot address the walk yields is a live field of
+        // this interpreter, read while nothing else holds it.
+        self.visit_snapshot_roots(&mut |slot| out.push(unsafe { *slot }));
+        out
+    }
+
     /// Write a Chrome DevTools `.heapsnapshot` JSON document for the
     /// current heap state. The output matches the format documented
     /// at

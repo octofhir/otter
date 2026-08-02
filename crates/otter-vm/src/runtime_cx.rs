@@ -1373,7 +1373,7 @@ impl<'rt> NativeCtx<'rt> {
                 .cx
                 .interp
                 .realm_intrinsics
-                .array_prototype
+                .array_prototype()
                 .is_some_and(|p| Value::object(p).to_bits() == proto.to_bits())
         {
             return;
@@ -2948,7 +2948,7 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
             .cx
             .interp
             .realm_intrinsics()
-            .date_prototype
+            .date_prototype()
             .ok_or_else(|| NativeError::TypeError {
                 name: "NativeScope::date",
                 reason: "canonical Date prototype is unavailable".to_string(),

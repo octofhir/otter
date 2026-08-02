@@ -143,12 +143,14 @@ fn external_ref_indices_are_stable_across_runtimes() {
     );
 }
 
-/// Where each API surface's objects land. The young population is
-/// contributed entirely by the pre-tenure interpreter bootstrap: the
-/// extension surfaces run inside the tenured window and add old-space
-/// objects only.
+/// Where each API surface's objects land.
+///
+/// Everything a build allocates outlives the isolate, so the whole build
+/// runs tenured — the interpreter's own builtin surface included, which
+/// is why the nursery is empty on a freshly built runtime. This is the
+/// property a snapshot writer rests on: the dump set is old space.
 #[test]
-fn api_surfaces_add_only_tenured_objects() {
+fn a_built_runtime_leaves_nothing_in_the_nursery() {
     let surfaces: [(&str, Runtime); 5] = [
         ("base", base_runtime()),
         (
@@ -194,22 +196,26 @@ fn api_surfaces_add_only_tenured_objects() {
         rows.push((*label, heap, natives));
     }
 
-    let base_young_natives = rows[0].2.outside_old_space;
-    assert!(
-        base_young_natives > 0,
-        "the interpreter builds its builtin surface before the tenured window",
-    );
-    for (label, _heap, natives) in &rows {
+    for (label, heap, natives) in &rows {
         assert_eq!(
-            natives.outside_old_space, base_young_natives,
-            "`{label}` changed the untenured native population; \
-             API surfaces install inside the tenured window, so they must add \
-             old-space natives only",
+            natives.outside_old_space, 0,
+            "`{label}` left {} native callables outside old space",
+            natives.outside_old_space,
+        );
+        assert_eq!(
+            heap.young.object_count, 0,
+            "`{label}` left {} objects ({} bytes) in the nursery; a page dump \
+             of old space would miss them",
+            heap.young.object_count, heap.young.live_bytes,
+        );
+        assert!(
+            heap.old.object_count > 0,
+            "`{label}` allocated nothing into old space",
         );
     }
     let full = &rows[4];
     assert!(
         full.2.in_old_space > rows[0].2.in_old_space,
-        "the full surface must add tenured natives on top of the base runtime",
+        "the full surface must add natives on top of the base runtime",
     );
 }

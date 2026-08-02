@@ -932,6 +932,16 @@ impl GcHeap {
         if aligned > LARGE_OBJECT_THRESHOLD {
             return Err(value);
         }
+        // A tenuring phase owns where its objects land, and this path only
+        // ever bump-allocates young. Hand the payload back so the caller
+        // reaches `alloc_with_roots`, which routes to old space — otherwise a
+        // bootstrap would scatter part of its permanent graph across the
+        // nursery purely by which allocation helper a call site happened to
+        // use. The test is one branch on a flag that is false for the whole
+        // mutator lifetime.
+        if self.tenure_all {
+            return Err(value);
+        }
         if self.gc_stress_stride != 0 && self.gc_stress_armed && !self.in_major_gc {
             return Err(value);
         }

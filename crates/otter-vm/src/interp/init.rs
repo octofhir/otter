@@ -83,6 +83,14 @@ impl Interpreter {
         let startup_timer = StartupPhaseTimer::from_env();
         let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(cap_bytes)
             .expect("GcHeap construction never fails on the default cage");
+        // The builtin surface built below — every intrinsic, prototype,
+        // native callable and shape the realm starts with — lives as long as
+        // the isolate does. Allocating it young makes the first scavenges
+        // copy the whole set and every later one re-trace it, for objects
+        // that were never going to die. Tenuring is released at the end of
+        // this constructor so an embedder that drives the interpreter
+        // directly still gets an ordinary nursery.
+        gc_heap.set_tenure_all(true);
         object::register_gc_traceables(&mut gc_heap);
         startup_timer.mark("vm_gc_heap");
         let mut well_known_symbols = WellKnownSymbols::new(&mut gc_heap)
@@ -384,6 +392,9 @@ impl Interpreter {
             slot.set(value);
         }
         drop(extra_roots_guard);
+        // The realm is complete; anything allocated from here is mutator work
+        // and belongs in the nursery, where most of it dies.
+        interp.gc_heap.set_tenure_all(false);
         interp
     }
 

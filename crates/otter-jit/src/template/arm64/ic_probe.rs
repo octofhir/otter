@@ -858,7 +858,7 @@ pub(crate) fn native_leaf_call_is_supported(
     let Some(declaration) = otter_vm::math::jit_leaf_builtin(stub_id) else {
         return false;
     };
-    view.native_static_fn_byte != 0
+    view.native_ref_byte != 0
         && argc == usize::from(declaration.argument_count)
         && leaf_no_alloc_stub2_by_id(stub_id).is_some()
 }
@@ -884,7 +884,7 @@ pub(crate) fn guarded_method_call_is_supported(
     call: &JitGuardedMethodCall,
 ) -> bool {
     view.cage_base != 0
-        && view.native_static_fn_byte != 0
+        && view.native_ref_byte != 0
         && native_entry_call_is_supported(call.entry_stub_id, call.safepoint_id)
 }
 
@@ -905,7 +905,7 @@ pub(crate) fn emit_native_leaf_call<F>(
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     stub_id: RuntimeStubId,
-    builtin_fn_addr: usize,
+    builtin_native_ref: u32,
     callee_x: u8,
     load_argument: F,
     bail: DynamicLabel,
@@ -926,18 +926,11 @@ where
         ; ldrb w14, [X(callee_x)]
         ; cmp w14, native_type_tag
         ; b.ne =>bail
-        ; ldr x14, [X(callee_x), view.native_static_fn_byte]
+        ; ldr w14, [X(callee_x), view.native_ref_byte]
     );
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        15,
-        builtin_fn_addr as u64,
-        RelocationTarget::NativeLeafBuiltinFunction { stub_id },
-    );
+    emit_native_ref_compare(ops, builtin_native_ref);
     dynasm!(ops
         ; .arch aarch64
-        ; cmp x14, x15
         ; b.ne =>bail
     );
 
@@ -1118,7 +1111,7 @@ pub(crate) fn emit_guarded_method_call<F>(
 where
     F: FnMut(&mut Assembler, u8, u8) -> Result<(), Unsupported>,
 {
-    if view.cage_base == 0 || view.native_static_fn_byte == 0 {
+    if view.cage_base == 0 || view.native_ref_byte == 0 {
         return Err(Unsupported::OperandShape("guarded method call layout"));
     }
     // An exotic receiver is passed to the entry as its first operand, because
@@ -1188,9 +1181,7 @@ where
         relocations,
         view,
         call.method_value_byte,
-        call.builtin_fn_addr,
-        byte_pc,
-        call.entry_stub_id,
+        call.builtin_native_ref,
         miss,
     );
     // An exotic receiver occupies the entry's first operand word, so the call's
@@ -1339,13 +1330,11 @@ pub(crate) fn emit_builtin_identity_guard(
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     method_value_byte: u32,
-    builtin_fn_addr: usize,
-    byte_pc: u32,
-    runtime_stub_id: RuntimeStubId,
+    builtin_native_ref: u32,
     miss: DynamicLabel,
 ) {
     let native_function_type_tag = u32::from(view.collection_layout.native_function_type_tag);
-    let native_static_fn_byte = view.native_static_fn_byte;
+    let native_ref_byte = view.native_ref_byte;
     dynasm!(ops
         ; .arch aarch64
         ; ldr w9, [x15, method_value_byte]
@@ -1367,21 +1356,34 @@ pub(crate) fn emit_builtin_identity_guard(
         ; ldrb w14, [x13]
         ; cmp w14, native_function_type_tag
         ; b.ne =>miss
-        ; ldr x14, [x13, native_static_fn_byte]
+        ; ldr w14, [x13, native_ref_byte]
     );
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        15,
-        builtin_fn_addr as u64,
-        RelocationTarget::GuardedBuiltinFunction {
-            byte_pc,
-            runtime_stub_id,
-        },
-    );
+    emit_native_ref_compare(ops, builtin_native_ref);
     dynasm!(ops
         ; .arch aarch64
-        ; cmp x14, x15
         ; b.ne =>miss
+    );
+}
+
+/// Compare the external-reference index already loaded into `w14` against the
+/// one the guard demands, leaving the result in the flags.
+///
+/// The index is isolate-local and assigned in bootstrap install order, so
+/// unlike the entry address it used to replace it is a plain build-stable
+/// constant: no relocation, and a table small enough that the common case is a
+/// single `cmp` against a 12-bit immediate.
+fn emit_native_ref_compare(ops: &mut Assembler, native_ref: u32) {
+    if native_ref <= 0xfff {
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp w14, native_ref
+        );
+        return;
+    }
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz w15, native_ref & 0xffff
+        ; movk w15, native_ref >> 16, lsl 16
+        ; cmp w14, w15
     );
 }

@@ -79,9 +79,9 @@ impl Interpreter {
         if !ic.tag.matches_builtin(method, &self.gc_heap) {
             return None;
         }
-        let builtin_fn_addr = method
+        let builtin_native_ref = method
             .as_native_function()
-            .and_then(|native| native.jit_static_fn_addr(&self.gc_heap))?;
+            .and_then(|native| native.native_ref(&self.gc_heap))?;
         Some(JitGuardedMethodCall {
             receiver: JitGuardedReceiver::Exotic {
                 type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
@@ -90,7 +90,7 @@ impl Interpreter {
             },
             holder_shape: crate::object::shape(proto, &self.gc_heap).offset(),
             method_value_byte: compressed_slot_byte(ic.proto_slot),
-            builtin_fn_addr,
+            builtin_native_ref,
             entry_stub_id: stub_id,
             safepoint_id,
             argument_count,
@@ -135,9 +135,9 @@ impl Interpreter {
         if !crate::string::prototype::is_prototype_builtin(method, &self.gc_heap, bridge) {
             return None;
         }
-        let builtin_fn_addr = method
+        let builtin_native_ref = method
             .as_native_function()
-            .and_then(|native| native.jit_static_fn_addr(&self.gc_heap))?;
+            .and_then(|native| native.native_ref(&self.gc_heap))?;
         Some(JitGuardedMethodCall {
             receiver: JitGuardedReceiver::Exotic {
                 type_tag: crate::string::JS_STRING_BODY_TYPE_TAG,
@@ -146,7 +146,7 @@ impl Interpreter {
             },
             holder_shape: crate::object::shape(proto, &self.gc_heap).offset(),
             method_value_byte: compressed_slot_byte(hit.slot),
-            builtin_fn_addr,
+            builtin_native_ref,
             entry_stub_id: stub_id,
             safepoint_id: NO_SAFEPOINT,
             argument_count: 1,
@@ -200,9 +200,9 @@ impl Interpreter {
         if !ic.op.matches_builtin(method, &self.gc_heap) {
             return None;
         }
-        let builtin_fn_addr = method
+        let builtin_native_ref = method
             .as_native_function()
-            .and_then(|native| native.jit_static_fn_addr(&self.gc_heap))?;
+            .and_then(|native| native.native_ref(&self.gc_heap))?;
         Some(JitGuardedMethodCall {
             receiver: JitGuardedReceiver::Exotic {
                 type_tag: receiver_type_tag,
@@ -211,7 +211,7 @@ impl Interpreter {
             },
             holder_shape: crate::object::shape(proto, &self.gc_heap).offset(),
             method_value_byte: compressed_slot_byte(ic.proto_slot),
-            builtin_fn_addr,
+            builtin_native_ref,
             entry_stub_id: stub_id,
             safepoint_id,
             argument_count: ic.op.argument_count(),

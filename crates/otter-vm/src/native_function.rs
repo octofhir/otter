@@ -200,11 +200,14 @@ pub type NativeTraceFn = dyn Fn(&mut SlotVisitor<'_>);
 pub struct NativeFunctionBody {
     /// Machine-readable static function identity for JIT builtin guards.
     ///
-    /// Zero means the callable is not backed by [`NativeCallStorage::Static`].
-    /// Static builtins store their raw function entry address here so generated
-    /// code can validate prototype method slots without decoding the Rust enum.
+    /// [`otter_gc::NO_EXTERNAL_REF`] means the callable is not backed by
+    /// [`NativeCallStorage::Static`]. Static builtins store their index in
+    /// the isolate's [`otter_gc::ExternalRefTable`], so generated code can
+    /// validate prototype method slots without decoding the Rust enum —
+    /// and so the body holds no raw entry address, which differs per
+    /// build and per process and could not survive a page dump.
     #[pelt(skip)]
-    jit_static_fn: usize,
+    native_ref: u32,
     /// Display name (used in stack traces and `Function.prototype.
     /// toString` once that lands).
     #[pelt(skip)]
@@ -250,10 +253,10 @@ pub struct NativeFunctionBody {
     realm_global: Option<JsObject>,
 }
 
-pub(crate) const NATIVE_FUNCTION_BODY_JIT_STATIC_FN_OFFSET: usize =
-    std::mem::offset_of!(NativeFunctionBody, jit_static_fn);
+pub(crate) const NATIVE_FUNCTION_BODY_NATIVE_REF_OFFSET: usize =
+    std::mem::offset_of!(NativeFunctionBody, native_ref);
 
-const _: () = assert!(NATIVE_FUNCTION_BODY_JIT_STATIC_FN_OFFSET == 0);
+const _: () = assert!(NATIVE_FUNCTION_BODY_NATIVE_REF_OFFSET == 0);
 
 impl NativeFunctionBody {
     /// Describe this body's non-GC payload for
@@ -274,7 +277,7 @@ impl NativeFunctionBody {
             name: self.name,
             kind,
             static_addr,
-            jit_static_fn: self.jit_static_fn,
+            native_ref: self.native_ref,
             capture_count: self.captures.len(),
             has_trace_hook: self.trace.is_some(),
         }
@@ -323,6 +326,17 @@ impl NativeFunction {
         metadata: NativeFunctionMetadata,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
+        // Interning before the body is built keeps this the one place a
+        // static native's entry address enters the isolate: every
+        // constructor and every install funnel reaches the heap through
+        // here, so registration is automatic and ordered by install
+        // sequence rather than by anything a call site remembers to do.
+        let native_ref = heap.intern_external_ref(match &call {
+            NativeCallStorage::Static(f) => *f as *const () as usize,
+            NativeCallStorage::VmIntrinsic(_)
+            | NativeCallStorage::Dynamic(_)
+            | NativeCallStorage::LocalDynamic(_) => 0,
+        });
         let own_properties = {
             let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                 external_visit(visitor);
@@ -352,12 +366,7 @@ impl NativeFunction {
         Ok(Self {
             inner: heap.alloc_with_roots(
                 NativeFunctionBody {
-                    jit_static_fn: match call {
-                        NativeCallStorage::Static(f) => f as *const () as usize,
-                        NativeCallStorage::VmIntrinsic(_)
-                        | NativeCallStorage::Dynamic(_)
-                        | NativeCallStorage::LocalDynamic(_) => 0,
-                    },
+                    native_ref,
                     name,
                     length,
                     call,
@@ -1066,11 +1075,13 @@ impl NativeFunction {
         })
     }
 
-    /// Raw static function address for JIT builtin guards.
+    /// External-reference index identifying this callable's static entry
+    /// for JIT builtin guards. `None` when the callable is not
+    /// static-backed.
     #[must_use]
-    pub(crate) fn jit_static_fn_addr(&self, heap: &otter_gc::GcHeap) -> Option<usize> {
+    pub(crate) fn native_ref(&self, heap: &otter_gc::GcHeap) -> Option<u32> {
         heap.read_payload(self.inner, |body| {
-            (body.jit_static_fn != 0).then_some(body.jit_static_fn)
+            (body.native_ref != otter_gc::NO_EXTERNAL_REF).then_some(body.native_ref)
         })
     }
 

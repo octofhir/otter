@@ -3469,7 +3469,7 @@ fn emit(
                                     &mut relocations,
                                     view,
                                     stub_id,
-                                    target.builtin_fn_addr,
+                                    target.builtin_native_ref,
                                     9,
                                     |ops, index, register| {
                                         let value = instruction

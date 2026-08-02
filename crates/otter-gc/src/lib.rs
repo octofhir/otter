@@ -24,6 +24,8 @@
 //! - [`branded`] — experimental isolate-branded session/root API.
 //! - [`heap`] — `GcHeap` orchestrator.
 //! - [`external`] — RAII accounting for native backing stores.
+//! - [`external_refs`] — isolate-local interner for non-GC addresses
+//!   (Rust function entries) that bodies reference by index.
 //! - [`extra_roots`] — heap-registered callbacks for runtime-owned roots.
 //! - [`frame_roots`] — active interpreter frame-stack root registry.
 //! - [`finalize`] — raw weak-reference and finalization bookkeeping.
@@ -69,6 +71,7 @@ pub mod devtools_snapshot;
 #[doc(hidden)]
 pub mod ephemeron;
 pub mod external;
+pub mod external_refs;
 pub mod extra_roots;
 #[doc(hidden)]
 pub mod finalize;
@@ -95,6 +98,7 @@ pub use branded::{GcSession, MutationSession, Root, Weak, with_gc_session};
 pub use census::{HeapCensus, SpaceCensus, TagRow};
 pub use compressed::{CageStats, Gc, cage_base, cage_size, cage_stats, init_cage_with_size};
 pub use external::{ExternalMemory, SharedExternalMemory};
+pub use external_refs::{ExternalRefTable, NO_EXTERNAL_REF};
 pub use extra_roots::{ExtraRootSource, ExtraRoots, ExtraRootsGuard};
 pub use frame_roots::{FrameRootProviders, FrameRoots, FrameRootsGuard, RawFrameRoots};
 pub use handle::{EscapableHandleScope, HandleScope, HandleStack, Local};

@@ -268,8 +268,8 @@ impl CodeBlock {
                     + crate::collections::MAP_BODY_JIT_GUARD_FLAGS_OFFSET as u32,
                 native_function_type_tag: crate::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG,
             },
-            native_static_fn_byte: otter_gc::header::HEADER_SIZE as u32
-                + crate::native_function::NATIVE_FUNCTION_BODY_JIT_STATIC_FN_OFFSET as u32,
+            native_ref_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::native_function::NATIVE_FUNCTION_BODY_NATIVE_REF_OFFSET as u32,
             instructions: self
                 .code
                 .iter()

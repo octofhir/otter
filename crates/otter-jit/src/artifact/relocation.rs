@@ -46,9 +46,7 @@ const TARGET_GC_CAGE_BASE: u8 = 2;
 const TARGET_PROPERTY_IC_CELL: u8 = 3;
 const TARGET_TEMPLATE_OPERAND_SLICE: u8 = 4;
 const TARGET_GUARDED_HEAP_REFERENCE: u8 = 6;
-const TARGET_GUARDED_BUILTIN_FUNCTION: u8 = 7;
 const TARGET_DIRECT_CALL_ENTRY_CELL: u8 = 8;
-const TARGET_NATIVE_LEAF_BUILTIN_FUNCTION: u8 = 9;
 const TARGET_GLOBAL_LEXICAL_CELL: u8 = 10;
 const TARGET_DEOPT_RUNTIME_DATA: u8 = 11;
 
@@ -125,16 +123,6 @@ pub(crate) enum RelocationTarget {
         component: GuardedHeapComponent,
         byte_pc: u32,
         runtime_stub_id: u32,
-    },
-    GuardedBuiltinFunction {
-        byte_pc: u32,
-        runtime_stub_id: u32,
-    },
-    /// Exact bootstrap function identity guarded before a declared leaf entry
-    /// runs. The process address is deliberately absent; the entry id names the
-    /// declaration that owns it.
-    NativeLeafBuiltinFunction {
-        stub_id: otter_vm::native_abi::RuntimeStubId,
     },
     /// Stable registry cell guarded by one generated direct-call site.
     ///
@@ -1032,18 +1020,6 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             put_u32(output, *byte_pc);
             put_u32(output, *runtime_stub_id);
         }
-        RelocationTarget::GuardedBuiltinFunction {
-            byte_pc,
-            runtime_stub_id,
-        } => {
-            output.push(TARGET_GUARDED_BUILTIN_FUNCTION);
-            put_u32(output, *byte_pc);
-            put_u32(output, *runtime_stub_id);
-        }
-        RelocationTarget::NativeLeafBuiltinFunction { stub_id } => {
-            output.push(TARGET_NATIVE_LEAF_BUILTIN_FUNCTION);
-            put_u32(output, *stub_id);
-        }
         RelocationTarget::DirectCallEntryCell {
             byte_pc,
             direct_call,
@@ -1374,13 +1350,6 @@ mod tests {
                 byte_pc: 8,
                 runtime_stub_id: 9,
             },
-            RelocationTarget::GuardedBuiltinFunction {
-                byte_pc: 10,
-                runtime_stub_id: 11,
-            },
-            RelocationTarget::NativeLeafBuiltinFunction {
-                stub_id: otter_vm::native_abi::STUB_MATH_ABS_LEAF.id,
-            },
             direct_call_target(
                 29,
                 DirectCallTierArtifact::Optimizing,
@@ -1391,7 +1360,7 @@ mod tests {
             .into_iter()
             .map(|target| render_single(&code, 4, target).normalized_code)
             .collect();
-        assert_eq!(normalized.len(), 8);
+        assert_eq!(normalized.len(), 6);
 
         let first = render_single(
             &code,

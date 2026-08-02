@@ -39,6 +39,7 @@ use std::time::Instant;
 use crate::compressed::{Cage, Gc, RawGc, cage_base, cage_size};
 use crate::ephemeron::EphemeronRegistry;
 use crate::external::{ExternalMemory, SharedExternalMemory, SharedExternalState};
+use crate::external_refs::ExternalRefTable;
 use crate::extra_roots::{ExtraRoots, ExtraRootsGuard};
 use crate::finalize::WeakFinalizationRegistry;
 use crate::frame_roots::{FrameRootProviders, FrameRoots, FrameRootsGuard};
@@ -147,6 +148,10 @@ pub struct GcHeap {
     old_space: OldSpace,
     large_space: LargeObjectSpace,
     trace_table: TraceTable,
+    /// Isolate-local interner for the non-GC addresses bodies point at.
+    /// Per-heap, not process-global, so index order is a property of
+    /// this isolate's install sequence alone.
+    external_refs: ExternalRefTable,
     marking: MarkingState,
     /// Object-granular remembered set: the per-isolate store buffer of
     /// mutated **old/large parents** that hold an old→young edge. Fed by
@@ -332,6 +337,7 @@ impl GcHeap {
             old_space: OldSpace::new(),
             large_space: LargeObjectSpace::new(),
             trace_table: TraceTable::new(),
+            external_refs: ExternalRefTable::new(),
             marking: MarkingState::new(),
             remembered_parents: Vec::new(),
             handle_stack: Box::new(HandleStack::new()),
@@ -734,6 +740,19 @@ impl GcHeap {
     #[doc(hidden)]
     pub fn trace_table(&self) -> &TraceTable {
         &self.trace_table
+    }
+
+    /// Intern a non-GC address so a body can reference it by a small
+    /// index instead of storing the raw pointer. See
+    /// [`crate::external_refs`].
+    pub fn intern_external_ref(&mut self, addr: usize) -> u32 {
+        self.external_refs.intern(addr)
+    }
+
+    /// The heap's external-reference table.
+    #[must_use]
+    pub fn external_refs(&self) -> &ExternalRefTable {
+        &self.external_refs
     }
 
     /// Borrow the heap's handle stack.

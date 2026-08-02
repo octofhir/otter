@@ -16,7 +16,7 @@
 //! - [`ClosureCallHeader`] — stable machine-facing call ABI prefix.
 //! - [`ClosureCallState`] — allocation-neutral VM call metadata.
 //! - [`JsClosureBody`] — GC body holding the ABI prefix, canonical
-//!   bound values, and the Rust-owned traced tail.
+//!   bound values, and the traced tail.
 //! - [`JsClosure`] — 8-byte handle plus cached function id.
 //! - [`alloc_closure`] / [`alloc_closure_with_roots`] — allocators.
 //! - [`JS_CLOSURE_BODY_TYPE_TAG`] — reserved
@@ -26,13 +26,13 @@
 //!
 //! - The machine-facing prefix is `#[repr(C)]`: native linkage may read
 //!   [`ClosureCallHeader`], `bound_this`, and `bound_new_target` only. It
-//!   must never interpret the following Rust `Vec` / `Option` layout.
-//! - The upvalue slice is built once at closure creation
+//!   must never interpret the following Rust `Option` layout.
+//! - The upvalue spine is built once at closure creation
 //!   ([`Op::MakeClosure`](otter_bytecode::Op::MakeClosure)) and never
-//!   resized. Its backing allocation therefore matches the immutable
-//!   `upvalue_base` / `upvalue_count` pair for the closure's lifetime;
-//!   native code must not retain that base beyond the live call.
-//!   Per-cell mutation flows through
+//!   resized. It is a [`crate::upvalue_spine::UpvalueSpineBody`] in old
+//!   space, so its address matches the `upvalue_base` / `upvalue_count`
+//!   pair for the closure's lifetime; native code must not retain that
+//!   base beyond the live call. Per-cell mutation flows through
 //!   [`crate::store_upvalue`] / [`crate::read_upvalue`].
 //! - Canonical `Value` fields are always traced. Presence flags distinguish
 //!   `None` from `Some(undefined)` while [`JsClosure`] keeps the ergonomic
@@ -55,14 +55,13 @@
 //! - ECMA-262 §13.3.6 — `[[Call]]` for ordinary functions / closures.
 //! - ECMA-262 §10.2.1.1 — `[[ThisMode]]` for arrow functions.
 
+use crate::object::JsObject;
+use crate::upvalue_spine::UpvalueSpineHandle;
+use crate::{UpvalueCell, Value, upvalue_source::UpvalueSource};
 use otter_gc::GcHeap;
 use otter_gc::OutOfMemory;
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
-use otter_macros::Pelt;
-
-use crate::object::JsObject;
-use crate::{UpvalueCell, Value, upvalue_source::UpvalueSource};
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`JsClosureBody`].
 pub const JS_CLOSURE_BODY_TYPE_TAG: u8 = 0x23;
@@ -88,9 +87,10 @@ pub const CLOSURE_CALL_RUNTIME_SETUP_FLAGS: u32 = CLOSURE_CALL_FLAG_BOUND_NEW_TA
 /// Stable machine-facing closure call metadata.
 ///
 /// All addresses use fixed-width integers instead of Rust references. The
-/// `upvalue_base` points at the immutable backing allocation of the body's
-/// `Vec<UpvalueCell>` and is valid only while the closure remains live; it is
-/// not a movable GC-object pointer and must not be cached across calls.
+/// `upvalue_base` points into the closure's
+/// [`crate::upvalue_spine::UpvalueSpineBody`] and is valid only while the
+/// closure remains live; it is not a movable GC-object pointer and must
+/// not be cached across calls.
 #[repr(C, align(8))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClosureCallHeader {
@@ -106,9 +106,9 @@ pub struct ClosureCallHeader {
 
 /// Allocation-neutral closure state consumed by call preparation.
 ///
-/// `upvalues` borrows the closure's stable external vector allocation without
-/// constructing a `Vec`/`Box`. The exact closure value must remain rooted for
-/// every use of this record that can cross a collection.
+/// `upvalues` borrows the closure's spine without constructing a
+/// `Vec`/`Box`. The exact closure value must remain rooted for every use
+/// of this record that can cross a collection.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ClosureCallState {
     pub(crate) upvalues: UpvalueSource,
@@ -121,19 +121,13 @@ pub(crate) struct ClosureCallState {
 impl ClosureCallHeader {
     fn new(
         function_id: u32,
-        upvalues: &[UpvalueCell],
+        upvalue_count: u32,
+        upvalue_base: u64,
         bound_this: bool,
         bound_new_target: bool,
         bound_derived_this: bool,
         eval_env: bool,
     ) -> Self {
-        let upvalue_count =
-            u32::try_from(upvalues.len()).expect("closure upvalue spine exceeds the u32 call ABI");
-        let upvalue_base = if upvalues.is_empty() {
-            0
-        } else {
-            upvalues.as_ptr() as usize as u64
-        };
         let mut flags = 0;
         if bound_this {
             flags |= CLOSURE_CALL_FLAG_BOUND_THIS;
@@ -177,22 +171,23 @@ impl ClosureCallHeader {
 /// GC body backing every closure value.
 ///
 /// Only the prefix through `bound_new_target` is part of the stable call ABI.
-/// Everything after it is a traced Rust implementation detail.
+/// Everything after it is a traced implementation detail.
 #[repr(C, align(8))]
-#[derive(Debug, Pelt)]
-#[pelt(tag = JS_CLOSURE_BODY_TYPE_TAG)]
+#[derive(Debug)]
 pub struct JsClosureBody {
     /// Fixed-layout metadata read by native linkage.
-    #[pelt(skip)]
     pub call_header: ClosureCallHeader,
     /// Canonical traced lexical `this`; consult the header flag for presence.
     pub bound_this: Value,
     /// Canonical traced lexical `new.target`; consult the header flag for presence.
     pub bound_new_target: Value,
-    /// Captured upvalue spine in declaration order. Per-cell mutation
-    /// flows through [`crate::store_upvalue`] /
-    /// [`crate::read_upvalue`]; the slice itself never resizes.
-    pub upvalues: Vec<UpvalueCell>,
+    /// Captured upvalue spine in declaration order, or a null handle
+    /// when the closure captures nothing. The cells live in the spine
+    /// body's own cell, so the closure owns no storage outside the heap
+    /// and a page image carries the whole of it. Per-cell mutation flows
+    /// through [`crate::store_upvalue`] / [`crate::read_upvalue`]; the
+    /// spine itself never resizes.
+    pub spine: UpvalueSpineHandle,
     /// Arrow closures created inside derived constructors capture the
     /// constructor's shared `this` cell so `super()` can bind it even
     /// when the arrow is invoked through a nested sync dispatch.
@@ -210,6 +205,34 @@ pub struct JsClosureBody {
     /// sibling closure of the same source would share). `None` until
     /// the first own property or `prototype` materialization.
     pub own_props: Option<JsObject>,
+}
+
+impl otter_gc::SafeTraceable for JsClosureBody {
+    const TYPE_TAG: u8 = JS_CLOSURE_BODY_TYPE_TAG;
+
+    /// Walk every outgoing reference, then republish the spine's address.
+    ///
+    /// The spine handle is visited first on purpose. A restore relocates
+    /// it here, and `upvalue_base` — a raw process address compiled code
+    /// loads directly out of the call header — has to be recomputed from
+    /// the handle's post-relocation value. A scavenge never moves the
+    /// spine (it is old-space), so outside a restore the refresh writes
+    /// back what was already there.
+    fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
+        use crate::pelt::PeltField as _;
+
+        if !self.spine.is_null() {
+            let p = &mut self.spine as *mut UpvalueSpineHandle as *mut RawGc;
+            visitor(p);
+        }
+        self.refresh_upvalue_base();
+
+        self.bound_this.pelt_trace(visitor);
+        self.bound_new_target.pelt_trace(visitor);
+        self.bound_derived_this.pelt_trace(visitor);
+        self.eval_env.pelt_trace(visitor);
+        self.own_props.pelt_trace(visitor);
+    }
 }
 
 /// Byte offset of `function_id` inside [`ClosureCallHeader`].
@@ -257,7 +280,9 @@ const _: [(); 32] = [(); CLOSURE_BODY_BOUND_NEW_TARGET_OFFSET];
 impl JsClosureBody {
     fn new(
         function_id: u32,
-        upvalues: Vec<UpvalueCell>,
+        spine: UpvalueSpineHandle,
+        upvalue_count: u32,
+        upvalue_base: u64,
         bound_this: Option<Value>,
         bound_new_target: Option<Value>,
         bound_derived_this: Option<UpvalueCell>,
@@ -265,7 +290,8 @@ impl JsClosureBody {
     ) -> Self {
         let call_header = ClosureCallHeader::new(
             function_id,
-            &upvalues,
+            upvalue_count,
+            upvalue_base,
             bound_this.is_some(),
             bound_new_target.is_some(),
             bound_derived_this.is_some(),
@@ -275,11 +301,17 @@ impl JsClosureBody {
             call_header,
             bound_this: bound_this.unwrap_or_else(Value::undefined),
             bound_new_target: bound_new_target.unwrap_or_else(Value::undefined),
-            upvalues,
+            spine,
             bound_derived_this,
             eval_env,
             own_props: None,
         }
+    }
+
+    /// Recompute the raw spine address compiled code reads out of the
+    /// call header. Cheap, and correct wherever the spine ended up.
+    fn refresh_upvalue_base(&mut self) {
+        self.call_header.upvalue_base = crate::upvalue_spine::cells_base_address(self.spine);
     }
 
     #[inline]
@@ -317,11 +349,18 @@ impl JsClosureBody {
 
     /// Copy call metadata while borrowing the immutable upvalue allocation.
     fn call_state(&self) -> ClosureCallState {
-        // SAFETY: closure upvalue vectors are built once and never resized. A
-        // consumer of ClosureCallState must root the exact closure value for
-        // the record's live extent, as documented on the record itself.
-        let upvalues = unsafe { UpvalueSource::from_stable_slice(&self.upvalues) }
-            .expect("closure upvalue spine must fit the u32 call ABI");
+        // SAFETY: the spine is built once, never resized, and lives in
+        // old space, so the published base stays valid while the closure
+        // is reachable. A consumer of ClosureCallState must root the
+        // exact closure value for the record's live extent, as documented
+        // on the record itself.
+        let upvalues = unsafe {
+            UpvalueSource::from_raw_parts(
+                self.call_header.upvalue_base as usize as *mut UpvalueCell,
+                self.call_header.upvalue_count,
+            )
+        }
+        .expect("closure upvalue spine must fit the u32 call ABI");
         ClosureCallState {
             upvalues,
             bound_this: self.bound_this_option(),
@@ -463,7 +502,11 @@ impl JsClosure {
     where
         F: FnOnce(&[UpvalueCell]) -> R,
     {
-        heap.read_payload(self.handle, |body| f(&body.upvalues))
+        let spine = heap.read_payload(self.handle, |body| body.spine);
+        if spine.is_null() {
+            return f(&[]);
+        }
+        heap.read_payload(spine, |body| f(body.cells()))
     }
 
     /// Snapshot the captured upvalue spine into a fresh `Vec`.
@@ -471,7 +514,7 @@ impl JsClosure {
     /// boundary; otherwise prefer [`Self::with_upvalues`].
     #[must_use]
     pub fn upvalues_snapshot(self, heap: &GcHeap) -> Vec<UpvalueCell> {
-        heap.read_payload(self.handle, |body| body.upvalues.to_vec())
+        self.with_upvalues(heap, <[UpvalueCell]>::to_vec)
     }
 
     /// Identity comparison via GC handle offset.
@@ -493,9 +536,8 @@ impl JsClosure {
     }
 }
 
-/// Allocate a closure body in old-space (consistent with
-/// [`crate::alloc_upvalue`]; the scavenger does not yet rewrite
-/// embedded `UpvalueCell` slots).
+/// Allocate a closure body in old-space, consistent with
+/// [`crate::alloc_upvalue`] and with the spine itself.
 ///
 /// # Errors
 ///
@@ -509,9 +551,13 @@ pub fn alloc_closure(
     bound_derived_this: Option<UpvalueCell>,
     eval_env: Option<crate::eval_env::EvalEnvHandle>,
 ) -> Result<JsClosure, OutOfMemory> {
+    let mut upvalues = upvalues;
+    let spine = alloc_spine_for(heap, &mut upvalues, &mut |_| {})?;
     let body = JsClosureBody::new(
         function_id,
-        upvalues,
+        spine,
+        upvalue_count_of(&upvalues),
+        crate::upvalue_spine::cells_base_address(spine),
         bound_this,
         bound_new_target,
         bound_derived_this,
@@ -519,6 +565,24 @@ pub fn alloc_closure(
     );
     let handle = heap.alloc_old(body)?;
     Ok(JsClosure::from_parts(handle, function_id))
+}
+
+/// Cell count as the call ABI expresses it.
+fn upvalue_count_of(upvalues: &[UpvalueCell]) -> u32 {
+    u32::try_from(upvalues.len()).expect("closure upvalue spine exceeds the u32 call ABI")
+}
+
+/// Allocate the spine a closure will own, or a null handle when it
+/// captures nothing — a closure with no upvalues costs no second cell.
+fn alloc_spine_for(
+    heap: &mut GcHeap,
+    upvalues: &mut [UpvalueCell],
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<crate::upvalue_spine::UpvalueSpineHandle, OutOfMemory> {
+    if upvalues.is_empty() {
+        return Ok(crate::upvalue_spine::UpvalueSpineHandle::null());
+    }
+    crate::upvalue_spine::alloc_upvalue_spine(heap, upvalues, external_visit)
 }
 
 /// Allocate a closure body while exposing caller-owned roots across
@@ -541,9 +605,13 @@ pub fn alloc_closure_with_roots(
     eval_env: Option<crate::eval_env::EvalEnvHandle>,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsClosure, OutOfMemory> {
+    let mut upvalues = upvalues;
+    let spine = alloc_spine_for(heap, &mut upvalues, external_visit)?;
     let body = JsClosureBody::new(
         function_id,
-        upvalues,
+        spine,
+        upvalue_count_of(&upvalues),
+        crate::upvalue_spine::cells_base_address(spine),
         bound_this,
         bound_new_target,
         bound_derived_this,
@@ -572,7 +640,7 @@ mod tests {
             assert_eq!(body.call_header.flags, 0);
             assert_eq!(body.call_header.upvalue_base, 0);
             assert_eq!(body.call_header.upvalue_count, 0);
-            assert!(body.upvalues.is_empty());
+            assert!(body.spine.is_null(), "no captures means no spine cell");
             assert!(body.bound_this.is_undefined());
             assert!(body.bound_new_target.is_undefined());
         });
@@ -602,29 +670,31 @@ mod tests {
         assert_eq!(call_state.upvalues.len(), 2);
         assert_eq!(call_state.upvalues.read(0), Some(cell_a));
         assert_eq!(call_state.upvalues.read(1), Some(cell_b));
-        heap.read_payload(closure.handle(), |body| {
+        let spine = heap.read_payload(closure.handle(), |body| {
             assert_eq!(body.call_header.function_id, 42);
             assert_eq!(body.call_header.upvalue_count, 2);
-            assert_eq!(
-                body.call_header.upvalue_base,
-                body.upvalues.as_ptr() as usize as u64
-            );
-            assert_eq!(
-                call_state.upvalues.base_ptr_or_null(),
-                body.upvalues.as_ptr().cast_mut()
-            );
             assert!(body.call_header.has_flag(CLOSURE_CALL_FLAG_BOUND_THIS));
             assert!(
                 !body
                     .call_header
                     .has_flag(CLOSURE_CALL_FLAG_BOUND_NEW_TARGET)
             );
-            assert_eq!(body.upvalues.len(), 2);
-            assert_eq!(body.upvalues[0], cell_a);
-            assert_eq!(body.upvalues[1], cell_b);
             assert!(body.bound_this.is_null());
             assert!(body.bound_new_target.is_undefined());
+            body.spine
         });
+        // The published base is the spine's trailing array, so compiled
+        // code and the call state read the same cells.
+        let base = crate::upvalue_spine::cells_base_address(spine);
+        assert_eq!(
+            heap.read_payload(closure.handle(), |body| body.call_header.upvalue_base),
+            base
+        );
+        assert_eq!(call_state.upvalues.base_ptr_or_null() as usize as u64, base);
+        assert_eq!(
+            heap.read_payload(spine, |body| body.cells().to_vec()),
+            vec![cell_a, cell_b]
+        );
     }
 
     #[test]

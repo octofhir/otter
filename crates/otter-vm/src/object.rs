@@ -1628,6 +1628,7 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
         crate::symbol::SymbolBody,
         crate::temporal::payload::TemporalBody,
         crate::upvalue::UpvalueCellBody,
+        crate::upvalue_spine::UpvalueSpineBody,
         crate::weak_refs::FinalizationRegistryBody,
         crate::weak_refs::WeakRefBody,
         AccessorCellBody,

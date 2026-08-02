@@ -60,18 +60,6 @@ impl UpvalueSource {
         Ok(Self { base, len })
     }
 
-    /// Describe a stable Rust-owned slice.
-    ///
-    /// # Safety
-    /// The slice's backing allocation must satisfy the lifetime/stability
-    /// contract of [`Self::from_raw_parts`].
-    pub(crate) unsafe fn from_stable_slice(cells: &[UpvalueCell]) -> Result<Self, VmError> {
-        let len = u32::try_from(cells.len()).map_err(|_| VmError::InvalidOperand)?;
-        // SAFETY: forwarded from this function's contract. `as_ptr` is
-        // non-null for a non-empty slice; the empty case is canonicalized.
-        unsafe { Self::from_raw_parts(cells.as_ptr().cast_mut(), len) }
-    }
-
     /// Number of initialized cells.
     #[inline]
     #[must_use]
@@ -152,12 +140,14 @@ mod tests {
     #[test]
     fn stable_source_copies_without_retaining_a_slice() {
         let mut heap = otter_gc::GcHeap::new().unwrap();
-        let cells = vec![
+        let mut cells = vec![
             crate::alloc_upvalue(&mut heap, crate::Value::undefined()).unwrap(),
             crate::alloc_upvalue(&mut heap, crate::Value::null()).unwrap(),
         ];
         // SAFETY: `cells` stays allocated and unmodified for the source's use.
-        let source = unsafe { UpvalueSource::from_stable_slice(&cells) }.unwrap();
+        let source =
+            unsafe { UpvalueSource::from_raw_parts(cells.as_mut_ptr(), cells.len() as u32) }
+                .unwrap();
         assert_eq!(source.len(), 2);
         assert_eq!(source.base_ptr_or_null(), cells.as_ptr().cast_mut());
         assert_eq!(source.copy_owned().as_ref(), cells.as_slice());
@@ -181,9 +171,11 @@ mod tests {
         let before = crate::read_upvalue(&heap, cell)
             .as_raw_gc()
             .expect("young object handle");
-        let cells = [cell];
+        let mut cells = [cell];
         // SAFETY: the array remains initialized and live through collection.
-        let source = unsafe { UpvalueSource::from_stable_slice(&cells) }.unwrap();
+        let source =
+            unsafe { UpvalueSource::from_raw_parts(cells.as_mut_ptr(), cells.len() as u32) }
+                .unwrap();
 
         heap.collect_minor_with_roots(&mut |visitor| source.trace_slots(visitor))
             .unwrap();

@@ -310,8 +310,9 @@ pub fn alloc_flat_string_body_with_roots(
         );
     }
     // The code units live in the same cell as the body, so they are part of
-    // the GC allocation and need no separate cap reservation.
-    let handle = heap.alloc_trailing_with_roots(
+    // the GC allocation and need no separate cap reservation. Old space,
+    // like every other string body: see the module invariant.
+    let handle = heap.alloc_variable_with_roots(
         JsStringBody {
             id,
             len,
@@ -355,8 +356,9 @@ pub fn alloc_latin1_string_body_with_roots(
             external_visit,
         );
     }
-    // Same as the flat path: the bytes are inside the GC allocation.
-    let handle = heap.alloc_trailing_with_roots(
+    // Same as the flat path: the bytes are inside the GC allocation, and
+    // the body is old-space like every other string body.
+    let handle = heap.alloc_variable_with_roots(
         JsStringBody {
             id,
             len,

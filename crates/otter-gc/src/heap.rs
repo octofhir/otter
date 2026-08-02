@@ -736,6 +736,14 @@ impl GcHeap {
         self.weak_finalization.finalization_registry_count()
     }
 
+    /// Whether a header read at `offset` could belong to a live body.
+    /// See [`TraceTable::header_could_be_live`].
+    #[must_use]
+    pub fn header_could_be_live(&self, offset: u32, size_bytes: u32, type_tag: u8) -> bool {
+        self.trace_table
+            .header_could_be_live(offset, size_bytes, type_tag)
+    }
+
     /// Reference to the trace table (used by tests).
     #[doc(hidden)]
     pub fn trace_table(&self) -> &TraceTable {

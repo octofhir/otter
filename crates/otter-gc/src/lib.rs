@@ -87,6 +87,7 @@ pub mod page;
 pub mod root_scope;
 #[doc(hidden)]
 pub mod scavenger;
+pub mod self_contained;
 pub mod snapshot;
 pub mod space;
 pub mod stats;
@@ -109,6 +110,7 @@ pub use heap_image::{HeapImage, ImageError, Relocation};
 pub use oom::OutOfMemory;
 pub use page::{CARD_SIZE, PAGE_SIZE, Page, SpaceKind};
 pub use root_scope::{ErasedSlotTracer, RootScope};
+pub use self_contained::{EscapeRow, SelfContainmentAudit};
 pub use snapshot::{HeapSnapshot, SnapshotObject};
 pub use stats::{GcStats, TYPE_TAG_COUNT, TypeStats};
 pub use store::{GcEdge, GcStore};

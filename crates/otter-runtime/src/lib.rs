@@ -3975,6 +3975,13 @@ impl Runtime {
         self.interp.native_census()
     }
 
+    /// Which live bodies still own GC references outside their own heap
+    /// cell. A capture is only sound once this reports none.
+    #[must_use]
+    pub fn self_containment_audit(&mut self) -> otter_gc::SelfContainmentAudit {
+        self.interp.self_containment_audit()
+    }
+
     /// Inventory of the interpreter's GC root sources — which of them a
     /// finished build actually filled, and how much they hold.
     #[must_use]

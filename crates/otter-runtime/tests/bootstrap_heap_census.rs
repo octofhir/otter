@@ -237,3 +237,40 @@ fn build_fills_only_a_handful_of_root_sources() {
         "some root sources must still be empty after a build",
     );
 }
+
+/// Which bodies still keep GC references in memory the heap does not own.
+///
+/// A page image carries page bytes and nothing else, so a body holding a
+/// `Vec`, a `Box`, or a hash table restores as a second owner of the
+/// original buffer and hands the collector slot addresses the image never
+/// carried. Capture is unsound until this reports nothing.
+///
+/// The allow-list below is the remaining work, and it only ever shrinks:
+/// a type that appears here without being listed is a new way to make the
+/// bootstrap graph unrestorable.
+#[test]
+fn only_the_known_body_types_still_own_memory_outside_the_heap() {
+    /// Body types whose out-of-heap storage has not moved into the heap
+    /// yet. Delete an entry when its storage lands; never add one.
+    const STILL_OWNS_OUTSIDE_STORAGE: &[&str] =
+        &["JsClosureBody", "SetBody", "ObjectBody", "ArrayBody"];
+
+    let mut runtime = full_surface_runtime();
+    let audit = runtime.self_containment_audit();
+    println!("{}", audit.render_text());
+
+    assert!(
+        audit.objects_audited > 1000,
+        "the audit must have walked the built graph, saw {} objects",
+        audit.objects_audited,
+    );
+    for row in &audit.rows {
+        let leaf = row.type_name.rsplit("::").next().unwrap_or(row.type_name);
+        assert!(
+            STILL_OWNS_OUTSIDE_STORAGE.contains(&leaf),
+            "`{leaf}` keeps {} references outside the heap; either move that \
+             storage into the heap or the bootstrap image cannot carry it",
+            row.escaping_slots,
+        );
+    }
+}

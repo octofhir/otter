@@ -1785,6 +1785,7 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
         crate::upvalue::UpvalueCellBody,
         crate::upvalue_spine::UpvalueSpineBody,
         ExoticSlots,
+        crate::array::ArrayExoticSlots,
         crate::weak_refs::FinalizationRegistryBody,
         crate::weak_refs::WeakRefBody,
         AccessorCellBody,

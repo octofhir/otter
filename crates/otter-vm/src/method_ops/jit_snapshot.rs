@@ -36,10 +36,13 @@ fn collection_guard() -> JitBodyGuard {
 /// the instance can shadow the method or override an element's attributes,
 /// which is what makes the prototype-slot guard sufficient.
 fn dense_array_guard() -> JitBodyGuard {
+    // The sidecar is a 4-byte GC handle; a wider read would take the
+    // neighbouring field with it and can land on a byte offset a 64-bit
+    // load cannot encode.
     JitBodyGuard::clear(
         otter_gc::header::HEADER_SIZE as u32
             + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
-        JitGuardWidth::Word64,
+        JitGuardWidth::Word32,
     )
 }
 

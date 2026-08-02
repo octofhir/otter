@@ -1819,7 +1819,7 @@ impl Interpreter {
                 // Plain dense array only (no accessors / sparse / prototype
                 // override / named props) — then a bulk snapshot matches the
                 // per-index `[[Get]]` observably.
-                if body.exotic.is_some() {
+                if !body.exotic.is_null() {
                     return None;
                 }
                 let mut elems = Vec::with_capacity(cap);

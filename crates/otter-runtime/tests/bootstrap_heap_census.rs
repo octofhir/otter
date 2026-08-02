@@ -260,8 +260,9 @@ fn only_the_known_body_types_are_not_yet_self_contained() {
         // The object sidecar itself: `Vec<String>` dictionary keys, an
         // `FxHashMap` index, `Vec<SlotMeta>`, and host payloads.
         "ExoticSlots",
-        // `exotic: Option<Box<..>>`.
-        "ArrayBody",
+        // The array sidecar: sparse/named/accessor tables and JSON
+        // source bytes, in `HashMap`/`IndexMap`/`Vec`/`Arc` containers.
+        "ArrayExoticSlots",
         // `SmallVec` captures, `Arc` closure payloads and trace hooks.
         "NativeFunctionBody",
         "JsRegExpBody",

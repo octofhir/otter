@@ -766,9 +766,10 @@ impl Interpreter {
         jit::JitElementAccess {
             type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
             guards: [
+                // The sidecar is a 4-byte GC handle: read exactly it.
                 Some(jit::JitBodyGuard::clear(
                     header + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
-                    jit::JitGuardWidth::Word64,
+                    jit::JitGuardWidth::Word32,
                 )),
                 None,
             ],

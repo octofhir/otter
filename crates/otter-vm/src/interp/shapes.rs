@@ -155,12 +155,12 @@ impl Interpreter {
         // Assignment reaches the object through this shape-advancing store
         // rather than through `define_own_property`, so the latch is tripped
         // from both places.
-        if self.realm_intrinsics.array_prototype == Some(obj)
-            || self.realm_intrinsics.object_prototype == Some(obj)
+        if self.realm_intrinsics.array_prototype() == Some(obj)
+            || self.realm_intrinsics.object_prototype() == Some(obj)
         {
             self.activate_array_index_accessor_protector();
         }
-        if self.realm_intrinsics.array_prototype != Some(obj) {
+        if self.realm_intrinsics.array_prototype() != Some(obj) {
             return;
         }
         let new_len = f64::from(index) + 1.0;

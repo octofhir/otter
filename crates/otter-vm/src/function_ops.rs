@@ -331,7 +331,7 @@ impl Interpreter {
         // on %Function.prototype% whenever no parent class identity was
         // recorded.
         if class.ctor_proto(&self.gc_heap).is_undefined()
-            && let Some(function_prototype) = self.realm_intrinsics.function_prototype
+            && let Some(function_prototype) = self.realm_intrinsics.function_prototype()
         {
             // Re-read `statics` from its GC-rooted register: the class
             // construction above may have scavenged and relocated it, leaving
@@ -2128,7 +2128,7 @@ impl Interpreter {
             stack,
             &[&function_root, &constructor_value, &bag_root],
         )?;
-        if let Some(object_proto) = self.realm_intrinsics.object_prototype.or_else(|| {
+        if let Some(object_proto) = self.realm_intrinsics.object_prototype().or_else(|| {
             crate::object::get(self.global_this, &self.gc_heap, "Object")
                 .and_then(|v| v.as_object())
                 .and_then(|object_ctor| {
@@ -2252,9 +2252,9 @@ impl Interpreter {
         name: &str,
     ) -> Option<Value> {
         let cached = match constructor_name {
-            "Object" => self.realm_intrinsics.object_prototype,
-            "Function" => self.realm_intrinsics.function_prototype,
-            "Array" => self.realm_intrinsics.array_prototype,
+            "Object" => self.realm_intrinsics.object_prototype(),
+            "Function" => self.realm_intrinsics.function_prototype(),
+            "Array" => self.realm_intrinsics.array_prototype(),
             _ => None,
         };
         if let Some(prototype_obj) = cached {

@@ -89,7 +89,7 @@ impl Interpreter {
         let mut result = abstract_ops::is_array(&self.gc_heap, &value)?;
         if !result
             && let Some(obj) = value.as_object()
-            && self.realm_intrinsics.array_prototype == Some(obj)
+            && self.realm_intrinsics.array_prototype() == Some(obj)
         {
             result = true;
         }

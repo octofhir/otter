@@ -401,15 +401,15 @@ impl Interpreter {
         // global → ctor → prototype double-lookup that fires on every
         // `OrdinaryCreateFromConstructor` style allocation.
         let cached = match constructor_name {
-            "Object" => self.realm_intrinsics.object_prototype,
-            "Function" => self.realm_intrinsics.function_prototype,
-            "Array" => self.realm_intrinsics.array_prototype,
-            "Promise" => self.realm_intrinsics.promise_prototype,
-            "RegExp" => self.realm_intrinsics.regexp_prototype,
-            "String" => self.realm_intrinsics.string_prototype,
-            "Number" => self.realm_intrinsics.number_prototype,
-            "Map" => self.realm_intrinsics.map_prototype,
-            "Set" => self.realm_intrinsics.set_prototype,
+            "Object" => self.realm_intrinsics.object_prototype(),
+            "Function" => self.realm_intrinsics.function_prototype(),
+            "Array" => self.realm_intrinsics.array_prototype(),
+            "Promise" => self.realm_intrinsics.promise_prototype(),
+            "RegExp" => self.realm_intrinsics.regexp_prototype(),
+            "String" => self.realm_intrinsics.string_prototype(),
+            "Number" => self.realm_intrinsics.number_prototype(),
+            "Map" => self.realm_intrinsics.map_prototype(),
+            "Set" => self.realm_intrinsics.set_prototype(),
             _ => None,
         };
         if let Some(proto) = cached {

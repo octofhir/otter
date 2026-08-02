@@ -786,7 +786,7 @@ impl Interpreter {
     }
 
     pub(crate) fn current_array_prototype_override(&self) -> Option<Value> {
-        self.realm_intrinsics.array_prototype.map(Value::object)
+        self.realm_intrinsics.array_prototype().map(Value::object)
     }
 
     pub(crate) fn register_array_prototype_override(&mut self, array: crate::array::JsArray) {

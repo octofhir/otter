@@ -800,7 +800,7 @@ fn proto_compile(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
             .context()
             .interp_mut()
             .realm_intrinsics()
-            .regexp_prototype;
+            .regexp_prototype();
         if let Some(prototype) = re.prototype_override(scope.context().heap())
             && prototype.as_object() != default_proto
         {
@@ -1116,7 +1116,7 @@ fn this_is_regexp_prototype(ctx: &mut NativeCtx<'_>) -> bool {
         return false;
     };
     matches!(
-        ctx.interp_mut().realm_intrinsics().regexp_prototype,
+        ctx.interp_mut().realm_intrinsics().regexp_prototype(),
         Some(proto) if proto == this_obj
     )
 }

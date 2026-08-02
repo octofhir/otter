@@ -2268,6 +2268,12 @@ impl Runtime {
         // The interpreter owns both per-isolate heaps; the string and GC
         // allocators honor the configured cap.
         let mut interp = Interpreter::with_string_heap_cap(config.max_heap_bytes);
+        // Everything this build allocates — globals, prototypes, the objects
+        // the bootstrap sources create — lives as long as the runtime does.
+        // Allocating it young makes the first scavenges copy the whole set and
+        // every later one re-trace it, for objects that were never going to
+        // die, so the build runs tenured and the nursery starts empty.
+        interp.gc_heap_mut().set_tenure_all(true);
         interp.set_max_stack_depth(config.max_stack_depth);
         interp.set_allow_blocking_atomics_wait(config.allow_blocking_atomics_wait);
         interp.set_console_sink(config.console_sink.clone());
@@ -2536,6 +2542,9 @@ impl Runtime {
                     message: format!("class `{name}` attached JS glue failed: {err}"),
                 })?;
         }
+        // Bootstrap is over; user allocations go back through the nursery,
+        // where most of them die.
+        runtime.interp.gc_heap_mut().set_tenure_all(false);
         Ok(runtime)
     }
 }

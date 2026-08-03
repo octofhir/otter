@@ -1518,7 +1518,12 @@ impl otter_gc::SafeTraceable for SymbolPropsBody {
     const TYPE_TAG: u8 = SYMBOL_PROPS_BODY_TYPE_TAG;
 
     fn trace_slots_safe(&mut self, v: &mut SlotVisitor<'_>) {
-        for (_sym, slot) in self.entries_mut() {
+        for (sym, slot) in self.entries_mut() {
+            // The key's symbol handle (and its description string) must
+            // relocate with the table: symbol property lookup is handle
+            // identity, so an unvisited key would compare unequal to the
+            // relocated well-known symbol after a snapshot restore.
+            sym.trace_value_slots(v);
             match &mut slot.kind {
                 SlotKind::Data => slot.value.trace_value_slot_mut(v),
                 SlotKind::Accessor(pair) => {
@@ -2497,6 +2502,11 @@ impl otter_gc::SafeTraceable for ObjectBody {
         // words. Tracing the handle before `refresh_values_ptr` below is
         // what keeps the cached base pointing at the post-move slab.
         if !self.slab.is_null() {
+            debug_assert!(
+                self.slab.offset() >= 0x1000 && self.slab.offset().is_multiple_of(8),
+                "ObjectBody.slab holds a garbage handle {:#x}",
+                self.slab.offset(),
+            );
             let p = &mut self.slab as *mut slot_slab::SlotSlabHandle as *mut RawGc;
             v(p);
         }

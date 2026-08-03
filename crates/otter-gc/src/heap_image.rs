@@ -423,10 +423,26 @@ impl GcHeap {
                 pages: self.old_space_page_count(),
             });
         }
-        // 1) Place the pages and record where each one landed.
+        // 1) Place the pages and record where each one landed. A target
+        // page whose offset coincides with any CAPTURED page is held
+        // back and returned to the cage afterwards: keeping the two
+        // offset sets disjoint is what makes the relocation idempotent —
+        // an already-relocated slot value can never look like a captured
+        // offset, so a slot shared between an owner and its
+        // backing-store body tolerates the second visit.
+        let captured: std::collections::HashSet<u32> =
+            image.pages.iter().map(|p| p.cage_offset).collect();
+        let mut held_back: Vec<Page> = Vec::new();
         let mut placed: Vec<(u32, Page)> = Vec::with_capacity(image.pages.len());
         for entry in &image.pages {
-            let page = Page::new(SpaceKind::Old).ok_or(OutOfMemory::CageExhausted)?;
+            let page = loop {
+                let candidate = Page::new(SpaceKind::Old).ok_or(OutOfMemory::CageExhausted)?;
+                if captured.contains(&candidate.cage_offset()) {
+                    held_back.push(candidate);
+                    continue;
+                }
+                break candidate;
+            };
             // SAFETY: `page` is a live cage page of `PAGE_SIZE` bytes and
             // `entry.bytes` is at most that long; the two never overlap.
             unsafe {
@@ -474,17 +490,21 @@ impl GcHeap {
             }
         }
 
-        // 3) Rewrite every pointer slot in the restored objects, each
-        // slot exactly once. Owners and their backing-store bodies
-        // intentionally trace shared slots, and "is this value already
-        // relocated" is undecidable when the cage reissues a captured
-        // page's offsets to the restore (a dropped donor makes overlap
-        // routine) — so the walk collects slot ADDRESSES, dedupes, and
-        // relocates each survivor once. Done before the pages are
-        // adopted so a failure leaves the heap untouched and the pages
-        // simply drop back to the cage.
+        // 3) Rewrite every pointer slot in the restored objects,
+        // inline through each body's own trace. Traces that surface a
+        // slot through a stack temporary (a tagged compressed word, a
+        // map key) write the relocated value back themselves, so the
+        // rewrite must happen inside the visitor — collecting slot
+        // addresses for a later pass would write into dead stack
+        // frames. Idempotence comes from the disjoint offset sets
+        // above: a value the visitor already relocated can never look
+        // like a captured offset, so shared slots tolerate a second
+        // visit, and a value outside every captured page (a sentinel
+        // encoding, an already-relocated handle) passes through
+        // verbatim. Done before the pages are adopted so a failure
+        // leaves the heap untouched and the pages simply drop back to
+        // the cage.
         let mut failure: Option<ImageError> = None;
-        let mut slots: Vec<*mut RawGc> = Vec::with_capacity(image.object_count as usize);
         for (_, page) in &placed {
             // SAFETY: the copied bytes are a faithful page prefix, so every
             // header up to `bump_cursor` is one this heap's trace table can
@@ -505,7 +525,13 @@ impl GcHeap {
                         return;
                     };
                     trace(header, &mut |slot: *mut RawGc| {
-                        slots.push(slot);
+                        let old = *slot;
+                        if old.is_null() {
+                            return;
+                        }
+                        if let Some(new) = relocation.relocate(old.0) {
+                            *slot = RawGc(new);
+                        }
                     });
                 });
             }
@@ -513,27 +539,7 @@ impl GcHeap {
         if let Some(err) = failure {
             return Err(err);
         }
-        slots.sort_unstable();
-        slots.dedup();
-        for slot in slots {
-            // SAFETY: every collected address names a live slot inside
-            // a placed page; nothing between collection and this write
-            // moved or freed those pages.
-            unsafe {
-                let old = *slot;
-                if old.is_null() {
-                    continue;
-                }
-                // A value outside every captured page is not a handle
-                // this image owns: sentinel encodings (a non-null tag
-                // in an otherwise-pointer slot) pass through verbatim.
-                // The self-containment audit guarantees no genuine
-                // out-of-image pointer survives to this walk.
-                if let Some(new) = relocation.relocate(old.0) {
-                    *slot = RawGc(new);
-                }
-            }
-        }
+        drop(held_back);
 
         // 3b) Re-run every trace once more, discarding the slots: some
         // bodies recompute a cached absolute address (a slab's element

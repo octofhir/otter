@@ -316,13 +316,27 @@ impl Interpreter {
             tracer: None,
             cpu_profiler: None,
         };
+        interp.prime_realm_caches();
+        // The realm is complete; anything allocated from here is mutator work
+        // and belongs in the nursery, where most of it dies.
+        interp.gc_heap.set_tenure_all(false);
+        interp
+    }
+
+    /// Post-bootstrap realm cache priming, shared by the ordinary
+    /// constructor and the snapshot restore path: populate the typed
+    /// intrinsic slots from the global graph, build the per-kind
+    /// iterator prototypes, and install the function-kind prototypes.
+    fn prime_realm_caches(&mut self) {
+        let interp = self;
+        let global_this = interp.global_this;
         // Cache typed handles for the well-known constructors and
         // prototypes. Subsequent runtime lookups read the slots and
         // skip the global → ctor → prototype string walk.
         interp
             .realm_intrinsics
             .populate(&mut interp.gc_heap, global_this);
-        let extra_roots = otter_gc::ExtraRoots::new(&interp);
+        let extra_roots = otter_gc::ExtraRoots::new(&*interp);
         let extra_roots_guard = interp.gc_heap.register_extra_roots(extra_roots);
         let mut iterator_roots = [Value::undefined(); 7];
         let mut iterator_scope = otter_gc::RootScope::new(&mut interp.gc_heap);
@@ -392,10 +406,6 @@ impl Interpreter {
             slot.set(value);
         }
         drop(extra_roots_guard);
-        // The realm is complete; anything allocated from here is mutator work
-        // and belongs in the nursery, where most of it dies.
-        interp.gc_heap.set_tenure_all(false);
-        interp
     }
 
     fn swap_active_realm_state(&mut self, state: &mut RealmState) {

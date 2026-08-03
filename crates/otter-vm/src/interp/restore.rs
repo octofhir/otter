@@ -55,6 +55,10 @@ impl Interpreter {
         let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(max_heap_bytes)
             .expect("GcHeap construction never fails on the default cage");
         object::register_gc_traceables(&mut gc_heap);
+        // Before anything can mint a shape id in this process: freshly
+        // minted ids must never collide with the ids the image's shapes
+        // and dictionary objects already carry.
+        object::bump_next_shape_id_to(snapshot.next_shape_id);
         let relocation = gc_heap.restore_old_space(&snapshot.image)?;
         // Same indices, current addresses: every captured entry slides
         // by however far the loader moved the binary image (zero for an

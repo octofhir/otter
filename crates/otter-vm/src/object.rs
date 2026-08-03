@@ -115,6 +115,21 @@ fn next_shape_id() -> ShapeId {
     ShapeId(NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed))
 }
 
+/// The next shape id this process would mint — captured into a
+/// snapshot so a restoring process never re-issues an id the image's
+/// shapes (or dictionary objects) already carry. Shape ids key the
+/// property caches; a collision hands one object another's slots.
+pub(crate) fn snapshot_next_shape_id() -> u64 {
+    NEXT_SHAPE_ID.load(Ordering::Relaxed)
+}
+
+/// Advance the shape-id counter past every id a restored image
+/// carries. `fetch_max` keeps it monotonic when several isolates
+/// restore into one process.
+pub(crate) fn bump_next_shape_id_to(minimum: u64) {
+    NEXT_SHAPE_ID.fetch_max(minimum, Ordering::Relaxed);
+}
+
 /// Rust-owned, non-traced data attached to a JavaScript object.
 ///
 /// This convenience marker is for payloads that contain no JavaScript values.

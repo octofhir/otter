@@ -182,6 +182,11 @@ struct RunArgs {
     /// Execution tier installed in every per-test runtime.
     #[arg(long, value_enum, default_value_t = JitTierArg::ProductionTiered)]
     jit_tier: JitTierArg,
+
+    /// Restore every per-test runtime from a per-worker donor
+    /// snapshot instead of bootstrapping from scratch.
+    #[arg(long)]
+    snapshot_isolates: bool,
 }
 
 /// Execution-tier selection forwarded to every per-test runtime.
@@ -250,6 +255,11 @@ struct WorkerArgs {
     /// Execution tier installed in every per-test runtime.
     #[arg(long, value_enum, default_value_t = JitTierArg::ProductionTiered)]
     jit_tier: JitTierArg,
+
+    /// Restore every per-test runtime from a per-worker donor
+    /// snapshot instead of bootstrapping from scratch.
+    #[arg(long)]
+    snapshot_isolates: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -417,6 +427,7 @@ fn run(repo_root: &Path, args: RunArgs) -> Result<ExitCode> {
         args.process_chunk_size.max(1),
         worker_soft_rss_bytes,
         jit_tier,
+        args.snapshot_isolates,
     )
 }
 
@@ -512,6 +523,7 @@ fn execute_process_isolated(
     chunk_size: usize,
     worker_soft_rss_bytes: u64,
     jit_tier: JitTierArg,
+    snapshot_isolates: bool,
 ) -> Result<ExitCode> {
     let temp = tempfile::Builder::new()
         .prefix("otter-test262-")
@@ -599,6 +611,7 @@ fn execute_process_isolated(
                     max_heap_bytes,
                     worker_soft_rss_bytes,
                     jit_tier,
+                    snapshot_isolates,
                 );
             })
         })
@@ -664,6 +677,7 @@ fn process_parent_worker_loop(
     max_heap_bytes: u64,
     worker_soft_rss_bytes: u64,
     jit_tier: JitTierArg,
+    snapshot_isolates: bool,
 ) {
     loop {
         if interrupted.load(Ordering::Relaxed) {
@@ -689,6 +703,7 @@ fn process_parent_worker_loop(
             worker_soft_rss_bytes,
             config_path,
             jit_tier,
+            snapshot_isolates,
         );
 
         let recorded = read_worker_lines(&out_file, slots, pb, progress);
@@ -779,6 +794,7 @@ fn run_worker_child(
     worker_soft_rss_bytes: u64,
     config_path: Option<&Path>,
     jit_tier: JitTierArg,
+    snapshot_isolates: bool,
 ) -> WorkerRunStatus {
     let mut cmd = std::process::Command::new(exe);
     let stdout = File::create(stdout_file).ok();
@@ -803,6 +819,9 @@ fn run_worker_child(
         .arg(worker_soft_rss_bytes.to_string())
         .arg("--jit-tier")
         .arg(jit_tier.as_arg());
+    if snapshot_isolates {
+        cmd.arg("--snapshot-isolates");
+    }
     if let Some(stdout) = stdout {
         cmd.stdout(stdout);
     }
@@ -932,11 +951,21 @@ fn worker(repo_root: &Path, args: WorkerArgs) -> Result<ExitCode> {
         eprintln!("error: failed to prewarm harness: {err}");
         return Ok(ExitCode::from(2));
     }
+    let snapshot = if args.snapshot_isolates {
+        let image = otter_test262::isolation::capture_snapshot_donor(args.jit_tier.selection())
+            .context("donor snapshot capture failed")?;
+        Some(otter_test262::runner::SharedSnapshot(std::rc::Rc::new(
+            image,
+        )))
+    } else {
+        None
+    };
     let exec = ExecConfig {
         timeout: Duration::from_millis(args.timeout_ms),
         max_heap_bytes: args.max_heap_bytes,
         config,
         jit_selection: args.jit_tier.selection(),
+        snapshot,
     };
     let test_paths = std::fs::read_to_string(&args.paths_file)
         .with_context(|| format!("failed to read {}", args.paths_file.display()))?;

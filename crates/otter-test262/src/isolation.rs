@@ -30,8 +30,9 @@ use std::time::{Duration, Instant};
 
 use otter_runtime::{
     ExecutionResult, InterruptHandle, JitSelection, OtterError, Runtime, RuntimeExtensionInstaller,
-    SourceInput,
+    SnapshotRuntimeOptions, SourceInput,
 };
+use otter_vm::snapshot::IsolateSnapshot;
 
 /// Build a fresh runtime with the configured per-test caps.
 ///
@@ -54,6 +55,41 @@ pub fn fresh_runtime(
             crate::agent::install_natives,
         ))
         .build()
+}
+
+/// Capture a donor image for snapshot-per-test isolation: bootstrap
+/// one runtime with the exact surface [`fresh_runtime`] builds, then
+/// freeze its heap. Every restored isolate shares the image
+/// read-only, so the per-test cost drops from a full bootstrap to a
+/// page restore.
+pub fn capture_snapshot_donor(jit_selection: JitSelection) -> Result<IsolateSnapshot, OtterError> {
+    let donor = fresh_runtime(Duration::ZERO, 0, false, jit_selection)?;
+    donor
+        .capture_isolate_snapshot()
+        .map_err(|err| OtterError::Internal {
+            code: "test262/snapshot-capture".to_string(),
+            message: format!("donor snapshot capture failed: {err}"),
+        })
+}
+
+/// Restore a per-test runtime from `snapshot` with the same knobs
+/// [`fresh_runtime`] applies to a bootstrapped one.
+pub fn snapshot_runtime(
+    snapshot: &IsolateSnapshot,
+    timeout: Duration,
+    max_heap_bytes: u64,
+    allow_blocking_atomics_wait: bool,
+    jit_selection: JitSelection,
+) -> Result<Runtime, OtterError> {
+    Runtime::from_isolate_snapshot_with(
+        snapshot,
+        SnapshotRuntimeOptions {
+            timeout,
+            max_heap_bytes,
+            allow_blocking_atomics_wait,
+            jit_selection,
+        },
+    )
 }
 
 /// Outcome of [`run_with_watchdog`] when the engine call returned.

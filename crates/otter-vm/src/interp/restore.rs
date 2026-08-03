@@ -39,8 +39,21 @@ impl Interpreter {
     /// # Errors
     /// Propagates [`otter_gc::ImageError`] from the page restore.
     pub fn from_isolate_snapshot(snapshot: &IsolateSnapshot) -> Result<Self, otter_gc::ImageError> {
-        let mut gc_heap =
-            otter_gc::GcHeap::new().expect("GcHeap construction never fails on the default cage");
+        Self::from_isolate_snapshot_capped(snapshot, 0)
+    }
+
+    /// [`Self::from_isolate_snapshot`] with a heap cap (`0` =
+    /// unlimited), for hosts that bound per-isolate memory — the
+    /// test262 runner caps every test at 512 MiB.
+    ///
+    /// # Errors
+    /// Propagates [`otter_gc::ImageError`] from the page restore.
+    pub fn from_isolate_snapshot_capped(
+        snapshot: &IsolateSnapshot,
+        max_heap_bytes: u64,
+    ) -> Result<Self, otter_gc::ImageError> {
+        let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(max_heap_bytes)
+            .expect("GcHeap construction never fails on the default cage");
         object::register_gc_traceables(&mut gc_heap);
         let relocation = gc_heap.restore_old_space(&snapshot.image)?;
 

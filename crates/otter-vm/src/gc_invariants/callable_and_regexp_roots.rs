@@ -82,7 +82,7 @@ fn native_function_captures_root_gc_values_when_rooted() {
     let Some(native) = rooted.as_native_function() else {
         panic!("expected native value after force_gc");
     };
-    assert_eq!(native.name(interp.gc_heap()), "capture-root");
+    assert_eq!(native.name_string(interp.gc_heap()), "capture-root");
     let captures = native_function_captures(native, interp.gc_heap());
     assert!(
         captures.first().is_some_and(|v| v.is_object()),

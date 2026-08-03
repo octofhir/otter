@@ -2,10 +2,10 @@
 //!
 //! A bootstrap snapshot restores heap pages verbatim, so every byte it
 //! dumps must survive a process boundary. [`NativeFunctionBody`] does
-//! not: it stores a raw Rust function pointer for static builtins, a
-//! duplicate raw entry address for JIT builtin guards, `Arc` closures
-//! for dynamic natives, and a `&'static str` name pointing into the
-//! binary's rodata. All four differ per build and per process (ASLR).
+//! not: it stores a raw Rust function pointer for static builtins and
+//! `Arc` closures for dynamic natives, both of which differ per build
+//! and per process (ASLR). The display name is a heap-owned string,
+//! so it rides the page dump like any other body field.
 //!
 //! This module counts them honestly — by walking live bodies, not by
 //! grepping declaration sites — so the snapshot design knows exactly
@@ -73,8 +73,8 @@ impl NativeStorageKind {
 /// `NativeFunctionBody::census_facts`.
 #[derive(Debug, Clone, Copy)]
 pub struct NativeBodyFacts {
-    /// Display name — a `&'static str` into the binary's rodata.
-    pub name: &'static str,
+    /// Display name — the body's heap-owned string.
+    pub name: crate::string::JsString,
     /// Storage bucket.
     pub kind: NativeStorageKind,
     /// Raw entry address for [`NativeStorageKind::Static`] bodies.
@@ -90,7 +90,7 @@ pub struct NativeBodyFacts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynamicNativeRow {
     /// Display name the restore path would re-install under.
-    pub name: &'static str,
+    pub name: String,
     /// Which closure storage the body uses.
     pub kind: NativeStorageKind,
     /// Live bodies sharing this name and kind.
@@ -201,7 +201,7 @@ pub fn native_census(heap: &GcHeap) -> NativeCensus {
         closures: Vec::new(),
     };
     let mut static_addrs: HashSet<usize> = HashSet::new();
-    let mut closures: BTreeMap<(&'static str, NativeStorageKind), u64> = BTreeMap::new();
+    let mut closures: BTreeMap<(String, NativeStorageKind), u64> = BTreeMap::new();
 
     heap.for_each_live_payload::<NativeFunctionBody, _>(|space, body| {
         let facts = body.census_facts();
@@ -223,7 +223,9 @@ pub fn native_census(heap: &GcHeap) -> NativeCensus {
             NativeStorageKind::LocalDynamic => census.local_dynamic_count += 1,
         }
         if facts.kind.needs_reinstall() {
-            *closures.entry((facts.name, facts.kind)).or_default() += 1;
+            *closures
+                .entry((facts.name.to_lossy_string(heap), facts.kind))
+                .or_default() += 1;
         }
         if facts.native_ref != otter_gc::NO_EXTERNAL_REF {
             census.native_ref_count += 1;

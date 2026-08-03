@@ -1200,7 +1200,7 @@ fn make_thrower(ctx: &mut NativeCtx<'_>, reason: Value) -> Result<Value, NativeE
 fn is_builtin_promise_constructor(interp: &Interpreter, constructor: &Value) -> bool {
     constructor
         .as_native_function()
-        .is_some_and(|native| native.name(interp.gc_heap()) == "Promise")
+        .is_some_and(|native| native.name_is(interp.gc_heap(), "Promise"))
 }
 
 fn builtin_promise_constructor(interp: &Interpreter) -> Result<Value, NativeError> {

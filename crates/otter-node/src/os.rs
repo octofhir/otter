@@ -249,7 +249,7 @@ fn os_method_to_primitive(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
     let Some(native) = this.as_native_function() else {
         return string_value(ctx, "");
     };
-    match native.name(ctx.heap()) {
+    match native.name_string(ctx.heap()).as_str() {
         "arch" => os_arch(ctx, &[]),
         "platform" => os_platform(ctx, &[]),
         "machine" => os_machine(ctx, &[]),

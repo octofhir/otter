@@ -1042,7 +1042,7 @@ impl Interpreter {
                         strict,
                         format!(
                             "Cannot assign to read-only property '{name}' of function {}",
-                            native.name(&self.gc_heap)
+                            native.name_string(&self.gc_heap)
                         ),
                     )?;
                     None
@@ -1058,7 +1058,7 @@ impl Interpreter {
                                 strict,
                                 format!(
                                     "Cannot assign to read-only property '{name}' of function {}",
-                                    native.name(&self.gc_heap)
+                                    native.name_string(&self.gc_heap)
                                 ),
                             )?;
                         }
@@ -1078,7 +1078,7 @@ impl Interpreter {
                                     strict,
                                     format!(
                                         "Cannot define property '{name}' on function {}",
-                                        native.name(&self.gc_heap)
+                                        native.name_string(&self.gc_heap)
                                     ),
                                 )?;
                             }
@@ -1095,7 +1095,7 @@ impl Interpreter {
                             strict,
                             format!(
                                 "Cannot define property '{name}' on function {}",
-                                native.name(&self.gc_heap)
+                                native.name_string(&self.gc_heap)
                             ),
                         )?;
                     }

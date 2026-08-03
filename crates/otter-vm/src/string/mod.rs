@@ -526,6 +526,20 @@ impl JsString {
         gc_body::equals_string_bodies(heap, self.handle, other.handle)
     }
 
+    /// Content equality against a Rust string, without allocating.
+    /// Code-unit comparison: `s` is transcoded to UTF-16 on the fly,
+    /// so non-ASCII literals compare correctly too.
+    #[must_use]
+    pub fn eq_str(self, s: &str, heap: &GcHeap) -> bool {
+        if (self.cached_len as usize) > s.len() {
+            // A UTF-16 unit never encodes from more than one UTF-8
+            // byte's worth of `s`, so more units than bytes can never
+            // match. Cheap reject before the body walk.
+            return false;
+        }
+        self.with_utf16(heap, |units| units.iter().copied().eq(s.encode_utf16()))
+    }
+
     /// Find `needle` starting at code-unit `from`. Returns the match
     /// position or `None`.
     ///

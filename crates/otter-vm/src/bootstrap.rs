@@ -674,8 +674,12 @@ mod tests {
         // `SmallVec` spill; a symbol-property table (well-known symbols
         // installed on prototypes) and a slot-meta table (materialized
         // per-slot attributes) each replaced a sidecar `Vec`.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 2620;
-        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 560 * 1024;
+        // Every native callable also allocates its display name as a
+        // heap string: a `&'static str` is a rodata address that could
+        // never survive a page dump, so the name must live in the heap
+        // for the bootstrap snapshot to carry it.
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 3430;
+        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 600 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");
         let well_known = crate::symbol::WellKnownSymbols::new(&mut heap).expect("well-known");

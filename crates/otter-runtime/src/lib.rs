@@ -2257,6 +2257,72 @@ impl Runtime {
         Self::from_config_with_task_spawner(config, None)
     }
 
+    /// Assemble a runtime around an isolate restored from `snapshot`,
+    /// skipping the bootstrap and every surface installer: the image
+    /// carries the fully-built realm, including the extension globals
+    /// and the dynamic natives the installers would have created.
+    ///
+    /// In-process only — see
+    /// [`otter_vm::Interpreter::from_isolate_snapshot`].
+    ///
+    /// # Errors
+    /// Propagates config validation and image-restore failures.
+    pub fn from_isolate_snapshot(
+        snapshot: &otter_vm::snapshot::IsolateSnapshot,
+    ) -> Result<Self, OtterError> {
+        let config = RuntimeConfig::default();
+        Self::validate_config(&config)?;
+        let module_loader = RuntimeModuleLoaderState::new(config.loader.clone());
+        let package_manager =
+            RuntimePackageManagerHandle::from_loader_config(config.loader.as_ref());
+        let mut interp =
+            Interpreter::from_isolate_snapshot(snapshot).map_err(|err| OtterError::Internal {
+                code: DiagnosticCode::IsolateStart.as_str().to_string(),
+                message: format!("snapshot restore failed: {err}"),
+            })?;
+        interp.set_max_stack_depth(config.max_stack_depth);
+        interp.set_allow_blocking_atomics_wait(config.allow_blocking_atomics_wait);
+        interp.set_console_sink(config.console_sink.clone());
+        if let Some(hook) = config.promise_rejection_hook.clone() {
+            interp.set_promise_rejection_hook(hook);
+        }
+        let layer_a_dynamic_imports = LayerADynamicImportQueue::default();
+        if let Some(threshold) = config.jit_osr_threshold {
+            interp.set_jit_osr_threshold(threshold);
+        }
+        match config.jit_selection {
+            JitSelection::ProductionTiered => {
+                interp.set_jit_compiler(Some(std::sync::Arc::new(
+                    otter_jit::OtterJitCompiler::production_tiered(),
+                )));
+            }
+            JitSelection::Template => {
+                interp.set_jit_compiler(Some(std::sync::Arc::new(
+                    otter_jit::OtterJitCompiler::template_only(),
+                )));
+            }
+            JitSelection::InterpreterOnly => {}
+        }
+        interp.set_dynamic_import_loader(std::sync::Arc::new(LayerADynamicImportLoader {
+            queue: layer_a_dynamic_imports.clone(),
+        }));
+        Ok(Runtime {
+            interp,
+            realm_owner_id: realm::next_realm_owner_id(),
+            config,
+            enforce_direct_timeout: true,
+            module_loader,
+            module_graph: RuntimeModuleGraphState::default(),
+            module_records: module_records::RuntimeModuleRecords::default(),
+            source_maps: RuntimeSourceMapTable::default(),
+            diagnostics: RuntimeDiagnosticsSink::default(),
+            package_manager,
+            layer_a_dynamic_imports,
+            promise_registry: promise_registry::PromiseRegistry::new(),
+            runtime_task_spawner: None,
+        })
+    }
+
     pub(crate) fn from_config_with_task_spawner(
         config: RuntimeConfig,
         runtime_task_spawner: Option<RuntimeTaskSpawner>,

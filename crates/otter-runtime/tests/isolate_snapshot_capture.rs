@@ -79,3 +79,73 @@ fn restore_round_trips_in_process() {
         .expect("Object survives a full GC");
     assert!(after.is_object_type());
 }
+
+#[test]
+fn restored_runtime_evaluates_javascript() {
+    let source = full_surface_runtime();
+    let snapshot = source.capture_isolate_snapshot().expect("capture");
+    let mut restored =
+        otter_runtime::Runtime::from_isolate_snapshot(&snapshot).expect("runtime restore");
+
+    let result = restored
+        .eval(otter_runtime::SourceInput::from_javascript("1 + 1"))
+        .expect("eval on restored runtime");
+    assert_eq!(result.completion_string(), "2");
+
+    let json = restored
+        .eval(otter_runtime::SourceInput::from_javascript(
+            "JSON.stringify({restored: [1, 2, 3], re: /a+/.test('caaat')})",
+        ))
+        .expect("JSON + RegExp on restored runtime");
+    assert_eq!(
+        json.completion_string(),
+        r#"{"restored":[1,2,3],"re":true}"#
+    );
+
+    let steps: &[(&str, &str, &str)] = &[
+        ("plain method", "({ tag() { return 'ok' } }).tag()", "ok"),
+        ("map ctor", "new Map([[1,2]]).size.toString()", "1"),
+        (
+            "plain class",
+            "class P { tag() { return 'ok' } } new P().tag()",
+            "ok",
+        ),
+        (
+            "extends proto wiring",
+            "class E1 extends Map {}; (Object.getPrototypeOf(E1) === Map).toString()",
+            "true",
+        ),
+        (
+            "extends construct",
+            "class E2 extends Map {}; (new E2() instanceof Map).toString()",
+            "true",
+        ),
+        (
+            "reflect construct",
+            "Reflect.construct(Map, [], Map).size.toString()",
+            "0",
+        ),
+        (
+            "extends object with method",
+            "class E3 extends Object { tag() { return 'ok' } } new E3().tag()",
+            "ok",
+        ),
+        (
+            "subclass instance canonical getter",
+            "class Q8 extends Map {} new Q8().size.toString()",
+            "0",
+        ),
+        // NOT probed: an own method on a Map-subclass instance
+        // (`class Q extends Map { tag() {} } new Q().tag()`). The
+        // collection [[Get]] ladder resolves the prototype by
+        // constructor name and ignores the per-instance override, so
+        // the probe fails identically on an ordinarily-built isolate —
+        // a pre-existing engine gap, not a restore defect.
+    ];
+    for (name, source, expected) in steps {
+        let got = restored
+            .eval(otter_runtime::SourceInput::from_javascript(*source))
+            .unwrap_or_else(|err| panic!("{name} failed: {err}"));
+        assert_eq!(got.completion_string(), *expected, "{name}");
+    }
+}

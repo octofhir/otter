@@ -188,6 +188,18 @@ pub struct TestResult {
     pub wall_ms: u64,
 }
 
+/// Per-worker donor image for snapshot-per-test isolation. `Rc`
+/// because the worker loop is single-threaded and clones per
+/// [`ExecConfig`]; the image itself is immutable after capture.
+#[derive(Clone)]
+pub struct SharedSnapshot(pub std::rc::Rc<otter_vm::snapshot::IsolateSnapshot>);
+
+impl std::fmt::Debug for SharedSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedSnapshot(..)")
+    }
+}
+
 /// Configuration shared across all `run_one` calls in a sweep.
 #[derive(Debug, Clone)]
 pub struct ExecConfig {
@@ -199,6 +211,9 @@ pub struct ExecConfig {
     pub config: Test262Config,
     /// Execution tiers installed in every per-test runtime.
     pub jit_selection: otter_runtime::JitSelection,
+    /// When set, per-test runtimes restore from this donor image
+    /// instead of bootstrapping from scratch.
+    pub snapshot: Option<SharedSnapshot>,
 }
 
 impl ExecConfig {
@@ -457,6 +472,29 @@ pub fn run_one(
     result_with(rel_path, esid, features, mapped, start)
 }
 
+/// Build the per-test runtime: restore from the worker's donor
+/// snapshot when one is configured, else bootstrap from scratch.
+fn per_test_runtime(
+    exec: &ExecConfig,
+    allow_blocking_atomics_wait: bool,
+) -> Result<Runtime, otter_runtime::OtterError> {
+    match &exec.snapshot {
+        Some(snapshot) => crate::isolation::snapshot_runtime(
+            &snapshot.0,
+            exec.timeout,
+            exec.max_heap_bytes,
+            allow_blocking_atomics_wait,
+            exec.jit_selection,
+        ),
+        None => fresh_runtime(
+            exec.timeout,
+            exec.max_heap_bytes,
+            allow_blocking_atomics_wait,
+            exec.jit_selection,
+        ),
+    }
+}
+
 fn run_script_with_fresh_runtime(
     exec: &ExecConfig,
     allow_blocking_atomics_wait: bool,
@@ -466,12 +504,7 @@ fn run_script_with_fresh_runtime(
     test_path: &Path,
     stage_on_disk: bool,
 ) -> Outcome {
-    let mut runtime = match fresh_runtime(
-        exec.timeout,
-        exec.max_heap_bytes,
-        allow_blocking_atomics_wait,
-        exec.jit_selection,
-    ) {
+    let mut runtime = match per_test_runtime(exec, allow_blocking_atomics_wait) {
         Ok(rt) => rt,
         Err(err) => {
             return Outcome::Crash {
@@ -516,12 +549,7 @@ fn run_module_with_fresh_runtime(
     body: &str,
     test_path: &Path,
 ) -> Outcome {
-    let mut runtime = match fresh_runtime(
-        exec.timeout,
-        exec.max_heap_bytes,
-        allow_blocking_atomics_wait,
-        exec.jit_selection,
-    ) {
+    let mut runtime = match per_test_runtime(exec, allow_blocking_atomics_wait) {
         Ok(rt) => rt,
         Err(err) => {
             return Outcome::Crash {

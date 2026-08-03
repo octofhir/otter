@@ -1500,6 +1500,66 @@ impl std::fmt::Debug for TracerFactory {
     }
 }
 
+/// The one eval/`new Function` compile path every isolate shares.
+/// The closure is reusable across calls; each invocation builds a
+/// fresh `BytecodeModule`.
+fn standard_eval_hook() -> otter_vm::EvalHook {
+    std::sync::Arc::new(|source: &str, options: EvalCompileOptions| {
+        // §16.1.6 ScriptEvaluation — host-requested script
+        // execution ($262.evalScript) compiles under script
+        // GDI semantics, not eval semantics.
+        if options.script_goal {
+            return otter_compiler::compile_script_source(
+                source,
+                SourceKind::JavaScript,
+                "<evalScript>",
+            )
+            .map_err(|e| format!("compile error: {e:?}"));
+        }
+        // §19.2.1.3 — a direct eval inside a function carries
+        // its caller variable environment binding list.
+        let caller_scope: Option<Vec<otter_compiler::EvalCallerBinding>> =
+            options.caller_scope.map(|bindings| {
+                bindings
+                    .into_iter()
+                    .map(|binding| otter_compiler::EvalCallerBinding {
+                        name: binding.name,
+                        lexical: binding.lexical,
+                        captured: binding.captured,
+                        is_const: binding.is_const,
+                        fn_self_name: binding.fn_self_name,
+                    })
+                    .collect()
+            });
+        otter_compiler::compile_eval_source(
+            source,
+            SourceKind::JavaScript,
+            "<eval>",
+            options.force_strict,
+            options.forbid_var_arguments,
+            caller_scope.as_deref(),
+            options.new_target_allowed,
+            options.in_class_field_initializer,
+            options.super_property_allowed,
+        )
+        .map_err(|e| format!("compile error: {e:?}"))
+    })
+}
+
+/// The per-isolate knobs [`Runtime::from_isolate_snapshot_with`]
+/// honors; everything else about the realm rides the image.
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotRuntimeOptions {
+    /// Per-run wall-clock timeout; `Duration::ZERO` disables it.
+    pub timeout: Duration,
+    /// Heap cap in bytes; `0` disables the cap.
+    pub max_heap_bytes: u64,
+    /// Whether `Atomics.wait` may block this isolate's thread.
+    pub allow_blocking_atomics_wait: bool,
+    /// JIT tier selection.
+    pub jit_selection: JitSelection,
+}
+
 /// Runtime configuration.
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeConfig {
@@ -2270,19 +2330,41 @@ impl Runtime {
     pub fn from_isolate_snapshot(
         snapshot: &otter_vm::snapshot::IsolateSnapshot,
     ) -> Result<Self, OtterError> {
-        let config = RuntimeConfig::default();
+        Self::from_isolate_snapshot_with(snapshot, SnapshotRuntimeOptions::default())
+    }
+
+    /// [`Self::from_isolate_snapshot`] with the per-isolate knobs a
+    /// host actually varies per run — everything else about the realm
+    /// is already inside the image.
+    ///
+    /// # Errors
+    /// Propagates config validation and image-restore failures.
+    pub fn from_isolate_snapshot_with(
+        snapshot: &otter_vm::snapshot::IsolateSnapshot,
+        options: SnapshotRuntimeOptions,
+    ) -> Result<Self, OtterError> {
+        let config = RuntimeConfig {
+            timeout: options.timeout,
+            max_heap_bytes: options.max_heap_bytes,
+            allow_blocking_atomics_wait: options.allow_blocking_atomics_wait,
+            jit_selection: options.jit_selection,
+            ..RuntimeConfig::default()
+        };
         Self::validate_config(&config)?;
         let module_loader = RuntimeModuleLoaderState::new(config.loader.clone());
         let package_manager =
             RuntimePackageManagerHandle::from_loader_config(config.loader.as_ref());
-        let mut interp =
-            Interpreter::from_isolate_snapshot(snapshot).map_err(|err| OtterError::Internal {
+        let mut interp = Interpreter::from_isolate_snapshot_capped(snapshot, config.max_heap_bytes)
+            .map_err(|err| OtterError::Internal {
                 code: DiagnosticCode::IsolateStart.as_str().to_string(),
                 message: format!("snapshot restore failed: {err}"),
             })?;
         interp.set_max_stack_depth(config.max_stack_depth);
         interp.set_allow_blocking_atomics_wait(config.allow_blocking_atomics_wait);
         interp.set_console_sink(config.console_sink.clone());
+        // §19.4.1 / §20.2.1.1 — the eval hook is host machinery, not
+        // heap state, so a restored isolate wires it fresh.
+        interp.set_eval_hook(Some(standard_eval_hook()));
         if let Some(hook) = config.promise_rejection_hook.clone() {
             interp.set_promise_rejection_hook(hook);
         }
@@ -2476,50 +2558,7 @@ impl Runtime {
                     }
                     // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /
                     // `new Function(...)` reach a real parse + compile path.
-                    // The closure is reusable across calls; each invocation
-                    // builds a fresh `BytecodeModule`.
-                    let hook: otter_vm::EvalHook =
-                        std::sync::Arc::new(|source: &str, options: EvalCompileOptions| {
-                            // §16.1.6 ScriptEvaluation — host-requested script
-                            // execution ($262.evalScript) compiles under script
-                            // GDI semantics, not eval semantics.
-                            if options.script_goal {
-                                return otter_compiler::compile_script_source(
-                                    source,
-                                    SourceKind::JavaScript,
-                                    "<evalScript>",
-                                )
-                                .map_err(|e| format!("compile error: {e:?}"));
-                            }
-                            // §19.2.1.3 — a direct eval inside a function carries
-                            // its caller variable environment binding list.
-                            let caller_scope: Option<Vec<otter_compiler::EvalCallerBinding>> =
-                                options.caller_scope.map(|bindings| {
-                                    bindings
-                                        .into_iter()
-                                        .map(|binding| otter_compiler::EvalCallerBinding {
-                                            name: binding.name,
-                                            lexical: binding.lexical,
-                                            captured: binding.captured,
-                                            is_const: binding.is_const,
-                                            fn_self_name: binding.fn_self_name,
-                                        })
-                                        .collect()
-                                });
-                            otter_compiler::compile_eval_source(
-                                source,
-                                SourceKind::JavaScript,
-                                "<eval>",
-                                options.force_strict,
-                                options.forbid_var_arguments,
-                                caller_scope.as_deref(),
-                                options.new_target_allowed,
-                                options.in_class_field_initializer,
-                                options.super_property_allowed,
-                            )
-                            .map_err(|e| format!("compile error: {e:?}"))
-                        });
-                    interp.set_eval_hook(Some(hook));
+                    interp.set_eval_hook(Some(standard_eval_hook()));
                     // Functions start in the interpreter and tier up through the
                     // explicitly configured compiler policy.
                     interp.set_jit_debug_request(config.jit_debug);

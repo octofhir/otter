@@ -135,6 +135,22 @@ fn restored_runtime_evaluates_javascript() {
             "class Q8 extends Map {} new Q8().size.toString()",
             "0",
         ),
+        ("eval hook", "eval('2 + 3').toString()", "5"),
+        (
+            "dynamic Function",
+            "new Function('return \"fn-ok\"')()",
+            "fn-ok",
+        ),
+        (
+            "resizable ArrayBuffer",
+            "const ab = new ArrayBuffer(8, {maxByteLength: 16}); ab.resize(16); ab.byteLength.toString()",
+            "16",
+        ),
+        (
+            "length-tracking TypedArray",
+            "const ab2 = new ArrayBuffer(8, {maxByteLength: 16}); const ta = new Uint8Array(ab2); ab2.resize(12); ta.length.toString()",
+            "12",
+        ),
         // NOT probed: an own method on a Map-subclass instance
         // (`class Q extends Map { tag() {} } new Q().tag()`). The
         // collection [[Get]] ladder resolves the prototype by
@@ -167,8 +183,7 @@ fn restore_is_cheaper_than_bootstrap() {
 
     let restore_started = Instant::now();
     for _ in 0..ROUNDS {
-        let runtime =
-            otter_runtime::Runtime::from_isolate_snapshot(&snapshot).expect("restore");
+        let runtime = otter_runtime::Runtime::from_isolate_snapshot(&snapshot).expect("restore");
         std::hint::black_box(&runtime);
     }
     let restore = restore_started.elapsed() / ROUNDS;

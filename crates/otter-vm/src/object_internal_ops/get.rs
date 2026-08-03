@@ -748,16 +748,24 @@ impl Interpreter {
                     object::PropertyLookup::Absent => {}
                 }
             }
-            let proto_name = if base.is_map() {
-                "Map"
-            } else if base.is_set() {
-                "Set"
-            } else if base.is_weak_map() {
-                "WeakMap"
-            } else {
-                "WeakSet"
+            // §10.1.8 — a subclass instance carries its constructor's
+            // `prototype` as a per-instance override; walk *that*
+            // chain, falling back to the canonical realm prototype.
+            let proto = match self.collection_prototype_override_value(&base) {
+                Some(proto) => proto,
+                None => {
+                    let proto_name = if base.is_map() {
+                        "Map"
+                    } else if base.is_set() {
+                        "Set"
+                    } else if base.is_weak_map() {
+                        "WeakMap"
+                    } else {
+                        "WeakSet"
+                    };
+                    self.constructor_prototype_value(proto_name)?
+                }
             };
-            let proto = self.constructor_prototype_value(proto_name)?;
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }

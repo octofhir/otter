@@ -478,6 +478,31 @@ impl Interpreter {
             &self.global_this as *const crate::object::JsObject as *mut otter_gc::raw::RawGc;
         visitor(global);
         self.realm_intrinsics.visit_slots(visitor);
+        // The well-known symbol set is fixed by the spec, so its entry
+        // order is identical on every isolate.
+        for symbol in self.well_known_symbols.entries() {
+            symbol.trace_value_slots(visitor);
+        }
+        // The shape runtime's side tables are caches a restore rebuilds
+        // from the heap; the root shape is the one authoritative handle.
+        self.shape_runtime.visit_root_slot(visitor);
+    }
+
+    /// The property-name atom table, in id order. Restoring the list
+    /// through the interner re-mints identical atom ids.
+    #[must_use]
+    pub fn snapshot_atom_names(&self) -> Vec<Box<str>> {
+        self.names.snapshot_names()
+    }
+
+    /// Global lexical bindings: name, cell, `is_const`. Unordered; the
+    /// snapshot layer sorts.
+    #[must_use]
+    pub fn snapshot_global_lexicals(&self) -> Vec<(Box<str>, crate::UpvalueCell, bool)> {
+        self.global_lexicals
+            .iter()
+            .map(|(name, (cell, is_const))| (name.clone(), *cell, *is_const))
+            .collect()
     }
 
     /// Collect the snapshot root slots in walk order.

@@ -158,6 +158,12 @@ impl ShapeRuntime {
         self.root.set(ShapeHandle::null());
     }
 
+    /// Yield the root shape's cell slot for the snapshot root walk. The
+    /// other side tables are caches a restore rebuilds from the heap.
+    pub(crate) fn visit_root_slot(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        visitor(self.root.as_ptr() as *mut RawGc);
+    }
+
     /// Yield every GC handle stored in side tables as a mutable root slot.
     pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
         if !self.root.get().is_null() {

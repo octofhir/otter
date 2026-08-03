@@ -4004,6 +4004,17 @@ impl Runtime {
         self.interp.capture_snapshot_roots()
     }
 
+    /// Capture everything a restore needs from this isolate. See
+    /// [`otter_vm::snapshot::IsolateSnapshot`].
+    ///
+    /// # Errors
+    /// Propagates [`otter_gc::ImageError`].
+    pub fn capture_isolate_snapshot(
+        &self,
+    ) -> Result<otter_vm::snapshot::IsolateSnapshot, otter_gc::ImageError> {
+        self.interp.capture_isolate_snapshot()
+    }
+
     /// This realm's `globalThis` as a GC handle, for callers that need
     /// the object identity rather than a JS value.
     #[must_use]

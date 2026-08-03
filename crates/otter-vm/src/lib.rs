@@ -194,6 +194,7 @@ pub mod runtime_budget;
 pub mod runtime_cx;
 pub mod runtime_state;
 pub mod runtime_stubs;
+pub mod snapshot;
 pub mod source_registry;
 mod static_call_ops;
 mod static_load_ops;

@@ -327,7 +327,7 @@ impl Interpreter {
     /// constructor and the snapshot restore path: populate the typed
     /// intrinsic slots from the global graph, build the per-kind
     /// iterator prototypes, and install the function-kind prototypes.
-    fn prime_realm_caches(&mut self) {
+    pub(crate) fn prime_realm_caches(&mut self) {
         let interp = self;
         let global_this = interp.global_this;
         // Cache typed handles for the well-known constructors and
@@ -1251,5 +1251,5 @@ impl Interpreter {
     /// Back-edge count at which a hot loop tiers up via OSR. Higher than the
     /// call-count threshold: a loop iterating this many times amortizes the
     /// compile cost many times over, while short loops never pay it.
-    const JIT_OSR_THRESHOLD: u32 = 1000;
+    pub(crate) const JIT_OSR_THRESHOLD: u32 = 1000;
 }

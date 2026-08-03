@@ -53,3 +53,29 @@ fn capture_is_structurally_deterministic() {
         snap_a.image.object_count()
     );
 }
+
+#[test]
+fn restore_round_trips_in_process() {
+    let source = full_surface_runtime();
+    let snapshot = source.capture_isolate_snapshot().expect("capture");
+    let mut restored = otter_vm::Interpreter::from_isolate_snapshot(&snapshot).expect("restore");
+
+    // The restored global graph resolves the same intrinsics.
+    let global = *restored.global_this();
+    let object_ctor = otter_vm::object::get(global, restored.gc_heap(), "Object")
+        .expect("restored global has Object");
+    assert!(
+        object_ctor.is_object_type(),
+        "Object constructor survived the round trip"
+    );
+    let json = otter_vm::object::get(global, restored.gc_heap(), "JSON")
+        .expect("restored global has JSON");
+    assert!(json.is_object_type());
+
+    // A full collection over the restored heap must find a consistent
+    // graph: every reachable slot relocated, nothing double-owned.
+    restored.force_gc().expect("full GC over restored heap");
+    let after = otter_vm::object::get(global, restored.gc_heap(), "Object")
+        .expect("Object survives a full GC");
+    assert!(after.is_object_type());
+}

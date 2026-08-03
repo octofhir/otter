@@ -493,6 +493,13 @@ impl Interpreter {
         self.shape_runtime.visit_root_slot(visitor);
     }
 
+    /// Shared handle to this isolate's code space, for the in-process
+    /// snapshot.
+    #[must_use]
+    pub(crate) fn snapshot_code_space(&self) -> std::sync::Arc<crate::code_space::CodeSpace> {
+        self.code_space.clone()
+    }
+
     /// The property-name atom table, in id order. Restoring the list
     /// through the interner re-mints identical atom ids.
     #[must_use]

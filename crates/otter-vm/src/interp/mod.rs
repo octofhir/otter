@@ -15,6 +15,7 @@ mod jit_call;
 mod jit_compile;
 mod modules;
 mod protos;
+mod restore;
 mod shapes;
 mod stats;
 #[cfg(test)]

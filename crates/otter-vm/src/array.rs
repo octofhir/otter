@@ -394,6 +394,35 @@ fn trace_array_symbol_accessors(
     }
 }
 
+impl ArrayExoticSlots {
+    /// Sever foreign ownership after a snapshot restore: every
+    /// container is re-read out of the aliased storage into a fresh
+    /// allocation and written back without dropping the alias.
+    pub(crate) fn sever_after_restore(&mut self) {
+        let sparse = self.sparse_elements.clone();
+        let named = self.named_properties.clone();
+        let accessors = self.accessors.clone();
+        let flags = self.property_flags.clone();
+        let symbol_properties = self.symbol_properties.clone();
+        let symbol_accessors = self.symbol_accessors.clone();
+        let source_bytes = self
+            .source_bytes
+            .as_ref()
+            .map(|bytes| std::sync::Arc::from(bytes.as_ref().to_vec().into_boxed_slice()));
+        // SAFETY: overwriting without dropping severs the alias; the
+        // capture isolate remains the owner.
+        unsafe {
+            std::ptr::write(&mut self.sparse_elements, sparse);
+            std::ptr::write(&mut self.named_properties, named);
+            std::ptr::write(&mut self.accessors, accessors);
+            std::ptr::write(&mut self.property_flags, flags);
+            std::ptr::write(&mut self.symbol_properties, symbol_properties);
+            std::ptr::write(&mut self.symbol_accessors, symbol_accessors);
+            std::ptr::write(&mut self.source_bytes, source_bytes);
+        }
+    }
+}
+
 impl otter_gc::SafeTraceable for ArrayExoticSlots {
     const TYPE_TAG: u8 = ARRAY_EXOTIC_SLOTS_TYPE_TAG;
 

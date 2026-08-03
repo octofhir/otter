@@ -68,7 +68,7 @@ pub type NativeFn = dyn for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> 
     + Send
     + Sync;
 
-type LocalNativeFn =
+pub(crate) type LocalNativeFn =
     dyn for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>;
 
 #[derive(Debug, Clone)]
@@ -306,24 +306,44 @@ impl NativeFunctionBody {
 /// are both `Arc`s that clone by reference count. A cross-process
 /// restore replaces this wholesale with the re-install-by-name list.
 pub fn clone_host_refs_for_restore(source: &otter_gc::GcHeap, target: &mut otter_gc::GcHeap) {
-    let cloned: Vec<(u32, Box<dyn std::any::Any>)> = source
-        .host_refs()
+    for (index, payload) in snapshot_dynamic_natives(source) {
+        install_dynamic_native(target, index, &payload);
+    }
+}
+
+/// Collect the dynamic-native closures of `heap`'s host-ref table for
+/// the in-process snapshot, Arc-cloned at their indices.
+pub(crate) fn snapshot_dynamic_natives(
+    heap: &otter_gc::GcHeap,
+) -> Vec<(u32, crate::snapshot::DynamicNativePayload)> {
+    use crate::snapshot::DynamicNativePayload;
+    heap.host_refs()
         .entries()
         .map(|(index, payload)| {
-            let clone: Box<dyn std::any::Any> =
-                if let Some(shared) = payload.downcast_ref::<Arc<NativeFn>>() {
-                    Box::new(shared.clone())
-                } else if let Some(local) = payload.downcast_ref::<Arc<LocalNativeFn>>() {
-                    Box::new(local.clone())
-                } else {
-                    unreachable!("host-ref table holds only dynamic-native closures")
-                };
+            let clone = if let Some(shared) = payload.downcast_ref::<Arc<NativeFn>>() {
+                DynamicNativePayload::Shared(shared.clone())
+            } else if let Some(local) = payload.downcast_ref::<Arc<LocalNativeFn>>() {
+                DynamicNativePayload::Local(local.clone())
+            } else {
+                unreachable!("host-ref table holds only dynamic-native closures")
+            };
             (index, clone)
         })
-        .collect();
-    for (index, payload) in cloned {
-        target.host_refs_mut().insert_at(index, payload);
-    }
+        .collect()
+}
+
+/// Install one snapshot-carried closure at its captured index.
+pub(crate) fn install_dynamic_native(
+    heap: &mut otter_gc::GcHeap,
+    index: u32,
+    payload: &crate::snapshot::DynamicNativePayload,
+) {
+    use crate::snapshot::DynamicNativePayload;
+    let boxed: Box<dyn std::any::Any> = match payload {
+        DynamicNativePayload::Shared(shared) => Box::new(shared.clone()),
+        DynamicNativePayload::Local(local) => Box::new(local.clone()),
+    };
+    heap.host_refs_mut().insert_at(index, boxed);
 }
 
 impl otter_gc::trace::ReleaseHostRefs for NativeFunctionBody {

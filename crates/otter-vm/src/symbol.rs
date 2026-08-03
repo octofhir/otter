@@ -185,6 +185,33 @@ impl JsSymbol {
     /// # Errors
     ///
     /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+    /// A shell whose body handle the snapshot root walk fills in. The
+    /// well-known tag is spec-fixed; the description cache is re-read
+    /// from the restored body by [`Self::refresh_from_body`].
+    #[must_use]
+    pub(crate) fn restored_shell(tag: WellKnown) -> Self {
+        Self {
+            inner: SymbolHandle::null(),
+            description: None,
+            well_known: Some(tag),
+            registered: false,
+            private_name: false,
+        }
+    }
+
+    /// Re-read the wrapper-side caches from the (restored) body.
+    pub(crate) fn refresh_from_body(&mut self, heap: &otter_gc::GcHeap) {
+        if self.inner.is_null() {
+            return;
+        }
+        self.description = heap.read_payload(self.inner, |body| body.description);
+    }
+
+    /// Allocate a well-known symbol's body with its spec tag and
+    /// description.
+    ///
+    /// # Errors
+    /// Propagates [`otter_gc::OutOfMemory`].
     pub fn well_known(
         heap: &mut otter_gc::GcHeap,
         tag: WellKnown,
@@ -484,6 +511,28 @@ pub struct WellKnownSymbols {
 }
 
 impl WellKnownSymbols {
+    /// A shell for the snapshot restore path: one entry per spec tag,
+    /// in [`WellKnown::all`] order, each holding a null body handle.
+    /// The snapshot root walk writes the restored handles through
+    /// [`JsSymbol::visit_handle_slot`]; call
+    /// [`Self::refresh_from_bodies`] afterwards to re-read the
+    /// wrapper-side caches from the restored bodies.
+    #[must_use]
+    pub(crate) fn restored_shell() -> Self {
+        let entries = WellKnown::all()
+            .iter()
+            .map(|tag| JsSymbol::restored_shell(*tag))
+            .collect();
+        Self { entries }
+    }
+
+    /// Re-read each wrapper's description cache from its restored body.
+    pub(crate) fn refresh_from_bodies(&mut self, heap: &otter_gc::GcHeap) {
+        for symbol in &mut self.entries {
+            symbol.refresh_from_body(heap);
+        }
+    }
+
     /// Allocate every well-known symbol with its spec-mandated
     /// description text. Each entry's [`SymbolBody`] lives on the GC
     /// heap; root tracing keeps them alive across collections.

@@ -89,6 +89,12 @@ pub enum ImageError {
     },
     /// The cage could not supply the pages the image needs.
     OutOfMemory(OutOfMemory),
+    /// A live body carries foreign-owned content the snapshot format
+    /// does not serialize; capturing would silently drop it.
+    ForeignPayloadNotSerializable {
+        /// The offending body type.
+        type_name: &'static str,
+    },
 }
 
 impl std::fmt::Display for ImageError {
@@ -110,6 +116,12 @@ impl std::fmt::Display for ImageError {
                 write!(f, "image body has unregistered type tag {type_tag:#04x}")
             }
             Self::OutOfMemory(err) => write!(f, "cage could not back the image: {err}"),
+            Self::ForeignPayloadNotSerializable { type_name } => {
+                write!(
+                    f,
+                    "a live `{type_name}` holds content the snapshot cannot carry"
+                )
+            }
         }
     }
 }
@@ -440,10 +452,39 @@ impl GcHeap {
         };
         relocation.pages.sort_by_key(|(from, _)| *from);
 
-        // 2) Rewrite every pointer slot in the restored objects. Done
-        // before the pages are adopted so a failure leaves the heap
-        // untouched and the pages simply drop back to the cage.
+        // 2) Sever foreign ownership BEFORE the first trace: a body
+        // whose trace impl dereferences capture-process pointers (a
+        // host-data vtable, a malloc'd table) would crash the very
+        // relocation walk below. Registered hooks overwrite those
+        // fields with process-local state, without reading them.
+        for (_, page) in &placed {
+            // SAFETY: the copied bytes are a faithful page prefix, so
+            // every header up to `bump_cursor` precedes a payload of
+            // its tag's registered type.
+            unsafe {
+                page.for_each_object(|header, _| {
+                    let tag = (*header).type_tag();
+                    if tag == FREE_TAG {
+                        return;
+                    }
+                    if let Some(sever) = self.trace_table().get_sever_restored(tag) {
+                        sever(header);
+                    }
+                });
+            }
+        }
+
+        // 3) Rewrite every pointer slot in the restored objects, each
+        // slot exactly once. Owners and their backing-store bodies
+        // intentionally trace shared slots, and "is this value already
+        // relocated" is undecidable when the cage reissues a captured
+        // page's offsets to the restore (a dropped donor makes overlap
+        // routine) — so the walk collects slot ADDRESSES, dedupes, and
+        // relocates each survivor once. Done before the pages are
+        // adopted so a failure leaves the heap untouched and the pages
+        // simply drop back to the cage.
         let mut failure: Option<ImageError> = None;
+        let mut slots: Vec<*mut RawGc> = Vec::with_capacity(image.object_count as usize);
         for (_, page) in &placed {
             // SAFETY: the copied bytes are a faithful page prefix, so every
             // header up to `bump_cursor` is one this heap's trace table can
@@ -464,22 +505,7 @@ impl GcHeap {
                         return;
                     };
                     trace(header, &mut |slot: *mut RawGc| {
-                        let old = *slot;
-                        if old.is_null() {
-                            return;
-                        }
-                        match relocation.relocate(old.0) {
-                            Some(new) => *slot = RawGc(new),
-                            None => {
-                                // A slot shared between an owner and its
-                                // backing-store body gets visited twice on
-                                // this walk; the second visit sees the
-                                // already-relocated value and keeps it.
-                                if !relocation.already_relocated(old.0) && failure.is_none() {
-                                    failure = Some(ImageError::DanglingSlot { offset: old.0 });
-                                }
-                            }
-                        }
+                        slots.push(slot);
                     });
                 });
             }
@@ -487,8 +513,49 @@ impl GcHeap {
         if let Some(err) = failure {
             return Err(err);
         }
+        slots.sort_unstable();
+        slots.dedup();
+        for slot in slots {
+            // SAFETY: every collected address names a live slot inside
+            // a placed page; nothing between collection and this write
+            // moved or freed those pages.
+            unsafe {
+                let old = *slot;
+                if old.is_null() {
+                    continue;
+                }
+                // A value outside every captured page is not a handle
+                // this image owns: sentinel encodings (a non-null tag
+                // in an otherwise-pointer slot) pass through verbatim.
+                // The self-containment audit guarantees no genuine
+                // out-of-image pointer survives to this walk.
+                if let Some(new) = relocation.relocate(old.0) {
+                    *slot = RawGc(new);
+                }
+            }
+        }
 
-        // 3) Adopt the pages and account for what they hold.
+        // 3b) Re-run every trace once more, discarding the slots: some
+        // bodies recompute a cached absolute address (a slab's element
+        // pointer, a closure's upvalue base) as a side effect of their
+        // trace impl, and that recomputation must observe the
+        // relocated handles written above.
+        for (_, page) in &placed {
+            // SAFETY: same contract as the collection walk above.
+            unsafe {
+                page.for_each_object(|header, _| {
+                    let tag = (*header).type_tag();
+                    if tag == FREE_TAG {
+                        return;
+                    }
+                    if let Some(trace) = self.trace_table().get(tag) {
+                        trace(header, &mut |_slot: *mut RawGc| {});
+                    }
+                });
+            }
+        }
+
+        // 4) Adopt the pages and account for what they hold.
         for (_, page) in placed {
             self.adopt_restored_old_page(page);
         }

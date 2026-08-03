@@ -255,35 +255,46 @@ impl Interpreter {
             crate::native_function::install_dynamic_native(&mut interp.gc_heap, *index, payload);
         }
 
-        // Sever foreign ownership: the page copy carried malloc pointers
-        // owned by the capture isolate. Each remaining owner type
-        // (the audit's exact remaining list) rebuilds or drops its payload
-        // without dropping the alias.
+        // Rebuild the one payload the page image cannot carry: every
+        // regexp's compiled matcher and pattern text, from the
+        // snapshot's own records. Host-data boxes and array sidecars
+        // were already severed inside the page restore, before the
+        // relocation walk could touch a foreign vtable. The live walk
+        // here visits bodies in the same page order the capture walk
+        // did, so the records zip positionally.
         {
             let heap = &interp.gc_heap;
             let mut regexps: Vec<*mut crate::regexp::JsRegExpBody> = Vec::new();
             heap.for_each_live_payload::<crate::regexp::JsRegExpBody, _>(|_space, body| {
                 regexps.push(body as *const _ as *mut _);
             });
-            let mut sidecars: Vec<*mut object::ExoticSlots> = Vec::new();
-            heap.for_each_live_payload::<object::ExoticSlots, _>(|_space, body| {
-                sidecars.push(body as *const _ as *mut _);
-            });
+            assert_eq!(
+                regexps.len(),
+                snapshot.regexp_payloads.len(),
+                "regexp record count must match the restored bodies"
+            );
             let mut array_sidecars: Vec<*mut crate::array::ArrayExoticSlots> = Vec::new();
             heap.for_each_live_payload::<crate::array::ArrayExoticSlots, _>(|_space, body| {
                 array_sidecars.push(body as *const _ as *mut _);
             });
+            assert_eq!(
+                array_sidecars.len(),
+                snapshot.array_sidecar_flags.len(),
+                "array-sidecar record count must match the restored bodies"
+            );
             // SAFETY: single mutator, no allocation between collect and
             // write; each pointer names a live payload of its type.
             unsafe {
-                for body in regexps {
-                    (*body).sever_after_restore();
+                for (body, (pattern_utf16, source)) in
+                    regexps.into_iter().zip(&snapshot.regexp_payloads)
+                {
+                    (*body).rebuild_after_restore(pattern_utf16, source);
                 }
-                for body in sidecars {
-                    (*body).sever_after_restore();
-                }
-                for body in array_sidecars {
-                    (*body).sever_after_restore();
+                for (body, records) in array_sidecars
+                    .into_iter()
+                    .zip(&snapshot.array_sidecar_flags)
+                {
+                    (*body).restore_property_flags(records);
                 }
             }
         }

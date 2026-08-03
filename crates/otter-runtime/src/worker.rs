@@ -146,13 +146,13 @@ impl Drop for WorkerRecord {
 }
 
 #[derive(Default)]
-struct WorkerHostState {
+pub(crate) struct WorkerHostState {
     config: RuntimeConfig,
     workers: Mutex<HashMap<u64, Arc<WorkerRecord>>>,
 }
 
 impl WorkerHostState {
-    fn new(config: RuntimeConfig) -> Self {
+    pub(crate) fn new(config: RuntimeConfig) -> Self {
         Self {
             config,
             workers: Mutex::new(HashMap::new()),
@@ -205,6 +205,28 @@ pub(crate) fn install_main_worker_globals(runtime: &mut Runtime) -> Result<(), O
     install_worker_host_natives(runtime, Arc::clone(&host))?;
     runtime.install_native_constructor_global_call("Worker", 2, worker_constructor_call(host))?;
     Ok(())
+}
+
+/// Re-create one of this module's dynamic-native closures by its
+/// captured display name — the worker half of a snapshot-restore
+/// resolver. All five share one fresh [`WorkerHostState`]: a restored
+/// isolate starts with no live workers, exactly like a built one.
+pub(crate) fn dynamic_native_payload(
+    name: &str,
+    host: &Arc<WorkerHostState>,
+) -> Option<otter_vm::snapshot::DynamicNativePayload> {
+    let call = match name {
+        "Worker" => worker_constructor_call(Arc::clone(host)),
+        "__otter_worker_spawn" => worker_spawn_call(Arc::clone(host)),
+        "__otter_worker_post_message" => worker_post_message_call(Arc::clone(host)),
+        "__otter_worker_terminate" => worker_terminate_call(Arc::clone(host)),
+        "__otter_worker_drain" => worker_drain_call(Arc::clone(host)),
+        _ => return None,
+    };
+    match call {
+        NativeCall::Dynamic(arc) => Some(otter_vm::snapshot::DynamicNativePayload::Shared(arc)),
+        NativeCall::Static(_) | NativeCall::VmIntrinsic(_) => None,
+    }
 }
 
 fn install_worker_host_natives(

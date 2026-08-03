@@ -94,6 +94,15 @@ pub fn with_web_apis(builder: RuntimeBuilder) -> RuntimeBuilder {
     builder
         .extension(&WEB_EXTENSION)
         .extension_installer(globals::web_globals_installer())
+        .dynamic_native_factory(
+            "__nativeFetch",
+            std::sync::Arc::new(|ctx| {
+                let capabilities = ctx.capabilities.clone();
+                otter_runtime::RuntimeDynamicNativePayload::shared(move |ctx, args, _captures| {
+                    crate::fetch_ext::native_fetch(ctx, args, &capabilities)
+                })
+            }),
+        )
 }
 
 /// Register active Web API globals on a Layer-A builder.
@@ -102,6 +111,15 @@ pub fn with_web_apis_for_otter(builder: OtterBuilder) -> OtterBuilder {
     builder
         .extension(&WEB_EXTENSION)
         .extension_installer(globals::web_globals_installer())
+        .dynamic_native_factory(
+            "__nativeFetch",
+            std::sync::Arc::new(|ctx| {
+                let capabilities = ctx.capabilities.clone();
+                otter_runtime::RuntimeDynamicNativePayload::shared(move |ctx, args, _captures| {
+                    crate::fetch_ext::native_fetch(ctx, args, &capabilities)
+                })
+            }),
+        )
 }
 
 /// Ergonomic extension trait for enabling Web APIs on builders.

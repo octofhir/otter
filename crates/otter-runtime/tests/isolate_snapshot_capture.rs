@@ -200,6 +200,44 @@ fn snapshot_blob_round_trips_in_process() {
 }
 
 #[test]
+fn snapshot_cache_serves_the_second_build() {
+    let cache_dir = tempfile::tempdir().expect("tempdir");
+
+    let build = |dir: &std::path::Path| {
+        otter_runtime::Runtime::builder()
+            .with_node_apis()
+            .with_otter_modules()
+            .with_web_apis()
+            .snapshot_cache_root(dir)
+            .build()
+            .expect("cached build")
+    };
+
+    let first = build(cache_dir.path());
+    assert!(
+        !first.restored_from_snapshot(),
+        "an empty cache must bootstrap"
+    );
+    drop(first);
+
+    let mut second = build(cache_dir.path());
+    assert!(
+        second.restored_from_snapshot(),
+        "the second build must restore from the stored blob"
+    );
+    let probe = second
+        .eval(otter_runtime::SourceInput::from_javascript(
+            "JSON.stringify([1 + 1, typeof fetch, typeof Worker, typeof process.cwd(), \
+             process.argv.length >= 0, eval('7 * 6')])",
+        ))
+        .expect("eval on cache-restored runtime");
+    assert_eq!(
+        probe.completion_string(),
+        r#"[2,"function","function","string",true,42]"#
+    );
+}
+
+#[test]
 fn restore_is_cheaper_than_bootstrap() {
     use std::time::Instant;
     // Warm everything once, then capture the snapshot both paths share.

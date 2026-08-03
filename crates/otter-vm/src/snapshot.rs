@@ -87,6 +87,13 @@ pub struct IsolateSnapshot {
     pub atom_names: Vec<Box<str>>,
     /// Global lexical bindings: name, cell handle, `is_const`.
     pub global_lexicals: Vec<(Box<str>, RawGc, bool)>,
+    /// Per-body regexp pattern records in live-walk order — the
+    /// serializer contract for the one payload the page image cannot
+    /// carry (the compiled matcher and its foreign-owned text).
+    pub regexp_payloads: Vec<(Vec<u16>, String)>,
+    /// Per-body array-sidecar descriptor-flag records in live-walk
+    /// order: `(key, writable, enumerable, configurable)` per entry.
+    pub array_sidecar_flags: Vec<Vec<(String, bool, bool, bool)>>,
 }
 
 /// Format marker for [`IsolateSnapshot::to_bytes`]. Not versioned —
@@ -134,6 +141,24 @@ impl IsolateSnapshot {
         for (index, name) in dynamic_names {
             out.extend_from_slice(&index.to_le_bytes());
             push_str(&mut out, name);
+        }
+        out.extend_from_slice(&(self.regexp_payloads.len() as u32).to_le_bytes());
+        for (pattern_utf16, source) in &self.regexp_payloads {
+            out.extend_from_slice(&(pattern_utf16.len() as u32).to_le_bytes());
+            for unit in pattern_utf16 {
+                out.extend_from_slice(&unit.to_le_bytes());
+            }
+            push_str(&mut out, source);
+        }
+        out.extend_from_slice(&(self.array_sidecar_flags.len() as u32).to_le_bytes());
+        for records in &self.array_sidecar_flags {
+            out.extend_from_slice(&(records.len() as u32).to_le_bytes());
+            for (key, writable, enumerable, configurable) in records {
+                push_str(&mut out, key);
+                out.push(u8::from(*writable));
+                out.push(u8::from(*enumerable));
+                out.push(u8::from(*configurable));
+            }
         }
         out
     }
@@ -184,6 +209,29 @@ impl IsolateSnapshot {
             let name = r.str_block()?;
             dynamic_natives.push((index, resolve(name)?));
         }
+        let mut regexp_payloads = Vec::new();
+        for _ in 0..r.u32()? {
+            let unit_count = r.u32()? as usize;
+            let mut pattern_utf16 = Vec::with_capacity(unit_count.min(64 * 1024));
+            for _ in 0..unit_count {
+                pattern_utf16.push(u16::from_le_bytes(r.take(2)?.try_into().unwrap()));
+            }
+            let source = r.str_block()?.to_owned();
+            regexp_payloads.push((pattern_utf16, source));
+        }
+        let mut array_sidecar_flags = Vec::new();
+        for _ in 0..r.u32()? {
+            let record_count = r.u32()? as usize;
+            let mut records = Vec::with_capacity(record_count.min(1024));
+            for _ in 0..record_count {
+                let key = r.str_block()?.to_owned();
+                let writable = r.u8()? != 0;
+                let enumerable = r.u8()? != 0;
+                let configurable = r.u8()? != 0;
+                records.push((key, writable, enumerable, configurable));
+            }
+            array_sidecar_flags.push(records);
+        }
         if !r.is_empty() {
             return None;
         }
@@ -195,6 +243,8 @@ impl IsolateSnapshot {
             external_ref_addrs,
             atom_names,
             global_lexicals,
+            regexp_payloads,
+            array_sidecar_flags,
         })
     }
 }
@@ -267,6 +317,29 @@ impl crate::Interpreter {
         let dynamic_natives = crate::native_function::snapshot_dynamic_natives(self.gc_heap());
         let fixed_roots = self.capture_snapshot_roots();
         let external_ref_addrs = self.gc_heap().external_refs().addrs().to_vec();
+        let mut regexp_payloads: Vec<(Vec<u16>, String)> = Vec::new();
+        self.gc_heap()
+            .for_each_live_payload::<crate::regexp::JsRegExpBody, _>(|_space, body| {
+                regexp_payloads.push((body.pattern_utf16.clone(), body.source.clone()));
+            });
+        let mut array_sidecar_with_content = false;
+        let mut array_sidecar_flags: Vec<Vec<(String, bool, bool, bool)>> = Vec::new();
+        self.gc_heap()
+            .for_each_live_payload::<crate::array::ArrayExoticSlots, _>(|_space, body| {
+                if !body.is_empty_for_snapshot() {
+                    array_sidecar_with_content = true;
+                    eprintln!(
+                        "snapshot capture: array sidecar holds {}",
+                        body.snapshot_content_summary()
+                    );
+                }
+                array_sidecar_flags.push(body.snapshot_property_flags());
+            });
+        if array_sidecar_with_content {
+            return Err(otter_gc::ImageError::ForeignPayloadNotSerializable {
+                type_name: "ArrayExoticSlots",
+            });
+        }
         let atom_names = self.snapshot_atom_names();
         let mut global_lexicals: Vec<(Box<str>, RawGc, bool)> = self
             .snapshot_global_lexicals()
@@ -282,6 +355,8 @@ impl crate::Interpreter {
             external_ref_addrs,
             atom_names,
             global_lexicals,
+            regexp_payloads,
+            array_sidecar_flags,
         })
     }
 }

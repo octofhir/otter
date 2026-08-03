@@ -133,6 +133,9 @@ pub trait Traceable: 'static {
 /// Signature of a sweep-time host-ref release wrapper.
 pub type HostReleaseFn = unsafe fn(*mut GcHeader, &mut crate::host_refs::HostRefTable);
 
+/// Signature of a restore-time foreign-ownership sever wrapper.
+pub type SeverRestoredFn = unsafe fn(*mut GcHeader);
+
 /// Sweep-time hook for bodies that name entries in the isolate's
 /// [`crate::host_refs::HostRefTable`]. A finalizer cannot release the
 /// slot — it runs against the body alone, with no heap in reach — so
@@ -140,6 +143,19 @@ pub type HostReleaseFn = unsafe fn(*mut GcHeader, &mut crate::host_refs::HostRef
 pub trait ReleaseHostRefs: SafeTraceable {
     /// Release every host-ref index this body holds.
     fn release_host_refs(&mut self, table: &mut crate::host_refs::HostRefTable);
+}
+
+/// Restore-time hook for bodies that own storage outside the heap.
+/// A restored page carries the capture isolate's malloc pointers and
+/// vtables verbatim; dereferencing any of them in another process is
+/// unsound — including from the body's own trace impl during the
+/// restore's relocation walk. The restore invokes this on every such
+/// body BEFORE its first trace; the implementation must overwrite the
+/// foreign fields (`std::ptr::write` — no drop, no read through the
+/// old values) with owned, process-local state.
+pub trait SeverRestoredPayload: SafeTraceable {
+    /// Replace every foreign-owned field with process-local state.
+    fn sever_restored_payload(&mut self);
 }
 
 pub trait SafeFinalize: SafeTraceable {
@@ -213,6 +229,7 @@ pub struct TraceTable {
     /// Sweep-time host-ref release hooks, `None` for every other tag.
     /// Fires before `finalize_table`.
     host_release_table: [Option<HostReleaseFn>; 256],
+    sever_restored_table: [Option<SeverRestoredFn>; 256],
     /// Sweep-time finalizers for bodies that impl [`SafeFinalize`].
     /// `None` for every other tag. Fires *before* `drop_table`.
     finalize_table: [Option<unsafe fn(*mut GcHeader)>; 256],
@@ -237,6 +254,7 @@ impl TraceTable {
             drop_table: [None; 256],
             finalize_table: [None; 256],
             host_release_table: [None; 256],
+            sever_restored_table: [None; 256],
             name_table: [None; 256],
         }
     }
@@ -397,6 +415,37 @@ impl TraceTable {
             );
         }
         self.host_release_table[tag] = Some(release_wrapper::<T>);
+    }
+
+    /// Look up the restore-time sever function for a type tag. `None`
+    /// when the tag has no [`SeverRestoredPayload`] registration.
+    #[inline]
+    pub fn get_sever_restored(&self, tag: u8) -> Option<SeverRestoredFn> {
+        self.sever_restored_table[tag as usize]
+    }
+
+    /// Register the restore-time sever wrapper for a type that opts
+    /// into [`SeverRestoredPayload`]. Must be paired with an earlier
+    /// [`Self::register`] call for the same type tag.
+    pub fn register_sever_restored<T: Traceable + SeverRestoredPayload>(&mut self) {
+        unsafe fn sever_wrapper<T: Traceable + SeverRestoredPayload>(header: *mut GcHeader) {
+            // SAFETY: by the [`Traceable`] safety contract, `header`
+            // precedes a valid `T` payload.
+            unsafe {
+                let payload = (header as *mut u8)
+                    .add(std::mem::size_of::<GcHeader>())
+                    .cast::<T>();
+                (*payload).sever_restored_payload();
+            }
+        }
+        let tag = <T as Traceable>::TYPE_TAG as usize;
+        if let Some(existing) = self.sever_restored_table[tag] {
+            debug_assert!(
+                existing as *const () == sever_wrapper::<T> as *const (),
+                "sever-restored tag {tag} already registered with a different fn",
+            );
+        }
+        self.sever_restored_table[tag] = Some(sever_wrapper::<T>);
     }
 
     /// Register the finalize wrapper for a type that opts into

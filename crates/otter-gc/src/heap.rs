@@ -800,6 +800,12 @@ impl GcHeap {
         self.trace_table.register_host_release::<T>();
     }
 
+    /// Register the restore-time foreign-ownership sever hook. See
+    /// [`crate::trace::SeverRestoredPayload`].
+    pub fn register_sever_restored<T: Traceable + crate::trace::SeverRestoredPayload>(&mut self) {
+        self.trace_table.register_sever_restored::<T>();
+    }
+
     /// Borrow the heap's handle stack.
     pub fn handle_stack(&self) -> &HandleStack {
         &self.handle_stack

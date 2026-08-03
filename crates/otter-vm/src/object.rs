@@ -875,15 +875,16 @@ pub struct ExoticSlots {
     is_arguments_object: bool,
 }
 
-impl ExoticSlots {
-    /// Sever foreign ownership after a snapshot restore: the host
-    /// payload box aliases the capture isolate's allocation and is
-    /// overwritten without being dropped. The bootstrap graph carries
-    /// no live host payloads; anything that did would re-create its
-    /// payload through its own serializer contract.
-    pub(crate) fn sever_after_restore(&mut self) {
-        // SAFETY: overwriting without dropping severs the alias; the
-        // capture isolate remains the owner.
+impl otter_gc::trace::SeverRestoredPayload for ExoticSlots {
+    /// Sever foreign ownership on a snapshot restore: the host payload
+    /// box aliases the capture isolate's allocation — its vtable is
+    /// dead in another process, so even this body's own trace impl
+    /// must never see it. The bootstrap graph carries no live host
+    /// payloads; anything that did would re-create its payload through
+    /// its own serializer contract.
+    fn sever_restored_payload(&mut self) {
+        // SAFETY: overwriting without dropping (or reading) severs the
+        // alias; the capture isolate remains the owner.
         unsafe { std::ptr::write(&mut self.host_data, None) };
     }
 }
@@ -2450,11 +2451,13 @@ impl otter_gc::SafeTraceable for ObjectBody {
     /// The GC-managed shape handle is traced directly; dictionary keys are
     /// owned Rust strings and need no GC tracing.
     fn trace_slots_safe(&mut self, v: &mut SlotVisitor<'_>) {
-        debug_assert_object_shape_handle(self.shape, "object trace entry");
+        // No shape-validity assert here: an image restore traces bodies
+        // while their handles still carry the capture isolate's offsets,
+        // so a trace-entry read of the shape cell would dereference
+        // pre-relocation state. The store paths keep the assert.
         if !self.shape.is_null() {
             let p = &mut self.shape as *mut ShapeHandle as *mut RawGc;
             v(p);
-            debug_assert_object_shape_handle(self.shape, "object trace shape slot");
         }
         // The ordinary-object / null prototype lives solely in the flat
         // `jit_proto` handle (null == `[[Prototype]]` null); the moving collector
@@ -2735,6 +2738,8 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
     // `every_allocated_type_tag_is_registered` fails if this list falls
     // behind the types a real build produces.
     heap.register_host_release::<crate::native_function::NativeFunctionBody>();
+    heap.register_sever_restored::<ExoticSlots>();
+    heap.register_sever_restored::<crate::array::ArrayExoticSlots>();
     register! {
         crate::array::ArrayBody,
         crate::value_slab::ValueSlabBody,

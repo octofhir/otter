@@ -131,7 +131,7 @@ pub fn cache_key(source: &str, kind: SourceKind, specifier: &str) -> String {
 /// forgetting to do. When the executable cannot be inspected the identity is
 /// deliberately unrepeatable, so every process computes a different one and
 /// nothing is ever reused — the safe way to be wrong.
-fn build_identity() -> String {
+pub(crate) fn build_identity() -> String {
     let Ok(path) = std::env::current_exe() else {
         return unrepeatable_identity();
     };

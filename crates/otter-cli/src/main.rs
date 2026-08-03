@@ -809,6 +809,7 @@ async fn run_file_with_cpu_profile(
         .with_node_apis()
         .with_otter_modules()
         .with_web_apis()
+        .snapshot_cache(true)
         .process_argv(process_argv_for_file(path, args))
         .module_loader(cli_loader_config_for_entry(path).await);
     let mut builder = execution.apply_runtime_builder(builder);
@@ -1866,6 +1867,7 @@ fn cli_otter_builder(
         .with_node_apis()
         .with_otter_modules()
         .with_web_apis()
+        .snapshot_cache(true)
         .process_env(project_env_files());
     execution.apply_otter_builder(builder)
 }

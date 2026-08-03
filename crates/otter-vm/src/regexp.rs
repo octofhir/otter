@@ -361,11 +361,9 @@ impl JsRegExpBody {
     /// recompiling the pattern exactly as V8 recompiles RegExp code on
     /// deserialization — so the alias is never dropped and both isolates
     /// own their storage.
-    pub(crate) fn sever_after_restore(&mut self) {
-        let pattern_utf16: Vec<u16> = self.pattern_utf16.as_slice().to_vec();
-        let source: String = self.source.as_str().to_owned();
+    pub(crate) fn rebuild_after_restore(&mut self, pattern_utf16: &[u16], source: &str) {
         let regex = engine::compile(
-            &source,
+            source,
             self.flags.ignore_case,
             self.flags.multiline,
             self.flags.dot_all,
@@ -373,12 +371,15 @@ impl JsRegExpBody {
             self.flags.unicode_sets,
         )
         .expect("a captured pattern compiled once already");
-        // SAFETY: overwriting without dropping is the point — the old
-        // values are the capture isolate's property.
+        // SAFETY: overwriting without dropping (or reading) is the
+        // point — the old values are the capture isolate's property
+        // and may not even be readable in this process. The pattern
+        // text comes from the snapshot's own record, never from the
+        // restored bytes.
         unsafe {
             std::ptr::write(&mut self.regex, regex);
-            std::ptr::write(&mut self.pattern_utf16, pattern_utf16);
-            std::ptr::write(&mut self.source, source);
+            std::ptr::write(&mut self.pattern_utf16, pattern_utf16.to_vec());
+            std::ptr::write(&mut self.source, source.to_owned());
         }
     }
 }

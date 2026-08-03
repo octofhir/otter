@@ -1198,7 +1198,7 @@ impl Value {
     #[must_use]
     pub fn is_html_dda(self, heap: &otter_gc::GcHeap) -> bool {
         self.as_native_function()
-            .is_some_and(|native| native.name(heap) == "__otter_is_htmldda")
+            .is_some_and(|native| native.name_is(heap, "__otter_is_htmldda"))
     }
 
     /// Spec [`typeof`](https://tc39.es/ecma262/#sec-typeof-operator) —

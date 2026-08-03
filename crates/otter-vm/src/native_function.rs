@@ -223,9 +223,10 @@ pub struct NativeFunctionBody {
     #[pelt(skip)]
     native_ref: u32,
     /// Display name (used in stack traces and `Function.prototype.
-    /// toString` once that lands).
-    #[pelt(skip)]
-    name: &'static str,
+    /// toString` once that lands). A heap-owned string, not a
+    /// `&'static str`: rodata addresses differ per build and per
+    /// process, so a dumped page could not carry one.
+    name: JsString,
     /// ECMAScript `.length` metadata.
     #[pelt(skip)]
     length: u8,
@@ -392,6 +393,11 @@ impl NativeFunction {
         metadata: NativeFunctionMetadata,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
+        // The display name becomes a heap string first: nothing local
+        // is live yet, so only the caller's roots need to survive the
+        // allocation.
+        let name_string = JsString::from_str_with_roots(name, heap, external_visit)?;
+        let name_root = Value::string(name_string);
         // Interning before the body is built keeps this the one place a
         // static native's entry address enters the isolate: every
         // constructor and every install funnel reaches the heap through
@@ -420,6 +426,7 @@ impl NativeFunction {
         let own_properties = {
             let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                 external_visit(visitor);
+                name_root.trace_value_slots(visitor);
                 for value in &captures {
                     value.trace_value_slots(visitor);
                 }
@@ -436,6 +443,7 @@ impl NativeFunction {
         let mut captures_slab = {
             let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                 external_visit(visitor);
+                name_root.trace_value_slots(visitor);
                 own_properties_root.trace_value_slots(visitor);
             };
             crate::value_slab::slab_from_values(heap, &mut captures, &mut visit)?
@@ -443,6 +451,7 @@ impl NativeFunction {
         let captures_slot = std::ptr::addr_of_mut!(captures_slab);
         let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
+            name_root.trace_value_slots(visitor);
             own_properties_root.trace_value_slots(visitor);
             visitor(captures_slot.cast::<RawGc>());
         };
@@ -450,7 +459,7 @@ impl NativeFunction {
             inner: heap.alloc_with_roots(
                 NativeFunctionBody {
                     native_ref,
-                    name,
+                    name: name_string,
                     length,
                     call,
                     captures: captures_slab,
@@ -764,8 +773,22 @@ impl NativeFunction {
 
     /// Read display metadata.
     #[must_use]
-    pub fn name(&self, heap: &otter_gc::GcHeap) -> &'static str {
+    pub fn name(&self, heap: &otter_gc::GcHeap) -> JsString {
         heap.read_payload(self.inner, |body| body.name)
+    }
+
+    /// Display name as a Rust `String`, for diagnostics and error
+    /// message formatting.
+    #[must_use]
+    pub fn name_string(&self, heap: &otter_gc::GcHeap) -> String {
+        self.name(heap).to_lossy_string(heap)
+    }
+
+    /// Whether the display name equals `expected`, without allocating.
+    /// Hot dispatch paths use this to recognise specific builtins.
+    #[must_use]
+    pub(crate) fn name_is(&self, heap: &otter_gc::GcHeap, expected: &str) -> bool {
+        self.name(heap).eq_str(expected, heap)
     }
 
     /// Read ECMAScript `.length` metadata.
@@ -1382,23 +1405,21 @@ where
 }
 
 struct NativeFunctionBodySnapshot {
-    name: &'static str,
+    name: JsString,
     length: u8,
     metadata: NativeFunctionMetadata,
 }
 
 fn native_builtin_descriptor(
     body: &NativeFunctionBodySnapshot,
-    heap: &mut otter_gc::GcHeap,
+    _heap: &mut otter_gc::GcHeap,
     key: &str,
-    external_visit: &mut RootSlotVisitor<'_>,
+    _external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<PropertyDescriptor, otter_gc::OutOfMemory> {
     let value = match key {
-        "name" => Value::string(JsString::from_str_with_roots(
-            body.name,
-            heap,
-            external_visit,
-        )?),
+        // The body already owns its name as a heap string; hand the
+        // handle out directly instead of allocating a copy.
+        "name" => Value::string(body.name),
         "length" => Value::number(crate::number::NumberValue::from_i32(body.length as i32)),
         _ => Value::undefined(),
     };

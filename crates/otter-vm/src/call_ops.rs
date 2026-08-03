@@ -2417,14 +2417,15 @@ impl Interpreter {
         } else {
             return None;
         };
-        matches!(
-            native.name(&self.gc_heap),
-            "Promise"
-                | "Function"
-                | "GeneratorFunction"
-                | "AsyncFunction"
-                | "AsyncGeneratorFunction"
-        )
+        [
+            "Promise",
+            "Function",
+            "GeneratorFunction",
+            "AsyncFunction",
+            "AsyncGeneratorFunction",
+        ]
+        .iter()
+        .any(|expected| native.name(&self.gc_heap).eq_str(expected, &self.gc_heap))
         .then_some(native)
     }
 
@@ -3466,24 +3467,25 @@ impl Interpreter {
             );
         }
         if let Some(native) = roots.current.get().as_native_function()
-            && matches!(
-                native.name(&self.gc_heap),
-                "ArrayBuffer"
-                    | "SharedArrayBuffer"
-                    | "DataView"
-                    | "Int8Array"
-                    | "Uint8Array"
-                    | "Uint8ClampedArray"
-                    | "Int16Array"
-                    | "Uint16Array"
-                    | "Int32Array"
-                    | "Uint32Array"
-                    | "Float16Array"
-                    | "Float32Array"
-                    | "Float64Array"
-                    | "BigInt64Array"
-                    | "BigUint64Array"
-            )
+            && [
+                "ArrayBuffer",
+                "SharedArrayBuffer",
+                "DataView",
+                "Int8Array",
+                "Uint8Array",
+                "Uint8ClampedArray",
+                "Int16Array",
+                "Uint16Array",
+                "Int32Array",
+                "Uint32Array",
+                "Float16Array",
+                "Float32Array",
+                "Float64Array",
+                "BigInt64Array",
+                "BigUint64Array",
+            ]
+            .iter()
+            .any(|expected| native.name(&self.gc_heap).eq_str(expected, &self.gc_heap))
         {
             let effective_args = roots.take_args();
             let new_target = roots.new_target.get();
@@ -3533,7 +3535,7 @@ impl Interpreter {
                 .current
                 .get()
                 .as_native_function()
-                .is_some_and(|native| native.name(&self.gc_heap) == "Date")
+                .is_some_and(|native| native.name_is(&self.gc_heap, "Date"))
             {
                 proto = Some(self.constructor_prototype_value("Date")?);
             } else {

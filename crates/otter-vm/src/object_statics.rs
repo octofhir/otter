@@ -1592,7 +1592,7 @@ pub fn call(
                     let msg = format!(
                         "Cannot define property '{}' on function {}",
                         key.label(gc_heap),
-                        native.name(gc_heap)
+                        native.name_string(gc_heap)
                     );
                     return Err(interp.err_type(msg.into()));
                 }

@@ -315,7 +315,7 @@ fn emit_to_int32_common(ops: &mut Assembler, src_x: u8, dst_w: u8, bail: Dynamic
 
 /// Compute the value-slab base for a shape-matched receiver into `x13`, which
 /// holds the decompressed `GcHeader` pointer on entry (`x14` is clobbered). A
-/// small object (`slab_len <= INLINE_SLOT_CAP`) carries its slab inline in the
+/// small object (null out-of-line slab handle) carries its slab inline in the
 /// body, so the base is `header + object_inline_values_byte`, derived fresh
 /// from the receiver's header every access. This deliberately never reads the
 /// cached `values_ptr` for inline slabs: that pointer aims into the body and
@@ -327,20 +327,23 @@ pub(crate) fn emit_slab_base(ops: &mut Assembler, view: &JitCompileSnapshot, reg
     // inline slab capacity and the header-relative offset of the in-body
     // inline slab, checked against the values otter-vm baked from the live
     // `#[repr(C)]` layout so a field reorder trips in tests.
-    const INLINE_SLOT_CAP: u32 = 6;
     const INLINE_VALUES_BYTE: u32 = 64;
-    debug_assert_eq!(INLINE_SLOT_CAP, view.object_inline_slot_cap);
+    const SLAB_HANDLE_BYTE: u32 = 24;
     debug_assert_eq!(INLINE_VALUES_BYTE, view.object_inline_values_byte);
+    debug_assert_eq!(SLAB_HANDLE_BYTE, view.object_slab_handle_byte);
     assert_eq!((reg, scratch), (13, 14), "fixed-register slab-base form");
-    let slab_len_off = view.object_slab_len_byte;
     let values_ptr_off = view.object_values_ptr_byte;
     let spilled = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
+    // Branch on the out-of-line slab HANDLE, not on `slab_len`: the
+    // capacity model can move a `len <= INLINE_SLOT_CAP` object's slots
+    // out of line (an existing-slot slow store reserves ahead), and a
+    // spilled slab that shrinks back stays out of line — a length
+    // compare reads the stale in-body copy in both cases.
     dynasm!(ops
         ; .arch aarch64
-        ; ldrh w14, [x13, slab_len_off]
-        ; cmp w14, INLINE_SLOT_CAP
-        ; b.hi =>spilled
+        ; ldr w14, [x13, SLAB_HANDLE_BYTE]
+        ; cbnz w14, =>spilled
         ; add x13, x13, INLINE_VALUES_BYTE
         ; b =>done
         ; =>spilled

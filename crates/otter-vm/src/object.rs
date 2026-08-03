@@ -1868,6 +1868,14 @@ pub(crate) const OBJECT_BODY_INLINE_VALUES_OFFSET: usize =
 /// branch inline-vs-overflow and to bounds-check an inline slot store.
 pub(crate) const OBJECT_BODY_SLAB_LEN_OFFSET: usize = std::mem::offset_of!(ObjectBody, slab_len);
 
+/// Byte offset of the out-of-line slab handle. The JIT reads it to branch
+/// inline-vs-overflow: a null handle means the slots live in
+/// [`ObjectBody::inline_values`]. `slab_len` cannot decide this — the
+/// capacity model can move a `len <= INLINE_SLOT_CAP` object's slots out of
+/// line (an existing-slot slow store reserves ahead), and a spilled slab
+/// that shrinks back stays out of line.
+pub(crate) const OBJECT_BODY_SLAB_HANDLE_OFFSET: usize = std::mem::offset_of!(ObjectBody, slab);
+
 // The JIT bakes these offsets into emitted property loads, the inline `New`
 // store sequence, and the deopt frame-state record, so they are a frozen ABI:
 // pin every one to its EXACT value (not `>=` / `%`) so an accidental field
@@ -1879,6 +1887,7 @@ const _: () = assert!(OBJECT_BODY_DICTIONARY_SHAPE_ID_OFFSET == 24);
 const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET == 36);
 const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET == 56);
 const _: () = assert!(OBJECT_BODY_SLAB_LEN_OFFSET == 80);
+const _: () = assert!(OBJECT_BODY_SLAB_HANDLE_OFFSET == 16);
 // The shape guard word must sit at offset 0 (single-compare guard) and the
 // slab base must stay 8-aligned for the JIT's pointer load.
 const _: () = assert!(OBJECT_BODY_VALUES_PTR_OFFSET.is_multiple_of(8));

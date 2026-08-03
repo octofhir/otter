@@ -227,6 +227,8 @@ impl CodeBlock {
                 + crate::object::OBJECT_BODY_VALUES_PTR_OFFSET as u32,
             object_inline_values_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_INLINE_VALUES_OFFSET as u32,
+            object_slab_handle_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::OBJECT_BODY_SLAB_HANDLE_OFFSET as u32,
             object_slab_len_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_SLAB_LEN_OFFSET as u32,
             object_inline_slot_cap: crate::object::INLINE_SLOT_CAP as u32,

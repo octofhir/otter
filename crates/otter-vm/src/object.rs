@@ -2764,6 +2764,8 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
     heap.register_host_release::<crate::native_function::NativeFunctionBody>();
     heap.register_sever_restored::<ExoticSlots>();
     heap.register_sever_restored::<crate::array::ArrayExoticSlots>();
+    heap.register_sever_restored::<crate::weak_refs::WeakRefBody>();
+    heap.register_sever_restored::<crate::weak_refs::FinalizationRegistryBody>();
     register! {
         crate::array::ArrayBody,
         crate::value_slab::ValueSlabBody,

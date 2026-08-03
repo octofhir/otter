@@ -69,6 +69,32 @@ pub struct WeakRefBody {
     prototype_override: Option<Value>,
 }
 
+impl otter_gc::trace::SeverRestoredPayload for WeakRefBody {
+    /// A restored weak target is a capture-process offset the weak
+    /// channel never relocates; clear it (the deref observes
+    /// `undefined`, exactly as if the target had been collected).
+    fn sever_restored_payload(&mut self) {
+        self.target = RawGc::NULL;
+    }
+}
+
+impl otter_gc::trace::SeverRestoredPayload for FinalizationRegistryBody {
+    /// The cell vector is capture-process malloc storage and its weak
+    /// targets are capture-process offsets; neither is readable here.
+    /// Dropping the registrations is sound for a bootstrap image: its
+    /// targets live in old space for the isolate's lifetime, so their
+    /// finalizers could never have fired anyway. The capture-side
+    /// execution context is likewise foreign host state.
+    fn sever_restored_payload(&mut self) {
+        // SAFETY: overwriting without dropping (or reading) severs the
+        // alias; the capture isolate remains the owner.
+        unsafe {
+            std::ptr::write(&mut self.cells, Vec::new());
+            std::ptr::write(&mut self.cleanup_context, None);
+        }
+    }
+}
+
 fn weak_ref_ephemeron_walk(
     body: &mut WeakRefBody,
     visitor: &mut otter_gc::trace::EphemeronVisitor<'_>,

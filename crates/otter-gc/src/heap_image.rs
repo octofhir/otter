@@ -139,7 +139,13 @@ impl From<OutOfMemory> for ImageError {
 struct PageImage {
     /// Cage offset of the page base at capture time.
     cage_offset: u32,
-    /// Bytes `[0, bump_cursor)` of the page — its header followed by
+    /// Consecutive cage pages the region spans — `1` for an ordinary
+    /// page, more for a large-body region. The restore must place the
+    /// copy in an equally-sized contiguous region: pouring a spanning
+    /// region's bytes into a single page would overflow into whatever
+    /// neighbours the cage had handed out.
+    span_pages: u32,
+    /// Bytes `[0, bump_cursor)` of the region — its header followed by
     /// every object it had bump-allocated.
     bytes: Vec<u8>,
 }
@@ -197,6 +203,7 @@ impl HeapImage {
         out.extend_from_slice(&(self.pages.len() as u32).to_le_bytes());
         for page in &self.pages {
             out.extend_from_slice(&page.cage_offset.to_le_bytes());
+            out.extend_from_slice(&page.span_pages.to_le_bytes());
             out.extend_from_slice(&(page.bytes.len() as u32).to_le_bytes());
             out.extend_from_slice(&page.bytes);
         }
@@ -219,9 +226,14 @@ impl HeapImage {
         let mut pages = Vec::with_capacity(page_count.min(1024));
         for _ in 0..page_count {
             let cage_offset = r.u32()?;
+            let span_pages = r.u32()?;
             let len = r.u32()? as usize;
             let bytes = r.take(len)?.to_vec();
-            pages.push(PageImage { cage_offset, bytes });
+            pages.push(PageImage {
+                cage_offset,
+                span_pages,
+                bytes,
+            });
         }
         if !r.is_empty() {
             return None;
@@ -396,6 +408,7 @@ impl GcHeap {
             let bytes = unsafe { std::slice::from_raw_parts(page.base_ptr(), len) }.to_vec();
             pages.push(PageImage {
                 cage_offset: page.cage_offset(),
+                span_pages: header.span_pages,
                 bytes,
             });
         }
@@ -430,14 +443,23 @@ impl GcHeap {
         // an already-relocated slot value can never look like a captured
         // offset, so a slot shared between an owner and its
         // backing-store body tolerates the second visit.
-        let captured: std::collections::HashSet<u32> =
-            image.pages.iter().map(|p| p.cage_offset).collect();
+        let mut captured: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for p in &image.pages {
+            for i in 0..p.span_pages {
+                captured.insert(p.cage_offset + i * crate::page::PAGE_SIZE as u32);
+            }
+        }
         let mut held_back: Vec<Page> = Vec::new();
         let mut placed: Vec<(u32, Page)> = Vec::with_capacity(image.pages.len());
         for entry in &image.pages {
             let page = loop {
-                let candidate = Page::new(SpaceKind::Old).ok_or(OutOfMemory::CageExhausted)?;
-                if captured.contains(&candidate.cage_offset()) {
+                let candidate = Page::new_spanning(SpaceKind::Old, entry.span_pages)
+                    .ok_or(OutOfMemory::CageExhausted)?;
+                let overlaps = (0..entry.span_pages).any(|i| {
+                    captured
+                        .contains(&(candidate.cage_offset() + i * crate::page::PAGE_SIZE as u32))
+                });
+                if overlaps {
                     held_back.push(candidate);
                     continue;
                 }
@@ -452,10 +474,13 @@ impl GcHeap {
                     entry.bytes.len(),
                 );
             }
-            // The copied header still names the capturing page.
+            // The copied header still names the capturing page. The span
+            // width is identical by construction (the placement above
+            // allocated the same number of consecutive pages).
             let header = page.header_mut();
             header.cage_offset = page.cage_offset();
             header.space = SpaceKind::Old;
+            debug_assert_eq!(header.span_pages, entry.span_pages);
             placed.push((entry.cage_offset, page));
         }
         let mut relocation = Relocation {

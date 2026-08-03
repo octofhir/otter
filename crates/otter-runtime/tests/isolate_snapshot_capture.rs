@@ -374,6 +374,47 @@ fn cache_restored_isolate_survives_allocation_pressure() {
 }
 
 #[test]
+fn a_donor_finalization_registry_severs_on_restore() {
+    // Seed the registry inside the bootstrap, the way an extension's
+    // install script would: the donor captures under tenure-all, so
+    // registry cells land in old space and ride the image.
+    let source = otter_runtime::Runtime::builder()
+        .with_node_apis()
+        .with_otter_modules()
+        .with_web_apis()
+        .extension_installer(otter_runtime::RuntimeExtensionInstaller::new(|ctx| {
+            ctx.install_script(otter_runtime::SourceInput::from_javascript(
+                "globalThis.__fr = new FinalizationRegistry(function(){}); \
+                 globalThis.__wr = new WeakRef(globalThis); \
+                 for (var i = 0; i < 64; i++) { __fr.register({t: i}, i, {u: i}); }",
+            ))
+        }))
+        .build()
+        .expect("seeded runtime");
+    let bytes = source.snapshot_blob().expect("blob capture");
+    let dynamics = source.dynamic_natives_by_name();
+
+    let mut restored = otter_runtime::Runtime::from_snapshot_blob_with(
+        &bytes,
+        otter_runtime::SnapshotRuntimeOptions::default(),
+        &mut |name| {
+            dynamics
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, payload)| payload.clone())
+        },
+    )
+    .expect("blob restore");
+    restored.force_gc().expect("full GC over severed registry");
+    let probe = restored
+        .eval(otter_runtime::SourceInput::from_javascript(
+            "var junk; for (var i = 0; i < 200000; i++) { junk = {a: i}; }             JSON.stringify([typeof __fr, __wr.deref() === undefined || __wr.deref() === globalThis])",
+        ))
+        .expect("eval after severed-registry GC");
+    assert_eq!(probe.completion_string(), r#"["object",true]"#);
+}
+
+#[test]
 fn restore_is_cheaper_than_bootstrap() {
     use std::time::Instant;
     // Warm everything once, then capture the snapshot both paths share.

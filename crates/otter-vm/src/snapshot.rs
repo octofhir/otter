@@ -94,6 +94,10 @@ pub struct IsolateSnapshot {
     /// Per-body array-sidecar descriptor-flag records in live-walk
     /// order: `(key, writable, enumerable, configurable)` per entry.
     pub array_sidecar_flags: Vec<Vec<(String, bool, bool, bool)>>,
+    /// The capture process's next shape id. A restoring process bumps
+    /// its own counter past this so freshly minted shape ids never
+    /// collide with the image's — shape ids key the property caches.
+    pub next_shape_id: u64,
 }
 
 /// Format marker for [`IsolateSnapshot::to_bytes`]. Not versioned —
@@ -160,6 +164,7 @@ impl IsolateSnapshot {
                 out.push(u8::from(*configurable));
             }
         }
+        out.extend_from_slice(&self.next_shape_id.to_le_bytes());
         out
     }
 
@@ -232,6 +237,7 @@ impl IsolateSnapshot {
             }
             array_sidecar_flags.push(records);
         }
+        let next_shape_id = r.u64()?;
         if !r.is_empty() {
             return None;
         }
@@ -245,6 +251,7 @@ impl IsolateSnapshot {
             global_lexicals,
             regexp_payloads,
             array_sidecar_flags,
+            next_shape_id,
         })
     }
 }
@@ -340,6 +347,7 @@ impl crate::Interpreter {
                 type_name: "ArrayExoticSlots",
             });
         }
+        let next_shape_id = crate::object::snapshot_next_shape_id();
         let atom_names = self.snapshot_atom_names();
         let mut global_lexicals: Vec<(Box<str>, RawGc, bool)> = self
             .snapshot_global_lexicals()
@@ -357,6 +365,7 @@ impl crate::Interpreter {
             global_lexicals,
             regexp_payloads,
             array_sidecar_flags,
+            next_shape_id,
         })
     }
 }

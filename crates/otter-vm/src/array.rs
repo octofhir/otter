@@ -366,12 +366,12 @@ const _: () = assert!(std::mem::size_of::<ArrayBody>() <= 64);
 /// wrapper itself flows through ordinary roots / well-known
 /// installation, not through array body trace.
 fn trace_array_symbol_properties(
-    field: &Option<Vec<(crate::symbol::JsSymbol, Value)>>,
+    field: &mut Option<Vec<(crate::symbol::JsSymbol, Value)>>,
     visitor: &mut SlotVisitor<'_>,
 ) {
     if let Some(entries) = field {
         for (_sym, value) in entries {
-            value.trace_value_slots(visitor);
+            value.trace_value_slot_mut(visitor);
         }
     }
 }
@@ -379,16 +379,16 @@ fn trace_array_symbol_properties(
 /// Trace helper for symbol-keyed accessor descriptors: only the
 /// getter / setter `Value` slots carry GC references.
 fn trace_array_symbol_accessors(
-    field: &Option<Vec<(crate::symbol::JsSymbol, (Option<Value>, Option<Value>))>>,
+    field: &mut Option<Vec<(crate::symbol::JsSymbol, (Option<Value>, Option<Value>))>>,
     visitor: &mut SlotVisitor<'_>,
 ) {
     if let Some(entries) = field {
         for (_sym, (getter, setter)) in entries {
             if let Some(g) = getter {
-                g.trace_value_slots(visitor);
+                g.trace_value_slot_mut(visitor);
             }
             if let Some(s) = setter {
-                s.trace_value_slots(visitor);
+                s.trace_value_slot_mut(visitor);
             }
         }
     }
@@ -490,30 +490,33 @@ impl otter_gc::SafeTraceable for ArrayExoticSlots {
     const TYPE_TAG: u8 = ARRAY_EXOTIC_SLOTS_TYPE_TAG;
 
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
-        if let Some(sparse) = &self.sparse_elements {
-            for value in sparse.values() {
-                value.trace_value_slots(visitor);
+        // Mutable visits throughout: the mutable value trace normalizes
+        // a restored value's cage prefix in place, so a cross-process
+        // snapshot restore re-homes every slot on its relocation walk.
+        if let Some(sparse) = &mut self.sparse_elements {
+            for value in sparse.values_mut() {
+                value.trace_value_slot_mut(visitor);
             }
         }
-        if let Some(named) = &self.named_properties {
-            for value in named.values() {
-                value.trace_value_slots(visitor);
+        if let Some(named) = &mut self.named_properties {
+            for value in named.values_mut() {
+                value.trace_value_slot_mut(visitor);
             }
         }
-        if let Some(accessors) = &self.accessors {
-            for (getter, setter) in accessors.values() {
+        if let Some(accessors) = &mut self.accessors {
+            for (getter, setter) in accessors.values_mut() {
                 if let Some(g) = getter {
-                    g.trace_value_slots(visitor);
+                    g.trace_value_slot_mut(visitor);
                 }
                 if let Some(s) = setter {
-                    s.trace_value_slots(visitor);
+                    s.trace_value_slot_mut(visitor);
                 }
             }
         }
-        trace_array_symbol_properties(&self.symbol_properties, visitor);
-        trace_array_symbol_accessors(&self.symbol_accessors, visitor);
-        if let Some(proto) = &self.prototype_override {
-            proto.trace_value_slots(visitor);
+        trace_array_symbol_properties(&mut self.symbol_properties, visitor);
+        trace_array_symbol_accessors(&mut self.symbol_accessors, visitor);
+        if let Some(proto) = &mut self.prototype_override {
+            proto.trace_value_slot_mut(visitor);
         }
     }
 }

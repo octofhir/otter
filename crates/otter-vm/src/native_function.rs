@@ -124,6 +124,13 @@ impl NativeFunctionMetadata {
 /// dispatch.
 pub type NativeFastFn = for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>;
 
+/// Plain function pointer for a static native that reads traced
+/// captures. Same dump-safe identity as [`NativeFastFn`] — the entry
+/// address goes through the external-reference table — with the
+/// capture-slab slice the dynamic ABI passes.
+pub type NativeCapturesFn =
+    for<'rt> fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>;
+
 /// VM-owned intrinsic callable.
 ///
 /// These functions are JS-visible function values, but their
@@ -162,6 +169,7 @@ pub enum NativeCall {
 #[derive(Clone)]
 enum NativeCallStorage {
     Static(NativeFastFn),
+    StaticWithCaptures(NativeCapturesFn),
     VmIntrinsic(VmIntrinsicFunction),
     Dynamic(Arc<NativeFn>),
     LocalDynamic(Arc<LocalNativeFn>),
@@ -179,6 +187,7 @@ enum NativeCallStorage {
 #[derive(Clone, Copy)]
 enum NativeCallSlot {
     Static(NativeFastFn),
+    StaticWithCaptures(NativeCapturesFn),
     VmIntrinsic(VmIntrinsicFunction),
     Dynamic(u32),
     LocalDynamic(u32),
@@ -283,6 +292,9 @@ impl NativeFunctionBody {
             NativeCallSlot::Static(f) => {
                 (NativeStorageKind::Static, Some(*f as *const () as usize))
             }
+            NativeCallSlot::StaticWithCaptures(f) => {
+                (NativeStorageKind::Static, Some(*f as *const () as usize))
+            }
             NativeCallSlot::VmIntrinsic(_) => (NativeStorageKind::VmIntrinsic, None),
             NativeCallSlot::Dynamic(_) => (NativeStorageKind::Dynamic, None),
             NativeCallSlot::LocalDynamic(_) => (NativeStorageKind::LocalDynamic, None),
@@ -353,7 +365,9 @@ impl otter_gc::trace::ReleaseHostRefs for NativeFunctionBody {
             NativeCallSlot::Dynamic(index) | NativeCallSlot::LocalDynamic(index) => {
                 table.release(index);
             }
-            NativeCallSlot::Static(_) | NativeCallSlot::VmIntrinsic(_) => {}
+            NativeCallSlot::Static(_)
+            | NativeCallSlot::StaticWithCaptures(_)
+            | NativeCallSlot::VmIntrinsic(_) => {}
         }
     }
 }
@@ -405,6 +419,7 @@ impl NativeFunction {
         // sequence rather than by anything a call site remembers to do.
         let native_ref = heap.intern_external_ref(match &call {
             NativeCallStorage::Static(f) => *f as *const () as usize,
+            NativeCallStorage::StaticWithCaptures(f) => *f as *const () as usize,
             NativeCallStorage::VmIntrinsic(_)
             | NativeCallStorage::Dynamic(_)
             | NativeCallStorage::LocalDynamic(_) => 0,
@@ -414,6 +429,7 @@ impl NativeFunction {
         // the index, and the sweep releases the slot when the body dies.
         let call = match call {
             NativeCallStorage::Static(f) => NativeCallSlot::Static(f),
+            NativeCallStorage::StaticWithCaptures(f) => NativeCallSlot::StaticWithCaptures(f),
             NativeCallStorage::VmIntrinsic(intrinsic) => NativeCallSlot::VmIntrinsic(intrinsic),
             NativeCallStorage::Dynamic(arc) => {
                 NativeCallSlot::Dynamic(heap.intern_host_ref(Box::new(arc)))
@@ -540,7 +556,7 @@ impl NativeFunction {
             + Sync
             + 'static,
     {
-        Self::with_length_and_captures(heap, name, 0, call, SmallVec::new())
+        Self::with_length_and_closure(heap, name, 0, call, SmallVec::new())
     }
 
     /// Build a static native function with explicit `.length`.
@@ -713,12 +729,37 @@ impl NativeFunction {
             + Sync
             + 'static,
     {
-        Self::with_length_and_captures(heap, name, 0, call, captures)
+        Self::with_length_and_closure(heap, name, 0, call, captures)
     }
 
-    /// Build a dynamic native function with explicit `.length` and
-    /// explicit traced JS captures.
-    pub fn with_length_and_captures<F>(
+    /// Build a static native function with explicit `.length` and
+    /// explicit traced JS captures. The entry point is a plain `fn`,
+    /// so the callable is dump-safe: the address rides the
+    /// external-reference table and the captures ride the slab.
+    pub fn with_length_and_captures(
+        heap: &mut otter_gc::GcHeap,
+        name: &'static str,
+        length: u8,
+        call: NativeCapturesFn,
+        captures: SmallVec<[Value; 4]>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        let mut external_visit = no_roots;
+        Self::allocate_with_roots(
+            heap,
+            name,
+            length,
+            NativeCallStorage::StaticWithCaptures(call),
+            captures,
+            NativeFunctionMetadata::BUILTIN,
+            &mut external_visit,
+        )
+    }
+
+    /// Build a genuinely dynamic native function from a Rust closure,
+    /// with explicit `.length` and traced JS captures. Prefer the
+    /// `fn`-pointer constructors: a closure's `Arc` cannot ride a page
+    /// dump and must be re-installed by name on restore.
+    fn with_length_and_closure<F>(
         heap: &mut otter_gc::GcHeap,
         name: &'static str,
         length: u8,
@@ -1144,6 +1185,10 @@ impl NativeFunction {
     pub(crate) fn call_target(&self, heap: &otter_gc::GcHeap) -> NativeCallTarget {
         heap.read_payload(self.inner, |body| match body.call {
             NativeCallSlot::Static(call) => NativeCallTarget::Static(call),
+            NativeCallSlot::StaticWithCaptures(call) => NativeCallTarget::StaticWithCaptures {
+                call,
+                captures: body.captures,
+            },
             NativeCallSlot::VmIntrinsic(intrinsic) => NativeCallTarget::VmIntrinsic(intrinsic),
             NativeCallSlot::Dynamic(index) => NativeCallTarget::Dynamic {
                 call: heap
@@ -1219,6 +1264,13 @@ impl NativeFunction {
 pub(crate) enum NativeCallTarget {
     /// Static fast path.
     Static(NativeFastFn),
+    /// Static function with traced captures.
+    StaticWithCaptures {
+        /// Entry point.
+        call: NativeCapturesFn,
+        /// The callee body's capture slab.
+        captures: crate::value_slab::ValueSlabHandle,
+    },
     /// VM-owned intrinsic function.
     VmIntrinsic(VmIntrinsicFunction),
     /// Dynamic closure path with traced captures.
@@ -1252,6 +1304,11 @@ impl NativeCallTarget {
     ) -> Result<Value, NativeError> {
         match self {
             Self::Static(call) => call(ctx, args),
+            // SAFETY: see the doc above — the callee roots the slab
+            // across the call.
+            Self::StaticWithCaptures { call, captures } => call(ctx, args, unsafe {
+                crate::value_slab::live_slice(captures)
+            }),
             Self::VmIntrinsic(intrinsic) => Err(NativeError::TypeError {
                 name: intrinsic.name(),
                 reason: "VM intrinsic requires interpreter dispatch".to_string(),

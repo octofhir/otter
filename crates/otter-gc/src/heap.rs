@@ -780,6 +780,12 @@ impl GcHeap {
         &self.host_refs
     }
 
+    /// The heap's host-reference table, mutably. Restore-path use:
+    /// payloads must land at the indices the captured bodies carry.
+    pub fn host_refs_mut(&mut self) -> &mut crate::host_refs::HostRefTable {
+        &mut self.host_refs
+    }
+
     /// Register a [`crate::trace::ReleaseHostRefs`] body so the sweep
     /// releases its host-ref slots when it dies. Must be paired with an
     /// earlier `register_traceable::<T>()`.

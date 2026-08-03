@@ -84,6 +84,31 @@ impl HostRefTable {
         }
     }
 
+    /// Iterate occupied entries as `(index, payload)`.
+    pub fn entries(&self) -> impl Iterator<Item = (u32, &dyn Any)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.as_deref().map(|payload| (index as u32, payload)))
+    }
+
+    /// Store `payload` at exactly `index`, growing the table as needed.
+    ///
+    /// Restore-path primitive: restored bodies carry the capture
+    /// isolate's indices, so the payloads must land at the same slots.
+    pub fn insert_at(&mut self, index: u32, payload: Box<dyn Any>) {
+        assert_ne!(index, NO_HOST_REF, "index 0 is reserved");
+        let index = index as usize;
+        if self.entries.len() <= index {
+            self.entries.resize_with(index + 1, || None);
+        }
+        assert!(
+            self.entries[index].is_none(),
+            "restore collided with an occupied host-ref slot"
+        );
+        self.entries[index] = Some(payload);
+    }
+
     /// Occupied entries.
     #[must_use]
     pub fn len(&self) -> usize {

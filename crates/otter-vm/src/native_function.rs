@@ -298,6 +298,34 @@ impl NativeFunctionBody {
     }
 }
 
+/// Clone every dynamic-native closure entry of `source`'s host-ref
+/// table into `target`, at identical indices.
+///
+/// In-process restore only: the restored bodies carry the capture
+/// isolate's `u32` indices, and the two payload types this table holds
+/// are both `Arc`s that clone by reference count. A cross-process
+/// restore replaces this wholesale with the re-install-by-name list.
+pub fn clone_host_refs_for_restore(source: &otter_gc::GcHeap, target: &mut otter_gc::GcHeap) {
+    let cloned: Vec<(u32, Box<dyn std::any::Any>)> = source
+        .host_refs()
+        .entries()
+        .map(|(index, payload)| {
+            let clone: Box<dyn std::any::Any> =
+                if let Some(shared) = payload.downcast_ref::<Arc<NativeFn>>() {
+                    Box::new(shared.clone())
+                } else if let Some(local) = payload.downcast_ref::<Arc<LocalNativeFn>>() {
+                    Box::new(local.clone())
+                } else {
+                    unreachable!("host-ref table holds only dynamic-native closures")
+                };
+            (index, clone)
+        })
+        .collect();
+    for (index, payload) in cloned {
+        target.host_refs_mut().insert_at(index, payload);
+    }
+}
+
 impl otter_gc::trace::ReleaseHostRefs for NativeFunctionBody {
     fn release_host_refs(&mut self, table: &mut otter_gc::host_refs::HostRefTable) {
         match self.call {
@@ -1654,6 +1682,32 @@ mod tests {
             baseline,
             "dead body released its host-ref slot"
         );
+    }
+
+    /// The restore-path clone lands every closure at its original
+    /// index, so restored bodies resolve without rewriting.
+    #[test]
+    fn host_ref_clone_preserves_indices() {
+        let mut interp = crate::Interpreter::new();
+        let _f = native_value(interp.gc_heap_mut(), "cloned", |_, _, _| {
+            Ok(Value::undefined())
+        })
+        .expect("native");
+        let mut target = otter_gc::GcHeap::new().expect("target heap");
+        clone_host_refs_for_restore(interp.gc_heap(), &mut target);
+        assert_eq!(
+            target.host_refs().len(),
+            interp.gc_heap().host_refs().len(),
+            "every closure entry cloned"
+        );
+        let source_indices: Vec<u32> = interp
+            .gc_heap()
+            .host_refs()
+            .entries()
+            .map(|(i, _)| i)
+            .collect();
+        let target_indices: Vec<u32> = target.host_refs().entries().map(|(i, _)| i).collect();
+        assert_eq!(source_indices, target_indices, "indices preserved");
     }
 
     #[test]

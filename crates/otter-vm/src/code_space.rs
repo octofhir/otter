@@ -162,6 +162,76 @@ impl CodeSpace {
         }
     }
 
+    /// Every linked chunk in link order, as
+    /// `(function_base, property_ic_base, module)` — exactly what a
+    /// snapshot blob needs to rebuild this registry with
+    /// [`Self::link_restored_chunk`]. The stored modules already carry
+    /// their rebased ids.
+    pub(crate) fn chunk_snapshots(&self) -> Vec<(u32, u32, Arc<BytecodeModule>)> {
+        let mut out = Vec::new();
+        let mut ic_base = 0u32;
+        let mut chunk = self.first.get();
+        while let Some(current) = chunk {
+            let tables = &current.tables;
+            out.push((tables.function_base, ic_base, Arc::clone(&tables.module)));
+            ic_base = tables.executable.property_ic_site_end();
+            chunk = current.next.get();
+        }
+        out
+    }
+
+    /// Append a chunk whose module already carries rebased ids — the
+    /// restore half of [`Self::chunk_snapshots`]. Single-threaded by
+    /// contract: a blob restore rebuilds the whole registry before the
+    /// isolate runs anything.
+    ///
+    /// # Panics
+    /// When `function_base` does not continue the chain — that means
+    /// the blob's chunk order drifted from the registry invariant.
+    pub(crate) fn link_restored_chunk(
+        self: &Arc<Self>,
+        module: BytecodeModule,
+        function_base: u32,
+        property_ic_base: u32,
+    ) {
+        let mut tail = self.tail.lock().expect("code-space tail");
+        let (expected_base, expected_ic) = tail.as_ref().map_or((0, 0), |c| next_bases(&c.tables));
+        assert_eq!(
+            (function_base, property_ic_base),
+            (expected_base, expected_ic),
+            "restored chunk must continue the registry chain"
+        );
+        let function_count =
+            u32::try_from(module.functions.len()).expect("chunk function table exceeds u32 range");
+        let tables = ChunkTables {
+            function_base,
+            function_count,
+            executable: Arc::new(ExecutableModule::from_bytecode_with_ic_base(
+                &module,
+                property_ic_base,
+            )),
+            atoms: Arc::new(AtomTable::from_constants(&module.constants)),
+            module: Arc::new(module),
+        };
+        let chunk = Arc::new(CodeChunk {
+            tables,
+            next: OnceLock::new(),
+        });
+        match tail.as_ref() {
+            None => {
+                self.first
+                    .set(Arc::clone(&chunk))
+                    .expect("restored registry starts empty");
+            }
+            Some(prev) => {
+                prev.next
+                    .set(Arc::clone(&chunk))
+                    .expect("tail link is unclaimed under the tail lock");
+            }
+        }
+        *tail = Some(chunk);
+    }
+
     /// Resolve the chunk owning `function_id`, if any chunk was linked
     /// over that id.
     pub(crate) fn chunk_for(&self, function_id: u32) -> Option<&ChunkTables> {

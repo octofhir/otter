@@ -167,6 +167,39 @@ fn restored_runtime_evaluates_javascript() {
 }
 
 #[test]
+fn snapshot_blob_round_trips_in_process() {
+    let source = full_surface_runtime();
+    let bytes = source.snapshot_blob().expect("blob capture");
+    assert!(
+        bytes.len() > 100_000,
+        "the blob holds pages + bytecode, saw {} bytes",
+        bytes.len()
+    );
+
+    // Same-process resolver: hand back the live isolate's closures by
+    // their captured names.
+    let dynamics = source.dynamic_natives_by_name();
+    let mut restored = otter_runtime::Runtime::from_snapshot_blob_with(
+        &bytes,
+        otter_runtime::SnapshotRuntimeOptions::default(),
+        &mut |name| {
+            dynamics
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, payload)| payload.clone())
+        },
+    )
+    .expect("blob restore");
+
+    let result = restored
+        .eval(otter_runtime::SourceInput::from_javascript(
+            "JSON.stringify([1 + 1, /b+/.test('abbc'), new Map([[1, 2]]).get(1), eval('40 + 2')])",
+        ))
+        .expect("eval on blob-restored runtime");
+    assert_eq!(result.completion_string(), "[2,true,2,42]");
+}
+
+#[test]
 fn restore_is_cheaper_than_bootstrap() {
     use std::time::Instant;
     // Warm everything once, then capture the snapshot both paths share.

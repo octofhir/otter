@@ -56,6 +56,15 @@ impl Interpreter {
             .expect("GcHeap construction never fails on the default cage");
         object::register_gc_traceables(&mut gc_heap);
         let relocation = gc_heap.restore_old_space(&snapshot.image)?;
+        // Same indices, current addresses: every captured entry slides
+        // by however far the loader moved the binary image (zero for an
+        // in-process restore).
+        gc_heap.restore_external_refs(
+            snapshot
+                .external_ref_addrs
+                .iter()
+                .map(|&addr| relocation.slide_image_pointer(addr)),
+        );
 
         // Keyed side state that other shells depend on.
         let names = std::sync::Arc::new(crate::property_atom::NameInterner::default());
@@ -275,6 +284,28 @@ impl Interpreter {
                 }
                 for body in array_sidecars {
                     (*body).sever_after_restore();
+                }
+            }
+        }
+
+        // Native entry points are binary-image addresses; slide each one
+        // by the loader's image move. In-process the slide is zero and
+        // the pass rewrites nothing.
+        let slide = relocation.image_pointer_slide();
+        if slide != 0 {
+            let mut natives: Vec<*mut crate::native_function::NativeFunctionBody> = Vec::new();
+            interp
+                .gc_heap
+                .for_each_live_payload::<crate::native_function::NativeFunctionBody, _>(
+                    |_space, body| {
+                        natives.push(body as *const _ as *mut _);
+                    },
+                );
+            // SAFETY: single mutator, no allocation between collect and
+            // write; each pointer names a live payload of its type.
+            unsafe {
+                for body in natives {
+                    (*body).slide_entry_points(slide);
                 }
             }
         }

@@ -110,6 +110,14 @@ impl NameInterner {
         AtomId(id)
     }
 
+    /// The whole table in id order, for the isolate snapshot: index
+    /// equals the atom's id, so replaying the list through [`Self::intern`]
+    /// on a fresh isolate re-mints identical ids.
+    #[must_use]
+    pub(crate) fn snapshot_names(&self) -> Vec<Box<str>> {
+        self.inner.lock().expect("name interner").names.clone()
+    }
+
     /// Spelling of an interned atom, for diagnostics. Copies out because the
     /// storage is behind the interner's lock.
     #[cfg(test)]

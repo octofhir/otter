@@ -81,6 +81,7 @@ mod process_flags;
 pub mod promise_registry;
 mod realm;
 mod runtime_activity;
+pub mod snapshot_cache;
 pub mod structured_clone;
 pub mod surface;
 pub mod web_fetch_host;
@@ -169,15 +170,15 @@ pub use structured_clone::{
 };
 pub use surface::{
     HostAtomInterner, RuntimeAccessorSpec, RuntimeAttr, RuntimeClassSpec, RuntimeConstSpec,
-    RuntimeConstValue, RuntimeConstructorSpec, RuntimeHostAtom, RuntimeHostAtomId,
-    RuntimeHostDataTracer, RuntimeHostObjectData, RuntimeHostObjectError, RuntimeHostValueSlot,
-    RuntimeJsObject, RuntimeJsString, RuntimeLocal, RuntimeMethodSpec, RuntimeNamespaceSpec,
-    RuntimeNativeCall, RuntimeNativeCtx, RuntimeNativeError, RuntimeNativeFastFn, RuntimeNativeFn,
-    RuntimeNativeScope, RuntimeNumberValue, RuntimePropertySpec, RuntimeSurfaceError,
-    RuntimeTracedHostObjectData, RuntimeValue, runtime_accessor, runtime_alloc_object,
-    runtime_arg_to_string, runtime_array_from_elements, runtime_class, runtime_constant,
-    runtime_constructor, runtime_getter, runtime_method, runtime_method_with_attrs,
-    runtime_namespace, runtime_native_dynamic, runtime_native_static,
+    RuntimeConstValue, RuntimeConstructorSpec, RuntimeDynamicNativePayload, RuntimeHostAtom,
+    RuntimeHostAtomId, RuntimeHostDataTracer, RuntimeHostObjectData, RuntimeHostObjectError,
+    RuntimeHostValueSlot, RuntimeJsObject, RuntimeJsString, RuntimeLocal, RuntimeMethodSpec,
+    RuntimeNamespaceSpec, RuntimeNativeCall, RuntimeNativeCtx, RuntimeNativeError,
+    RuntimeNativeFastFn, RuntimeNativeFn, RuntimeNativeScope, RuntimeNumberValue,
+    RuntimePropertySpec, RuntimeSurfaceError, RuntimeTracedHostObjectData, RuntimeValue,
+    runtime_accessor, runtime_alloc_object, runtime_arg_to_string, runtime_array_from_elements,
+    runtime_class, runtime_constant, runtime_constructor, runtime_getter, runtime_method,
+    runtime_method_with_attrs, runtime_namespace, runtime_native_dynamic, runtime_native_static,
     runtime_optional_arg_to_string, runtime_property, runtime_set_property, runtime_string_value,
     runtime_this_object, runtime_type_error, runtime_with_host_data, runtime_with_host_data_mut,
 };
@@ -1592,6 +1593,49 @@ pub(crate) struct RuntimeConfig {
     jit_selection: JitSelection,
     jit_osr_threshold: Option<u32>,
     jit_debug: JitDebugRequest,
+    /// Named factories re-creating dynamic-native closures on a
+    /// snapshot restore. Populated by extension builder methods.
+    dynamic_native_factories: DynamicNativeFactories,
+    /// Serve builds from the per-user snapshot cache and store fresh
+    /// builds back into it.
+    snapshot_cache: bool,
+    /// Cache directory override; `None` uses the per-user default.
+    snapshot_cache_root: Option<PathBuf>,
+}
+
+/// What a [`DynamicNativeFactory`] sees at restore time.
+pub struct DynamicNativeReattachCtx<'a> {
+    /// The restoring runtime's capability set.
+    pub capabilities: &'a CapabilitySet,
+    /// Event-loop task spawner, when the host runs one.
+    pub task_spawner: Option<RuntimeTaskSpawner>,
+}
+
+/// Factory re-creating one named dynamic-native closure on restore.
+pub type DynamicNativeFactory = Arc<
+    dyn Fn(&DynamicNativeReattachCtx<'_>) -> otter_vm::snapshot::DynamicNativePayload + Send + Sync,
+>;
+
+/// Name-keyed [`DynamicNativeFactory`] set carried by the config.
+#[derive(Clone, Default)]
+pub(crate) struct DynamicNativeFactories {
+    by_name: std::collections::HashMap<String, DynamicNativeFactory>,
+}
+
+impl std::fmt::Debug for DynamicNativeFactories {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DynamicNativeFactories({})", self.by_name.len())
+    }
+}
+
+impl DynamicNativeFactories {
+    fn insert(&mut self, name: String, factory: DynamicNativeFactory) {
+        self.by_name.insert(name, factory);
+    }
+
+    fn get(&self, name: &str) -> Option<&DynamicNativeFactory> {
+        self.by_name.get(name)
+    }
 }
 
 /// Which execution tiers a runtime installs at construction.
@@ -1851,6 +1895,9 @@ impl Default for RuntimeConfig {
             jit_selection: JitSelection::default(),
             jit_osr_threshold: None,
             jit_debug: JitDebugRequest::default(),
+            dynamic_native_factories: DynamicNativeFactories::default(),
+            snapshot_cache: false,
+            snapshot_cache_root: None,
         }
     }
 }
@@ -1862,6 +1909,40 @@ impl RuntimeConfig {
 
     pub(crate) fn runtime_host(&self) -> Option<TokioRuntimeHost> {
         self.runtime_host.clone()
+    }
+
+    /// The cache this build reads and writes, honoring the root
+    /// override.
+    pub(crate) fn snapshot_cache_handle(&self) -> Option<snapshot_cache::SnapshotCache> {
+        match &self.snapshot_cache_root {
+            Some(root) => Some(snapshot_cache::SnapshotCache::new(root.clone())),
+            None => snapshot_cache::SnapshotCache::user_default(),
+        }
+    }
+
+    /// Everything about this build that shapes the bootstrap image and
+    /// is not per-run data — the snapshot cache key's discriminator.
+    /// Per-run values (argv, cwd, env, capabilities) are deliberately
+    /// absent: the restore path re-supplies them.
+    pub(crate) fn snapshot_surface_tag(&self) -> String {
+        use std::fmt::Write as _;
+        let mut tag = String::new();
+        for extension in &self.extensions {
+            let _ = write!(tag, "ext:{};", extension.name);
+        }
+        for hosted in &self.hosted_modules {
+            let _ = write!(tag, "mod:{};", hosted.specifier);
+        }
+        let _ = write!(
+            tag,
+            "classes:{};installers:{};commonjs:{};process:{};worker:{}",
+            self.global_classes.len(),
+            self.realm_installers.len(),
+            self.commonjs_enabled,
+            self.install_process_global,
+            self.install_worker_global,
+        );
+        tag
     }
 }
 
@@ -2224,6 +2305,40 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Register a factory that re-creates the named dynamic-native
+    /// closure when this build restores from a snapshot blob.
+    /// Extension builder methods call this for every closure they
+    /// install; a name the restore cannot resolve is a cache miss.
+    #[must_use]
+    pub fn dynamic_native_factory(
+        mut self,
+        name: impl Into<String>,
+        factory: DynamicNativeFactory,
+    ) -> Self {
+        self.config
+            .dynamic_native_factories
+            .insert(name.into(), factory);
+        self
+    }
+
+    /// Serve this build from the per-user snapshot cache: a hit
+    /// restores the bootstrap image instead of rebuilding it, a miss
+    /// bootstraps and stores the blob for the next launch.
+    #[must_use]
+    pub fn snapshot_cache(mut self, enabled: bool) -> Self {
+        self.config.snapshot_cache = enabled;
+        self
+    }
+
+    /// Root directory for the snapshot cache, overriding the per-user
+    /// default. Implies [`Self::snapshot_cache`]`(true)`.
+    #[must_use]
+    pub fn snapshot_cache_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config.snapshot_cache = true;
+        self.config.snapshot_cache_root = Some(root.into());
+        self
+    }
+
     /// Override the back-edge count at which a hot loop tiers up via OSR.
     /// Differential and conformance harnesses set `1` to force compiled loop
     /// coverage; production embedders keep the default.
@@ -2372,6 +2487,17 @@ impl Runtime {
             jit_selection: options.jit_selection,
             ..RuntimeConfig::default()
         };
+        Self::assemble_restored(snapshot, config, None)
+    }
+
+    /// Build a full runtime around a restored interpreter: the same
+    /// host wiring `from_config` applies after bootstrap, minus
+    /// everything that already lives in the image.
+    fn assemble_restored(
+        snapshot: &otter_vm::snapshot::IsolateSnapshot,
+        config: RuntimeConfig,
+        runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    ) -> Result<Self, OtterError> {
         Self::validate_config(&config)?;
         let module_loader = RuntimeModuleLoaderState::new(config.loader.clone());
         let package_manager =
@@ -2412,6 +2538,7 @@ impl Runtime {
         }));
         Ok(Runtime {
             interp,
+            restored_from_snapshot: true,
             realm_owner_id: realm::next_realm_owner_id(),
             config,
             enforce_direct_timeout: true,
@@ -2423,14 +2550,66 @@ impl Runtime {
             package_manager,
             layer_a_dynamic_imports,
             promise_registry: promise_registry::PromiseRegistry::new(),
-            runtime_task_spawner: None,
+            runtime_task_spawner,
         })
+    }
+
+    /// Try to serve `config` from the snapshot cache. Any miss —
+    /// absent entry, undecodable blob, unresolvable dynamic native —
+    /// returns `None` and the caller bootstraps.
+    fn try_snapshot_restore(
+        config: &RuntimeConfig,
+        runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    ) -> Option<Self> {
+        let cache = config.snapshot_cache_handle()?;
+        let key = snapshot_cache::snapshot_cache_key(&config.snapshot_surface_tag());
+        let bytes = cache.load(&key)?;
+        let worker_host = config
+            .install_worker_global
+            .then(|| Arc::new(worker::WorkerHostState::new(config.clone())));
+        let reattach_ctx = DynamicNativeReattachCtx {
+            capabilities: &config.capabilities,
+            task_spawner: runtime_task_spawner.clone(),
+        };
+        let mut resolve = |name: &str| {
+            if let Some(host) = &worker_host
+                && let Some(payload) = worker::dynamic_native_payload(name, host)
+            {
+                return Some(payload);
+            }
+            if config.install_process_global
+                && let Some(payload) = process::dynamic_native_payload(name, &config.process_cwd)
+            {
+                return Some(payload);
+            }
+            config
+                .dynamic_native_factories
+                .get(name)
+                .map(|factory| factory(&reattach_ctx))
+        };
+        let snapshot = otter_vm::snapshot::IsolateSnapshot::from_bytes(&bytes, &mut resolve)?;
+        let mut runtime =
+            Self::assemble_restored(&snapshot, config.clone(), runtime_task_spawner).ok()?;
+        process::reattach_after_restore(
+            &mut runtime.interp,
+            &runtime.config.process_argv,
+            &runtime.config.process_env_overlay,
+            &runtime.config.capabilities,
+            &runtime.config.hooks,
+        )
+        .ok()?;
+        Some(runtime)
     }
 
     pub(crate) fn from_config_with_task_spawner(
         config: RuntimeConfig,
         runtime_task_spawner: Option<RuntimeTaskSpawner>,
     ) -> Result<Self, OtterError> {
+        if config.snapshot_cache
+            && let Some(runtime) = Self::try_snapshot_restore(&config, runtime_task_spawner.clone())
+        {
+            return Ok(runtime);
+        }
         Self::validate_config(&config)?;
         let module_loader = RuntimeModuleLoaderState::new(config.loader.clone());
         let package_manager =
@@ -2626,6 +2805,7 @@ impl Runtime {
             layer_a_dynamic_imports,
             promise_registry: promise_registry::PromiseRegistry::new(),
             runtime_task_spawner,
+            restored_from_snapshot: false,
         };
         if runtime.config.install_worker_global {
             worker::install_main_worker_globals(&mut runtime)?;
@@ -2669,6 +2849,16 @@ impl Runtime {
                     message: format!("class `{name}` attached JS glue failed: {err}"),
                 })?;
         }
+        // The build is complete and still fully tenured — exactly the
+        // state a snapshot wants. Store the blob so the next launch of
+        // this binary restores instead of rebuilding.
+        if runtime.config.snapshot_cache
+            && let Some(cache) = runtime.config.snapshot_cache_handle()
+            && let Ok(blob) = runtime.snapshot_blob()
+        {
+            let key = snapshot_cache::snapshot_cache_key(&runtime.config.snapshot_surface_tag());
+            cache.store(&key, &blob);
+        }
         // Bootstrap is over; user allocations go back through the nursery,
         // where most of them die.
         runtime.interp.gc_heap_mut().set_tenure_all(false);
@@ -2680,6 +2870,9 @@ impl Runtime {
 #[derive(Debug)]
 pub struct Runtime {
     interp: Interpreter,
+    /// Whether this runtime came from a snapshot restore rather than a
+    /// bootstrap — observable for tests and startup diagnostics.
+    restored_from_snapshot: bool,
     /// Process-unique scalar used to reject realm ids from another isolate.
     realm_owner_id: u64,
     config: RuntimeConfig,
@@ -4129,6 +4322,13 @@ impl Runtime {
     #[must_use]
     pub fn capture_snapshot_roots(&self) -> Vec<otter_gc::raw::RawGc> {
         self.interp.capture_snapshot_roots()
+    }
+
+    /// Whether this runtime restored from a snapshot blob instead of
+    /// bootstrapping.
+    #[must_use]
+    pub fn restored_from_snapshot(&self) -> bool {
+        self.restored_from_snapshot
     }
 
     /// Serialize this isolate to the flat snapshot blob a later
@@ -5647,6 +5847,26 @@ impl OtterBuilder {
     #[must_use]
     pub fn jit_debug(mut self, request: JitDebugRequest) -> Self {
         self.runtime = self.runtime.jit_debug(request);
+        self
+    }
+
+    /// Serve this build from the per-user snapshot cache. See
+    /// [`RuntimeBuilder::snapshot_cache`].
+    #[must_use]
+    pub fn snapshot_cache(mut self, enabled: bool) -> Self {
+        self.runtime = self.runtime.snapshot_cache(enabled);
+        self
+    }
+
+    /// Register a snapshot-restore factory for a named dynamic native.
+    /// See [`RuntimeBuilder::dynamic_native_factory`].
+    #[must_use]
+    pub fn dynamic_native_factory(
+        mut self,
+        name: impl Into<String>,
+        factory: DynamicNativeFactory,
+    ) -> Self {
+        self.runtime = self.runtime.dynamic_native_factory(name, factory);
         self
     }
 

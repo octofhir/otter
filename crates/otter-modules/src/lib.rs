@@ -58,6 +58,18 @@ impl OtterModulesBuilderExt for RuntimeBuilder {
     fn with_otter_modules(self) -> Self {
         self.hosted_modules(HOSTED_MODULES.iter().copied())
             .extension_installer(serve::otter_global_installer())
+            .dynamic_native_factory(
+                "__otterServe",
+                std::sync::Arc::new(|ctx| {
+                    let capabilities = ctx.capabilities.clone();
+                    let task_spawner = ctx.task_spawner.clone();
+                    otter_runtime::RuntimeDynamicNativePayload::shared(
+                        move |ctx, args, _captures| {
+                            serve::serve(ctx, args, &capabilities, task_spawner.clone())
+                        },
+                    )
+                }),
+            )
     }
 }
 
@@ -65,6 +77,18 @@ impl OtterModulesBuilderExt for OtterBuilder {
     fn with_otter_modules(self) -> Self {
         self.hosted_modules(HOSTED_MODULES.iter().copied())
             .extension_installer(serve::otter_global_installer())
+            .dynamic_native_factory(
+                "__otterServe",
+                std::sync::Arc::new(|ctx| {
+                    let capabilities = ctx.capabilities.clone();
+                    let task_spawner = ctx.task_spawner.clone();
+                    otter_runtime::RuntimeDynamicNativePayload::shared(
+                        move |ctx, args, _captures| {
+                            serve::serve(ctx, args, &capabilities, task_spawner.clone())
+                        },
+                    )
+                }),
+            )
     }
 }
 

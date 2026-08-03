@@ -398,27 +398,90 @@ impl ArrayExoticSlots {
     /// Sever foreign ownership after a snapshot restore: every
     /// container is re-read out of the aliased storage into a fresh
     /// allocation and written back without dropping the alias.
-    pub(crate) fn sever_after_restore(&mut self) {
-        let sparse = self.sparse_elements.clone();
-        let named = self.named_properties.clone();
-        let accessors = self.accessors.clone();
-        let flags = self.property_flags.clone();
-        let symbol_properties = self.symbol_properties.clone();
-        let symbol_accessors = self.symbol_accessors.clone();
-        let source_bytes = self
-            .source_bytes
+    /// Whether every container is absent — the state a snapshot can
+    /// carry. The capture refuses an image whose array sidecars hold
+    /// content, because [`Self::sever_restored_payload`] drops it.
+    /// The serializable slice of this sidecar: per-key descriptor
+    /// flags as `(key, writable, enumerable, configurable)`. Every
+    /// other container must be empty for a snapshot
+    /// ([`Self::is_empty_for_snapshot`] modulo this one).
+    pub(crate) fn snapshot_property_flags(&self) -> Vec<(String, bool, bool, bool)> {
+        self.property_flags
             .as_ref()
-            .map(|bytes| std::sync::Arc::from(bytes.as_ref().to_vec().into_boxed_slice()));
-        // SAFETY: overwriting without dropping severs the alias; the
-        // capture isolate remains the owner.
+            .map(|flags| {
+                let mut out: Vec<(String, bool, bool, bool)> = flags
+                    .iter()
+                    .map(|(key, f)| (key.clone(), f.writable(), f.enumerable(), f.configurable()))
+                    .collect();
+                out.sort_by(|a, b| a.0.cmp(&b.0));
+                out
+            })
+            .unwrap_or_default()
+    }
+
+    /// Rebuild the flags table from a snapshot record. Runs after the
+    /// restore hook wrote the container to `None`, so this is a plain
+    /// assignment, not an alias overwrite.
+    pub(crate) fn restore_property_flags(&mut self, records: &[(String, bool, bool, bool)]) {
+        if records.is_empty() {
+            return;
+        }
+        let mut table = HashMap::with_capacity(records.len());
+        for (key, writable, enumerable, configurable) in records {
+            table.insert(
+                key.clone(),
+                PropertyFlags::new(*writable, *enumerable, *configurable),
+            );
+        }
+        self.property_flags = Some(table);
+    }
+
+    pub(crate) fn snapshot_content_summary(&self) -> String {
+        format!(
+            "sparse:{} named:{:?} accessors:{:?} flags:{:?} sym:{} symacc:{} src:{}",
+            self.sparse_elements.as_ref().map_or(0, |m| m.len()),
+            self.named_properties
+                .as_ref()
+                .map(|m| m.keys().cloned().collect::<Vec<_>>()),
+            self.accessors
+                .as_ref()
+                .map(|m| m.keys().cloned().collect::<Vec<_>>()),
+            self.property_flags
+                .as_ref()
+                .map(|m| m.keys().cloned().collect::<Vec<_>>()),
+            self.symbol_properties.as_ref().map_or(0, |v| v.len()),
+            self.symbol_accessors.as_ref().map_or(0, |v| v.len()),
+            self.source_bytes.is_some(),
+        )
+    }
+
+    pub(crate) fn is_empty_for_snapshot(&self) -> bool {
+        self.sparse_elements.is_none()
+            && self.named_properties.is_none()
+            && self.accessors.is_none()
+            && self.symbol_properties.is_none()
+            && self.symbol_accessors.is_none()
+            && self.source_bytes.is_none()
+    }
+}
+
+impl otter_gc::trace::SeverRestoredPayload for ArrayExoticSlots {
+    /// Sever foreign ownership on a snapshot restore. The containers
+    /// alias the capture isolate's mallocs — unreadable in another
+    /// process, so they are overwritten with `None` without being read
+    /// or dropped. The capture side guarantees they were empty
+    /// ([`Self::is_empty_for_snapshot`]).
+    fn sever_restored_payload(&mut self) {
+        // SAFETY: overwriting without dropping (or reading) severs the
+        // alias; the capture isolate remains the owner.
         unsafe {
-            std::ptr::write(&mut self.sparse_elements, sparse);
-            std::ptr::write(&mut self.named_properties, named);
-            std::ptr::write(&mut self.accessors, accessors);
-            std::ptr::write(&mut self.property_flags, flags);
-            std::ptr::write(&mut self.symbol_properties, symbol_properties);
-            std::ptr::write(&mut self.symbol_accessors, symbol_accessors);
-            std::ptr::write(&mut self.source_bytes, source_bytes);
+            std::ptr::write(&mut self.sparse_elements, None);
+            std::ptr::write(&mut self.named_properties, None);
+            std::ptr::write(&mut self.accessors, None);
+            std::ptr::write(&mut self.property_flags, None);
+            std::ptr::write(&mut self.symbol_properties, None);
+            std::ptr::write(&mut self.symbol_accessors, None);
+            std::ptr::write(&mut self.source_bytes, None);
         }
     }
 }

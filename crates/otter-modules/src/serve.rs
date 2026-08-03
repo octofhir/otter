@@ -182,7 +182,7 @@ fn install_global_otter(runtime: &mut RuntimeExtensionContext<'_>) -> Result<(),
     Ok(())
 }
 
-fn serve(
+pub(crate) fn serve(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
     capabilities: &CapabilitySet,

@@ -397,6 +397,96 @@ pub(crate) fn exit_code(interp: &Interpreter) -> u8 {
     normalize_exit_code(&value).unwrap_or(0)
 }
 
+/// Patch the per-run values a restored `process` object carries from
+/// its donor: argv / argv0 / execPath, env (this process's variables
+/// under the current capability policy), and pid / ppid. Everything
+/// else on `process` is build-static and correct as restored; `cwd()`
+/// and the clocks are dynamic natives the restore resolver already
+/// re-created against the current configuration.
+pub(crate) fn reattach_after_restore(
+    interp: &mut Interpreter,
+    process_argv: &[String],
+    process_env_overlay: &std::collections::BTreeMap<String, String>,
+    capabilities: &CapabilitySet,
+    hooks: &RuntimeHooks,
+) -> Result<(), OtterError> {
+    let snapshot = runtime_process_snapshot();
+    let global_object = *interp.global_this();
+    let result: Result<(), NativeError> = NativeCtx::with_host_context(
+        interp,
+        otter_vm::NativeCallInfo::default_call(),
+        None,
+        |ctx| {
+            ctx.scope(|mut scope| {
+                let global_object = scope.value(Value::object(global_object));
+                let process = scope.get(global_object, "process")?;
+                if !scope.is_object(process) {
+                    return Ok(());
+                }
+
+                let argv = scope.array(process_argv.len())?;
+                for (index, arg) in process_argv.iter().enumerate() {
+                    let arg = scope.string(arg)?;
+                    scope.set_index(argv, index, arg)?;
+                }
+                scope.set(process, "argv", argv)?;
+
+                for (name, value) in [
+                    (
+                        "argv0",
+                        process_argv.first().map(String::as_str).unwrap_or("otter"),
+                    ),
+                    ("execPath", snapshot.exec_path.as_str()),
+                ] {
+                    let value = scope.string(value)?;
+                    scope.set(process, name, value)?;
+                }
+
+                let pid = scope.number(f64::from(pid_to_i32(snapshot.pid)));
+                scope.set(process, "pid", pid)?;
+                let ppid = scope.number(f64::from(pid_to_i32(snapshot.ppid.unwrap_or(0))));
+                scope.set(process, "ppid", ppid)?;
+
+                let env = crate::process_env::build(
+                    &mut scope,
+                    process_env_overlay,
+                    capabilities,
+                    hooks,
+                )?;
+                scope.set(process, "env", env)?;
+                Ok(())
+            })
+        },
+    );
+    result.map_err(|err| OtterError::Internal {
+        code: crate::DiagnosticCode::IsolateStart.as_str().to_string(),
+        message: format!("process reattach failed: {err:?}"),
+    })
+}
+
+/// Re-create one of this module's dynamic-native closures by its
+/// captured display name — the process half of a snapshot-restore
+/// resolver. Clock closures start from a fresh `Instant`, which is
+/// what a new process's `uptime()`/`hrtime()` should measure anyway;
+/// `cwd` reads the restoring configuration, not the captured one.
+pub(crate) fn dynamic_native_payload(
+    name: &str,
+    process_cwd: &Path,
+) -> Option<otter_vm::snapshot::DynamicNativePayload> {
+    let snapshot = runtime_process_snapshot();
+    let call = match name {
+        "cwd" => cwd_call(process_cwd.to_string_lossy().to_string()),
+        "uptime" => uptime_call(Instant::now(), snapshot.run_time_secs),
+        "hrtime" => hrtime_call(Instant::now()),
+        "bigint" => hrtime_bigint_call(Instant::now()),
+        _ => return None,
+    };
+    match call {
+        NativeCall::Dynamic(arc) => Some(otter_vm::snapshot::DynamicNativePayload::Shared(arc)),
+        NativeCall::Static(_) | NativeCall::VmIntrinsic(_) => None,
+    }
+}
+
 fn cwd_call(cwd: String) -> NativeCall {
     let call: Arc<NativeFn> = Arc::new(move |ctx, _args, _captures| {
         Ok(otter_vm::Value::string(

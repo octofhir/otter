@@ -136,6 +136,12 @@ fn restored_runtime_evaluates_javascript() {
             "0",
         ),
         ("eval hook", "eval('2 + 3').toString()", "5"),
+        ("string match via @@match", "'abc'.match(/b/)[0]", "b"),
+        (
+            "regexp @@match presence",
+            "(typeof RegExp.prototype[Symbol.match]).toString()",
+            "function",
+        ),
         (
             "dynamic Function",
             "new Function('return \"fn-ok\"')()",
@@ -244,6 +250,49 @@ fn snapshot_cache_serves_the_second_build() {
         probe.completion_string(),
         r#"[2,"function","function","string",true,42]"#
     );
+}
+
+#[test]
+fn a_full_collection_on_a_restored_isolate_loses_nothing() {
+    let mut source = full_surface_runtime();
+    let snapshot = source.capture_isolate_snapshot().expect("capture");
+    source.force_gc().expect("donor full GC");
+    let donor = source.heap_census();
+    let donor_rows: Vec<(u8, u64)> = donor
+        .old
+        .rows
+        .iter()
+        .map(|row| (row.type_tag, row.object_count))
+        .collect();
+
+    let mut restored =
+        otter_runtime::Runtime::from_isolate_snapshot(&snapshot).expect("runtime restore");
+    restored.force_gc().expect("restored full GC");
+    let after = restored.heap_census();
+    let after_by_tag: std::collections::HashMap<u8, u64> = after
+        .old
+        .rows
+        .iter()
+        .map(|row| (row.type_tag, row.object_count))
+        .collect();
+    // The restored isolate rebuilds its lookup caches empty, so bodies
+    // the donor held ONLY through a cache legitimately die on the
+    // first collection. What must never happen is a whole type
+    // vanishing or a large bite out of one — that is the signature of
+    // slots the relocation walk failed to rewrite (tagged compressed
+    // words surfaced through stack temporaries, unvisited symbol
+    // keys), which this test regresses.
+    for (tag, donor_count) in &donor_rows {
+        let after_count = after_by_tag.get(tag).copied().unwrap_or(0);
+        assert!(
+            after_count > 0,
+            "type {tag:#x} vanished entirely after a restored-isolate GC ({donor_count} at donor)"
+        );
+        assert!(
+            after_count * 2 >= *donor_count,
+            "type {tag:#x} lost most of its bodies: donor {donor_count}, restored {after_count}"
+        );
+    }
 }
 
 #[test]

@@ -393,7 +393,8 @@ fn trace_array_symbol_properties(
     visitor: &mut SlotVisitor<'_>,
 ) {
     if let Some(entries) = field {
-        for (_sym, value) in entries {
+        for (sym, value) in entries {
+            sym.trace_value_slots(visitor);
             value.trace_value_slot_mut(visitor);
         }
     }
@@ -406,7 +407,8 @@ fn trace_array_symbol_accessors(
     visitor: &mut SlotVisitor<'_>,
 ) {
     if let Some(entries) = field {
-        for (_sym, (getter, setter)) in entries {
+        for (sym, (getter, setter)) in entries {
+            sym.trace_value_slots(visitor);
             if let Some(g) = getter {
                 g.trace_value_slot_mut(visitor);
             }

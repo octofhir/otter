@@ -282,6 +282,31 @@ pub(crate) const NATIVE_FUNCTION_BODY_NATIVE_REF_OFFSET: usize =
 const _: () = assert!(NATIVE_FUNCTION_BODY_NATIVE_REF_OFFSET == 0);
 
 impl NativeFunctionBody {
+    /// Rewrite the entry-point address by the loader's image slide.
+    /// A page restore in another process copies the captured function
+    /// pointer verbatim; the whole binary image moved as one unit, so
+    /// adding the slide yields this process's address for the same
+    /// function. Dynamic variants hold host-ref indices, not
+    /// addresses, and stay untouched.
+    pub(crate) fn slide_entry_points(&mut self, slide: isize) {
+        match &mut self.call {
+            NativeCallSlot::Static(f) => {
+                let addr = (*f as usize).wrapping_add_signed(slide);
+                // SAFETY: `addr` is the captured entry point of this
+                // exact function in the current process image.
+                *f = unsafe { std::mem::transmute::<usize, NativeFastFn>(addr) };
+            }
+            NativeCallSlot::StaticWithCaptures(f) => {
+                let addr = (*f as usize).wrapping_add_signed(slide);
+                // SAFETY: as above, for the captures ABI.
+                *f = unsafe { std::mem::transmute::<usize, NativeCapturesFn>(addr) };
+            }
+            NativeCallSlot::VmIntrinsic(_)
+            | NativeCallSlot::Dynamic(_)
+            | NativeCallSlot::LocalDynamic(_) => {}
+        }
+    }
+
     /// Describe this body's non-GC payload for
     /// [`crate::native_census`]. Lives here because the storage enum
     /// and the raw entry address are module-private; the census
@@ -322,6 +347,37 @@ pub fn clone_host_refs_for_restore(source: &otter_gc::GcHeap, target: &mut otter
     for (index, payload) in snapshot_dynamic_natives(source) {
         install_dynamic_native(target, index, &payload);
     }
+}
+
+/// Display names of every dynamic-native body, keyed by host-ref
+/// index — the serializable half of the closure list. A blob restore
+/// re-creates each payload by name through the host's resolver.
+pub fn dynamic_native_names(heap: &otter_gc::GcHeap) -> Vec<(u32, String)> {
+    let mut out: Vec<(u32, String)> = Vec::new();
+    heap.for_each_live_payload::<NativeFunctionBody, _>(|_space, body| {
+        if let NativeCallSlot::Dynamic(index) | NativeCallSlot::LocalDynamic(index) = body.call {
+            out.push((index, body.name.to_lossy_string(heap)));
+        }
+    });
+    out.sort_by_key(|entry| entry.0);
+    out.dedup_by(|a, b| a.0 == b.0);
+    out
+}
+
+/// Dynamic-native payloads keyed by display name — the in-process
+/// resolver for a blob decode: the same process that captured the
+/// closures can hand them back by name, Arc-cloned.
+pub fn dynamic_natives_by_name(
+    heap: &otter_gc::GcHeap,
+) -> Vec<(String, crate::snapshot::DynamicNativePayload)> {
+    let names = dynamic_native_names(heap);
+    let payloads = snapshot_dynamic_natives(heap);
+    let by_index: std::collections::HashMap<u32, crate::snapshot::DynamicNativePayload> =
+        payloads.into_iter().collect();
+    names
+        .into_iter()
+        .filter_map(|(index, name)| Some((name, by_index.get(&index)?.clone())))
+        .collect()
 }
 
 /// Collect the dynamic-native closures of `heap`'s host-ref table for

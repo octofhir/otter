@@ -96,6 +96,32 @@ impl ExternalRefTable {
         self.addrs.get(index as usize - 1).copied()
     }
 
+    /// Every interned address in index order (index `i + 1` holds
+    /// `addrs()[i]`). This is the list a snapshot serializes; a
+    /// restore feeds it back through [`Self::restore_from_addrs`]
+    /// after sliding each address by the loader's image move.
+    #[must_use]
+    pub fn addrs(&self) -> &[usize] {
+        &self.addrs
+    }
+
+    /// Rebuild the table from a serialized address list, preserving
+    /// indices. The table must be empty — restore precedes any
+    /// interning in a restored isolate.
+    ///
+    /// # Panics
+    /// When the table already holds entries; that is a caller
+    /// sequencing bug, not an input problem.
+    pub fn restore_from_addrs(&mut self, addrs: impl IntoIterator<Item = usize>) {
+        assert!(
+            self.addrs.is_empty(),
+            "external-ref restore requires an empty table"
+        );
+        for addr in addrs {
+            self.intern(addr);
+        }
+    }
+
     /// Number of distinct addresses interned.
     #[must_use]
     pub fn len(&self) -> usize {

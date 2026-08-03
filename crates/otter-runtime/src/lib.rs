@@ -2333,6 +2333,28 @@ impl Runtime {
         Self::from_isolate_snapshot_with(snapshot, SnapshotRuntimeOptions::default())
     }
 
+    /// Restore from a serialized snapshot blob. `resolve` supplies
+    /// each dynamic-native closure by its captured display name.
+    ///
+    /// # Errors
+    /// A blob this binary did not write (or a name the resolver cannot
+    /// supply) surfaces as [`OtterError::Internal`]; callers treat it
+    /// as a cache miss and bootstrap instead.
+    pub fn from_snapshot_blob_with(
+        bytes: &[u8],
+        options: SnapshotRuntimeOptions,
+        resolve: &mut dyn FnMut(&str) -> Option<otter_vm::snapshot::DynamicNativePayload>,
+    ) -> Result<Self, OtterError> {
+        let snapshot =
+            otter_vm::snapshot::IsolateSnapshot::from_bytes(bytes, resolve).ok_or_else(|| {
+                OtterError::Internal {
+                    code: DiagnosticCode::IsolateStart.as_str().to_string(),
+                    message: "snapshot blob decode failed".to_string(),
+                }
+            })?;
+        Self::from_isolate_snapshot_with(&snapshot, options)
+    }
+
     /// [`Self::from_isolate_snapshot`] with the per-isolate knobs a
     /// host actually varies per run — everything else about the realm
     /// is already inside the image.
@@ -4107,6 +4129,27 @@ impl Runtime {
     #[must_use]
     pub fn capture_snapshot_roots(&self) -> Vec<otter_gc::raw::RawGc> {
         self.interp.capture_snapshot_roots()
+    }
+
+    /// Serialize this isolate to the flat snapshot blob a later
+    /// process of the same binary restores with
+    /// [`Self::from_snapshot_blob_with`].
+    ///
+    /// # Errors
+    /// Propagates [`otter_gc::ImageError`] from the capture.
+    pub fn snapshot_blob(&self) -> Result<Vec<u8>, otter_gc::ImageError> {
+        let snapshot = self.capture_isolate_snapshot()?;
+        let names = otter_vm::native_function::dynamic_native_names(self.interp.gc_heap());
+        Ok(snapshot.to_bytes(&names))
+    }
+
+    /// Dynamic-native payloads of this live isolate keyed by display
+    /// name — the resolver a same-process blob decode uses.
+    #[must_use]
+    pub fn dynamic_natives_by_name(
+        &self,
+    ) -> Vec<(String, otter_vm::snapshot::DynamicNativePayload)> {
+        otter_vm::native_function::dynamic_natives_by_name(self.interp.gc_heap())
     }
 
     /// Capture everything a restore needs from this isolate. See

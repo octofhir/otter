@@ -170,6 +170,96 @@ impl HeapImage {
     pub fn byte_len(&self) -> usize {
         self.pages.iter().map(|p| p.bytes.len()).sum()
     }
+
+    /// Serialize to a flat byte stream. Little-endian, length-prefixed
+    /// pages, no graph walk — the format a same-binary cache reads
+    /// straight back with [`Self::from_bytes`]. The image anchor rides
+    /// along so the reader can compute the loader slide.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64 + self.byte_len());
+        out.extend_from_slice(IMAGE_MAGIC);
+        out.extend_from_slice(&(self.image_anchor as u64).to_le_bytes());
+        out.extend_from_slice(&self.object_count.to_le_bytes());
+        out.extend_from_slice(&self.live_bytes.to_le_bytes());
+        out.extend_from_slice(&(self.pages.len() as u32).to_le_bytes());
+        for page in &self.pages {
+            out.extend_from_slice(&page.cage_offset.to_le_bytes());
+            out.extend_from_slice(&(page.bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(&page.bytes);
+        }
+        out
+    }
+
+    /// Decode a stream [`Self::to_bytes`] wrote. Any structural
+    /// mismatch yields `None`; the caller treats that as a cache miss
+    /// and bootstraps instead.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = ByteReader::new(bytes);
+        if r.take(IMAGE_MAGIC.len())? != IMAGE_MAGIC {
+            return None;
+        }
+        let image_anchor = r.u64()? as usize;
+        let object_count = r.u64()?;
+        let live_bytes = r.u64()?;
+        let page_count = r.u32()? as usize;
+        let mut pages = Vec::with_capacity(page_count.min(1024));
+        for _ in 0..page_count {
+            let cage_offset = r.u32()?;
+            let len = r.u32()? as usize;
+            let bytes = r.take(len)?.to_vec();
+            pages.push(PageImage { cage_offset, bytes });
+        }
+        if !r.is_empty() {
+            return None;
+        }
+        Some(Self {
+            pages,
+            image_anchor,
+            object_count,
+            live_bytes,
+        })
+    }
+}
+
+/// Format marker for [`HeapImage::to_bytes`]. Not versioned — the
+/// cache key already changes with every rebuild, so a stale stream is
+/// never found, only an absent one.
+const IMAGE_MAGIC: &[u8] = b"otter-heap-image\0";
+
+/// Bounds-checked little-endian cursor for [`HeapImage::from_bytes`].
+struct ByteReader<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> ByteReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        if self.bytes.len() < n {
+            return None;
+        }
+        let (head, rest) = self.bytes.split_at(n);
+        self.bytes = rest;
+        Some(head)
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        self.take(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        self.take(8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
 }
 
 /// The mapping a restore produced, so callers can rewrite handles they

@@ -768,6 +768,13 @@ impl GcHeap {
         &self.external_refs
     }
 
+    /// Rebuild the external-reference table from a serialized address
+    /// list, preserving indices. See
+    /// [`ExternalRefTable::restore_from_addrs`].
+    pub fn restore_external_refs(&mut self, addrs: impl IntoIterator<Item = usize>) {
+        self.external_refs.restore_from_addrs(addrs);
+    }
+
     /// Store an owned host payload and return its index. See
     /// [`crate::host_refs`].
     pub fn intern_host_ref(&mut self, payload: Box<dyn std::any::Any>) -> u32 {

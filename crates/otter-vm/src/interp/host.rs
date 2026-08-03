@@ -483,6 +483,9 @@ impl Interpreter {
         for symbol in self.well_known_symbols.entries() {
             symbol.trace_value_slots(visitor);
         }
+        // The error class registry's sixteen prototype/constructor
+        // handles are realm-authoritative, fixed in count and order.
+        self.error_classes.trace_gc_roots(visitor);
         // The shape runtime's side tables are caches a restore rebuilds
         // from the heap; the root shape is the one authoritative handle.
         self.shape_runtime.visit_root_slot(visitor);

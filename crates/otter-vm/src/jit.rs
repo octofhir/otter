@@ -209,6 +209,13 @@ pub struct JitCompileSnapshot {
     /// the header is recomputed from the (rooted) receiver every access and never
     /// dangles.
     pub object_inline_values_byte: u32,
+    /// Byte offset from a decompressed object pointer to the out-of-line slab
+    /// handle (`HEADER_SIZE + OBJECT_BODY_SLAB_HANDLE_OFFSET`). The emitter
+    /// reads this 4-byte handle to pick the slab base: null means the slots
+    /// live in the in-body inline array, non-null means they moved to the
+    /// out-of-line slab (which `values_ptr` addresses). `slab_len` cannot
+    /// decide this — the capacity model can spill a small object early.
+    pub object_slab_handle_byte: u32,
     /// Byte offset from a decompressed object pointer to the `u16`
     /// [`slab_len`](crate::object) counter (`HEADER_SIZE +
     /// OBJECT_BODY_SLAB_LEN_OFFSET`). The emitter reads it to pick the inline vs
@@ -969,6 +976,7 @@ impl JitCompileSnapshot {
             object_dictionary_shape_id_byte: 0,
             object_values_ptr_byte: 0,
             object_inline_values_byte: 0,
+            object_slab_handle_byte: 0,
             object_slab_len_byte: 0,
             object_inline_slot_cap: 0,
             gc_barrier: JitGcBarrierLayout::default(),

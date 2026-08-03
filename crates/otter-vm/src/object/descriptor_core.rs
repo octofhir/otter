@@ -51,6 +51,11 @@ pub(super) fn ordinary_set_data_property(
     let dictionary_keys = super::dictionary_keys_for_shape_transition(heap, obj, existing_offset);
     let slot_metas = super::slot_metas_for_shape_transition(heap, obj, existing_offset);
     let append_index = heap.read_payload(obj, |body| super::body_property_count(heap, body));
+    // An overwrite of an existing slot fits the capacity it already has;
+    // only a genuine append needs one more word. Reserving `count + 1`
+    // for overwrites silently spilled every `INLINE_SLOT_CAP`-sized
+    // object out of line on its first slow-path store.
+    let needed = append_index + usize::from(existing_offset.is_none());
     // The writable/accessor gate reads the slot's attributes through the shape,
     // which `with_payload` cannot walk, so resolve it under a read borrow first.
     let existing_attrs = existing_offset
@@ -59,7 +64,7 @@ pub(super) fn ordinary_set_data_property(
     if super::reserve_slot_capacity(
         &mut obj,
         heap,
-        append_index + 1,
+        needed,
         std::slice::from_mut(&mut compressed),
     )
     .is_err()
@@ -70,7 +75,7 @@ pub(super) fn ordinary_set_data_property(
         &mut obj,
         heap,
         &slot_metas,
-        append_index + 1,
+        needed,
         std::slice::from_mut(&mut compressed),
     ) else {
         return false;

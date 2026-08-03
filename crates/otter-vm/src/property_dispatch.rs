@@ -1077,6 +1077,25 @@ impl Interpreter {
         }
     }
 
+    /// A collection receiver's per-instance `[[Prototype]]` override
+    /// (`class Q extends Map` stores `Q.prototype` here at construct),
+    /// or `None` for every other shape. Property loads must consult
+    /// this before the canonical constructor-name walk, or subclass
+    /// instance methods become invisible.
+    pub(crate) fn collection_prototype_override_value(&self, receiver: &Value) -> Option<Value> {
+        if let Some(map) = receiver.as_map() {
+            crate::collections::map_prototype_override(map, &self.gc_heap)
+        } else if let Some(set) = receiver.as_set() {
+            crate::collections::set_prototype_override(set, &self.gc_heap)
+        } else if let Some(map) = receiver.as_weak_map() {
+            crate::collections::weak_map_prototype_override(map, &self.gc_heap)
+        } else if let Some(set) = receiver.as_weak_set() {
+            crate::collections::weak_set_prototype_override(set, &self.gc_heap)
+        } else {
+            None
+        }
+    }
+
     fn load_from_constructor_prototype(
         &mut self,
         stack: &mut ActivationStack,
@@ -1085,7 +1104,10 @@ impl Interpreter {
         receiver: &Value,
         name: &str,
     ) -> Result<Value, VmError> {
-        let proto = self.constructor_prototype_value(proto_name)?;
+        let proto = match self.collection_prototype_override_value(receiver) {
+            Some(proto) => proto,
+            None => self.constructor_prototype_value(proto_name)?,
+        };
         let Some(proto_obj) = proto.as_object() else {
             return Ok(Value::undefined());
         };

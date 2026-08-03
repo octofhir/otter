@@ -151,12 +151,21 @@ fn restored_runtime_evaluates_javascript() {
             "const ab2 = new ArrayBuffer(8, {maxByteLength: 16}); const ta = new Uint8Array(ab2); ab2.resize(12); ta.length.toString()",
             "12",
         ),
-        // NOT probed: an own method on a Map-subclass instance
-        // (`class Q extends Map { tag() {} } new Q().tag()`). The
-        // collection [[Get]] ladder resolves the prototype by
-        // constructor name and ignores the per-instance override, so
-        // the probe fails identically on an ordinarily-built isolate —
-        // a pre-existing engine gap, not a restore defect.
+        (
+            "subclass instance method (Map)",
+            "class Q extends Map { tag() { return 'ok' } } new Q().tag()",
+            "ok",
+        ),
+        (
+            "subclass instance method (Set)",
+            "class QS extends Set { tag() { return 'ok' } } new QS().tag()",
+            "ok",
+        ),
+        (
+            "subclass canonical through override chain",
+            "class QM extends Map {} const m = new QM(); m.set(1, 2); m.get(1).toString()",
+            "2",
+        ),
     ];
     for (name, source, expected) in steps {
         let got = restored

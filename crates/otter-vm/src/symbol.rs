@@ -317,6 +317,16 @@ impl JsSymbol {
     /// compressed offset in place if the body moves. Called from
     /// [`crate::Value::trace_value_slots`] and from
     /// [`crate::gc_trace::GcTrace`] adapters for the registry / table.
+    /// Visit only the body handle, unconditionally — one slot per
+    /// symbol regardless of description state. The snapshot root walk
+    /// needs a shape that does not depend on isolate state; the
+    /// wrapper's description/well-known fields are caches over the
+    /// body, re-read after a restore rewrites the handle.
+    pub(crate) fn visit_handle_slot(&self, visitor: &mut SlotVisitor<'_>) {
+        let p = &self.inner as *const SymbolHandle as *mut otter_gc::raw::RawGc;
+        visitor(p);
+    }
+
     pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
         let p = &self.inner as *const SymbolHandle as *mut otter_gc::raw::RawGc;
         visitor(p);

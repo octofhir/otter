@@ -296,6 +296,84 @@ fn a_full_collection_on_a_restored_isolate_loses_nothing() {
 }
 
 #[test]
+fn a_full_collection_on_a_blob_restored_isolate_loses_nothing() {
+    let mut source = full_surface_runtime();
+    let bytes = source.snapshot_blob().expect("blob capture");
+    let dynamics = source.dynamic_natives_by_name();
+    source.force_gc().expect("donor full GC");
+    let donor = source.heap_census();
+    let donor_rows: Vec<(u8, u64)> = donor
+        .old
+        .rows
+        .iter()
+        .map(|row| (row.type_tag, row.object_count))
+        .collect();
+
+    let mut restored = otter_runtime::Runtime::from_snapshot_blob_with(
+        &bytes,
+        otter_runtime::SnapshotRuntimeOptions::default(),
+        &mut |name| {
+            dynamics
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, payload)| payload.clone())
+        },
+    )
+    .expect("blob restore");
+    restored.force_gc().expect("restored full GC");
+    let after = restored.heap_census();
+    let after_by_tag: std::collections::HashMap<u8, u64> = after
+        .old
+        .rows
+        .iter()
+        .map(|row| (row.type_tag, row.object_count))
+        .collect();
+    for (tag, donor_count) in &donor_rows {
+        let after_count = after_by_tag.get(tag).copied().unwrap_or(0);
+        assert!(
+            after_count > 0,
+            "type {tag:#x} vanished after a blob-restored GC ({donor_count} at donor)"
+        );
+        assert!(
+            after_count * 2 >= *donor_count,
+            "type {tag:#x} lost most bodies through the blob: donor {donor_count}, restored {after_count}"
+        );
+    }
+}
+
+#[test]
+fn cache_restored_isolate_survives_allocation_pressure() {
+    let cache_dir = tempfile::tempdir().expect("tempdir");
+    let build = || {
+        otter_runtime::Runtime::builder()
+            .with_node_apis()
+            .with_otter_modules()
+            .with_web_apis()
+            .snapshot_cache_root(cache_dir.path())
+            .build()
+            .expect("cached build")
+    };
+    drop(build());
+    let mut restored = build();
+    assert!(restored.restored_from_snapshot());
+
+    let probe = restored
+        .eval(otter_runtime::SourceInput::from_javascript(
+            "var junk; for (var i = 0; i < 400000; i++) { junk = {a: i, b: [i, i + 1]}; }             JSON.stringify(['abc'.match(/b/)[0], new Map([[1, 2]]).get(1),              typeof RegExp.prototype[Symbol.match], new Set([3]).has(3)])",
+        ))
+        .expect("pressure loop on cache-restored runtime");
+    assert_eq!(probe.completion_string(), r#"["b",2,"function",true]"#);
+
+    restored.force_gc().expect("full GC");
+    let again = restored
+        .eval(otter_runtime::SourceInput::from_javascript(
+            "JSON.stringify(['xyz'.match(/y/)[0], [1, 2, 3].map(function(v) { return v * 2; })])",
+        ))
+        .expect("post-GC eval");
+    assert_eq!(again.completion_string(), r#"["y",[2,4,6]]"#);
+}
+
+#[test]
 fn restore_is_cheaper_than_bootstrap() {
     use std::time::Instant;
     // Warm everything once, then capture the snapshot both paths share.

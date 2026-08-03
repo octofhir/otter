@@ -479,9 +479,11 @@ impl Interpreter {
         visitor(global);
         self.realm_intrinsics.visit_slots(visitor);
         // The well-known symbol set is fixed by the spec, so its entry
-        // order is identical on every isolate.
+        // order is identical on every isolate. Only the body handle is
+        // walked — one slot per symbol, state-independent; the wrapper's
+        // description cache is re-read from the restored body.
         for symbol in self.well_known_symbols.entries() {
-            symbol.trace_value_slots(visitor);
+            symbol.visit_handle_slot(visitor);
         }
         // The error class registry's sixteen prototype/constructor
         // handles are realm-authoritative, fixed in count and order.

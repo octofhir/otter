@@ -55,8 +55,14 @@ pub const ARRAY_BODY_TYPE_TAG: u8 = 0x12;
 pub type JsArray = otter_gc::Gc<ArrayBody>;
 
 /// GC-allocated storage backing every [`JsArray`] handle.
-#[derive(Debug, otter_macros::Pelt)]
-#[pelt(tag = ARRAY_BODY_TYPE_TAG)]
+///
+/// Hand-written trace (no Pelt derive): the cached `elements_ptr`
+/// must be recomputed from the slab handle after every visit, so a
+/// relocation — a snapshot restore in particular — leaves compiled
+/// fast paths reading the slab's current address rather than the
+/// captured one. Same contract as `ObjectBody::values_ptr` and the
+/// closure call header's `upvalue_base`.
+#[derive(Debug)]
 pub struct ArrayBody {
     /// Dense element storage: an [`crate::value_slab::ValueSlabBody`] whose
     /// values live in its own GC cell, so the array owns nothing outside
@@ -71,7 +77,6 @@ pub struct ArrayBody {
     /// Logical `length` property. This may be larger than dense
     /// storage when `length` is assigned directly or when sparse
     /// elements are written.
-    #[pelt(skip)]
     pub(crate) length: usize,
     /// Lazily-allocated rare/exotic array state. Null for ordinary dense
     /// arrays with default extensibility and no named/sparse/symbol/accessor
@@ -84,18 +89,36 @@ pub struct ArrayBody {
     /// field so compiled code can address elements without knowing where the
     /// slab lives. The slab is an old-space body, so a scavenge leaves the
     /// base valid; only growth and a restore change it, and both refresh it.
-    #[pelt(skip)]
     elements_ptr: Cell<*mut Value>,
     /// Live dense length. Authoritative, and sited next to the base pointer
     /// so a compiled bounds check reads it as one 32-bit load. Dense storage
     /// beyond `u32::MAX` elements is unreachable in practice — growth helpers
     /// cap dense storage far below it.
-    #[pelt(skip)]
     dense_len: Cell<u32>,
     /// Values the current slab can hold. Cached beside the base for the same
     /// reason the length is: a push under a payload borrow has no heap to ask.
-    #[pelt(skip)]
     dense_cap: Cell<u32>,
+}
+
+impl otter_gc::SafeTraceable for ArrayBody {
+    const TYPE_TAG: u8 = ARRAY_BODY_TYPE_TAG;
+
+    /// Visit the slab and sidecar handles, then republish the element
+    /// base. The refresh must follow the visits: a restore relocates
+    /// the slab handle here, and the cached absolute pointer has to be
+    /// recomputed from the relocated value.
+    fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
+        if !self.slab.is_null() {
+            let p = &mut self.slab as *mut crate::value_slab::ValueSlabHandle
+                as *mut otter_gc::raw::RawGc;
+            visitor(p);
+        }
+        if !self.exotic.is_null() {
+            let p = &mut self.exotic as *mut ArrayExoticHandle as *mut otter_gc::raw::RawGc;
+            visitor(p);
+        }
+        self.refresh_element_cache();
+    }
 }
 
 impl Default for ArrayBody {

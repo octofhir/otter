@@ -149,3 +149,33 @@ fn restored_runtime_evaluates_javascript() {
         assert_eq!(got.completion_string(), *expected, "{name}");
     }
 }
+
+#[test]
+fn restore_is_cheaper_than_bootstrap() {
+    use std::time::Instant;
+    // Warm everything once, then capture the snapshot both paths share.
+    let warm = full_surface_runtime();
+    let snapshot = warm.capture_isolate_snapshot().expect("capture");
+
+    const ROUNDS: u32 = 5;
+    let build_started = Instant::now();
+    for _ in 0..ROUNDS {
+        let runtime = full_surface_runtime();
+        std::hint::black_box(&runtime);
+    }
+    let build = build_started.elapsed() / ROUNDS;
+
+    let restore_started = Instant::now();
+    for _ in 0..ROUNDS {
+        let runtime =
+            otter_runtime::Runtime::from_isolate_snapshot(&snapshot).expect("restore");
+        std::hint::black_box(&runtime);
+    }
+    let restore = restore_started.elapsed() / ROUNDS;
+
+    eprintln!("SNAPSHOT-TIMING: build={build:?} restore={restore:?} per round over {ROUNDS}");
+    assert!(
+        restore < build,
+        "restoring ({restore:?}) must beat rebuilding ({build:?})"
+    );
+}

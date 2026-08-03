@@ -875,6 +875,19 @@ pub struct ExoticSlots {
     is_arguments_object: bool,
 }
 
+impl ExoticSlots {
+    /// Sever foreign ownership after a snapshot restore: the host
+    /// payload box aliases the capture isolate's allocation and is
+    /// overwritten without being dropped. The bootstrap graph carries
+    /// no live host payloads; anything that did would re-create its
+    /// payload through its own serializer contract.
+    pub(crate) fn sever_after_restore(&mut self) {
+        // SAFETY: overwriting without dropping severs the alias; the
+        // capture isolate remains the owner.
+        unsafe { std::ptr::write(&mut self.host_data, None) };
+    }
+}
+
 impl otter_gc::SafeTraceable for ExoticSlots {
     const TYPE_TAG: u8 = EXOTIC_SLOTS_TYPE_TAG;
 

@@ -158,6 +158,30 @@ impl ShapeRuntime {
         self.root.set(ShapeHandle::null());
     }
 
+    /// A shell for the snapshot restore path: null root, empty side
+    /// tables. The snapshot root walk writes the restored root through
+    /// [`Self::visit_root_slot`]; [`Self::register_restored_shape`]
+    /// re-populates `handles_by_id` from the restored heap, and the
+    /// remaining tables are lookup caches that refill on use.
+    #[must_use]
+    pub(crate) fn restored_shell(names: Arc<NameInterner>) -> Self {
+        Self {
+            root: Cell::new(ShapeHandle::null()),
+            handles_by_id: FxHashMap::default(),
+            next_string_id: 0,
+            interned_keys: FxHashMap::default(),
+            transitions: FxHashMap::default(),
+            offset_cache: FxHashMap::default(),
+            names,
+            observer: None,
+        }
+    }
+
+    /// Record one restored shape body under its id.
+    pub(crate) fn register_restored_shape(&mut self, id: ShapeId, handle: ShapeHandle) {
+        self.handles_by_id.insert(id, Cell::new(handle));
+    }
+
     /// Yield the root shape's cell slot for the snapshot root walk. The
     /// other side tables are caches a restore rebuilds from the heap.
     pub(crate) fn visit_root_slot(&self, visitor: &mut dyn FnMut(*mut RawGc)) {

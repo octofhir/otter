@@ -352,6 +352,37 @@ pub struct JsRegExpBody {
     pub prototype_override: Option<Value>,
 }
 
+impl JsRegExpBody {
+    /// Sever foreign ownership after a snapshot restore.
+    ///
+    /// A restored body's `regex`, `pattern_utf16` and `source` alias the
+    /// capture isolate's malloc storage byte-for-byte. Each owning field
+    /// is overwritten via `ptr::write` with a freshly built value —
+    /// recompiling the pattern exactly as V8 recompiles RegExp code on
+    /// deserialization — so the alias is never dropped and both isolates
+    /// own their storage.
+    pub(crate) fn sever_after_restore(&mut self) {
+        let pattern_utf16: Vec<u16> = self.pattern_utf16.as_slice().to_vec();
+        let source: String = self.source.as_str().to_owned();
+        let regex = engine::compile(
+            &source,
+            self.flags.ignore_case,
+            self.flags.multiline,
+            self.flags.dot_all,
+            self.flags.unicode,
+            self.flags.unicode_sets,
+        )
+        .expect("a captured pattern compiled once already");
+        // SAFETY: overwriting without dropping is the point — the old
+        // values are the capture isolate's property.
+        unsafe {
+            std::ptr::write(&mut self.regex, regex);
+            std::ptr::write(&mut self.pattern_utf16, pattern_utf16);
+            std::ptr::write(&mut self.source, source);
+        }
+    }
+}
+
 /// Cheap-to-clone JS regex handle.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy)]

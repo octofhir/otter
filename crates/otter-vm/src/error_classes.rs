@@ -476,6 +476,27 @@ pub(crate) fn append_stack_frames(
 }
 
 impl ErrorClassRegistry {
+    /// A shell for the snapshot restore path: every prototype and
+    /// constructor handle null, filled in by the snapshot root walk in
+    /// `trace_gc_roots` order.
+    #[must_use]
+    pub(crate) fn restored_shell() -> Self {
+        let entry = || ClassEntry {
+            prototype: crate::object::JsObject::null(),
+            constructor: crate::object::JsObject::null(),
+        };
+        Self {
+            error: entry(),
+            type_error: entry(),
+            range_error: entry(),
+            syntax_error: entry(),
+            reference_error: entry(),
+            uri_error: entry(),
+            eval_error: entry(),
+            aggregate_error: entry(),
+        }
+    }
+
     /// Walk every GC-managed object held by the registry.
     ///
     /// The interpreter roots this registry across every full-GC

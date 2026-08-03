@@ -184,6 +184,17 @@ pub struct Relocation {
 }
 
 impl Relocation {
+    /// `true` when `offset` already lies inside a restored page — the
+    /// mark of a slot a previous tracer on the same walk relocated.
+    /// Object bodies and their backing-store bodies intentionally trace
+    /// shared slots (the scavenger's forwarding is idempotent), so the
+    /// image walk must tolerate the second visit.
+    #[must_use]
+    pub fn already_relocated(&self, offset: u32) -> bool {
+        let base = offset & !(PAGE_SIZE as u32 - 1);
+        self.pages.iter().any(|(_, to)| *to == base)
+    }
+
     /// Rewrite one captured cage offset to where it now lives.
     ///
     /// `None` for a null offset, and for any offset that did not fall in a
@@ -370,7 +381,11 @@ impl GcHeap {
                         match relocation.relocate(old.0) {
                             Some(new) => *slot = RawGc(new),
                             None => {
-                                if failure.is_none() {
+                                // A slot shared between an owner and its
+                                // backing-store body gets visited twice on
+                                // this walk; the second visit sees the
+                                // already-relocated value and keeps it.
+                                if !relocation.already_relocated(old.0) && failure.is_none() {
                                     failure = Some(ImageError::DanglingSlot { offset: old.0 });
                                 }
                             }

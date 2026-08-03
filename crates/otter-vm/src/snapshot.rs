@@ -39,10 +39,25 @@
 
 use otter_gc::raw::RawGc;
 
+/// One dynamic-native closure carried by the in-process snapshot,
+/// keyed by the host-ref index the captured bodies name it with.
+pub(crate) enum DynamicNativePayload {
+    /// `Send + Sync` embedder/runtime closure.
+    Shared(std::sync::Arc<crate::native_function::NativeFn>),
+    /// Isolate-local VM helper closure.
+    Local(std::sync::Arc<crate::native_function::LocalNativeFn>),
+}
+
 /// Everything a restore needs that the page image alone does not carry.
 pub struct IsolateSnapshot {
     /// The old generation, verbatim.
     pub image: otter_gc::HeapImage,
+    /// The isolate's code space, shared by reference. Restored closure
+    /// bodies name their bytecode by function id inside it. In-process
+    /// only; the build-time snapshot pairs with embedded bytecode.
+    pub(crate) code_space: std::sync::Arc<crate::code_space::CodeSpace>,
+    /// Dynamic-native closures at their host-ref indices.
+    pub(crate) dynamic_natives: Vec<(u32, DynamicNativePayload)>,
     /// Heap handles from the fixed-shape root walk, in walk order.
     pub fixed_roots: Vec<RawGc>,
     /// The property-name atom table, in id order.
@@ -59,6 +74,8 @@ impl crate::Interpreter {
     /// nursery empty, so a capture taken right after one succeeds.
     pub fn capture_isolate_snapshot(&self) -> Result<IsolateSnapshot, otter_gc::ImageError> {
         let image = self.capture_heap_image()?;
+        let code_space = self.snapshot_code_space();
+        let dynamic_natives = crate::native_function::snapshot_dynamic_natives(self.gc_heap());
         let fixed_roots = self.capture_snapshot_roots();
         let atom_names = self.snapshot_atom_names();
         let mut global_lexicals: Vec<(Box<str>, RawGc, bool)> = self
@@ -69,6 +86,8 @@ impl crate::Interpreter {
         global_lexicals.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(IsolateSnapshot {
             image,
+            code_space,
+            dynamic_natives,
             fixed_roots,
             atom_names,
             global_lexicals,

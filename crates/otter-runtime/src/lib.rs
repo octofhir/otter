@@ -2517,6 +2517,11 @@ impl Runtime {
             interp.set_promise_rejection_hook(hook);
         }
         let layer_a_dynamic_imports = LayerADynamicImportQueue::default();
+        // Diagnostics are host machinery too: the image carries heap state, so
+        // the caller's tracing and JIT-diagnostics requests reach a restored
+        // isolate only from here. Skipping them makes `--trace`, `--jit-events`,
+        // and `--jit-artifacts` silently observe nothing on the cached path.
+        interp.set_jit_debug_request(config.jit_debug);
         if let Some(threshold) = config.jit_osr_threshold {
             interp.set_jit_osr_threshold(threshold);
         }
@@ -2532,6 +2537,9 @@ impl Runtime {
                 )));
             }
             JitSelection::InterpreterOnly => {}
+        }
+        if let Some(factory) = &config.tracer_factory {
+            interp.set_tracer(Some(factory.build()));
         }
         interp.set_dynamic_import_loader(std::sync::Arc::new(LayerADynamicImportLoader {
             queue: layer_a_dynamic_imports.clone(),

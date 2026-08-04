@@ -253,6 +253,43 @@ fn snapshot_cache_serves_the_second_build() {
 }
 
 #[test]
+fn a_cache_restored_runtime_still_observes_its_diagnostics() {
+    let cache_dir = tempfile::tempdir().expect("tempdir");
+
+    let build = |dir: &std::path::Path| {
+        otter_runtime::Runtime::builder()
+            .with_node_apis()
+            .with_otter_modules()
+            .with_web_apis()
+            .snapshot_cache_root(dir)
+            .jit_debug(otter_vm::jit_debug::JitDebugRequest::events())
+            .build()
+            .expect("cached build")
+    };
+
+    drop(build(cache_dir.path()));
+    let mut restored = build(cache_dir.path());
+    assert!(
+        restored.restored_from_snapshot(),
+        "the second build must restore from the stored blob"
+    );
+
+    // Diagnostics are host machinery, not heap state: a restored isolate owes
+    // the same capture the caller asked the builder for. A disabled sink
+    // reports `None` here no matter how much it ran.
+    let result = restored
+        .eval(otter_runtime::SourceInput::from_javascript(
+            "function f(n){var s=0;for(var i=0;i<n;i++)s+=i;return s} \
+             for(var k=0;k<20000;k++)f(8); f(3)",
+        ))
+        .expect("eval on cache-restored runtime");
+    assert!(
+        result.jit_debug_report().is_some(),
+        "a restored isolate must carry the requested JIT diagnostics capture"
+    );
+}
+
+#[test]
 fn a_full_collection_on_a_restored_isolate_loses_nothing() {
     let mut source = full_surface_runtime();
     let snapshot = source.capture_isolate_snapshot().expect("capture");

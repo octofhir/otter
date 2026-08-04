@@ -220,6 +220,11 @@ pub(crate) fn total_spill_slots(allocation: &Allocation) -> Result<u32, Optimiza
 /// abstract frame state still names the old interpreter-register value. The
 /// final allocation gives only those colliding values fresh homes and leaves
 /// every non-conflicting assignment intact.
+///
+/// The colliding set of one exit is its whole reified chain, not one frame: an
+/// exit inside a spliced callee rebuilds that callee and every caller above it
+/// from a single register dump, so a caller's value and a callee's value that
+/// share a machine home restore each other's bits.
 fn legalize_deopt_locations(
     allocation: &Allocation,
     frame_states: &FrameStateTable,
@@ -230,26 +235,30 @@ fn legalize_deopt_locations(
     let mut legalized = allocation.clone();
     for state in frame_states.states() {
         let mut owners = BTreeMap::<Location, ValueId>::new();
-        for value in state.registers.iter().flatten().copied() {
-            if rematerialized_deopt_slot(ssa, reprs, merges, Some(value)).is_some() {
-                continue;
+        let mut frame = Some(state);
+        while let Some(current) = frame {
+            for value in current.registers.iter().flatten().copied() {
+                if rematerialized_deopt_slot(ssa, reprs, merges, Some(value)).is_some() {
+                    continue;
+                }
+                let location = legalized.location(value);
+                if owners.get(&location).is_some_and(|owner| *owner != value) {
+                    let class = location.class();
+                    let next_spill = match class {
+                        RegClass::Gpr => &mut legalized.spill_slot_counts.gpr,
+                        RegClass::Fp => &mut legalized.spill_slot_counts.fp,
+                    };
+                    let slot = *next_spill;
+                    *next_spill = next_spill
+                        .checked_add(1)
+                        .ok_or(OptimizationError::DeoptSpillOverflow)?;
+                    legalized.locations[value.0 as usize] = Location::Spill(class, slot);
+                    owners.insert(legalized.location(value), value);
+                } else {
+                    owners.insert(location, value);
+                }
             }
-            let location = legalized.location(value);
-            if owners.get(&location).is_some_and(|owner| *owner != value) {
-                let class = location.class();
-                let next_spill = match class {
-                    RegClass::Gpr => &mut legalized.spill_slot_counts.gpr,
-                    RegClass::Fp => &mut legalized.spill_slot_counts.fp,
-                };
-                let slot = *next_spill;
-                *next_spill = next_spill
-                    .checked_add(1)
-                    .ok_or(OptimizationError::DeoptSpillOverflow)?;
-                legalized.locations[value.0 as usize] = Location::Spill(class, slot);
-                owners.insert(legalized.location(value), value);
-            } else {
-                owners.insert(location, value);
-            }
+            frame = current.caller.map(|index| &frame_states.states()[index]);
         }
     }
     Ok(legalized)

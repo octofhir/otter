@@ -54,6 +54,7 @@ pub(crate) enum OptimizationError {
     InlineTreeVerification(InlineError),
     CfgConstruction(CfgError),
     CfgVerification(CfgError),
+    FrameEntryIsLoopHeader { inline: u32 },
     DominanceVerification(DomError),
     SsaConstruction(SsaError),
     SsaVerification(SsaError),
@@ -76,6 +77,7 @@ impl OptimizationError {
             Self::InlineTreeVerification(_) => "optimizing inline-tree verification",
             Self::CfgConstruction(_) => "optimizing CFG construction",
             Self::CfgVerification(_) => "optimizing CFG verification",
+            Self::FrameEntryIsLoopHeader { .. } => "optimizing frame entry is a loop header",
             Self::DominanceVerification(_) => "optimizing dominance verification",
             Self::SsaConstruction(_) => "optimizing SSA construction",
             Self::SsaVerification(_) => "optimizing SSA verification",
@@ -129,6 +131,7 @@ impl OptimizationPipeline {
         let cfg =
             ControlFlowGraph::build_inlined(&tree).map_err(OptimizationError::CfgConstruction)?;
         cfg.verify().map_err(OptimizationError::CfgVerification)?;
+        reject_looping_frame_entry(&cfg)?;
 
         let dom = DominatorTree::compute(&cfg);
         dom.verify(&cfg)
@@ -203,6 +206,36 @@ impl OptimizationPipeline {
             spill_slot_count,
         })
     }
+}
+
+/// Refuse a frame whose entry block is its own loop header.
+///
+/// A frame entry carries the seed definitions of its registers — parameters for
+/// the root frame, `Uninitialized` for the rest — and those seeds are the
+/// block's head values. Phi placement only considers a block a join when it has
+/// two normal predecessors, and a frame entry reached by its own back edge has
+/// exactly one: the latch. The entry edge is implicit, so no phi is placed, the
+/// seeds win, and the value the latch carries is dropped. A loop written so
+/// that its header is the first instruction (`while (node !== null) { … node =
+/// node.next }`) would then re-read the parameter every iteration and never
+/// terminate.
+///
+/// Modeling that implicit edge belongs in the graph, not in a repair here.
+/// Until it is, the frame belongs to the template tier.
+fn reject_looping_frame_entry(cfg: &ControlFlowGraph) -> Result<(), OptimizationError> {
+    for (inline, &entry) in cfg.frame_entries.iter().enumerate() {
+        let frame = cfg.blocks[entry.0 as usize].inline;
+        let looping = cfg.blocks[entry.0 as usize].preds.iter().any(|&pred| {
+            cfg.blocks[pred.0 as usize].inline == frame
+                && cfg.blocks[pred.0 as usize].normal_succs.contains(&entry)
+        });
+        if looping {
+            return Err(OptimizationError::FrameEntryIsLoopHeader {
+                inline: inline as u32,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Checked total number of final GPR and FP spill slots.

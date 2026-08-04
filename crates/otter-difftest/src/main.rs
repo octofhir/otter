@@ -93,34 +93,29 @@ fn run(otter: &Path, source: &str, case: &str, mode: &Mode, timeout: Duration) -
     let stderr_file = File::create(&stderr_path).expect("create stderr capture");
     let mut command = Command::new(otter);
     command
-        .arg("--timeout")
-        .arg("0")
-        .arg("-p")
-        .arg(source)
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
         .env_remove("OTTER_GC_STRESS")
         .env_remove("OTTER_GC_VERIFY")
         .env_remove("OTTER_JIT_OSR_THRESHOLD");
+    // Tier selection is a CLI decision, not an environment one: the oracle asks
+    // the binary for the interpreter, so a renamed or retired environment
+    // variable can never silently turn the oracle into another tiered run.
     match mode {
         Mode::InterpreterOnly => {
-            command.env("OTTER_JIT", "0");
+            command.arg("--jitless");
         }
-        Mode::NormalTiering => {
-            command.env("OTTER_JIT", "1");
-        }
+        Mode::NormalTiering => {}
         Mode::ForcedBaseline => {
-            command
-                .env("OTTER_JIT", "1")
-                .env("OTTER_JIT_OSR_THRESHOLD", "1");
+            command.env("OTTER_JIT_OSR_THRESHOLD", "1");
         }
         Mode::GcStress { stride } => {
             command
-                .env("OTTER_JIT", "1")
                 .env("OTTER_GC_STRESS", stride.to_string())
                 .env("OTTER_GC_VERIFY", "1");
         }
     }
+    command.arg("--timeout").arg("0").arg("-p").arg(source);
     let mut child = command.spawn().expect("spawn otter candidate");
     let started = Instant::now();
     let (status, timed_out) = loop {

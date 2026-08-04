@@ -2633,8 +2633,11 @@ pub(crate) fn reserve_slot_capacity(
         true
     });
     // The slab handle was installed by a raw payload write, so record the
-    // old-to-young edge the mutator barrier would have.
-    heap.record_write(owner, &Value::object(owner));
+    // old-to-young edge the mutator barrier would have. The child of that
+    // edge is the slab: naming the owner as its own child makes the barrier
+    // read the owner's generation, find it old, and record nothing, leaving
+    // an old object pointing at a young slab the next scavenge never visits.
+    heap.record_write(owner, &slab);
     Ok(())
 }
 
@@ -3183,13 +3186,24 @@ pub(crate) fn install_mapped_arguments(
     // borrow below. This may move `obj`, which is why the local is `mut`.
     let mut obj = obj;
     ensure_exotic(&mut obj, heap).expect("exotic sidecar");
+    if entries.is_empty() {
+        return;
+    }
+    let cells: Vec<UpvalueCell> = entries.iter().map(|entry| entry.cell).collect();
     heap.with_payload(obj, |body| {
-        if !entries.is_empty() {
-            body.exotic_mut().host_data = Some(HostData::Untraced(Box::new(MappedArgumentsData {
-                entries: entries.into_boxed_slice(),
-            })));
-        }
+        body.exotic_mut().host_data = Some(HostData::Untraced(Box::new(MappedArgumentsData {
+            entries: entries.into_boxed_slice(),
+        })));
     });
+    // The parameter cells are held by the sidecar, which is its own old-space
+    // body, so the edge a scavenge has to re-trace starts there and not at the
+    // object: re-tracing the object finds one edge to an old child and stops
+    // before it ever reaches the cells. Recording the object instead leaves a
+    // young cell unevacuated and the sidecar holding its pre-move offset.
+    let sidecar = heap.read_payload(obj, |body| body.exotic.get());
+    for cell in cells {
+        heap.record_write(sidecar, &cell);
+    }
 }
 
 fn mapped_argument_cell(body: &ObjectBody, key: &str) -> Option<UpvalueCell> {

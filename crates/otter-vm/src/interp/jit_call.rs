@@ -125,7 +125,9 @@ impl Interpreter {
                     jit_debug::JitDebugTarget::Entry,
                     pc,
                 );
-                if !optimized && !self.reoptimize_arith_overflow_bail(context, fid, pc) {
+                if optimized {
+                    self.note_jit_optimized_bail(fid, pc);
+                } else if !self.reoptimize_arith_overflow_bail(context, fid, pc) {
                     self.note_jit_entry_bail(fid);
                 }
                 Ok(None)
@@ -465,8 +467,14 @@ impl Interpreter {
     /// it — is discarded and the next hot entry recompiles against what
     /// execution actually does. Callers that bound the discarded entry
     /// directly drop with it; the function's template generation survives.
-    /// Past [`MAX_OPTIMIZED_REOPTIMIZATIONS`] rebuilds the installed body is
-    /// the best this feedback produces and stays.
+    /// Past [`MAX_OPTIMIZED_REOPTIMIZATIONS`] rebuilds the speculation is the
+    /// one this feedback keeps producing and it keeps failing, so the body is
+    /// discarded rather than kept: an installed generation that exits is not a
+    /// slower generation, it is a round trip on every entry that reaches it.
+    /// The function drops to its template generation and is admitted again only
+    /// when its feedback epoch advances — the same "stop speculating until the
+    /// profile actually changes" rule V8 spells `DisableOptimization` and JSC
+    /// spells `jettison` plus an exit-site check.
     fn note_jit_optimized_bail(&mut self, fid: u32, resume_pc: u32) {
         self.jit_runtime_stats.optimized_deopts =
             self.jit_runtime_stats.optimized_deopts.saturating_add(1);
@@ -480,6 +488,7 @@ impl Interpreter {
             .copied()
             .unwrap_or(0);
         if reopts >= MAX_OPTIMIZED_REOPTIMIZATIONS {
+            self.abandon_optimized_generation(fid);
             return;
         }
         let bails = self
@@ -501,6 +510,33 @@ impl Interpreter {
         };
         self.jit_optimized_code.remove(&fid);
         self.jit_optimized_declined_epoch.remove(&fid);
+        self.jit_optimized_code_cache = None;
+        let dependents: Vec<u32> = dependents
+            .into_iter()
+            .filter(|&dependent| dependent != fid)
+            .collect();
+        self.discard_invalidated_jit_state(&dependents);
+    }
+
+    /// Drop `fid`'s optimizing generation and refuse to build another one until
+    /// its feedback epoch advances.
+    ///
+    /// Reached when rebuilding has stopped paying: the same speculation keeps
+    /// being emitted and keeps exiting. Leaving the body installed would keep
+    /// charging every entry a compiled prologue plus a deoptimization, so the
+    /// entry paths would rather have the template generation. Recording the
+    /// current epoch as declined is what makes the refusal outlive this call
+    /// without making it permanent — new feedback readmits the function.
+    fn abandon_optimized_generation(&mut self, fid: u32) {
+        let dependents = match self.jit_optimized_code.get(&fid) {
+            Some(Some(code)) => self
+                .jit_code_registry
+                .invalidate_code_object(code.metadata().id),
+            _ => return,
+        };
+        self.jit_optimized_code.insert(fid, None);
+        self.jit_optimized_declined_epoch
+            .insert(fid, self.code_space.feedback_epoch(fid));
         self.jit_optimized_code_cache = None;
         let dependents: Vec<u32> = dependents
             .into_iter()
@@ -621,7 +657,9 @@ impl Interpreter {
                     jit_debug::JitDebugTarget::SyncEntry,
                     pc,
                 );
-                if !optimized && !self.reoptimize_arith_overflow_bail(context, fid, pc) {
+                if optimized {
+                    self.note_jit_optimized_bail(fid, pc);
+                } else if !self.reoptimize_arith_overflow_bail(context, fid, pc) {
                     self.note_jit_entry_bail(fid);
                 }
                 Ok(None)

@@ -494,6 +494,10 @@ where
         emit_way_walk(ops, do_store, miss);
         emit_refuse_prototype_hop(ops, miss);
     }
+    // `x12` retains the guarded receiver's header: the slab base overwrites
+    // `x13`, and a pointer store's write barrier names the parent object, not
+    // its value slab.
+    dynasm!(ops ; .arch aarch64 ; mov x12, x13);
     super::values::emit_slab_base(ops, view, 13, 14);
     dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);
     Ok(())

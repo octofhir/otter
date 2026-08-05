@@ -75,6 +75,16 @@ impl MarkingState {
         self.is_marking
     }
 
+    /// Address of the marking flag byte.
+    ///
+    /// Compiled code tests the insertion barrier's precondition inline, so it
+    /// needs the one byte rather than the state that owns it. The address is
+    /// stable for the heap's lifetime.
+    #[must_use]
+    pub fn marking_flag_addr(&self) -> *const u8 {
+        std::ptr::from_ref(&self.is_marking).cast::<u8>()
+    }
+
     /// Push `header` onto the worklist if it is currently white.
     /// Idempotent — re-marking the same header is a no-op.
     ///

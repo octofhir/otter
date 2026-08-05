@@ -2026,6 +2026,7 @@ fn emit(
                                 }
                             }
                             let store_prim = ops.new_dynamic_label();
+                            let barrier_slow = ops.new_dynamic_label();
                             dynasm!(ops
                                 ; .arch aarch64
                                 ; movz x11, NUMBER_TAG_HI16, lsl #48
@@ -2034,8 +2035,23 @@ fn emit(
                                 ; b.ne =>store_prim        // primitive: no barrier
                                 ; str w9, [x13, x17]
                             );
-                            // Cell store: stage receiver and value into their window
-                            // slots and run the barrier through the window stub.
+                            // The barrier runs inline against the guarded
+                            // receiver's header; only a real unrecorded
+                            // old->young edge or a live marking cycle reaches
+                            // the runtime.
+                            crate::template::arm64::values::emit_write_barrier_fast(
+                                &mut ops,
+                                &mut relocations,
+                                view,
+                                12,
+                                9,
+                                barrier_slow,
+                                done,
+                            );
+                            // Cell store the barrier could not settle inline:
+                            // stage receiver and value into their window slots
+                            // and complete through the window stub.
+                            dynasm!(ops ; .arch aarch64 ; =>barrier_slow);
                             emit_build_transition_frames(
                                 &mut ops,
                                 tree,

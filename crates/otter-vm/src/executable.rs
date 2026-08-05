@@ -235,10 +235,7 @@ impl CodeBlock {
             gc_barrier: crate::jit::JitGcBarrierLayout {
                 header_flags_byte: otter_gc::header::HEADER_FLAGS_BYTE_OFFSET as u32,
                 young_flag: otter_gc::header::GENERATION_YOUNG_FLAG as u32,
-                card_bitmap_byte: std::mem::offset_of!(otter_gc::page::PageHeader, card_bitmap)
-                    as u32,
-                page_mask: !(otter_gc::PAGE_SIZE as u64 - 1),
-                card_shift: otter_gc::CARD_SIZE.trailing_zeros(),
+                remembered_flag: otter_gc::header::REMEMBERED_FLAG as u32,
             },
             jit_proto_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_JIT_PROTO_OFFSET as u32,

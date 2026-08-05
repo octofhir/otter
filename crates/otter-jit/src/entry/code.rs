@@ -79,6 +79,7 @@ pub(crate) unsafe fn enter_compiled(
         let activation_top_ptr = unsafe { (*vm).jit_native_activation_top_addr() };
         let activation_limit = unsafe { (*vm).jit_generated_activation_limit() };
         let gc_heap = unsafe { (*vm).jit_gc_heap_ptr() };
+        let marking_flag = unsafe { (*vm).jit_marking_flag_ptr() };
         let interrupt_flag = unsafe { (*vm).jit_interrupt_flag_ptr() };
         let backedge_fuel = unsafe { (*vm).jit_backedge_fuel_ptr() };
         let global_this_offset = unsafe { (*vm).jit_global_this_offset_addr() };
@@ -119,6 +120,7 @@ pub(crate) unsafe fn enter_compiled(
         thread.gc_heap = gc_heap as u64;
         thread.backedge_fuel_cell = backedge_fuel as u64;
         thread.global_lexical_epoch_cell = global_lexical_epoch as u64;
+        thread.marking_flag_cell = marking_flag as u64;
         let mut error = None;
         let mut ctx = JitCtx {
             thread: std::ptr::addr_of_mut!(thread),

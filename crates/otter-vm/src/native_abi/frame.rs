@@ -43,6 +43,10 @@ pub struct VmThread {
     /// global-object reads compare the live epoch with their compile snapshot
     /// before trusting a shape-matched own-data slot.
     pub global_lexical_epoch_cell: u64,
+    /// Address of the collector's incremental-marking flag byte. Generated
+    /// code runs the generational write barrier inline and reaches the runtime
+    /// only when this byte says a marking cycle is in progress.
+    pub marking_flag_cell: u64,
 }
 
 impl VmThread {
@@ -58,6 +62,7 @@ impl VmThread {
             gc_heap: 0,
             backedge_fuel_cell: 0,
             global_lexical_epoch_cell: 0,
+            marking_flag_cell: 0,
         }
     }
 }
@@ -304,7 +309,7 @@ impl NativeFrame {
     }
 }
 
-const _: [(); 64] = [(); std::mem::size_of::<VmThread>()];
+const _: [(); 72] = [(); std::mem::size_of::<VmThread>()];
 const _: [(); 8] = [(); std::mem::align_of::<VmThread>()];
 const _: [(); 16] = [(); std::mem::size_of::<VmFrameHeader>()];
 const _: [(); 64] = [(); std::mem::size_of::<NativeFrame>()];
@@ -314,6 +319,7 @@ const _: [(); 8] = [(); std::mem::offset_of!(VmThread, current_code_object_id)];
 const _: [(); 40] = [(); std::mem::offset_of!(VmThread, gc_heap)];
 const _: [(); 48] = [(); std::mem::offset_of!(VmThread, backedge_fuel_cell)];
 const _: [(); 56] = [(); std::mem::offset_of!(VmThread, global_lexical_epoch_cell)];
+const _: [(); 64] = [(); std::mem::offset_of!(VmThread, marking_flag_cell)];
 const _: [(); 8] = [(); std::mem::offset_of!(VmFrameHeader, pc)];
 const _: [(); 12] = [(); std::mem::offset_of!(VmFrameHeader, register_count)];
 const _: [(); 15] = [(); std::mem::offset_of!(VmFrameHeader, flags)];

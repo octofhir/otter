@@ -881,15 +881,10 @@ pub struct JitGcBarrierLayout {
     pub header_flags_byte: u32,
     /// Young-generation flag bit within the flag byte (`GENERATION_YOUNG_FLAG`).
     pub young_flag: u32,
-    /// Byte offset of the card-table bitmap inside a `PageHeader`
-    /// (`offset_of!(PageHeader, card_bitmap)`); the page header sits at the
-    /// page base (`page_addr & page_mask`).
-    pub card_bitmap_byte: u32,
-    /// `!(PAGE_SIZE - 1)` — masks a header address down to its page base.
-    pub page_mask: u64,
-    /// `log2(CARD_SIZE)` — right-shift a within-page byte offset to its card
-    /// index.
-    pub card_shift: u32,
+    /// Already-in-the-remembered-set flag bit within the flag byte
+    /// (`REMEMBERED_FLAG`). The generational barrier records a parent at most
+    /// once per scavenge interval, so a set bit is the barrier's fast out.
+    pub remembered_flag: u32,
 }
 
 /// Mutable JIT feedback overlay for one authoritative CodeBlock instruction.

@@ -2169,6 +2169,16 @@ impl GcHeap {
         value.visit_gc_edges(&mut record);
     }
 
+    /// Address of the incremental-marking flag byte.
+    ///
+    /// The insertion half of [`crate::barrier::write_barrier`] fires only
+    /// while a marking cycle is in progress. Compiled code tests that one byte
+    /// inline so an ordinary pointer store never leaves generated code.
+    #[must_use]
+    pub fn marking_flag_addr(&self) -> *const u8 {
+        self.marking.marking_flag_addr()
+    }
+
     /// Type-erased write barrier for callers that hold the
     /// child as a [`RawGc`] rather than a typed `Gc<U>`.
     /// Equivalent to [`Self::write_barrier`] otherwise.

@@ -652,8 +652,7 @@ mod tests {
         let tree = InlineTree::trivial(&view);
         let cfg = ControlFlowGraph::build_inlined(&tree).expect("CFG builds");
         let mut ssa = SsaFunction::build_inlined(&tree, &cfg).expect("SSA builds");
-        let reprs = ReprMap::compute(&tree, &ssa);
-        lower_settled_property_accesses(&mut ssa, &cfg, &view, &tree, &reprs);
+        lower_settled_property_accesses(&mut ssa, &cfg, &view, &tree);
         (cfg, ssa, tree)
     }
 

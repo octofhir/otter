@@ -143,8 +143,7 @@ impl OptimizationPipeline {
         // which this pass does not change: it selects by producer and every
         // producer here keeps its node. The map is recomputed below over the
         // renumbered graph.
-        let value_reprs = ReprMap::compute(&tree, &ssa);
-        lower_settled_property_accesses(&mut ssa, &cfg, view, &tree, &value_reprs);
+        lower_settled_property_accesses(&mut ssa, &cfg, view, &tree);
         // A settled access on a receiver its loop cannot change belongs before
         // the loop, not in it.
         let hoisted_loops =

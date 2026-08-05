@@ -151,7 +151,7 @@ size, and explicit `filesPresent` / `filesAbsent` inventories.
 | --- | --- |
 | `bytecode.txt` | Deterministic logical-PC and encoded-byte-PC listing. |
 | `template-plan.txt` | The already-built template lowering plan and its decoded operand side buffers. |
-| `optimized-ir.txt` | The input owned by the selected optimizing backend: Otter's deterministic reverse-postorder unit or Cranelift IR for a numeric leaf. |
+| `optimized-ir.txt` | Deterministic optimizing input: the legacy reverse-postorder unit or normalized Machine IR plus allocation for switched functions. |
 | `code.bin` | Exact finalized executable bytes for this runtime process. |
 | `code-normalized.bin` | Non-executable semantic instruction stream with symbolic relocations and logical branch targets. |
 | `asm.txt` | Annotated AArch64 assembly over the exact bytes in `code.bin`. |
@@ -171,26 +171,12 @@ executable addresses. A range must satisfy
 `code-map.json` contains typed structural regions and validates every native
 range against the matching code object.
 
-The first line of `optimized-ir.txt` identifies the backend. The general Otter
-backend starts with its optimized-unit banner. A Cranelift numeric leaf starts
-with:
-
-```text
-; backend=cranelift numeric-leaf
-; parameters=<n> registers=<n> arithmetic-ops=<n>
-```
-
-The remaining text is the exact CLIF function compiled for that code object.
-Its `code-map.json` contains a `craneliftNumericLeaf` structural region,
-bytecode-PC/opcode instruction ranges, and explicit `craneliftBackendGlue`
-ranges for entry guards, backend scaffolding, and padding that has no
-JavaScript operation identity. Every four-byte machine instruction is covered
-by an instruction or glue range. Cranelift ranges deliberately omit
-`operationIndex`: CLIF text does not expose Otter optimizer operation ids, so a
-synthetic join key would be misleading. Because this subset is pure,
-call-free, and restartable before effects, its relocation, safepoint, and
-deopt inventories are empty. These files still belong to the same optimizing
-artifact contract; there is no parallel tier or format generation.
+Inspect the first line of `optimized-ir.txt` before interpreting the payload.
+The replacement numeric-leaf path starts with `; backend=otter-machine-ir
+numeric-leaf`, followed by normalized Machine IR and exact regalloc2 output;
+its `code-map.json` owns one `machineNumericLeaf` structural region. Functions
+not yet switched retain the legacy optimized-unit banner. Both are payloads of
+the one current artifact bundle, not separate artifact formats.
 
 ### Template leaf-inline regions
 

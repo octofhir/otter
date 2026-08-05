@@ -618,8 +618,7 @@ impl Interpreter {
     /// cache cell or walks the cell's ways. A receiver that stops matching
     /// misses to the same window transition, which re-patches the cell.
     pub(crate) fn bake_property_loads(&mut self, view: &mut jit::JitCompileSnapshot) {
-        const SLOT_BYTES: u32 =
-            std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
+        const SLOT_BYTES: u32 = std::mem::size_of::<crate::Value>() as u32;
         let sites: Vec<_> = view
             .instructions
             .iter()
@@ -680,8 +679,7 @@ impl Interpreter {
     /// constants and the site needs no cache cell. A shape that has since moved
     /// on drops its way, and a site that loses every way keeps its cell.
     fn bake_prototype_loads(&mut self, view: &mut jit::JitCompileSnapshot) {
-        const SLOT_BYTES: u32 =
-            std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
+        const SLOT_BYTES: u32 = std::mem::size_of::<crate::Value>() as u32;
         let sites: Vec<_> = view
             .instructions
             .iter()
@@ -848,8 +846,7 @@ impl Interpreter {
         instruction: &jit::JitInstructionMetadata,
         site: usize,
     ) -> Option<(u32, u32)> {
-        const SLOT_BYTES: u32 =
-            std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
+        const SLOT_BYTES: u32 = std::mem::size_of::<crate::Value>() as u32;
         let op = instruction.op(code_block);
         let kind = match op {
             Op::LoadProperty => crate::property_ic::PropertyIcKind::Load,
@@ -883,8 +880,7 @@ impl Interpreter {
         code_block: &CodeBlock,
         instruction: &jit::JitInstructionMetadata,
     ) -> Option<(u32, u32)> {
-        const SLOT_BYTES: u32 =
-            std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
+        const SLOT_BYTES: u32 = std::mem::size_of::<crate::Value>() as u32;
         let name_operand = match instruction.op(code_block) {
             Op::LoadProperty => 2,
             Op::StoreProperty => 1,
@@ -1056,9 +1052,7 @@ impl Interpreter {
             return None;
         }
         let recv_shape = crate::object::shape_id(recv, &self.gc_heap);
-        let slot_byte = |slot: u32| {
-            slot * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32
-        };
+        let slot_byte = |slot: u32| slot * std::mem::size_of::<crate::Value>() as u32;
         if let Some(slot) = self.shape_offset_of(recv_shape_handle, name.name()) {
             return Some(MethodSite {
                 recv_shape,
@@ -1194,8 +1188,7 @@ impl Interpreter {
             } else {
                 (u64::from(shape.offset()), false)
             };
-            const SLOT_BYTES: u32 =
-                std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
+            const SLOT_BYTES: u32 = std::mem::size_of::<crate::Value>() as u32;
             view.global_object_loads.insert(
                 instruction.byte_pc,
                 jit::JitGlobalObjectLoad {
@@ -1731,8 +1724,7 @@ impl Interpreter {
         // stores at operand 1.
         let mut prop_offsets: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
         let mut prop_shapes: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
-        const SLOT_BYTES: u32 =
-            std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
+        const SLOT_BYTES: u32 = std::mem::size_of::<crate::Value>() as u32;
         for instr in &method_view.instructions {
             let name_operand = match instr.op(&method_view.code_block) {
                 Op::LoadProperty => 2,

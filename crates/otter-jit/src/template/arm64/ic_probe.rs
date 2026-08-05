@@ -270,11 +270,9 @@ pub(crate) fn emit_check_shape(
 /// first.
 pub(crate) fn emit_load_field(
     ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     header: u8,
     value_byte: u32,
-    boxed_slot_slow_paths: &mut Vec<super::values::BoxedSlotSlowPath>,
     miss: DynamicLabel,
 ) {
     if header != 13 {
@@ -284,29 +282,8 @@ pub(crate) fn emit_load_field(
     dynasm!(ops
         ; .arch aarch64
         ; cbz x13, =>miss
-        ; ldr w9, [x13, value_byte]
+        ; ldr x9, [x13, value_byte]
     );
-    emit_slot_value(ops, relocations, view, boxed_slot_slow_paths, miss);
-}
-
-/// Turn the 4-byte slot in `x9` into the full `Value` it encodes, deferring the
-/// heap-boxed encoding to a cold path.
-fn emit_slot_value(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    boxed_slot_slow_paths: &mut Vec<super::values::BoxedSlotSlowPath>,
-    miss: DynamicLabel,
-) {
-    let boxed_entry = ops.new_dynamic_label();
-    let continuation = ops.new_dynamic_label();
-    boxed_slot_slow_paths.push(super::values::BoxedSlotSlowPath {
-        entry: boxed_entry,
-        continuation,
-        miss,
-    });
-    super::values::emit_decompress_slot(ops, relocations, view.cage_base as u64, boxed_entry);
-    dynasm!(ops ; .arch aarch64 ; =>continuation);
 }
 
 /// Probe a named-property load site and leave the loaded `Value` in `x9`.
@@ -315,14 +292,13 @@ fn emit_slot_value(
 /// cell with a non-empty hidden class, resolve the slot the site's feedback
 /// names — against settled shape immediates where it has them, otherwise by
 /// walking the cache cell's ways and performing the guarded prototype hop a
-/// matched way asks for — and read that slot from the holder's value slab. A
-/// slot the compressed encoding cannot hold continues through the caller's
-/// boxed slow path; every failed guard branches to `miss`, where the site's
+/// matched way asks for — and read that slot from the holder's value slab.
+/// Every failed guard branches to `miss`, where the site's
 /// window transition owns full `[[Get]]` semantics and re-patches the cell.
 ///
 /// `load_receiver` materializes the receiver `Value` into the register it is
-/// handed and is the only thing a tier supplies. On return the boxed value is
-/// in `x9` and the boxed-slot continuation label is already bound.
+/// handed and is the only thing a tier supplies. On return the complete value
+/// is in `x9`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_property_ic_load<R>(
     ops: &mut Assembler,
@@ -332,7 +308,6 @@ pub(crate) fn emit_property_ic_load<R>(
     load_receiver: R,
     cell_addr: usize,
     cell_ordinal: u32,
-    boxed_slot_slow_paths: &mut Vec<super::values::BoxedSlotSlowPath>,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported>
 where
@@ -344,15 +319,7 @@ where
     if let Some([only]) = settled.filter(|chain| !chain.is_empty()) {
         emit_load_header(ops, relocations, view, load_receiver, 13, miss)?;
         emit_check_shape(ops, view, 13, only.receiver_shape, miss);
-        emit_load_field(
-            ops,
-            relocations,
-            view,
-            13,
-            only.value_byte,
-            boxed_slot_slow_paths,
-            miss,
-        );
+        emit_load_field(ops, view, 13, only.value_byte, miss);
         return Ok(());
     }
     emit_receiver_shape(ops, relocations, view, load_receiver, miss)?;
@@ -397,10 +364,9 @@ where
         dynasm!(ops
             ; .arch aarch64
             ; cbz x13, =>miss
-            ; ldr w9, [x13, x17]       // 4-byte compressed slot
+            ; ldr x9, [x13, x17]
         );
     }
-    emit_slot_value(ops, relocations, view, boxed_slot_slow_paths, miss);
     Ok(())
 }
 
@@ -415,9 +381,8 @@ where
 /// constant offset instead of loading the cell and walking its ways.
 ///
 /// The caller owns everything after the slot is resolved: loading the value,
-/// choosing between the compressed primitive store and the pointer store, and
-/// running the generational write barrier. Those genuinely differ between the
-/// tiers; the guard does not.
+/// storing its complete word, and running the generational write barrier for a
+/// cell. Those genuinely differ between the tiers; the guard does not.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_property_ic_store_guard<R>(
     ops: &mut Assembler,
@@ -506,12 +471,12 @@ where
 /// Overwrite the own data slot at `value_byte` of the holder `header` names with
 /// the boxed `Value` in `x9`.
 ///
-/// The value is compressed into the slot, never boxed: a double or an int the
-/// encoding cannot hold branches to `miss` instead, which is what keeps this
-/// free of an allocation and of the generational write barrier a heap cell would
-/// owe. Clobbers `x10`, `x11`, `x13`, `x14`.
+/// The slot stores the runtime `Value` word directly. This helper is used only
+/// for barrier-free primitive stores; cell stores use the guarded write-barrier
+/// path. Clobbers `x13`, `x14`.
 pub(crate) fn emit_store_field(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     header: u8,
     value_byte: u32,
@@ -520,10 +485,21 @@ pub(crate) fn emit_store_field(
     if header != 13 {
         dynasm!(ops ; .arch aarch64 ; mov x13, X(header));
     }
+    dynasm!(ops ; .arch aarch64 ; mov x12, x13);
     super::values::emit_slab_base(ops, view, 13, 14);
     dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);
-    super::values::emit_compress_slot_or_bail(ops, miss);
-    dynasm!(ops ; .arch aarch64 ; str w10, [x13, value_byte]);
+    let primitive = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    super::values::emit_cell_test(ops, 9, 11, super::values::CellTest::IsNotCell, primitive);
+    dynasm!(ops ; .arch aarch64 ; str x9, [x13, value_byte]);
+    super::values::emit_write_barrier(ops, relocations, view, 12, 9);
+    dynasm!(ops
+        ; .arch aarch64
+        ; b =>done
+        ; =>primitive
+        ; str x9, [x13, value_byte]
+        ; =>done
+    );
 }
 
 /// Serve `receiver.length` for the two receivers whose length is not an own
@@ -1324,11 +1300,7 @@ pub(crate) fn emit_prototype_guard(
 /// the holder's slab pointer in `x15`; leaves nothing live.
 ///
 /// Every holder — an ordinary receiver's own slab and a pinned realm
-/// prototype's alike — stores 4-byte compressed slots, so one read serves both.
-/// A callable builtin is always a heap cell, which is exactly a low-3 tag of
-/// `000` and a nonzero payload; the payload is then the bare cage offset. Any
-/// other encoding is not the builtin this site guarded and misses, so the slot
-/// never needs decoding into a full `Value`.
+/// prototype's alike — stores the same 8-byte `Value` representation.
 pub(crate) fn emit_builtin_identity_guard(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,

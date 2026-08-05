@@ -28,9 +28,7 @@ use otter_vm::{
 use crate::{
     artifact::relocation::RelocationCapture,
     entry::{NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, Unsupported},
-    template::arm64::values::{
-        emit_decompress_slot, emit_load_reg, emit_load_symbol_u64, emit_load_u64, emit_slab_base,
-    },
+    template::arm64::values::{emit_load_reg, emit_load_symbol_u64, emit_load_u64, emit_slab_base},
 };
 
 /// One receiver register and its exact monomorphic method identity.
@@ -137,9 +135,8 @@ pub(crate) fn emit_method_guard_from_tagged_register(
     dynasm!(ops
         ; .arch aarch64
         ; cbz x13, =>bail
-        ; ldr w9, [x13, guard.method_value_byte]
+        ; ldr x9, [x13, guard.method_value_byte]
     );
-    emit_decompress_slot(ops, relocations, view.cage_base as u64, bail);
     dynasm!(ops ; .arch aarch64 ; mov X(callable_register), x9);
 
     let guarded = ops.new_dynamic_label();

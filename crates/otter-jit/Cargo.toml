@@ -25,6 +25,7 @@ too_many_arguments = "allow"
 otter-bytecode = { workspace = true }
 otter-vm = { workspace = true }
 rustc-hash = { workspace = true }
+regalloc2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 smallvec = { workspace = true }
@@ -34,9 +35,6 @@ dynasm = "5"
 dynasmrt = "5"
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
-cranelift-codegen = { workspace = true }
-cranelift-frontend = { workspace = true }
-cranelift-native = { workspace = true }
 yaxpeax-arch = { workspace = true }
 yaxpeax-arm = { workspace = true }
 

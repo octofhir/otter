@@ -1,10 +1,9 @@
-//! Feedback-guided optimizing tier with specialized and general AArch64 backends.
+//! Feedback-guided optimizing tier with one shared AArch64 backend.
 //!
-//! Profitable straight-line, side-effect-free Number leaves first use a narrow
-//! Cranelift backend. Other supported functions run the complete CFG,
-//! dominance, SSA, liveness, register-allocation, representation, frame-state,
-//! and deopt-lowering pipeline before the general AArch64 emitter checks its
-//! eligibility contract. That path compiles multi-block int32 and float64
+//! Supported functions run the complete CFG, dominance, SSA, liveness,
+//! register-allocation, representation, frame-state, and deopt-lowering
+//! pipeline before the AArch64 emitter checks its eligibility contract. The
+//! backend compiles multi-block int32 and float64
 //! arithmetic, element access, and reducible loops entered at function entry
 //! or by on-stack replacement at a hot loop header. CFG edges carry
 //! sequentialized phi moves, while every back-edge polls the VM thread's
@@ -18,7 +17,6 @@
 //! # Contents
 //! - [`compile_optimized`] — whole-pipeline compilation entry point.
 //! - [`OptimizedCode`] — executable code plus deopt and allocation metadata.
-//! - `cranelift` — restartable, call-free Number leaves.
 //! - `pipeline` / `unit` — backend-neutral orchestration and its owned,
 //!   verified analysis product.
 //!
@@ -39,8 +37,6 @@
 //! - Bail writeback is generated from the same [`DeoptTable`] published with
 //!   the code object; every interpreter register and the exact logical resume
 //!   PC are published before return.
-//! - Cranelift leaves mutate no VM slot and guard every parameter before
-//!   arithmetic, so a miss restarts at logical PC zero before effects.
 //! - Every backend publishes bytes through the same [`CompiledCode`], code
 //!   registry, native-frame kind, artifact bundle, and W^X lifecycle.
 //!
@@ -65,13 +61,8 @@ use crate::{
 mod arm64;
 #[cfg(target_arch = "aarch64")]
 mod artifact;
-#[cfg(target_arch = "aarch64")]
-mod cranelift;
 pub(crate) mod pipeline;
 pub(crate) mod unit;
-
-#[cfg(target_arch = "aarch64")]
-pub(crate) use cranelift::NumericLeafBackend;
 
 /// Deterministic metadata for one optimized compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +111,7 @@ pub struct OptimizedCode {
 
 impl OptimizedCode {
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn new(
+    pub(crate) fn new(
         code: CompiledCode,
         generated_stack_frame_bytes: Option<u32>,
         deopt: Box<otter_vm::deopt::DeoptRuntime>,
@@ -300,25 +291,16 @@ impl JitFunctionCode for OptimizedCode {
     }
 }
 
-/// Compile through the first eligible backend of the existing optimizing tier,
-/// or return [`Unsupported`] without producing executable code.
+/// Compile through the shared optimizing backend, or return [`Unsupported`]
+/// without producing executable code.
 #[cfg(target_arch = "aarch64")]
 pub fn compile_optimized(
     view: &JitCompileSnapshot,
     code_object_id: u64,
 ) -> Result<OptimizedCode, Unsupported> {
     let transitions = TransitionTable::resolve();
-    let numeric_leaf = NumericLeafBackend::for_host();
-    compile_optimized_with_artifacts(
-        view,
-        code_object_id,
-        &transitions,
-        numeric_leaf.as_ref(),
-        None,
-        None,
-        false,
-    )
-    .map(|output| output.code)
+    compile_optimized_with_artifacts(view, code_object_id, &transitions, None, false)
+        .map(|output| output.code)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -326,14 +308,11 @@ pub(crate) fn compile_optimized_with_artifacts(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &TransitionTable,
-    numeric_leaf: Option<&NumericLeafBackend>,
-    osr_pc: Option<u32>,
     artifact_request: Option<crate::artifact::ArtifactRequest>,
     capture_events: bool,
 ) -> Result<crate::artifact::NativeCompileOutput<OptimizedCode>, Unsupported> {
-    if let Some(numeric_leaf) = numeric_leaf
-        && let Some(output) =
-            numeric_leaf.try_compile(view, code_object_id, osr_pc, artifact_request.clone())?
+    if let Some(output) =
+        crate::machine::numeric::try_compile(view, code_object_id, artifact_request.clone())?
     {
         return Ok(output);
     }

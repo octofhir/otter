@@ -3,8 +3,8 @@
 //! # Contents
 //! - Full `[[Get]]` completion for accessors, proxies, primitive receivers,
 //!   megamorphic sites, exceptions, and allocating getter reentry.
-//! - Exact compiled loads of boxed doubles, negative zero, NaN, and wide
-//!   int32s through a cold decoder after GC-producing allocation churn.
+//! - Exact compiled loads of doubles, negative zero, NaN, and wide int32s from
+//!   direct `Value` slots after GC-producing allocation churn.
 //! - Direct global-lexical cell reads, live binding updates, and TDZ side exits.
 //! - In-place `ToPrimitive`/`ToNumeric` completion through observable
 //!   `@@toPrimitive` and `valueOf` hooks.
@@ -17,7 +17,7 @@
 //! - A throwing getter/coercion hook advances no later instruction and is
 //!   never replayed after its observable counter increment.
 //! - Interpreter and compiled completion values remain identical under GC,
-//!   including every full-Value payload recovered from a compressed slot.
+//!   including every payload loaded directly from a property slot.
 //! - A compiled global lexical reads the permanent cell's current value; a TDZ
 //!   hole still enters the canonical throwing lookup exactly once.
 

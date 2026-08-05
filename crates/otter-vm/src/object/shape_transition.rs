@@ -16,7 +16,7 @@
 //!
 //! # Invariants
 //! - Replay only applies to fast-shape ordinary objects.
-//! - Replay guards run before value boxing, so a failed probe is
+//! - Replay guards run before sidecar or slab growth, so a failed probe is
 //!   allocation-free and cannot relocate a caller-owned receiver handle.
 //! - Prototype guards are complete here: null prototype, direct prototype with
 //!   missing key and no deeper chain, or direct prototype with a writable data
@@ -98,16 +98,18 @@ pub(crate) fn capture_store_property_transition(
     value: &Value,
 ) -> Option<StorePropertyTransition> {
     let mut obj = obj;
+    let mut stored = *value;
     // A store can demote this object to dictionary mode, and demotion
     // writes through the sidecar. Reserved here, outside every payload
     // borrow, because creating it allocates.
-    super::ensure_exotic(&mut obj, heap).ok()?;
+    super::ensure_exotic_with_pending_values(&mut obj, heap, std::slice::from_mut(&mut stored))
+        .ok()?;
     let index = heap.read_payload(obj, |body| super::body_property_count(heap, body));
     let slot = u16::try_from(index).ok()?;
-    // Reserve before boxing the value: growing the slab can collect, and a
-    // compressed word is a bare offset with nothing rooting it.
-    super::reserve_slot_capacity(&mut obj, heap, index + 1, &mut []).ok()?;
-    let compressed = super::compress_or_abort(heap, &mut obj, *value);
+    // Growing the slab can collect. Keep the incoming `Value` in the pending
+    // root slice so its embedded GC offset is rewritten if that happens.
+    super::reserve_slot_capacity(&mut obj, heap, index + 1, std::slice::from_mut(&mut stored))
+        .ok()?;
     let kind = transition_kind(obj, heap, key)?;
     let from_shape_id = super::shape_id(obj, heap);
     let existing_offset =
@@ -116,12 +118,23 @@ pub(crate) fn capture_store_property_transition(
     // built here, outside the borrow, exactly as the runtime demote
     // paths do.
     let slot_metas = super::slot_metas_for_shape_transition(heap, obj, existing_offset);
-    let slot_meta_table =
-        super::slot_meta_table_for_install(&mut obj, heap, &slot_metas, index + 1, &mut []).ok()?;
+    let slot_meta_table = super::slot_meta_table_for_install(
+        &mut obj,
+        heap,
+        &slot_metas,
+        index + 1,
+        std::slice::from_mut(&mut stored),
+    )
+    .ok()?;
     let dictionary_keys = super::dictionary_keys_for_shape_transition(heap, obj, existing_offset);
-    let dict_table =
-        super::dict_keys_table_for_install(&mut obj, heap, &dictionary_keys, key.name(), &mut [])
-            .ok()?;
+    let dict_table = super::dict_keys_table_for_install(
+        &mut obj,
+        heap,
+        &dictionary_keys,
+        key.name(),
+        std::slice::from_mut(&mut stored),
+    )
+    .ok()?;
     let transition = heap.with_payload(obj, |body| {
         if !is_fast_shape_body(body)
             || !body.extensible
@@ -142,7 +155,7 @@ pub(crate) fn capture_store_property_transition(
         }
         super::dict_push_key(body, key.name().to_owned());
         body.shape = super::ShapeHandle::null();
-        body.push_slot(index, SlotMeta::data_default(), compressed);
+        body.push_slot(index, SlotMeta::data_default(), stored);
         Some(StorePropertyTransition {
             from_shape_id,
             atom_id: key.atom().id(),
@@ -152,7 +165,7 @@ pub(crate) fn capture_store_property_transition(
             slot,
         })
     })?;
-    super::record_slot_write(heap, obj, compressed);
+    super::record_slot_write(heap, obj, stored);
     Some(transition)
 }
 
@@ -169,9 +182,11 @@ pub(crate) fn capture_store_property_transition_with_shape(
     // The appended slot's flat index is the new shape's last offset.
     let index = to_shape_count as usize - 1;
     let slot = u16::try_from(index).ok()?;
-    // Reserve before boxing the value: see the dictionary path above.
-    super::reserve_slot_capacity(&mut obj, heap, index + 1, &mut []).ok()?;
-    let compressed = super::compress_or_abort(heap, &mut obj, *value);
+    // Reserve before taking the payload borrow. The incoming value is not yet
+    // in a traced object, so keep its direct word in the pending-root slice.
+    let mut stored = *value;
+    super::reserve_slot_capacity(&mut obj, heap, index + 1, std::slice::from_mut(&mut stored))
+        .ok()?;
     let kind = transition_kind(obj, heap, key)?;
     let from_shape_id = super::shape_id(obj, heap);
     let existing_offset =
@@ -187,7 +202,7 @@ pub(crate) fn capture_store_property_transition_with_shape(
             return None;
         }
         body.shape = next_shape;
-        body.push_slot(index, SlotMeta::data_default(), compressed);
+        body.push_slot(index, SlotMeta::data_default(), stored);
         Some(StorePropertyTransition {
             from_shape_id,
             atom_id: key.atom().id(),
@@ -197,7 +212,7 @@ pub(crate) fn capture_store_property_transition_with_shape(
             slot,
         })
     })?;
-    super::record_slot_write(heap, obj, compressed);
+    super::record_slot_write(heap, obj, stored);
     heap.record_write(obj, &next_shape);
     Some(transition)
 }
@@ -258,26 +273,26 @@ pub(crate) fn replay_store_property_transition(
         return None;
     }
 
-    // Only a confirmed hit may allocate. `compress_or_abort` (and the
-    // sidecar reservation) root and refresh this local receiver if the
-    // allocation scavenges; on a miss the caller retains its original
-    // raw handle, so allocating before guard validation would leave
-    // fallback holding a forwarded cell.
+    // Only a confirmed hit may allocate for sidecar/slab growth. On a miss the
+    // caller retains its original raw handle, so allocating before guard
+    // validation would leave fallback holding a forwarded cell.
     let mut obj = obj;
+    let mut stored = *value;
     let mut slot_meta_table = None;
     let mut dict_table = None;
     if to_shape.is_null() {
         // The dictionary arm below appends through `dict_push_key`,
         // which writes the sidecar and materializes per-slot metadata;
         // the shape-append arm never touches either and allocates none.
-        super::ensure_exotic(&mut obj, heap).ok()?;
+        super::ensure_exotic_with_pending_values(&mut obj, heap, std::slice::from_mut(&mut stored))
+            .ok()?;
         let slot_metas = super::slot_metas_for_shape_transition(heap, obj, None);
         slot_meta_table = super::slot_meta_table_for_install(
             &mut obj,
             heap,
             &slot_metas,
             usize::from(transition.slot) + 1,
-            &mut [],
+            std::slice::from_mut(&mut stored),
         )
         .ok()?;
         let dictionary_keys = super::dictionary_keys_for_shape_transition(heap, obj, None);
@@ -286,17 +301,19 @@ pub(crate) fn replay_store_property_transition(
             heap,
             &dictionary_keys,
             key.name(),
-            &mut [],
+            std::slice::from_mut(&mut stored),
         )
         .ok()?;
     }
-    // Reserve before boxing the value: see the append paths above.
-    super::reserve_slot_capacity(&mut obj, heap, usize::from(transition.slot) + 1, &mut []).ok()?;
-    let compressed = super::compress_or_abort(heap, &mut obj, *value);
-    // Shape nodes are allocated with `alloc_old_with_roots` and pinned for the
-    // isolate lifetime because JIT guards bake their offsets. `to_shape`
-    // therefore cannot relocate during the boxing allocation and needs no
-    // post-allocation reload; only the young receiver above does.
+    // Reserve before taking the payload borrow; the slot stores `Value`
+    // directly and performs no numeric box allocation.
+    super::reserve_slot_capacity(
+        &mut obj,
+        heap,
+        usize::from(transition.slot) + 1,
+        std::slice::from_mut(&mut stored),
+    )
+    .ok()?;
     heap.with_payload(obj, |body| {
         let offset = usize::from(transition.slot);
         if to_shape.is_null() {
@@ -313,9 +330,9 @@ pub(crate) fn replay_store_property_transition(
             debug_assert_eq!(to_shape_id, Some(transition.to_shape_id));
             body.shape = to_shape;
         }
-        body.push_slot(offset, SlotMeta::data_default(), compressed);
+        body.push_slot(offset, SlotMeta::data_default(), stored);
     });
-    super::record_slot_write(heap, obj, compressed);
+    super::record_slot_write(heap, obj, stored);
     if !to_shape.is_null() {
         heap.record_write(obj, &to_shape);
     }

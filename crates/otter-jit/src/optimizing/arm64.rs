@@ -869,7 +869,6 @@ fn emit_settled_access<R>(
     view: &JitCompileSnapshot,
     allocation: &Allocation,
     reprs: &ReprMap,
-    boxed_slot_slow_paths: &mut Vec<crate::template::arm64::values::BoxedSlotSlowPath>,
     instruction: &SsaInstr,
     load_receiver: R,
     deopt: DynamicLabel,
@@ -917,9 +916,7 @@ where
             let header = materialized_header(ops, allocation, instruction.inputs[0])?;
             ic_probe::emit_check_shape(ops, view, header, shape, deopt);
         }
-        // A slot the compressed encoding cannot hold takes the shared cold
-        // path; a holder with no slab resumes in the interpreter at this
-        // site's PC.
+        // A holder with no slab resumes at this site's deopt PC.
         SsaOp::LoadField { byte } => {
             let result_location = allocation.location(
                 instruction
@@ -927,24 +924,13 @@ where
                     .expect("eligibility checked field-load result"),
             );
             let header = materialized_header(ops, allocation, instruction.inputs[0])?;
-            ic_probe::emit_load_field(
-                ops,
-                relocations,
-                view,
-                header,
-                byte,
-                boxed_slot_slow_paths,
-                deopt,
-            );
+            ic_probe::emit_load_field(ops, view, header, byte, deopt);
             emit_store_tagged_location(ops, result_location, 9)?;
         }
-        // The slot exists and keeps its class, so the write is one compressed
-        // store with no barrier and no allocation. A value the encoding cannot
-        // hold resumes in the interpreter.
+        // The slot exists and keeps its class, so the write is one direct
+        // `Value` store with no allocation.
         SsaOp::StoreField { byte } => {
             let header = materialized_header(ops, allocation, instruction.inputs[0])?;
-            // The lowering selects a site only for a proven int32, so the
-            // boxed value is the one the compressed slot takes whole.
             match reprs.representation(instruction.inputs[1]) {
                 Representation::Int32 => {
                     emit_load_location(ops, allocation.location(instruction.inputs[1]), 9)?;
@@ -954,12 +940,16 @@ where
                     emit_load_tagged_location(ops, allocation.location(instruction.inputs[1]), 9)?;
                 }
                 Representation::Float64 => {
-                    return Err(Unsupported::OperandShape(
-                        "optimizing settled store expects an int32 value",
-                    ));
+                    emit_load_fp_location(
+                        ops,
+                        allocation,
+                        allocation.location(instruction.inputs[1]),
+                        FP_SCRATCH,
+                    )?;
+                    emit_box_double(ops, FP_SCRATCH, 9);
                 }
             }
-            ic_probe::emit_store_field(ops, view, header, byte, deopt);
+            ic_probe::emit_store_field(ops, relocations, view, header, byte, deopt);
         }
         SsaOp::Reuse | SsaOp::Bytecode(_) => {
             return Err(Unsupported::OperandShape(
@@ -1135,7 +1125,6 @@ fn emit(
     let mut next_store_ic = 0usize;
     let mut ops = Assembler::new()
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
-    let mut boxed_slot_slow_paths = Vec::new();
     let mut deopt_exits = Vec::<(DynamicLabel, DeoptExitId, u32)>::new();
     let threw = ops.new_dynamic_label();
     let block_labels: Vec<_> = (0..cfg.blocks.len())
@@ -1288,7 +1277,6 @@ fn emit(
                         view,
                         allocation,
                         reprs,
-                        &mut boxed_slot_slow_paths,
                         instruction,
                         |ops, register| {
                             emit_load_tagged_location(
@@ -1758,13 +1746,7 @@ fn emit(
                         dynasm!(ops
                             ; .arch aarch64
                             ; cbz x13, =>deopt
-                            ; ldr w9, [x13, x15]
-                        );
-                        crate::template::arm64::values::emit_decompress_slot(
-                            &mut ops,
-                            &mut relocations,
-                            view.cage_base as u64,
-                            deopt,
+                            ; ldr x9, [x13, x15]
                         );
                         emit_store_tagged_location(&mut ops, result_location, 9)?;
                     }
@@ -1852,7 +1834,6 @@ fn emit(
                                 },
                                 cell_addr,
                                 cell_ordinal,
-                                &mut boxed_slot_slow_paths,
                                 miss,
                             )?;
                             emit_store_tagged_location(&mut ops, result_location, 9)?;
@@ -2024,7 +2005,7 @@ fn emit(
                                 ; orr x11, x11, #0x2
                                 ; tst x9, x11
                                 ; b.ne =>store_prim        // primitive: no barrier
-                                ; str w9, [x13, x17]
+                                ; str x9, [x13, x17]
                             );
                             crate::template::arm64::values::emit_write_barrier(
                                 &mut ops,
@@ -2033,11 +2014,13 @@ fn emit(
                                 12,
                                 9,
                             );
-                            dynasm!(ops ; .arch aarch64 ; b =>done ; =>store_prim);
-                            crate::template::arm64::values::emit_compress_slot_or_bail(
-                                &mut ops, miss,
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; b =>done
+                                ; =>store_prim
+                                ; str x9, [x13, x17]
+                                ; b =>done
                             );
-                            dynasm!(ops ; .arch aarch64 ; str w10, [x13, x17] ; b =>done);
                         }
 
                         // Miss: the window transition resolves the store and
@@ -2352,13 +2335,7 @@ fn emit(
                             dynasm!(ops
                                 ; .arch aarch64
                                 ; cbz x13, =>miss
-                                ; ldr w9, [x13, target.value_byte]
-                            );
-                            crate::template::arm64::values::emit_decompress_slot(
-                                &mut ops,
-                                &mut relocations,
-                                view.cage_base as u64,
-                                miss,
+                                ; ldr x9, [x13, target.value_byte]
                             );
                             emit_store_tagged_location(&mut ops, result_location, 9)?;
                             dynasm!(ops ; .arch aarch64 ; b =>done);
@@ -4189,7 +4166,6 @@ fn emit(
                 view,
                 allocation,
                 reprs,
-                &mut boxed_slot_slow_paths,
                 instruction,
                 |ops, register| {
                     let frame_register = receiver_register.ok_or(Unsupported::OperandShape(
@@ -4214,23 +4190,6 @@ fn emit(
             code_map.record_osr(site.logical_pc, offset, ops.offset().0);
         }
         osr_entries.insert(site.logical_pc, offset);
-    }
-
-    let boxed_slow_start = ops.offset().0;
-    crate::template::arm64::values::emit_boxed_slot_slow_paths(
-        &mut ops,
-        &mut relocations,
-        view,
-        boxed_slot_slow_paths,
-    );
-    if let Some(code_map) = code_map.as_mut()
-        && ops.offset().0 != boxed_slow_start
-    {
-        code_map.record(CodeRegion::structural(
-            "boxedSlotSlowPaths",
-            boxed_slow_start,
-            ops.offset().0,
-        ));
     }
 
     // A deopt exit site is an index and a branch. One shared handler dumps

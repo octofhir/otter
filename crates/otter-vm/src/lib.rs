@@ -117,7 +117,6 @@ pub mod global_functions;
 mod global_ops;
 pub mod groom;
 pub mod handles;
-pub mod heap_number;
 pub mod host_completion;
 pub mod host_strings;
 pub mod inspect;

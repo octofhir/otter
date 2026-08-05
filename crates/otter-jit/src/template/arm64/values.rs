@@ -4,15 +4,12 @@
 //! - Register-window loads/stores, 64-bit immediate materialization, and typed
 //!   symbolic-address capture.
 //! - Number guards, int32/double boxing, and NaN-purifying double encode.
-//! - Compressed property-slot decoding with cold boxed-payload recovery.
 //! - Full-semantics `ToInt32`/`ToUint32` fast paths for bitwise operators.
 //!
 //! # Invariants
 //! - Every helper documents its scratch registers; nothing survives a call.
 //! - Boxed doubles are purified before encoding, so no emitted value aliases
 //!   the cell space.
-//! - Boxed property slots validate their tag and `HeapNumber` body before the
-//!   exact full-Value payload is recovered.
 //! - Coercions the fast path cannot represent exactly branch to the caller's
 //!   supplied pre-effect continuation, normally an outlined VM transition.
 //! - Symbolic loads wrap the ordinary variable-width materializer, so capture
@@ -26,17 +23,9 @@ use otter_vm::JitCompileSnapshot;
 
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::entry::{
-    CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, FUNCTION_ID_TAG, NUMBER_TAG_HI16, THREAD_OFFSET,
-    Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED,
-    VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_MARKING_FLAG_CELL_OFFSET, reg_offset,
+    CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NUMBER_TAG_HI16, THREAD_OFFSET, Unsupported,
+    VALUE_FALSE_LOW, VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_MARKING_FLAG_CELL_OFFSET, reg_offset,
 };
-
-/// Immediate forms of the tagged constants for `dynasm` compare operands.
-const VALUE_UNDEFINED_IMM: u32 = VALUE_UNDEFINED as u32;
-const VALUE_NULL_IMM: u32 = VALUE_NULL as u32;
-const VALUE_TRUE_IMM: u32 = VALUE_TRUE as u32;
-const VALUE_FALSE_IMM: u32 = VALUE_FALSE as u32;
-const VALUE_HOLE_IMM: u32 = VALUE_HOLE as u32;
 
 /// `ldr X(t), [x19, #idx*8]`.
 pub(crate) fn emit_load_reg(ops: &mut Assembler, t: u8, idx: u16) -> Result<(), Unsupported> {
@@ -349,236 +338,6 @@ pub(crate) fn emit_slab_base(ops: &mut Assembler, view: &JitCompileSnapshot, reg
         ; b =>done
         ; =>spilled
         ; ldr x13, [x13, values_ptr_off]
-        ; =>done
-    );
-}
-
-/// Decompress a 4-byte object property slot (already zero-extended into
-/// `x9`) into a full tagged `Value`, in place in `x9`.
-///
-/// A small-int, cell-ref, immediate, or function-id slot decodes inline; a
-/// boxed slot (a heap-boxed double / wide int) branches to `boxed_bail`,
-/// where a deferred cold path reads the box. Fixed registers: `x9` is the
-/// slot in/out, `x10` scratch.
-pub(crate) fn emit_decompress_slot(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    cage_base: u64,
-    boxed_bail: DynamicLabel,
-) {
-    use otter_vm::value::compressed as cslot;
-    // The literal slot tags below are the frozen `compressed` layout.
-    debug_assert_eq!(cslot::TAG_MASK, 0b111);
-    debug_assert_eq!(cslot::TAG_IMMEDIATE, 0b100);
-    debug_assert_eq!(cslot::TAG_FUNCTION_ID, 0b110);
-    debug_assert_eq!(
-        (
-            cslot::IMM_NULL,
-            cslot::IMM_TRUE,
-            cslot::IMM_FALSE,
-            cslot::IMM_HOLE
-        ),
-        (1, 2, 3, 4)
-    );
-    let l_smi = ops.new_dynamic_label();
-    let l_cell = ops.new_dynamic_label();
-    let l_imm = ops.new_dynamic_label();
-    let l_fid = ops.new_dynamic_label();
-    let l_undef = ops.new_dynamic_label();
-    let l_null = ops.new_dynamic_label();
-    let l_true = ops.new_dynamic_label();
-    let l_false = ops.new_dynamic_label();
-    let l_hole = ops.new_dynamic_label();
-    let l_done = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch aarch64
-        ; tbnz w9, #0, =>l_smi                      // bit0 set → small int
-        ; and w10, w9, #0x7                         // low-3-bit slot tag
-        ; cbz w10, =>l_cell                         // 000 → cell ref
-        ; cmp w10, #0x4                             // 100 → immediate
-        ; b.eq =>l_imm
-        ; cmp w10, #0x6                             // 110 → function id
-        ; b.eq =>l_fid
-        ; b =>boxed_bail                            // 010 → boxed number
-        ; =>l_cell
-        // A cell ref widens to the canonical heap-cell `Value` bits:
-        // `cage_base | offset`. The empty slot (0) decodes to `undefined`.
-        ; cbz x9, =>l_undef
-    );
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        10,
-        cage_base,
-        RelocationTarget::GcCageBase,
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; orr x9, x9, x10
-        ; b =>l_done
-        ; =>l_smi
-        ; asr w9, w9, #1                            // int32 = (i31 << 1 | 1) >> 1
-        ; mov w9, w9                                // zero-extend the payload
-        ; movz x10, NUMBER_TAG_HI16, lsl #48
-        ; orr x9, x9, x10
-        ; b =>l_done
-        ; =>l_fid
-        ; lsr w9, w9, #3                            // function id
-        ; lsl x9, x9, #16
-        ; movz x10, FUNCTION_ID_TAG as u32          // fits a single movz
-        ; orr x9, x9, x10
-        ; b =>l_done
-        ; =>l_imm
-        ; lsr w10, w9, #3                           // immediate kind
-        ; cmp w10, #1                               // IMM_NULL
-        ; b.eq =>l_null
-        ; cmp w10, #2                               // IMM_TRUE
-        ; b.eq =>l_true
-        ; cmp w10, #3                               // IMM_FALSE
-        ; b.eq =>l_false
-        ; cmp w10, #4                               // IMM_HOLE
-        ; b.eq =>l_hole
-        ; =>l_undef
-        ; movz x9, VALUE_UNDEFINED as u32
-        ; b =>l_done
-        ; =>l_null
-        ; movz x9, VALUE_NULL as u32
-        ; b =>l_done
-        ; =>l_true
-        ; movz x9, VALUE_TRUE as u32
-        ; b =>l_done
-        ; =>l_false
-        ; movz x9, VALUE_FALSE as u32
-        ; b =>l_done
-        ; =>l_hole
-        ; movz x9, VALUE_HOLE as u32
-        ; =>l_done
-    );
-}
-
-/// One deferred boxed-slot decoder emitted after a compiled function's hot
-/// instruction stream. The hot site arrives with the compressed slot in `w9`;
-/// an exact payload returns through `continuation`, while a corrupt type tag
-/// takes that property's ordinary `miss` transition.
-pub(crate) struct BoxedSlotSlowPath {
-    pub(crate) entry: DynamicLabel,
-    pub(crate) continuation: DynamicLabel,
-    pub(crate) miss: DynamicLabel,
-}
-
-/// Emit every deferred boxed-slot load outside the hot instruction stream.
-/// Each path validates the heap body tag before recovering the exact full
-/// `Value` bits, including `-0`, NaN, and wide int32 payloads.
-pub(crate) fn emit_boxed_slot_slow_paths(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    slow_paths: Vec<BoxedSlotSlowPath>,
-) {
-    use otter_vm::value::compressed as cslot;
-
-    if slow_paths.is_empty() {
-        return;
-    }
-    debug_assert_eq!(cslot::TAG_BOXED, 0b010);
-    debug_assert_ne!(view.cage_base, 0);
-    debug_assert_ne!(view.heap_number_type_tag, 0);
-    let heap_number_type_tag = u32::from(view.heap_number_type_tag);
-    let heap_number_bits_byte = view.heap_number_bits_byte;
-    for path in slow_paths {
-        let BoxedSlotSlowPath {
-            entry,
-            continuation,
-            miss,
-        } = path;
-        dynasm!(ops
-            ; .arch aarch64
-            ; =>entry
-            ; and w10, w9, #0x7
-            ; cmp w10, #0x2
-            ; b.ne =>miss
-            ; and w9, w9, #0xfffffff8
-        );
-        emit_load_symbol_u64(
-            ops,
-            relocations,
-            10,
-            view.cage_base as u64,
-            RelocationTarget::GcCageBase,
-        );
-        dynasm!(ops
-            ; .arch aarch64
-            ; add x9, x10, x9
-            ; ldrb w10, [x9]
-            ; cmp w10, heap_number_type_tag
-            ; b.ne =>miss
-            ; ldr x9, [x9, heap_number_bits_byte]
-            ; b =>continuation
-        );
-    }
-}
-
-/// Compress the tagged `Value` in `x9` into a 4-byte object slot in `w10`.
-/// Handles the barrier-free, non-allocating cases: a small int in
-/// `[-2^30, 2^30)` and the `undefined` / `null` / boolean / hole immediates.
-/// A wide int, double, function id, or heap cell branches to `bail` (the
-/// window transition re-runs the store — a boxed number allocates, a cell
-/// needs the write barrier). The caller has already excluded cells. Fixed
-/// registers: `x9` value in, `w10` compressed slot out, `x11` scratch.
-pub(crate) fn emit_compress_slot_or_bail(ops: &mut Assembler, bail: DynamicLabel) {
-    use otter_vm::value::compressed as cslot;
-    // The literal compressed-immediate words below are `(kind << 3) | 0b100`.
-    debug_assert_eq!(cslot::TAG_IMMEDIATE, 0b100);
-    debug_assert_eq!(cslot::IMM_UNDEFINED, 0);
-    let not_int = ops.new_dynamic_label();
-    let done = ops.new_dynamic_label();
-    let imm_undef = ops.new_dynamic_label();
-    let imm_null = ops.new_dynamic_label();
-    let imm_true = ops.new_dynamic_label();
-    let imm_false = ops.new_dynamic_label();
-    let imm_hole = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch aarch64
-        ; movz x11, NUMBER_TAG_HI16, lsl #48
-        ; and x10, x9, x11
-        ; cmp x10, x11
-        ; b.ne =>not_int                            // not an int32
-        // int32: keep only a small int in [-2^30, 2^30); wider ints box.
-        ; movz w11, #0x4000, lsl #16                // 2^30
-        ; adds w10, w9, w11
-        // Out of small-int range. A test-and-branch reaches only ±32 KiB,
-        // which a large code object outgrows; the sign flag carries the same
-        // bit to a full-range conditional branch.
-        ; b.mi =>bail
-        ; lsl w10, w9, #1
-        ; orr w10, w10, #1                          // (i << 1) | 1
-        ; b =>done
-        ; =>not_int
-        ; cmp x9, VALUE_UNDEFINED_IMM
-        ; b.eq =>imm_undef
-        ; cmp x9, VALUE_NULL_IMM
-        ; b.eq =>imm_null
-        ; cmp x9, VALUE_TRUE_IMM
-        ; b.eq =>imm_true
-        ; cmp x9, VALUE_FALSE_IMM
-        ; b.eq =>imm_false
-        ; cmp x9, VALUE_HOLE_IMM
-        ; b.eq =>imm_hole
-        ; b =>bail                                  // double / function id
-        ; =>imm_undef
-        ; movz w10, #0x4                            // (0 << 3) | 0b100
-        ; b =>done
-        ; =>imm_null
-        ; movz w10, #0xc                            // (1 << 3) | 0b100
-        ; b =>done
-        ; =>imm_true
-        ; movz w10, #0x14                           // (2 << 3) | 0b100
-        ; b =>done
-        ; =>imm_false
-        ; movz w10, #0x1c                           // (3 << 3) | 0b100
-        ; b =>done
-        ; =>imm_hole
-        ; movz w10, #0x24                           // (4 << 3) | 0b100
         ; =>done
     );
 }

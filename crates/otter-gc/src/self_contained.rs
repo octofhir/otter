@@ -16,21 +16,6 @@
 //! direction: rather than enumerate the fields that are allowed, ask the
 //! tracer where the references are.
 //!
-//! # Telling a buffer from a temporary
-//!
-//! One idiom yields an out-of-cage slot and is nonetheless sound. A
-//! compressed slot word carrying tag bits cannot be handed to a
-//! `*mut RawGc` visitor directly, so its tracer forwards the bare offset
-//! through a stack temporary and writes the re-tagged word back to the
-//! live slot. Nothing is owned outside the heap; the address is simply a
-//! stack local.
-//!
-//! Distinguishing that from a real buffer is exact rather than
-//! heuristic: trace each object twice, the second time under an extra
-//! stack frame. A stack temporary's address moves by the frame delta; a
-//! buffer's does not. Only the addresses that hold still are counted as
-//! escapes.
-//!
 //! # Contents
 //!
 //! - [`EscapeRow`] — one type tag's escaping bodies and slots.

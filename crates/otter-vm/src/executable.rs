@@ -239,9 +239,6 @@ impl CodeBlock {
             },
             jit_proto_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_JIT_PROTO_OFFSET as u32,
-            heap_number_type_tag: crate::heap_number::HEAP_NUMBER_TYPE_TAG,
-            heap_number_bits_byte: otter_gc::header::HEADER_SIZE as u32
-                + std::mem::offset_of!(crate::heap_number::HeapNumberBody, bits) as u32,
             closure_call_layout: crate::jit::JitClosureCallLayout {
                 function_id_byte: gc_header_bytes
                     + crate::closure::CLOSURE_BODY_FUNCTION_ID_OFFSET as u32,

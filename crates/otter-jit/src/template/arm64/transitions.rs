@@ -36,8 +36,8 @@ use super::ic_probe::{
     DenseIndexForm, element_access_for, emit_element_address, emit_element_read, emit_element_write,
 };
 use super::values::{
-    emit_decompress_slot, emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64,
-    emit_load_u64, emit_slab_base, emit_store_reg,
+    emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64, emit_slab_base,
+    emit_store_reg,
 };
 pub(super) use crate::entry::TransitionTable;
 use otter_vm::JitCompileSnapshot;
@@ -282,9 +282,8 @@ pub(super) fn emit_load_global(
         dynasm!(ops
             ; .arch aarch64
             ; cbz x13, =>miss
-            ; ldr w9, [x13, target.value_byte]
+            ; ldr x9, [x13, target.value_byte]
         );
-        emit_decompress_slot(ops, relocations, view.cage_base as u64, miss);
         emit_store_reg(ops, 9, dst)?;
         dynasm!(ops ; .arch aarch64 ; b =>done);
     }

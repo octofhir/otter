@@ -359,7 +359,6 @@ fn compile_case(
     arguments: &[&str],
     compile_tier: &str,
     jit_policy: JitPolicy,
-    expected_backend: Option<&str>,
 ) -> BaselineCase {
     let mut args = vec![
         "jit-compile".into(),
@@ -376,10 +375,6 @@ fn compile_case(
         args.push("--argument".into());
         args.push((*argument).into());
     }
-    if let Some(backend) = expected_backend {
-        args.push("--expect-backend".into());
-        args.push(backend.into());
-    }
     args.extend([
         "--samples".into(),
         COMPILE_SAMPLES.to_string(),
@@ -387,7 +382,7 @@ fn compile_case(
         COMPILE_WARMUPS.to_string(),
     ]);
 
-    let mut benchmark_parameters = parameters([
+    let benchmark_parameters = parameters([
         ("source", source.into()),
         ("function", function.into()),
         ("expected", expected.into()),
@@ -397,10 +392,6 @@ fn compile_case(
             ENGINE_COMPILE_FEEDBACK_SEED_CALLS.to_string(),
         ),
     ]);
-    if let Some(backend) = expected_backend {
-        benchmark_parameters.insert("expectedBackend".into(), backend.into());
-    }
-
     BaselineCase {
         id: format!("jit-compile-{slug}-{compile_tier}"),
         args,
@@ -442,7 +433,6 @@ fn baseline_cases() -> Vec<BaselineCase> {
         &["1", "2"],
         "template",
         JitPolicy::Template,
-        None,
     ));
     cases.push(compile_case(
         "numeric-leaf",
@@ -452,7 +442,6 @@ fn baseline_cases() -> Vec<BaselineCase> {
         &["2", "2"],
         "template",
         JitPolicy::Template,
-        None,
     ));
     cases.push(compile_case(
         "numeric-leaf",
@@ -462,7 +451,6 @@ fn baseline_cases() -> Vec<BaselineCase> {
         &["2", "2"],
         "optimizing",
         JitPolicy::Optimizing,
-        Some("cranelift-numeric-leaf"),
     ));
     cases.push(BaselineCase {
         id: "memory-forced-full".into(),
@@ -1396,7 +1384,7 @@ mod tests {
                 && case
                     .args
                     .windows(2)
-                    .any(|pair| pair == ["--expect-backend", "cranelift-numeric-leaf"])
+                    .any(|pair| pair == ["--compile-tier", "optimizing"])
         }));
     }
 

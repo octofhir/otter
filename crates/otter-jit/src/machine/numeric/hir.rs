@@ -1,4 +1,4 @@
-//! Typed numeric HIR and acyclic control-flow construction.
+//! Typed numeric HIR and control-flow construction.
 //!
 //! # Contents
 //! - [`NumericFunction`] — bounded numeric SSA graph with explicit blocks.
@@ -43,10 +43,13 @@ pub(super) enum NumericNode {
     Constant(f64),
     WidenInt32(NumericValue),
     IntegerAdd(NumericValue, NumericValue),
+    IntegerSub(NumericValue, NumericValue),
     IntegerAddImmediate(NumericValue, i32),
+    IntegerSubImmediate(NumericValue, i32),
     IntegerAndImmediate(NumericValue, i32),
     IntegerLessThanImmediate(NumericValue, i32),
     IntegerEqualImmediate(NumericValue, i32),
+    IntegerNotEqualImmediate(NumericValue, i32),
     Add(NumericValue, NumericValue),
     Sub(NumericValue, NumericValue),
     Mul(NumericValue, NumericValue),
@@ -60,12 +63,15 @@ impl NumericNode {
         match self {
             Self::IntegerConstant(..)
             | Self::IntegerAdd(..)
+            | Self::IntegerSub(..)
             | Self::IntegerAddImmediate(..)
+            | Self::IntegerSubImmediate(..)
             | Self::IntegerAndImmediate(..)
             | Self::BlockParameter(NumericType::Int32) => NumericType::Int32,
             Self::LessThan(..)
             | Self::IntegerLessThanImmediate(..)
             | Self::IntegerEqualImmediate(..)
+            | Self::IntegerNotEqualImmediate(..)
             | Self::BlockParameter(NumericType::Boolean) => NumericType::Boolean,
             Self::Parameter(..)
             | Self::BlockParameter(NumericType::Number)
@@ -499,7 +505,7 @@ fn instruction_accesses(
         Op::LoadUndefined | Op::LoadInt32 | Op::LoadNumber => {
             Some((Vec::new(), vec![register(instruction, code, 0)?]))
         }
-        Op::ToPrimitive | Op::ToNumeric | Op::Neg => Some((
+        Op::ToPrimitive | Op::ToNumeric | Op::Neg | Op::Increment => Some((
             vec![register(instruction, code, 1)?],
             vec![register(instruction, code, 0)?],
         )),
@@ -510,7 +516,12 @@ fn instruction_accesses(
             ],
             vec![register(instruction, code, 0)?],
         )),
-        Op::AddImm | Op::BitwiseAndImm | Op::LessThanImm | Op::EqualImm => Some((
+        Op::AddImm
+        | Op::SubImm
+        | Op::BitwiseAndImm
+        | Op::LessThanImm
+        | Op::EqualImm
+        | Op::NotEqualImm => Some((
             vec![register(instruction, code, 1)?],
             vec![register(instruction, code, 0)?],
         )),
@@ -665,12 +676,16 @@ fn lower_instruction(
             let left = read_number(registers, nodes, register(instruction, code, 1)?)?;
             let right = read_number(registers, nodes, register(instruction, code, 2)?)?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
-            if op == Op::Add
+            if matches!(op, Op::Add | Op::Sub)
                 && instruction.arith_feedback().is_int32_only()
                 && value_type(nodes, left)? == NumericType::Int32
                 && value_type(nodes, right)? == NumericType::Int32
             {
-                NumericNode::IntegerAdd(left, right)
+                if op == Op::Add {
+                    NumericNode::IntegerAdd(left, right)
+                } else {
+                    NumericNode::IntegerSub(left, right)
+                }
             } else {
                 let left = widen_to_number(left, nodes, block_nodes)?;
                 let right = widen_to_number(right, nodes, block_nodes)?;
@@ -683,29 +698,31 @@ fn lower_instruction(
                 }
             }
         }
-        Op::AddImm | Op::BitwiseAndImm => {
+        Op::Increment | Op::AddImm | Op::SubImm | Op::BitwiseAndImm => {
             if !instruction.arith_feedback().is_int32_only() {
                 return None;
             }
             let source = read_int32(registers, nodes, register(instruction, code, 1)?)?;
             let immediate = instruction.imm32(code, 2)?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
-            if op == Op::AddImm {
-                NumericNode::IntegerAddImmediate(source, immediate)
-            } else {
-                NumericNode::IntegerAndImmediate(source, immediate)
+            match op {
+                Op::Increment | Op::AddImm => NumericNode::IntegerAddImmediate(source, immediate),
+                Op::SubImm => NumericNode::IntegerSubImmediate(source, immediate),
+                Op::BitwiseAndImm => NumericNode::IntegerAndImmediate(source, immediate),
+                _ => unreachable!("matched immediate int32 operation"),
             }
         }
-        Op::LessThanImm | Op::EqualImm => {
+        Op::LessThanImm | Op::EqualImm | Op::NotEqualImm => {
             if !instruction.arith_feedback().is_int32_only() {
                 return None;
             }
             let source = read_int32(registers, nodes, register(instruction, code, 1)?)?;
             let immediate = instruction.imm32(code, 2)?;
-            if op == Op::LessThanImm {
-                NumericNode::IntegerLessThanImmediate(source, immediate)
-            } else {
-                NumericNode::IntegerEqualImmediate(source, immediate)
+            match op {
+                Op::LessThanImm => NumericNode::IntegerLessThanImmediate(source, immediate),
+                Op::EqualImm => NumericNode::IntegerEqualImmediate(source, immediate),
+                Op::NotEqualImm => NumericNode::IntegerNotEqualImmediate(source, immediate),
+                _ => unreachable!("matched immediate int32 comparison"),
             }
         }
         Op::Neg => {
@@ -735,7 +752,10 @@ fn lower_instruction(
     block_nodes.push(value);
     if matches!(
         node,
-        NumericNode::IntegerAdd(..) | NumericNode::IntegerAddImmediate(..)
+        NumericNode::IntegerAdd(..)
+            | NumericNode::IntegerSub(..)
+            | NumericNode::IntegerAddImmediate(..)
+            | NumericNode::IntegerSubImmediate(..)
     ) {
         frame_states.push(NumericFrameState {
             point: NumericFramePoint::Node(value),

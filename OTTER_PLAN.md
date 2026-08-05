@@ -267,6 +267,29 @@ Native integer-loop publication landed on 2026-08-05:
 The full repository gate passed with 248 JIT tests, 831 VM tests, all-target
 all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
 
+Descending integer-loop publication landed on 2026-08-05:
+
+- checked Int32 register subtraction and immediate subtraction now have
+  distinct typed HIR and Machine IR operations; AArch64 `subs` overflow exits
+  reuse the same allocator-driven `MachineFrameState` and shared VM
+  `DeoptRuntime` as checked addition;
+- `Increment` selects the existing checked add-immediate operation, while
+  immediate inequality has its own Boolean-producing machine operation. No
+  bytecode identity reaches the emitter and no second recovery path was added;
+- focused native execution covers successful register subtraction,
+  subtraction-immediate and increment in a cyclic CFG, plus positive and
+  negative overflow with the exact pre-operation VM window and resume PC;
+- `benchmarks/scripts/countdown-phi.js` is a real frontend fixture whose loop
+  bytecode contains `NE_IMM`, `SUB_IMM`, `INCREMENT`, and a backedge. The
+  production optimizing selector test proves the corresponding shape starts
+  with `otter-machine-ir numeric-function` and returns `3000000`;
+- the validated three-sample production-tiered median was 2.288 ms with seven
+  optimizing entries and zero deopts, versus 7.010 ms for template tier
+  (-67.4%). Unsupported call and OSR-entry forms remain closed.
+
+The full repository gate passed with 250 JIT tests, 831 VM tests, all-target
+all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
+
 The remaining legacy optimizer and allocator are fallback for functions whose
 HIR/selection slices have not switched. Delete each old consumer as its final
 operation family moves; do not adapt old allocation or metadata into the new

@@ -298,14 +298,17 @@ pub enum MachineOpcode {
     FloatDiv,
     /// Floating-point negation.
     FloatNeg,
+    /// Ordered floating-point less-than comparison producing 0 or 1.
+    FloatLessThan,
     /// Canonically box one floating-point JavaScript Number.
     BoxNumber,
     /// Target ABI call through a call descriptor.
     Call(u32),
     /// Unconditional control transfer.
     Jump,
-    /// Conditional control transfer.
-    Branch,
+    /// Conditional control transfer; branch when the integer condition equals
+    /// the encoded polarity.
+    BranchIf(bool),
     /// Function return.
     Return,
 }
@@ -397,6 +400,12 @@ pub enum VerificationError {
     InvalidBlock(MachineBlock),
     /// Successor arguments do not match successor count or parameters.
     InvalidSuccessorArguments(MachineBlock),
+    /// Stored predecessors are not the exact reverse of successor edges.
+    PredecessorMismatch(MachineBlock),
+    /// An edge argument representation differs from its block parameter.
+    BlockParameterRepresentation(MachineBlock, MachineValue),
+    /// A selected branch/return has the wrong successor count.
+    TerminatorSuccessors(MachineBlock),
     /// An operand references a missing value.
     InvalidValue(MachineValue),
     /// A fixed register has the wrong class for its virtual value.
@@ -530,8 +539,20 @@ impl InstructionSequence {
         let mut expected_first = 0u32;
         let mut safepoints = std::collections::BTreeSet::new();
         let mut deopts = std::collections::BTreeSet::new();
+        let mut expected_predecessors = vec![Vec::new(); self.blocks.len()];
+        for (predecessor, block) in self.blocks.iter().enumerate() {
+            for successor in &block.successors {
+                let Some(predecessors) = expected_predecessors.get_mut(successor.0 as usize) else {
+                    return Err(VerificationError::InvalidBlock(*successor));
+                };
+                predecessors.push(MachineBlock(predecessor as u32));
+            }
+        }
         for (block_index, block) in self.blocks.iter().enumerate() {
             let block_id = MachineBlock(block_index as u32);
+            if block.predecessors != expected_predecessors[block_index] {
+                return Err(VerificationError::PredecessorMismatch(block_id));
+            }
             if block.first.0 != expected_first {
                 return Err(VerificationError::NonContiguousBlocks(block_id));
             }
@@ -548,8 +569,31 @@ impl InstructionSequence {
                 return Err(VerificationError::InvalidSuccessorArguments(block_id));
             }
             for (&successor, arguments) in block.successors.iter().zip(&block.successor_arguments) {
-                if arguments.len() != self.blocks[successor.0 as usize].parameters.len() {
+                let parameters = &self.blocks[successor.0 as usize].parameters;
+                if arguments.len() != parameters.len() {
                     return Err(VerificationError::InvalidSuccessorArguments(block_id));
+                }
+                for (&argument, &parameter) in arguments.iter().zip(parameters) {
+                    let Some(&argument_representation) =
+                        self.representations.get(argument.0 as usize)
+                    else {
+                        return Err(VerificationError::InvalidValue(argument));
+                    };
+                    let Some(&parameter_representation) =
+                        self.representations.get(parameter.0 as usize)
+                    else {
+                        return Err(VerificationError::InvalidValue(parameter));
+                    };
+                    if argument_representation != parameter_representation {
+                        return Err(VerificationError::BlockParameterRepresentation(
+                            successor, parameter,
+                        ));
+                    }
+                }
+            }
+            for &parameter in &block.parameters {
+                if parameter.0 as usize >= self.representations.len() {
+                    return Err(VerificationError::InvalidValue(parameter));
                 }
             }
             for instruction_index in block.first.0..block.end.0 {
@@ -562,6 +606,18 @@ impl InstructionSequence {
                         ControlFlow::Branch | ControlFlow::Return
                     ) {
                         return Err(VerificationError::MissingTerminator(block_id));
+                    }
+                    match instruction.opcode {
+                        MachineOpcode::Jump if block.successors.len() != 1 => {
+                            return Err(VerificationError::TerminatorSuccessors(block_id));
+                        }
+                        MachineOpcode::BranchIf(_) if block.successors.len() != 2 => {
+                            return Err(VerificationError::TerminatorSuccessors(block_id));
+                        }
+                        MachineOpcode::Return if !block.successors.is_empty() => {
+                            return Err(VerificationError::TerminatorSuccessors(block_id));
+                        }
+                        _ => {}
                     }
                 } else if instruction.control != ControlFlow::None {
                     return Err(VerificationError::EarlyTerminator(id));

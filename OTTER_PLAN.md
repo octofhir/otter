@@ -133,6 +133,31 @@ First production execution slice landed on 2026-08-05:
 The full repository gate passed with 241 JIT tests, 831 VM tests, all-target
 all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
 
+First control-flow slice landed on 2026-08-05:
+
+- the numeric HIR now builds an explicit acyclic CFG from authoritative
+  bytecode block boundaries, with typed Number/Boolean values, predecessors,
+  successors, block parameters, and per-edge arguments;
+- ordered Float64 less-than, both conditional-branch polarities, unconditional
+  jumps, and multi-block returns select into the one Machine IR;
+- the AArch64 emitter binds block labels and executes regalloc2 edge moves
+  before terminators; `NaN` remains unordered and therefore compares false;
+- the Machine IR verifier now checks reverse predecessor edges, terminator
+  successor counts, and block-parameter/edge-argument representations;
+- critical edges carrying arguments are declined until edge splitting lands;
+  loops, int32 operations, FrameState, and OSR still use the legacy fallback;
+- the current artifact identity is `otter-machine-ir numeric-function` with a
+  `machineNumericFunction` code-map region; the obsolete leaf-only identity was
+  changed in place;
+- a production frontend fixture executes a real diamond and validates its
+  merged return. On the same 50-sample harness, compile median fell from
+  136,312.5 ns on the parent legacy optimizer to 65,708 ns (-51.8%), with both
+  versions producing 468-byte code. The straight-line numeric fixture remains
+  256 bytes and measured 13,833 ns versus the previously accepted 14,625 ns.
+
+The full repository gate passed with 243 JIT tests, 831 VM tests, all-target
+all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
+
 The remaining legacy optimizer and allocator are fallback for functions whose
 HIR/selection slices have not switched. Delete each old consumer as its final
 operation family moves; do not adapt old allocation or metadata into the new

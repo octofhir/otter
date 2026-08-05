@@ -110,7 +110,7 @@ impl TargetRegisterFile {
         }
     }
 
-    pub(super) fn aarch64_numeric_leaf() -> Self {
+    pub(super) fn aarch64_numeric_function() -> Self {
         let mut registers = Self::aarch64();
         // The first executable Machine IR slice intentionally owns no
         // callee-saved register protocol. Keep the context in x15, reserve

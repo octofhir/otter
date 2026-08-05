@@ -393,10 +393,10 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     Guarded global-object reads prove the realm epoch, dictionary shape, and
     property slot before reading the live value.
   - Inspect the first line of `optimized-ir.txt`: general legacy lowering emits
-    the deterministic Otter optimized unit, while a numeric leaf compiled by
-    the replacement pipeline starts with `; backend=otter-machine-ir
-    numeric-leaf` and contains normalized Machine IR plus allocation. Its code
-    map uses the `machineNumericLeaf` structural region.
+    the deterministic Otter optimized unit, while a numeric function compiled
+    by the replacement pipeline starts with `; backend=otter-machine-ir
+    numeric-function` and contains normalized Machine IR plus allocation. Its
+    code map uses the `machineNumericFunction` structural region.
   - Exact code may contain process addresses and is not a portable golden.
     Compare `code-normalized.bin` across processes; its relocation tokens and
     branch targets are symbolic, and it is not executable. `relocations.json`

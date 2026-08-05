@@ -232,7 +232,7 @@ mod tests {
     use otter_bytecode::{Op, Operand};
     use otter_vm::{
         JitArtifactFileName, JitArtifactIdentity, JitCompileSnapshot, JitDebugTarget, JitDebugTier,
-        Value,
+        JitFunctionCode, Value,
         jit::JitTestInstruction,
         jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ArithFeedback},
         native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader, VmThread},
@@ -314,6 +314,36 @@ mod tests {
                 (Op::ReturnValue, vec![Operand::Register(1)]),
             ],
         )
+    }
+
+    fn spill_pressure_view() -> JitCompileSnapshot {
+        let mut instructions = (1..=32)
+            .map(|register| {
+                (
+                    Op::LoadInt32,
+                    vec![
+                        Operand::Register(register),
+                        Operand::Imm32(i32::from(register)),
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut source = 0;
+        let mut destination = 33;
+        for right in 1..=32 {
+            instructions.push((
+                Op::Add,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(source),
+                    Operand::Register(right),
+                ],
+            ));
+            source = destination;
+            destination += 1;
+        }
+        instructions.push((Op::ReturnValue, vec![Operand::Register(source)]));
+        numeric_view(1, destination, instructions)
     }
 
     fn compile_output(
@@ -410,6 +440,25 @@ mod tests {
 
         assert_eq!(ret.status, STATUS_RETURNED);
         assert_eq!(ret.value, tag::box_int32(-9));
+    }
+
+    #[test]
+    fn executes_allocator_spills_through_the_shared_frame_layout() {
+        let code = compile_output(&spill_pressure_view(), None).code;
+        assert!(code.metadata().spill_slot_count > 0);
+        assert!(
+            JitFunctionCode::generated_stack_frame_bytes(&code)
+                .is_some_and(|frame_bytes| frame_bytes > 16)
+        );
+
+        let (ret, _, _) = execute(&code, &[tag::box_int32(0)], 0);
+        assert_eq!(ret.status, STATUS_RETURNED);
+        assert_eq!(ret.value, tag::box_int32(528));
+
+        let (bail, frame, pc) = execute(&code, &[Value::undefined().to_bits()], 77);
+        assert_eq!(bail.status, STATUS_BAILED);
+        assert_eq!(pc, 0);
+        assert_eq!(frame[0], Value::undefined().to_bits());
     }
 
     #[test]

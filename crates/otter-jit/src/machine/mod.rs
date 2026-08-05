@@ -11,6 +11,7 @@
 //! - [`TargetRegisterFile`] — complete allocatable target register inventory.
 //! - [`AllocatedSequence`] — allocator edits, per-operand locations, and exact
 //!   safepoint/deoptimization locations.
+//! - [`MachineFrameLayout`] — aligned post-allocation spill-frame contract.
 //!
 //! # Invariants
 //! - Virtual values are dense and have one machine representation.
@@ -26,11 +27,13 @@
 //! # See also
 //! - [`crate::optimizing`] — current semantic lowering being replaced.
 
+mod frame;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod numeric;
 mod regalloc;
 mod target;
 
+pub use frame::{FrameLayoutError, MachineFrameLayout};
 pub use regalloc::{
     AllocatedLocation, AllocatedMetadata, AllocatedSequence, AllocationEdit, AllocationError,
     AllocationPoint,

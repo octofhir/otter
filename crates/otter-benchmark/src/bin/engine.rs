@@ -2880,6 +2880,31 @@ mod tests {
         );
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn jit_compile_executes_split_critical_edge_through_production_optimizer() {
+        let record = run_jit_compile(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../benchmarks/fixtures/engine/numeric-critical-edge.js"),
+            "engineNumericCriticalEdge".into(),
+            4.0,
+            CompileTier::Optimizing,
+            vec![1.0, 3.0],
+            1,
+            0,
+        );
+        assert!(record.failure.is_none(), "{:?}", record.failure);
+        assert_eq!(record.jit_policy, JitPolicy::Optimizing);
+        assert_eq!(record.measurements.compile_time_ns.len(), 1);
+        assert_eq!(record.measurements.code_bytes.len(), 1);
+        assert!(
+            record
+                .validation_marker
+                .as_deref()
+                .is_some_and(|marker| marker.contains("return=4"))
+        );
+    }
+
     #[test]
     fn clap_rejects_legacy_tier_and_macro_surfaces() {
         assert!(Args::try_parse_from(["otter-engine-benchmark", "call"]).is_err());

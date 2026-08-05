@@ -3,7 +3,9 @@
 //! This module is the final boundary between JavaScript-semantic lowering and
 //! target code emission. Instructions carry only machine operations, virtual
 //! registers, physical constraints, clobbers, and metadata operands. They do
-//! not contain bytecode opcodes, shapes, access plans, or interpreter slots.
+//! not contain bytecode opcodes, shapes, or access plans. The explicit OSR
+//! entry marker is the sole operation allowed to map live interpreter-frame
+//! registers into allocator operands.
 //!
 //! # Contents
 //! - [`InstructionSequence`] — verified block, value, and instruction storage.
@@ -21,6 +23,8 @@
 //!   live GC/deopt value in a clobbered register.
 //! - Root and deopt maps are built from the same per-operand allocation table
 //!   consumed by the emitter; there is no pre-allocation location fallback.
+//! - OSR sources are immutable entry metadata aligned with ordinary late-use
+//!   operands; their target locations come from that same allocation table.
 //! - Target register files enumerate physical registers explicitly. There is
 //!   no synthetic constant register budget.
 //!
@@ -164,6 +168,19 @@ pub struct MachineOperand {
 }
 
 impl MachineOperand {
+    /// Keep an ordinary input in its allocator-selected register or spill home
+    /// through the instruction's main effect.
+    #[must_use]
+    pub const fn location_input(value: MachineValue) -> Self {
+        Self {
+            value,
+            constraint: OperandConstraint::Any,
+            role: OperandRole::Use,
+            timing: OperandTiming::Late,
+            purpose: OperandPurpose::Input,
+        }
+    }
+
     /// Construct an ordinary early register input.
     #[must_use]
     pub const fn register_input(value: MachineValue) -> Self {
@@ -223,6 +240,28 @@ impl MachineOperand {
             purpose: OperandPurpose::Deopt,
         }
     }
+}
+
+/// Scalar contract for one interpreter-frame value entering Machine IR via OSR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineOsrType {
+    /// Tagged Number proven to fit a signed 32-bit integer.
+    Int32,
+    /// Tagged Number proven to fit an unsigned 32-bit integer.
+    Uint32,
+    /// Any tagged JavaScript Number decoded to binary64.
+    Float64,
+    /// Canonical tagged Boolean decoded to integer zero or one.
+    Boolean,
+}
+
+/// One live loop-header value materialized by an OSR entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MachineOsrInput {
+    /// Interpreter frame register containing the tagged source value.
+    pub frame_register: u16,
+    /// Unboxed scalar contract expected by the loop header.
+    pub value_type: MachineOsrType,
 }
 
 /// Memory and dependency effects declared by a machine call.
@@ -394,6 +433,14 @@ pub enum MachineOpcode {
     BoxBoolean,
     /// Target ABI call through a call descriptor.
     Call(u32),
+    /// Interpreter-to-native loop-header entry marker. Its late-use operands
+    /// name the exact allocator locations populated by the cold trampoline.
+    OsrEntry {
+        /// Canonical instruction index of the loop header.
+        logical_pc: u32,
+        /// Interpreter sources aligned one-for-one with instruction operands.
+        inputs: Vec<MachineOsrInput>,
+    },
     /// Loop backedge poll with an exact interpreter reconstruction state.
     BackedgePoll,
     /// Unconditional control transfer.

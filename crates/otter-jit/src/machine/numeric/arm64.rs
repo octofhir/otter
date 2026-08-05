@@ -7,7 +7,7 @@
 //! - regalloc2 edit emission between selected instructions.
 //!
 //! # Invariants
-//! - Callee-saved `x19` retains the entry context; `x16`/`x17` and `d31` are
+//! - Callee-saved `x19` retains the entry context; `x16`/`x17` and `d30`/`d31` are
 //!   emitter-only scratch registers excluded from allocation.
 //! - Spill storage and offsets come only from [`MachineFrameLayout`].
 //! - Callee-saved allocations remain excluded until shared save/restore maps
@@ -18,6 +18,8 @@
 //!   the emitter owns no parallel reconstruction recipe.
 //! - Backedge polls run before allocator edge edits and preserve every value
 //!   live into the loop header across the leaf runtime call.
+//! - OSR trampolines decode only live loop-header inputs into the exact
+//!   late-use locations selected by regalloc2; rejection never mutates VM slots.
 //! - Successful results use the VM's canonical Number or Boolean representation.
 //! - Pure numeric leaves exchange unboxed scalar values and use only the
 //!   frame-owned result shuttle; they have no heap or status channel.
@@ -38,7 +40,8 @@ use otter_vm::{
 
 use super::super::{
     AllocatedLocation, AllocatedSequence, AllocationEdit, AllocationPoint, DeoptId,
-    InstructionSequence, MachineFrameLayout, MachineInstructionId, MachineOpcode,
+    InstructionSequence, MachineFrameLayout, MachineInstructionId, MachineOpcode, MachineOsrInput,
+    MachineOsrType, MachineRepresentation,
 };
 use crate::{
     CompiledCode, Unsupported,
@@ -50,6 +53,7 @@ use crate::{
         VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
 };
+use std::collections::BTreeMap;
 
 pub(super) const GPR_BUDGET: u16 = 16;
 pub(super) const FP_BUDGET: u16 = 8;
@@ -61,6 +65,15 @@ pub(super) struct Emission {
     pub(super) code: CompiledCode,
     pub(super) generated_stack_frame_bytes: u32,
     pub(super) relocations: RelocationCapture,
+    pub(super) osr_entries: BTreeMap<u32, usize>,
+    pub(super) osr_regions: Vec<(u32, usize, usize)>,
+}
+
+struct OsrSite {
+    instruction: MachineInstructionId,
+    logical_pc: u32,
+    inputs: Vec<MachineOsrInput>,
+    continuation: DynamicLabel,
 }
 
 fn instruction_deopt_label(
@@ -221,23 +234,27 @@ pub(super) fn emit(
         .iter()
         .map(|_| ops.new_dynamic_label())
         .collect::<Vec<_>>();
-
-    dynasm!(ops
-        ; .arch aarch64
-        ; stp x29, x30, [sp, #-16]!
-        ; mov x29, sp
-        ; stp x19, x20, [sp, #-16]!
-    );
-    if frame.fixed_bytes() > BASE_FIXED_FRAME_BYTES {
-        dynasm!(ops ; .arch aarch64 ; stp xzr, xzr, [sp, #-16]!);
+    let mut osr_sites = Vec::new();
+    for (index, instruction) in sequence.instructions().iter().enumerate() {
+        let MachineOpcode::OsrEntry {
+            logical_pc,
+            ref inputs,
+        } = instruction.opcode
+        else {
+            continue;
+        };
+        if inputs.len() != instruction.operands.len() {
+            return Err(Unsupported::OperandShape("numeric OSR input arity"));
+        }
+        osr_sites.push(OsrSite {
+            instruction: MachineInstructionId(index as u32),
+            logical_pc,
+            inputs: inputs.clone(),
+            continuation: ops.new_dynamic_label(),
+        });
     }
-    emit_reserve_spill_area(&mut ops, frame.spill_area_bytes());
-    dynasm!(ops
-        ; .arch aarch64
-        ; mov x19, x0
-        ; ldr x17, [x19, NATIVE_FRAME_OFFSET]
-        ; ldr x17, [x17, NATIVE_FRAME_REGISTER_BASE_OFFSET]
-    );
+
+    emit_prologue(&mut ops, frame);
 
     for (index, instruction) in sequence.instructions().iter().enumerate() {
         let id = MachineInstructionId(index as u32);
@@ -265,6 +282,14 @@ pub(super) fn emit(
             .instruction_locations(id)
             .ok_or(Unsupported::OperandShape("numeric Machine IR locations"))?;
         match instruction.opcode {
+            MachineOpcode::OsrEntry { .. } => {
+                let site = osr_sites
+                    .iter()
+                    .find(|site| site.instruction == id)
+                    .ok_or(Unsupported::OperandShape("numeric OSR continuation"))?;
+                let continuation = site.continuation;
+                dynasm!(ops ; .arch aarch64 ; =>continuation);
+            }
             MachineOpcode::EntryValue(parameter) => {
                 let destination = integer_register(locations[0])?;
                 let offset = u32::from(parameter)
@@ -760,6 +785,54 @@ pub(super) fn emit(
         emit_epilogue(&mut ops, frame);
     }
 
+    let mut osr_entries = BTreeMap::new();
+    let mut osr_regions = Vec::with_capacity(osr_sites.len());
+    for site in &osr_sites {
+        let offset = ops.offset().0;
+        let representation_bail = ops.new_dynamic_label();
+        emit_prologue(&mut ops, frame);
+        let locations = allocation
+            .instruction_locations(site.instruction)
+            .ok_or(Unsupported::OperandShape("numeric OSR allocation coverage"))?;
+        for ((input, &location), operand) in site
+            .inputs
+            .iter()
+            .zip(locations)
+            .zip(&sequence.instructions()[site.instruction.0 as usize].operands)
+        {
+            emit_osr_materialization(
+                &mut ops,
+                frame,
+                *input,
+                sequence.representations()[operand.value.0 as usize],
+                location,
+                representation_bail,
+            )?;
+        }
+        let continuation = site.continuation;
+        dynasm!(ops
+            ; .arch aarch64
+            ; b =>continuation
+            ; =>representation_bail
+        );
+        emit_load_u64(&mut ops, 16, u64::from(site.logical_pc));
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x17, [x19, NATIVE_FRAME_OFFSET]
+            ; str w16, [x17, NATIVE_FRAME_PC_OFFSET]
+            ; mov x0, xzr
+            ; movz x1, STATUS_BAILED as u32
+        );
+        emit_epilogue(&mut ops, frame);
+        let end = ops.offset().0;
+        if osr_entries.insert(site.logical_pc, offset).is_some() {
+            return Err(Unsupported::OperandShape(
+                "duplicate numeric OSR logical PC",
+            ));
+        }
+        osr_regions.push((site.logical_pc, offset, end));
+    }
+
     let buffer = ops
         .finalize()
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::Finalization))?;
@@ -779,6 +852,8 @@ pub(super) fn emit(
         code: CompiledCode::new(buffer, AssemblyOffset(0)),
         generated_stack_frame_bytes,
         relocations,
+        osr_entries,
+        osr_regions,
     })
 }
 
@@ -966,6 +1041,173 @@ fn emit_box_boolean(ops: &mut dynasmrt::aarch64::Assembler, source: u8, destinat
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>is_false);
     emit_load_u64(ops, destination, Value::boolean(false).to_bits());
     dynasm!(ops ; .arch aarch64 ; =>done);
+}
+
+fn emit_prologue(ops: &mut dynasmrt::aarch64::Assembler, frame: MachineFrameLayout) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; stp x29, x30, [sp, #-16]!
+        ; mov x29, sp
+        ; stp x19, x20, [sp, #-16]!
+    );
+    if frame.fixed_bytes() > BASE_FIXED_FRAME_BYTES {
+        dynasm!(ops ; .arch aarch64 ; stp xzr, xzr, [sp, #-16]!);
+    }
+    emit_reserve_spill_area(ops, frame.spill_area_bytes());
+    dynasm!(ops
+        ; .arch aarch64
+        ; mov x19, x0
+        ; ldr x17, [x19, NATIVE_FRAME_OFFSET]
+        ; ldr x17, [x17, NATIVE_FRAME_REGISTER_BASE_OFFSET]
+    );
+}
+
+fn emit_load_osr_source(ops: &mut dynasmrt::aarch64::Assembler, frame_register: u16) {
+    let offset = u32::from(frame_register) * 8;
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x17, [x19, NATIVE_FRAME_OFFSET]
+        ; ldr x17, [x17, NATIVE_FRAME_REGISTER_BASE_OFFSET]
+        ; ldr x16, [x17, offset]
+    );
+}
+
+fn emit_decode_osr_number(ops: &mut dynasmrt::aarch64::Assembler, bail: DynamicLabel) {
+    let non_int = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; fmov d30, x16
+        ; movz x16, NUMBER_TAG_HI16, lsl #48
+        ; fmov x17, d30
+        ; and x17, x17, x16
+        ; cmp x17, x16
+        ; b.ne =>non_int
+        ; fmov x17, d30
+        ; scvtf d31, w17
+        ; b =>done
+        ; =>non_int
+        ; fmov x17, d30
+        ; tst x17, x16
+        ; b.eq =>bail
+        ; movz x16, DOUBLE_OFFSET_HI16, lsl #48
+        ; sub x17, x17, x16
+        ; fmov d31, x17
+        ; =>done
+    );
+}
+
+fn emit_store_osr_integer(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    frame: MachineFrameLayout,
+    location: AllocatedLocation,
+) -> Result<(), Unsupported> {
+    match location {
+        AllocatedLocation::Register(register) if register.is_integer() => {
+            let destination = register.encoding();
+            dynasm!(ops ; .arch aarch64 ; mov W(destination), w16);
+        }
+        AllocatedLocation::Stack(slot) => {
+            let offset = spill_offset(frame, slot)?;
+            dynasm!(ops ; .arch aarch64 ; str x16, [sp, offset]);
+        }
+        AllocatedLocation::Register(_) => {
+            return Err(Unsupported::OperandShape("numeric OSR integer location"));
+        }
+    }
+    Ok(())
+}
+
+fn emit_store_osr_float(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    frame: MachineFrameLayout,
+    location: AllocatedLocation,
+) -> Result<(), Unsupported> {
+    match location {
+        AllocatedLocation::Register(register) if register.is_float() => {
+            let destination = register.encoding();
+            dynasm!(ops ; .arch aarch64 ; fmov D(destination), d31);
+        }
+        AllocatedLocation::Stack(slot) => {
+            let offset = spill_offset(frame, slot)?;
+            dynasm!(ops ; .arch aarch64 ; str d31, [sp, offset]);
+        }
+        AllocatedLocation::Register(_) => {
+            return Err(Unsupported::OperandShape("numeric OSR float location"));
+        }
+    }
+    Ok(())
+}
+
+fn emit_osr_materialization(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    frame: MachineFrameLayout,
+    input: MachineOsrInput,
+    representation: MachineRepresentation,
+    location: AllocatedLocation,
+    bail: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let expected = match input.value_type {
+        MachineOsrType::Int32 | MachineOsrType::Boolean => MachineRepresentation::Int32,
+        MachineOsrType::Uint32 => MachineRepresentation::Uint32,
+        MachineOsrType::Float64 => MachineRepresentation::Float64,
+    };
+    if representation != expected {
+        return Err(Unsupported::OperandShape("numeric OSR representation"));
+    }
+
+    emit_load_osr_source(ops, input.frame_register);
+    match input.value_type {
+        MachineOsrType::Int32 => {
+            dynasm!(ops
+                ; .arch aarch64
+                ; movz x17, NUMBER_TAG_HI16, lsl #48
+                ; and x16, x16, x17
+                ; cmp x16, x17
+                ; b.ne =>bail
+            );
+            emit_load_osr_source(ops, input.frame_register);
+            dynasm!(ops ; .arch aarch64 ; mov w16, w16);
+            emit_store_osr_integer(ops, frame, location)
+        }
+        MachineOsrType::Uint32 => {
+            emit_decode_osr_number(ops, bail);
+            dynasm!(ops
+                ; .arch aarch64
+                ; fcvtzu w16, d31
+                ; ucvtf d30, w16
+                ; fcmp d31, d30
+                ; b.ne =>bail
+            );
+            emit_store_osr_integer(ops, frame, location)
+        }
+        MachineOsrType::Float64 => {
+            emit_decode_osr_number(ops, bail);
+            emit_store_osr_float(ops, frame, location)
+        }
+        MachineOsrType::Boolean => {
+            let is_true = ops.new_dynamic_label();
+            let ready = ops.new_dynamic_label();
+            emit_load_u64(ops, 17, Value::boolean(true).to_bits());
+            dynasm!(ops
+                ; .arch aarch64
+                ; cmp x16, x17
+                ; b.eq =>is_true
+            );
+            emit_load_u64(ops, 17, Value::boolean(false).to_bits());
+            dynasm!(ops
+                ; .arch aarch64
+                ; cmp x16, x17
+                ; b.ne =>bail
+                ; mov w16, wzr
+                ; b =>ready
+                ; =>is_true
+                ; mov w16, #1
+                ; =>ready
+            );
+            emit_store_osr_integer(ops, frame, location)
+        }
+    }
 }
 
 fn emit_epilogue(ops: &mut dynasmrt::aarch64::Assembler, frame: MachineFrameLayout) {

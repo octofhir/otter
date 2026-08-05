@@ -10,6 +10,8 @@
 //!   contain no bytecode operations.
 //! - Parameter guards bail at logical PC zero before observable effects.
 //! - Machine locations, edits, and frame size come only from regalloc2 output.
+//! - Reducible loop headers publish one representation-checked OSR trampoline
+//!   that fills only live block parameters and never mutates the VM window.
 //! - Runtime calls are leaf polls or cold deopt writeback; neither keeps a
 //!   tagged value solely in Machine IR storage across a GC safepoint.
 
@@ -26,8 +28,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use self::hir::{NumericFramePoint, NumericFunction, NumericNode, NumericTerminator, NumericType};
 use super::{
     ControlFlow, DeoptId, InstructionSequence, MachineBlock, MachineBlockData, MachineInstruction,
-    MachineInstructionId, MachineOpcode, MachineOperand, MachineRepresentation, MachineValue,
-    TargetRegisterFile, lower_deopt_table,
+    MachineInstructionId, MachineOpcode, MachineOperand, MachineOsrInput, MachineOsrType,
+    MachineRepresentation, MachineValue, TargetRegisterFile, lower_deopt_table,
 };
 use crate::{
     Unsupported,
@@ -100,6 +102,8 @@ pub(crate) fn try_compile(
         code: emitted_code,
         generated_stack_frame_bytes,
         relocations,
+        osr_entries,
+        osr_regions,
     } = emission;
 
     let artifact = artifact_request.map(|request| {
@@ -118,6 +122,9 @@ pub(crate) fn try_compile(
             0,
             emitted_code.len(),
         ));
+        for &(logical_pc, start, end) in &osr_regions {
+            code_map.record_osr(logical_pc, start, end);
+        }
         build_bundle(
             request,
             view,
@@ -139,7 +146,7 @@ pub(crate) fn try_compile(
         safepoints,
         frame_maps,
         frame_map_bitmap_words,
-        BTreeMap::new(),
+        osr_entries,
         Box::default(),
         Box::default(),
         Box::default(),
@@ -237,6 +244,40 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                     )],
                 ));
             }
+        }
+        if block
+            .predecessors
+            .iter()
+            .any(|&predecessor| predecessor >= block_index)
+        {
+            debug_assert_eq!(block.parameters.len(), block.parameter_registers.len());
+            let inputs = block
+                .parameters
+                .iter()
+                .zip(&block.parameter_registers)
+                .map(|(&parameter, &frame_register)| MachineOsrInput {
+                    frame_register,
+                    value_type: match hir.nodes[parameter.0].value_type() {
+                        NumericType::Int32 => MachineOsrType::Int32,
+                        NumericType::Uint32 => MachineOsrType::Uint32,
+                        NumericType::Number => MachineOsrType::Float64,
+                        NumericType::Boolean => MachineOsrType::Boolean,
+                    },
+                })
+                .collect();
+            instructions.push(MachineInstruction::plain(
+                MachineOpcode::OsrEntry {
+                    logical_pc: block.logical_pc,
+                    inputs,
+                },
+                block
+                    .parameters
+                    .iter()
+                    .map(|&parameter| {
+                        MachineOperand::location_input(machine_value(&values, parameter))
+                    })
+                    .collect(),
+            ));
         }
         for &node_value in &block.nodes {
             let result = values[node_value.0];
@@ -793,7 +834,7 @@ mod tests {
 
     use super::*;
     use crate::entry::{JitCtx, JitEntry, JitRet, STATUS_BAILED, STATUS_RETURNED};
-    use crate::machine::{AllocatedLocation, lower_deopt_table};
+    use crate::machine::{AllocatedLocation, OperandConstraint, OperandTiming, lower_deopt_table};
 
     fn numeric_view(
         param_count: u16,
@@ -1943,6 +1984,116 @@ mod tests {
         view
     }
 
+    fn mixed_osr_loop_view() -> JitCompileSnapshot {
+        let r = Operand::Register;
+        let i = Operand::Imm32;
+        let mut view = numeric_view(
+            0,
+            10,
+            vec![
+                (Op::LoadInt32, vec![r(7), i(-1)]),
+                (Op::LoadInt32, vec![r(8), i(0)]),
+                (Op::Ushr, vec![r(0), r(7), r(8)]),
+                (Op::LoadTrue, vec![r(1)]),
+                (Op::LoadInt32, vec![r(2), i(0)]),
+                (Op::LoadInt32, vec![r(3), i(3)]),
+                (Op::LessThan, vec![r(4), r(2), r(3)]),
+                (Op::JumpIfFalse, vec![i(8), r(4)]),
+                (Op::LoadInt32, vec![r(5), i(1)]),
+                (Op::Ushr, vec![r(6), r(0), r(5)]),
+                (Op::StoreLocal, vec![r(6), i(0)]),
+                (Op::LogicalNot, vec![r(7), r(1)]),
+                (Op::StoreLocal, vec![r(7), i(1)]),
+                (Op::AddImm, vec![r(8), r(2), i(1)]),
+                (Op::StoreLocal, vec![r(8), i(2)]),
+                (Op::Jump, vec![i(-10)]),
+                (Op::ReturnValue, vec![r(0)]),
+            ],
+        );
+        for pc in [6_u32, 13] {
+            view.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(ARITH_INT32));
+        }
+        view
+    }
+
+    fn osr_spill_pressure_loop_view() -> JitCompileSnapshot {
+        let mut instructions = (0_u16..20)
+            .map(|register| {
+                (
+                    Op::LoadInt32,
+                    vec![
+                        Operand::Register(register),
+                        Operand::Imm32(i32::from(register) + 1),
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        instructions.extend([
+            (
+                Op::LoadInt32,
+                vec![Operand::Register(20), Operand::Imm32(0)],
+            ),
+            (
+                Op::LoadInt32,
+                vec![Operand::Register(21), Operand::Imm32(1)],
+            ),
+            (
+                Op::LoadInt32,
+                vec![Operand::Register(23), Operand::Imm32(0)],
+            ),
+            (
+                Op::LessThan,
+                vec![
+                    Operand::Register(22),
+                    Operand::Register(20),
+                    Operand::Register(21),
+                ],
+            ),
+            (
+                Op::JumpIfFalse,
+                vec![Operand::Imm32(43), Operand::Register(22)],
+            ),
+        ]);
+        for register in 0_u16..20 {
+            instructions.push((
+                Op::Add,
+                vec![
+                    Operand::Register(24),
+                    Operand::Register(23),
+                    Operand::Register(register),
+                ],
+            ));
+            instructions.push((
+                Op::StoreLocal,
+                vec![Operand::Register(24), Operand::Imm32(23)],
+            ));
+        }
+        instructions.extend([
+            (
+                Op::AddImm,
+                vec![
+                    Operand::Register(24),
+                    Operand::Register(20),
+                    Operand::Imm32(1),
+                ],
+            ),
+            (
+                Op::StoreLocal,
+                vec![Operand::Register(24), Operand::Imm32(20)],
+            ),
+            (Op::Jump, vec![Operand::Imm32(-45)]),
+            (Op::ReturnValue, vec![Operand::Register(23)]),
+        ]);
+        let mut view = numeric_view(0, 25, instructions);
+        for pc in 23_u32..=65 {
+            if pc == 24 || (25..65).contains(&pc) && pc % 2 == 0 {
+                continue;
+            }
+            view.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(ARITH_INT32));
+        }
+        view
+    }
+
     fn branch_phi_loop_view_with(
         initial_checksum: i32,
         initial_index: i32,
@@ -2098,6 +2249,35 @@ mod tests {
         let entry: JitEntry = unsafe { std::mem::transmute(code.compiled_code().entry_ptr()) };
         let mut frame = vec![Value::undefined().to_bits(); code.metadata().register_count as usize];
         frame[..args.len()].copy_from_slice(args);
+        execute_at(code, entry, frame, initial_pc, interrupt, fuel)
+    }
+
+    fn execute_osr_with_poll_cells(
+        code: &OptimizedCode,
+        logical_pc: u32,
+        frame: Vec<u64>,
+        interrupt: *const u8,
+        fuel: &mut u64,
+    ) -> (JitRet, Vec<u64>, u32) {
+        // SAFETY: the code object owns the recorded trampoline throughout the call.
+        let entry = unsafe {
+            code.osr_entry_ptr_for_test(logical_pc)
+                .expect("numeric OSR entry")
+        };
+        // SAFETY: the trampoline uses the same shared `JitEntry` ABI as main entry.
+        let entry: JitEntry = unsafe { std::mem::transmute(entry) };
+        execute_at(code, entry, frame, logical_pc, interrupt, fuel)
+    }
+
+    fn execute_at(
+        code: &OptimizedCode,
+        entry: JitEntry,
+        mut frame: Vec<u64>,
+        initial_pc: u32,
+        interrupt: *const u8,
+        fuel: &mut u64,
+    ) -> (JitRet, Vec<u64>, u32) {
+        assert_eq!(frame.len(), code.metadata().register_count as usize);
         let metadata = code.metadata();
         let mut native_frame = NativeFrame::new(
             VmFrameHeader {
@@ -2332,6 +2512,36 @@ mod tests {
                 .any(|node| matches!(node, NumericNode::IntegerAddImmediate(_, 1)))
         );
         let sequence = select(&hir).expect("branch-phi Machine IR");
+        let (osr_logical_pc, osr_inputs, osr_operands) = sequence
+            .instructions()
+            .iter()
+            .find_map(|instruction| match &instruction.opcode {
+                MachineOpcode::OsrEntry { logical_pc, inputs } => Some((
+                    *logical_pc,
+                    inputs.as_slice(),
+                    instruction.operands.as_slice(),
+                )),
+                _ => None,
+            })
+            .expect("branch-phi OSR marker");
+        assert_eq!(osr_logical_pc, 3);
+        assert_eq!(
+            osr_inputs,
+            [
+                MachineOsrInput {
+                    frame_register: 0,
+                    value_type: MachineOsrType::Int32,
+                },
+                MachineOsrInput {
+                    frame_register: 1,
+                    value_type: MachineOsrType::Int32,
+                },
+            ]
+        );
+        assert_eq!(osr_operands.len(), osr_inputs.len());
+        assert!(osr_operands.iter().all(|operand| {
+            operand.constraint == OperandConstraint::Any && operand.timing == OperandTiming::Late
+        }));
         let polls = sequence
             .blocks()
             .iter()
@@ -2440,6 +2650,15 @@ mod tests {
         )
         .expect("UTF-8 optimized IR");
         assert!(optimized_ir.starts_with("; backend=otter-machine-ir numeric-function\n"));
+        assert!(optimized_ir.contains("OsrEntry { logical_pc: 3"));
+        let code_map = std::str::from_utf8(
+            artifact
+                .file(JitArtifactFileName::CodeMap)
+                .expect("branch-phi code map")
+                .contents(),
+        )
+        .expect("UTF-8 branch-phi code map");
+        assert!(code_map.contains("\"logicalPc\": 3"));
         let (result, _, _) = execute(&exact.code, &[], 0);
         assert_eq!(result.status, STATUS_RETURNED);
         assert_eq!(result.value, tag::box_int32(-6_000_000));
@@ -3080,6 +3299,224 @@ mod tests {
         assert_eq!(pc, 15);
         assert_eq!(frame[0], tag::box_int32(-14));
         assert_eq!(frame[1], tag::box_int32(1));
+    }
+
+    #[test]
+    fn numeric_osr_enters_exact_header_and_rejects_without_vm_mutation() {
+        let code = compile_output(&branch_phi_loop_view_with(0, 0, 5, 1), None).code;
+        let mut frame = vec![Value::undefined().to_bits(); 12];
+        frame[0] = tag::box_int32(2);
+        frame[1] = tag::box_int32(1);
+        let interrupt = 0_u8;
+        let mut fuel = i64::MAX as u64;
+        let (result, after, pc) = execute_osr_with_poll_cells(
+            &code,
+            3,
+            frame.clone(),
+            std::ptr::addr_of!(interrupt),
+            &mut fuel,
+        );
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, tag::box_int32(-22));
+        assert_eq!(after, frame, "successful OSR must keep VM slots untouched");
+        assert_eq!(pc, 3);
+
+        frame[0] = Value::boolean(true).to_bits();
+        let rejected = frame.clone();
+        let mut fuel = i64::MAX as u64;
+        let (result, after, pc) =
+            execute_osr_with_poll_cells(&code, 3, frame, std::ptr::addr_of!(interrupt), &mut fuel);
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(pc, 3);
+        assert_eq!(after, rejected, "OSR representation reject must be atomic");
+    }
+
+    #[test]
+    fn numeric_osr_deopts_overflow_and_interrupts_before_phi_moves() {
+        let overflow = compile_output(&branch_phi_loop_view_with(i32::MAX, 0, 1, 1), None).code;
+        let mut frame = vec![Value::undefined().to_bits(); 12];
+        frame[0] = tag::box_int32(i32::MAX);
+        frame[1] = tag::box_int32(0);
+        let interrupt = 0_u8;
+        let mut fuel = i64::MAX as u64;
+        let (result, frame, pc) = execute_osr_with_poll_cells(
+            &overflow,
+            3,
+            frame,
+            std::ptr::addr_of!(interrupt),
+            &mut fuel,
+        );
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(pc, 13);
+        assert_eq!(frame[0], tag::box_int32(i32::MAX));
+        assert_eq!(frame[1], tag::box_int32(0));
+        assert_eq!(frame[2], tag::box_int32(2));
+
+        let code = compile_output(&branch_phi_loop_view_with(0, 0, 5, 1), None).code;
+        let mut frame = vec![Value::undefined().to_bits(); 12];
+        frame[0] = tag::box_int32(2);
+        frame[1] = tag::box_int32(1);
+        let interrupt = 1_u8;
+        let mut fuel = i64::MAX as u64;
+        let (result, frame, pc) =
+            execute_osr_with_poll_cells(&code, 3, frame, std::ptr::addr_of!(interrupt), &mut fuel);
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(pc, 3);
+        assert_eq!(frame[0], tag::box_int32(-12));
+        assert_eq!(frame[1], tag::box_int32(2));
+        assert_eq!(frame[2], Value::undefined().to_bits());
+    }
+
+    #[test]
+    fn numeric_osr_materializes_float_uint32_and_boolean_headers() {
+        let float_view = float_bitwise_loop_view();
+        let float_hir = NumericFunction::build(&float_view).expect("float OSR HIR");
+        let float_sequence = select(&float_hir).expect("float OSR Machine IR");
+        let float_inputs = float_sequence
+            .instructions()
+            .iter()
+            .find_map(|instruction| match &instruction.opcode {
+                MachineOpcode::OsrEntry {
+                    logical_pc: 4,
+                    inputs,
+                } => Some(inputs.as_slice()),
+                _ => None,
+            })
+            .expect("float OSR marker");
+        assert_eq!(
+            float_inputs,
+            [
+                MachineOsrInput {
+                    frame_register: 0,
+                    value_type: MachineOsrType::Float64,
+                },
+                MachineOsrInput {
+                    frame_register: 1,
+                    value_type: MachineOsrType::Int32,
+                },
+                MachineOsrInput {
+                    frame_register: 2,
+                    value_type: MachineOsrType::Int32,
+                },
+                MachineOsrInput {
+                    frame_register: 3,
+                    value_type: MachineOsrType::Int32,
+                },
+            ]
+        );
+        let float_code = compile_output(&float_view, None).code;
+        let mut float_frame = vec![Value::undefined().to_bits(); 12];
+        float_frame[0] = boxed_f64(4_294_967_299.25);
+        float_frame[1] = tag::box_int32(0);
+        float_frame[2] = tag::box_int32(1);
+        float_frame[3] = tag::box_int32(200_000);
+        let interrupt = 0_u8;
+        let mut fuel = i64::MAX as u64;
+        let (result, after, _) = execute_osr_with_poll_cells(
+            &float_code,
+            4,
+            float_frame.clone(),
+            std::ptr::addr_of!(interrupt),
+            &mut fuel,
+        );
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, tag::box_int32(120_790));
+        assert_eq!(after, float_frame);
+
+        let view = mixed_osr_loop_view();
+        let hir = NumericFunction::build(&view).expect("mixed OSR numeric HIR");
+        let sequence = select(&hir).expect("mixed OSR Machine IR");
+        let inputs = sequence
+            .instructions()
+            .iter()
+            .find_map(|instruction| match &instruction.opcode {
+                MachineOpcode::OsrEntry {
+                    logical_pc: 6,
+                    inputs,
+                } => Some(inputs.as_slice()),
+                _ => None,
+            })
+            .expect("mixed OSR marker");
+        assert_eq!(
+            inputs
+                .iter()
+                .map(|input| input.value_type)
+                .collect::<Vec<_>>(),
+            [
+                MachineOsrType::Uint32,
+                MachineOsrType::Boolean,
+                MachineOsrType::Int32,
+                MachineOsrType::Int32,
+            ]
+        );
+
+        let code = compile_output(&view, None).code;
+        let mut frame = vec![Value::undefined().to_bits(); 10];
+        frame[0] = boxed_f64(f64::from(u32::MAX));
+        frame[1] = Value::boolean(true).to_bits();
+        frame[2] = tag::box_int32(0);
+        frame[3] = tag::box_int32(3);
+        let mut fuel = i64::MAX as u64;
+        let (result, after, _) = execute_osr_with_poll_cells(
+            &code,
+            6,
+            frame.clone(),
+            std::ptr::addr_of!(interrupt),
+            &mut fuel,
+        );
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, tag::box_int32(536_870_911));
+        assert_eq!(after, frame);
+
+        frame[1] = tag::box_int32(1);
+        let rejected = frame.clone();
+        let mut fuel = i64::MAX as u64;
+        let (result, after, pc) =
+            execute_osr_with_poll_cells(&code, 6, frame, std::ptr::addr_of!(interrupt), &mut fuel);
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(pc, 6);
+        assert_eq!(after, rejected);
+    }
+
+    #[test]
+    fn numeric_osr_materializes_allocator_spill_homes() {
+        let view = osr_spill_pressure_loop_view();
+        let hir = NumericFunction::build(&view).expect("OSR spill-pressure HIR");
+        let sequence = select(&hir).expect("OSR spill-pressure Machine IR");
+        let marker = sequence
+            .instructions()
+            .iter()
+            .position(|instruction| matches!(instruction.opcode, MachineOpcode::OsrEntry { .. }))
+            .map(|index| MachineInstructionId(index as u32))
+            .expect("OSR spill-pressure marker");
+        let allocation = sequence
+            .allocate(&TargetRegisterFile::aarch64_numeric_function())
+            .expect("OSR spill-pressure allocation");
+        assert!(
+            allocation
+                .instruction_locations(marker)
+                .expect("OSR marker locations")
+                .iter()
+                .any(|location| matches!(location, AllocatedLocation::Stack(_))),
+            "OSR pressure fixture must exercise direct spill materialization"
+        );
+
+        let code = compile_output(&view, None).code;
+        let mut frame = vec![Value::undefined().to_bits(); 25];
+        for (register, slot) in frame.iter_mut().enumerate().take(20) {
+            *slot = tag::box_int32(register as i32 + 1);
+        }
+        frame[20] = tag::box_int32(0);
+        frame[21] = tag::box_int32(1);
+        frame[23] = tag::box_int32(0);
+        let original = frame.clone();
+        let interrupt = 0_u8;
+        let mut fuel = i64::MAX as u64;
+        let (result, after, _) =
+            execute_osr_with_poll_cells(&code, 23, frame, std::ptr::addr_of!(interrupt), &mut fuel);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, tag::box_int32(210));
+        assert_eq!(after, original);
     }
 
     #[test]

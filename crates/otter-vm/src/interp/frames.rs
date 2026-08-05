@@ -302,6 +302,13 @@ impl Interpreter {
         std::ptr::addr_of!(self.gc_heap).cast::<std::ffi::c_void>()
     }
 
+    /// Address of the collector's incremental-marking flag byte, read by the
+    /// inline write barrier compiled code emits for a pointer store.
+    #[must_use]
+    pub fn jit_marking_flag_ptr(&self) -> *const u8 {
+        self.gc_heap.marking_flag_addr()
+    }
+
     /// Capacity of the flat JIT register stack in slots — the overflow bound
     /// compiled code checks before reserving a callee window.
     #[must_use]

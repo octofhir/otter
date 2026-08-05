@@ -34,7 +34,7 @@ use super::ic_probe;
 use super::transitions::TransitionTable;
 use super::values::{
     BoxedSlotSlowPath, CellTest, emit_cell_test, emit_compress_slot_or_bail,
-    emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64,
+    emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64, emit_write_barrier_fast,
 };
 use crate::artifact::relocation::{PropertyIcAccess, RelocationCapture, RelocationTarget};
 use crate::entry::{Unsupported, reg_offset};
@@ -185,13 +185,19 @@ pub(super) fn emit_store_property(
         let store_prim = ops.new_dynamic_label();
         dynasm!(ops ; .arch aarch64 ; ldr x9, [x19, src_off]);
         emit_cell_test(ops, 9, 11, CellTest::IsNotCell, store_prim);
+        let barrier_slow = ops.new_dynamic_label();
         dynasm!(ops
             ; .arch aarch64
             // Cell: the compressed ref is the low-32 8-aligned offset
             // (low-3 tag 000), i.e. the value's low word.
             ; str w9, [x13, x17]
-            // Pointer value: card-mark the parent header from the published
-            // frame's register window.
+        );
+        // The barrier runs inline; only a real unrecorded old->young edge or a
+        // live marking cycle reaches the runtime.
+        emit_write_barrier_fast(ops, relocations, view, 12, 9, barrier_slow, done);
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>barrier_slow
             ; mov x0, x20
             ; movz x1, object as u32
             ; movz x2, value as u32

@@ -26,8 +26,9 @@ use otter_vm::JitCompileSnapshot;
 
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::entry::{
-    CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, FUNCTION_ID_TAG, NUMBER_TAG_HI16, Unsupported,
-    VALUE_FALSE, VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, reg_offset,
+    CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, FUNCTION_ID_TAG, NUMBER_TAG_HI16, THREAD_OFFSET,
+    Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED,
+    VM_THREAD_MARKING_FLAG_CELL_OFFSET, reg_offset,
 };
 
 /// Immediate forms of the tagged constants for `dynasm` compare operands.
@@ -579,6 +580,62 @@ pub(crate) fn emit_compress_slot_or_bail(ops: &mut Assembler, bail: DynamicLabel
         ; =>imm_hole
         ; movz w10, #0x24                           // (4 << 3) | 0b100
         ; =>done
+    );
+}
+
+/// Run the write barrier a pointer store owes, inline.
+///
+/// `parent` holds the guarded receiver's `GcHeader` address and `child` the
+/// stored cell `Value`. The barrier has exactly two reasons to reach the
+/// runtime, and both are one flag test away: a marking cycle is in progress
+/// (the insertion half has to shade the child), or the store really creates an
+/// old->young edge whose parent is not yet in the remembered set. Everything
+/// else — a young parent, a parent already recorded this scavenge interval, an
+/// old child, a null child — falls straight through to `done`.
+///
+/// Clobbers `w14` and `w15`.
+pub(crate) fn emit_write_barrier_fast(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    parent: u8,
+    child: u8,
+    slow: DynamicLabel,
+    done: DynamicLabel,
+) {
+    let flags_byte = view.gc_barrier.header_flags_byte;
+    let young = view.gc_barrier.young_flag;
+    let settled = young | view.gc_barrier.remembered_flag;
+    dynasm!(ops
+        ; .arch aarch64
+        ; cbz W(child), =>done
+        ; ldr x14, [x20, THREAD_OFFSET]
+        ; ldr x14, [x14, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
+        ; ldrb w14, [x14]
+        ; cbnz w14, =>slow
+        ; ldrb w14, [X(parent), flags_byte]
+        ; movz w15, settled
+        ; tst w14, w15
+        ; b.ne =>done
+        // An old, unrecorded parent: only a nursery child owes the remembered
+        // set an entry.
+        ; mov w15, W(child)
+    );
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        14,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; add x14, x14, x15
+        ; ldrb w14, [x14, flags_byte]
+        ; movz w15, young
+        ; tst w14, w15
+        ; b.eq =>done
+        ; b =>slow
     );
 }
 

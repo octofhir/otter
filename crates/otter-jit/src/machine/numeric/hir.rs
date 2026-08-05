@@ -25,7 +25,7 @@ use otter_vm::{JitCompileSnapshot, JitInstructionMetadata};
 const MAX_FUNCTION_INSTRUCTIONS: usize = 512;
 const MAX_FUNCTION_PARAMETERS: u16 = 16;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct NumericValue(pub(super) usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,11 +111,26 @@ pub(super) struct NumericBlock {
 pub(super) struct NumericFunction {
     pub(super) nodes: Vec<NumericNode>,
     pub(super) blocks: Vec<NumericBlock>,
+    pub(super) frame_states: Vec<NumericFrameState>,
     pub(super) parameter_count: u16,
     pub(super) register_count: u16,
     pub(super) arithmetic_op_count: usize,
     pub(super) has_backedges: bool,
     pub(super) requires_integer_lowering: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NumericFrameSlot {
+    Value(NumericValue),
+    Undefined,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NumericFrameState {
+    pub(super) node: NumericValue,
+    pub(super) function_id: u32,
+    pub(super) byte_pc: u32,
+    pub(super) slots: Vec<NumericFrameSlot>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -153,6 +168,8 @@ impl NumericFunction {
 
         let raw_blocks = build_raw_blocks(view)?;
         let live_in = build_liveness(view, &raw_blocks, register_count)?;
+        let instruction_live_in =
+            build_instruction_liveness(view, &raw_blocks, &live_in, register_count)?;
         let mut nodes = Vec::with_capacity(view.instructions.len() + register_count as usize);
         let mut entry = vec![RegisterState::Unset; usize::from(register_count)];
         let mut entry_nodes = Vec::with_capacity(parameter_count as usize);
@@ -166,6 +183,7 @@ impl NumericFunction {
         let mut out_states = Vec::<Vec<RegisterState>>::with_capacity(raw_blocks.len());
         let mut parameter_registers = Vec::<Vec<u16>>::with_capacity(raw_blocks.len());
         let mut arithmetic_op_count = 0usize;
+        let mut frame_states = Vec::new();
 
         for (block_index, raw) in raw_blocks.iter().enumerate() {
             let (mut registers, mut parameters, mut parameter_regs) = if block_index == 0 {
@@ -216,7 +234,12 @@ impl NumericFunction {
             block_nodes.extend(parameters.iter().copied());
 
             let terminal_pc = raw.end.checked_sub(1)?;
-            for pc in raw.start..raw.end {
+            for (pc, instruction_live) in instruction_live_in
+                .iter()
+                .enumerate()
+                .take(raw.end)
+                .skip(raw.start)
+            {
                 let instruction = &view.instructions[pc];
                 let op = instruction.op(code);
                 if pc == terminal_pc
@@ -234,6 +257,9 @@ impl NumericFunction {
                     &mut nodes,
                     &mut block_nodes,
                     &mut arithmetic_op_count,
+                    instruction_live,
+                    &mut frame_states,
+                    code.id,
                 )?;
             }
 
@@ -294,6 +320,7 @@ impl NumericFunction {
         Some(Self {
             nodes,
             blocks,
+            frame_states,
             parameter_count,
             register_count,
             arithmetic_op_count,
@@ -380,41 +407,7 @@ fn build_liveness(
     for (block_index, block) in blocks.iter().enumerate() {
         for pc in block.start..block.end {
             let instruction = view.instructions.get(pc)?;
-            let op = instruction.op(code);
-            let (reads, writes) = match op {
-                Op::StoreLocal => (
-                    vec![register(instruction, code, 0)?],
-                    vec![local_index(instruction, code, 1)?],
-                ),
-                Op::LoadLocal => (
-                    vec![local_index(instruction, code, 1)?],
-                    vec![register(instruction, code, 0)?],
-                ),
-                Op::LoadUndefined | Op::LoadInt32 | Op::LoadNumber => {
-                    (Vec::new(), vec![register(instruction, code, 0)?])
-                }
-                Op::ToPrimitive | Op::ToNumeric | Op::Neg => (
-                    vec![register(instruction, code, 1)?],
-                    vec![register(instruction, code, 0)?],
-                ),
-                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::LessThan => (
-                    vec![
-                        register(instruction, code, 1)?,
-                        register(instruction, code, 2)?,
-                    ],
-                    vec![register(instruction, code, 0)?],
-                ),
-                Op::AddImm | Op::BitwiseAndImm | Op::LessThanImm | Op::EqualImm => (
-                    vec![register(instruction, code, 1)?],
-                    vec![register(instruction, code, 0)?],
-                ),
-                Op::JumpIfTrue | Op::JumpIfFalse => {
-                    (vec![register(instruction, code, 1)?], Vec::new())
-                }
-                Op::ReturnValue => (vec![register(instruction, code, 0)?], Vec::new()),
-                Op::Jump => (Vec::new(), Vec::new()),
-                _ => return None,
-            };
+            let (reads, writes) = instruction_accesses(instruction, code)?;
             for read in reads {
                 let read = usize::from(read);
                 if !definitions[block_index][read] {
@@ -447,6 +440,77 @@ fn build_liveness(
         if !changed {
             return Some(live_in);
         }
+    }
+}
+
+fn build_instruction_liveness(
+    view: &JitCompileSnapshot,
+    blocks: &[RawBlock],
+    block_live_in: &[Vec<bool>],
+    register_count: u16,
+) -> Option<Vec<Vec<bool>>> {
+    let code = view.code_block.as_ref();
+    let width = usize::from(register_count);
+    let mut instruction_live_in = vec![vec![false; width]; view.instructions.len()];
+    for block in blocks {
+        let mut live = vec![false; width];
+        for &successor in &block.successors {
+            for (register, &successor_live) in block_live_in[successor].iter().enumerate() {
+                live[register] |= successor_live;
+            }
+        }
+        for pc in (block.start..block.end).rev() {
+            let instruction = view.instructions.get(pc)?;
+            let (reads, writes) = instruction_accesses(instruction, code)?;
+            for write in writes {
+                live[usize::from(write)] = false;
+            }
+            for read in reads {
+                live[usize::from(read)] = true;
+            }
+            instruction_live_in[pc] = live.clone();
+        }
+    }
+    Some(instruction_live_in)
+}
+
+fn instruction_accesses(
+    instruction: &JitInstructionMetadata,
+    code: &otter_vm::CodeBlock,
+) -> Option<(Vec<u16>, Vec<u16>)> {
+    match instruction.op(code) {
+        Op::StoreLocal => Some((
+            vec![register(instruction, code, 0)?],
+            vec![local_index(instruction, code, 1)?],
+        )),
+        Op::LoadLocal => Some((
+            vec![local_index(instruction, code, 1)?],
+            vec![register(instruction, code, 0)?],
+        )),
+        Op::LoadUndefined | Op::LoadInt32 | Op::LoadNumber => {
+            Some((Vec::new(), vec![register(instruction, code, 0)?]))
+        }
+        Op::ToPrimitive | Op::ToNumeric | Op::Neg => Some((
+            vec![register(instruction, code, 1)?],
+            vec![register(instruction, code, 0)?],
+        )),
+        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::LessThan => Some((
+            vec![
+                register(instruction, code, 1)?,
+                register(instruction, code, 2)?,
+            ],
+            vec![register(instruction, code, 0)?],
+        )),
+        Op::AddImm | Op::BitwiseAndImm | Op::LessThanImm | Op::EqualImm => Some((
+            vec![register(instruction, code, 1)?],
+            vec![register(instruction, code, 0)?],
+        )),
+        Op::JumpIfTrue | Op::JumpIfFalse => {
+            Some((vec![register(instruction, code, 1)?], Vec::new()))
+        }
+        Op::ReturnValue => Some((vec![register(instruction, code, 0)?], Vec::new())),
+        Op::Jump => Some((Vec::new(), Vec::new())),
+        _ => None,
     }
 }
 
@@ -537,6 +601,9 @@ fn lower_instruction(
     nodes: &mut Vec<NumericNode>,
     block_nodes: &mut Vec<NumericValue>,
     arithmetic_op_count: &mut usize,
+    live_in: &[bool],
+    frame_states: &mut Vec<NumericFrameState>,
+    function_id: u32,
 ) -> Option<()> {
     let op = instruction.op(code);
     let node = match op {
@@ -657,6 +724,26 @@ fn lower_instruction(
     let destination = register(instruction, code, 0)?;
     let value = push(nodes, node);
     block_nodes.push(value);
+    if matches!(
+        node,
+        NumericNode::IntegerAdd(..) | NumericNode::IntegerAddImmediate(..)
+    ) {
+        frame_states.push(NumericFrameState {
+            node: value,
+            function_id,
+            byte_pc: instruction.byte_pc,
+            slots: registers
+                .iter()
+                .copied()
+                .zip(live_in.iter().copied())
+                .map(|(state, live)| match (state, live) {
+                    (RegisterState::Value(value), true) => NumericFrameSlot::Value(value),
+                    (RegisterState::Unset | RegisterState::Undefined, _)
+                    | (RegisterState::Value(_), false) => NumericFrameSlot::Undefined,
+                })
+                .collect(),
+        });
+    }
     write(registers, destination, RegisterState::Value(value))
 }
 

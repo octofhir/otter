@@ -207,6 +207,22 @@ Machine FrameState lowering substrate landed on 2026-08-05:
 The full repository gate passed with 246 JIT tests, 831 VM tests, all-target
 all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
 
+Checked-integer FrameState wiring landed on 2026-08-05:
+
+- backward liveness is now exact at every numeric instruction, not only at
+  block entry;
+- checked Int32 add and add-immediate nodes own dense frame-state identities
+  at their exact byte PCs and keep only live VM registers as late deopt uses;
+- the exact `branch-phi` body lowers both overflow exits through regalloc2 into
+  complete 12-slot VM frames: three allocated values at `ADD`, two at
+  `ADD_IMM`, and tagged `undefined` literals everywhere else;
+- native publication remains closed only on backedge polling and cold-exit
+  emission. Integer overflow metadata itself no longer depends on the legacy
+  optimizer.
+
+The full repository gate passed with 246 JIT tests, 831 VM tests, all-target
+all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
+
 The remaining legacy optimizer and allocator are fallback for functions whose
 HIR/selection slices have not switched. Delete each old consumer as its final
 operation family moves; do not adapt old allocation or metadata into the new

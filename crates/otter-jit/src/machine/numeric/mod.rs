@@ -16,7 +16,7 @@ mod arm64;
 mod hir;
 
 use otter_vm::{JitArtifactFileName, JitCompileSnapshot, deopt::DeoptTable};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use self::hir::{NumericFunction, NumericNode, NumericTerminator, NumericType};
 use super::{
@@ -143,7 +143,12 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
     let selection_cfg = SelectionCfg::build(hir);
     let mut instructions = Vec::with_capacity(hir.nodes.len() + hir.parameter_count as usize + 4);
     let mut blocks = Vec::with_capacity(selection_cfg.order.len());
-    let mut next_deopt = 0u32;
+    let frame_state_ids = hir
+        .frame_states
+        .iter()
+        .enumerate()
+        .map(|(index, state)| (state.node, DeoptId(index as u32)))
+        .collect::<BTreeMap<_, _>>();
     for selected in &selection_cfg.order {
         let first = MachineInstructionId(instructions.len() as u32);
         let SelectedBlock::Original(block_index) = *selected else {
@@ -188,20 +193,16 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
         for &node_value in &block.nodes {
             let result = values[node_value.0];
             let node = hir.nodes[node_value.0];
-            let instruction = match node {
+            let mut instruction = match node {
                 NumericNode::Parameter(parameter) => {
                     let tagged = tagged_parameters[usize::from(parameter)];
-                    let mut instruction = MachineInstruction::plain(
+                    MachineInstruction::plain(
                         MachineOpcode::DecodeNumber,
                         vec![
                             MachineOperand::register_input(tagged),
                             MachineOperand::register_output(result),
-                            MachineOperand::deopt(tagged),
                         ],
-                    );
-                    instruction.deopt = Some(DeoptId(next_deopt));
-                    next_deopt += 1;
-                    instruction
+                    )
                 }
                 NumericNode::BlockParameter(_) => continue,
                 NumericNode::IntegerConstant(value) => MachineInstruction::plain(
@@ -290,6 +291,21 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                     ],
                 ),
             };
+            if let Some(&deopt) = frame_state_ids.get(&node_value) {
+                let state = &hir.frame_states[deopt.0 as usize];
+                let mut values_at_exit = BTreeSet::new();
+                for slot in &state.slots {
+                    let hir::NumericFrameSlot::Value(value) = slot else {
+                        continue;
+                    };
+                    if values_at_exit.insert(*value) {
+                        instruction
+                            .operands
+                            .push(MachineOperand::deopt(machine_value(&values, *value)));
+                    }
+                }
+                instruction.deopt = Some(deopt);
+            }
             instructions.push(instruction);
         }
 
@@ -360,6 +376,29 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
         blocks,
         instructions,
     )
+}
+
+#[cfg(test)]
+fn machine_frame_states(hir: &NumericFunction) -> Vec<super::MachineFrameState> {
+    hir.frame_states
+        .iter()
+        .enumerate()
+        .map(|(index, state)| super::MachineFrameState {
+            id: DeoptId(index as u32),
+            function_id: state.function_id,
+            byte_pc: state.byte_pc,
+            slots: state
+                .slots
+                .iter()
+                .map(|slot| match slot {
+                    hir::NumericFrameSlot::Value(value) => {
+                        super::MachineFrameSlot::Value(MachineValue(value.0 as u32))
+                    }
+                    hir::NumericFrameSlot::Undefined => super::undefined_slot(),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -515,6 +554,7 @@ mod tests {
 
     use super::*;
     use crate::entry::{JitCtx, JitEntry, JitRet, STATUS_BAILED, STATUS_RETURNED};
+    use crate::machine::{MachineFrameLayout, lower_deopt_table};
 
     fn numeric_view(
         param_count: u16,
@@ -1062,6 +1102,7 @@ mod tests {
         let hir = NumericFunction::build(&view).expect("branch-phi numeric HIR");
         assert!(hir.has_backedges);
         assert!(hir.requires_integer_lowering);
+        assert_eq!(hir.frame_states.len(), 2);
         assert!(
             hir.nodes
                 .iter()
@@ -1079,9 +1120,37 @@ mod tests {
                     sequence.representations()[parameter.0 as usize] == MachineRepresentation::Int32
                 })
         }));
-        sequence
+        let allocation = sequence
             .allocate(&TargetRegisterFile::aarch64_numeric_function())
             .expect("branch-phi Machine IR allocation");
+        let layout = MachineFrameLayout::new(&allocation, 16, 16).expect("branch-phi frame layout");
+        let deopt_table = lower_deopt_table(
+            &sequence,
+            &allocation,
+            layout,
+            16,
+            8,
+            &machine_frame_states(&hir),
+        )
+        .expect("branch-phi allocator-driven FrameState");
+        assert_eq!(deopt_table.len(), 2);
+        assert_eq!(deopt_table.entries()[0].outermost().slots.len(), 12);
+        assert_eq!(deopt_table.entries()[1].outermost().slots.len(), 12);
+        let live_slot_counts = deopt_table
+            .entries()
+            .iter()
+            .map(|state| {
+                state
+                    .outermost()
+                    .slots
+                    .iter()
+                    .filter(|slot| {
+                        !matches!(slot.location, otter_vm::deopt::DeoptLocation::Literal(_))
+                    })
+                    .count()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(live_slot_counts, [3, 2]);
         assert!(
             try_compile(&view, 7003, None)
                 .expect("branch-phi compilation decision")

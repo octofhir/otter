@@ -344,6 +344,12 @@ pub enum MachineOpcode {
     Int32ToFloat64,
     /// Losslessly widen an unsigned integer Number into floating-point representation.
     Uint32ToFloat64,
+    /// Convert an unboxed Float64 through ECMAScript ToInt32.
+    Float64ToInt32,
+    /// Load the Int32 result deposited by the preceding numeric leaf call.
+    IntegerLeafResult,
+    /// Reinterpret canonical Boolean bits as Int32.
+    BooleanToInt32,
     /// Floating-point addition.
     FloatAdd,
     /// Floating-point subtraction.

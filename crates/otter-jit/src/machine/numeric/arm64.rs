@@ -2,7 +2,8 @@
 //!
 //! # Contents
 //! - [`emit`] — emits one numeric function from allocator locations.
-//! - Exact JavaScript Number decode, canonical boxing, and shared cold exits.
+//! - Exact JavaScript Number decode, scalar coercion leaves, canonical boxing,
+//!   and shared cold exits.
 //! - regalloc2 edit emission between selected instructions.
 //!
 //! # Invariants
@@ -18,6 +19,8 @@
 //! - Backedge polls run before allocator edge edits and preserve every value
 //!   live into the loop header across the leaf runtime call.
 //! - Successful results use the VM's canonical Number or Boolean representation.
+//! - Pure numeric leaves exchange unboxed scalar values and use only the
+//!   frame-owned result shuttle; they have no heap or status channel.
 
 // dynasm's dynamic-register expansion calls `.into()` on the required u8
 // register encoding. Clippy sees the macro expansion as an identity conversion.
@@ -29,7 +32,7 @@ use otter_vm::{
     deopt::DeoptRuntime,
     native_abi::{
         RuntimeStubDescriptor, STUB_JIT_BACKEDGE_POLL, STUB_JIT_DEOPT_WRITEBACK,
-        STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF,
+        STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF,
     },
 };
 
@@ -139,6 +142,32 @@ fn emit_float_leaf_binary(
     );
 }
 
+fn emit_float_to_int32_leaf(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    relocations: &mut RelocationCapture,
+    source: u8,
+    entry: u64,
+    result_offset: u32,
+) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; str D(source), [sp, result_offset]
+        ; ldr d0, [sp, result_offset]
+    );
+    emit_load_symbolic_u64(
+        ops,
+        relocations,
+        16,
+        entry,
+        RelocationTarget::runtime_stub(STUB_NUMBER_TO_INT32_F64_LEAF),
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; str x0, [sp, result_offset]
+    );
+}
+
 pub(super) fn frame_layout(
     sequence: &InstructionSequence,
     allocation: &AllocatedSequence,
@@ -146,7 +175,11 @@ pub(super) fn frame_layout(
     let owns_leaf_result = sequence.instructions().iter().any(|instruction| {
         matches!(
             instruction.opcode,
-            MachineOpcode::FloatRem | MachineOpcode::FloatPow | MachineOpcode::FloatLeafResult
+            MachineOpcode::FloatRem
+                | MachineOpcode::FloatPow
+                | MachineOpcode::FloatLeafResult
+                | MachineOpcode::Float64ToInt32
+                | MachineOpcode::IntegerLeafResult
         )
     });
     let fixed_bytes = BASE_FIXED_FRAME_BYTES
@@ -168,6 +201,7 @@ pub(super) fn emit(
     deopt_writeback_entry: u64,
     number_rem_entry: u64,
     number_pow_entry: u64,
+    number_to_int32_entry: u64,
     capture_artifacts: bool,
 ) -> Result<Emission, Unsupported> {
     reject_unimplemented_locations(sequence, allocation)?;
@@ -297,6 +331,20 @@ pub(super) fn emit(
                 let offset = frame.spill_area_bytes();
                 dynasm!(ops ; .arch aarch64 ; ldr D(destination), [sp, offset]);
             }
+            MachineOpcode::Float64ToInt32 => {
+                emit_float_to_int32_leaf(
+                    &mut ops,
+                    &mut relocations,
+                    float_register(locations[0])?,
+                    number_to_int32_entry,
+                    frame.spill_area_bytes(),
+                );
+            }
+            MachineOpcode::IntegerLeafResult => {
+                let destination = integer_register(locations[0])?;
+                let offset = frame.spill_area_bytes();
+                dynasm!(ops ; .arch aarch64 ; ldr X(destination), [sp, offset]);
+            }
             MachineOpcode::FloatNeg => {
                 let source = float_register(locations[0])?;
                 let destination = float_register(locations[1])?;
@@ -350,6 +398,11 @@ pub(super) fn emit(
                 let source = integer_register(locations[0])?;
                 let destination = float_register(locations[1])?;
                 dynasm!(ops ; .arch aarch64 ; ucvtf D(destination), W(source));
+            }
+            MachineOpcode::BooleanToInt32 => {
+                let source = integer_register(locations[0])?;
+                let destination = integer_register(locations[1])?;
+                dynasm!(ops ; .arch aarch64 ; mov W(destination), W(source));
             }
             MachineOpcode::IntegerAdd | MachineOpcode::IntegerSub => {
                 let left = integer_register(locations[0])?;

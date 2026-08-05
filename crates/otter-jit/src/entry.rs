@@ -410,6 +410,7 @@ mod tests {
                     descriptor.signature,
                     RuntimeStubSignature::LeafValue2
                         | RuntimeStubSignature::Float64Leaf2
+                        | RuntimeStubSignature::Float64ToWordLeaf1
                         | RuntimeStubSignature::MutatingLeafValue2
                         | RuntimeStubSignature::MutatingLeafValue3
                         | RuntimeStubSignature::AllocValue3

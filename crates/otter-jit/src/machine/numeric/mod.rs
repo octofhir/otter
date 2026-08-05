@@ -87,6 +87,7 @@ pub(crate) fn try_compile(
         transitions.variadic_entry(STUB_JIT_DEOPT_WRITEBACK),
         otter_vm::runtime_stubs::NUMBER_REM_F64_LEAF.entry_addr() as u64,
         otter_vm::runtime_stubs::NUMBER_POW_F64_LEAF.entry_addr() as u64,
+        otter_vm::runtime_stubs::NUMBER_TO_INT32_F64_LEAF.entry_addr() as u64,
         artifact_request.is_some(),
     )?;
     let machine_register_count = u8::try_from(allocation.used_register_count())
@@ -240,6 +241,21 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
         for &node_value in &block.nodes {
             let result = values[node_value.0];
             let node = hir.nodes[node_value.0];
+            if let NumericNode::FloatToInt32(source) = node {
+                let mut call = MachineInstruction::plain(
+                    MachineOpcode::Float64ToInt32,
+                    vec![MachineOperand::register_input(machine_value(
+                        &values, source,
+                    ))],
+                );
+                call.clobbers = TargetRegisterFile::aarch64_numeric_call_clobbers();
+                instructions.push(call);
+                instructions.push(MachineInstruction::plain(
+                    MachineOpcode::IntegerLeafResult,
+                    vec![MachineOperand::register_output(result)],
+                ));
+                continue;
+            }
             if let NumericNode::Rem(left, right) | NumericNode::Pow(left, right) = node {
                 let opcode = if matches!(node, NumericNode::Rem(..)) {
                     MachineOpcode::FloatRem
@@ -277,6 +293,10 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                     MachineOpcode::IntegerConstant(i64::from(value)),
                     vec![MachineOperand::register_output(result)],
                 ),
+                NumericNode::BooleanConstant(value) => MachineInstruction::plain(
+                    MachineOpcode::IntegerConstant(i64::from(value)),
+                    vec![MachineOperand::register_output(result)],
+                ),
                 NumericNode::Constant(value) => MachineInstruction::plain(
                     MachineOpcode::FloatConstant(value.to_bits()),
                     vec![MachineOperand::register_output(result)],
@@ -295,6 +315,16 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         MachineOperand::register_output(result),
                     ],
                 ),
+                NumericNode::BooleanToInt32(source) => MachineInstruction::plain(
+                    MachineOpcode::BooleanToInt32,
+                    vec![
+                        MachineOperand::register_input(machine_value(&values, source)),
+                        MachineOperand::register_output(result),
+                    ],
+                ),
+                NumericNode::FloatToInt32(_) => {
+                    unreachable!("Float64 ToInt32 selected as a typed leaf call")
+                }
                 NumericNode::IntegerAdd(left, right) => MachineInstruction::plain(
                     MachineOpcode::IntegerAdd,
                     vec![
@@ -854,6 +884,57 @@ mod tests {
             vec![
                 (Op::Neg, vec![Operand::Register(1), Operand::Register(0)]),
                 (Op::ReturnValue, vec![Operand::Register(1)]),
+            ],
+        )
+    }
+
+    fn float_bitwise_view(op: Op) -> JitCompileSnapshot {
+        assert!(matches!(
+            op,
+            Op::BitwiseAnd | Op::BitwiseOr | Op::BitwiseXor | Op::Shl | Op::Shr | Op::Ushr
+        ));
+        numeric_view(
+            2,
+            3,
+            vec![
+                (
+                    op,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        )
+    }
+
+    fn boolean_bitwise_view() -> JitCompileSnapshot {
+        numeric_view(
+            0,
+            4,
+            vec![
+                (Op::Nop, vec![]),
+                (Op::LoadTrue, vec![Operand::Register(0)]),
+                (Op::LoadFalse, vec![Operand::Register(1)]),
+                (
+                    Op::BitwiseAndImm,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Imm32(3),
+                    ],
+                ),
+                (
+                    Op::BitwiseOr,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(2),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(3)]),
             ],
         )
     }
@@ -1818,6 +1899,50 @@ mod tests {
         view
     }
 
+    fn float_bitwise_loop_view() -> JitCompileSnapshot {
+        let r = Operand::Register;
+        let i = Operand::Imm32;
+        let c = Operand::ConstIndex;
+        let mut view = numeric_view(
+            0,
+            12,
+            vec![
+                (Op::LoadNumber, vec![r(0), c(1)]),
+                (Op::LoadInt32, vec![r(1), i(0)]),
+                (Op::LoadInt32, vec![r(2), i(0)]),
+                (Op::LoadInt32, vec![r(3), i(200_000)]),
+                (Op::LessThan, vec![r(6), r(2), r(3)]),
+                (Op::JumpIfFalse, vec![i(17), r(6)]),
+                (Op::LoadInt32, vec![r(7), i(0)]),
+                (Op::BitwiseOr, vec![r(4), r(0), r(7)]),
+                (Op::LoadLocal, vec![r(7), i(0)]),
+                (Op::BitwiseAndImm, vec![r(8), r(2), i(7)]),
+                (Op::Ushr, vec![r(5), r(7), r(8)]),
+                (Op::BitwiseXor, vec![r(7), r(1), r(4)]),
+                (Op::LoadLocal, vec![r(8), i(5)]),
+                (Op::BitwiseXor, vec![r(9), r(7), r(8)]),
+                (Op::LoadInt32, vec![r(10), i(0)]),
+                (Op::BitwiseOr, vec![r(7), r(9), r(10)]),
+                (Op::StoreLocal, vec![r(7), i(1)]),
+                (Op::LoadNumber, vec![r(8), c(2)]),
+                (Op::Add, vec![r(9), r(0), r(8)]),
+                (Op::StoreLocal, vec![r(9), i(0)]),
+                (Op::AddImm, vec![r(10), r(2), i(1)]),
+                (Op::StoreLocal, vec![r(10), i(2)]),
+                (Op::Jump, vec![i(-19)]),
+                (Op::LoadLocal, vec![r(11), i(1)]),
+                (Op::ReturnValue, vec![r(11)]),
+            ],
+        );
+        view.instructions[0].load_number = Some(4_294_967_297.75);
+        view.instructions[17].load_number = Some(1.5);
+        for pc in [4_u32, 20] {
+            view.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(ARITH_INT32));
+        }
+        view.seed_arith_feedback_for_test(18, ArithFeedback::from_bits(ARITH_FLOAT64));
+        view
+    }
+
     fn branch_phi_loop_view_with(
         initial_checksum: i32,
         initial_index: i32,
@@ -2457,6 +2582,50 @@ mod tests {
     }
 
     #[test]
+    fn float64_bitwise_inputs_use_exact_to_int32_semantics() {
+        for (value, expected) in [
+            (0.0, 0),
+            (-0.0, 0),
+            (1.9, 1),
+            (-1.9, -1),
+            (f64::NAN, 0),
+            (f64::INFINITY, 0),
+            (f64::NEG_INFINITY, 0),
+            (2_147_483_648.0, i32::MIN),
+            (4_294_967_295.0, -1),
+            (4_294_967_297.0, 1),
+            (-4_294_967_297.0, -1),
+            (9_007_199_254_740_992.0, 0),
+        ] {
+            let code = compile_output(&float_bitwise_view(Op::BitwiseOr), None).code;
+            let (result, _, _) = execute(&code, &[boxed_f64(value), tag::box_int32(0)], 0);
+            assert_eq!(result.status, STATUS_RETURNED);
+            assert_eq!(result.value, tag::box_int32(expected));
+        }
+
+        let code = compile_output(&float_bitwise_view(Op::Ushr), None).code;
+        let (result, _, _) = execute(&code, &[boxed_f64(-1.9), tag::box_int32(0)], 0);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(unbox_number(result.value), 4_294_967_295.0);
+
+        let code = compile_output(&float_bitwise_view(Op::Shl), None).code;
+        let (result, _, _) = execute(&code, &[boxed_f64(1.9), boxed_f64(33.9)], 0);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, tag::box_int32(2));
+
+        let view = boolean_bitwise_view();
+        let hir = NumericFunction::build(&view).expect("Boolean constants numeric HIR");
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::BooleanToInt32(..)))
+        );
+        let (result, _, _) = execute(&compile_output(&view, None).code, &[], 0);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, tag::box_int32(1));
+    }
+
+    #[test]
     fn checked_integer_subtraction_reconstructs_pre_operation_frames() {
         let interrupt = 0_u8;
         let mut fuel = i64::MAX as u64;
@@ -2813,6 +2982,75 @@ mod tests {
         assert_eq!(unbox_number(frame[0]), 0.75);
         assert_eq!(frame[1], tag::box_int32(1));
         assert_eq!(frame[2], tag::box_int32(2));
+    }
+
+    #[test]
+    fn publishes_float_bitwise_loop_through_machine_ir_backend() {
+        let view = float_bitwise_loop_view();
+        let hir = NumericFunction::build(&view).expect("float-bitwise-loop numeric HIR");
+        assert!(
+            hir.nodes
+                .iter()
+                .filter(|node| matches!(node, NumericNode::FloatToInt32(..)))
+                .count()
+                >= 2
+        );
+        let sequence = select(&hir).expect("float-bitwise-loop Machine IR");
+        let allocation = sequence
+            .allocate(&TargetRegisterFile::aarch64_numeric_function())
+            .expect("float-bitwise-loop allocation");
+        assert!(
+            allocation.spill_slots() > 0,
+            "loop-carried values live across ToInt32 leaves must spill"
+        );
+
+        let output = crate::optimizing::compile_optimized_with_artifacts(
+            &view,
+            7008,
+            &TransitionTable::resolve(),
+            Some(ArtifactRequest {
+                identity: JitArtifactIdentity {
+                    function_name: "engineKernel".to_string(),
+                    module: "benchmarks/scripts/float-bitwise.js".to_string(),
+                },
+                tier: JitDebugTier::Optimizing,
+                entry: JitDebugTarget::Entry,
+            }),
+            false,
+        )
+        .expect("production selector compiles float bitwise loop");
+        let optimized_ir = std::str::from_utf8(
+            output
+                .artifact
+                .as_ref()
+                .expect("float-bitwise artifact")
+                .file(JitArtifactFileName::OptimizedIr)
+                .expect("float-bitwise optimized IR")
+                .contents(),
+        )
+        .expect("UTF-8 optimized IR");
+        assert!(optimized_ir.starts_with("; backend=otter-machine-ir numeric-function\n"));
+        assert!(optimized_ir.contains("Float64ToInt32"));
+        assert!(optimized_ir.contains("IntegerLeafResult"));
+
+        let (result, _, _) = execute(&output.code, &[], 0);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, tag::box_int32(120_790));
+
+        let interrupt = 1_u8;
+        let mut fuel = i64::MAX as u64;
+        let (result, frame, pc) = execute_with_poll_cells(
+            &output.code,
+            &[],
+            0,
+            std::ptr::addr_of!(interrupt),
+            &mut fuel,
+        );
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(pc, 4);
+        assert_eq!(unbox_number(frame[0]), 4_294_967_299.25);
+        assert_eq!(frame[1], tag::box_int32(0));
+        assert_eq!(frame[2], tag::box_int32(1));
     }
 
     #[test]

@@ -143,11 +143,9 @@ cargo run --release -p otter-benchmark --features engine \
   --samples 100 --warmup 10
 ```
 
-The optimizing numeric-leaf row additionally passes
-`--expect-backend cranelift-numeric-leaf`. The command captures one untimed
-artifact preflight and requires `optimized-ir.txt` to begin with
-`; backend=cranelift numeric-leaf`; a silent fallback to the general optimizer
-is a validation failure.
+The optimizing numeric-leaf row exercises the same optimizing pipeline as
+every other function. The exact returned result validates the generated code;
+there is no backend-specific preflight or benchmark parameter.
 
 ### Managed memory
 

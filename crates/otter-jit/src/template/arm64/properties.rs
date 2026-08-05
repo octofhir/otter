@@ -14,8 +14,7 @@
 //!   out-of-line `values_ptr` — never a cached body pointer that the moving
 //!   collector could dangle.
 //! - Pointer-valued stores run the generational write barrier; primitive
-//!   stores skip it. Wide values the compressed slot cannot hold take the
-//!   window transition.
+//!   stores skip it. Every slot stores the complete runtime `Value` word.
 //! - Store misses publish the frame window before entering the VM, so setters,
 //!   proxies, exceptions, reentry, and moving GC complete without replay.
 //! - Cage bases, IC cells, and transition entries carry semantic relocation
@@ -33,8 +32,8 @@ use otter_vm::native_abi as abi;
 use super::ic_probe;
 use super::transitions::TransitionTable;
 use super::values::{
-    BoxedSlotSlowPath, CellTest, emit_cell_test, emit_compress_slot_or_bail,
-    emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64, emit_write_barrier,
+    CellTest, emit_cell_test, emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64,
+    emit_write_barrier,
 };
 use crate::artifact::relocation::{PropertyIcAccess, RelocationCapture, RelocationTarget};
 use crate::entry::{Unsupported, reg_offset};
@@ -54,7 +53,6 @@ pub(super) fn emit_load_property(
     cell_addr: usize,
     cell_ordinal: u32,
     settled: Option<&[otter_vm::JitInlinePropertyLoad]>,
-    boxed_slot_slow_paths: &mut Vec<BoxedSlotSlowPath>,
     threw: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let cage_base = view.cage_base;
@@ -95,7 +93,6 @@ pub(super) fn emit_load_property(
             },
             cell_addr,
             cell_ordinal,
-            boxed_slot_slow_paths,
             miss,
         )?;
         dynasm!(ops
@@ -187,20 +184,16 @@ pub(super) fn emit_store_property(
         emit_cell_test(ops, 9, 11, CellTest::IsNotCell, store_prim);
         dynasm!(ops
             ; .arch aarch64
-            // Cell: the compressed ref is the low-32 8-aligned offset
-            // (low-3 tag 000), i.e. the value's low word.
-            ; str w9, [x13, x17]
+            ; str x9, [x13, x17]
         );
         emit_write_barrier(ops, relocations, view, 12, 9);
         dynasm!(ops
             ; .arch aarch64
             ; b =>done
             ; =>store_prim
+            ; str x9, [x13, x17]
+            ; b =>done
         );
-        // A wide int / double / function id cannot inline-compress (a boxed
-        // number allocates); the window transition handles it.
-        emit_compress_slot_or_bail(ops, miss);
-        dynasm!(ops ; .arch aarch64 ; str w10, [x13, x17] ; b =>done);
     }
 
     // Miss / no cage base: the window transition resolves the store and

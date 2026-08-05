@@ -236,12 +236,6 @@ pub struct JitCompileSnapshot {
     /// `[recv_ptr + jit_proto_byte]` to chase the receiver's prototype chain
     /// in machine code without runtime resolution.
     pub jit_proto_byte: u32,
-    /// `GcHeader::type_tag` for heap-number boxes referenced by compressed
-    /// object slots.
-    pub heap_number_type_tag: u8,
-    /// Byte offset from a decompressed heap-number pointer to its raw boxed
-    /// `Value` bits (`HEADER_SIZE + offset_of!(HeapNumberBody, bits)`).
-    pub heap_number_bits_byte: u32,
     /// Complete VM-owned closure-call ABI contract. Method identity guards use
     /// its function-id offset; native call linkage additionally consumes its
     /// flags, immutable upvalue spine, and canonical bound-value metadata.
@@ -263,7 +257,7 @@ pub struct JitCompileSnapshot {
     /// Guarded own-data reads from the global object record keyed by the
     /// `Op::LoadGlobalOrThrow` byte-PC. Generated code validates both the live
     /// global-declarative epoch and the global object's hidden class before
-    /// reading the current compressed slot value.
+    /// reading the current `Value` slot word.
     pub global_object_loads: rustc_hash::FxHashMap<u32, JitGlobalObjectLoad>,
     /// Guarded static-native leaf calls keyed by the caller's `Op::Call`
     /// byte-PC. Each plan names one exact bootstrap function identity and one
@@ -1000,8 +994,6 @@ impl JitCompileSnapshot {
             object_inline_slot_cap: 0,
             gc_barrier: JitGcBarrierLayout::default(),
             jit_proto_byte: 0,
-            heap_number_type_tag: 0,
-            heap_number_bits_byte: 0,
             closure_call_layout: JitClosureCallLayout::default(),
             upvalue_value_byte: 0,
             collection_layout: JitCollectionLayout::default(),

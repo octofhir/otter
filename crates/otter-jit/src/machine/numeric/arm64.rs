@@ -1,0 +1,325 @@
+//! AArch64 emission for allocated numeric Machine IR.
+//!
+//! # Contents
+//! - [`emit`] — emits one call-free numeric leaf from allocator locations.
+//! - Exact JavaScript Number decode, canonical boxing, and bailout sequences.
+//! - regalloc2 edit emission between selected instructions.
+//!
+//! # Invariants
+//! - `x15` retains the entry context; `x16`/`x17` and `d31` are emitter-only
+//!   scratch registers excluded from allocation.
+//! - This first executable slice rejects spills and callee-saved allocations;
+//!   support is added through the shared frame builder, never hidden here.
+//! - A failed Number guard writes logical PC zero and returns `BAILED` before
+//!   any externally visible effect.
+//! - Successful results use the VM's canonical int32/double representation.
+
+// dynasm's dynamic-register expansion calls `.into()` on the required u8
+// register encoding. Clippy sees the macro expansion as an identity conversion.
+#![allow(clippy::useless_conversion)]
+
+use dynasmrt::{AssemblyOffset, DynasmApi, DynasmLabelApi, dynasm};
+
+use super::super::{
+    AllocatedLocation, AllocatedSequence, AllocationEdit, AllocationPoint, InstructionSequence,
+    MachineInstructionId, MachineOpcode,
+};
+use crate::{
+    CompiledCode, Unsupported,
+    entry::{
+        CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
+        NATIVE_FRAME_REGISTER_BASE_OFFSET, NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED,
+    },
+};
+
+pub(super) struct Emission {
+    pub(super) code: CompiledCode,
+    pub(super) stack_frame_bytes: u32,
+}
+
+pub(super) fn emit(
+    sequence: &InstructionSequence,
+    allocation: &AllocatedSequence,
+) -> Result<Emission, Unsupported> {
+    reject_unimplemented_locations(sequence, allocation)?;
+    let mut ops = dynasmrt::aarch64::Assembler::new()
+        .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
+    let bail = ops.new_dynamic_label();
+
+    dynasm!(ops
+        ; .arch aarch64
+        ; stp x29, x30, [sp, #-16]!
+        ; mov x29, sp
+        ; mov x15, x0
+        ; ldr x17, [x15, NATIVE_FRAME_OFFSET]
+        ; ldr x17, [x17, NATIVE_FRAME_REGISTER_BASE_OFFSET]
+    );
+
+    for (index, instruction) in sequence.instructions().iter().enumerate() {
+        let id = MachineInstructionId(index as u32);
+        emit_edits(&mut ops, allocation.edits(), AllocationPoint::Before(id))?;
+        let locations = allocation
+            .instruction_locations(id)
+            .ok_or(Unsupported::OperandShape("numeric Machine IR locations"))?;
+        match instruction.opcode {
+            MachineOpcode::EntryValue(parameter) => {
+                let destination = integer_register(locations[0])?;
+                let offset = u32::from(parameter)
+                    .checked_mul(8)
+                    .ok_or(Unsupported::OperandShape("numeric parameter offset"))?;
+                dynasm!(ops ; .arch aarch64 ; ldr X(destination), [x17, offset]);
+            }
+            MachineOpcode::DecodeNumber => {
+                emit_decode_number(
+                    &mut ops,
+                    integer_register(locations[0])?,
+                    float_register(locations[1])?,
+                    bail,
+                );
+            }
+            MachineOpcode::FloatConstant(bits) => {
+                emit_load_u64(&mut ops, 16, bits);
+                let destination = float_register(locations[0])?;
+                dynasm!(ops ; .arch aarch64 ; fmov D(destination), x16);
+            }
+            MachineOpcode::FloatAdd
+            | MachineOpcode::FloatSub
+            | MachineOpcode::FloatMul
+            | MachineOpcode::FloatDiv => {
+                let left = float_register(locations[0])?;
+                let right = float_register(locations[1])?;
+                let destination = float_register(locations[2])?;
+                match instruction.opcode {
+                    MachineOpcode::FloatAdd => {
+                        dynasm!(ops ; .arch aarch64 ; fadd D(destination), D(left), D(right));
+                    }
+                    MachineOpcode::FloatSub => {
+                        dynasm!(ops ; .arch aarch64 ; fsub D(destination), D(left), D(right));
+                    }
+                    MachineOpcode::FloatMul => {
+                        dynasm!(ops ; .arch aarch64 ; fmul D(destination), D(left), D(right));
+                    }
+                    MachineOpcode::FloatDiv => {
+                        dynasm!(ops ; .arch aarch64 ; fdiv D(destination), D(left), D(right));
+                    }
+                    _ => unreachable!("matched floating binary operation"),
+                }
+            }
+            MachineOpcode::FloatNeg => {
+                let source = float_register(locations[0])?;
+                let destination = float_register(locations[1])?;
+                dynasm!(ops ; .arch aarch64 ; fneg D(destination), D(source));
+            }
+            MachineOpcode::BoxNumber => emit_box_number(
+                &mut ops,
+                float_register(locations[0])?,
+                integer_register(locations[1])?,
+            ),
+            MachineOpcode::Return => {
+                let source = integer_register(locations[0])?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; mov x0, X(source)
+                    ; movz x1, STATUS_RETURNED as u32
+                );
+                emit_epilogue(&mut ops);
+            }
+            MachineOpcode::IntegerConstant(_)
+            | MachineOpcode::IntegerAdd
+            | MachineOpcode::Call(_)
+            | MachineOpcode::Jump
+            | MachineOpcode::Branch => {
+                return Err(Unsupported::OperandShape(
+                    "numeric AArch64 Machine IR opcode",
+                ));
+            }
+        }
+        emit_edits(&mut ops, allocation.edits(), AllocationPoint::After(id))?;
+    }
+
+    dynasm!(ops
+        ; .arch aarch64
+        ; =>bail
+        ; ldr x17, [x15, NATIVE_FRAME_OFFSET]
+        ; str wzr, [x17, NATIVE_FRAME_PC_OFFSET]
+        ; mov x0, xzr
+        ; movz x1, STATUS_BAILED as u32
+    );
+    emit_epilogue(&mut ops);
+    let buffer = ops
+        .finalize()
+        .map_err(|_| Unsupported::Backend(crate::BackendFailure::Finalization))?;
+    Ok(Emission {
+        code: CompiledCode::new(buffer, AssemblyOffset(0)),
+        stack_frame_bytes: 16,
+    })
+}
+
+fn reject_unimplemented_locations(
+    sequence: &InstructionSequence,
+    allocation: &AllocatedSequence,
+) -> Result<(), Unsupported> {
+    for instruction_index in 0..sequence.instructions().len() {
+        let locations = allocation
+            .instruction_locations(MachineInstructionId(instruction_index as u32))
+            .ok_or(Unsupported::OperandShape("numeric allocation coverage"))?;
+        for &location in locations {
+            match location {
+                AllocatedLocation::Stack(_) => {
+                    return Err(Unsupported::OperandShape("numeric Machine IR spill"));
+                }
+                AllocatedLocation::Register(register)
+                    if register.is_integer() && register.encoding() >= 19 =>
+                {
+                    return Err(Unsupported::OperandShape(
+                        "numeric Machine IR callee-saved GPR",
+                    ));
+                }
+                AllocatedLocation::Register(register)
+                    if register.is_float() && (8..=15).contains(&register.encoding()) =>
+                {
+                    return Err(Unsupported::OperandShape(
+                        "numeric Machine IR callee-saved FP register",
+                    ));
+                }
+                AllocatedLocation::Register(_) => {}
+            }
+        }
+    }
+    for edit in allocation.edits() {
+        if matches!(edit.from, AllocatedLocation::Stack(_))
+            || matches!(edit.to, AllocatedLocation::Stack(_))
+        {
+            return Err(Unsupported::OperandShape("numeric Machine IR spill edit"));
+        }
+    }
+    Ok(())
+}
+
+fn emit_edits(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    edits: &[AllocationEdit],
+    point: AllocationPoint,
+) -> Result<(), Unsupported> {
+    for edit in edits.iter().filter(|edit| edit.point == point) {
+        let from = match edit.from {
+            AllocatedLocation::Register(register) => register,
+            AllocatedLocation::Stack(_) => {
+                return Err(Unsupported::OperandShape("numeric edit source spill"));
+            }
+        };
+        let to = match edit.to {
+            AllocatedLocation::Register(register) => register,
+            AllocatedLocation::Stack(_) => {
+                return Err(Unsupported::OperandShape("numeric edit destination spill"));
+            }
+        };
+        if from == to {
+            continue;
+        }
+        if from.is_integer() && to.is_integer() {
+            dynasm!(ops ; .arch aarch64 ; mov X(to.encoding()), X(from.encoding()));
+        } else if from.is_float() && to.is_float() {
+            dynasm!(ops ; .arch aarch64 ; fmov D(to.encoding()), D(from.encoding()));
+        } else {
+            return Err(Unsupported::OperandShape("numeric edit register class"));
+        }
+    }
+    Ok(())
+}
+
+fn emit_decode_number(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    source: u8,
+    destination: u8,
+    bail: dynasmrt::DynamicLabel,
+) {
+    let non_int = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz x16, NUMBER_TAG_HI16, lsl #48
+        ; and x17, X(source), x16
+        ; cmp x17, x16
+        ; b.ne =>non_int
+        ; scvtf D(destination), W(source)
+        ; b =>done
+        ; =>non_int
+        ; tst X(source), x16
+        ; b.eq =>bail
+        ; movz x16, DOUBLE_OFFSET_HI16, lsl #48
+        ; sub x17, X(source), x16
+        ; fmov D(destination), x17
+        ; =>done
+    );
+}
+
+fn emit_box_number(ops: &mut dynasmrt::aarch64::Assembler, source: u8, destination: u8) {
+    let encode_double = ops.new_dynamic_label();
+    let tag_integer = ops.new_dynamic_label();
+    let double_ready = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; fcvtzs w16, D(source)
+        ; scvtf d31, w16
+        ; fcmp D(source), d31
+        ; b.ne =>encode_double
+        ; fmov x17, D(source)
+        ; cbnz w16, =>tag_integer
+        ; tbnz x17, #63, =>encode_double
+        ; =>tag_integer
+        ; mov w17, w16
+        ; movz x16, NUMBER_TAG_HI16, lsl #48
+        ; orr X(destination), x17, x16
+        ; b =>done
+        ; =>encode_double
+        ; fmov X(destination), D(source)
+        ; fcmp D(source), D(source)
+        ; b.vc =>double_ready
+        ; movz X(destination), CANONICAL_NAN_HI16, lsl #48
+        ; =>double_ready
+        ; movz x16, DOUBLE_OFFSET_HI16, lsl #48
+        ; add X(destination), X(destination), x16
+        ; =>done
+    );
+}
+
+fn emit_epilogue(ops: &mut dynasmrt::aarch64::Assembler) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldp x29, x30, [sp], #16
+        ; ret
+    );
+}
+
+fn emit_load_u64(ops: &mut dynasmrt::aarch64::Assembler, register: u8, value: u64) {
+    dynasm!(ops ; .arch aarch64 ; movz X(register), (value & 0xffff) as u32);
+    if (value >> 16) & 0xffff != 0 {
+        dynasm!(ops ; .arch aarch64 ; movk X(register), ((value >> 16) & 0xffff) as u32, lsl #16);
+    }
+    if (value >> 32) & 0xffff != 0 {
+        dynasm!(ops ; .arch aarch64 ; movk X(register), ((value >> 32) & 0xffff) as u32, lsl #32);
+    }
+    if (value >> 48) & 0xffff != 0 {
+        dynasm!(ops ; .arch aarch64 ; movk X(register), ((value >> 48) & 0xffff) as u32, lsl #48);
+    }
+}
+
+fn integer_register(location: AllocatedLocation) -> Result<u8, Unsupported> {
+    match location {
+        AllocatedLocation::Register(register) if register.is_integer() => Ok(register.encoding()),
+        AllocatedLocation::Register(_) | AllocatedLocation::Stack(_) => {
+            Err(Unsupported::OperandShape("numeric integer register"))
+        }
+    }
+}
+
+fn float_register(location: AllocatedLocation) -> Result<u8, Unsupported> {
+    match location {
+        AllocatedLocation::Register(register) if register.is_float() => Ok(register.encoding()),
+        AllocatedLocation::Register(_) | AllocatedLocation::Stack(_) => {
+            Err(Unsupported::OperandShape("numeric floating register"))
+        }
+    }
+}

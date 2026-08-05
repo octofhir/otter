@@ -76,7 +76,6 @@ use crate::property_atom::{AtomId, AtomizedPropertyKey};
 use crate::proxy::JsProxy;
 use crate::string::{JsString, to_utf16_vec};
 use crate::symbol::JsSymbol;
-use crate::value::compressed::{CompressedValue, compress, decompress};
 use crate::{UpvalueCell, Value, read_upvalue, store_upvalue};
 use otter_gc::GcHeap;
 use otter_gc::heap::RootSlotVisitor;
@@ -496,27 +495,23 @@ impl SlotData {
         self,
         heap: &mut GcHeap,
         obj: &mut JsObject,
-    ) -> Result<(SlotMeta, CompressedValue), otter_gc::OutOfMemory> {
+    ) -> Result<(SlotMeta, Value), otter_gc::OutOfMemory> {
         match self.kind {
-            SlotKind::Data => {
-                let compressed = compress_rooted(heap, obj, self.value)?;
-                Ok((
-                    SlotMeta {
-                        flags: self.flags,
-                        is_accessor: false,
-                    },
-                    compressed,
-                ))
-            }
+            SlotKind::Data => Ok((
+                SlotMeta {
+                    flags: self.flags,
+                    is_accessor: false,
+                },
+                self.value,
+            )),
             SlotKind::Accessor(pair) => {
                 let cell = alloc_accessor_cell(heap, obj, pair.getter, pair.setter)?;
-                let compressed = compress_rooted(heap, obj, cell)?;
                 Ok((
                     SlotMeta {
                         flags: self.flags,
                         is_accessor: true,
                     },
-                    compressed,
+                    cell,
                 ))
             }
         }
@@ -691,7 +686,7 @@ pub struct ObjectBody {
     /// base is an **always-current** invariant — refreshed after every move,
     /// grow, shrink, or spill ([`Self::refresh_values_ptr`]) and verified at
     /// every slab access in debug ([`Self::values_ptr_is_current`]).
-    values_ptr: Cell<*mut CompressedValue>,
+    values_ptr: Cell<*mut Value>,
     /// Out-of-line string-keyed own-property values once the object grows
     /// past [`INLINE_SLOT_CAP`], indexed by shape slot offset. A data slot
     /// stores its `[[Value]]` directly; an accessor slot stores a handle to
@@ -761,7 +756,7 @@ pub struct ObjectBody {
     /// every slot wholesale into `values` and leaves this array unused.
     /// `values_ptr` always points at whichever buffer is active, so the slot
     /// access path and the JIT both index it uniformly.
-    inline_values: [CompressedValue; INLINE_SLOT_CAP],
+    inline_values: [Value; INLINE_SLOT_CAP],
     /// Count of live string-keyed slots, across `inline_values` or `values`.
     slab_len: u16,
 }
@@ -770,15 +765,11 @@ pub struct ObjectBody {
 /// properties or fewer carry their slab in [`ObjectBody::inline_values`]; larger
 /// objects spill the whole slab to the out-of-line `values` vector.
 ///
-/// Held to 2 (not 4): the object-granular remembered set records the parent
-/// object and re-traces it through the refreshed slab base, so it does not
-/// matter for GC precision whether a small object's slots are in-page or in
-/// the malloc `values` Vec. The inline cap therefore exists purely for
-/// allocation locality, and a flat reservation of 4 charged every body — the
-/// dominant `{}` / class-instance case included — 8 bytes of always-present
-/// slack it usually does not use. Two inline slots cover the large majority of
-/// objects with ≤2 own string-keyed properties at half the slack.
-pub(crate) const INLINE_SLOT_CAP: usize = 6;
+/// Three direct `Value` words preserve the previous 88-byte hot-object
+/// footprint while covering the common small record. A fourth own property
+/// spills to the GC-managed slab; increasing this cap would charge every empty
+/// object another eight bytes per slot.
+pub(crate) const INLINE_SLOT_CAP: usize = 3;
 
 /// Rarely-used `ObjectBody` slots, boxed out of the hot object so plain
 /// objects stay small. Every field here is absent on a plain `{}` / class
@@ -1246,7 +1237,7 @@ fn dict_keys_table_for_install(
     heap: &mut otter_gc::GcHeap,
     keys: &Option<Vec<String>>,
     pending_key: &str,
-    pending: &mut [CompressedValue],
+    pending: &mut [Value],
 ) -> Result<Option<DictKeysHandle>, otter_gc::OutOfMemory> {
     let object_slot = (object as *mut JsObject).cast::<otter_gc::raw::RawGc>();
     let pending_base = pending.as_mut_ptr();
@@ -1255,21 +1246,8 @@ fn dict_keys_table_for_install(
         visitor(object_slot);
         for index in 0..pending_len {
             // SAFETY: `index < pending_len`, and the slice outlives this
-            // call; forward tagged words as the slab reserve does.
-            let word = unsafe { pending_base.add(index) };
-            let slot = unsafe { *word };
-            if !slot.is_gc_offset() {
-                continue;
-            }
-            if slot.0 & 0b111 == 0 {
-                visitor(word.cast::<otter_gc::raw::RawGc>());
-            } else {
-                let tag = slot.0 & 0b111;
-                let mut raw = otter_gc::raw::RawGc(slot.0 & !0b111);
-                visitor(std::ptr::addr_of_mut!(raw));
-                // SAFETY: same in-range word as above.
-                unsafe { *word = CompressedValue(raw.0 | tag) };
-            }
+            // call; `Value` rewrites its embedded moving offset in place.
+            unsafe { (*pending_base.add(index)).trace_value_slot_mut(visitor) };
         }
     };
     if let Some(keys) = keys {
@@ -1858,6 +1836,32 @@ pub(crate) fn ensure_exotic_with_roots(
     Ok(())
 }
 
+/// [`ensure_exotic`], with direct `Value` words kept live across the
+/// sidecar allocation.
+///
+/// Property stores call this before the values have entered a traced object.
+/// A young referent may therefore move while the sidecar is allocated; tracing
+/// the caller-owned words here rewrites their embedded offsets in place.
+///
+/// # Errors
+/// Propagates [`otter_gc::OutOfMemory`].
+pub(crate) fn ensure_exotic_with_pending_values(
+    object: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    pending: &mut [Value],
+) -> Result<(), otter_gc::OutOfMemory> {
+    let pending_base = pending.as_mut_ptr();
+    let pending_len = pending.len();
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        for index in 0..pending_len {
+            // SAFETY: `index < pending_len`, and `pending` outlives the
+            // allocation. `Value` rewrites a moving cell offset in place.
+            unsafe { (*pending_base.add(index)).trace_value_slot_mut(visitor) };
+        }
+    };
+    ensure_exotic_with_roots(object, heap, &mut visit)
+}
+
 /// Remember a write against the sidecar that actually holds it.
 ///
 /// The exotic slots are their own old-space body, so the object is not
@@ -1887,8 +1891,8 @@ pub(crate) const OBJECT_BODY_DICTIONARY_SHAPE_ID_OFFSET: usize =
 
 /// Byte offset of the string-keyed value slab pointer within an [`ObjectBody`]
 /// payload. The JIT reads this pointer after its shape guard and then indexes
-/// the contiguous slab by `slot * size_of::<CompressedValue>()` (4 bytes),
-/// decompressing each 4-byte slot into a full `Value`.
+/// the contiguous slab by `slot * size_of::<Value>()` (8 bytes). The loaded
+/// word is already the runtime `Value`; no property-slot codec is involved.
 pub(crate) const OBJECT_BODY_VALUES_PTR_OFFSET: usize =
     std::mem::offset_of!(ObjectBody, values_ptr);
 
@@ -1933,10 +1937,8 @@ const _: () = assert!(OBJECT_BODY_VALUES_PTR_OFFSET.is_multiple_of(8));
 
 // Pin the hot object footprint. Per-slot metadata lives out of line only for
 // dictionary-mode / attribute-overridden objects, while string-keyed values use
-// one contiguous slab addressed from a cached pointer. Six inline slots cover
-// the common constructor-built object (a 3-6 field instance) without an
-// out-of-line allocation; measured on allocation-heavy workloads, the malloc
-// per spilled object cost more than the 16 extra body bytes.
+// one contiguous slab addressed from a cached pointer. Three 8-byte inline
+// values keep the complete body at the old 88-byte footprint.
 const _: () = assert!(std::mem::size_of::<ObjectBody>() == 88);
 
 impl ObjectBody {
@@ -1980,9 +1982,9 @@ impl ObjectBody {
         }
     }
 
-    /// Read the compressed word for string-keyed slot `i`.
+    /// Read the value word for string-keyed slot `i`.
     #[inline]
-    fn slot_word(&self, i: usize) -> CompressedValue {
+    fn slot_word(&self, i: usize) -> Value {
         debug_assert!(
             self.values_ptr_is_current(),
             "stale values_ptr on slab read: body={:p} values_ptr={:p} expected={:p} slab_len={}",
@@ -1998,15 +2000,15 @@ impl ObjectBody {
         unsafe { *self.values_ptr.get().add(i) }
     }
 
-    /// Read and decompress the data value for string-keyed slot `i`.
+    /// Read the data value for string-keyed slot `i`.
     #[inline]
-    fn data_value(&self, heap: &otter_gc::GcHeap, i: usize) -> Value {
-        decompress(self.slot_word(i), heap)
+    fn data_value(&self, _heap: &otter_gc::GcHeap, i: usize) -> Value {
+        self.slot_word(i)
     }
 
-    /// Write a pre-compressed data value into string-keyed slot `i`.
+    /// Write a value into string-keyed slot `i`.
     #[inline]
-    fn set_data_value(&mut self, i: usize, value: CompressedValue) {
+    fn set_data_value(&mut self, i: usize, value: Value) {
         debug_assert!(
             self.values_ptr_is_current(),
             "stale values_ptr on slab write"
@@ -2019,7 +2021,7 @@ impl ObjectBody {
     /// Append one slab word, migrating the inline slab to `values` on the
     /// transition past [`INLINE_SLOT_CAP`].
     #[inline]
-    fn push_slab_word(&mut self, value: CompressedValue) {
+    fn push_slab_word(&mut self, value: Value) {
         let len = self.slab_len();
         // Branch on the actual storage location, not on `len`: a slab that
         // spilled and then shrank back to `INLINE_SLOT_CAP` via
@@ -2051,7 +2053,7 @@ impl ObjectBody {
         unsafe {
             let base = self.values_ptr.get();
             std::ptr::copy(base.add(i + 1), base.add(i), len - i - 1);
-            *base.add(len - 1) = CompressedValue::default();
+            *base.add(len - 1) = Value::default();
         }
         self.slab_len -= 1;
         self.refresh_values_ptr();
@@ -2090,7 +2092,7 @@ impl ObjectBody {
     /// also pushes `meta` onto its per-slot metadata vector so it stays
     /// index-aligned with the value array. For an accessor slot `value` is the
     /// [`AccessorCellBody`] handle produced by [`SlotData::into_flat`].
-    fn push_slot(&mut self, index: usize, meta: SlotMeta, value: CompressedValue) {
+    fn push_slot(&mut self, index: usize, meta: SlotMeta, value: Value) {
         debug_assert_eq!(self.slab_len(), index, "value slab append desynced");
         self.push_slab_word(value);
         if self.slots_materialized() {
@@ -2115,7 +2117,7 @@ impl ObjectBody {
         &mut self,
         i: usize,
         meta: SlotMeta,
-        value: CompressedValue,
+        value: Value,
         attr_shape: Option<ShapeHandle>,
     ) {
         self.set_data_value(i, value);
@@ -2262,7 +2264,7 @@ impl ObjectBody {
     }
 
     #[inline]
-    fn expected_values_ptr(&self) -> *const CompressedValue {
+    fn expected_values_ptr(&self) -> *const Value {
         if self.slab_len == 0 {
             std::ptr::null()
         } else if self.slab_is_inline() {
@@ -2543,22 +2545,9 @@ impl otter_gc::SafeTraceable for ObjectBody {
         for i in 0..self.slab_len() {
             // SAFETY: `base` is the live slab base and `i < slab_len`.
             let word = unsafe { base.add(i) };
-            let slot = unsafe { *word };
-            if !slot.is_gc_offset() {
-                continue;
-            }
-            if slot.0 & 0b111 == 0 {
-                // Cell ref: the compressed word is the bare 8-aligned offset, so
-                // it is itself a `RawGc` slot the collector rewrites in place.
-                v(word.cast::<RawGc>());
-            } else {
-                // Boxed number: forward the offset through a temporary, then
-                // re-apply the slot tag to the live word.
-                let mut tmp = RawGc(slot.gc_offset());
-                v(&mut tmp);
-                // SAFETY: `word` is the live slab slot with mut provenance.
-                unsafe { *word = slot.with_gc_offset(tmp.0) };
-            }
+            // SAFETY: same live in-range value word. `Value` skips immediates
+            // and rewrites the low-word GC offset of cells in place.
+            unsafe { (*word).trace_value_slot_mut(v) };
         }
         // The exotic sidecar is its own GC body: trace the handle so a
         // moving collection rewrites it, and let the sidecar trace its own
@@ -2602,7 +2591,7 @@ pub(crate) fn reserve_slot_capacity(
     object: &mut JsObject,
     heap: &mut otter_gc::GcHeap,
     needed: usize,
-    pending: &mut [CompressedValue],
+    pending: &mut [Value],
 ) -> Result<(), otter_gc::OutOfMemory> {
     // A materialized object appends per-slot metadata in lockstep with
     // the value it appends, so its meta table must keep pace with the
@@ -2625,24 +2614,11 @@ pub(crate) fn reserve_slot_capacity(
         // allocation that produces it — and the caller's handle is what the
         // collector rewrites, so the caller sees the moved object.
         visitor(object_slot);
-        // A word the caller already compressed is a bare offset with nothing
-        // else rooting it. Forward it the same way the slab's own trace does.
+        // Pending values are not in the object yet, so trace them as explicit
+        // roots across the slab allocation.
         for index in 0..pending_len {
             // SAFETY: `index < pending_len`, and the slice outlives this call.
-            let word = unsafe { pending_base.add(index) };
-            let slot = unsafe { *word };
-            if !slot.is_gc_offset() {
-                continue;
-            }
-            if slot.0 & 0b111 == 0 {
-                visitor(word.cast::<otter_gc::raw::RawGc>());
-            } else {
-                let tag = slot.0 & 0b111;
-                let mut raw = otter_gc::raw::RawGc(slot.0 & !0b111);
-                visitor(std::ptr::addr_of_mut!(raw));
-                // SAFETY: same in-range word as above.
-                unsafe { *word = CompressedValue(raw.0 | tag) };
-            }
+            unsafe { (*pending_base.add(index)).trace_value_slot_mut(visitor) };
         }
     };
     let slab = slot_slab::alloc_slot_slab(heap, grown, &mut visit)?;
@@ -2672,7 +2648,7 @@ pub(crate) fn reserve_slot_meta_capacity(
     object: &mut JsObject,
     heap: &mut otter_gc::GcHeap,
     needed: usize,
-    pending: &mut [CompressedValue],
+    pending: &mut [Value],
 ) -> Result<(), otter_gc::OutOfMemory> {
     let state = heap.read_payload(*object, |body| {
         if !body.slots_materialized() {
@@ -2700,21 +2676,8 @@ pub(crate) fn reserve_slot_meta_capacity(
         visitor(object_slot);
         for index in 0..pending_len {
             // SAFETY: `index < pending_len`, and the slice outlives this
-            // call; forward tagged words the same way the slab reserve does.
-            let word = unsafe { pending_base.add(index) };
-            let slot = unsafe { *word };
-            if !slot.is_gc_offset() {
-                continue;
-            }
-            if slot.0 & 0b111 == 0 {
-                visitor(word.cast::<otter_gc::raw::RawGc>());
-            } else {
-                let tag = slot.0 & 0b111;
-                let mut raw = otter_gc::raw::RawGc(slot.0 & !0b111);
-                visitor(std::ptr::addr_of_mut!(raw));
-                // SAFETY: same in-range word as above.
-                unsafe { *word = CompressedValue(raw.0 | tag) };
-            }
+            // call; rewrite the embedded moving offset in place.
+            unsafe { (*pending_base.add(index)).trace_value_slot_mut(visitor) };
         }
     };
     // The old table is old space and does not move; copy after the
@@ -2748,7 +2711,7 @@ fn slot_meta_table_for_install(
     heap: &mut otter_gc::GcHeap,
     metas: &Option<Vec<SlotMeta>>,
     capacity: usize,
-    pending: &mut [CompressedValue],
+    pending: &mut [Value],
 ) -> Result<Option<SlotMetaHandle>, otter_gc::OutOfMemory> {
     let Some(metas) = metas else {
         return Ok(None);
@@ -2760,21 +2723,8 @@ fn slot_meta_table_for_install(
         visitor(object_slot);
         for index in 0..pending_len {
             // SAFETY: `index < pending_len`, and the slice outlives this
-            // call; forward tagged words as the slab reserve does.
-            let word = unsafe { pending_base.add(index) };
-            let slot = unsafe { *word };
-            if !slot.is_gc_offset() {
-                continue;
-            }
-            if slot.0 & 0b111 == 0 {
-                visitor(word.cast::<otter_gc::raw::RawGc>());
-            } else {
-                let tag = slot.0 & 0b111;
-                let mut raw = otter_gc::raw::RawGc(slot.0 & !0b111);
-                visitor(std::ptr::addr_of_mut!(raw));
-                // SAFETY: same in-range word as above.
-                unsafe { *word = CompressedValue(raw.0 | tag) };
-            }
+            // call; rewrite the embedded moving offset in place.
+            unsafe { (*pending_base.add(index)).trace_value_slot_mut(visitor) };
         }
     };
     let table = slot_meta_table_from(heap, metas, capacity, &mut visit)?;
@@ -2820,7 +2770,6 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
         crate::eval_env::EvalEnvBody,
         crate::generator::GeneratorBody,
         crate::generator::ParkedFrameBody,
-        crate::heap_number::HeapNumberBody,
         crate::intl::payload::IntlBody,
         crate::iterator_state::IteratorState,
         crate::native_function::NativeFunctionBody,
@@ -2853,7 +2802,7 @@ fn empty_object_body() -> ObjectBody {
         shape: ShapeHandle::null(),
         values_ptr: Cell::new(std::ptr::null_mut()),
         slab: otter_gc::Gc::null(),
-        inline_values: [CompressedValue::default(); INLINE_SLOT_CAP],
+        inline_values: [Value::default(); INLINE_SLOT_CAP],
         slab_len: 0,
         dictionary_shape_id: ShapeId::UNASSIGNED,
         shape_cache_mode: ShapeCacheMode::Fast,
@@ -2942,15 +2891,10 @@ pub(crate) fn alloc_object_with_shape_roots(
 /// hidden-class data slot, in shape order.
 pub(crate) fn initialize_shaped_data_slots(obj: JsObject, heap: &mut GcHeap, values: &[Value]) {
     let mut obj = obj;
-    // Compress (boxing any double) before borrowing the body, rooting `obj`
-    // across each box allocation.
-    let compressed: Vec<CompressedValue> = values
-        .iter()
-        .map(|&value| compress_or_abort(heap, &mut obj, value))
-        .collect();
+    let stored = values.to_vec();
     let expected = heap.read_payload(obj, |body| body_property_count(heap, body));
-    let mut compressed = compressed;
-    if reserve_slot_capacity(&mut obj, heap, compressed.len(), &mut compressed).is_err() {
+    let mut stored = stored;
+    if reserve_slot_capacity(&mut obj, heap, stored.len(), &mut stored).is_err() {
         return;
     }
     heap.with_payload(obj, |body| {
@@ -2961,14 +2905,14 @@ pub(crate) fn initialize_shaped_data_slots(obj: JsObject, heap: &mut GcHeap, val
         debug_assert!(body.slab_len == 0, "bulk slot init requires a fresh object");
         debug_assert_eq!(
             expected,
-            compressed.len(),
+            stored.len(),
             "shape slot count and init value count diverged"
         );
-        for (index, &value) in compressed.iter().enumerate() {
+        for (index, &value) in stored.iter().enumerate() {
             body.push_slot(index, SlotMeta::data_default(), value);
         }
     });
-    for &value in &compressed {
+    for &value in &stored {
         record_slot_write(heap, obj, value);
     }
 }
@@ -3047,7 +2991,7 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
             shape: ShapeHandle::null(),
             values_ptr: Cell::new(std::ptr::null_mut()),
             slab: otter_gc::Gc::null(),
-            inline_values: [CompressedValue::default(); INLINE_SLOT_CAP],
+            inline_values: [Value::default(); INLINE_SLOT_CAP],
             slab_len: 0,
             dictionary_shape_id: next_shape_id(),
             shape_cache_mode: ShapeCacheMode::Fast,
@@ -3089,7 +3033,7 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
             shape,
             values_ptr: Cell::new(std::ptr::null_mut()),
             slab: otter_gc::Gc::null(),
-            inline_values: [CompressedValue::default(); INLINE_SLOT_CAP],
+            inline_values: [Value::default(); INLINE_SLOT_CAP],
             slab_len: 0,
             dictionary_shape_id: ShapeId::UNASSIGNED,
             shape_cache_mode: ShapeCacheMode::Fast,
@@ -3132,7 +3076,7 @@ pub(crate) fn alloc_traced_host_object_with_shape_roots<T: TracedHostObjectData>
             shape,
             values_ptr: Cell::new(std::ptr::null_mut()),
             slab: otter_gc::Gc::null(),
-            inline_values: [CompressedValue::default(); INLINE_SLOT_CAP],
+            inline_values: [Value::default(); INLINE_SLOT_CAP],
             slab_len: 0,
             dictionary_shape_id: ShapeId::UNASSIGNED,
             shape_cache_mode: ShapeCacheMode::Fast,
@@ -3263,7 +3207,7 @@ fn remove_mapped_argument(body: &mut ObjectBody, key: &str) {
 }
 
 fn apply_mapped_arguments_partial_define(
-    mut obj: JsObject,
+    obj: JsObject,
     heap: &mut otter_gc::GcHeap,
     key: &str,
     descriptor: PartialPropertyDescriptor,
@@ -3291,7 +3235,7 @@ fn apply_mapped_arguments_partial_define(
     if descriptor.writable == Some(false) {
         if descriptor.value.is_none() {
             let current = read_upvalue(heap, cell);
-            let compressed = compress_or_abort(heap, &mut obj, current);
+            let stored = current;
             if let Some(offset) = existing_offset {
                 let is_data_slot = heap.read_payload(obj, |body| {
                     (usize::from(offset) < body_property_count(heap, body))
@@ -3299,9 +3243,9 @@ fn apply_mapped_arguments_partial_define(
                 });
                 if is_data_slot {
                     heap.with_payload(obj, |body| {
-                        body.set_data_value(offset as usize, compressed);
+                        body.set_data_value(offset as usize, stored);
                     });
-                    record_slot_write(heap, obj, compressed);
+                    record_slot_write(heap, obj, stored);
                 }
             }
         }
@@ -3768,19 +3712,16 @@ pub(crate) fn store_own_data_slot_atom(
         "shape-id store hit resolved to a slot whose key differs from the request"
     );
 
-    let mut obj = obj;
-    let compressed = compress_or_abort(heap, &mut obj, *value);
-    // `mapped_cell` is itself movable. Re-read it only after boxing has
-    // refreshed `obj` from the allocation root.
+    let stored = *value;
     let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key.name()));
     heap.with_payload(obj, |body| {
         let offset = hit.slot as usize;
-        body.set_data_value(offset, compressed);
+        body.set_data_value(offset, stored);
     });
     if let Some(cell) = mapped_cell {
         store_upvalue(heap, cell, *value);
     }
-    record_slot_write(heap, obj, compressed);
+    record_slot_write(heap, obj, stored);
     Some(())
 }
 
@@ -4568,48 +4509,10 @@ pub fn is_frozen(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 /// flag: this path is only used by code that owns the object and
 /// is allowed to seed it (`Error.prototype.message`, etc.).
 ///
-/// Compress `value` for storage in `*obj`'s slab, rooting `obj` across the
-/// box allocation a double or wide int32 triggers. `obj` is updated in place
-/// if that collection relocates it, so callers must use the returned handle
-/// for any subsequent body access.
-///
-/// # Errors
-///
-/// Surfaces [`otter_gc::OutOfMemory`] from the box allocation.
-fn compress_rooted(
-    heap: &mut otter_gc::GcHeap,
-    obj: &mut JsObject,
-    value: Value,
-) -> Result<CompressedValue, otter_gc::OutOfMemory> {
-    let mut raw = obj.raw();
-    let compressed = compress(value, heap, &mut |visit: &mut dyn FnMut(*mut RawGc)| {
-        visit(&mut raw as *mut RawGc);
-    })?;
-    // SAFETY: `raw` started as `obj`'s offset and the collector only ever
-    // rewrites it to another live `ObjectBody` offset during the box alloc.
-    *obj = unsafe { raw.cast::<ObjectBody>() };
-    Ok(compressed)
-}
-
-/// Like [`compress_rooted`], but aborts on box-allocation OOM. Used by the
-/// infallible store helpers; a 16-byte box that cannot allocate means the
-/// heap is already exhausted.
-fn compress_or_abort(
-    heap: &mut otter_gc::GcHeap,
-    obj: &mut JsObject,
-    value: Value,
-) -> CompressedValue {
-    compress_rooted(heap, obj, value).expect("heap number box allocation")
-}
-
-/// Fire the generational write barrier for a compressed slot just stored into
-/// `obj`. A cell-ref or boxed-number slot establishes an `obj → cell` edge
-/// (the box for a boxed number); small ints and immediates carry no edge.
-fn record_slot_write(heap: &mut otter_gc::GcHeap, obj: JsObject, slot: CompressedValue) {
-    if slot.is_gc_offset() {
-        let cell = Value::from_object_gc(RawGc(slot.gc_offset()));
-        heap.record_write(obj, &cell);
-    }
+/// Fire the generational/incremental barrier for the value just stored in an
+/// object slot. Immediate values expose no outgoing edge through `GcStore`.
+fn record_slot_write(heap: &mut otter_gc::GcHeap, obj: JsObject, slot: Value) {
+    heap.record_write(obj, &slot);
 }
 
 /// Records the GC store when `value` carries a `Gc<…>` handle so the
@@ -4617,12 +4520,12 @@ fn record_slot_write(heap: &mut otter_gc::GcHeap, obj: JsObject, slot: Compresse
 /// Store `value` under string key `key` on `obj`, taking `obj` to dictionary
 /// mode if the key is new.
 ///
-/// `obj` is a `&mut` handle because a value-boxing allocation (a wide number
-/// boxes a `HeapNumber`) can trigger a moving GC that relocates a young
-/// receiver. The relocation is reflected back into the caller's handle so a
-/// sequence of `set` calls on a freshly-allocated object never writes through
-/// a stale handle.
+/// `obj` is a `&mut` handle because sidecar or slab allocation can trigger a
+/// moving GC that relocates a young receiver. The relocation is reflected back
+/// into the caller's handle so a sequence of `set` calls on a freshly allocated
+/// object never writes through a stale handle.
 pub fn set(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) {
+    let mut stored = value;
     let existing_offset = heap.read_payload(*obj, |body| body_offset_of(heap, body, key));
     if existing_offset.is_none() {
         // A fresh key demotes this object to dictionary mode, and the
@@ -4632,9 +4535,9 @@ pub fn set(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Va
         // actually write it: an in-place update never touches the
         // sidecar, and reserving on every store gave most of the
         // bootstrap graph a sidecar it never used.
-        ensure_exotic(obj, heap).expect("exotic sidecar");
+        ensure_exotic_with_pending_values(obj, heap, std::slice::from_mut(&mut stored))
+            .expect("exotic sidecar");
     }
-    let compressed = compress_or_abort(heap, obj, value);
     if let Some(offset) = existing_offset {
         let i = offset as usize;
         // Overwriting an accessor slot with a data value diverges this slot
@@ -4649,16 +4552,15 @@ pub fn set(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Va
             if is_accessor {
                 body.slots_mut().entries_mut()[i].is_accessor = false;
             }
-            body.set_data_value(i, compressed);
+            body.set_data_value(i, stored);
         });
-        record_slot_write(heap, *obj, compressed);
+        record_slot_write(heap, *obj, stored);
         return;
     }
     let dictionary_keys = dictionary_keys_for_shape_transition(heap, *obj, existing_offset);
     let slot_metas = slot_metas_for_shape_transition(heap, *obj, existing_offset);
     let index = heap.read_payload(*obj, |body| body_property_count(heap, body));
-    let mut compressed = compressed;
-    if reserve_slot_capacity(obj, heap, index + 1, std::slice::from_mut(&mut compressed)).is_err() {
+    if reserve_slot_capacity(obj, heap, index + 1, std::slice::from_mut(&mut stored)).is_err() {
         return;
     }
     let Ok(slot_meta_table) = slot_meta_table_for_install(
@@ -4666,7 +4568,7 @@ pub fn set(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Va
         heap,
         &slot_metas,
         index + 1,
-        std::slice::from_mut(&mut compressed),
+        std::slice::from_mut(&mut stored),
     ) else {
         return;
     };
@@ -4675,7 +4577,7 @@ pub fn set(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Va
         heap,
         &dictionary_keys,
         key,
-        std::slice::from_mut(&mut compressed),
+        std::slice::from_mut(&mut stored),
     ) else {
         return;
     };
@@ -4689,7 +4591,7 @@ pub fn set(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Va
         }
         dict_push_key(body, key.to_owned());
         body.shape = ShapeHandle::null();
-        body.push_slot(index, SlotMeta::data_default(), compressed);
+        body.push_slot(index, SlotMeta::data_default(), stored);
     });
     let sidecar = heap.read_payload(*obj, |body| body.exotic.get());
     if let Some(table) = slot_meta_table {
@@ -4698,7 +4600,7 @@ pub fn set(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Va
     if let Some(table) = dict_table {
         heap.record_write(sidecar, &table);
     }
-    record_slot_write(heap, *obj, compressed);
+    record_slot_write(heap, *obj, stored);
 }
 
 /// Construction-time data store for callers that already allocated the next
@@ -4715,7 +4617,7 @@ pub(crate) fn set_with_shape(
     append_index: usize,
 ) {
     let mut obj = obj;
-    let compressed = compress_or_abort(heap, &mut obj, value);
+    let stored = value;
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     if let Some(offset) = existing_offset {
         let i = offset as usize;
@@ -4731,9 +4633,9 @@ pub(crate) fn set_with_shape(
             if is_accessor {
                 body.slots_mut().entries_mut()[i].is_accessor = false;
             }
-            body.set_data_value(i, compressed);
+            body.set_data_value(i, stored);
         });
-        record_slot_write(heap, obj, compressed);
+        record_slot_write(heap, obj, stored);
         return;
     }
     let index = append_index;
@@ -4741,23 +4643,17 @@ pub(crate) fn set_with_shape(
         index,
         shape_body::shape_property_count(heap, next_shape) as usize - 1
     );
-    let mut compressed = compressed;
-    if reserve_slot_capacity(
-        &mut obj,
-        heap,
-        index + 1,
-        std::slice::from_mut(&mut compressed),
-    )
-    .is_err()
+    let mut stored = stored;
+    if reserve_slot_capacity(&mut obj, heap, index + 1, std::slice::from_mut(&mut stored)).is_err()
     {
         return;
     }
     heap.with_payload(obj, |body| {
         debug_assert_object_shape_handle(next_shape, "shape-slot store");
         body.shape = next_shape;
-        body.push_slot(index, SlotMeta::data_default(), compressed);
+        body.push_slot(index, SlotMeta::data_default(), stored);
     });
-    record_slot_write(heap, obj, compressed);
+    record_slot_write(heap, obj, stored);
     heap.record_write(obj, &next_shape);
     #[cfg(debug_assertions)]
     debug_assert_appended_shape_slot(obj, heap);
@@ -4816,8 +4712,8 @@ pub(crate) fn ordinary_set_data_property_with_shape(
     }
     #[cfg(debug_assertions)]
     if success {
-        // `obj` was relocated in place by the store if the value's compression
-        // scavenged; the assertion reads the live handle.
+        // `obj` was relocated in place if slot growth scavenged; the assertion
+        // reads the live handle.
         debug_assert_appended_shape_slot(obj, heap);
     }
     success
@@ -5161,7 +5057,14 @@ pub fn define_own_property_partial(
     // The sidecar allocates, so it is reserved here, outside the payload
     // borrow below. This may move `obj`, which is why the local is `mut`.
     let mut obj = obj;
-    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
+    let mut descriptor = descriptor;
+    {
+        let descriptor_slot = &mut descriptor;
+        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            crate::pelt::PeltField::pelt_trace(&mut *descriptor_slot, visitor);
+        };
+        ensure_exotic_with_roots(&mut obj, heap, &mut roots).expect("exotic sidecar");
+    }
     let completed = descriptor.complete_for_new_property();
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     let dictionary_keys = dictionary_keys_for_shape_transition(heap, obj, existing_offset);
@@ -5180,12 +5083,6 @@ pub fn define_own_property_partial(
     } else {
         None
     };
-    // Redefining an existing shaped slot without a shape transition diverges
-    // its attributes from the hidden class, so materialize per-slot metadata
-    // first (no-op when already dictionary-mode/overridden).
-    if existing_offset.is_some() {
-        materialize_slots(obj, heap);
-    }
     // Lower the slot to its flat `(meta, value)` form before taking the body
     // borrow: an accessor allocates its cell here (rooting `obj`), so the
     // mutation closure never allocates.
@@ -5198,6 +5095,12 @@ pub fn define_own_property_partial(
         Err(_) => return false,
     };
     let mut stored = stored;
+    // Redefining an existing shaped slot without a shape transition diverges
+    // its attributes from the hidden class. Materialization allocates, so keep
+    // the flattened direct value rooted while it runs.
+    if existing_offset.is_some() {
+        materialize_slots_with_pending_values(&mut obj, heap, std::slice::from_mut(&mut stored));
+    }
     if reserve_slot_capacity(
         &mut obj,
         heap,
@@ -5260,6 +5163,11 @@ pub fn define_own_property_partial(
         heap.record_write(sidecar, &table);
     }
     if success {
+        // Mapped arguments only consume a present data `[[Value]]`; keep that
+        // field synchronized with the collector-rewritten slot word.
+        if descriptor.value.is_some() && !meta.is_accessor {
+            descriptor.value = Some(stored);
+        }
         apply_mapped_arguments_partial_define(obj, heap, key, descriptor, existing_offset);
         record_slot_write(heap, obj, stored);
     }
@@ -5411,16 +5319,17 @@ pub fn define_own_property(
 /// Like [`define_own_property`], but reflects any relocation the write's own
 /// allocation drove back into the caller's handle.
 ///
-/// A wide-number value boxes a `HeapNumber` and the shape transition can move a
-/// young receiver; the caller's `obj` must be refreshed so a following write on
-/// the same builder (e.g. [`crate::ObjectBuilder`] chaining several properties)
-/// never dereferences a vacated cell.
+/// Sidecar or slab growth can move a young receiver; the caller's `obj` must be
+/// refreshed so a following write on the same builder (for example,
+/// [`crate::ObjectBuilder`] chaining several properties) never dereferences a
+/// vacated cell.
 pub fn define_own_property_in_place(
     obj_ref: &mut JsObject,
     heap: &mut otter_gc::GcHeap,
     key: &str,
     descriptor: PropertyDescriptor,
 ) -> bool {
+    let mut descriptor = descriptor;
     let existing_offset = heap.read_payload(*obj_ref, |body| body_offset_of(heap, body, key));
     if existing_offset.is_none() {
         // A fresh key demotes this object to dictionary mode, and the
@@ -5428,10 +5337,15 @@ pub fn define_own_property_in_place(
         // sidecar. Reserved here, outside every payload borrow, because
         // creating it allocates. Redefinition of an existing slot goes
         // through `materialize_slots`, which reserves for itself.
-        ensure_exotic(obj_ref, heap).expect("exotic sidecar");
+        let descriptor_slot = &mut descriptor;
+        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            crate::pelt::PeltField::pelt_trace(&mut *descriptor_slot, visitor);
+        };
+        ensure_exotic_with_roots(obj_ref, heap, &mut roots).expect("exotic sidecar");
     }
     let mut obj = *obj_ref;
-    let map_descriptor = descriptor.clone();
+    let map_is_data = descriptor.is_data();
+    let map_writable = descriptor.writable();
     let dictionary_keys = dictionary_keys_for_shape_transition(heap, obj, existing_offset);
     let slot_metas = slot_metas_for_shape_transition(heap, obj, existing_offset);
     let append_index = heap.read_payload(obj, |body| body_property_count(heap, body));
@@ -5444,12 +5358,6 @@ pub fn define_own_property_in_place(
     } else {
         None
     };
-    // Redefining an existing shaped slot without a shape transition diverges
-    // its attributes from the hidden class, so materialize per-slot metadata
-    // first (no-op when already dictionary-mode/overridden).
-    if existing_offset.is_some() {
-        materialize_slots(obj, heap);
-    }
     let slot_source = match merged_for_existing {
         Some(merged) => merged,
         None => SlotData::from_descriptor(descriptor),
@@ -5464,6 +5372,11 @@ pub fn define_own_property_in_place(
         }
     };
     let mut stored = stored;
+    // Materialization may allocate; the flattened direct value has not entered
+    // the object yet, so keep it in the pending-root slice.
+    if existing_offset.is_some() {
+        materialize_slots_with_pending_values(&mut obj, heap, std::slice::from_mut(&mut stored));
+    }
     if reserve_slot_capacity(
         &mut obj,
         heap,
@@ -5528,16 +5441,13 @@ pub fn define_own_property_in_place(
     if success {
         let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
         if let Some(cell) = mapped_cell {
-            match &map_descriptor.kind {
-                DescriptorKind::Data { value } => {
-                    store_upvalue(heap, cell, *value);
-                    if !map_descriptor.writable() {
-                        heap.with_payload(obj, |body| remove_mapped_argument(body, key));
-                    }
-                }
-                DescriptorKind::Accessor { .. } => {
+            if map_is_data {
+                store_upvalue(heap, cell, stored);
+                if !map_writable {
                     heap.with_payload(obj, |body| remove_mapped_argument(body, key));
                 }
+            } else {
+                heap.with_payload(obj, |body| remove_mapped_argument(body, key));
             }
         }
         record_slot_write(heap, obj, stored);
@@ -6005,7 +5915,7 @@ pub(crate) fn freeze_with_shape(
 /// outlive the closure scope.
 pub struct Properties<'a> {
     body: &'a ObjectBody,
-    /// Heap used to decompress boxed-number slots during iteration.
+    /// Heap used to resolve shape and accessor metadata during iteration.
     heap: &'a otter_gc::GcHeap,
     /// `(key, flat slot index, flags, is_accessor)` in ordinary own-key order.
     /// Per-slot attributes are captured at build time (where the hidden class
@@ -6353,23 +6263,33 @@ fn materialized_slot_metas(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Vec<Sl
 /// (construction accessor→data overwrite, the no-shape `defineProperty` /
 /// `freeze` / `seal` fallbacks, `delete`).
 fn materialize_slots(obj: JsObject, heap: &mut otter_gc::GcHeap) {
-    // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj`, which is why the local is `mut`.
     let mut obj = obj;
-    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
-    let metas = heap.read_payload(obj, |body| {
+    materialize_slots_with_pending_values(&mut obj, heap, &mut []);
+}
+
+/// [`materialize_slots`], reflecting receiver relocation and tracing values
+/// which have not entered the object yet across sidecar/table allocation.
+fn materialize_slots_with_pending_values(
+    obj: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    pending: &mut [Value],
+) {
+    // The sidecar allocates, so it is reserved here, outside the payload
+    // borrow below. This may move `obj` and every pending cell value.
+    ensure_exotic_with_pending_values(obj, heap, pending).expect("exotic sidecar");
+    let metas = heap.read_payload(*obj, |body| {
         (!body.slots_materialized()).then(|| materialized_slot_metas(heap, body))
     });
     if let Some(metas) = metas {
         let metas_for_install = Some(metas);
-        let table = slot_meta_table_for_install(&mut obj, heap, &metas_for_install, 0, &mut [])
+        let table = slot_meta_table_for_install(obj, heap, &metas_for_install, 0, pending)
             .expect("slot meta table")
             .expect("metas present");
-        heap.with_payload(obj, |body| {
+        heap.with_payload(*obj, |body| {
             body.exotic_mut().slots = table;
             body.slot_attrs_overridden = true;
         });
-        let sidecar = heap.read_payload(obj, |body| body.exotic.get());
+        let sidecar = heap.read_payload(*obj, |body| body.exotic.get());
         heap.record_write(sidecar, &table);
     }
 }
@@ -6878,9 +6798,10 @@ mod tests {
             store_own_data_slot_atom(o, &mut heap, key, hit, &Value::number_f64(1.25)),
             Some(())
         );
-        assert!(
-            total_allocations(&mut heap) > allocations_before_hit,
-            "a matching store IC must still box and commit its numeric RHS"
+        assert_eq!(
+            total_allocations(&mut heap),
+            allocations_before_hit,
+            "a matching store IC writes the complete numeric Value without allocation"
         );
         assert_eq!(
             load_own_data_slot_atom(o, &heap, key, hit)
@@ -6899,7 +6820,7 @@ mod tests {
         assert_eq!(
             total_allocations(&mut heap),
             allocations_before_miss,
-            "a rejected store IC must validate before boxing its numeric RHS"
+            "a rejected store IC must not allocate"
         );
     }
 
@@ -6969,7 +6890,7 @@ mod tests {
         assert_eq!(
             total_allocations(&mut heap),
             allocations_before_miss,
-            "a rejected transition replay must validate before boxing its numeric RHS"
+            "a rejected transition replay must not allocate"
         );
     }
 

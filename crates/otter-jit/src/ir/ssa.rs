@@ -96,9 +96,8 @@ pub enum SsaOp {
     /// names with its second input.
     ///
     /// The slot already exists and keeps its hidden class, so this neither
-    /// allocates nor transitions. A value the compressed slot encoding cannot
-    /// hold resumes in the interpreter instead of boxing, which is what keeps it
-    /// free of a write barrier and of a safepoint.
+    /// allocates nor transitions. Cell values still require the ordinary
+    /// generated write barrier.
     StoreField {
         /// Byte offset of the slot in the holder's value slab.
         byte: u32,

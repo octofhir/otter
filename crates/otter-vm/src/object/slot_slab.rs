@@ -21,8 +21,8 @@
 //!
 //! # Invariants
 //!
-//! - The trailing array holds exactly `capacity` words and starts
-//!   zeroed, which decodes as `undefined`.
+//! - The trailing array holds exactly `capacity` words and is initialized to
+//!   `Value::undefined()` before the slab becomes observable.
 //! - A slab never shrinks in place and never reallocates itself: growth
 //!   allocates a larger slab and copies, so a live `values_ptr` into the
 //!   old slab is invalidated by exactly one event the object controls.
@@ -31,9 +31,9 @@
 //! - Old space: a backing store lives as long as the object that owns it,
 //!   so a semispace copy of one is pure overhead.
 
-use otter_gc::raw::{RawGc, SlotVisitor};
+use otter_gc::raw::SlotVisitor;
 
-use crate::value::compressed::CompressedValue;
+use crate::Value;
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`SlotSlabBody`].
 pub const SLOT_SLAB_BODY_TYPE_TAG: u8 = 0x31;
@@ -43,7 +43,7 @@ pub type SlotSlabHandle = otter_gc::Gc<SlotSlabBody>;
 
 /// Capacity header for an out-of-line property slab. The words follow it
 /// in the same cell.
-#[repr(C)]
+#[repr(C, align(8))]
 pub struct SlotSlabBody {
     /// Words the trailing array can hold.
     capacity: u32,
@@ -53,7 +53,7 @@ impl SlotSlabBody {
     /// Trailing bytes a slab of `capacity` words needs.
     #[must_use]
     pub fn trailing_bytes(capacity: usize) -> usize {
-        capacity * std::mem::size_of::<CompressedValue>()
+        capacity * std::mem::size_of::<Value>()
     }
 
     /// Header for a slab of `capacity` words.
@@ -75,7 +75,7 @@ impl SlotSlabBody {
     /// The object body caches this as its `values_ptr` so a slot read is
     /// one indexed load whether the slab is inline or out of line.
     #[must_use]
-    pub fn words_ptr(&self) -> *mut CompressedValue {
+    pub fn words_ptr(&self) -> *mut Value {
         // SAFETY: the allocation reserved `trailing_bytes(capacity)`
         // immediately after this header, so the array starts one `Self`
         // past `self` and runs for `capacity` words.
@@ -96,31 +96,18 @@ impl otter_gc::SafeTraceable for SlotSlabBody {
             // SAFETY: `index < capacity`, and the array is live for the
             // body's lifetime.
             let word = unsafe { base.add(index) };
-            let slot = unsafe { *word };
-            if !slot.is_gc_offset() {
-                continue;
-            }
-            if slot.0 & 0b111 == 0 {
-                // Cell ref: the compressed word is the bare 8-aligned
-                // offset, so it is itself a slot the collector rewrites.
-                v(word.cast::<RawGc>());
-            } else {
-                // Boxed number: forward through a temporary, then
-                // re-apply the slot tag to the live word.
-                let tag = slot.0 & 0b111;
-                let mut raw = RawGc(slot.0 & !0b111);
-                v(std::ptr::addr_of_mut!(raw));
-                // SAFETY: same in-range word as above.
-                unsafe { *word = CompressedValue(raw.0 | tag) };
-            }
+            // SAFETY: same in-range word as above. `Value` owns the precise
+            // cell/immediate discrimination and exposes its embedded moving
+            // GC offset directly to the collector.
+            unsafe { (*word).trace_value_slot_mut(v) };
         }
     }
 }
 
 /// Allocate a slab that can hold `capacity` words.
 ///
-/// The words start zeroed, which decodes as `undefined`, so a caller may
-/// treat the tail beyond the live length as empty without writing it.
+/// Every word is initialized to `undefined`, so a caller may treat the tail
+/// beyond the live length as empty without writing it.
 ///
 /// `external_visit` must yield every root the caller holds: this
 /// allocation can collect, and an object waiting to receive the slab is
@@ -134,11 +121,19 @@ pub fn alloc_slot_slab(
     capacity: usize,
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<SlotSlabHandle, otter_gc::OutOfMemory> {
-    heap.alloc_variable_with_roots(
+    let slab = heap.alloc_variable_with_roots(
         SlotSlabBody::new(capacity),
         SlotSlabBody::trailing_bytes(capacity),
         external_visit,
-    )
+    )?;
+    heap.with_payload(slab, |body| {
+        for index in 0..body.capacity() {
+            // SAFETY: the allocation reserved exactly `capacity` trailing
+            // `Value` words and no observer can see the slab before return.
+            unsafe { *body.words_ptr().add(index) = Value::undefined() };
+        }
+    });
+    Ok(slab)
 }
 
 #[cfg(test)]
@@ -157,7 +152,7 @@ mod tests {
                 // SAFETY: index is within the capacity just read.
                 unsafe { *body.words_ptr().add(index) }
             });
-            assert_eq!(word, CompressedValue::EMPTY, "word {index} starts empty");
+            assert_eq!(word, Value::undefined(), "word {index} starts empty");
         }
     }
 
@@ -168,9 +163,7 @@ mod tests {
         interp.gc_heap_mut().with_payload(slab, |body| {
             for index in 0..body.capacity() {
                 // SAFETY: index is within the slab's capacity.
-                unsafe {
-                    *body.words_ptr().add(index) = CompressedValue(((index as u32) << 3) | 1)
-                };
+                unsafe { *body.words_ptr().add(index) = Value::number_i32(index as i32) };
             }
             true
         });
@@ -179,7 +172,7 @@ mod tests {
                 // SAFETY: index is within the slab's capacity.
                 unsafe { *body.words_ptr().add(index) }
             });
-            assert_eq!(word.0, ((index as u32) << 3) | 1);
+            assert_eq!(word, Value::number_i32(index as i32));
         }
     }
 }

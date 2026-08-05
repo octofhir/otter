@@ -667,5 +667,5 @@ pub(crate) fn resolve_atom_data_slot(
 
 /// Byte offset of a string-keyed own slot inside the object's value slab.
 fn slot_value_byte(slot: u16) -> u32 {
-    u32::from(slot) * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32
+    u32::from(slot) * std::mem::size_of::<crate::Value>() as u32
 }

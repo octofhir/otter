@@ -51,9 +51,9 @@ use otter_jit::OtterJitCompiler;
 use otter_runtime::{JitSelection, Runtime, SourceInput, module_graph::ModulePhaseTimings};
 use otter_syntax::SourceKind;
 use otter_vm::{
-    ExecutionContext, Interpreter, JitArtifactFileName, JitArtifactIdentity, JitCompileError,
-    JitCompileRequest, JitCompileStatus, JitCompilerHook, JitDebugRequest, JitExecOutcome,
-    JitFunctionCode, JitRuntimeStats, JitRuntimeStubBinding, VmRuntimeActivation,
+    ExecutionContext, Interpreter, JitArtifactIdentity, JitCompileError, JitCompileRequest,
+    JitCompileStatus, JitCompilerHook, JitDebugRequest, JitExecOutcome, JitFunctionCode,
+    JitRuntimeStats, JitRuntimeStubBinding, VmRuntimeActivation,
 };
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -95,20 +95,6 @@ impl CompileTier {
         match self {
             Self::Template => "template",
             Self::Optimizing => "optimizing",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum CompileBackend {
-    /// Require the Cranelift straight-line Number-leaf backend.
-    CraneliftNumericLeaf,
-}
-
-impl CompileBackend {
-    const fn cli(self) -> &'static str {
-        match self {
-            Self::CraneliftNumericLeaf => "cranelift-numeric-leaf",
         }
     }
 }
@@ -194,8 +180,6 @@ enum Command {
         compile_tier: CompileTier,
         #[arg(long = "argument", allow_hyphen_values = true, required = true)]
         arguments: Vec<f64>,
-        #[arg(long, value_enum)]
-        expect_backend: Option<CompileBackend>,
         #[arg(long, default_value_t = 100)]
         samples: u32,
         #[arg(long, default_value_t = 10)]
@@ -1352,30 +1336,6 @@ fn compile_once(
     }
 }
 
-fn validate_compile_backend(
-    expected: CompileBackend,
-    artifact: Option<&otter_vm::JitArtifactBundle>,
-) -> Result<(), String> {
-    let artifact = artifact.ok_or_else(|| "compiler returned no backend artifact".to_owned())?;
-    let optimized_ir = artifact
-        .file(JitArtifactFileName::OptimizedIr)
-        .ok_or_else(|| "compiler artifact has no optimized-ir.txt".to_owned())?
-        .contents();
-    match expected {
-        CompileBackend::CraneliftNumericLeaf => {
-            const MARKER: &[u8] = b"; backend=cranelift numeric-leaf\n";
-            if !optimized_ir.starts_with(MARKER) {
-                return Err(format!(
-                    "optimizing compiler did not select {}; optimized-ir.txt starts with {:?}",
-                    expected.cli(),
-                    String::from_utf8_lossy(&optimized_ir[..optimized_ir.len().min(MARKER.len())])
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn validate_optimizing_feedback(view: &otter_vm::JitCompileSnapshot) -> Result<(), String> {
     let missing = view
         .instructions
@@ -1580,12 +1540,11 @@ fn run_jit_compile(
     expected: f64,
     compile_tier: CompileTier,
     arguments: Vec<f64>,
-    expect_backend: Option<CompileBackend>,
     samples: u32,
     warmup: u32,
 ) -> RunRecord {
     let name = format!("jit-compile-{function_name}");
-    let mut parameters = BTreeMap::from([
+    let parameters = BTreeMap::from([
         ("source".into(), source_path.display().to_string()),
         ("function".into(), function_name.clone()),
         ("expected".into(), expected.to_string()),
@@ -1602,9 +1561,6 @@ fn run_jit_compile(
             ENGINE_COMPILE_FEEDBACK_SEED_CALLS.to_string(),
         ),
     ]);
-    if let Some(backend) = expect_backend {
-        parameters.insert("expectedBackend".into(), backend.cli().into());
-    }
     let fail = |kind: RunFailureKind, failure: String| {
         RunRecord::failure(
             name.clone(),
@@ -1638,12 +1594,6 @@ fn run_jit_compile(
         return fail(
             RunFailureKind::Configuration,
             "expected result and numeric arguments must be finite".into(),
-        );
-    }
-    if expect_backend.is_some() && compile_tier != CompileTier::Optimizing {
-        return fail(
-            RunFailureKind::Configuration,
-            "--expect-backend requires --compile-tier=optimizing".into(),
         );
     }
     let source = match std::fs::read_to_string(&source_path) {
@@ -1745,21 +1695,6 @@ fn run_jit_compile(
         return fail(RunFailureKind::Validation, error);
     }
     let module_name = source_path.to_string_lossy();
-    if let Some(expected_backend) = expect_backend {
-        let request = compile_request(&view, &function_name, &module_name, true);
-        let (_, artifact) = match compile_once(compiler.as_ref(), compile_tier, request) {
-            Ok(compiled) => compiled,
-            Err(error) => {
-                return fail(
-                    RunFailureKind::Compile,
-                    format!("backend preflight failed: {error}"),
-                );
-            }
-        };
-        if let Err(error) = validate_compile_backend(expected_backend, artifact.as_deref()) {
-            return fail(RunFailureKind::Validation, error);
-        }
-    }
     for _ in 0..warmup {
         let request = compile_request(&view, &function_name, &module_name, false);
         if let Err(error) = compile_once(compiler.as_ref(), compile_tier, request) {
@@ -2550,7 +2485,6 @@ fn main() {
             expected,
             compile_tier,
             arguments,
-            expect_backend,
             samples,
             warmup,
         } => run_jit_compile(
@@ -2559,7 +2493,6 @@ fn main() {
             expected,
             compile_tier,
             arguments,
-            expect_backend,
             samples,
             warmup,
         ),
@@ -2805,8 +2738,6 @@ mod tests {
             "2",
             "--argument",
             "-3",
-            "--expect-backend",
-            "cranelift-numeric-leaf",
         ])
         .expect("negative compile checksum");
         match args.command {
@@ -2814,13 +2745,11 @@ mod tests {
                 expected,
                 compile_tier,
                 arguments,
-                expect_backend,
                 ..
             } => {
                 assert_eq!(expected, -42.0);
                 assert_eq!(compile_tier, CompileTier::Optimizing);
                 assert_eq!(arguments, vec![2.0, -3.0]);
-                assert_eq!(expect_backend, Some(CompileBackend::CraneliftNumericLeaf));
             }
             _ => panic!("expected JIT compile command"),
         }
@@ -2903,7 +2832,7 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn jit_compile_enters_exact_cranelift_numeric_leaf() {
+    fn jit_compile_executes_numeric_leaf_through_production_optimizer() {
         let record = run_jit_compile(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../benchmarks/scripts/numeric-leaf.js"),
@@ -2911,7 +2840,6 @@ mod tests {
             -7.0,
             CompileTier::Optimizing,
             vec![2.0, 2.0],
-            Some(CompileBackend::CraneliftNumericLeaf),
             1,
             0,
         );

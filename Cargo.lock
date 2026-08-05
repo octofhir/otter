@@ -2621,13 +2621,11 @@ dependencies = [
 name = "otter-jit"
 version = "0.1.0"
 dependencies = [
- "cranelift-codegen",
- "cranelift-frontend",
- "cranelift-native",
  "dynasm",
  "dynasmrt",
  "otter-bytecode",
  "otter-vm",
+ "regalloc2",
  "rustc-hash",
  "serde",
  "serde_json",

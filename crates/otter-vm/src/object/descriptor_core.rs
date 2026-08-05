@@ -39,15 +39,16 @@ pub(super) fn ordinary_set_data_property(
     value: Value,
 ) -> bool {
     let mut obj = obj;
+    let mut stored = value;
     let existing_offset = heap.read_payload(obj, |body| super::body_offset_of(heap, body, key));
     if existing_offset.is_none() {
         // A fresh key demotes this object to dictionary mode, and
         // demotion writes through the sidecar. Reserved here, outside
         // every payload borrow, because creating it allocates — and only
         // for the append that will actually write it.
-        super::ensure_exotic(&mut obj, heap).expect("exotic sidecar");
+        super::ensure_exotic_with_pending_values(&mut obj, heap, std::slice::from_mut(&mut stored))
+            .expect("exotic sidecar");
     }
-    let compressed = super::compress_or_abort(heap, &mut obj, value);
     let dictionary_keys = super::dictionary_keys_for_shape_transition(heap, obj, existing_offset);
     let slot_metas = super::slot_metas_for_shape_transition(heap, obj, existing_offset);
     let append_index = heap.read_payload(obj, |body| super::body_property_count(heap, body));
@@ -60,14 +61,8 @@ pub(super) fn ordinary_set_data_property(
     // which `with_payload` cannot walk, so resolve it under a read borrow first.
     let existing_attrs = existing_offset
         .map(|offset| heap.read_payload(obj, |body| body.slot_attrs(heap, offset as usize)));
-    let mut compressed = compressed;
-    if super::reserve_slot_capacity(
-        &mut obj,
-        heap,
-        needed,
-        std::slice::from_mut(&mut compressed),
-    )
-    .is_err()
+    if super::reserve_slot_capacity(&mut obj, heap, needed, std::slice::from_mut(&mut stored))
+        .is_err()
     {
         return false;
     }
@@ -76,7 +71,7 @@ pub(super) fn ordinary_set_data_property(
         heap,
         &slot_metas,
         needed,
-        std::slice::from_mut(&mut compressed),
+        std::slice::from_mut(&mut stored),
     ) else {
         return false;
     };
@@ -86,7 +81,7 @@ pub(super) fn ordinary_set_data_property(
             heap,
             &dictionary_keys,
             key,
-            std::slice::from_mut(&mut compressed),
+            std::slice::from_mut(&mut stored),
         ) else {
             return false;
         };
@@ -101,7 +96,7 @@ pub(super) fn ordinary_set_data_property(
             if !flags.writable() || is_accessor {
                 return false;
             }
-            body.set_data_value(i, compressed);
+            body.set_data_value(i, stored);
             return true;
         }
 
@@ -117,7 +112,7 @@ pub(super) fn ordinary_set_data_property(
         }
         super::dict_push_key(body, key.to_owned());
         body.shape = ShapeHandle::null();
-        body.push_slot(append_index, SlotMeta::data_default(), compressed);
+        body.push_slot(append_index, SlotMeta::data_default(), stored);
         true
     });
     let sidecar = heap.read_payload(obj, |body| body.exotic.get());
@@ -128,7 +123,7 @@ pub(super) fn ordinary_set_data_property(
         heap.record_write(sidecar, &table);
     }
     if success {
-        super::record_slot_write(heap, obj, compressed);
+        super::record_slot_write(heap, obj, stored);
     }
     success
 }
@@ -141,11 +136,7 @@ pub(super) fn ordinary_set_data_property_with_shape(
     next_shape: ShapeHandle,
     append_index: usize,
 ) -> bool {
-    // `compress_or_abort` re-reads `obj` after any scavenge its allocation
-    // triggers; propagate that relocated handle back to the caller so its own
-    // post-store reads (write barriers, the debug shape-slot check) observe the
-    // live cell instead of a forwarded one.
-    let compressed = super::compress_or_abort(heap, obj, value);
+    let stored = value;
     let existing_offset = heap.read_payload(*obj, |body| super::body_offset_of(heap, body, key));
     let existing_attrs = existing_offset
         .map(|offset| heap.read_payload(*obj, |body| body.slot_attrs(heap, offset as usize)));
@@ -156,12 +147,12 @@ pub(super) fn ordinary_set_data_property_with_shape(
         append_index,
         super::shape_property_count(next_shape, heap) as usize - 1
     );
-    let mut compressed = compressed;
+    let mut stored = stored;
     if super::reserve_slot_capacity(
         obj,
         heap,
         append_index + 1,
-        std::slice::from_mut(&mut compressed),
+        std::slice::from_mut(&mut stored),
     )
     .is_err()
     {
@@ -174,7 +165,7 @@ pub(super) fn ordinary_set_data_property_with_shape(
             if !flags.writable() || is_accessor {
                 return false;
             }
-            body.set_data_value(i, compressed);
+            body.set_data_value(i, stored);
             return true;
         }
 
@@ -182,11 +173,11 @@ pub(super) fn ordinary_set_data_property_with_shape(
             return false;
         }
         body.shape = next_shape;
-        body.push_slot(append_index, SlotMeta::data_default(), compressed);
+        body.push_slot(append_index, SlotMeta::data_default(), stored);
         true
     });
     if success {
-        super::record_slot_write(heap, *obj, compressed);
+        super::record_slot_write(heap, *obj, stored);
         heap.record_write(*obj, &next_shape);
     }
     success

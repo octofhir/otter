@@ -658,12 +658,13 @@ mod tests {
         // into the flat value array: each bootstrap accessor property now
         // allocates one GC-managed `AccessorCellBody` for its getter/setter
         // pair where it previously lived in a non-GC box.
-        // The 32-bit object slab boxes a property value that does not fit a
-        // 4-byte slot, so each double-valued builtin constant (Math.PI, the
-        // Number limits, …) allocates one HeapNumber during bootstrap.
-        // Objects that outgrow their six inline slots allocate an overflow
-        // slab, and that slab is now a GC body rather than a `Vec`. The
-        // count rises because those allocations became visible to this
+        // Property slabs store the complete 8-byte `Value`, so numeric builtin
+        // constants do not allocate heap-number boxes. Objects that outgrow
+        // their three inline slots allocate an overflow slab, and that slab is
+        // a GC body rather than a `Vec`. Reducing the inline cap from six to
+        // three adds exactly three bootstrap slab allocations while preserving
+        // the 88-byte hot-object footprint. The count also includes slabs
+        // because those allocations are visible to this
         // counter, not because the bootstrap does more work — the malloc
         // they used to be is gone, and every object lost the 20-byte `Vec`
         // header whether it spilled or not.
@@ -678,7 +679,7 @@ mod tests {
         // heap string: a `&'static str` is a rodata address that could
         // never survive a page dump, so the name must live in the heap
         // for the bootstrap snapshot to carry it.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 3430;
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 3433;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 600 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");

@@ -24,10 +24,9 @@
 //! - A site whose cache program reaches past the receiver — a prototype hop, a
 //!   polymorphic chain, an exotic `length` — keeps its bytecode node. Those
 //!   need the cache cell the node vocabulary does not describe.
-//! - A store lowers only when its value is a proven `Int32`. Anything else may
-//!   be a heap cell, which owes the generational write barrier, or a double,
-//!   which owes a heap number: both are calls, and a call is what the lowered
-//!   form exists to avoid.
+//! - A lowered store writes the complete `Value` representation. Heap cells
+//!   retain the generated generational/incremental barrier; primitives need no
+//!   call or allocation.
 //!
 //! # See also
 //! - [`super::ssa`] — the vocabulary and its verifier.
@@ -42,7 +41,7 @@ use smallvec::SmallVec;
 use super::{
     cfg::ControlFlowGraph,
     inline::InlineTree,
-    repr::{ReprMap, Representation},
+    repr::ReprMap,
     ssa::{SsaFunction, SsaInstr, SsaOp, ValueData, ValueDef, ValueId},
 };
 
@@ -52,7 +51,6 @@ pub fn lower_settled_property_accesses(
     cfg: &ControlFlowGraph,
     view: &JitCompileSnapshot,
     tree: &InlineTree,
-    reprs: &ReprMap,
 ) {
     if view.cage_base == 0 {
         return;
@@ -60,8 +58,7 @@ pub fn lower_settled_property_accesses(
     let mut lowered_any = false;
     for block_index in 0..ssa.blocks.len() {
         if !ssa.blocks[block_index].instrs.iter().any(|instruction| {
-            settled_slot(tree, reprs, instruction).is_some()
-                || settled_hop(tree, instruction).is_some()
+            settled_slot(tree, instruction).is_some() || settled_hop(tree, instruction).is_some()
         }) {
             continue;
         }
@@ -73,7 +70,7 @@ pub fn lower_settled_property_accesses(
                 lower_prototype_load(ssa, &mut lowered, instruction, hop, block_index);
                 continue;
             }
-            let Some((shape, byte, writes)) = settled_slot(tree, reprs, &instruction) else {
+            let Some((shape, byte, writes)) = settled_slot(tree, &instruction) else {
                 lowered.push(instruction);
                 continue;
             };
@@ -400,11 +397,7 @@ pub fn eliminate_redundant_checks(ssa: &mut SsaFunction, cfg: &ControlFlowGraph,
 }
 
 /// The single own slot a property site has settled on, and whether it writes.
-fn settled_slot(
-    tree: &InlineTree,
-    reprs: &ReprMap,
-    instruction: &SsaInstr,
-) -> Option<(u32, u32, bool)> {
+fn settled_slot(tree: &InlineTree, instruction: &SsaInstr) -> Option<(u32, u32, bool)> {
     if instruction.result.is_none() || instruction.result_register.is_none() {
         return None;
     }
@@ -414,13 +407,8 @@ fn settled_slot(
         {
             false
         }
-        // Only a proven `Int32` may be written inline: the compressed slot
-        // takes it whole, so there is no box to allocate and no cell to
-        // barrier.
         SsaOp::Bytecode(Op::StoreProperty)
-            if instruction.inputs.len() == 2
-                && instruction.input_registers.len() == 2
-                && reprs.representation(instruction.inputs[1]) == Representation::Int32 =>
+            if instruction.inputs.len() == 2 && instruction.input_registers.len() == 2 =>
         {
             true
         }
@@ -483,8 +471,7 @@ mod tests {
         let tree = InlineTree::trivial(&view);
         let cfg = ControlFlowGraph::build_inlined(&tree).expect("CFG builds");
         let mut ssa = SsaFunction::build_inlined(&tree, &cfg).expect("SSA builds");
-        let reprs = ReprMap::compute(&tree, &ssa);
-        lower_settled_property_accesses(&mut ssa, &cfg, &view, &tree, &reprs);
+        lower_settled_property_accesses(&mut ssa, &cfg, &view, &tree);
         (cfg, ssa, tree)
     }
 
@@ -521,6 +508,55 @@ mod tests {
             &ReprMap::compute(&tree, &ssa),
         )
         .expect("the lowered graph verifies");
+    }
+
+    #[test]
+    fn a_tagged_settled_store_becomes_a_direct_value_write() {
+        let mut view = JitCompileSnapshot::without_feedback(
+            0,
+            2,
+            3,
+            vec![
+                JitTestInstruction::new(
+                    Op::StoreProperty,
+                    0,
+                    0,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 1, 4, vec![Operand::Register(2)]),
+            ],
+        );
+        view.cage_base = 0x1000;
+        view.property_stores.insert(
+            0,
+            vec![JitInlinePropertyLoad {
+                receiver_shape: 9,
+                value_byte: 16,
+            }],
+        );
+        let tree = InlineTree::trivial(&view);
+        let cfg = ControlFlowGraph::build_inlined(&tree).expect("CFG builds");
+        let mut ssa = SsaFunction::build_inlined(&tree, &cfg).expect("SSA builds");
+
+        lower_settled_property_accesses(&mut ssa, &cfg, &view, &tree);
+
+        let instrs = &ssa.blocks[0].instrs;
+        assert_eq!(instrs[0].op, SsaOp::LoadHeader);
+        assert_eq!(instrs[1].op, SsaOp::CheckShape { shape: 9 });
+        assert_eq!(instrs[2].op, SsaOp::StoreField { byte: 16 });
+        assert_eq!(instrs[2].inputs.len(), 2);
+        assert_eq!(instrs[2].result_register, Some(2));
+        ssa.verify(
+            &cfg,
+            &DominatorTree::compute(&cfg),
+            &ReprMap::compute(&tree, &ssa),
+        )
+        .expect("the direct tagged store graph verifies");
     }
 
     #[test]
@@ -571,8 +607,7 @@ mod tests {
         let tree = InlineTree::trivial(&view);
         let cfg = ControlFlowGraph::build_inlined(&tree).expect("CFG builds");
         let mut ssa = SsaFunction::build_inlined(&tree, &cfg).expect("SSA builds");
-        let reprs = ReprMap::compute(&tree, &ssa);
-        lower_settled_property_accesses(&mut ssa, &cfg, &view, &tree, &reprs);
+        lower_settled_property_accesses(&mut ssa, &cfg, &view, &tree);
 
         let ops: Vec<_> = ssa.blocks[0].instrs.iter().map(|i| i.op).collect();
         assert_eq!(
@@ -661,8 +696,7 @@ mod tests {
         let tree = InlineTree::trivial(&view);
         let cfg = ControlFlowGraph::build_inlined(&tree).expect("CFG builds");
         let mut ssa = SsaFunction::build_inlined(&tree, &cfg).expect("SSA builds");
-        let reprs = ReprMap::compute(&tree, &ssa);
-        lower_settled_property_accesses(&mut ssa, &cfg, &view, &tree, &reprs);
+        lower_settled_property_accesses(&mut ssa, &cfg, &view, &tree);
 
         let ops: Vec<_> = ssa.blocks[0].instrs.iter().map(|i| i.op).collect();
         assert_eq!(
@@ -830,8 +864,7 @@ mod tests {
         let tree = InlineTree::trivial(&view);
         let cfg = ControlFlowGraph::build_inlined(&tree).expect("CFG builds");
         let mut ssa = SsaFunction::build_inlined(&tree, &cfg).expect("SSA builds");
-        let reprs = ReprMap::compute(&tree, &ssa);
-        lower_settled_property_accesses(&mut ssa, &cfg, &view, &tree, &reprs);
+        lower_settled_property_accesses(&mut ssa, &cfg, &view, &tree);
         ssa.verify(
             &cfg,
             &DominatorTree::compute(&cfg),
@@ -875,8 +908,7 @@ mod tests {
         let tree = InlineTree::trivial(&view);
         let cfg = ControlFlowGraph::build_inlined(&tree).expect("CFG builds");
         let mut ssa = SsaFunction::build_inlined(&tree, &cfg).expect("SSA builds");
-        let reprs = ReprMap::compute(&tree, &ssa);
-        lower_settled_property_accesses(&mut ssa, &cfg, &view, &tree, &reprs);
+        lower_settled_property_accesses(&mut ssa, &cfg, &view, &tree);
 
         let ops: Vec<_> = ssa.blocks[0].instrs.iter().map(|i| i.op).collect();
         assert_eq!(

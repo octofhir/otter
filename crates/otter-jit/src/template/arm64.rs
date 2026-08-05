@@ -83,10 +83,7 @@ use self::arith::{
     emit_fused_numeric_chain, emit_increment, emit_int_bitwise, emit_loose_compare, emit_negate,
     emit_numeric_slow_paths, emit_to_numeric, emit_to_primitive, emit_unsigned_shift_right,
 };
-use self::values::{
-    BoxedSlotSlowPath, emit_boxed_slot_slow_paths, emit_load_reg, emit_load_runtime_stub,
-    emit_load_u64, emit_store_reg,
-};
+use self::values::{emit_load_reg, emit_load_runtime_stub, emit_load_u64, emit_store_reg};
 use super::{TemplateCode, TemplateOp, TemplatePlan};
 use crate::CompiledCode;
 use crate::artifact::{
@@ -210,7 +207,6 @@ pub(super) fn compile(
         vec![crate::entry::WhiskerIcCell::default(); plan.store_property_count].into_boxed_slice();
     let mut next_load_ic = 0usize;
     let mut next_store_ic = 0usize;
-    let mut boxed_slot_slow_paths = Vec::<BoxedSlotSlowPath>::new();
     let mut coercion_slow_paths = Vec::new();
     let mut numeric_slow_paths = Vec::new();
     let mut ops = Assembler::new()
@@ -677,7 +673,6 @@ pub(super) fn compile(
                     cell_addr,
                     cell_ordinal,
                     view.property_loads.get(&instr.byte_pc).map(Vec::as_slice),
-                    &mut boxed_slot_slow_paths,
                     threw,
                 )?;
             }
@@ -1307,13 +1302,9 @@ pub(super) fn compile(
     // Preserve the old end-of-stream exact exit while keeping cold
     // continuations out of line. Each returns to the label immediately after
     // its source operation's inline fast path.
-    if !boxed_slot_slow_paths.is_empty()
-        || !coercion_slow_paths.is_empty()
-        || !numeric_slow_paths.is_empty()
-    {
+    if !coercion_slow_paths.is_empty() || !numeric_slow_paths.is_empty() {
         let slow_paths_start = ops.offset().0;
         dynasm!(ops ; .arch aarch64 ; b =>bail);
-        emit_boxed_slot_slow_paths(&mut ops, &mut relocations, view, boxed_slot_slow_paths);
         emit_numeric_slow_paths(
             &mut ops,
             &mut relocations,

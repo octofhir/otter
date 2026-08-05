@@ -49,9 +49,9 @@ use super::ic_probe::{
 };
 use super::transitions::TransitionTable;
 use super::values::{
-    CellTest, emit_box_double, emit_box_int32, emit_box_number, emit_cell_test,
-    emit_decompress_slot, emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64,
-    emit_load_u64, emit_num_to_double, emit_slab_base, emit_store_reg,
+    CellTest, emit_box_double, emit_box_int32, emit_box_number, emit_cell_test, emit_load_reg,
+    emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64, emit_num_to_double,
+    emit_slab_base, emit_store_reg,
 };
 use crate::arm64::{
     DirectCallForm, DirectCallSite, MethodGuardSite, direct_call_artifact,
@@ -300,18 +300,14 @@ fn emit_inline_negate(
 
 fn emit_inline_receiver_property(
     ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
     dst: InlineScratchSlot,
     value_byte: u32,
-    miss: DynamicLabel,
 ) -> Result<(), Unsupported> {
     // `x17` holds the receiver's slab base, derived once from the exact
     // receiver body after its type/shape guard. Eligible inline bodies cannot
     // call, allocate, branch, or mutate, so neither the receiver nor its slab
     // can move or change before this load.
-    dynasm!(ops ; .arch aarch64 ; ldr w9, [x17, value_byte]);
-    emit_decompress_slot(ops, relocations, view.cage_base as u64, miss);
+    dynasm!(ops ; .arch aarch64 ; ldr x9, [x17, value_byte]);
     emit_store_inline_slot(ops, 9, dst);
     Ok(())
 }
@@ -339,8 +335,6 @@ struct InlineBodySpec<'a> {
 #[allow(clippy::too_many_arguments)]
 fn emit_inline_leaf_body(
     ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
     plan: &InlineLeafPlan<'_>,
     spec: InlineBodySpec<'_>,
     dst: u16,
@@ -455,7 +449,7 @@ fn emit_inline_leaf_body(
                     .prop_offsets
                     .get(&instruction.byte_pc)
                     .ok_or(Unsupported::OperandShape("inline method property offset"))?;
-                emit_inline_receiver_property(ops, relocations, view, dst, value_byte, body_deopt)?;
+                emit_inline_receiver_property(ops, dst, value_byte)?;
             }
             TemplateOp::ToPrimitive { dst, src, .. } | TemplateOp::ToNumeric { dst, src } => {
                 let dst = plan
@@ -695,8 +689,6 @@ fn try_emit_inline_numeric_method(
 
     emit_inline_leaf_body(
         ops,
-        relocations,
-        view,
         &plan,
         InlineBodySpec {
             function_id: method.guard.method_fid,
@@ -740,7 +732,6 @@ fn inline_argument_registers(argc: u16, argument_registers: &[u16]) -> Option<[O
 #[allow(clippy::too_many_arguments)]
 fn try_emit_inline_numeric_callee(
     ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     callee: &JitInlineCallee,
     dst: u16,
@@ -848,8 +839,6 @@ fn try_emit_inline_numeric_callee(
 
     emit_inline_leaf_body(
         ops,
-        relocations,
-        view,
         &plan,
         InlineBodySpec {
             function_id: callee.function_id(),
@@ -991,7 +980,6 @@ pub(super) fn emit_call(
     if let Some(candidate) = view.inline_callees.get(&byte_pc)
         && try_emit_inline_numeric_callee(
             ops,
-            relocations,
             view,
             candidate,
             dst,

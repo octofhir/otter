@@ -1189,13 +1189,10 @@ mod tests {
 
     #[test]
     fn scoped_wide_number_write_keeps_sibling_handle_live() {
-        // The set-boxing hole: `object::set` boxes a wide double into a
-        // `HeapNumber`, and that box allocation traces only the receiver it is
-        // handed — never the runtime root snapshot. On the host-side path (no
-        // dispatch provider) a collection the box drives would strand every
-        // sibling parked in the arena. `with_handle_scope` closes the hole by
-        // registering the runtime-root provider (which traces the arena) for the
-        // scope, so any such collection keeps siblings live.
+        // On the host-side path (no dispatch provider), a collection during a
+        // property write must still trace every sibling parked in the handle
+        // arena. `with_handle_scope` installs the runtime-root provider for the
+        // scope, so slot-growth collections cannot strand those siblings.
         let mut interp = Interpreter::new();
         // No dispatch loop is running, so the scope must install the provider
         // itself — the exact condition the fix targets.
@@ -1212,9 +1209,7 @@ mod tests {
             interp.scoped_set(s, sibling, "k", marker).unwrap();
             let target = interp.scoped_object(s).unwrap();
 
-            // Exercise the real boxing path: store a wide double through the
-            // scoped write. This is the allocation whose internal collection
-            // roots only `target`.
+            // Store a wide double through the direct-Value slot path.
             let wide = interp.scoped_number(s, 12345.6789);
             interp.scoped_set(s, target, "n", wide).unwrap();
 
@@ -1224,11 +1219,10 @@ mod tests {
                 .expect("sibling is a heap cell")
                 .0;
 
-            // Model `object::set`'s box allocation precisely: force a minor
-            // collection that roots ONLY the receiver, exactly as `compress`
-            // does. The sibling survives solely through the scope-registered
-            // runtime-root provider (the arena). Churn young space so the
-            // scavenge has a survivor to relocate.
+            // Force a minor collection that explicitly roots only the receiver.
+            // The sibling survives through the scope-registered runtime-root
+            // provider (the arena). Churn young space so the scavenge has a
+            // survivor to relocate.
             let mut after = before;
             let mut moved = false;
             for _ in 0..8 {

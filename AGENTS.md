@@ -392,10 +392,11 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     permanent cell and a TDZ hole retains the canonical throwing transition.
     Guarded global-object reads prove the realm epoch, dictionary shape, and
     property slot before reading the live value.
-  - Inspect the first line of `optimized-ir.txt` before reading it: the general
-    backend emits the Otter optimized unit, while a Cranelift numeric leaf
-    starts with `; backend=cranelift numeric-leaf` and then contains CLIF. Its
-    code map uses the `craneliftNumericLeaf` structural region.
+  - Inspect the first line of `optimized-ir.txt`: general legacy lowering emits
+    the deterministic Otter optimized unit, while a numeric leaf compiled by
+    the replacement pipeline starts with `; backend=otter-machine-ir
+    numeric-leaf` and contains normalized Machine IR plus allocation. Its code
+    map uses the `machineNumericLeaf` structural region.
   - Exact code may contain process addresses and is not a portable golden.
     Compare `code-normalized.bin` across processes; its relocation tokens and
     branch targets are symbolic, and it is not executable. `relocations.json`

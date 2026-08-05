@@ -18,8 +18,8 @@ use super::MethodCallIc;
 use crate::Interpreter;
 use crate::jit::{JitBodyGuard, JitGuardWidth, JitGuardedMethodCall, JitGuardedReceiver};
 
-fn compressed_slot_byte(slot: u16) -> u32 {
-    u32::from(slot) * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32
+fn value_slot_byte(slot: u16) -> u32 {
+    u32::from(slot) * std::mem::size_of::<crate::Value>() as u32
 }
 
 /// The 32-bit no-expando/no-override word every `Map` and `Set` body carries.
@@ -92,7 +92,7 @@ impl Interpreter {
                 proto_offset: proto.offset(),
             },
             holder_shape: crate::object::shape(proto, &self.gc_heap).offset(),
-            method_value_byte: compressed_slot_byte(ic.proto_slot),
+            method_value_byte: value_slot_byte(ic.proto_slot),
             builtin_native_ref,
             entry_stub_id: stub_id,
             safepoint_id,
@@ -148,7 +148,7 @@ impl Interpreter {
                 proto_offset: proto.offset(),
             },
             holder_shape: crate::object::shape(proto, &self.gc_heap).offset(),
-            method_value_byte: compressed_slot_byte(hit.slot),
+            method_value_byte: value_slot_byte(hit.slot),
             builtin_native_ref,
             entry_stub_id: stub_id,
             safepoint_id: NO_SAFEPOINT,
@@ -213,7 +213,7 @@ impl Interpreter {
                 proto_offset: proto.offset(),
             },
             holder_shape: crate::object::shape(proto, &self.gc_heap).offset(),
-            method_value_byte: compressed_slot_byte(ic.proto_slot),
+            method_value_byte: value_slot_byte(ic.proto_slot),
             builtin_native_ref,
             entry_stub_id: stub_id,
             safepoint_id,

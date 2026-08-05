@@ -1,568 +1,202 @@
-# Otter Implementation Plan
+# Otter Engine Redesign
 
-This is the single repository-level implementation tracker. It records active
-engine work, cross-cutting invariants, and required verification. Shipped
-behavior belongs in `AGENTS.md`, crate/module documentation, and the docs site;
-completed implementation detail belongs in commits rather than permanent task
-diaries.
+This is the sole repository-level implementation tracker. Otter is pre-user
+and pre-stability: internal APIs, ABI, bytecode, metadata, artifacts, fixtures,
+and tests may break whenever that produces the intended final architecture.
+There are no compatibility readers, dual writers, legacy modes, or parallel
+engine stacks.
 
-## Plan Rules
+## Objective
 
-- Update this file when a repository-level slice starts, lands, changes scope,
-  or is deliberately dropped.
-- Keep completed work as a short ledger. Do not append commit-by-commit history.
-- Keep subsystem-specific usage instructions in `AGENTS.md` and the docs site.
-- Change internal contracts in place. Do not add compatibility readers,
-  versioned internal schemas, parallel runtimes, or parked transition layers.
-- Every active item must have an explicit correctness gate; performance items
-  also require reproducible before/after measurements.
+Replace the interpreter-window-based compiled execution model with one typed,
+target-neutral compiler pipeline whose ABI is machine locations plus immutable
+metadata:
 
-## Status At A Glance
-
-Active repository-level work:
-
-1. x86_64 parity for the template JIT.
-2. Measurement-driven baseline-v2 and runtime-throughput work.
-3. Optimizing-tier prerequisites and the optimizing tier itself.
-4. JIT-aware profiling, tracing, and bounded failure diagnostics.
-5. Production-ready `Otter.serve` async dispatch, streaming, and transport.
-
-The public WebAssembly surface is documented separately in the docs-site
-[WebAssembly roadmap](docs/site/src/content/docs/web/webassembly-roadmap.md).
-Its remaining runtime-integration candidates are zero-copy `Memory.buffer`,
-Wasm ES modules, and WASI.
-
-## Permanent Architecture Invariants
-
-- The active stack remains `otter-gc -> otter-vm -> otter-runtime -> product
-  crates`; legacy crates never re-enter the active build graph.
-- The interpreter is the semantic oracle for every JIT tier.
-- The VM/JIT share one typed execution representation and authoritative dense
-  feedback. JIT code must not maintain live mirrors of VM state.
-- JIT runtime entries are typed, classified as leaf/allocating/reentrant, and
-  resolved from the isolate-owned immutable entry table.
-- Allocating or reentrant transitions publish exact frame PC and safepoint
-  state. JavaScript exceptions never unwind native Rust frames.
-- Invalid code accepts no new entries; live anchors keep mappings resident
-  until the final active frame leaves.
-- Moving GC values are built and retained through handle scopes or persistent
-  roots. No raw GC handle crosses an allocation or `.await`.
-- Diagnostics are explicit owned configuration and default-off. Disabled
-  diagnostics must not allocate payloads, format output, open files, or lock.
-- Standard diagnostic formats are primary when available: Chrome Trace Event,
-  Chrome/V8 CPU profiles and heap snapshots, folded stacks, machine code, and
-  annotated assembly.
-- Permissions remain deny-by-default and are enforced at the Rust host
-  boundary, including for servers, WASI, loaders, and async resources.
-
-## 1. Engine And JIT
-
-### Completed Ledger
-
-- [x] Measurement, GC-stress, differential-testing, benchmark, and profiling
-  gates established.
-- [x] Legacy monolithic baseline split into focused compiler, ABI, runtime-op,
-  architecture, and executable-code modules.
-- [x] Typed lowering plan and authoritative dense feedback landed.
-- [x] Exact-PC exit contracts, typed isolate-owned runtime-entry table,
-  canonical native frames, classified stub inventory, code lifetime states,
-  and compiled-to-compiled calls landed.
-- [x] Template AArch64 compiler reached synchronous opcode coverage, replaced
-  the legacy emitter, and became the production baseline tier.
-- [x] Baseline-v1 arithmetic, comparisons, calls, IC probes, collection fast
-  paths, runtime transitions, exception edges, and OSR landed.
-- [x] Template coverage reached all 163 synchronously completable active
-  opcodes. The nine suspend/tail/module opcodes remain deliberate exact side
-  exits until the optimizing tier owns suspend/resume and deopt.
-- [x] Optimizing monomorphic plain/method callee splicing landed with synthetic
-  `this`, multi-frame exact-PC deopt, loop-invariant method-guard caching,
-  numeric coercion residency, and bounded batched polling. On the controlled
-  M1 matrix it improved the method-call kernel by 1.56x and the five-kernel
-  geomean by 1.17x.
-- [x] Optimizing loop-versioned own-data Number loads, fused numeric
-  compare/branch emission, activation-local backedge polling, and deopt literal
-  rematerialization landed as one measured instruction-count slice. The
-  version becomes active only after one complete all-fast-hit iteration; an
-  accessor, proxy, non-number, or IC miss keeps the canonical `[[Get]]` path.
-  On the controlled M1 five-kernel matrix it improved the property kernel by
-  1.41x, the branch kernel by 1.11x, and geomean by 1.09x, while the largest
-  unrelated regression stayed below 2%.
-
-### 1.1 x86_64 Template Backend
-
-- [ ] Implement x86_64 emission from the existing `TemplatePlan` and entry ABI.
-- [ ] Reach AArch64 parity for exact side exits, runtime calls, safepoints, IC
-  probes, code lifetime, and differential coverage.
-- [ ] Add architecture-specific optimization only after parity gates pass.
-
-### 1.2 Baseline V2
-
-Each lever lands independently with workload measurements plus a
-differential/GC-stress regression case.
-
-- [ ] Add profitable self-recursive and bounded polymorphic-method inlining for
-  measured Richards/DeltaBlue gaps.
-- [ ] Keep floating-point values resident where measurements justify it.
-- [x] Add fused compare/branch emission to the optimizing tier; keep template
-  fusion measurement-triggered.
-- [ ] Improve PIC probing and protector/version cells.
-- [ ] Add architecture-specific peepholes that preserve semantics.
-- [ ] Remove experiments that do not win representative workloads.
-
-### 1.3 Runtime Throughput
-
-- [ ] Add a persistent content-addressed bytecode/module cache.
-- [ ] Add an immutable or copy-on-write bootstrap image.
-- [ ] Make TypeScript stripping/lowering one-pass with correct type-only import
-  erasure.
-- [ ] Add package/loader metadata caches.
-- [ ] Close package-script and representative workload compatibility gaps.
-- [ ] Measure and tune object, property, and array storage paths.
-
-### 1.4 Optimizing-Tier Prerequisites
-
-- [ ] Stabilize typed feedback epochs and bounded target/type distributions.
-- [ ] Complete dependency/protector invalidation contracts.
-- [x] Complete the deopt frame-state schema, verifier, and interpreter-frame
-  reification stub.
-- [x] Enforce callee-identity guards for spliced calls.
-- [x] Stabilize backend-independent typed SSA, CFG, liveness, register
-  allocation, and safepoint models.
-- [ ] Tune tier policy from real hot workloads.
-- [x] Remove the measured duplicate instruction/operand decoding path: the VM
-  now translates compiler wordcode once into one 32-byte execution record and
-  hot dispatch reads it without repeated function-table lookup. Typed execution
-  entry for return, primitive coercion, and the widest method-call handler also
-  bypasses the generic opcode schema after verification. Across the five
-  controlled kernels these slices improved interpreter medians by 1.87-2.34x
-  (2.13x geomean) and cut the property-kernel Node `--jitless` gap from 27.2x
-  to 11.8x with unchanged peak RSS. The follow-up typed variadic-argument
-  window now carries verified execution records through ordinary calls,
-  explicit-`this` calls, proper tail calls, and constructors without rebuilding
-  schema operands. Relative to that checkpoint it improved the same five
-  interpreter kernels by another 1.09% geomean, bytecode calls with four
-  arguments by 1.73%, computed explicit-`this` calls by about 1%, and the
-  constructor corpus by about 2%; zero-argument calls and tail recursion stayed
-  neutral within measurement resolution. The next interpreter-only call-entry
-  batch removes repeated callable-family probes, reuses the already resolved
-  `CodeBlock`, carries the decoded closure through frame preparation, and reads
-  closure id/state in one heap access. A clean 25-sample A/B against `123d81df`
-  improves bytecode calls by 2.70% at arity 0, 1.41% at arity 4, and 0.72% at
-  arity 8; the monomorphic method kernel stays neutral. The arity-4 process
-  retires 44.10-44.15 billion instructions after the change versus 45.01
-  billion before it, a reproducible 1.92-2.02% reduction without JIT state,
-  atomics, or a new cache. The following jitless batch removes four measured
-  sources of useless work: cooperative cancellation is polled at loop entry,
-  back-edges, and tail calls instead of every instruction; the turn-local
-  reduction count is derived from the total instead of maintained beside it;
-  narrow fixed-shape opcodes read verified operand words straight out of the
-  32-byte execution record while variadic and wide opcodes resolve the overflow
-  table; argument windows bind from one operand-word slice and skip both
-  side-record vectors for callees without `arguments` or a rest parameter; and
-  Number arithmetic folds without a handle scope or a `NumericKind` round trip.
-  Measured as retired instructions per process on M1, that batch cuts bytecode
-  calls by 17.2% at arity 0, 19.0% at arity 4, and 20.1% at arity 8, and the
-  five controlled kernels by 14.3-20.1%.
-  The next jitless batch removes per-instruction, per-call, and per-property
-  work rather than adding caches: every execution record carries its own
-  runtime-budget charge so metering no longer re-derives one from the opcode;
-  back-edge OSR accounting is gated on the loop-invariant JIT-installed flag;
-  callees that capture nothing and bodies without direct `eval` keep the
-  cell-building and environment-installing paths out of line; an ordinary call
-  binds its arguments and pushes its frame without a prepared-frame record,
-  with only generator entry keeping a separate tail; frame pop resolves the
-  whole construct/derived/async completion vocabulary from one cold-pool probe;
-  relational comparison folds Number operands in IEEE-754 directly; `Type(v)`
-  primitive classification costs one body type-tag read instead of three; an
-  own dense array element answers a computed integer index without spelling it
-  as a heap string through `ToPropertyKey`; and a shape-matched data-slot IC
-  hit no longer re-reads the shape body to re-prove the slot is not an
-  accessor. Measured as retired instructions per process on M1, the batch cuts
-  bytecode calls by 10.7% at arity 0, 11.2% at arity 4, and 11.4% at arity 8,
-  the monomorphic method kernel by 9.7%, branch-phi by 9.9%, the boxed-double
-  property kernel by 10.9%, numeric-leaf by 8.5%, and the dense-array kernel by
-  42.8%. One measurement rule came out of it: the arms of `dispatch_loop_inner`
-  share one register allocation, so a change confined to a cold arm can still
-  move every kernel by around 1%; per-opcode fast paths belong in the helper
-  the arm already calls.
-  The following batch moved the coercion the arithmetic operators need out of
-  the instruction stream and into the operators themselves. `Op::Add`, the
-  relational comparisons, and the non-additive numeric / bitwise / shift
-  opcodes now run their own `ToPrimitive` / `ToNumeric` ladders in the order
-  §13.15.3, §7.2.13, and §7.2.14 prescribe, so the compiler emits the operator
-  alone. That removed four dispatched instructions per non-additive arithmetic
-  operation and two per addition or comparison, all of which reduced to
-  identity as soon as the operand was already a Number. On the reference
-  `numeric-leaf` body the compiler now emits 25 bytecodes where it emitted 49,
-  against 23 for V8's Ignition on the same source. Measured as retired
-  instructions per process on M1 the interpreter improved by 11.8-35.4% across
-  the eight controlled workloads, the template tier by 15.5-27.2%, and the
-  optimizing tier by 7.2-30.7% on four of five kernels with `branch-phi`
-  neutral. The full Test262 corpus is byte-identical to the pre-change run:
-  53289 tests, the same 463 failures, 11 timeouts, and zero crashes.
-
-  Two invariants came out of it. Removing the coercion opcodes removed the
-  producers an optimizing-tier whitelist recognized, so a checked
-  tagged-to-numeric conversion is now admitted for any value with a machine
-  home — a parameter or any bytecode operation result — rather than for an
-  enumerated set of producer opcodes. And recycling the operand temporaries
-  must not hand the result the register an operand still occupies: the opcode
-  reads before it writes, so an aliased destination is semantically fine, but
-  the optimizing tier side-exits on it and pins the function to the template
-  tier.
-  A separate pass cleared ten of the eleven Test262 timeouts, each a distinct
-  defect rather than general slowness. `Op::IteratorClose` ran the iterator's
-  `[[return]]` while the loop body's own `try` handlers were still pushed, so a
-  throwing `return()` was caught by the body and the abrupt completion was
-  lost, leaving `for (x of it) { try { return; } catch {} }` spinning forever;
-  the close now disarms the catch arms inside the iterator's region on the
-  throwing path while leaving their `finally` blocks to run. `Date`'s local-time
-  getters re-resolved the host time zone on every call at roughly a hundred
-  microseconds each, which is now resolved once per isolate. `GetSubstitution`
-  grew its replacement buffer until the final string allocation failed, and now
-  stops as soon as the expansion passes what the heap could hold. `WeakMap` and
-  `WeakSet` scanned their entries linearly, making a hundred-thousand-entry
-  chain quadratic; both now carry an identity index that the ephemeron walk
-  invalidates, since a moving collection relocates the addresses its hashes are
-  derived from. The one remaining timeout, `dst-offset-caching-3-of-8`, is no
-  longer a time-zone problem: its cost is the surrounding interpreter loop and
-  the `new Date` per probe, so it belongs to the general throughput work.
-  Toward a template interpreter, the frame register window is now verified once
-  when a `CodeBlock` is built rather than bound-checked on every access. The
-  opcode schema already declares which operands address the window — both the
-  `Register`-encoded operands and the `Imm32` local indices of `LoadLocal` /
-  `StoreLocal` — so `register_access_at` drives the verifier and the set cannot
-  drift as opcodes change. The hot dispatch arms (`LoadLocal`, `StoreLocal`, the
-  binary arithmetic and comparison operands, the destination commit, and the
-  `JumpIf*` conditions) then read and write the window unchecked. Retired
-  instructions on M1 fell 2.8-4.9% across the eight controlled workloads. This
-  is the "verify once, access unchecked" invariant a template interpreter needs:
-  generated handlers cannot afford a bounds check per operand.
-  Measurement then placed the remaining interpreter gap, so the next batch cut
-  per-instruction overhead rather than the dispatch mechanism. A generated-code
-  A/B on this machine put a replicated or directly threaded dispatch tail only
-  about two retired instructions per operation ahead of one shared indirect
-  jump, against roughly ninety retired instructions per bytecode operation in
-  the real loop, so the cost is the per-tick work and the operand handling, not
-  the `match`. Three costs came out of the straight-line path. The executing
-  frame is always the top frame, so the hot arms and the arithmetic helpers now
-  reach it through the unchecked top-frame accessor instead of the
-  bounds-checked stack index — the same verify-once rule as the register
-  window, applied to the frame index. The canonical PC advances through a
-  direct field write, since a PC past the end is still caught by the next
-  instruction fetch. And the number operation the numeric helpers apply is
-  generic, so every arithmetic opcode monomorphizes and inlines it instead of
-  calling through a function pointer. Retired instructions on M1 fell 3.0-3.7%
-  on bytecode calls, 3.0% on the monomorphic method kernel, 6.2% on branch-phi,
-  5.8% on boxed-double-property, 6.5% on dense-array, and 7.6% on numeric-leaf.
-  Test262 holds at 463 failures and zero crashes over 53289 tests, and the last
-  remaining timeout now passes.
-  Profiling the loop again put roughly three quarters of its self time in
-  per-tick work rather than opcode bodies, so the following batch took the
-  remaining scaffolding out of the straight-line path. The CPU sampler and the
-  step tracer are called behind loop-invariant "hook installed" branches, but
-  their bodies were being inlined into the loop and spending its registers and
-  instruction cache on every run that installs neither; both are now out of
-  line. Budget enforcement, sampling, and tracing are also tested as one union
-  first, so an instruction with no hook pays a single not-taken branch instead
-  of three. Reduction metering wraps rather than saturates, since exhausting a
-  `u64` reduction count is unreachable and the saturation test ran on every
-  dispatched instruction. Retired instructions on M1 fell a further 1.8-4.1%,
-  bringing the totals against the pre-batch baseline to 7.3-7.8% on bytecode
-  calls, 5.9% on the monomorphic method kernel, 9.8% on boxed-double-property,
-  11.8% on branch-phi, 11.8% on numeric-leaf, and 12.1% on dense-array. Test262
-  again holds at 463 failures and zero crashes.
-  Comparing the emitted bytecode directly against Ignition's
-  (`node --jitless --print-bytecode`) on the same source then exposed dead work
-  no interpreter profile could show. Every `if`, `while`, `do`, `for`,
-  `for`-`in`/`of`, and `switch` unconditionally reserved a running completion
-  register (`V`), initialized it to `undefined`, and stored each body
-  completion into it. That value is only observable for a script or `eval`
-  program — inside a function body a statement's value is unreachable, since a
-  call's result comes from `return` — so in every function the whole ladder was
-  computed and discarded. The statement forms now reserve `V` only when the
-  completion value can still be observed. Unary minus on a numeric literal also
-  lowered to a load of the positive value followed by `Op::Neg`; it now folds to
-  the negated constant, so a negative literal costs one instruction like a
-  positive one. On the reference `branch-phi` loop body the compiler emits 24
-  bytecodes where it emitted 29, against 16 for Ignition. Retired instructions
-  on M1 fell a further 2.6-10.9%, bringing the totals against the pre-batch
-  baseline to 10.8-11.1% on bytecode calls, 8.3% on the monomorphic method
-  kernel, 13.9% on boxed-double-property, 14.0% on numeric-leaf, 16.2% on
-  dense-array, and 24.9% on branch-phi. Test262 again holds at 463 failures and
-  zero crashes.
-  The same Ignition comparison showed a plain-identifier operand lowering to a
-  `LoadLocal` that copies its binding's frame slot into a temporary. The copy
-  was once load-bearing — it snapshotted the operand before a separate coercion
-  opcode could re-enter JavaScript and reassign the binding — but now that each
-  operator runs its own ladder, the operator's arm reads both operand registers
-  before it coerces either, so an operand may address the binding slot directly.
-  A binary operand now names its binding register when the operator reads its
-  operands up front and both operands are either such a borrowable name or an
-  effect-free literal, which keeps evaluation order intact (nothing evaluated
-  beside the operand can reassign the slot). `with`, captured upvalues, module
-  imports, and dead-zone bindings still lower normally. Retired instructions on
-  M1 fell a further 4.0-23.6%, bringing the totals against the pre-batch
-  baseline to 15.2-16.9% on bytecode calls, 12.0% on the monomorphic method
-  kernel, 19.8% on boxed-double-property, 26.4% on dense-array, 34.3% on
-  numeric-leaf, and 38.6% on branch-phi. Test262 holds at 463 failures and zero
-  crashes.
-  The last op-count lever from the Ignition comparison was small-integer
-  fusion: node folds an integer-literal right operand into the opcode
-  (`AddSmi`, `BitwiseAndSmi`), where the register form needs a preceding
-  constant load. Six immediate-right opcodes now carry `dst, lhs, imm`:
-  `AddImm`, `SubImm`, `BitwiseAndImm`, `LessThanImm`, `EqualImm`, and
-  `NotEqualImm`. The compiler folds an integer-literal (or negated-literal)
-  right operand in `i32` range into them, and the interpreter runs the left
-  operand through the operator's own ladder with the immediate as the `Number`
-  right operand, so `"a" + 1` still concatenates and an object still coerces.
-  Both JIT tiers keep the fusion rather than declining the function. The
-  template tier expands each immediate opcode into a constant load plus the
-  register operator sharing the source PC (the destination doubles as the
-  constant register, so no extra register or PC is needed; only the first
-  operation at a PC takes the branch label). The optimizing tier keeps its
-  `pc == index` invariant intact by treating the immediate operators as
-  single-input operations — the `AddImm`/`SubImm`/`BitwiseAndImm` result is an
-  int32 like `Op::Increment`, and the immediate comparisons produce a boolean
-  from one int32 register input and the baked constant — so representation
-  selection, liveness, and register allocation see one register input and the
-  emitter materializes the constant. On the reference `branch-phi` loop body
-  the compiler emits 20 bytecodes where it emitted 24, against 16 for Ignition.
-  Retired instructions per process on M1 fell a further 7.6-29.4% in the
-  interpreter, bringing the totals against the pre-batch baseline to 22.3-26.1%
-  on bytecode calls, 18.1% on the monomorphic method kernel, 29.2% on
-  boxed-double-property, 41.8% on dense-array, 39.0% on numeric-leaf, and 55.4%
-  on branch-phi. The optimizing tier is unchanged to slightly faster on
-  dense-array and numeric-leaf and within about a tenth on the others (the
-  immediate comparisons do not yet fuse with a following branch). Test262 holds
-  at 463 failures and zero crashes; GC differential is 13/13.
-  The monomorphic method-call kernel — the widest remaining interpreter gap to
-  `node --jitless` — pays for the call, not the op count. `CALL_METHOD_VALUE`
-  probed the array and collection call ICs before the ordinary method-resolution
-  IC, so every plain-object method call ran two guaranteed misses first. The
-  method-resolution IC is gated on an `ObjectBody` receiver, which arrays, Map,
-  and Set never present, so it now probes ahead of the two collection ICs: an
-  ordinary object resolves on the first probe and the array/collection kernels
-  skip it on the receiver-family check. Retired instructions on the monomorphic
-  method kernel fell 2.4% (129.66e9 -> 126.56e9); the other four kernels are
-  unchanged in the hot loop (their startup runs the extra receiver check on
-  builtin-setup method calls, a fixed cost). Test262 holds at 463 failures and
-  zero crashes; GC differential is 13/13.
-  The monomorphic own-data method call then still resolved through the
-  property-atom resolution, the load-IC site lookup, and the load-stub walk
-  (`probe_load` -> `load_own_data_slot_atom`, including the receiver handle
-  decompress) plus an `is_callable` string dispatch on every call. The first
-  resolution now seeds a `MethodCallIc::Ordinary` holding the recorded
-  own-property hit (shape + slot, no GC pointer); the hot guard is a single
-  shape-handle compare plus a direct slab read (`load_own_data_slot_by_shape`),
-  since the shape match fixes both the slot and the key. Installed only while the
-  load site stays monomorphic and the method is an own data slot; prototype
-  methods and polymorphic sites fall through and the cache self-clears on a shape
-  miss. Retired instructions on the monomorphic method kernel fell a further 6.4%
-  (126.56e9 -> 118.50e9), for -8.6% across the two method-call batches from
-  129.66e9; the other four kernels are unchanged (no method calls in their hot
-  loops). (A separate attempt to drop the per-call register-window zero-fill via
-  a per-window GC scan cursor was GC-correct but measured net-negative — a
-  scan-cursor bump on every register write costs more than the once-per-call
-  memset it removes — and was reverted.)
-  The same shape-guarded read then paid down ordinary property loads:
-  `drive_load_property` resolved a monomorphic `obj.k` through the megamorphic
-  query and the load-IC stub walk on every hit. A leading fast path reads the
-  single own-data stub's recorded hit and does one shape-handle compare plus a
-  direct slab read. Retired instructions: monomorphic method kernel a further
-  2.3% (its `this.bias` load), boxed-double-property 8.1%. Session cumulative:
-  method kernel -10.7% from 129.66e9, boxed-double-property -8.0% from 68.70e9.
-  Finally, the tier framing was corrected: `node --jitless` is Ignition (a
-  bytecode interpreter), so the jitless engine is otter's TEMPLATE baseline
-  compiler, not the interpreter. `--jitless` now selects `JitSelection::Template`
-  (was `InterpreterOnly`); otter --jitless beats node --jitless on every kernel
-  (method-call-monomorphic 6.1x, branch-phi 3.2x, dense-array 2.5x,
-  boxed-double-property 1.95x, numeric-leaf 1.75x, wall on M1).
-  The template numeric-leaf ceiling then moved with a fused unboxed-double
-  chain, without an optimizing-tier regalloc. A maximal linear run of
-  numeric-only arithmetic (`is_numeric_only` feedback; the operators computable
-  by one hardware floating-point instruction — `Add`/`Sub`/`Mul`/`Div`, never
-  `Rem`/`Pow`) whose intermediates are single-use and dead is lowered as one
-  computation: every leaf is number-guarded and unboxed once into a vector
-  register, the chain runs entirely in hardware floating-point through a single
-  accumulator, and only the results that outlive the chain are boxed and stored.
-  The boxing is representation-preserving — an integral value in signed 32-bit
-  range that is not `-0` boxes as `int32`, everything else (fraction, out of
-  range, `-0`, `NaN`, `±Inf`) as a double — reproducing the exact tag the
-  per-operation path leaves behind, on which downstream `int32` fast paths and
-  `1 / -0 === -Infinity` depend. Dead intermediates never touch memory; the
-  box+store+reload+unbox roundtrip between operations is the cost removed. A
-  non-number leaf falls through into the untouched per-operation stream, which
-  reproduces exact coercion and `+`-concatenation operator by operator, so the
-  fused fast path is anchored on the tested baseline as its own fallback.
-  Template retired instructions on numeric-leaf fell 24.5% (2.047e9 -> 1.545e9);
-  the other four kernels are unchanged. Wall on M1 versus node --jitless:
-  numeric-leaf 1.75x -> 2.32x. Test262 holds at 463 failures and zero crashes;
-  GC differential 13/13.
-  The remaining numeric-leaf gap was then the call frame, not arithmetic:
-  `engineKernel` calls `engineNumericLeaf` every iteration and the template tier
-  did not inline it, because the inline-leaf subset rejected the trailing unary
-  `Negate` (and, after fusion, the `FusedNumericChain` header). Both are now
-  accepted: `Negate` lowers to an inline `fneg` with a non-number deopt (`-0` and
-  `-i32::MIN` promote to their exact doubles), and a `FusedNumericChain` emits the
-  fused unboxed-double computation directly over compact scratch slots — leaves
-  unboxed once into vector registers, the chain kept in floating-point, only the
-  live result boxed — then skips the per-operation stream it stands for. So the
-  inlined body is as cheap as the standalone fused callee with no call frame,
-  rather than the naive per-operation double path (which measured a regression
-  before the fused inline path replaced it). `engineNumericLeaf` now inlines into
-  `engineKernel`. Template retired instructions on numeric-leaf fell a further
-  26.8% (1.545e9 -> 1.131e9), 44.7% below the pre-fusion baseline; the other four
-  kernels are unchanged. Wall on M1 versus node --jitless: numeric-leaf 2.32x ->
-  3.67x. Test262 holds at 463 failures and zero crashes; GC differential 13/13.
-  (boxed-double-property's `checksum + value * scale` already fuses — its `MUL`
-  and `ADD` are adjacent — but stays property-load bound, so the arithmetic is a
-  small fraction of its loop.)
-  With those two levers the template (jitless) tier is at its baseline ceiling
-  for this kernel set. Wall on M1 versus node --jitless: method-call-monomorphic
-  6.1x, numeric-leaf 3.65x, branch-phi 3.19x, dense-array 2.62x,
-  boxed-double-property ~2.0x — every kernel ahead of Ignition. The two weakest
-  (dense-array, boxed-double) are element-/property-load bound: their per-iteration
-  guarded load is already an inline shape/type guard plus a direct slab read with
-  no runtime call, and hoisting or unboxing it is loop-invariant-code-motion and
-  representation selection — optimizing-tier work, not a baseline change. (A
-  register-pinned GC cage base was prototyped to drop the per-load immediate
-  rebuild, then dropped: the cage base is a process constant so it is sound, but
-  the gain is a couple of retired instructions per load that overlap the load
-  latency on wide out-of-order cores, i.e. a thermometer move, not an
-  architecture fix.) Further jitless gains now belong to the optimizing tier.
-- [ ] Replace the remaining measured dispatch/boxed-register/runtime-entry
-  bottleneck with generated bytecode handlers and shared IC fast paths; retain
-  the interpreter as semantic oracle rather than weakening its contracts.
-
-Deopt remains keyed by dense `DeoptExitId`, not bytecode PC. Abstract frame
-states lower to an outermost-first frame chain; every inlined frame is
-reified, caller frames resume after their call, and the ordinary return path
-fills the caller result register. Exit-metadata compaction and lazy exit
-compilation remain measurement-triggered, not prerequisites.
-
-### 1.5 Optimizing Tier
-
-- [x] Start with local numeric specialization and verified deopt.
-- [x] Add monomorphic plain and method inlining after call-target stability and
-  reconstructed-frame tests are proven.
-- [ ] Generalize the shipped property-loop versioning into SSA expression
-  LICM, then add loop constant propagation, dead scaffolding elimination, and
-  measured unrolling to close the remaining native instruction-count gap.
-- [ ] Choose Cranelift/custom emission from measurements rather than treating a
-  backend as an architectural premise.
-- [ ] Own suspend/resume semantics for `TailCall`, generator/await/promise, and
-  async-module opcodes before removing their template-tier side exits.
-
-### Engine Verification
-
-Every phase-changing engine commit runs the relevant subset of:
-
-```bash
-cargo test -p otter-vm --locked
-cargo test -p otter-jit --locked
-cargo test -p otter-runtime --locked
-cargo clippy -p otter-vm -p otter-jit --all-targets --locked -- -D warnings
-cargo build --release -p otter-cli -p otter-difftest -p otter-benchmark \
-  --features otter-benchmark/phase0 --locked
-target/release/otter-difftest --otter target/release/otter \
-  --gc-strides 1,2,4,8,16
+```text
+bytecode + feedback
+        |
+        v
+typed CFG HIR -> Machine IR -> target selection/legalization
+        -> instruction sequence -> register allocation
+        -> code + stack maps + deopt maps
 ```
 
-Also preserve affected `ES_CONFORMANCE.md` results, startup/code-size
-baselines, deterministic benchmark success markers, and capability/runtime/GC
-invariants.
+Quick and optimizing compilation share HIR, Machine IR, target backends, frame
+layout, call descriptors, safepoints, deopt reconstruction, dispatch cells,
+and artifact schemas. They differ only in optimization budget and tier policy.
 
-## 2. Debugging, Tracing, And Profiling
+## Accepted gates
 
-### Shipped Surface
+### Compiler walking skeleton
 
-- [x] Text/JSON bytecode disassembly and current text step trace.
-- [x] Opt-in `.cpuprofile` and folded-stack sampling.
-- [x] Embedder IC, shape, frame, heap-summary, and Chrome heap snapshots.
-- [x] One production CLI policy plus `--jitless` selecting the existing
-  interpreter oracle. Explicit tier controls remain confined to benchmark and
-  Test262 harnesses.
-- [x] Bounded owned JIT events and current-format JIT artifact bundles with
-  machine code, normalized code, annotated ARM64, relocations, code maps,
-  deopt metadata, and safepoints.
-- [x] Budgeted-inline/direct-call/method/global-load/static-native lowering and
-  deopt events, including named complete-pipeline inline declines.
-- [x] Benchmark idle-memory and complete JIT runtime-stat deltas.
+Accepted on 2026-08-05, then deleted rather than landed beside the old
+compiler:
 
-### Active Diagnostics Work
+- one typed Machine IR selected and encoded real AArch64 and x86-64 code;
+- regalloc2 Ion allocation supplied exact final deopt and root locations;
+- a tagged root survived an allocating call's caller-saved clobbers;
+- unrelated source identity and serialized byte-PC changes left normalized
+  function-local artifacts identical;
+- x86-64 required no JavaScript-semantic lowering fork.
 
-- [ ] Cover JIT recompilation and abrupt compiler failure in artifact tests.
-- [ ] Add golden artifact tests for branches, calls, safepoints, OSR entries,
-  and deopt exits.
-- [ ] Record exact safepoint native-return offsets and join them to assembly.
-- [ ] Add a live runtime code-range map for profiler symbolization.
-- [ ] Account for native JIT body time instead of the last interpreter frame.
-- [ ] Symbolize samples with function, tier, code offset, and source/bytecode
-  location while preserving Chrome/V8 CPU-profile compatibility.
-- [ ] Add tier-entry, OSR, deopt, compile, and invalidation Chrome/Perfetto
-  events.
-- [ ] Quantify disabled/enabled profiling overhead.
-- [ ] Add a bounded timeout ring buffer with deterministic snapshots.
-- [ ] Add Chrome/Perfetto async/op spans with stable parent/span linkage.
-- [ ] Retain Test262 diagnostics only for failures and timeouts.
-- [ ] Preview-cap large values and explicitly bound every diagnostic buffer.
-- [ ] Validate every machine-readable output against its target tool or its
-  complete current schema.
+### Property-slot representation
 
-Diagnostics slices run:
+Accepted on 2026-08-05 and implemented as the first breaking slice:
 
-```bash
-cargo test -p otter-vm
-cargo test -p otter-jit
-cargo test -p otter-runtime --test jit_call_lifecycle
-cargo check -p otter-web
-cargo test -p otter-runtime
-```
+- every object property slot stores the ordinary 8-byte `Value`;
+- `CompressedValue`, heap-number boxes, and JIT slot codecs are deleted;
+- generated loads/stores are direct 64-bit operations;
+- cell stores retain the precise generational/incremental barrier;
+- three inline values preserve the previous 88-byte `ObjectBody` footprint.
 
-## 3. `Otter.serve`
+The official release memory harness (100,000 iterations, five samples) kept
+allocations at 300,004, improved median execution by 1.21% and full-GC time by
+4.36%, and increased retained heap by 5,504 bytes (1.37%). VM, JIT, runtime,
+and focused GC-stress gates passed.
 
-### Boundaries And Current State
+### Optimizing-backend consolidation
 
-- `otter-modules` owns options, permissions, HTTP transport, Fetch conversion,
-  and the `Server` host object.
-- `otter-web` owns standard Request/Response/Headers/Web Streams behavior.
-- `otter-runtime` owns keep-alive, isolate inboxes, and typed runtime tasks.
-- `otter-vm` exposes only generic roots/context helpers and contains no HTTP
-  policy.
-- [x] `Otter.serve` and `import { serve } from "otter"` are wired.
-- [x] Requests enter the isolate through typed runtime tasks and persistent
-  callback roots.
-- [x] Server lifecycle exposes stop/close/ref/unref and runtime liveness.
-- [x] Request bytes reach the existing one-chunk `ReadableStream` layer.
+Accepted on 2026-08-05 and implemented before the compiler switch:
 
-The current transport remains a bootstrap `TcpListener` with
-`Connection: close`; it is not the production backend.
+- the Cranelift numeric-leaf fork and its backend-specific benchmark contract
+  are deleted;
+- numeric leaf functions now use the shared optimizing CFG/SSA backend;
+- the 20-sample compile median improved from 100,687.5 ns to 70,437.5 ns
+  (-30.0%); generated code grew from 252 to 852 bytes;
+- the 20-sample production-tiered kernel median improved from 10,138,583 ns to
+  2,175,729 ns (-78.5%), with 2.1 million optimizing returns and no deopts.
 
-### Active Server Work
+The shared optimizer is still slower than the current template tier on this
+kernel (2.176 ms versus 1.418 ms); backend consolidation removes the much worse
+fork but does not close the remaining optimizer/code-generation gap.
 
-- [ ] Allow `fetch(request)` to return `Response | Promise<Response>` and await
-  settlement on the isolate event loop.
-- [ ] Replace full request buffering with a host-backed
-  `ReadableStream<Uint8Array>` plus abort/timeout cleanup.
-- [ ] Stream `Response.body` with backpressure while preserving buffered
-  string/byte fast paths.
-- [ ] Replace the bootstrap listener with an async HTTP/1.1 transport while
-  keeping VM interaction on the isolate thread.
-- [ ] Close Hono blockers: thenable adoption, member/private-field update
-  expressions, package-entry `.ts` detection, and URL/prototype gaps reached by
-  the workload.
-- [ ] Update the source-of-truth Otter `.d.ts` files and contributor docs.
-- [ ] Add Hono smoke, throughput, latency, and cold-start benchmarks against
-  equivalent applications.
+## Active implementation
 
-Server slices run:
+### 1. Atomic compiler and execution-contract switch
 
-```bash
-cargo test -p otter-modules
-cargo test -p otter-runtime runtime_keep_alive_liveness_is_idempotent
-cargo test -p otter-runtime runtime_task_runs_on_isolate_loop
-```
+Land one complete replacement, not a bridge:
 
-Smoke coverage includes both serve surfaces, a `Response` round trip, POST body
-stream identity, and stop/ref/unref liveness.
+- typed CFG HIR with explicit effects, representations, guards, FrameState,
+  dependency tokens, and call descriptors;
+- target-neutral Machine IR with blocks, phis, legal machine operations,
+  virtual registers, clobbers, and safepoint/deopt annotations;
+- complete AArch64 and x86-64 selectors/legalizers over the same Machine IR;
+- regalloc2 allocation followed by final stack-map and deopt-map construction;
+- universal JS call ABI, native frame walk, stable dispatch cells, and
+  generation-independent caller linkage;
+- deterministic normalized IR, allocation, code, relocation, stack-map, and
+  deopt artifacts.
+
+Landed substrate on 2026-08-05:
+
+- verified target-selected instruction sequences contain dense values, blocks,
+  block parameters, physical constraints, explicit clobbers, safepoints, and
+  deopt operands without bytecode or interpreter-slot identities;
+- every call requires a checked descriptor for argument/result
+  representations, effects, clobbers, exceptional transfer, and GC behavior;
+- regalloc2 Ion allocates the complete AArch64 and System V x86-64 register
+  files, including fixed operands and inserted moves;
+- root and deopt values are late allocator uses, and one post-allocation table
+  supplies their exact register/spill locations;
+- normalized Machine IR and allocation are deterministic, and tests prove a
+  tagged root survives the AArch64 caller-saved clobber set.
+
+The repository gate passed with 235 JIT tests, 831 VM tests, and all 17
+interpreter/tier/GC-stress differential cases.
+
+First production execution slice landed on 2026-08-05:
+
+- eligible straight-line Number leaves now lower from bytecode into a typed,
+  side-effect-free numeric HIR, then into the shared Machine IR;
+- eligibility has no fixture-sized arithmetic-count threshold; even a
+  one-operation leaf uses the replacement pipeline once feedback proves Number
+  inputs;
+- regalloc2's exact operand locations drive a new AArch64 emitter directly;
+- Number entry guards bail before effects, and result boxing preserves int32,
+  double, `NaN`, infinities, and negative zero semantics;
+- the installed code object and artifact bundle identify
+  `otter-machine-ir numeric-leaf`; the previous optimizing CFG/SSA emitter is
+  not entered for eligible leaves;
+- the 20-sample compile median is 14,625 ns with 256-byte code, versus 70,437.5
+  ns for the consolidated legacy optimizer (-79.2%) and 100,687.5 ns for the
+  published baseline (-85.5%);
+- the production-tiered kernel median is 1,578,541.5 ns, down from 2,175,729 ns
+  (-27.5%), with 2.1 million optimizing returns and zero deopts.
+
+The full repository gate passed with 239 JIT tests, 831 VM tests, all-target
+all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
+
+The remaining legacy optimizer and allocator are fallback for functions whose
+HIR/selection slices have not switched. Delete each old consumer as its final
+operation family moves; do not adapt old allocation or metadata into the new
+pipeline.
+
+In the same switch delete the template compiler, current optimizing SSA path,
+interpreter-window compiled ABI, status-return protocol, duplicated direct
+emitters, and caller-visible callee tier/frame contracts.
+
+Correctness gates:
+
+- recursive and mutually recursive calls;
+- exceptions and reentrant natives;
+- moving-GC stress across supported strides;
+- nested inline deopt reconstruction;
+- OSR entry/exit representation round trips;
+- identical function-local artifacts under unrelated source edits;
+- no conservative compiled-stack scan and no interpreter-window root ABI.
+
+Performance gates:
+
+- exact instruction counts for settled binding, monomorphic property load and
+  store, shape guard, and 0-2 argument monomorphic call;
+- current engine `call`, `kernel`, `module`, `jit-compile`, `memory`, and
+  `idle-memory` harnesses;
+- no benchmark result is scoreable without validation markers and explicit
+  tier/GC/runtime-reuse configuration.
+
+### 2. Shared semantic optimization
+
+After the atomic switch, add representation propagation, dependency-aware
+guard facts, inlining, GVN, LICM, loop scheduling, and cold outlining to the
+shared HIR/Machine IR pipeline. Quick compilation skips expensive global
+passes; it does not use a different backend or value/frame format.
+
+### 3. Scaling slices
+
+Implement in this order, each as a vertical behavior/metadata/test/artifact
+slice:
+
+1. typed fields and elements;
+2. inline object allocation;
+3. inline constructors and virtual objects;
+4. OSR at every reducible loop;
+5. incremental-GC handshakes using compiled stack maps.
+
+No slice may introduce a second IR, call path, frame layout, value format,
+deopt schema, or runtime stack.
+
+## Stop conditions
+
+Revise the architecture instead of adding a workaround if any occurs:
+
+1. x86-64 needs a JavaScript-semantic lowering fork.
+2. A moving root needs an interpreter window or conservative stack scan.
+3. A caller must be recompiled when a callee changes tier or frame size.
+4. Typed fields require another deopt, frame, or value schema.
+5. Inline allocation cannot share ordinary FrameState and stack-map machinery.
+6. Unrelated dead source changes normalized function-local artifacts.
+7. Exact post-allocation root/deopt locations require pervasive forced spills.
+
+## Working rules
+
+- The interpreter remains the semantic oracle during replacement, not the
+  compiled ABI.
+- JavaScript semantics lower once above target selection.
+- Target backends own legalization, instruction selection, register classes,
+  calling convention details, and encoding only.
+- Every substantial change updates runtime behavior, tests, artifacts, and
+  contributor docs together.
+- Use focused tests during development. Before a commit run `scripts/gate.sh`
+  and compare the relevant Test262 failing set when semantics changed.
+- Performance claims require fresh-process, randomized A/B measurements with
+  medians, dispersion, and validation markers.

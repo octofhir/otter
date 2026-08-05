@@ -643,15 +643,20 @@ pub const STUB_JIT_STORE_UPVALUE_CHECKED: RuntimeStubDescriptor = descriptor(
     RuntimeStubException::Status,
     RuntimeStubResultAbi::StatusWord,
 );
-/// Generational write barrier for an inline pointer store.
-pub const STUB_JIT_WRITE_BARRIER: RuntimeStubDescriptor = descriptor(
+/// Generational and insertion write barrier for one pointer store.
+///
+/// Generated code runs both halves inline and reaches this only when a marking
+/// cycle is in progress or the store really creates an unrecorded old->young
+/// edge. It therefore takes the parent's header address and the stored value
+/// directly: no register window, no published frame, no reentry.
+pub const STUB_WRITE_BARRIER: RuntimeStubDescriptor = descriptor(
     34,
     RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubSignature::MutatingLeafValue2,
+    2,
     RuntimeStubEffects::leaf(false, true),
     RuntimeStubException::Never,
-    RuntimeStubResultAbi::StatusWord,
+    RuntimeStubResultAbi::StatusPair,
 );
 /// Frameless write barrier over the register window.
 pub const STUB_JIT_WRITE_BARRIER_WINDOW: RuntimeStubDescriptor = descriptor(
@@ -1329,7 +1334,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         31 => "jit_load_upvalue",
         32 => "jit_store_upvalue",
         33 => "jit_store_upvalue_checked",
-        34 => "jit_write_barrier",
+        34 => "write_barrier",
         35 => "jit_write_barrier_window",
         36 => "jit_inline_closure_upvalues",
         37 => "strict_eq_leaf",
@@ -1418,7 +1423,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_LOAD_UPVALUE,
     STUB_JIT_STORE_UPVALUE,
     STUB_JIT_STORE_UPVALUE_CHECKED,
-    STUB_JIT_WRITE_BARRIER,
+    STUB_WRITE_BARRIER,
     STUB_JIT_WRITE_BARRIER_WINDOW,
     STUB_JIT_INLINE_CLOSURE_UPVALUES,
     STUB_STRICT_EQ_LEAF,

@@ -480,6 +480,12 @@ pub const COLLECTION_MAP_GET_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     entry: collection_map_get_leaf,
 };
 
+/// Callable ABI entry for the generational/insertion write barrier.
+pub const WRITE_BARRIER_MUTATING: MutatingLeafStub2 = MutatingLeafStub2 {
+    descriptor: crate::native_abi::STUB_WRITE_BARRIER,
+    entry: write_barrier_mutating,
+};
+
 /// Callable ABI entry for in-place `Map.prototype.set`.
 pub const COLLECTION_MAP_SET_MUTATING: MutatingLeafStub3 = MutatingLeafStub3 {
     descriptor: STUB_COLLECTION_MAP_SET_MUTATING,
@@ -660,6 +666,7 @@ pub const fn mutating_leaf_stub2_by_id(id: RuntimeStubId) -> Option<MutatingLeaf
     match id {
         id if id == STUB_ARRAY_POP_LEAF.id => Some(ARRAY_POP_LEAF),
         id if id == STUB_ARRAY_SHIFT_LEAF.id => Some(ARRAY_SHIFT_LEAF),
+        id if id == crate::native_abi::STUB_WRITE_BARRIER.id => Some(WRITE_BARRIER_MUTATING),
         _ => None,
     }
 }
@@ -1381,6 +1388,30 @@ fn collection_map_get_leaf_inner(
 /// unmaterialized key, or a non-Map receiver misses, and the allocating
 /// sibling completes the call.
 #[must_use]
+/// Record one pointer store's write barrier from the parent's header address.
+///
+/// Generated code has already proven that the store needs the runtime: either
+/// a marking cycle is in progress or the parent is an old, unrecorded object
+/// with a nursery child. Nothing here allocates or re-enters, so the call site
+/// publishes no safepoint.
+pub extern "C" fn write_barrier_mutating(
+    heap: *mut otter_gc::GcHeap,
+    parent_header: u64,
+    child_bits: u64,
+) -> RuntimeStubResultPair {
+    let Some(heap) = heap_mut(heap) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    let child = Value::from_abi_bits(child_bits);
+    // SAFETY: the emitted barrier derived this header from the receiver it is
+    // storing into, under the same guard that proved the receiver's class.
+    unsafe {
+        heap.record_write_at(parent_header as *mut otter_gc::header::GcHeader, &child);
+    }
+    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::undefined()))
+}
+
+/// Insert or overwrite one `Map` entry in place.
 pub extern "C" fn collection_map_set_mutating(
     heap: *mut otter_gc::GcHeap,
     recv_bits: u64,

@@ -28,7 +28,7 @@ use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::entry::{
     CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, FUNCTION_ID_TAG, NUMBER_TAG_HI16, THREAD_OFFSET,
     Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED,
-    VM_THREAD_MARKING_FLAG_CELL_OFFSET, reg_offset,
+    VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_MARKING_FLAG_CELL_OFFSET, reg_offset,
 };
 
 /// Immediate forms of the tagged constants for `dynasm` compare operands.
@@ -583,29 +583,32 @@ pub(crate) fn emit_compress_slot_or_bail(ops: &mut Assembler, bail: DynamicLabel
     );
 }
 
-/// Run the write barrier a pointer store owes, inline.
+/// Run the write barrier a pointer store owes.
 ///
 /// `parent` holds the guarded receiver's `GcHeader` address and `child` the
-/// stored cell `Value`. The barrier has exactly two reasons to reach the
+/// stored cell `Value`. The barrier has exactly two reasons to need the
 /// runtime, and both are one flag test away: a marking cycle is in progress
 /// (the insertion half has to shade the child), or the store really creates an
 /// old->young edge whose parent is not yet in the remembered set. Everything
 /// else — a young parent, a parent already recorded this scavenge interval, an
-/// old child, a null child — falls straight through to `done`.
+/// old child, a null child — falls straight through.
 ///
-/// Clobbers `w14` and `w15`.
-pub(crate) fn emit_write_barrier_fast(
+/// The runtime half is a leaf taking those two words directly, so even the
+/// slow path publishes no frame and re-enters nothing.
+///
+/// Clobbers `x0`, `x1`, `x2`, `x14`, `x15` and `x16`.
+pub(crate) fn emit_write_barrier(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     parent: u8,
     child: u8,
-    slow: DynamicLabel,
-    done: DynamicLabel,
 ) {
     let flags_byte = view.gc_barrier.header_flags_byte;
     let young = view.gc_barrier.young_flag;
     let settled = young | view.gc_barrier.remembered_flag;
+    let slow = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
         ; cbz W(child), =>done
@@ -635,8 +638,20 @@ pub(crate) fn emit_write_barrier_fast(
         ; movz w15, young
         ; tst w14, w15
         ; b.eq =>done
-        ; b =>slow
+        ; =>slow
+        ; mov x1, X(parent)
+        ; mov x2, X(child)
+        ; ldr x0, [x20, THREAD_OFFSET]
+        ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
     );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        16,
+        otter_vm::runtime_stubs::WRITE_BARRIER_MUTATING.entry_addr() as u64,
+        otter_vm::native_abi::STUB_WRITE_BARRIER,
+    );
+    dynasm!(ops ; .arch aarch64 ; blr x16 ; =>done);
 }
 
 #[cfg(test)]

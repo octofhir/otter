@@ -41,6 +41,11 @@ pub(crate) fn try_compile(
     let Some(hir) = NumericFunction::build(view) else {
         return Ok(None);
     };
+    // Loop CFG/SSA is constructed now, but publishing native code waits for
+    // backedge polls and allocator-driven FrameState reconstruction.
+    if hir.has_backedges {
+        return Ok(None);
+    }
     let sequence = select(&hir)
         .map_err(|_| Unsupported::OperandShape("numeric HIR to Machine IR selection"))?;
     let allocation = sequence
@@ -134,11 +139,41 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
         tagged_parameters.push(tagged);
     }
 
+    let selection_cfg = SelectionCfg::build(hir);
     let mut instructions = Vec::with_capacity(hir.nodes.len() + hir.parameter_count as usize + 4);
-    let mut blocks = Vec::with_capacity(hir.blocks.len());
+    let mut blocks = Vec::with_capacity(selection_cfg.order.len());
     let mut next_deopt = 0u32;
-    for (block_index, block) in hir.blocks.iter().enumerate() {
+    for selected in &selection_cfg.order {
         let first = MachineInstructionId(instructions.len() as u32);
+        let SelectedBlock::Original(block_index) = *selected else {
+            let SelectedBlock::CriticalEdge {
+                predecessor,
+                edge,
+                successor,
+            } = *selected
+            else {
+                unreachable!("selected block is original or critical edge")
+            };
+            let mut jump = MachineInstruction::plain(MachineOpcode::Jump, Vec::new());
+            jump.control = ControlFlow::Branch;
+            instructions.push(jump);
+            let end = MachineInstructionId(instructions.len() as u32);
+            blocks.push(MachineBlockData {
+                first,
+                end,
+                predecessors: vec![selection_cfg.originals[predecessor]],
+                successors: vec![selection_cfg.originals[successor]],
+                parameters: Vec::new(),
+                successor_arguments: vec![
+                    hir.blocks[predecessor].successor_arguments[edge]
+                        .iter()
+                        .map(|&value| machine_value(&values, value))
+                        .collect(),
+                ],
+            });
+            continue;
+        };
+        let block = &hir.blocks[block_index];
         if block_index == 0 {
             for parameter in 0..hir.parameter_count {
                 instructions.push(MachineInstruction::plain(
@@ -238,18 +273,32 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                 ret.control = ControlFlow::Return;
                 instructions.push(ret);
                 let end = MachineInstructionId(instructions.len() as u32);
-                blocks.push(machine_block(block, &values, first, end));
+                blocks.push(machine_block(
+                    hir,
+                    &selection_cfg,
+                    block_index,
+                    &values,
+                    first,
+                    end,
+                ));
                 continue;
             }
         };
         terminator.control = ControlFlow::Branch;
         instructions.push(terminator);
         let end = MachineInstructionId(instructions.len() as u32);
-        blocks.push(machine_block(block, &values, first, end));
+        blocks.push(machine_block(
+            hir,
+            &selection_cfg,
+            block_index,
+            &values,
+            first,
+            end,
+        ));
     }
 
     InstructionSequence::new(
-        MachineBlock(0),
+        selection_cfg.originals[0],
         representations,
         Vec::new(),
         blocks,
@@ -257,24 +306,105 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectedBlock {
+    Original(usize),
+    CriticalEdge {
+        predecessor: usize,
+        edge: usize,
+        successor: usize,
+    },
+}
+
+struct SelectionCfg {
+    order: Vec<SelectedBlock>,
+    originals: Vec<MachineBlock>,
+    critical_edges: BTreeMap<(usize, usize), MachineBlock>,
+}
+
+impl SelectionCfg {
+    fn build(hir: &NumericFunction) -> Self {
+        let mut order = Vec::with_capacity(hir.blocks.len());
+        let mut originals = vec![MachineBlock(u32::MAX); hir.blocks.len()];
+        let mut critical_edges = BTreeMap::new();
+        for (successor, original) in originals.iter_mut().enumerate() {
+            for (predecessor, edge) in incoming_edges(hir, successor) {
+                if is_critical_edge(hir, predecessor, successor) {
+                    let block = MachineBlock(order.len() as u32);
+                    critical_edges.insert((predecessor, edge), block);
+                    order.push(SelectedBlock::CriticalEdge {
+                        predecessor,
+                        edge,
+                        successor,
+                    });
+                }
+            }
+            *original = MachineBlock(order.len() as u32);
+            order.push(SelectedBlock::Original(successor));
+        }
+        Self {
+            order,
+            originals,
+            critical_edges,
+        }
+    }
+}
+
+fn incoming_edges(hir: &NumericFunction, successor: usize) -> Vec<(usize, usize)> {
+    hir.blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(predecessor, block)| {
+            block
+                .successors
+                .iter()
+                .enumerate()
+                .filter_map(move |(edge, &target)| {
+                    (target == successor).then_some((predecessor, edge))
+                })
+        })
+        .collect()
+}
+
+fn is_critical_edge(hir: &NumericFunction, predecessor: usize, successor: usize) -> bool {
+    hir.blocks[predecessor].successors.len() > 1 && hir.blocks[successor].predecessors.len() > 1
+}
+
 fn machine_block(
-    block: &hir::NumericBlock,
+    hir: &NumericFunction,
+    selection_cfg: &SelectionCfg,
+    block_index: usize,
     values: &[MachineValue],
     first: MachineInstructionId,
     end: MachineInstructionId,
 ) -> MachineBlockData {
+    let block = &hir.blocks[block_index];
+    let mut predecessors = incoming_edges(hir, block_index)
+        .into_iter()
+        .map(|(predecessor, edge)| {
+            selection_cfg
+                .critical_edges
+                .get(&(predecessor, edge))
+                .copied()
+                .unwrap_or(selection_cfg.originals[predecessor])
+        })
+        .collect::<Vec<_>>();
+    predecessors.sort_unstable();
     MachineBlockData {
         first,
         end,
-        predecessors: block
-            .predecessors
-            .iter()
-            .map(|&block| MachineBlock(block as u32))
-            .collect(),
+        predecessors,
         successors: block
             .successors
             .iter()
-            .map(|&block| MachineBlock(block as u32))
+            .enumerate()
+            .map(|(edge, &successor)| {
+                selection_cfg
+                    .critical_edges
+                    .get(&(block_index, edge))
+                    .copied()
+                    .unwrap_or(selection_cfg.originals[successor])
+            })
             .collect(),
         parameters: block
             .parameters
@@ -284,11 +414,19 @@ fn machine_block(
         successor_arguments: block
             .successor_arguments
             .iter()
-            .map(|arguments| {
-                arguments
-                    .iter()
-                    .map(|&value| machine_value(values, value))
-                    .collect()
+            .enumerate()
+            .map(|(edge, arguments)| {
+                if selection_cfg
+                    .critical_edges
+                    .contains_key(&(block_index, edge))
+                {
+                    Vec::new()
+                } else {
+                    arguments
+                        .iter()
+                        .map(|&value| machine_value(values, value))
+                        .collect()
+                }
             })
             .collect(),
     }
@@ -495,6 +633,38 @@ mod tests {
         )
     }
 
+    fn loop_view() -> JitCompileSnapshot {
+        numeric_view(
+            1,
+            3,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(1)]),
+                (
+                    Op::LessThan,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(2), Operand::Register(2)],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(0),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::Jump, vec![Operand::Imm32(-4)]),
+                (Op::ReturnValue, vec![Operand::Register(0)]),
+            ],
+        )
+    }
+
     fn compile_output(
         view: &JitCompileSnapshot,
         artifact_request: Option<ArtifactRequest>,
@@ -660,8 +830,70 @@ mod tests {
     }
 
     #[test]
-    fn declines_unsplit_critical_edge_with_block_parameter() {
-        assert!(NumericFunction::build(&critical_edge_view()).is_none());
+    fn splits_and_executes_critical_edge_with_block_parameter() {
+        let view = critical_edge_view();
+        let hir = NumericFunction::build(&view).expect("critical-edge numeric HIR");
+        let sequence = select(&hir).expect("split critical-edge Machine IR");
+        assert_eq!(sequence.blocks().len(), hir.blocks.len() + 1);
+        let split = sequence
+            .blocks()
+            .iter()
+            .find(|block| {
+                block.predecessors.len() == 1
+                    && block.successors.len() == 1
+                    && block.parameters.is_empty()
+                    && block.successor_arguments[0].len() == 1
+            })
+            .expect("critical edge split block");
+        assert!(
+            sequence.blocks()[split.successors[0].0 as usize]
+                .parameters
+                .len()
+                == 1
+        );
+
+        let code = compile_output(&view, None).code;
+        let (direct_edge, _, _) = execute(&code, &[tag::box_int32(3), tag::box_int32(1)], 0);
+        assert_eq!(direct_edge.status, STATUS_RETURNED);
+        assert_eq!(direct_edge.value, tag::box_int32(3));
+
+        let (arm_edge, _, _) = execute(&code, &[tag::box_int32(1), tag::box_int32(3)], 0);
+        assert_eq!(arm_edge.status, STATUS_RETURNED);
+        assert_eq!(arm_edge.value, tag::box_int32(4));
+    }
+
+    #[test]
+    fn builds_and_allocates_loop_header_parameters_before_native_publication() {
+        let view = loop_view();
+        let hir = NumericFunction::build(&view).expect("loop numeric HIR");
+        assert!(hir.has_backedges);
+        let sequence = select(&hir).expect("loop Machine IR");
+        let (header_index, header) = sequence
+            .blocks()
+            .iter()
+            .enumerate()
+            .find(|(_, block)| block.predecessors.len() == 2 && !block.parameters.is_empty())
+            .expect("loop header block parameters");
+        assert_eq!(header.parameters.len(), 2);
+        for &predecessor in &header.predecessors {
+            let predecessor = &sequence.blocks()[predecessor.0 as usize];
+            let edge = predecessor
+                .successors
+                .iter()
+                .position(|successor| successor.0 as usize == header_index)
+                .expect("incoming loop edge");
+            assert_eq!(predecessor.successor_arguments[edge].len(), 2);
+        }
+        sequence
+            .allocate(&TargetRegisterFile::aarch64_numeric_function())
+            .expect("loop Machine IR allocation");
+
+        assert!(
+            try_compile(&view, 7002, None)
+                .expect("loop compilation decision")
+                .is_none(),
+            "native publication waits for poll and FrameState lowering"
+        );
     }
 
     #[test]

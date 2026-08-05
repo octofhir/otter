@@ -158,6 +158,23 @@ First control-flow slice landed on 2026-08-05:
 The full repository gate passed with 243 JIT tests, 831 VM tests, all-target
 all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
 
+CFG normalization and loop-SSA substrate landed on 2026-08-05:
+
+- selection splits every critical edge into an explicit Machine IR block, so
+  allocator edge moves never execute speculatively on the untaken successor;
+- a production frontend fixture validates the split critical-edge path through
+  native execution, including the merged Number result;
+- numeric HIR now constructs cyclic CFGs, forces typed parameters for values
+  live into loop headers, and attaches both preheader and backedge arguments
+  after all blocks are lowered;
+- regalloc2 accepts the resulting cyclic Machine IR. Native loop publication
+  remains explicitly disabled until backedge polling and allocator-driven
+  FrameState reconstruction land; this is a safety boundary, not a fallback
+  compatibility mode.
+
+The full repository gate passed with 244 JIT tests, 831 VM tests, all-target
+all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
+
 The remaining legacy optimizer and allocator are fallback for functions whose
 HIR/selection slices have not switched. Delete each old consumer as its final
 operation family moves; do not adapt old allocation or metadata into the new

@@ -11,9 +11,11 @@
 //! - Accepted nodes cannot allocate, call, touch the heap, or throw.
 //! - Register merges become typed block parameters; no interpreter slot reaches
 //!   Machine IR.
-//! - Only acyclic graphs are accepted until loop FrameState and OSR land.
-//! - Critical edges carrying block arguments are rejected until edge splitting
-//!   makes allocator move placement unambiguous.
+//! - Loop headers receive explicit parameters for every numeric value live from
+//!   a forward predecessor; backedge arguments are attached after all blocks
+//!   are lowered.
+//! - HIR preserves source CFG edges; selection splits critical edges before
+//!   allocator move placement.
 
 use std::collections::BTreeMap;
 
@@ -95,6 +97,7 @@ pub(super) struct NumericFunction {
     pub(super) parameter_count: u16,
     pub(super) register_count: u16,
     pub(super) arithmetic_op_count: usize,
+    pub(super) has_backedges: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -125,7 +128,6 @@ impl NumericFunction {
             || parameter_count > MAX_FUNCTION_PARAMETERS
             || view.instructions.is_empty()
             || view.instructions.len() > MAX_FUNCTION_INSTRUCTIONS
-            || !code.loop_headers().is_empty()
             || !code.control_flow().exception_regions().is_empty()
         {
             return None;
@@ -147,11 +149,35 @@ impl NumericFunction {
         let mut arithmetic_op_count = 0usize;
 
         for (block_index, raw) in raw_blocks.iter().enumerate() {
-            let (mut registers, parameters, parameter_regs) = if block_index == 0 {
+            let (mut registers, mut parameters, mut parameter_regs) = if block_index == 0 {
                 (entry.clone(), Vec::new(), Vec::new())
+            } else if raw
+                .predecessors
+                .iter()
+                .any(|&predecessor| predecessor >= block_index)
+            {
+                let forward_predecessors = raw
+                    .predecessors
+                    .iter()
+                    .copied()
+                    .filter(|&predecessor| predecessor < block_index)
+                    .collect::<Vec<_>>();
+                merge_predecessors(&forward_predecessors, &out_states, &mut nodes)?
             } else {
-                merge_predecessors(raw, &out_states, &mut nodes)?
+                merge_predecessors(&raw.predecessors, &out_states, &mut nodes)?
             };
+            if raw
+                .predecessors
+                .iter()
+                .any(|&predecessor| predecessor >= block_index)
+            {
+                force_loop_parameters(
+                    &mut registers,
+                    &mut parameters,
+                    &mut parameter_regs,
+                    &mut nodes,
+                )?;
+            }
             let mut block_nodes = if block_index == 0 {
                 entry_nodes.clone()
             } else {
@@ -213,12 +239,6 @@ impl NumericFunction {
         for predecessor in 0..blocks.len() {
             for edge in 0..blocks[predecessor].successors.len() {
                 let successor = blocks[predecessor].successors[edge];
-                if !blocks[successor].parameters.is_empty()
-                    && blocks[predecessor].successors.len() > 1
-                    && blocks[successor].predecessors.len() > 1
-                {
-                    return None;
-                }
                 blocks[predecessor].successor_arguments[edge] = parameter_registers[successor]
                     .iter()
                     .map(
@@ -237,6 +257,12 @@ impl NumericFunction {
             parameter_count,
             register_count,
             arithmetic_op_count,
+            has_backedges: raw_blocks.iter().enumerate().any(|(predecessor, block)| {
+                block
+                    .successors
+                    .iter()
+                    .any(|&successor| successor <= predecessor)
+            }),
         })
     }
 }
@@ -288,9 +314,6 @@ fn build_raw_blocks(view: &JitCompileSnapshot) -> Option<Vec<RawBlock>> {
     }
     for predecessor in 0..blocks.len() {
         for successor in blocks[predecessor].successors.clone() {
-            if successor <= predecessor {
-                return None;
-            }
             blocks.get_mut(successor)?.predecessors.push(predecessor);
         }
     }
@@ -317,17 +340,16 @@ fn target_block(
 }
 
 fn merge_predecessors(
-    raw: &RawBlock,
+    predecessors: &[usize],
     out_states: &[Vec<RegisterState>],
     nodes: &mut Vec<NumericNode>,
 ) -> Option<(Vec<RegisterState>, Vec<NumericValue>, Vec<u16>)> {
-    let first = out_states.get(*raw.predecessors.first()?)?.clone();
+    let first = out_states.get(*predecessors.first()?)?.clone();
     let mut merged = first.clone();
     let mut parameters = Vec::new();
     let mut parameter_registers = Vec::new();
     for (register, merged_state) in merged.iter_mut().enumerate() {
-        let states = raw
-            .predecessors
+        let states = predecessors
             .iter()
             .map(|&predecessor| out_states.get(predecessor)?.get(register).copied())
             .collect::<Option<Vec<_>>>()?;
@@ -351,6 +373,28 @@ fn merge_predecessors(
         parameter_registers.push(u16::try_from(register).ok()?);
     }
     Some((merged, parameters, parameter_registers))
+}
+
+fn force_loop_parameters(
+    registers: &mut [RegisterState],
+    parameters: &mut Vec<NumericValue>,
+    parameter_registers: &mut Vec<u16>,
+    nodes: &mut Vec<NumericNode>,
+) -> Option<()> {
+    for (register, state) in registers.iter_mut().enumerate() {
+        let RegisterState::Value(value) = *state else {
+            continue;
+        };
+        if parameter_registers.contains(&u16::try_from(register).ok()?) {
+            continue;
+        }
+        let value_type = nodes.get(value.0)?.value_type();
+        let parameter = push(nodes, NumericNode::BlockParameter(value_type));
+        *state = RegisterState::Value(parameter);
+        parameters.push(parameter);
+        parameter_registers.push(u16::try_from(register).ok()?);
+    }
+    Some(())
 }
 
 fn lower_instruction(

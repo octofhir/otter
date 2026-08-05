@@ -115,8 +115,6 @@ pub(super) struct NumericFunction {
     pub(super) parameter_count: u16,
     pub(super) register_count: u16,
     pub(super) arithmetic_op_count: usize,
-    pub(super) has_backedges: bool,
-    pub(super) requires_integer_lowering: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,16 +333,6 @@ impl NumericFunction {
             }
         }
 
-        let requires_integer_lowering = nodes.iter().any(|node| {
-            matches!(
-                node,
-                NumericNode::IntegerAdd(..)
-                    | NumericNode::IntegerAddImmediate(..)
-                    | NumericNode::IntegerAndImmediate(..)
-                    | NumericNode::IntegerLessThanImmediate(..)
-                    | NumericNode::IntegerEqualImmediate(..)
-            )
-        });
         Some(Self {
             nodes,
             blocks,
@@ -352,13 +340,6 @@ impl NumericFunction {
             parameter_count,
             register_count,
             arithmetic_op_count,
-            has_backedges: raw_blocks.iter().enumerate().any(|(predecessor, block)| {
-                block
-                    .successors
-                    .iter()
-                    .any(|&successor| successor <= predecessor)
-            }),
-            requires_integer_lowering,
         })
     }
 }

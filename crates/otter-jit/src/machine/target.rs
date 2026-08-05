@@ -113,14 +113,24 @@ impl TargetRegisterFile {
     pub(super) fn aarch64_numeric_function() -> Self {
         let mut registers = Self::aarch64();
         // The first executable Machine IR slice intentionally owns no
-        // callee-saved register protocol. Keep the context in x15, reserve
-        // x16/x17 and v31 for the emitter, and expose only AAPCS64
-        // caller-saved registers to allocation. Later general-function
-        // lowering can widen this inventory together with its prologue.
+        // callee-saved allocation protocol. The emitter owns saved x19 for
+        // the context, reserves x15..x17 and v31, and exposes a dense
+        // caller-saved register namespace that its deopt dump can publish.
+        // Later general-function lowering can widen this inventory together
+        // with its prologue and dump map.
         registers.preferred[RegClass::Int as usize].retain(|register| register.encoding != 15);
         registers.non_preferred[RegClass::Int as usize].clear();
         registers.preferred[RegClass::Float as usize].retain(|register| register.encoding <= 7);
+        registers.non_preferred[RegClass::Float as usize].clear();
         registers
+    }
+
+    /// Caller-saved registers exposed to numeric-function allocation.
+    pub(super) fn aarch64_numeric_call_clobbers() -> Vec<PhysicalRegister> {
+        (0..=14)
+            .map(PhysicalRegister::integer)
+            .chain((0..=7).map(PhysicalRegister::float))
+            .collect()
     }
 
     /// Complete System V x86-64 register inventory.

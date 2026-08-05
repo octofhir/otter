@@ -240,6 +240,33 @@ Backedge FrameState wiring landed on 2026-08-05:
 The full repository gate passed with 246 JIT tests, 831 VM tests, all-target
 all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
 
+Native integer-loop publication landed on 2026-08-05:
+
+- the numeric AArch64 emitter now lowers checked Int32 add/add-immediate,
+  bitwise-and-immediate, signed less-than/equality-immediate, and
+  `BackedgePoll` directly from allocated Machine IR;
+- one post-regalloc frame layout owns spills, the saved `x19` context, and the
+  exact generated-stack reservation. Checked overflow and interrupt exits
+  branch by dense deopt id into one cold register dump and the existing VM
+  `DeoptRuntime`; no emitter-local reconstruction format or replay path was
+  added;
+- poll clobbers are explicit allocator input. Loop-header values therefore
+  remain in exact late-use spill homes until an interrupt deopt completes, and
+  the successful fuel-refill call returns before allocator edge/phi moves run;
+- native publication no longer has loop/integer-family guards. Focused native
+  execution covers both branch-phi arms, multiple iterations, exact `ADD` and
+  `ADD_IMM` overflow PCs/windows, forced poll spills, fuel refill, and an
+  interrupt exit at the next complete loop-header state;
+- the production optimizing selector compiles the exact
+  `benchmarks/scripts/branch-phi.js` bytecode shape as
+  `otter-machine-ir numeric-function`. The real kernel validated
+  `return=-6000000` with seven optimizing entries, zero optimizing OSR entries,
+  and zero deopts; a local three-sample median was 2.767 ms versus the
+  published 7.366 ms baseline (-62.4%).
+
+The full repository gate passed with 248 JIT tests, 831 VM tests, all-target
+all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
+
 The remaining legacy optimizer and allocator are fallback for functions whose
 HIR/selection slices have not switched. Delete each old consumer as its final
 operation family moves; do not adapt old allocation or metadata into the new

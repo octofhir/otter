@@ -311,9 +311,12 @@ pub(crate) fn compile_optimized_with_artifacts(
     artifact_request: Option<crate::artifact::ArtifactRequest>,
     capture_events: bool,
 ) -> Result<crate::artifact::NativeCompileOutput<OptimizedCode>, Unsupported> {
-    if let Some(output) =
-        crate::machine::numeric::try_compile(view, code_object_id, artifact_request.clone())?
-    {
+    if let Some(output) = crate::machine::numeric::try_compile(
+        view,
+        code_object_id,
+        transitions,
+        artifact_request.clone(),
+    )? {
         return Ok(output);
     }
     arm64::compile_with_artifacts(

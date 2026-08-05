@@ -313,6 +313,36 @@ Register bitwise loop publication landed on 2026-08-05:
 The full repository gate passed with 251 JIT tests, 831 VM tests, all-target
 all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
 
+Checked multiply, Uint32, and comparison publication landed on 2026-08-05:
+
+- checked Int32 multiply now stays unboxed through typed HIR and Machine IR.
+  The AArch64 widening multiply deopts before committing the destination on
+  either signed overflow or a JavaScript negative-zero result, preserving the
+  exact pre-operation PC and VM window through the shared deopt runtime;
+- logical right shift has an explicit `Uint32` representation from HIR through
+  regalloc2, VM `DeoptTable` reconstruction, Float64 widening, and return
+  boxing. Values above `i32::MAX` therefore remain exact rather than being
+  mislabeled signed integers or forced through an eager boxed detour;
+- all six register numeric comparisons select distinct Int32 or Float64
+  machine operations and return canonical tagged booleans. Ordered Float64
+  comparisons explicitly reject unordered NaN flags while numeric inequality
+  remains true for NaN;
+- deopt frames now permit several VM slots to read the same immutable machine
+  snapshot location. This is the correct final contract for ordinary
+  `LoadLocal` aliases and removes a false verifier rejection without adding a
+  second recovery representation;
+- `benchmarks/scripts/integer-scalar.js` combines checked multiply, Uint32
+  loop-header phis, logical shifts, register comparison, bitwise operations,
+  checked increment, and a polled backedge. Its production-selector artifact
+  proves `otter-machine-ir numeric-function` and native execution returns the
+  Node oracle `1725`;
+- with a focused OSR threshold of 10, the validated five-sample median was
+  3.104 ms with nine optimizing entries and zero deopts, versus 24.778 ms for
+  template tier (-87.5%). Unsupported call and OSR-entry forms remain closed.
+
+The full repository gate passed with 255 JIT tests, 831 VM tests, all-target
+all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
+
 The remaining legacy optimizer and allocator are fallback for functions whose
 HIR/selection slices have not switched. Delete each old consumer as its final
 operation family moves; do not adapt old allocation or metadata into the new

@@ -75,6 +75,8 @@ pub enum MachineRepresentation {
     Cell,
     /// Unboxed signed 32-bit integer.
     Int32,
+    /// Unboxed unsigned 32-bit integer.
+    Uint32,
     /// Unboxed 64-bit integer or address-sized scalar.
     Int64,
     /// Unboxed IEEE-754 binary64 value.
@@ -84,7 +86,9 @@ pub enum MachineRepresentation {
 impl MachineRepresentation {
     fn register_class(self) -> regalloc2::RegClass {
         match self {
-            Self::Tagged | Self::Cell | Self::Int32 | Self::Int64 => regalloc2::RegClass::Int,
+            Self::Tagged | Self::Cell | Self::Int32 | Self::Uint32 | Self::Int64 => {
+                regalloc2::RegClass::Int
+            }
             Self::Float64 => regalloc2::RegClass::Float,
         }
     }
@@ -294,6 +298,8 @@ pub enum MachineOpcode {
     IntegerAdd,
     /// Integer subtraction with an overflow exit.
     IntegerSub,
+    /// Integer multiplication with overflow and negative-zero exits.
+    IntegerMul,
     /// Integer addition with a baked right operand and overflow exit.
     IntegerAddImmediate(i32),
     /// Integer subtraction with a baked right operand and overflow exit.
@@ -308,6 +314,8 @@ pub enum MachineOpcode {
     IntegerShiftLeft,
     /// Signed integer right shift with JavaScript's masked count.
     IntegerShiftRight,
+    /// Unsigned integer right shift with JavaScript's masked count.
+    IntegerShiftRightLogical,
     /// Integer bitwise complement.
     IntegerNot,
     /// Integer bitwise AND with a baked right operand.
@@ -318,8 +326,22 @@ pub enum MachineOpcode {
     IntegerEqualImmediate(i32),
     /// Integer inequality with a baked right operand.
     IntegerNotEqualImmediate(i32),
+    /// Signed integer equality producing 0 or 1.
+    IntegerEqual,
+    /// Signed integer inequality producing 0 or 1.
+    IntegerNotEqual,
+    /// Signed integer less-than producing 0 or 1.
+    IntegerLessThan,
+    /// Signed integer less-than-or-equal producing 0 or 1.
+    IntegerLessEqual,
+    /// Signed integer greater-than producing 0 or 1.
+    IntegerGreaterThan,
+    /// Signed integer greater-than-or-equal producing 0 or 1.
+    IntegerGreaterEqual,
     /// Losslessly widen an integer Number into floating-point representation.
     Int32ToFloat64,
+    /// Losslessly widen an unsigned integer Number into floating-point representation.
+    Uint32ToFloat64,
     /// Floating-point addition.
     FloatAdd,
     /// Floating-point subtraction.
@@ -332,10 +354,24 @@ pub enum MachineOpcode {
     FloatNeg,
     /// Ordered floating-point less-than comparison producing 0 or 1.
     FloatLessThan,
+    /// Floating-point equality comparison producing 0 or 1.
+    FloatEqual,
+    /// Floating-point inequality comparison producing 0 or 1.
+    FloatNotEqual,
+    /// Ordered floating-point less-than-or-equal comparison producing 0 or 1.
+    FloatLessEqual,
+    /// Ordered floating-point greater-than comparison producing 0 or 1.
+    FloatGreaterThan,
+    /// Ordered floating-point greater-than-or-equal comparison producing 0 or 1.
+    FloatGreaterEqual,
     /// Canonically box one floating-point JavaScript Number.
     BoxNumber,
     /// Canonically box one integer JavaScript Number.
     BoxInt32,
+    /// Canonically box one unsigned integer JavaScript Number.
+    BoxUint32,
+    /// Canonically box one Boolean represented as integer 0 or 1.
+    BoxBoolean,
     /// Target ABI call through a call descriptor.
     Call(u32),
     /// Loop backedge poll with an exact interpreter reconstruction state.

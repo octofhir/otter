@@ -28,10 +28,10 @@
 //! # Reconstitution
 //!
 //! A register held unboxed in compiled code must be re-tagged on the way out.
-//! [`DeoptRepr::reconstitute`] is the single source of truth: an `Int32` slot
-//! re-tags through [`Value::number_i32`], a `Float64` slot re-boxes through
-//! [`Value::number_f64`] (both apply the frozen value encoding), and a
-//! `Tagged` slot is already a full `Value`.
+//! [`DeoptRepr::reconstitute`] is the single source of truth: integer slots
+//! re-tag through the matching signed or unsigned Number conversion, a
+//! `Float64` slot re-boxes through [`Value::number_f64`], and a `Tagged` slot
+//! is already a full `Value`.
 //!
 //! # Invariants
 //!
@@ -46,8 +46,6 @@
 //!   number of slots. They let optimized code omit values needed only by deopt.
 //! - A [`StackMap`] indexes the same compiled slots the frame state locates;
 //!   bit `i` set means slot `i` holds a tagged pointer the collector relocates.
-
-use std::collections::BTreeMap;
 
 use crate::Value;
 
@@ -82,17 +80,6 @@ pub enum DeoptVerifyError {
         max: usize,
         /// Stored slot count.
         actual: usize,
-    },
-    /// Two interpreter slots claim the same concrete location.
-    DuplicateLocation {
-        /// Frame state's exact byte-PC.
-        byte_pc: u32,
-        /// First slot using the location.
-        first_slot: usize,
-        /// Later slot reusing the location.
-        second_slot: usize,
-        /// Duplicated concrete location.
-        location: DeoptLocation,
     },
     /// A machine-register location exceeds the declared register file.
     MachineRegisterOutOfRange {
@@ -151,6 +138,8 @@ pub enum DeoptRepr {
     Tagged,
     /// An unboxed `i32` in the low 32 bits; re-tag to a number `Value`.
     Int32,
+    /// An unboxed `u32` in the low 32 bits; re-tag to a number `Value`.
+    Uint32,
     /// An unboxed `f64` bit pattern; re-box to a number `Value`.
     Float64,
 }
@@ -163,6 +152,7 @@ impl DeoptRepr {
         match self {
             DeoptRepr::Tagged => Value::from_bits(raw),
             DeoptRepr::Int32 => Value::number_i32(raw as u32 as i32),
+            DeoptRepr::Uint32 => Value::number_f64(f64::from(raw as u32)),
             DeoptRepr::Float64 => Value::number_f64(f64::from_bits(raw)),
         }
     }
@@ -267,10 +257,10 @@ impl FrameState {
 }
 
 impl FrameState {
-    /// Verify slot count, concrete-location uniqueness, and location bounds.
+    /// Verify slot count and location bounds.
     ///
     /// [`DeoptRepr`] is a closed Rust enum, so every safely constructed value
-    /// is intrinsically one of the three supported representations.
+    /// is intrinsically one of the supported representations.
     pub fn verify(&self, limits: DeoptVerifyLimits) -> Result<(), DeoptVerifyError> {
         if limits.min_stack_slot_offset > limits.max_stack_slot_offset {
             return Err(DeoptVerifyError::InvalidStackSlotRange {
@@ -289,14 +279,14 @@ impl FrameState {
 }
 
 impl DeoptFrame {
-    /// Verify slot count, concrete-location uniqueness, and location bounds.
+    /// Verify slot count and location bounds.
     ///
-    /// Locations are unique within a frame but deliberately not across the
-    /// chain: an inlined callee's parameter is the caller's argument value, so
-    /// both frames read it from the same place.
+    /// Multiple slots may read the same concrete location. This is required
+    /// for ordinary aliases such as a bytecode `LoadLocal`: reconstruction
+    /// reads an immutable machine-state snapshot before writing VM registers.
     ///
     /// [`DeoptRepr`] is a closed Rust enum, so every safely constructed value
-    /// is intrinsically one of the three supported representations.
+    /// is intrinsically one of the supported representations.
     pub fn verify(&self, limits: DeoptVerifyLimits) -> Result<(), DeoptVerifyError> {
         if self.slots.len() > limits.max_frame_slots {
             return Err(DeoptVerifyError::FrameSlotCountOutOfRange {
@@ -306,21 +296,7 @@ impl DeoptFrame {
             });
         }
 
-        let mut locations = BTreeMap::new();
         for (slot_index, slot) in self.slots.iter().enumerate() {
-            // Literals are reconstruction recipes, not storage. Repeating one
-            // is intentional; only physical homes must remain unique.
-            if let Some(key) = location_key(slot.location)
-                && let Some(first_slot) = locations.insert(key, slot_index)
-            {
-                return Err(DeoptVerifyError::DuplicateLocation {
-                    byte_pc: self.byte_pc,
-                    first_slot,
-                    second_slot: slot_index,
-                    location: slot.location,
-                });
-            }
-
             match slot.location {
                 DeoptLocation::Register(register) if register >= limits.machine_register_count => {
                     return Err(DeoptVerifyError::MachineRegisterOutOfRange {
@@ -357,18 +333,10 @@ impl DeoptFrame {
             }
 
             match slot.repr {
-                DeoptRepr::Tagged | DeoptRepr::Int32 | DeoptRepr::Float64 => {}
+                DeoptRepr::Tagged | DeoptRepr::Int32 | DeoptRepr::Uint32 | DeoptRepr::Float64 => {}
             }
         }
         Ok(())
-    }
-}
-
-fn location_key(location: DeoptLocation) -> Option<(u8, i64)> {
-    match location {
-        DeoptLocation::Register(register) => Some((0, i64::from(register))),
-        DeoptLocation::StackSlot(offset) => Some((1, i64::from(offset))),
-        DeoptLocation::Literal(_) => None,
     }
 }
 
@@ -606,6 +574,17 @@ mod tests {
             Value::number_i32(i32::MIN),
             "Int32 uses only the low 32 bits"
         );
+        for integer in [0_u32, 1, i32::MAX as u32, i32::MAX as u32 + 1, u32::MAX] {
+            assert_eq!(
+                DeoptRepr::Uint32.reconstitute(u64::from(integer)),
+                Value::number_f64(f64::from(integer))
+            );
+        }
+        assert_eq!(
+            DeoptRepr::Uint32.reconstitute(0xdead_beef_ffff_ffff),
+            Value::number_f64(f64::from(u32::MAX)),
+            "Uint32 uses only the low 32 bits"
+        );
 
         for number in [0.0, -0.0, 3.5, f64::MIN, f64::MAX, f64::INFINITY] {
             assert_eq!(
@@ -642,7 +621,7 @@ mod tests {
     #[test]
     fn an_inlined_chain_shares_locations_across_frames() {
         // A callee's parameter is the caller's argument value, so both frames
-        // read it from the same place. That is unique per frame, not per state.
+        // read it from the same immutable machine-state snapshot.
         let shared = DeoptSlot {
             location: DeoptLocation::Register(3),
             repr: DeoptRepr::Tagged,
@@ -733,8 +712,8 @@ mod tests {
     }
 
     #[test]
-    fn frame_state_verifier_rejects_duplicate_and_out_of_range_locations() {
-        let duplicate = single_frame(
+    fn frame_state_verifier_accepts_aliases_and_rejects_out_of_range_locations() {
+        let aliased = single_frame(
             12,
             vec![
                 DeoptSlot {
@@ -747,15 +726,7 @@ mod tests {
                 },
             ],
         );
-        assert_eq!(
-            duplicate.verify(verify_limits()),
-            Err(DeoptVerifyError::DuplicateLocation {
-                byte_pc: 12,
-                first_slot: 0,
-                second_slot: 1,
-                location: DeoptLocation::Register(3),
-            })
-        );
+        assert_eq!(aliased.verify(verify_limits()), Ok(()));
 
         let repeated_literal = single_frame(
             20,

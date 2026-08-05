@@ -17,7 +17,7 @@
 //!   the emitter owns no parallel reconstruction recipe.
 //! - Backedge polls run before allocator edge edits and preserve every value
 //!   live into the loop header across the leaf runtime call.
-//! - Successful results use the VM's canonical int32/double representation.
+//! - Successful results use the VM's canonical Number or Boolean representation.
 
 // dynasm's dynamic-register expansion calls `.into()` on the required u8
 // register encoding. Clippy sees the macro expansion as an identity conversion.
@@ -25,6 +25,7 @@
 
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 use otter_vm::{
+    Value,
     deopt::DeoptRuntime,
     native_abi::{STUB_JIT_BACKEDGE_POLL, STUB_JIT_DEOPT_WRITEBACK},
 };
@@ -226,15 +227,37 @@ pub(super) fn emit(
                 let destination = float_register(locations[1])?;
                 dynasm!(ops ; .arch aarch64 ; fneg D(destination), D(source));
             }
-            MachineOpcode::FloatLessThan => {
+            MachineOpcode::FloatEqual
+            | MachineOpcode::FloatNotEqual
+            | MachineOpcode::FloatLessThan
+            | MachineOpcode::FloatLessEqual
+            | MachineOpcode::FloatGreaterThan
+            | MachineOpcode::FloatGreaterEqual => {
                 let left = float_register(locations[0])?;
                 let right = float_register(locations[1])?;
                 let destination = integer_register(locations[2])?;
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; fcmp D(left), D(right)
-                    ; cset W(destination), lt
-                );
+                dynasm!(ops ; .arch aarch64 ; fcmp D(left), D(right));
+                match instruction.opcode {
+                    MachineOpcode::FloatEqual => {
+                        dynasm!(ops ; .arch aarch64 ; cset W(destination), eq);
+                    }
+                    MachineOpcode::FloatNotEqual => {
+                        dynasm!(ops ; .arch aarch64 ; cset W(destination), ne);
+                    }
+                    MachineOpcode::FloatLessThan => {
+                        dynasm!(ops ; .arch aarch64 ; cset W(destination), mi);
+                    }
+                    MachineOpcode::FloatLessEqual => {
+                        dynasm!(ops ; .arch aarch64 ; cset W(destination), ls);
+                    }
+                    MachineOpcode::FloatGreaterThan => {
+                        dynasm!(ops ; .arch aarch64 ; cset W(destination), gt);
+                    }
+                    MachineOpcode::FloatGreaterEqual => {
+                        dynasm!(ops ; .arch aarch64 ; cset W(destination), ge);
+                    }
+                    _ => unreachable!("matched Float64 comparison"),
+                }
             }
             MachineOpcode::IntegerConstant(value) => {
                 emit_load_u64(
@@ -247,6 +270,11 @@ pub(super) fn emit(
                 let source = integer_register(locations[0])?;
                 let destination = float_register(locations[1])?;
                 dynasm!(ops ; .arch aarch64 ; scvtf D(destination), W(source));
+            }
+            MachineOpcode::Uint32ToFloat64 => {
+                let source = integer_register(locations[0])?;
+                let destination = float_register(locations[1])?;
+                dynasm!(ops ; .arch aarch64 ; ucvtf D(destination), W(source));
             }
             MachineOpcode::IntegerAdd | MachineOpcode::IntegerSub => {
                 let left = integer_register(locations[0])?;
@@ -266,6 +294,25 @@ pub(super) fn emit(
                         ; b.vs =>exit
                     );
                 }
+            }
+            MachineOpcode::IntegerMul => {
+                let left = integer_register(locations[0])?;
+                let right = integer_register(locations[1])?;
+                let destination = integer_register(locations[2])?;
+                let exit = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let nonzero = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; smull x16, W(left), W(right)
+                    ; sxtw x17, w16
+                    ; cmp x16, x17
+                    ; b.ne =>exit
+                    ; cbnz w16, =>nonzero
+                    ; eor w17, W(left), W(right)
+                    ; tbnz w17, #31, =>exit
+                    ; =>nonzero
+                    ; mov W(destination), w16
+                );
             }
             MachineOpcode::IntegerAddImmediate(immediate)
             | MachineOpcode::IntegerSubImmediate(immediate) => {
@@ -321,6 +368,12 @@ pub(super) fn emit(
                 let destination = integer_register(locations[1])?;
                 dynasm!(ops ; .arch aarch64 ; mvn W(destination), W(source));
             }
+            MachineOpcode::IntegerShiftRightLogical => {
+                let left = integer_register(locations[0])?;
+                let right = integer_register(locations[1])?;
+                let destination = integer_register(locations[2])?;
+                dynasm!(ops ; .arch aarch64 ; lsr W(destination), W(left), W(right));
+            }
             MachineOpcode::IntegerAndImmediate(immediate) => {
                 let source = integer_register(locations[0])?;
                 let destination = integer_register(locations[1])?;
@@ -347,6 +400,38 @@ pub(super) fn emit(
                     _ => unreachable!("matched immediate integer comparison"),
                 }
             }
+            MachineOpcode::IntegerEqual
+            | MachineOpcode::IntegerNotEqual
+            | MachineOpcode::IntegerLessThan
+            | MachineOpcode::IntegerLessEqual
+            | MachineOpcode::IntegerGreaterThan
+            | MachineOpcode::IntegerGreaterEqual => {
+                let left = integer_register(locations[0])?;
+                let right = integer_register(locations[1])?;
+                let destination = integer_register(locations[2])?;
+                dynasm!(ops ; .arch aarch64 ; cmp W(left), W(right));
+                match instruction.opcode {
+                    MachineOpcode::IntegerEqual => {
+                        dynasm!(ops ; .arch aarch64 ; cset W(destination), eq);
+                    }
+                    MachineOpcode::IntegerNotEqual => {
+                        dynasm!(ops ; .arch aarch64 ; cset W(destination), ne);
+                    }
+                    MachineOpcode::IntegerLessThan => {
+                        dynasm!(ops ; .arch aarch64 ; cset W(destination), lt);
+                    }
+                    MachineOpcode::IntegerLessEqual => {
+                        dynasm!(ops ; .arch aarch64 ; cset W(destination), le);
+                    }
+                    MachineOpcode::IntegerGreaterThan => {
+                        dynasm!(ops ; .arch aarch64 ; cset W(destination), gt);
+                    }
+                    MachineOpcode::IntegerGreaterEqual => {
+                        dynasm!(ops ; .arch aarch64 ; cset W(destination), ge);
+                    }
+                    _ => unreachable!("matched int32 comparison"),
+                }
+            }
             MachineOpcode::BackedgePoll => {
                 let exit = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
                 emit_backedge_poll(&mut ops, &mut relocations, poll_entry, exit, threw);
@@ -366,6 +451,16 @@ pub(super) fn emit(
                     ; orr X(destination), X(destination), x16
                 );
             }
+            MachineOpcode::BoxUint32 => emit_box_uint32(
+                &mut ops,
+                integer_register(locations[0])?,
+                integer_register(locations[1])?,
+            ),
+            MachineOpcode::BoxBoolean => emit_box_boolean(
+                &mut ops,
+                integer_register(locations[0])?,
+                integer_register(locations[1])?,
+            ),
             MachineOpcode::Return => {
                 let source = integer_register(locations[0])?;
                 dynasm!(ops
@@ -672,6 +767,35 @@ fn emit_box_number(ops: &mut dynasmrt::aarch64::Assembler, source: u8, destinati
         ; add X(destination), X(destination), x16
         ; =>done
     );
+}
+
+fn emit_box_uint32(ops: &mut dynasmrt::aarch64::Assembler, source: u8, destination: u8) {
+    let encode_double = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; tbnz W(source), #31, =>encode_double
+        ; mov W(destination), W(source)
+        ; movz x16, NUMBER_TAG_HI16, lsl #48
+        ; orr X(destination), X(destination), x16
+        ; b =>done
+        ; =>encode_double
+        ; ucvtf d31, W(source)
+        ; fmov X(destination), d31
+        ; movz x16, DOUBLE_OFFSET_HI16, lsl #48
+        ; add X(destination), X(destination), x16
+        ; =>done
+    );
+}
+
+fn emit_box_boolean(ops: &mut dynasmrt::aarch64::Assembler, source: u8, destination: u8) {
+    let is_false = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64 ; cbz W(source), =>is_false);
+    emit_load_u64(ops, destination, Value::boolean(true).to_bits());
+    dynasm!(ops ; .arch aarch64 ; b =>done ; =>is_false);
+    emit_load_u64(ops, destination, Value::boolean(false).to_bits());
+    dynasm!(ops ; .arch aarch64 ; =>done);
 }
 
 fn emit_epilogue(ops: &mut dynasmrt::aarch64::Assembler, frame: MachineFrameLayout) {

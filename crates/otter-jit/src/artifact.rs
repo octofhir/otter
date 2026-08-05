@@ -720,6 +720,7 @@ fn render_deopt(table: &DeoptTable) -> String {
                                 representation: match slot.repr {
                                     DeoptRepr::Tagged => "tagged",
                                     DeoptRepr::Int32 => "int32",
+                                    DeoptRepr::Uint32 => "uint32",
                                     DeoptRepr::Float64 => "float64",
                                 },
                             }

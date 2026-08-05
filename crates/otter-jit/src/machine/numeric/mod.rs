@@ -10,54 +10,94 @@
 //!   contain no bytecode operations.
 //! - Parameter guards bail at logical PC zero before observable effects.
 //! - Machine locations, edits, and frame size come only from regalloc2 output.
-//! - Emitted functions contain no call or safepoint and own no GC roots.
+//! - Runtime calls are leaf polls or cold deopt writeback; neither keeps a
+//!   tagged value solely in Machine IR storage across a GC safepoint.
 
 mod arm64;
 mod hir;
 
-use otter_vm::{JitArtifactFileName, JitCompileSnapshot, deopt::DeoptTable};
+use otter_vm::{
+    JitArtifactFileName, JitCompileSnapshot,
+    deopt::{DeoptExitDescriptor, DeoptExitId, DeoptRuntime},
+    native_abi::{STUB_JIT_BACKEDGE_POLL, STUB_JIT_DEOPT_WRITEBACK},
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 use self::hir::{NumericFramePoint, NumericFunction, NumericNode, NumericTerminator, NumericType};
 use super::{
     ControlFlow, DeoptId, InstructionSequence, MachineBlock, MachineBlockData, MachineInstruction,
     MachineInstructionId, MachineOpcode, MachineOperand, MachineRepresentation, MachineValue,
-    TargetRegisterFile,
+    TargetRegisterFile, lower_deopt_table,
 };
 use crate::{
     Unsupported,
-    artifact::{
-        ArtifactRequest, CodeMapCapture, CodeRegion, NativeCompileOutput, build_bundle,
-        relocation::RelocationCapture,
-    },
+    artifact::{ArtifactRequest, CodeMapCapture, CodeRegion, NativeCompileOutput, build_bundle},
+    entry::TransitionTable,
     optimizing::{OptimizedCode, OptimizedMetadata},
 };
 
 pub(crate) fn try_compile(
     view: &JitCompileSnapshot,
     code_object_id: u64,
+    transitions: &TransitionTable,
     artifact_request: Option<ArtifactRequest>,
 ) -> Result<Option<NativeCompileOutput<OptimizedCode>>, Unsupported> {
     let Some(hir) = NumericFunction::build(view) else {
         return Ok(None);
     };
-    // Loop CFG/SSA is constructed now, but publishing native code waits for
-    // backedge polls and allocator-driven FrameState reconstruction.
-    if hir.has_backedges || hir.requires_integer_lowering {
-        return Ok(None);
-    }
     let sequence = select(&hir)
         .map_err(|_| Unsupported::OperandShape("numeric HIR to Machine IR selection"))?;
     let allocation = sequence
         .allocate(&TargetRegisterFile::aarch64_numeric_function())
         .map_err(|_| Unsupported::OperandShape("numeric Machine IR allocation"))?;
-    let emission = arm64::emit(&sequence, &allocation)?;
+    let frame = arm64::frame_layout(&allocation)?;
+    let deopt_table = lower_deopt_table(
+        &sequence,
+        &allocation,
+        frame,
+        arm64::GPR_BUDGET,
+        arm64::FP_BUDGET,
+        &machine_frame_states(&hir),
+    )
+    .map_err(|_| Unsupported::OperandShape("numeric Machine IR deopt lowering"))?;
+    let mut exits = Vec::with_capacity(hir.frame_states.len());
+    for (index, state) in hir.frame_states.iter().enumerate() {
+        let logical_pc = view
+            .instructions
+            .iter()
+            .position(|instruction| instruction.byte_pc == state.byte_pc)
+            .and_then(|pc| u32::try_from(pc).ok())
+            .ok_or(Unsupported::OperandShape("numeric deopt resume PC"))?;
+        exits.push(DeoptExitDescriptor {
+            state: DeoptExitId(index as u32),
+            resume_pcs: vec![logical_pc].into_boxed_slice(),
+        });
+    }
+    let deopt_runtime = Box::new(DeoptRuntime {
+        table: deopt_table,
+        exits: exits.into_boxed_slice(),
+        gpr_budget: arm64::GPR_BUDGET,
+    });
+    let emission = arm64::emit(
+        &sequence,
+        &allocation,
+        frame,
+        &deopt_runtime,
+        transitions.entry(STUB_JIT_BACKEDGE_POLL),
+        transitions.variadic_entry(STUB_JIT_DEOPT_WRITEBACK),
+        artifact_request.is_some(),
+    )?;
     let machine_register_count = u8::try_from(allocation.used_register_count())
         .map_err(|_| Unsupported::OperandShape("numeric machine register count"))?;
-    let deopt_table = DeoptTable::default();
     let safepoints = Box::default();
     let frame_maps = Box::default();
     let frame_map_bitmap_words = Box::default();
+
+    let arm64::Emission {
+        code: emitted_code,
+        generated_stack_frame_bytes,
+        relocations,
+    } = emission;
 
     let artifact = artifact_request.map(|request| {
         let mut tier_input = format!(
@@ -73,30 +113,26 @@ pub(crate) fn try_compile(
         code_map.record(CodeRegion::structural(
             "machineNumericFunction",
             0,
-            emission.code.len(),
+            emitted_code.len(),
         ));
         build_bundle(
             request,
             view,
             code_object_id,
-            &emission.code,
+            &emitted_code,
             JitArtifactFileName::OptimizedIr,
             tier_input,
             code_map,
-            RelocationCapture::new(true),
-            Some(&deopt_table),
+            relocations,
+            Some(&deopt_runtime.table),
             &safepoints,
         )
     });
 
     let code = OptimizedCode::new(
-        emission.code,
-        Some(emission.stack_frame_bytes),
-        Box::new(otter_vm::deopt::DeoptRuntime {
-            table: deopt_table,
-            exits: Box::default(),
-            gpr_budget: 0,
-        }),
+        emitted_code,
+        Some(generated_stack_frame_bytes),
+        deopt_runtime,
         safepoints,
         frame_maps,
         frame_map_bitmap_words,
@@ -165,6 +201,7 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                 let deopt = frame_state_ids[&point];
                 let mut poll = MachineInstruction::plain(MachineOpcode::BackedgePoll, Vec::new());
                 attach_frame_state(hir, &values, deopt, &mut poll);
+                poll.clobbers = TargetRegisterFile::aarch64_numeric_call_clobbers();
                 instructions.push(poll);
             }
             let mut jump = MachineInstruction::plain(MachineOpcode::Jump, Vec::new());
@@ -394,7 +431,6 @@ fn attach_frame_state(
     instruction.deopt = Some(deopt);
 }
 
-#[cfg(test)]
 fn machine_frame_states(hir: &NumericFunction) -> Vec<super::MachineFrameState> {
     hir.frame_states
         .iter()
@@ -567,7 +603,7 @@ mod tests {
 
     use super::*;
     use crate::entry::{JitCtx, JitEntry, JitRet, STATUS_BAILED, STATUS_RETURNED};
-    use crate::machine::{MachineFrameLayout, lower_deopt_table};
+    use crate::machine::{AllocatedLocation, lower_deopt_table};
 
     fn numeric_view(
         param_count: u16,
@@ -784,12 +820,27 @@ mod tests {
     }
 
     fn branch_phi_loop_view() -> JitCompileSnapshot {
+        branch_phi_loop_view_with(0, 0, 1_000_000, 1)
+    }
+
+    fn branch_phi_loop_view_with(
+        initial_checksum: i32,
+        initial_index: i32,
+        limit: i32,
+        increment: i32,
+    ) -> JitCompileSnapshot {
         let mut view = numeric_view(
             0,
             12,
             vec![
-                (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(0)]),
-                (Op::LoadInt32, vec![Operand::Register(3), Operand::Imm32(0)]),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(0), Operand::Imm32(initial_checksum)],
+                ),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(3), Operand::Imm32(initial_index)],
+                ),
                 (
                     Op::StoreLocal,
                     vec![Operand::Register(3), Operand::Imm32(1)],
@@ -799,7 +850,7 @@ mod tests {
                     vec![
                         Operand::Register(4),
                         Operand::Register(1),
-                        Operand::Imm32(1_000_000),
+                        Operand::Imm32(limit),
                     ],
                 ),
                 (
@@ -857,7 +908,7 @@ mod tests {
                     vec![
                         Operand::Register(10),
                         Operand::Register(1),
-                        Operand::Imm32(1),
+                        Operand::Imm32(increment),
                     ],
                 ),
                 (
@@ -882,17 +933,51 @@ mod tests {
         view: &JitCompileSnapshot,
         artifact_request: Option<ArtifactRequest>,
     ) -> NativeCompileOutput<OptimizedCode> {
-        try_compile(view, 7001, artifact_request)
+        let transitions = TransitionTable::resolve();
+        compile_output_with_transitions(view, &transitions, artifact_request)
+    }
+
+    fn compile_output_with_transitions(
+        view: &JitCompileSnapshot,
+        transitions: &TransitionTable,
+        artifact_request: Option<ArtifactRequest>,
+    ) -> NativeCompileOutput<OptimizedCode> {
+        try_compile(view, 7001, transitions, artifact_request)
             .expect("numeric Machine IR code generation")
             .expect("eligible numeric function")
     }
 
     fn execute(code: &OptimizedCode, args: &[u64], initial_pc: u32) -> (JitRet, Vec<u64>, u32) {
+        let interrupt = 0_u8;
+        let mut fuel = i64::MAX as u64;
+        let result = execute_with_poll_cells(
+            code,
+            args,
+            initial_pc,
+            std::ptr::addr_of!(interrupt),
+            &mut fuel,
+        );
+        let mut original_frame =
+            vec![Value::undefined().to_bits(); code.metadata().register_count as usize];
+        original_frame[..args.len()].copy_from_slice(args);
+        assert_eq!(
+            result.1, original_frame,
+            "successful numeric function must not mutate VM slots"
+        );
+        result
+    }
+
+    fn execute_with_poll_cells(
+        code: &OptimizedCode,
+        args: &[u64],
+        initial_pc: u32,
+        interrupt: *const u8,
+        fuel: &mut u64,
+    ) -> (JitRet, Vec<u64>, u32) {
         assert!(args.len() <= code.metadata().register_count as usize);
         let entry: JitEntry = unsafe { std::mem::transmute(code.compiled_code().entry_ptr()) };
         let mut frame = vec![Value::undefined().to_bits(); code.metadata().register_count as usize];
         frame[..args.len()].copy_from_slice(args);
-        let original_frame = frame.clone();
         let metadata = code.metadata();
         let mut native_frame = NativeFrame::new(
             VmFrameHeader {
@@ -911,6 +996,8 @@ mod tests {
         let mut thread = VmThread::empty();
         thread.current_frame = std::ptr::addr_of_mut!(native_frame) as u64;
         thread.current_code_object_id = metadata.code_object_id;
+        thread.interrupt_cell = interrupt as u64;
+        thread.backedge_fuel_cell = std::ptr::from_mut(fuel) as u64;
         let mut error = None;
         let mut ctx = JitCtx {
             thread: std::ptr::addr_of_mut!(thread),
@@ -924,10 +1011,6 @@ mod tests {
             generated_feedback_clean: 1,
         };
         let result = entry(&mut ctx);
-        assert_eq!(
-            frame, original_frame,
-            "numeric function must not mutate VM slots"
-        );
         (result, frame, native_frame.header.pc)
     }
 
@@ -1076,10 +1159,14 @@ mod tests {
     }
 
     #[test]
-    fn builds_and_allocates_loop_header_parameters_before_native_publication() {
+    fn executes_loop_header_parameters_through_native_publication() {
         let view = loop_view();
         let hir = NumericFunction::build(&view).expect("loop numeric HIR");
-        assert!(hir.has_backedges);
+        assert!(
+            hir.frame_states
+                .iter()
+                .any(|state| matches!(state.point, NumericFramePoint::Backedge { .. }))
+        );
         let sequence = select(&hir).expect("loop Machine IR");
         let (header_index, header) = sequence
             .blocks()
@@ -1101,20 +1188,18 @@ mod tests {
             .allocate(&TargetRegisterFile::aarch64_numeric_function())
             .expect("loop Machine IR allocation");
 
-        assert!(
-            try_compile(&view, 7002, None)
-                .expect("loop compilation decision")
-                .is_none(),
-            "native publication waits for poll and FrameState lowering"
-        );
+        let code = compile_output(&view, None).code;
+        for (input, expected) in [(-2, 1), (0, 1), (1, 1), (3, 3)] {
+            let (result, _, _) = execute(&code, &[tag::box_int32(input)], 0);
+            assert_eq!(result.status, STATUS_RETURNED);
+            assert_eq!(result.value, tag::box_int32(expected));
+        }
     }
 
     #[test]
-    fn builds_branch_phi_as_typed_int32_loop_before_frame_state_publication() {
+    fn executes_branch_phi_integer_loop_through_machine_ir_backend() {
         let view = branch_phi_loop_view();
         let hir = NumericFunction::build(&view).expect("branch-phi numeric HIR");
-        assert!(hir.has_backedges);
-        assert!(hir.requires_integer_lowering);
         assert_eq!(hir.frame_states.len(), 3);
         assert!(
             hir.nodes
@@ -1165,7 +1250,15 @@ mod tests {
         let allocation = sequence
             .allocate(&TargetRegisterFile::aarch64_numeric_function())
             .expect("branch-phi Machine IR allocation");
-        let layout = MachineFrameLayout::new(&allocation, 16, 16).expect("branch-phi frame layout");
+        assert!(
+            allocation
+                .metadata()
+                .iter()
+                .filter(|metadata| metadata.deopt == Some(DeoptId(2)))
+                .all(|metadata| matches!(metadata.location, AllocatedLocation::Stack(_))),
+            "poll operands must survive the leaf call in allocator spill homes"
+        );
+        let layout = arm64::frame_layout(&allocation).expect("branch-phi frame layout");
         let deopt_table = lower_deopt_table(
             &sequence,
             &allocation,
@@ -1194,12 +1287,109 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(live_slot_counts, [3, 2, 2]);
-        assert!(
-            try_compile(&view, 7003, None)
-                .expect("branch-phi compilation decision")
-                .is_none(),
-            "native publication waits for emitting overflow exits and the backedge poll"
+
+        for (limit, expected) in [(1, 2), (2, -12), (5, -22)] {
+            let code = compile_output(&branch_phi_loop_view_with(0, 0, limit, 1), None).code;
+            let (result, _, _) = execute(&code, &[], 0);
+            assert_eq!(result.status, STATUS_RETURNED);
+            assert_eq!(result.value, tag::box_int32(expected));
+        }
+
+        let transitions = TransitionTable::resolve();
+        let exact = crate::optimizing::compile_optimized_with_artifacts(
+            &view,
+            7003,
+            &transitions,
+            Some(ArtifactRequest {
+                identity: JitArtifactIdentity {
+                    function_name: "engineKernel".to_string(),
+                    module: "benchmarks/scripts/branch-phi.js".to_string(),
+                },
+                tier: JitDebugTier::Optimizing,
+                entry: JitDebugTarget::Entry,
+            }),
+            false,
+        )
+        .expect("production optimizing selector compiles exact branch-phi");
+        let artifact = exact.artifact.expect("exact branch-phi artifact");
+        let optimized_ir = std::str::from_utf8(
+            artifact
+                .file(JitArtifactFileName::OptimizedIr)
+                .expect("optimized IR artifact")
+                .contents(),
+        )
+        .expect("UTF-8 optimized IR");
+        assert!(optimized_ir.starts_with("; backend=otter-machine-ir numeric-function\n"));
+        let (result, _, _) = execute(&exact.code, &[], 0);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, tag::box_int32(-6_000_000));
+    }
+
+    #[test]
+    fn checked_integer_overflow_reconstructs_exact_mid_loop_frames() {
+        let add = compile_output(&branch_phi_loop_view_with(i32::MAX, 0, 1, 1), None).code;
+        let interrupt = 0_u8;
+        let mut fuel = i64::MAX as u64;
+        let (result, frame, pc) =
+            execute_with_poll_cells(&add, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(pc, 13);
+        assert_eq!(frame[0], tag::box_int32(i32::MAX));
+        assert_eq!(frame[1], tag::box_int32(0));
+        assert_eq!(frame[2], tag::box_int32(2));
+
+        let add_immediate =
+            compile_output(&branch_phi_loop_view_with(0, 1, 2, i32::MAX), None).code;
+        let mut fuel = i64::MAX as u64;
+        let (result, frame, pc) = execute_with_poll_cells(
+            &add_immediate,
+            &[],
+            0,
+            std::ptr::addr_of!(interrupt),
+            &mut fuel,
         );
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(pc, 15);
+        assert_eq!(frame[0], tag::box_int32(-14));
+        assert_eq!(frame[1], tag::box_int32(1));
+    }
+
+    #[test]
+    fn backedge_poll_refills_fuel_and_interrupt_bails_before_phi_moves() {
+        extern "C" fn refill(ctx: *mut JitCtx) -> u64 {
+            // SAFETY: the execution fixture keeps its thread and fuel cell live.
+            unsafe {
+                let thread = &*(*ctx).thread;
+                *(thread.backedge_fuel_cell as *mut u64) = 100;
+            }
+            0
+        }
+
+        let mut transitions = TransitionTable::resolve();
+        transitions.replace_entry_for_test(STUB_JIT_BACKEDGE_POLL, refill as *const () as usize);
+        let code = compile_output_with_transitions(
+            &branch_phi_loop_view_with(0, 0, 5, 1),
+            &transitions,
+            None,
+        )
+        .code;
+        let interrupt = 0_u8;
+        let mut fuel = 1_u64;
+        let (result, _, _) =
+            execute_with_poll_cells(&code, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, tag::box_int32(-22));
+        assert_eq!(fuel, 96);
+
+        let interrupt = 1_u8;
+        let mut fuel = i64::MAX as u64;
+        let (result, frame, pc) =
+            execute_with_poll_cells(&code, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(pc, 3);
+        assert_eq!(frame[0], tag::box_int32(2));
+        assert_eq!(frame[1], tag::box_int32(1));
+        assert_eq!(frame[2], Value::undefined().to_bits());
     }
 
     #[test]

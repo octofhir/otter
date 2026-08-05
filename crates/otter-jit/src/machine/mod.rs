@@ -320,6 +320,8 @@ pub enum MachineOpcode {
     BoxInt32,
     /// Target ABI call through a call descriptor.
     Call(u32),
+    /// Loop backedge poll with an exact interpreter reconstruction state.
+    BackedgePoll,
     /// Unconditional control transfer.
     Jump,
     /// Conditional control transfer; branch when the integer condition equals

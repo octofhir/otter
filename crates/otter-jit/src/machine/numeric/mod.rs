@@ -18,7 +18,7 @@ mod hir;
 use otter_vm::{JitArtifactFileName, JitCompileSnapshot, deopt::DeoptTable};
 use std::collections::{BTreeMap, BTreeSet};
 
-use self::hir::{NumericFunction, NumericNode, NumericTerminator, NumericType};
+use self::hir::{NumericFramePoint, NumericFunction, NumericNode, NumericTerminator, NumericType};
 use super::{
     ControlFlow, DeoptId, InstructionSequence, MachineBlock, MachineBlockData, MachineInstruction,
     MachineInstructionId, MachineOpcode, MachineOperand, MachineRepresentation, MachineValue,
@@ -147,19 +147,26 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
         .frame_states
         .iter()
         .enumerate()
-        .map(|(index, state)| (state.node, DeoptId(index as u32)))
+        .map(|(index, state)| (state.point, DeoptId(index as u32)))
         .collect::<BTreeMap<_, _>>();
     for selected in &selection_cfg.order {
         let first = MachineInstructionId(instructions.len() as u32);
         let SelectedBlock::Original(block_index) = *selected else {
-            let SelectedBlock::CriticalEdge {
+            let SelectedBlock::SplitEdge {
                 predecessor,
                 edge,
                 successor,
             } = *selected
             else {
-                unreachable!("selected block is original or critical edge")
+                unreachable!("selected block is original or split edge")
             };
+            if successor <= predecessor {
+                let point = NumericFramePoint::Backedge { predecessor, edge };
+                let deopt = frame_state_ids[&point];
+                let mut poll = MachineInstruction::plain(MachineOpcode::BackedgePoll, Vec::new());
+                attach_frame_state(hir, &values, deopt, &mut poll);
+                instructions.push(poll);
+            }
             let mut jump = MachineInstruction::plain(MachineOpcode::Jump, Vec::new());
             jump.control = ControlFlow::Branch;
             instructions.push(jump);
@@ -291,20 +298,8 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                     ],
                 ),
             };
-            if let Some(&deopt) = frame_state_ids.get(&node_value) {
-                let state = &hir.frame_states[deopt.0 as usize];
-                let mut values_at_exit = BTreeSet::new();
-                for slot in &state.slots {
-                    let hir::NumericFrameSlot::Value(value) = slot else {
-                        continue;
-                    };
-                    if values_at_exit.insert(*value) {
-                        instruction
-                            .operands
-                            .push(MachineOperand::deopt(machine_value(&values, *value)));
-                    }
-                }
-                instruction.deopt = Some(deopt);
+            if let Some(&deopt) = frame_state_ids.get(&NumericFramePoint::Node(node_value)) {
+                attach_frame_state(hir, &values, deopt, &mut instruction);
             }
             instructions.push(instruction);
         }
@@ -378,6 +373,27 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
     )
 }
 
+fn attach_frame_state(
+    hir: &NumericFunction,
+    values: &[MachineValue],
+    deopt: DeoptId,
+    instruction: &mut MachineInstruction,
+) {
+    let state = &hir.frame_states[deopt.0 as usize];
+    let mut values_at_exit = BTreeSet::new();
+    for slot in &state.slots {
+        let hir::NumericFrameSlot::Value(value) = slot else {
+            continue;
+        };
+        if values_at_exit.insert(*value) {
+            instruction
+                .operands
+                .push(MachineOperand::deopt(machine_value(values, *value)));
+        }
+    }
+    instruction.deopt = Some(deopt);
+}
+
 #[cfg(test)]
 fn machine_frame_states(hir: &NumericFunction) -> Vec<super::MachineFrameState> {
     hir.frame_states
@@ -404,7 +420,7 @@ fn machine_frame_states(hir: &NumericFunction) -> Vec<super::MachineFrameState> 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectedBlock {
     Original(usize),
-    CriticalEdge {
+    SplitEdge {
         predecessor: usize,
         edge: usize,
         successor: usize,
@@ -414,20 +430,20 @@ enum SelectedBlock {
 struct SelectionCfg {
     order: Vec<SelectedBlock>,
     originals: Vec<MachineBlock>,
-    critical_edges: BTreeMap<(usize, usize), MachineBlock>,
+    split_edges: BTreeMap<(usize, usize), MachineBlock>,
 }
 
 impl SelectionCfg {
     fn build(hir: &NumericFunction) -> Self {
         let mut order = Vec::with_capacity(hir.blocks.len());
         let mut originals = vec![MachineBlock(u32::MAX); hir.blocks.len()];
-        let mut critical_edges = BTreeMap::new();
+        let mut split_edges = BTreeMap::new();
         for (successor, original) in originals.iter_mut().enumerate() {
             for (predecessor, edge) in incoming_edges(hir, successor) {
-                if is_critical_edge(hir, predecessor, successor) {
+                if is_critical_edge(hir, predecessor, successor) || successor <= predecessor {
                     let block = MachineBlock(order.len() as u32);
-                    critical_edges.insert((predecessor, edge), block);
-                    order.push(SelectedBlock::CriticalEdge {
+                    split_edges.insert((predecessor, edge), block);
+                    order.push(SelectedBlock::SplitEdge {
                         predecessor,
                         edge,
                         successor,
@@ -440,7 +456,7 @@ impl SelectionCfg {
         Self {
             order,
             originals,
-            critical_edges,
+            split_edges,
         }
     }
 }
@@ -478,7 +494,7 @@ fn machine_block(
         .into_iter()
         .map(|(predecessor, edge)| {
             selection_cfg
-                .critical_edges
+                .split_edges
                 .get(&(predecessor, edge))
                 .copied()
                 .unwrap_or(selection_cfg.originals[predecessor])
@@ -495,7 +511,7 @@ fn machine_block(
             .enumerate()
             .map(|(edge, &successor)| {
                 selection_cfg
-                    .critical_edges
+                    .split_edges
                     .get(&(block_index, edge))
                     .copied()
                     .unwrap_or(selection_cfg.originals[successor])
@@ -511,10 +527,7 @@ fn machine_block(
             .iter()
             .enumerate()
             .map(|(edge, arguments)| {
-                if selection_cfg
-                    .critical_edges
-                    .contains_key(&(block_index, edge))
-                {
+                if selection_cfg.split_edges.contains_key(&(block_index, edge)) {
                     Vec::new()
                 } else {
                     arguments
@@ -1102,7 +1115,7 @@ mod tests {
         let hir = NumericFunction::build(&view).expect("branch-phi numeric HIR");
         assert!(hir.has_backedges);
         assert!(hir.requires_integer_lowering);
-        assert_eq!(hir.frame_states.len(), 2);
+        assert_eq!(hir.frame_states.len(), 3);
         assert!(
             hir.nodes
                 .iter()
@@ -1114,6 +1127,35 @@ mod tests {
                 .any(|node| matches!(node, NumericNode::IntegerAddImmediate(_, 1)))
         );
         let sequence = select(&hir).expect("branch-phi Machine IR");
+        let polls = sequence
+            .blocks()
+            .iter()
+            .filter_map(|block| {
+                let instructions =
+                    &sequence.instructions()[block.first.0 as usize..block.end.0 as usize];
+                instructions
+                    .iter()
+                    .any(|instruction| instruction.opcode == MachineOpcode::BackedgePoll)
+                    .then_some((block, instructions))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(polls.len(), 1);
+        let (poll_block, poll_instructions) = polls[0];
+        assert_eq!(poll_block.predecessors.len(), 1);
+        assert_eq!(poll_block.successors.len(), 1);
+        assert!(poll_block.parameters.is_empty());
+        assert!(matches!(
+            poll_instructions
+                .last()
+                .map(|instruction| &instruction.opcode),
+            Some(MachineOpcode::Jump)
+        ));
+        let poll = poll_instructions
+            .iter()
+            .find(|instruction| instruction.opcode == MachineOpcode::BackedgePoll)
+            .expect("backedge poll instruction");
+        assert_eq!(poll.deopt, Some(DeoptId(2)));
+        assert_eq!(poll.operands.len(), 2);
         assert!(sequence.blocks().iter().any(|block| {
             block.parameters.len() >= 2
                 && block.parameters.iter().all(|parameter| {
@@ -1133,9 +1175,10 @@ mod tests {
             &machine_frame_states(&hir),
         )
         .expect("branch-phi allocator-driven FrameState");
-        assert_eq!(deopt_table.len(), 2);
+        assert_eq!(deopt_table.len(), 3);
         assert_eq!(deopt_table.entries()[0].outermost().slots.len(), 12);
         assert_eq!(deopt_table.entries()[1].outermost().slots.len(), 12);
+        assert_eq!(deopt_table.entries()[2].outermost().slots.len(), 12);
         let live_slot_counts = deopt_table
             .entries()
             .iter()
@@ -1150,12 +1193,12 @@ mod tests {
                     .count()
             })
             .collect::<Vec<_>>();
-        assert_eq!(live_slot_counts, [3, 2]);
+        assert_eq!(live_slot_counts, [3, 2, 2]);
         assert!(
             try_compile(&view, 7003, None)
                 .expect("branch-phi compilation decision")
                 .is_none(),
-            "overflow FrameState and backedge polling must land before publication"
+            "native publication waits for emitting overflow exits and the backedge poll"
         );
     }
 

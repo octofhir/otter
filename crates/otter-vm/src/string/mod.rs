@@ -143,7 +143,18 @@ impl JsString {
             visitor(p);
         }
     }
+}
 
+/// The single edge a stored string wrapper carries, so a write barrier can
+/// remember it against whatever holds the wrapper. The mirror of
+/// [`JsString::trace_handle_slot`].
+impl otter_gc::GcStore for JsString {
+    fn visit_gc_edges(&self, visitor: &mut dyn FnMut(otter_gc::GcEdge)) {
+        self.handle.visit_gc_edges(visitor);
+    }
+}
+
+impl JsString {
     /// Construct a flat WTF-16 string body.
     ///
     /// # Errors

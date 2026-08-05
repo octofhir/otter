@@ -361,7 +361,23 @@ impl JsSymbol {
             description.trace_handle_slot(visitor);
         }
     }
+}
 
+/// The edges a stored symbol key carries — the body handle and the
+/// description string — so a write barrier can remember them against
+/// whatever holds the key. Must stay in step with
+/// [`JsSymbol::trace_value_slots`]: an edge the tracer follows but the
+/// barrier does not record is an old parent the scavenger never re-traces.
+impl otter_gc::GcStore for JsSymbol {
+    fn visit_gc_edges(&self, visitor: &mut dyn FnMut(otter_gc::GcEdge)) {
+        self.inner.visit_gc_edges(visitor);
+        if let Some(description) = &self.description {
+            description.visit_gc_edges(visitor);
+        }
+    }
+}
+
+impl JsSymbol {
     /// Render the symbol per `Symbol.prototype.toString` —
     /// `Symbol(<desc>)` with empty description rendered as
     /// `Symbol()`. Spec §20.4.3.3.

@@ -230,7 +230,7 @@ pub(super) fn ordinary_set_symbol_data_property(
         true
     });
     if success {
-        super::record_symbol_prop_write(heap, obj, &barrier_value);
+        super::record_symbol_entry_write(heap, obj, &key, &barrier_value);
     }
     success
 }

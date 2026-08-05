@@ -290,6 +290,29 @@ Descending integer-loop publication landed on 2026-08-05:
 The full repository gate passed with 250 JIT tests, 831 VM tests, all-target
 all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
 
+Register bitwise loop publication landed on 2026-08-05:
+
+- Int32 `AND`, `OR`, `XOR`, complement, signed left shift, and arithmetic right
+  shift now have explicit typed HIR and Machine IR operations and emit directly
+  from regalloc2 locations on AArch64;
+- variable shifts rely on AArch64's architected low-five-bit count behavior,
+  which exactly implements JavaScript's Int32 shift normalization without
+  modifying an allocator-owned live right operand;
+- focused cyclic-CFG execution covers all six operations, negative and
+  greater-than-31 shift counts, allocation, native publication, and canonical
+  Int32 return boxing;
+- `benchmarks/scripts/bitwise-mix.js` is the real frontend fixture. Its loop
+  bytecode contains `SHL`, `SHR`, `BIT_XOR`, `BIT_OR`, `BIT_AND`, `BIT_NOT`,
+  checked increment, and a polled backedge; the production selector artifact
+  proves it uses `otter-machine-ir numeric-function`;
+- the validated three-sample production-tiered median was 3.629 ms with seven
+  optimizing entries and zero deopts, versus 18.564 ms for template tier
+  (-80.4%). `USHR` remains on fallback because its Uint32 result needs an
+  explicit representation decision instead of pretending it is always Int32.
+
+The full repository gate passed with 251 JIT tests, 831 VM tests, all-target
+all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
+
 The remaining legacy optimizer and allocator are fallback for functions whose
 HIR/selection slices have not switched. Delete each old consumer as its final
 operation family moves; do not adapt old allocation or metadata into the new

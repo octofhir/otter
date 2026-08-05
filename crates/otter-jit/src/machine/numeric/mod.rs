@@ -272,13 +272,26 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         MachineOperand::register_output(result),
                     ],
                 ),
+                NumericNode::IntegerSub(left, right) => MachineInstruction::plain(
+                    MachineOpcode::IntegerSub,
+                    vec![
+                        MachineOperand::register_input(machine_value(&values, left)),
+                        MachineOperand::register_input(machine_value(&values, right)),
+                        MachineOperand::register_output(result),
+                    ],
+                ),
                 NumericNode::IntegerAddImmediate(source, immediate)
+                | NumericNode::IntegerSubImmediate(source, immediate)
                 | NumericNode::IntegerAndImmediate(source, immediate)
                 | NumericNode::IntegerLessThanImmediate(source, immediate)
-                | NumericNode::IntegerEqualImmediate(source, immediate) => {
+                | NumericNode::IntegerEqualImmediate(source, immediate)
+                | NumericNode::IntegerNotEqualImmediate(source, immediate) => {
                     let opcode = match node {
                         NumericNode::IntegerAddImmediate(..) => {
                             MachineOpcode::IntegerAddImmediate(immediate)
+                        }
+                        NumericNode::IntegerSubImmediate(..) => {
+                            MachineOpcode::IntegerSubImmediate(immediate)
                         }
                         NumericNode::IntegerAndImmediate(..) => {
                             MachineOpcode::IntegerAndImmediate(immediate)
@@ -288,6 +301,9 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         }
                         NumericNode::IntegerEqualImmediate(..) => {
                             MachineOpcode::IntegerEqualImmediate(immediate)
+                        }
+                        NumericNode::IntegerNotEqualImmediate(..) => {
+                            MachineOpcode::IntegerNotEqualImmediate(immediate)
                         }
                         _ => unreachable!("matched immediate integer node"),
                     };
@@ -631,10 +647,13 @@ mod tests {
                     | Op::Div
                     | Op::Neg
                     | Op::LessThan
+                    | Op::Increment
                     | Op::AddImm
+                    | Op::SubImm
                     | Op::BitwiseAndImm
                     | Op::LessThanImm
                     | Op::EqualImm
+                    | Op::NotEqualImm
             ) {
                 view.seed_arith_feedback_for_test(
                     pc as u32,
@@ -821,6 +840,126 @@ mod tests {
 
     fn branch_phi_loop_view() -> JitCompileSnapshot {
         branch_phi_loop_view_with(0, 0, 1_000_000, 1)
+    }
+
+    fn countdown_loop_view() -> JitCompileSnapshot {
+        let mut view = numeric_view(
+            0,
+            7,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(5)]),
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
+                (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(0)]),
+                (Op::LoadInt32, vec![Operand::Register(3), Operand::Imm32(1)]),
+                (
+                    Op::NotEqualImm,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(0),
+                        Operand::Imm32(0),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(7), Operand::Register(4)],
+                ),
+                (
+                    Op::Sub,
+                    vec![
+                        Operand::Register(5),
+                        Operand::Register(0),
+                        Operand::Register(3),
+                    ],
+                ),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(5), Operand::Imm32(0)],
+                ),
+                (
+                    Op::SubImm,
+                    vec![
+                        Operand::Register(6),
+                        Operand::Register(1),
+                        Operand::Imm32(-3),
+                    ],
+                ),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(6), Operand::Imm32(1)],
+                ),
+                (
+                    Op::Increment,
+                    vec![
+                        Operand::Register(6),
+                        Operand::Register(2),
+                        Operand::Imm32(1),
+                    ],
+                ),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(6), Operand::Imm32(2)],
+                ),
+                (Op::Jump, vec![Operand::Imm32(-9)]),
+                (Op::ReturnValue, vec![Operand::Register(1)]),
+            ],
+        );
+        for pc in [4_u32, 6, 8, 10] {
+            view.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(ARITH_INT32));
+        }
+        view
+    }
+
+    fn checked_sub_view(left: i32, right: i32) -> JitCompileSnapshot {
+        let mut view = numeric_view(
+            0,
+            3,
+            vec![
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(0), Operand::Imm32(left)],
+                ),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(1), Operand::Imm32(right)],
+                ),
+                (
+                    Op::Sub,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        );
+        view.seed_arith_feedback_for_test(2, ArithFeedback::from_bits(ARITH_INT32));
+        view
+    }
+
+    fn checked_immediate_view(op: Op, source: i32, immediate: i32) -> JitCompileSnapshot {
+        assert!(matches!(op, Op::SubImm | Op::Increment));
+        let mut view = numeric_view(
+            0,
+            2,
+            vec![
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(0), Operand::Imm32(source)],
+                ),
+                (
+                    op,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(0),
+                        Operand::Imm32(immediate),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(1)]),
+            ],
+        );
+        view.seed_arith_feedback_for_test(1, ArithFeedback::from_bits(ARITH_INT32));
+        view
     }
 
     fn branch_phi_loop_view_with(
@@ -1323,6 +1462,105 @@ mod tests {
         let (result, _, _) = execute(&exact.code, &[], 0);
         assert_eq!(result.status, STATUS_RETURNED);
         assert_eq!(result.value, tag::box_int32(-6_000_000));
+    }
+
+    #[test]
+    fn executes_countdown_integer_loop_through_machine_ir_backend() {
+        let view = countdown_loop_view();
+        let hir = NumericFunction::build(&view).expect("countdown numeric HIR");
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::IntegerSub(..)))
+        );
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::IntegerSubImmediate(_, -3)))
+        );
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::IntegerAddImmediate(_, 1)))
+        );
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::IntegerNotEqualImmediate(_, 0)))
+        );
+        assert_eq!(hir.frame_states.len(), 4);
+
+        let output = crate::optimizing::compile_optimized_with_artifacts(
+            &view,
+            7004,
+            &TransitionTable::resolve(),
+            Some(ArtifactRequest {
+                identity: JitArtifactIdentity {
+                    function_name: "countdownKernel".to_string(),
+                    module: "test:countdown-machine-loop".to_string(),
+                },
+                tier: JitDebugTier::Optimizing,
+                entry: JitDebugTarget::Entry,
+            }),
+            false,
+        )
+        .expect("production optimizing selector compiles countdown loop");
+        let optimized_ir = std::str::from_utf8(
+            output
+                .artifact
+                .as_ref()
+                .expect("countdown artifact")
+                .file(JitArtifactFileName::OptimizedIr)
+                .expect("countdown optimized IR")
+                .contents(),
+        )
+        .expect("UTF-8 optimized IR");
+        assert!(optimized_ir.starts_with("; backend=otter-machine-ir numeric-function\n"));
+
+        let (result, _, _) = execute(&output.code, &[], 0);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, tag::box_int32(15));
+    }
+
+    #[test]
+    fn checked_integer_subtraction_reconstructs_pre_operation_frames() {
+        let interrupt = 0_u8;
+        let mut fuel = i64::MAX as u64;
+        let register = compile_output(&checked_sub_view(i32::MIN, 1), None).code;
+        let (result, frame, pc) =
+            execute_with_poll_cells(&register, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(pc, 2);
+        assert_eq!(
+            frame,
+            [
+                tag::box_int32(i32::MIN),
+                tag::box_int32(1),
+                Value::undefined().to_bits()
+            ]
+        );
+
+        let immediate =
+            compile_output(&checked_immediate_view(Op::SubImm, i32::MAX, -1), None).code;
+        let (result, frame, pc) =
+            execute_with_poll_cells(&immediate, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(pc, 1);
+        assert_eq!(
+            frame,
+            [tag::box_int32(i32::MAX), Value::undefined().to_bits()]
+        );
+
+        let increment =
+            compile_output(&checked_immediate_view(Op::Increment, i32::MAX, 1), None).code;
+        let (result, frame, pc) =
+            execute_with_poll_cells(&increment, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(pc, 1);
+        assert_eq!(
+            frame,
+            [tag::box_int32(i32::MAX), Value::undefined().to_bits()]
+        );
     }
 
     #[test]

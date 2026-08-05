@@ -292,14 +292,20 @@ pub enum MachineOpcode {
     FloatConstant(u64),
     /// Integer addition.
     IntegerAdd,
+    /// Integer subtraction with an overflow exit.
+    IntegerSub,
     /// Integer addition with a baked right operand and overflow exit.
     IntegerAddImmediate(i32),
+    /// Integer subtraction with a baked right operand and overflow exit.
+    IntegerSubImmediate(i32),
     /// Integer bitwise AND with a baked right operand.
     IntegerAndImmediate(i32),
     /// Signed integer less-than with a baked right operand.
     IntegerLessThanImmediate(i32),
     /// Integer equality with a baked right operand.
     IntegerEqualImmediate(i32),
+    /// Integer inequality with a baked right operand.
+    IntegerNotEqualImmediate(i32),
     /// Losslessly widen an integer Number into floating-point representation.
     Int32ToFloat64,
     /// Floating-point addition.

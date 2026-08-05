@@ -248,27 +248,44 @@ pub(super) fn emit(
                 let destination = float_register(locations[1])?;
                 dynasm!(ops ; .arch aarch64 ; scvtf D(destination), W(source));
             }
-            MachineOpcode::IntegerAdd => {
+            MachineOpcode::IntegerAdd | MachineOpcode::IntegerSub => {
                 let left = integer_register(locations[0])?;
                 let right = integer_register(locations[1])?;
                 let destination = integer_register(locations[2])?;
                 let exit = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; adds W(destination), W(left), W(right)
-                    ; b.vs =>exit
-                );
+                if instruction.opcode == MachineOpcode::IntegerAdd {
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; adds W(destination), W(left), W(right)
+                        ; b.vs =>exit
+                    );
+                } else {
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; subs W(destination), W(left), W(right)
+                        ; b.vs =>exit
+                    );
+                }
             }
-            MachineOpcode::IntegerAddImmediate(immediate) => {
+            MachineOpcode::IntegerAddImmediate(immediate)
+            | MachineOpcode::IntegerSubImmediate(immediate) => {
                 let source = integer_register(locations[0])?;
                 let destination = integer_register(locations[1])?;
                 let exit = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
                 emit_load_u64(&mut ops, 16, immediate as u32 as u64);
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; adds W(destination), W(source), w16
-                    ; b.vs =>exit
-                );
+                if matches!(instruction.opcode, MachineOpcode::IntegerAddImmediate(_)) {
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; adds W(destination), W(source), w16
+                        ; b.vs =>exit
+                    );
+                } else {
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; subs W(destination), W(source), w16
+                        ; b.vs =>exit
+                    );
+                }
             }
             MachineOpcode::IntegerAndImmediate(immediate) => {
                 let source = integer_register(locations[0])?;
@@ -277,18 +294,23 @@ pub(super) fn emit(
                 dynasm!(ops ; .arch aarch64 ; and W(destination), W(source), w16);
             }
             MachineOpcode::IntegerLessThanImmediate(immediate)
-            | MachineOpcode::IntegerEqualImmediate(immediate) => {
+            | MachineOpcode::IntegerEqualImmediate(immediate)
+            | MachineOpcode::IntegerNotEqualImmediate(immediate) => {
                 let source = integer_register(locations[0])?;
                 let destination = integer_register(locations[1])?;
                 emit_load_u64(&mut ops, 16, immediate as u32 as u64);
                 dynasm!(ops ; .arch aarch64 ; cmp W(source), w16);
-                if matches!(
-                    instruction.opcode,
-                    MachineOpcode::IntegerLessThanImmediate(_)
-                ) {
-                    dynasm!(ops ; .arch aarch64 ; cset W(destination), lt);
-                } else {
-                    dynasm!(ops ; .arch aarch64 ; cset W(destination), eq);
+                match instruction.opcode {
+                    MachineOpcode::IntegerLessThanImmediate(_) => {
+                        dynasm!(ops ; .arch aarch64 ; cset W(destination), lt);
+                    }
+                    MachineOpcode::IntegerEqualImmediate(_) => {
+                        dynasm!(ops ; .arch aarch64 ; cset W(destination), eq);
+                    }
+                    MachineOpcode::IntegerNotEqualImmediate(_) => {
+                        dynasm!(ops ; .arch aarch64 ; cset W(destination), ne);
+                    }
+                    _ => unreachable!("matched immediate integer comparison"),
                 }
             }
             MachineOpcode::BackedgePoll => {

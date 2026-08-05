@@ -1,35 +1,64 @@
-//! Typed, side-effect-free numeric HIR selection from authoritative bytecode.
+//! Typed numeric HIR and acyclic control-flow construction.
 //!
 //! # Contents
-//! - [`NumericFunction`] — bounded numeric expression graph.
-//! - [`NumericNode`] — typed parameter, constant, and arithmetic nodes.
-//! - Strict decoding of compiler-generated local-copy scaffolding.
+//! - [`NumericFunction`] — bounded numeric SSA graph with explicit blocks.
+//! - [`NumericBlock`] and [`NumericTerminator`] — predecessor/successor edges,
+//!   block parameters, edge arguments, branches, and returns.
+//! - [`NumericNode`] — typed parameters, constants, arithmetic, and comparison.
 //!
 //! # Invariants
 //! - Every accepted parameter is guarded as a JavaScript Number before effects.
-//! - Accepted nodes cannot allocate, call, branch, touch the heap, or throw.
-//! - Numeric coercion opcodes are erased only after their inputs are proven.
-//! - The graph has one terminal numeric return; profitability belongs to tier
-//!   policy, not to a benchmark-shaped operation-count threshold.
+//! - Accepted nodes cannot allocate, call, touch the heap, or throw.
+//! - Register merges become typed block parameters; no interpreter slot reaches
+//!   Machine IR.
+//! - Only acyclic graphs are accepted until loop FrameState and OSR land.
+//! - Critical edges carrying block arguments are rejected until edge splitting
+//!   makes allocator move placement unambiguous.
+
+use std::collections::BTreeMap;
 
 use otter_bytecode::{Op, Operand};
 use otter_vm::{JitCompileSnapshot, JitInstructionMetadata};
 
-const MAX_LEAF_INSTRUCTIONS: usize = 512;
-const MAX_LEAF_PARAMETERS: u16 = 16;
+const MAX_FUNCTION_INSTRUCTIONS: usize = 512;
+const MAX_FUNCTION_PARAMETERS: u16 = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct NumericValue(pub(super) usize);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NumericType {
+    Number,
+    Boolean,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum NumericNode {
     Parameter(u16),
+    BlockParameter(NumericType),
     Constant(f64),
     Add(NumericValue, NumericValue),
     Sub(NumericValue, NumericValue),
     Mul(NumericValue, NumericValue),
     Div(NumericValue, NumericValue),
     Neg(NumericValue),
+    LessThan(NumericValue, NumericValue),
+}
+
+impl NumericNode {
+    pub(super) const fn value_type(self) -> NumericType {
+        match self {
+            Self::LessThan(..) | Self::BlockParameter(NumericType::Boolean) => NumericType::Boolean,
+            Self::Parameter(..)
+            | Self::BlockParameter(NumericType::Number)
+            | Self::Constant(..)
+            | Self::Add(..)
+            | Self::Sub(..)
+            | Self::Mul(..)
+            | Self::Div(..)
+            | Self::Neg(..) => NumericType::Number,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,13 +68,49 @@ enum RegisterState {
     Value(NumericValue),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NumericTerminator {
+    Jump,
+    Branch {
+        condition: NumericValue,
+        when_true: bool,
+    },
+    Return(NumericValue),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NumericBlock {
+    pub(super) predecessors: Vec<usize>,
+    pub(super) successors: Vec<usize>,
+    pub(super) parameters: Vec<NumericValue>,
+    pub(super) successor_arguments: Vec<Vec<NumericValue>>,
+    pub(super) nodes: Vec<NumericValue>,
+    pub(super) terminator: NumericTerminator,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct NumericFunction {
     pub(super) nodes: Vec<NumericNode>,
-    pub(super) result: NumericValue,
+    pub(super) blocks: Vec<NumericBlock>,
     pub(super) parameter_count: u16,
     pub(super) register_count: u16,
     pub(super) arithmetic_op_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RawTerminator {
+    Jump,
+    Branch { when_true: bool },
+    Return,
+}
+
+#[derive(Debug, Clone)]
+struct RawBlock {
+    start: usize,
+    end: usize,
+    predecessors: Vec<usize>,
+    successors: Vec<usize>,
+    terminator: RawTerminator,
 }
 
 impl NumericFunction {
@@ -57,115 +122,327 @@ impl NumericFunction {
             || code.is_generator
             || code.is_async_generator
             || parameter_count > register_count
-            || parameter_count > MAX_LEAF_PARAMETERS
+            || parameter_count > MAX_FUNCTION_PARAMETERS
             || view.instructions.is_empty()
-            || view.instructions.len() > MAX_LEAF_INSTRUCTIONS
+            || view.instructions.len() > MAX_FUNCTION_INSTRUCTIONS
+            || !code.loop_headers().is_empty()
+            || !code.control_flow().exception_regions().is_empty()
         {
             return None;
         }
 
-        let mut nodes = Vec::with_capacity(view.instructions.len());
-        let mut registers = vec![RegisterState::Unset; usize::from(register_count)];
+        let raw_blocks = build_raw_blocks(view)?;
+        let mut nodes = Vec::with_capacity(view.instructions.len() + register_count as usize);
+        let mut entry = vec![RegisterState::Unset; usize::from(register_count)];
+        let mut entry_nodes = Vec::with_capacity(parameter_count as usize);
         for parameter in 0..parameter_count {
             let value = push(&mut nodes, NumericNode::Parameter(parameter));
-            registers[usize::from(parameter)] = RegisterState::Value(value);
+            entry[usize::from(parameter)] = RegisterState::Value(value);
+            entry_nodes.push(value);
         }
 
+        let mut blocks = Vec::with_capacity(raw_blocks.len());
+        let mut out_states = Vec::<Vec<RegisterState>>::with_capacity(raw_blocks.len());
+        let mut parameter_registers = Vec::<Vec<u16>>::with_capacity(raw_blocks.len());
         let mut arithmetic_op_count = 0usize;
-        let mut result = None;
-        for (index, instruction) in view.instructions.iter().enumerate() {
-            if result.is_some() {
-                return None;
+
+        for (block_index, raw) in raw_blocks.iter().enumerate() {
+            let (mut registers, parameters, parameter_regs) = if block_index == 0 {
+                (entry.clone(), Vec::new(), Vec::new())
+            } else {
+                merge_predecessors(raw, &out_states, &mut nodes)?
+            };
+            let mut block_nodes = if block_index == 0 {
+                entry_nodes.clone()
+            } else {
+                Vec::new()
+            };
+            block_nodes.extend(parameters.iter().copied());
+
+            let terminal_pc = raw.end.checked_sub(1)?;
+            for pc in raw.start..raw.end {
+                let instruction = &view.instructions[pc];
+                let op = instruction.op(code);
+                if pc == terminal_pc
+                    && matches!(
+                        op,
+                        Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse | Op::ReturnValue
+                    )
+                {
+                    break;
+                }
+                lower_instruction(
+                    instruction,
+                    code,
+                    &mut registers,
+                    &mut nodes,
+                    &mut block_nodes,
+                    &mut arithmetic_op_count,
+                )?;
             }
-            let op = instruction.op(code);
-            match op {
-                Op::StoreLocal => {
-                    let source = register(instruction, code, 0)?;
-                    let local = local_index(instruction, code, 1)?;
-                    let value = read_state(&registers, source)?;
-                    write(&mut registers, local, value)?;
-                }
-                Op::LoadLocal => {
-                    let destination = register(instruction, code, 0)?;
-                    let local = local_index(instruction, code, 1)?;
-                    let value = read_state(&registers, local)?;
-                    write(&mut registers, destination, value)?;
-                }
-                Op::LoadUndefined => {
-                    write(
-                        &mut registers,
-                        register(instruction, code, 0)?,
-                        RegisterState::Undefined,
-                    )?;
-                }
-                Op::LoadInt32 => {
-                    let destination = register(instruction, code, 0)?;
-                    let value = f64::from(instruction.imm32(code, 1)?);
-                    let node = push(&mut nodes, NumericNode::Constant(value));
-                    write(&mut registers, destination, RegisterState::Value(node))?;
-                }
-                Op::LoadNumber => {
-                    let destination = register(instruction, code, 0)?;
-                    instruction.const_index(code, 1)?;
-                    let node = push(&mut nodes, NumericNode::Constant(instruction.load_number?));
-                    write(&mut registers, destination, RegisterState::Value(node))?;
-                }
-                Op::ToPrimitive => {
-                    let destination = register(instruction, code, 0)?;
-                    let source = register(instruction, code, 1)?;
-                    instruction.const_index(code, 2)?;
-                    let value = read_numeric(&registers, source)?;
-                    write(&mut registers, destination, RegisterState::Value(value))?;
-                }
-                Op::ToNumeric => {
-                    let destination = register(instruction, code, 0)?;
-                    let source = register(instruction, code, 1)?;
-                    let value = read_numeric(&registers, source)?;
-                    write(&mut registers, destination, RegisterState::Value(value))?;
-                }
-                Op::Add | Op::Sub | Op::Mul | Op::Div => {
-                    if !instruction.arith_feedback().is_numeric_only() {
-                        return None;
+
+            let terminal = &view.instructions[terminal_pc];
+            let terminator = match raw.terminator {
+                RawTerminator::Jump => NumericTerminator::Jump,
+                RawTerminator::Branch { when_true } => {
+                    let condition = read_boolean(&registers, &nodes, register(terminal, code, 1)?)?;
+                    NumericTerminator::Branch {
+                        condition,
+                        when_true,
                     }
-                    let destination = register(instruction, code, 0)?;
-                    let left = read_numeric(&registers, register(instruction, code, 1)?)?;
-                    let right = read_numeric(&registers, register(instruction, code, 2)?)?;
-                    let node = match op {
-                        Op::Add => NumericNode::Add(left, right),
-                        Op::Sub => NumericNode::Sub(left, right),
-                        Op::Mul => NumericNode::Mul(left, right),
-                        Op::Div => NumericNode::Div(left, right),
-                        _ => unreachable!("matched numeric binary operation"),
-                    };
-                    let node = push(&mut nodes, node);
-                    write(&mut registers, destination, RegisterState::Value(node))?;
-                    arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
                 }
-                Op::Neg => {
-                    if !instruction.arith_feedback().is_numeric_only() {
-                        return None;
-                    }
-                    let destination = register(instruction, code, 0)?;
-                    let source = read_numeric(&registers, register(instruction, code, 1)?)?;
-                    let node = push(&mut nodes, NumericNode::Neg(source));
-                    write(&mut registers, destination, RegisterState::Value(node))?;
-                    arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
+                RawTerminator::Return => NumericTerminator::Return(read_numeric(
+                    &registers,
+                    &nodes,
+                    register(terminal, code, 0)?,
+                )?),
+            };
+
+            out_states.push(registers);
+            parameter_registers.push(parameter_regs);
+            blocks.push(NumericBlock {
+                predecessors: raw.predecessors.clone(),
+                successors: raw.successors.clone(),
+                parameters,
+                successor_arguments: vec![Vec::new(); raw.successors.len()],
+                nodes: block_nodes,
+                terminator,
+            });
+        }
+
+        for predecessor in 0..blocks.len() {
+            for edge in 0..blocks[predecessor].successors.len() {
+                let successor = blocks[predecessor].successors[edge];
+                if !blocks[successor].parameters.is_empty()
+                    && blocks[predecessor].successors.len() > 1
+                    && blocks[successor].predecessors.len() > 1
+                {
+                    return None;
                 }
-                Op::ReturnValue if index + 1 == view.instructions.len() => {
-                    result = Some(read_numeric(&registers, register(instruction, code, 0)?)?);
-                }
-                _ => return None,
+                blocks[predecessor].successor_arguments[edge] = parameter_registers[successor]
+                    .iter()
+                    .map(
+                        |&register| match out_states[predecessor][usize::from(register)] {
+                            RegisterState::Value(value) => Some(value),
+                            RegisterState::Unset | RegisterState::Undefined => None,
+                        },
+                    )
+                    .collect::<Option<Vec<_>>>()?;
             }
         }
 
         Some(Self {
             nodes,
-            result: result?,
+            blocks,
             parameter_count,
             register_count,
             arithmetic_op_count,
         })
     }
+}
+
+fn build_raw_blocks(view: &JitCompileSnapshot) -> Option<Vec<RawBlock>> {
+    let code = view.code_block.as_ref();
+    let starts = code.block_starts();
+    if starts.first().copied() != Some(0) {
+        return None;
+    }
+    let by_pc = starts
+        .iter()
+        .enumerate()
+        .map(|(index, &pc)| (pc, index))
+        .collect::<BTreeMap<_, _>>();
+    let mut blocks = Vec::with_capacity(starts.len());
+    for (index, &start) in starts.iter().enumerate() {
+        let end = starts
+            .get(index + 1)
+            .copied()
+            .unwrap_or(view.instructions.len() as u32);
+        let terminal_pc = end.checked_sub(1)?;
+        let instruction = view.instructions.get(terminal_pc as usize)?;
+        let op = instruction.op(code);
+        let (successors, terminator) = match op {
+            Op::Jump => (
+                vec![target_block(instruction, code, terminal_pc, &by_pc)?],
+                RawTerminator::Jump,
+            ),
+            Op::JumpIfTrue | Op::JumpIfFalse => (
+                vec![
+                    target_block(instruction, code, terminal_pc, &by_pc)?,
+                    *by_pc.get(&end)?,
+                ],
+                RawTerminator::Branch {
+                    when_true: op == Op::JumpIfTrue,
+                },
+            ),
+            Op::ReturnValue => (Vec::new(), RawTerminator::Return),
+            _ => (vec![*by_pc.get(&end)?], RawTerminator::Jump),
+        };
+        blocks.push(RawBlock {
+            start: start as usize,
+            end: end as usize,
+            predecessors: Vec::new(),
+            successors,
+            terminator,
+        });
+    }
+    for predecessor in 0..blocks.len() {
+        for successor in blocks[predecessor].successors.clone() {
+            if successor <= predecessor {
+                return None;
+            }
+            blocks.get_mut(successor)?.predecessors.push(predecessor);
+        }
+    }
+    if blocks
+        .iter()
+        .skip(1)
+        .any(|block| block.predecessors.is_empty())
+    {
+        return None;
+    }
+    Some(blocks)
+}
+
+fn target_block(
+    instruction: &JitInstructionMetadata,
+    code: &otter_vm::CodeBlock,
+    pc: u32,
+    by_pc: &BTreeMap<u32, usize>,
+) -> Option<usize> {
+    let target = i64::from(pc) + 1 + i64::from(instruction.imm32(code, 0)?);
+    u32::try_from(target)
+        .ok()
+        .and_then(|target| by_pc.get(&target).copied())
+}
+
+fn merge_predecessors(
+    raw: &RawBlock,
+    out_states: &[Vec<RegisterState>],
+    nodes: &mut Vec<NumericNode>,
+) -> Option<(Vec<RegisterState>, Vec<NumericValue>, Vec<u16>)> {
+    let first = out_states.get(*raw.predecessors.first()?)?.clone();
+    let mut merged = first.clone();
+    let mut parameters = Vec::new();
+    let mut parameter_registers = Vec::new();
+    for (register, merged_state) in merged.iter_mut().enumerate() {
+        let states = raw
+            .predecessors
+            .iter()
+            .map(|&predecessor| out_states.get(predecessor)?.get(register).copied())
+            .collect::<Option<Vec<_>>>()?;
+        if states.iter().all(|&state| state == states[0]) {
+            continue;
+        }
+        let mut value_type = None;
+        for state in states {
+            let RegisterState::Value(value) = state else {
+                return None;
+            };
+            let current = nodes.get(value.0)?.value_type();
+            if value_type.is_some_and(|expected| expected != current) {
+                return None;
+            }
+            value_type = Some(current);
+        }
+        let parameter = push(nodes, NumericNode::BlockParameter(value_type?));
+        *merged_state = RegisterState::Value(parameter);
+        parameters.push(parameter);
+        parameter_registers.push(u16::try_from(register).ok()?);
+    }
+    Some((merged, parameters, parameter_registers))
+}
+
+fn lower_instruction(
+    instruction: &JitInstructionMetadata,
+    code: &otter_vm::CodeBlock,
+    registers: &mut [RegisterState],
+    nodes: &mut Vec<NumericNode>,
+    block_nodes: &mut Vec<NumericValue>,
+    arithmetic_op_count: &mut usize,
+) -> Option<()> {
+    let op = instruction.op(code);
+    let node = match op {
+        Op::StoreLocal => {
+            let value = read_state(registers, register(instruction, code, 0)?)?;
+            write(registers, local_index(instruction, code, 1)?, value)?;
+            return Some(());
+        }
+        Op::LoadLocal => {
+            let value = read_state(registers, local_index(instruction, code, 1)?)?;
+            write(registers, register(instruction, code, 0)?, value)?;
+            return Some(());
+        }
+        Op::LoadUndefined => {
+            write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Undefined,
+            )?;
+            return Some(());
+        }
+        Op::LoadInt32 => NumericNode::Constant(f64::from(instruction.imm32(code, 1)?)),
+        Op::LoadNumber => {
+            instruction.const_index(code, 1)?;
+            NumericNode::Constant(instruction.load_number?)
+        }
+        Op::ToPrimitive => {
+            instruction.const_index(code, 2)?;
+            let value = read_numeric(registers, nodes, register(instruction, code, 1)?)?;
+            write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            )?;
+            return Some(());
+        }
+        Op::ToNumeric => {
+            let value = read_numeric(registers, nodes, register(instruction, code, 1)?)?;
+            write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            )?;
+            return Some(());
+        }
+        Op::Add | Op::Sub | Op::Mul | Op::Div => {
+            if !instruction.arith_feedback().is_numeric_only() {
+                return None;
+            }
+            let left = read_numeric(registers, nodes, register(instruction, code, 1)?)?;
+            let right = read_numeric(registers, nodes, register(instruction, code, 2)?)?;
+            *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
+            match op {
+                Op::Add => NumericNode::Add(left, right),
+                Op::Sub => NumericNode::Sub(left, right),
+                Op::Mul => NumericNode::Mul(left, right),
+                Op::Div => NumericNode::Div(left, right),
+                _ => unreachable!("matched numeric binary operation"),
+            }
+        }
+        Op::Neg => {
+            if !instruction.arith_feedback().is_numeric_only() {
+                return None;
+            }
+            let source = read_numeric(registers, nodes, register(instruction, code, 1)?)?;
+            *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
+            NumericNode::Neg(source)
+        }
+        Op::LessThan => {
+            if !instruction.arith_feedback().is_numeric_only() {
+                return None;
+            }
+            NumericNode::LessThan(
+                read_numeric(registers, nodes, register(instruction, code, 1)?)?,
+                read_numeric(registers, nodes, register(instruction, code, 2)?)?,
+            )
+        }
+        _ => return None,
+    };
+    let destination = register(instruction, code, 0)?;
+    let value = push(nodes, node);
+    block_nodes.push(value);
+    write(registers, destination, RegisterState::Value(value))
 }
 
 fn push(nodes: &mut Vec<NumericNode>, node: NumericNode) -> NumericValue {
@@ -200,11 +477,26 @@ fn read_state(registers: &[RegisterState], register: u16) -> Option<RegisterStat
     }
 }
 
-fn read_numeric(registers: &[RegisterState], register: u16) -> Option<NumericValue> {
-    match read_state(registers, register)? {
-        RegisterState::Value(value) => Some(value),
-        RegisterState::Unset | RegisterState::Undefined => None,
-    }
+fn read_numeric(
+    registers: &[RegisterState],
+    nodes: &[NumericNode],
+    register: u16,
+) -> Option<NumericValue> {
+    let RegisterState::Value(value) = read_state(registers, register)? else {
+        return None;
+    };
+    (nodes.get(value.0)?.value_type() == NumericType::Number).then_some(value)
+}
+
+fn read_boolean(
+    registers: &[RegisterState],
+    nodes: &[NumericNode],
+    register: u16,
+) -> Option<NumericValue> {
+    let RegisterState::Value(value) = read_state(registers, register)? else {
+        return None;
+    };
+    (nodes.get(value.0)?.value_type() == NumericType::Boolean).then_some(value)
 }
 
 fn write(registers: &mut [RegisterState], register: u16, value: RegisterState) -> Option<()> {

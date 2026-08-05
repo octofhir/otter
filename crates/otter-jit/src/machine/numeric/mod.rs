@@ -1,4 +1,4 @@
-//! Production numeric-leaf lowering through the shared Machine IR pipeline.
+//! Production numeric-function lowering through the shared Machine IR pipeline.
 //!
 //! # Contents
 //! - `hir` — typed, side-effect-free numeric semantic graph.
@@ -10,7 +10,7 @@
 //!   contain no bytecode operations.
 //! - Parameter guards bail at logical PC zero before observable effects.
 //! - Machine locations, edits, and frame size come only from regalloc2 output.
-//! - The emitted leaf contains no call or safepoint and owns no GC roots.
+//! - Emitted functions contain no call or safepoint and own no GC roots.
 
 mod arm64;
 mod hir;
@@ -18,7 +18,7 @@ mod hir;
 use otter_vm::{JitArtifactFileName, JitCompileSnapshot, deopt::DeoptTable};
 use std::collections::BTreeMap;
 
-use self::hir::{NumericFunction, NumericNode};
+use self::hir::{NumericFunction, NumericNode, NumericTerminator, NumericType};
 use super::{
     ControlFlow, DeoptId, InstructionSequence, MachineBlock, MachineBlockData, MachineInstruction,
     MachineInstructionId, MachineOpcode, MachineOperand, MachineRepresentation, MachineValue,
@@ -44,7 +44,7 @@ pub(crate) fn try_compile(
     let sequence = select(&hir)
         .map_err(|_| Unsupported::OperandShape("numeric HIR to Machine IR selection"))?;
     let allocation = sequence
-        .allocate(&TargetRegisterFile::aarch64_numeric_leaf())
+        .allocate(&TargetRegisterFile::aarch64_numeric_function())
         .map_err(|_| Unsupported::OperandShape("numeric Machine IR allocation"))?;
     let emission = arm64::emit(&sequence, &allocation)?;
     let machine_register_count = u8::try_from(allocation.used_register_count())
@@ -56,14 +56,17 @@ pub(crate) fn try_compile(
 
     let artifact = artifact_request.map(|request| {
         let mut tier_input = format!(
-            "; backend=otter-machine-ir numeric-leaf\n; parameters={} registers={} arithmetic-ops={}\n",
-            hir.parameter_count, hir.register_count, hir.arithmetic_op_count
+            "; backend=otter-machine-ir numeric-function\n; parameters={} registers={} blocks={} arithmetic-ops={}\n",
+            hir.parameter_count,
+            hir.register_count,
+            hir.blocks.len(),
+            hir.arithmetic_op_count
         );
         tier_input.push_str(&sequence.normalized());
         tier_input.push_str(&allocation.normalized());
         let mut code_map = CodeMapCapture::default();
         code_map.record(CodeRegion::structural(
-            "machineNumericLeaf",
+            "machineNumericFunction",
             0,
             emission.code.len(),
         ));
@@ -114,104 +117,181 @@ pub(crate) fn try_compile(
 }
 
 fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::VerificationError> {
-    let mut representations =
-        Vec::with_capacity(hir.nodes.len() + hir.parameter_count as usize + 1);
-    let mut instructions = Vec::with_capacity(hir.nodes.len() + hir.parameter_count as usize + 2);
+    let mut representations = hir
+        .nodes
+        .iter()
+        .map(|node| match node.value_type() {
+            NumericType::Number => MachineRepresentation::Float64,
+            NumericType::Boolean => MachineRepresentation::Int32,
+        })
+        .collect::<Vec<_>>();
+    let values = (0..hir.nodes.len())
+        .map(|index| MachineValue(index as u32))
+        .collect::<Vec<_>>();
     let mut tagged_parameters = Vec::with_capacity(hir.parameter_count as usize);
-    for parameter in 0..hir.parameter_count {
+    for _ in 0..hir.parameter_count {
         let tagged = push_value(&mut representations, MachineRepresentation::Tagged);
         tagged_parameters.push(tagged);
-        instructions.push(MachineInstruction::plain(
-            MachineOpcode::EntryValue(parameter),
-            vec![MachineOperand::register_output(tagged)],
-        ));
     }
 
-    let mut values = vec![None; hir.nodes.len()];
+    let mut instructions = Vec::with_capacity(hir.nodes.len() + hir.parameter_count as usize + 4);
+    let mut blocks = Vec::with_capacity(hir.blocks.len());
     let mut next_deopt = 0u32;
-    for (index, node) in hir.nodes.iter().copied().enumerate() {
-        let result = push_value(&mut representations, MachineRepresentation::Float64);
-        let instruction = match node {
-            NumericNode::Parameter(parameter) => {
-                let tagged = tagged_parameters[usize::from(parameter)];
-                let mut instruction = MachineInstruction::plain(
-                    MachineOpcode::DecodeNumber,
-                    vec![
-                        MachineOperand::register_input(tagged),
-                        MachineOperand::register_output(result),
-                        MachineOperand::deopt(tagged),
-                    ],
-                );
-                instruction.deopt = Some(DeoptId(next_deopt));
-                next_deopt += 1;
-                instruction
+    for (block_index, block) in hir.blocks.iter().enumerate() {
+        let first = MachineInstructionId(instructions.len() as u32);
+        if block_index == 0 {
+            for parameter in 0..hir.parameter_count {
+                instructions.push(MachineInstruction::plain(
+                    MachineOpcode::EntryValue(parameter),
+                    vec![MachineOperand::register_output(
+                        tagged_parameters[usize::from(parameter)],
+                    )],
+                ));
             }
-            NumericNode::Constant(value) => MachineInstruction::plain(
-                MachineOpcode::FloatConstant(value.to_bits()),
-                vec![MachineOperand::register_output(result)],
-            ),
-            NumericNode::Add(left, right)
-            | NumericNode::Sub(left, right)
-            | NumericNode::Mul(left, right)
-            | NumericNode::Div(left, right) => {
-                let opcode = match node {
-                    NumericNode::Add(..) => MachineOpcode::FloatAdd,
-                    NumericNode::Sub(..) => MachineOpcode::FloatSub,
-                    NumericNode::Mul(..) => MachineOpcode::FloatMul,
-                    NumericNode::Div(..) => MachineOpcode::FloatDiv,
-                    _ => unreachable!("matched binary numeric node"),
-                };
-                MachineInstruction::plain(
-                    opcode,
+        }
+        for &node_value in &block.nodes {
+            let result = values[node_value.0];
+            let node = hir.nodes[node_value.0];
+            let instruction = match node {
+                NumericNode::Parameter(parameter) => {
+                    let tagged = tagged_parameters[usize::from(parameter)];
+                    let mut instruction = MachineInstruction::plain(
+                        MachineOpcode::DecodeNumber,
+                        vec![
+                            MachineOperand::register_input(tagged),
+                            MachineOperand::register_output(result),
+                            MachineOperand::deopt(tagged),
+                        ],
+                    );
+                    instruction.deopt = Some(DeoptId(next_deopt));
+                    next_deopt += 1;
+                    instruction
+                }
+                NumericNode::BlockParameter(_) => continue,
+                NumericNode::Constant(value) => MachineInstruction::plain(
+                    MachineOpcode::FloatConstant(value.to_bits()),
+                    vec![MachineOperand::register_output(result)],
+                ),
+                NumericNode::Add(left, right)
+                | NumericNode::Sub(left, right)
+                | NumericNode::Mul(left, right)
+                | NumericNode::Div(left, right) => {
+                    let opcode = match node {
+                        NumericNode::Add(..) => MachineOpcode::FloatAdd,
+                        NumericNode::Sub(..) => MachineOpcode::FloatSub,
+                        NumericNode::Mul(..) => MachineOpcode::FloatMul,
+                        NumericNode::Div(..) => MachineOpcode::FloatDiv,
+                        _ => unreachable!("matched binary numeric node"),
+                    };
+                    MachineInstruction::plain(
+                        opcode,
+                        vec![
+                            MachineOperand::register_input(machine_value(&values, left)),
+                            MachineOperand::register_input(machine_value(&values, right)),
+                            MachineOperand::register_output(result),
+                        ],
+                    )
+                }
+                NumericNode::Neg(source) => MachineInstruction::plain(
+                    MachineOpcode::FloatNeg,
                     vec![
-                        MachineOperand::register_input(value(&values, left)),
-                        MachineOperand::register_input(value(&values, right)),
+                        MachineOperand::register_input(machine_value(&values, source)),
                         MachineOperand::register_output(result),
                     ],
-                )
-            }
-            NumericNode::Neg(source) => MachineInstruction::plain(
-                MachineOpcode::FloatNeg,
-                vec![
-                    MachineOperand::register_input(value(&values, source)),
-                    MachineOperand::register_output(result),
-                ],
-            ),
-        };
-        instructions.push(instruction);
-        values[index] = Some(result);
-    }
+                ),
+                NumericNode::LessThan(left, right) => MachineInstruction::plain(
+                    MachineOpcode::FloatLessThan,
+                    vec![
+                        MachineOperand::register_input(machine_value(&values, left)),
+                        MachineOperand::register_input(machine_value(&values, right)),
+                        MachineOperand::register_output(result),
+                    ],
+                ),
+            };
+            instructions.push(instruction);
+        }
 
-    let boxed = push_value(&mut representations, MachineRepresentation::Tagged);
-    instructions.push(MachineInstruction::plain(
-        MachineOpcode::BoxNumber,
-        vec![
-            MachineOperand::register_input(value(&values, hir.result)),
-            MachineOperand::register_output(boxed),
-        ],
-    ));
-    let mut ret = MachineInstruction::plain(
-        MachineOpcode::Return,
-        vec![MachineOperand::register_input(boxed)],
-    );
-    ret.control = ControlFlow::Return;
-    instructions.push(ret);
-    let end = MachineInstructionId(instructions.len() as u32);
+        let mut terminator = match block.terminator {
+            NumericTerminator::Jump => MachineInstruction::plain(MachineOpcode::Jump, Vec::new()),
+            NumericTerminator::Branch {
+                condition,
+                when_true,
+            } => MachineInstruction::plain(
+                MachineOpcode::BranchIf(when_true),
+                vec![MachineOperand::register_input(machine_value(
+                    &values, condition,
+                ))],
+            ),
+            NumericTerminator::Return(value) => {
+                let boxed = push_value(&mut representations, MachineRepresentation::Tagged);
+                instructions.push(MachineInstruction::plain(
+                    MachineOpcode::BoxNumber,
+                    vec![
+                        MachineOperand::register_input(machine_value(&values, value)),
+                        MachineOperand::register_output(boxed),
+                    ],
+                ));
+                let mut ret = MachineInstruction::plain(
+                    MachineOpcode::Return,
+                    vec![MachineOperand::register_input(boxed)],
+                );
+                ret.control = ControlFlow::Return;
+                instructions.push(ret);
+                let end = MachineInstructionId(instructions.len() as u32);
+                blocks.push(machine_block(block, &values, first, end));
+                continue;
+            }
+        };
+        terminator.control = ControlFlow::Branch;
+        instructions.push(terminator);
+        let end = MachineInstructionId(instructions.len() as u32);
+        blocks.push(machine_block(block, &values, first, end));
+    }
 
     InstructionSequence::new(
         MachineBlock(0),
         representations,
         Vec::new(),
-        vec![MachineBlockData {
-            first: MachineInstructionId(0),
-            end,
-            predecessors: Vec::new(),
-            successors: Vec::new(),
-            parameters: Vec::new(),
-            successor_arguments: Vec::new(),
-        }],
+        blocks,
         instructions,
     )
+}
+
+fn machine_block(
+    block: &hir::NumericBlock,
+    values: &[MachineValue],
+    first: MachineInstructionId,
+    end: MachineInstructionId,
+) -> MachineBlockData {
+    MachineBlockData {
+        first,
+        end,
+        predecessors: block
+            .predecessors
+            .iter()
+            .map(|&block| MachineBlock(block as u32))
+            .collect(),
+        successors: block
+            .successors
+            .iter()
+            .map(|&block| MachineBlock(block as u32))
+            .collect(),
+        parameters: block
+            .parameters
+            .iter()
+            .map(|&value| machine_value(values, value))
+            .collect(),
+        successor_arguments: block
+            .successor_arguments
+            .iter()
+            .map(|arguments| {
+                arguments
+                    .iter()
+                    .map(|&value| machine_value(values, value))
+                    .collect()
+            })
+            .collect(),
+    }
 }
 
 fn push_value(
@@ -223,8 +303,8 @@ fn push_value(
     value
 }
 
-fn value(values: &[Option<MachineValue>], value: hir::NumericValue) -> MachineValue {
-    values[value.0].expect("numeric HIR is topologically ordered")
+fn machine_value(values: &[MachineValue], value: hir::NumericValue) -> MachineValue {
+    values[value.0]
 }
 
 #[cfg(test)]
@@ -262,7 +342,7 @@ mod tests {
         for pc in 0..view.instructions.len() {
             if matches!(
                 view.instructions[pc].op(view.code_block.as_ref()),
-                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Neg
+                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Neg | Op::LessThan
             ) {
                 view.seed_arith_feedback_for_test(
                     pc as u32,
@@ -346,13 +426,82 @@ mod tests {
         numeric_view(1, destination, instructions)
     }
 
+    fn diamond_view(branch: Op) -> JitCompileSnapshot {
+        assert!(matches!(branch, Op::JumpIfTrue | Op::JumpIfFalse));
+        numeric_view(
+            2,
+            4,
+            vec![
+                (
+                    Op::LessThan,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (branch, vec![Operand::Imm32(2), Operand::Register(2)]),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::Jump, vec![Operand::Imm32(1)]),
+                (
+                    Op::Sub,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(3)]),
+            ],
+        )
+    }
+
+    fn critical_edge_view() -> JitCompileSnapshot {
+        numeric_view(
+            2,
+            4,
+            vec![
+                (Op::LoadLocal, vec![Operand::Register(3), Operand::Imm32(0)]),
+                (
+                    Op::LessThan,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(2), Operand::Register(2)],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::Jump, vec![Operand::Imm32(0)]),
+                (Op::ReturnValue, vec![Operand::Register(3)]),
+            ],
+        )
+    }
+
     fn compile_output(
         view: &JitCompileSnapshot,
         artifact_request: Option<ArtifactRequest>,
     ) -> NativeCompileOutput<OptimizedCode> {
         try_compile(view, 7001, artifact_request)
             .expect("numeric Machine IR code generation")
-            .expect("eligible numeric leaf")
+            .expect("eligible numeric function")
     }
 
     fn execute(code: &OptimizedCode, args: &[u64], initial_pc: u32) -> (JitRet, Vec<u64>, u32) {
@@ -394,7 +543,7 @@ mod tests {
         let result = entry(&mut ctx);
         assert_eq!(
             frame, original_frame,
-            "numeric leaf must not mutate VM slots"
+            "numeric function must not mutate VM slots"
         );
         (result, frame, native_frame.header.pc)
     }
@@ -462,6 +611,60 @@ mod tests {
     }
 
     #[test]
+    fn executes_numeric_diamond_with_allocator_block_parameter() {
+        let view = diamond_view(Op::JumpIfFalse);
+        let hir = NumericFunction::build(&view).expect("diamond numeric HIR");
+        let sequence = select(&hir).expect("diamond Machine IR");
+        let merge = sequence
+            .blocks()
+            .iter()
+            .find(|block| block.predecessors.len() == 2)
+            .expect("diamond merge block");
+        assert_eq!(merge.parameters.len(), 1);
+        assert!(
+            sequence
+                .blocks()
+                .iter()
+                .filter(|block| block.successors.contains(&MachineBlock(3)))
+                .all(|block| block.successor_arguments[0].len() == 1)
+        );
+
+        let code = compile_output(&view, None).code;
+
+        let (taken, _, _) = execute(&code, &[tag::box_int32(1), tag::box_int32(3)], 0);
+        assert_eq!(taken.status, STATUS_RETURNED);
+        assert_eq!(taken.value, tag::box_int32(4));
+
+        let (fallthrough, _, _) = execute(&code, &[tag::box_int32(3), tag::box_int32(1)], 0);
+        assert_eq!(fallthrough.status, STATUS_RETURNED);
+        assert_eq!(fallthrough.value, tag::box_int32(2));
+
+        let (unordered, _, _) = execute(&code, &[boxed_f64(f64::NAN), tag::box_int32(1)], 0);
+        assert_eq!(unordered.status, STATUS_RETURNED);
+        assert!(unbox_number(unordered.value).is_nan());
+
+        let (bail, frame, pc) = execute(
+            &code,
+            &[tag::box_int32(1), Value::undefined().to_bits()],
+            19,
+        );
+        assert_eq!(bail.status, STATUS_BAILED);
+        assert_eq!(pc, 0);
+        assert_eq!(frame[1], Value::undefined().to_bits());
+
+        let branch_true = compile_output(&diamond_view(Op::JumpIfTrue), None).code;
+        let (true_edge, _, _) = execute(&branch_true, &[tag::box_int32(1), tag::box_int32(3)], 0);
+        assert_eq!(true_edge.value, tag::box_int32(-2));
+        let (false_edge, _, _) = execute(&branch_true, &[tag::box_int32(3), tag::box_int32(1)], 0);
+        assert_eq!(false_edge.value, tag::box_int32(4));
+    }
+
+    #[test]
+    fn declines_unsplit_critical_edge_with_block_parameter() {
+        assert!(NumericFunction::build(&critical_edge_view()).is_none());
+    }
+
+    #[test]
     fn number_guard_bails_before_observable_effects() {
         let code = compile_output(&identity_view(), None).code;
         let input = Value::undefined().to_bits();
@@ -493,9 +696,11 @@ mod tests {
 
         assert!(
             text(JitArtifactFileName::OptimizedIr)
-                .starts_with("; backend=otter-machine-ir numeric-leaf\n")
+                .starts_with("; backend=otter-machine-ir numeric-function\n")
         );
-        assert!(text(JitArtifactFileName::CodeMap).contains("\"kind\": \"machineNumericLeaf\""));
+        assert!(
+            text(JitArtifactFileName::CodeMap).contains("\"kind\": \"machineNumericFunction\"")
+        );
         assert_eq!(
             artifact
                 .file(JitArtifactFileName::Code)

@@ -1,7 +1,7 @@
 //! AArch64 emission for allocated numeric Machine IR.
 //!
 //! # Contents
-//! - [`emit`] — emits one call-free numeric leaf from allocator locations.
+//! - [`emit`] — emits one call-free numeric function from allocator locations.
 //! - Exact JavaScript Number decode, canonical boxing, and bailout sequences.
 //! - regalloc2 edit emission between selected instructions.
 //!
@@ -48,6 +48,11 @@ pub(super) fn emit(
     let mut ops = dynasmrt::aarch64::Assembler::new()
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
     let bail = ops.new_dynamic_label();
+    let block_labels = sequence
+        .blocks()
+        .iter()
+        .map(|_| ops.new_dynamic_label())
+        .collect::<Vec<_>>();
 
     dynasm!(ops
         ; .arch aarch64
@@ -64,12 +69,26 @@ pub(super) fn emit(
 
     for (index, instruction) in sequence.instructions().iter().enumerate() {
         let id = MachineInstructionId(index as u32);
+        let block_index = block_for_instruction(sequence, id)?;
+        if sequence.blocks()[block_index].first == id {
+            let label = block_labels[block_index];
+            dynasm!(ops ; .arch aarch64 ; =>label);
+        }
         emit_edits(
             &mut ops,
             allocation.edits(),
             AllocationPoint::Before(id),
             frame,
         )?;
+        let is_terminator = instruction.control != super::super::ControlFlow::None;
+        if is_terminator {
+            emit_edits(
+                &mut ops,
+                allocation.edits(),
+                AllocationPoint::After(id),
+                frame,
+            )?;
+        }
         let locations = allocation
             .instruction_locations(id)
             .ok_or(Unsupported::OperandShape("numeric Machine IR locations"))?;
@@ -122,6 +141,16 @@ pub(super) fn emit(
                 let destination = float_register(locations[1])?;
                 dynasm!(ops ; .arch aarch64 ; fneg D(destination), D(source));
             }
+            MachineOpcode::FloatLessThan => {
+                let left = float_register(locations[0])?;
+                let right = float_register(locations[1])?;
+                let destination = integer_register(locations[2])?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; fcmp D(left), D(right)
+                    ; cset W(destination), lt
+                );
+            }
             MachineOpcode::BoxNumber => emit_box_number(
                 &mut ops,
                 float_register(locations[0])?,
@@ -136,22 +165,45 @@ pub(super) fn emit(
                 );
                 emit_epilogue(&mut ops, frame);
             }
+            MachineOpcode::Jump => {
+                let block = &sequence.blocks()[block_index];
+                let [successor] = block.successors.as_slice() else {
+                    return Err(Unsupported::OperandShape("numeric jump successors"));
+                };
+                let target = block_labels[successor.0 as usize];
+                dynasm!(ops ; .arch aarch64 ; b =>target);
+            }
+            MachineOpcode::BranchIf(when_true) => {
+                let condition = integer_register(locations[0])?;
+                let block = &sequence.blocks()[block_index];
+                let [taken, fallthrough] = block.successors.as_slice() else {
+                    return Err(Unsupported::OperandShape("numeric branch successors"));
+                };
+                let taken = block_labels[taken.0 as usize];
+                let fallthrough = block_labels[fallthrough.0 as usize];
+                if when_true {
+                    dynasm!(ops ; .arch aarch64 ; cbnz W(condition), =>taken);
+                } else {
+                    dynasm!(ops ; .arch aarch64 ; cbz W(condition), =>taken);
+                }
+                dynasm!(ops ; .arch aarch64 ; b =>fallthrough);
+            }
             MachineOpcode::IntegerConstant(_)
             | MachineOpcode::IntegerAdd
-            | MachineOpcode::Call(_)
-            | MachineOpcode::Jump
-            | MachineOpcode::Branch => {
+            | MachineOpcode::Call(_) => {
                 return Err(Unsupported::OperandShape(
                     "numeric AArch64 Machine IR opcode",
                 ));
             }
         }
-        emit_edits(
-            &mut ops,
-            allocation.edits(),
-            AllocationPoint::After(id),
-            frame,
-        )?;
+        if !is_terminator {
+            emit_edits(
+                &mut ops,
+                allocation.edits(),
+                AllocationPoint::After(id),
+                frame,
+            )?;
+        }
     }
 
     dynasm!(ops
@@ -170,6 +222,17 @@ pub(super) fn emit(
         code: CompiledCode::new(buffer, AssemblyOffset(0)),
         stack_frame_bytes: frame.frame_bytes(),
     })
+}
+
+fn block_for_instruction(
+    sequence: &InstructionSequence,
+    instruction: MachineInstructionId,
+) -> Result<usize, Unsupported> {
+    sequence
+        .blocks()
+        .iter()
+        .position(|block| block.first.0 <= instruction.0 && instruction.0 < block.end.0)
+        .ok_or(Unsupported::OperandShape("numeric instruction block"))
 }
 
 fn reject_unimplemented_locations(

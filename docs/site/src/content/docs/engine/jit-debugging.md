@@ -172,9 +172,9 @@ executable addresses. A range must satisfy
 range against the matching code object.
 
 Inspect the first line of `optimized-ir.txt` before interpreting the payload.
-The replacement numeric-leaf path starts with `; backend=otter-machine-ir
-numeric-leaf`, followed by normalized Machine IR and exact regalloc2 output;
-its `code-map.json` owns one `machineNumericLeaf` structural region. Functions
+The replacement numeric-function path starts with `; backend=otter-machine-ir
+numeric-function`, followed by normalized Machine IR and exact regalloc2 output;
+its `code-map.json` owns one `machineNumericFunction` structural region. Functions
 not yet switched retain the legacy optimized-unit banner. Both are payloads of
 the one current artifact bundle, not separate artifact formats.
 

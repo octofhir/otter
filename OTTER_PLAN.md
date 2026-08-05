@@ -117,13 +117,20 @@ First production execution slice landed on 2026-08-05:
 - the installed code object and artifact bundle identify
   `otter-machine-ir numeric-leaf`; the previous optimizing CFG/SSA emitter is
   not entered for eligible leaves;
+- one shared post-allocation frame layout now turns allocator spill slots into
+  aligned frame bytes and exact stack offsets; the AArch64 emitter executes
+  register/spill and spill/spill edits and unwinds the same frame on return or
+  bailout;
+- native-entry coverage forces 33 simultaneously live numeric values, proves
+  real FP spills, validates the returned result, and bails from the spill frame
+  without corrupting the VM window or stack;
 - the 20-sample compile median is 14,625 ns with 256-byte code, versus 70,437.5
   ns for the consolidated legacy optimizer (-79.2%) and 100,687.5 ns for the
   published baseline (-85.5%);
 - the production-tiered kernel median is 1,578,541.5 ns, down from 2,175,729 ns
   (-27.5%), with 2.1 million optimizing returns and zero deopts.
 
-The full repository gate passed with 239 JIT tests, 831 VM tests, all-target
+The full repository gate passed with 241 JIT tests, 831 VM tests, all-target
 all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
 
 The remaining legacy optimizer and allocator are fallback for functions whose

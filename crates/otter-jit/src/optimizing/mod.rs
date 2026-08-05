@@ -182,7 +182,7 @@ impl OptimizedCode {
     }
 
     #[cfg(test)]
-    unsafe fn osr_entry_ptr_for_test(&self, logical_pc: u32) -> Option<*const u8> {
+    pub(crate) unsafe fn osr_entry_ptr_for_test(&self, logical_pc: u32) -> Option<*const u8> {
         let offset = *self.osr_entries.get(&logical_pc)?;
         // SAFETY: tests keep this code object alive through the native call.
         Some(unsafe { self.code.ptr_at(offset) })

@@ -400,6 +400,36 @@ Exact ToInt32 bitwise publication landed on 2026-08-06:
 The full repository gate passed with 260 JIT tests, 831 VM tests, all-target
 all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
 
+Numeric Machine IR OSR publication landed on 2026-08-06:
+
+- every reducible numeric loop header now owns an explicit `OsrEntry` marker.
+  Its immutable metadata aligns live VM-register sources and scalar contracts
+  with ordinary late-use Machine IR operands; regalloc2's operand locations
+  are the only physical destination map;
+- the AArch64 emitter publishes one cold trampoline per marker using the same
+  prologue, frame layout, and loop body as normal entry. It decodes exact
+  Int32, Uint32, Float64, and Boolean values directly into allocator registers
+  or spill homes, then joins after the marker's `Before` edits and before its
+  `After` edits;
+- a failed representation check writes the loop-header PC and unwinds without
+  touching the interpreter window. Successful entry reaches the existing
+  checked-operation deopt table and backedge poll, so overflow, interrupt, and
+  fuel semantics have no OSR-specific recovery or replay path;
+- focused native execution covers successful mid-loop entry, atomic type
+  rejection, exact overflow reconstruction, interrupt before phi moves, all
+  four scalar contracts, and a 23-value loop header that forces OSR operands
+  into allocator spill slots. Artifact coverage records the published OSR
+  range and retains the `otter-machine-ir numeric-function` identity;
+- the exact `benchmarks/scripts/branch-phi.js` kernel with OSR threshold 10
+  validated `return=-6000000`, one optimizing OSR entry, zero optimizing
+  deopts, and a five-sample production-tiered median of 2.286 ms versus
+  5.386 ms for template (-57.5%). These dirty-tree measurements are engineering
+  evidence, not a published baseline.
+
+The full repository gate passed with 264 JIT tests, 831 VM tests, all-target
+all-feature Clippy, compile-fail/rooting checks, and all 17
+interpreter/tier/GC-stress differential cases.
+
 The remaining legacy optimizer and allocator are fallback for functions whose
 HIR/selection slices have not switched. Delete each old consumer as its final
 operation family moves; do not adapt old allocation or metadata into the new

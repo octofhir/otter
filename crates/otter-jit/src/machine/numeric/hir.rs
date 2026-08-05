@@ -11,8 +11,8 @@
 //! - Every accepted parameter is guarded as a JavaScript Number before effects.
 //! - Accepted nodes cannot allocate, touch the heap, throw, or reenter JS;
 //!   exact scalar coercions may lower to declared pure numeric leaves.
-//! - Register merges become typed block parameters; no interpreter slot reaches
-//!   Machine IR.
+//! - Register merges become typed block parameters. Only loop-header OSR
+//!   metadata retains the aligned VM-register sources needed at the entry ABI.
 //! - Loop headers receive explicit parameters for every numeric value live from
 //!   a forward predecessor; backedge arguments are attached after all blocks
 //!   are lowered.
@@ -168,9 +168,11 @@ pub(super) enum NumericTerminator {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct NumericBlock {
+    pub(super) logical_pc: u32,
     pub(super) predecessors: Vec<usize>,
     pub(super) successors: Vec<usize>,
     pub(super) parameters: Vec<NumericValue>,
+    pub(super) parameter_registers: Vec<u16>,
     pub(super) successor_arguments: Vec<Vec<NumericValue>>,
     pub(super) nodes: Vec<NumericValue>,
     pub(super) terminator: NumericTerminator,
@@ -254,7 +256,6 @@ impl NumericFunction {
 
         let mut blocks = Vec::with_capacity(raw_blocks.len());
         let mut out_states = Vec::<Vec<RegisterState>>::with_capacity(raw_blocks.len());
-        let mut parameter_registers = Vec::<Vec<u16>>::with_capacity(raw_blocks.len());
         let mut arithmetic_op_count = 0usize;
         let mut frame_states = Vec::new();
 
@@ -351,11 +352,12 @@ impl NumericFunction {
             };
 
             out_states.push(registers);
-            parameter_registers.push(parameter_regs);
             blocks.push(NumericBlock {
+                logical_pc: u32::try_from(raw.start).ok()?,
                 predecessors: raw.predecessors.clone(),
                 successors: raw.successors.clone(),
                 parameters,
+                parameter_registers: parameter_regs,
                 successor_arguments: vec![Vec::new(); raw.successors.len()],
                 nodes: block_nodes,
                 terminator,
@@ -365,7 +367,8 @@ impl NumericFunction {
         for predecessor in 0..blocks.len() {
             for edge in 0..blocks[predecessor].successors.len() {
                 let successor = blocks[predecessor].successors[edge];
-                blocks[predecessor].successor_arguments[edge] = parameter_registers[successor]
+                let successor_registers = blocks[successor].parameter_registers.clone();
+                blocks[predecessor].successor_arguments[edge] = successor_registers
                     .iter()
                     .map(
                         |&register| match out_states[predecessor][usize::from(register)] {

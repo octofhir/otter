@@ -1760,7 +1760,8 @@ fn reserve_symbol_prop_capacity(
     if let Some(new_body) = symbol_props_body_of(table) {
         // SAFETY: live table payload.
         let entries: Vec<SymbolProp> = unsafe { (*new_body).entries().to_vec() };
-        for (_sym, slot) in entries {
+        for (sym, slot) in entries {
+            heap.record_write(table, &sym);
             heap.record_write(table, &slot.value);
             if let SlotKind::Accessor(pair) = &slot.kind {
                 if let Some(g) = &pair.getter {
@@ -1773,6 +1774,24 @@ fn reserve_symbol_prop_capacity(
         }
     }
     Ok(())
+}
+
+/// Remember a symbol-keyed entry write against the table that holds it.
+///
+/// The key is an edge in its own right — [`SymbolPropsBody`] traces the
+/// symbol body handle and its description string — so recording only the
+/// descriptor would leave the key's own old→young edges invisible to the
+/// scavenger.
+fn record_symbol_entry_write<V>(
+    heap: &mut otter_gc::GcHeap,
+    object: JsObject,
+    key: &crate::symbol::JsSymbol,
+    value: &V,
+) where
+    V: otter_gc::GcStore + ?Sized,
+{
+    record_symbol_prop_write(heap, object, key);
+    record_symbol_prop_write(heap, object, value);
 }
 
 /// Remember a write against the symbol table that actually holds it,
@@ -5370,7 +5389,7 @@ pub fn define_own_symbol_property_partial(
         }
     });
     if success {
-        record_exotic_write(heap, obj, &barrier_descriptor);
+        record_symbol_entry_write(heap, obj, &key, &barrier_descriptor);
     }
     success
 }
@@ -5582,7 +5601,7 @@ pub fn define_own_symbol_property(
         }
     });
     if success {
-        record_exotic_write(heap, obj, &barrier_descriptor);
+        record_symbol_entry_write(heap, obj, &key, &barrier_descriptor);
     }
     success
 }

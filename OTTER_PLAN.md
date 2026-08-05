@@ -192,6 +192,21 @@ Typed loop-value substrate landed on 2026-08-05:
 The full repository gate passed with 245 JIT tests, 831 VM tests, all-target
 all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
 
+Machine FrameState lowering substrate landed on 2026-08-05:
+
+- `MachineFrameState` records one register-ordered VM snapshot using only
+  Machine values or tagged literal recipes;
+- late deopt operands are the sole source of post-regalloc locations;
+- one target-neutral lowering unifies GPR, FP, and spill namespaces and emits
+  the VM's existing `DeoptTable`, including its schema verification;
+- focused coverage proves mixed Int32/Float64 allocator locations and an
+  undefined literal reconstruct into one exact frame. Numeric checked exits
+  and backedge polls are the next consumers; no emitter-local reconstruction
+  format was introduced.
+
+The full repository gate passed with 246 JIT tests, 831 VM tests, all-target
+all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
+
 The remaining legacy optimizer and allocator are fallback for functions whose
 HIR/selection slices have not switched. Delete each old consumer as its final
 operation family moves; do not adapt old allocation or metadata into the new

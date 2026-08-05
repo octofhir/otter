@@ -223,6 +223,23 @@ Checked-integer FrameState wiring landed on 2026-08-05:
 The full repository gate passed with 246 JIT tests, 831 VM tests, all-target
 all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
 
+Backedge FrameState wiring landed on 2026-08-05:
+
+- every numeric loop backedge, conditional or unconditional, now passes
+  through an explicit split-edge Machine IR block;
+- that block owns one `BackedgePoll` before its phi moves, so late allocator
+  uses describe predecessor values while the exit resumes at the loop header;
+- HIR records a complete loop-header VM snapshot for each backedge, masked by
+  header liveness. The exact `branch-phi` body lowers its poll into a third
+  complete 12-slot frame with two allocated values and tagged `undefined`
+  literals everywhere else;
+- native publication remains closed until the AArch64 emitter implements the
+  poll and shared cold deopt exits. CFG placement, state identity, and
+  post-regalloc value locations no longer depend on the legacy optimizer.
+
+The full repository gate passed with 246 JIT tests, 831 VM tests, all-target
+all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
+
 The remaining legacy optimizer and allocator are fallback for functions whose
 HIR/selection slices have not switched. Delete each old consumer as its final
 operation family moves; do not adapt old allocation or metadata into the new

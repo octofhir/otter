@@ -215,6 +215,7 @@ pub(super) fn emit(
             | MachineOpcode::IntegerAndImmediate(_)
             | MachineOpcode::IntegerLessThanImmediate(_)
             | MachineOpcode::IntegerEqualImmediate(_)
+            | MachineOpcode::BackedgePoll
             | MachineOpcode::Call(_) => {
                 return Err(Unsupported::OperandShape(
                     "numeric AArch64 Machine IR opcode",

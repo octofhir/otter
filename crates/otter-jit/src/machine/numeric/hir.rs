@@ -127,10 +127,16 @@ pub(super) enum NumericFrameSlot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct NumericFrameState {
-    pub(super) node: NumericValue,
+    pub(super) point: NumericFramePoint,
     pub(super) function_id: u32,
     pub(super) byte_pc: u32,
     pub(super) slots: Vec<NumericFrameSlot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum NumericFramePoint {
+    Node(NumericValue),
+    Backedge { predecessor: usize, edge: usize },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -232,7 +238,6 @@ impl NumericFunction {
                 Vec::new()
             };
             block_nodes.extend(parameters.iter().copied());
-
             let terminal_pc = raw.end.checked_sub(1)?;
             for (pc, instruction_live) in instruction_live_in
                 .iter()
@@ -304,6 +309,29 @@ impl NumericFunction {
                         },
                     )
                     .collect::<Option<Vec<_>>>()?;
+            }
+        }
+
+        for (predecessor, block) in blocks.iter().enumerate() {
+            for (edge, &successor) in block.successors.iter().enumerate() {
+                if successor > predecessor {
+                    continue;
+                }
+                frame_states.push(NumericFrameState {
+                    point: NumericFramePoint::Backedge { predecessor, edge },
+                    function_id: code.id,
+                    byte_pc: view.instructions.get(raw_blocks[successor].start)?.byte_pc,
+                    slots: out_states[predecessor]
+                        .iter()
+                        .copied()
+                        .zip(live_in[successor].iter().copied())
+                        .map(|(state, live)| match (state, live) {
+                            (RegisterState::Value(value), true) => NumericFrameSlot::Value(value),
+                            (RegisterState::Unset | RegisterState::Undefined, _)
+                            | (RegisterState::Value(_), false) => NumericFrameSlot::Undefined,
+                        })
+                        .collect(),
+                });
             }
         }
 
@@ -729,7 +757,7 @@ fn lower_instruction(
         NumericNode::IntegerAdd(..) | NumericNode::IntegerAddImmediate(..)
     ) {
         frame_states.push(NumericFrameState {
-            node: value,
+            point: NumericFramePoint::Node(value),
             function_id,
             byte_pc: instruction.byte_pc,
             slots: registers

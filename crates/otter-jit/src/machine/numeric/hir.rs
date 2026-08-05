@@ -47,6 +47,7 @@ pub(super) enum NumericNode {
     IntegerAdd(NumericValue, NumericValue),
     IntegerSub(NumericValue, NumericValue),
     IntegerMul(NumericValue, NumericValue),
+    IntegerNeg(NumericValue),
     IntegerAddImmediate(NumericValue, i32),
     IntegerSubImmediate(NumericValue, i32),
     IntegerAnd(NumericValue, NumericValue),
@@ -70,7 +71,12 @@ pub(super) enum NumericNode {
     Sub(NumericValue, NumericValue),
     Mul(NumericValue, NumericValue),
     Div(NumericValue, NumericValue),
+    Rem(NumericValue, NumericValue),
+    Pow(NumericValue, NumericValue),
     Neg(NumericValue),
+    IntegerToBoolean(NumericValue),
+    FloatToBoolean(NumericValue),
+    BooleanNot(NumericValue),
     LessThan(NumericValue, NumericValue),
     Equal(NumericValue, NumericValue),
     NotEqual(NumericValue, NumericValue),
@@ -86,6 +92,7 @@ impl NumericNode {
             | Self::IntegerAdd(..)
             | Self::IntegerSub(..)
             | Self::IntegerMul(..)
+            | Self::IntegerNeg(..)
             | Self::IntegerAddImmediate(..)
             | Self::IntegerSubImmediate(..)
             | Self::IntegerAnd(..)
@@ -111,6 +118,9 @@ impl NumericNode {
             | Self::IntegerLessEqual(..)
             | Self::IntegerGreaterThan(..)
             | Self::IntegerGreaterEqual(..)
+            | Self::IntegerToBoolean(..)
+            | Self::FloatToBoolean(..)
+            | Self::BooleanNot(..)
             | Self::IntegerLessThanImmediate(..)
             | Self::IntegerEqualImmediate(..)
             | Self::IntegerNotEqualImmediate(..)
@@ -124,6 +134,8 @@ impl NumericNode {
             | Self::Sub(..)
             | Self::Mul(..)
             | Self::Div(..)
+            | Self::Rem(..)
+            | Self::Pow(..)
             | Self::Neg(..) => NumericType::Number,
         }
     }
@@ -546,7 +558,14 @@ fn instruction_accesses(
         Op::LoadUndefined | Op::LoadInt32 | Op::LoadNumber => {
             Some((Vec::new(), vec![register(instruction, code, 0)?]))
         }
-        Op::ToPrimitive | Op::ToNumeric | Op::Neg | Op::Increment | Op::BitwiseNot => Some((
+        Op::ToPrimitive
+        | Op::ToNumeric
+        | Op::ToNumber
+        | Op::ToBoolean
+        | Op::LogicalNot
+        | Op::Neg
+        | Op::Increment
+        | Op::BitwiseNot => Some((
             vec![register(instruction, code, 1)?],
             vec![register(instruction, code, 0)?],
         )),
@@ -554,6 +573,8 @@ fn instruction_accesses(
         | Op::Sub
         | Op::Mul
         | Op::Div
+        | Op::Rem
+        | Op::Pow
         | Op::BitwiseAnd
         | Op::BitwiseOr
         | Op::BitwiseXor
@@ -716,7 +737,7 @@ fn lower_instruction(
             )?;
             return Some(());
         }
-        Op::ToNumeric => {
+        Op::ToNumeric | Op::ToNumber => {
             let value = read_number(registers, nodes, register(instruction, code, 1)?)?;
             write(
                 registers,
@@ -725,7 +746,24 @@ fn lower_instruction(
             )?;
             return Some(());
         }
-        Op::Add | Op::Sub | Op::Mul | Op::Div => {
+        Op::ToBoolean | Op::LogicalNot => {
+            let source = read_value(registers, register(instruction, code, 1)?)?;
+            let boolean = to_boolean(source, nodes, block_nodes)?;
+            let value = if op == Op::LogicalNot {
+                let value = push(nodes, NumericNode::BooleanNot(boolean));
+                block_nodes.push(value);
+                value
+            } else {
+                boolean
+            };
+            write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            )?;
+            return Some(());
+        }
+        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Pow => {
             if !instruction.arith_feedback().is_numeric_only() {
                 return None;
             }
@@ -751,6 +789,8 @@ fn lower_instruction(
                     Op::Sub => NumericNode::Sub(left, right),
                     Op::Mul => NumericNode::Mul(left, right),
                     Op::Div => NumericNode::Div(left, right),
+                    Op::Rem => NumericNode::Rem(left, right),
+                    Op::Pow => NumericNode::Pow(left, right),
                     _ => unreachable!("matched numeric binary operation"),
                 }
             }
@@ -806,9 +846,14 @@ fn lower_instruction(
                 return None;
             }
             let source = read_number(registers, nodes, register(instruction, code, 1)?)?;
-            let source = widen_to_number(source, nodes, block_nodes)?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
-            NumericNode::Neg(source)
+            if instruction.arith_feedback().is_int32_only()
+                && value_type(nodes, source)? == NumericType::Int32
+            {
+                NumericNode::IntegerNeg(source)
+            } else {
+                NumericNode::Neg(widen_to_number(source, nodes, block_nodes)?)
+            }
         }
         Op::Equal | Op::NotEqual | Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
             if !instruction.arith_feedback().is_numeric_only() {
@@ -853,6 +898,7 @@ fn lower_instruction(
         NumericNode::IntegerAdd(..)
             | NumericNode::IntegerSub(..)
             | NumericNode::IntegerMul(..)
+            | NumericNode::IntegerNeg(..)
             | NumericNode::IntegerAddImmediate(..)
             | NumericNode::IntegerSubImmediate(..)
     ) {
@@ -957,6 +1003,21 @@ fn read_int32_bits(
 
 fn value_type(nodes: &[NumericNode], value: NumericValue) -> Option<NumericType> {
     nodes.get(value.0).copied().map(NumericNode::value_type)
+}
+
+fn to_boolean(
+    value: NumericValue,
+    nodes: &mut Vec<NumericNode>,
+    block_nodes: &mut Vec<NumericValue>,
+) -> Option<NumericValue> {
+    let node = match value_type(nodes, value)? {
+        NumericType::Boolean => return Some(value),
+        NumericType::Int32 | NumericType::Uint32 => NumericNode::IntegerToBoolean(value),
+        NumericType::Number => NumericNode::FloatToBoolean(value),
+    };
+    let boolean = push(nodes, node);
+    block_nodes.push(boolean);
+    Some(boolean)
 }
 
 fn widen_to_number(

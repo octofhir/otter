@@ -8,11 +8,13 @@
 //! # Contents
 //! - Leaf/no-allocation collection probes for `Map.get`, `Map.has`, and
 //!   `Set.has`.
+//! - Unboxed binary64 math leaves for typed numeric machine code.
 //! - Allocating collection mutation and string-concat entries.
 //! - JIT transition-binding validation against the static descriptor inventory.
 //!
 //! # Invariants
-//! - Arguments are boxed [`crate::Value`] raw ABI bits.
+//! - Value-family arguments are boxed [`crate::Value`] raw ABI bits; typed
+//!   numeric leaves use the platform's unboxed floating-point ABI.
 //! - Machine results use the two-register
 //!   [`crate::native_abi::RuntimeStubResultPair`] encoding; Rust-facing
 //!   helpers expose [`crate::native_abi::RuntimeStubResult`].
@@ -34,11 +36,12 @@ use crate::native_abi::{
     STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_MAP_SET_MUTATING,
     STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC,
     STUB_COLLECTION_SET_HAS_LEAF, STUB_MATH_ABS_LEAF, STUB_MATH_FLOOR_LEAF, STUB_MATH_MAX_LEAF,
-    STUB_MATH_MIN_LEAF, STUB_MATH_SQRT_LEAF, STUB_NUMBER_REM_LEAF, STUB_STRICT_EQ_LEAF,
-    STUB_STRING_CHAR_CODE_AT_LEAF, STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC,
-    STUB_STRING_ENDS_WITH_LEAF, STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF,
-    STUB_STRING_STARTS_WITH_LEAF, STUB_TO_BOOLEAN_LEAF, SafepointId, SafepointRecord,
-    TaggedLocationKind, validate_stub_descriptor,
+    STUB_MATH_MIN_LEAF, STUB_MATH_SQRT_LEAF, STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF,
+    STUB_NUMBER_REM_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF,
+    STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_STRING_ENDS_WITH_LEAF,
+    STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF, STUB_STRING_STARTS_WITH_LEAF,
+    STUB_TO_BOOLEAN_LEAF, SafepointId, SafepointRecord, TaggedLocationKind,
+    validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
@@ -85,6 +88,39 @@ impl LeafNoAllocStub2 {
         a1_bits: u64,
     ) -> RuntimeStubResult {
         (self.entry)(heap, a0_bits, a1_bits).into_result()
+    }
+}
+
+/// Pure two-argument unboxed binary64 runtime stub ABI.
+pub type Float64LeafStub2Fn = extern "C" fn(f64, f64) -> f64;
+
+/// Callable unboxed binary64 leaf with its shared ABI descriptor.
+#[derive(Clone, Copy)]
+pub struct Float64LeafStub2 {
+    /// Passive descriptor shared with profiler/JIT metadata.
+    pub descriptor: RuntimeStubDescriptor,
+    /// Machine-callable entrypoint using FP argument and result registers.
+    pub entry: Float64LeafStub2Fn,
+}
+
+impl Float64LeafStub2 {
+    /// `true` when descriptor metadata matches this callable ABI shape.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        validate_stub_descriptor(self.descriptor, NO_SAFEPOINT)
+            && self.descriptor.argument_count == 2
+    }
+
+    /// Raw native entry address for generated code.
+    #[must_use]
+    pub fn entry_addr(self) -> usize {
+        self.entry as usize
+    }
+
+    /// Invoke the typed leaf without boxing or a status channel.
+    #[must_use]
+    pub fn invoke(self, left: f64, right: f64) -> f64 {
+        (self.entry)(left, right)
     }
 }
 
@@ -576,6 +612,18 @@ pub const NUMBER_REM_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     entry: number_rem_leaf,
 };
 
+/// Callable typed ABI entry for Number remainder.
+pub const NUMBER_REM_F64_LEAF: Float64LeafStub2 = Float64LeafStub2 {
+    descriptor: STUB_NUMBER_REM_F64_LEAF,
+    entry: number_rem_f64_leaf,
+};
+
+/// Callable typed ABI entry for Number exponentiation.
+pub const NUMBER_POW_F64_LEAF: Float64LeafStub2 = Float64LeafStub2 {
+    descriptor: STUB_NUMBER_POW_F64_LEAF,
+    entry: number_pow_f64_leaf,
+};
+
 /// Callable ABI entry for `Map.prototype.has`.
 pub const COLLECTION_MAP_HAS_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: STUB_COLLECTION_MAP_HAS_LEAF,
@@ -705,6 +753,16 @@ pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocS
     }
 }
 
+/// Resolve a pure unboxed binary64 leaf by ABI descriptor id.
+#[must_use]
+pub const fn float64_leaf_stub2_by_id(id: RuntimeStubId) -> Option<Float64LeafStub2> {
+    match id {
+        id if id == STUB_NUMBER_REM_F64_LEAF.id => Some(NUMBER_REM_F64_LEAF),
+        id if id == STUB_NUMBER_POW_F64_LEAF.id => Some(NUMBER_POW_F64_LEAF),
+        _ => None,
+    }
+}
+
 /// Resolve a fixed-value allocating stub descriptor by ABI descriptor id.
 #[must_use]
 pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub> {
@@ -727,6 +785,7 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
 #[must_use]
 pub(crate) fn is_vm_owned_runtime_stub(id: RuntimeStubId) -> bool {
     leaf_no_alloc_stub2_by_id(id).is_some()
+        || float64_leaf_stub2_by_id(id).is_some()
         || mutating_leaf_stub2_by_id(id).is_some()
         || mutating_leaf_stub3_by_id(id).is_some()
         || alloc_value_stub_by_id(id)
@@ -1049,6 +1108,22 @@ pub extern "C" fn number_rem_leaf(
     RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::number(
         crate::NumberValue::Double(rem),
     )))
+}
+
+/// Pure unboxed Number remainder for typed numeric machine code.
+#[must_use]
+pub extern "C" fn number_rem_f64_leaf(left: f64, right: f64) -> f64 {
+    left % right
+}
+
+/// Pure unboxed ECMAScript Number exponentiation for typed machine code.
+#[must_use]
+pub extern "C" fn number_pow_f64_leaf(base: f64, exponent: f64) -> f64 {
+    crate::number::pow(
+        crate::NumberValue::Double(base),
+        crate::NumberValue::Double(exponent),
+    )
+    .as_f64()
 }
 
 /// `String.prototype.charCodeAt` over a string receiver and an integral index.
@@ -2316,11 +2391,20 @@ mod tests {
         assert!(COLLECTION_MAP_GET_LEAF.is_valid());
         assert!(COLLECTION_MAP_HAS_LEAF.is_valid());
         assert!(COLLECTION_SET_HAS_LEAF.is_valid());
+        assert!(NUMBER_REM_F64_LEAF.is_valid());
+        assert!(NUMBER_POW_F64_LEAF.is_valid());
         assert_eq!(
             leaf_no_alloc_stub2_by_id(STUB_COLLECTION_MAP_GET_LEAF.id).map(|stub| stub.descriptor),
             Some(STUB_COLLECTION_MAP_GET_LEAF)
         );
+        assert_eq!(
+            float64_leaf_stub2_by_id(STUB_NUMBER_REM_F64_LEAF.id).map(|stub| stub.invoke(5.5, 2.0)),
+            Some(1.5)
+        );
+        assert_eq!(NUMBER_POW_F64_LEAF.invoke(f64::NAN, 0.0), 1.0);
+        assert!(NUMBER_POW_F64_LEAF.invoke(-1.0, f64::INFINITY).is_nan());
         assert!(leaf_no_alloc_stub2_by_id(u32::MAX).is_none());
+        assert!(float64_leaf_stub2_by_id(u32::MAX).is_none());
     }
 
     #[test]
@@ -2908,6 +2992,12 @@ mod tests {
                 match descriptor.signature {
                     crate::native_abi::RuntimeStubSignature::LeafValue2 => {
                         assert!(leaf_no_alloc_stub2_by_id(descriptor.id).is_some());
+                    }
+                    crate::native_abi::RuntimeStubSignature::Float64Leaf2 => {
+                        assert!(
+                            float64_leaf_stub2_by_id(descriptor.id)
+                                .is_some_and(Float64LeafStub2::is_valid)
+                        );
                     }
                     crate::native_abi::RuntimeStubSignature::MutatingLeafValue2 => {
                         assert!(

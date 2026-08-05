@@ -300,6 +300,8 @@ pub enum MachineOpcode {
     IntegerSub,
     /// Integer multiplication with overflow and negative-zero exits.
     IntegerMul,
+    /// Integer negation with overflow and negative-zero exits.
+    IntegerNeg,
     /// Integer addition with a baked right operand and overflow exit.
     IntegerAddImmediate(i32),
     /// Integer subtraction with a baked right operand and overflow exit.
@@ -350,8 +352,20 @@ pub enum MachineOpcode {
     FloatMul,
     /// Floating-point division.
     FloatDiv,
+    /// Floating-point remainder through the canonical no-allocation leaf.
+    FloatRem,
+    /// Floating-point exponentiation through the canonical no-allocation leaf.
+    FloatPow,
+    /// Load the Float64 result deposited by the preceding numeric leaf call.
+    FloatLeafResult,
     /// Floating-point negation.
     FloatNeg,
+    /// Convert an Int32 or Uint32 value to canonical Boolean bits.
+    IntegerToBoolean,
+    /// Convert a Float64 value to canonical Boolean bits.
+    FloatToBoolean,
+    /// Invert canonical Boolean bits.
+    BooleanNot,
     /// Ordered floating-point less-than comparison producing 0 or 1.
     FloatLessThan,
     /// Floating-point equality comparison producing 0 or 1.

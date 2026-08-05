@@ -27,7 +27,10 @@ use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 use otter_vm::{
     Value,
     deopt::DeoptRuntime,
-    native_abi::{STUB_JIT_BACKEDGE_POLL, STUB_JIT_DEOPT_WRITEBACK},
+    native_abi::{
+        RuntimeStubDescriptor, STUB_JIT_BACKEDGE_POLL, STUB_JIT_DEOPT_WRITEBACK,
+        STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF,
+    },
 };
 
 use super::super::{
@@ -47,7 +50,8 @@ use crate::{
 
 pub(super) const GPR_BUDGET: u16 = 16;
 pub(super) const FP_BUDGET: u16 = 8;
-const FIXED_FRAME_BYTES: u32 = 32;
+const BASE_FIXED_FRAME_BYTES: u32 = 32;
+const LEAF_RESULT_BYTES: u32 = 16;
 const DEOPT_DUMP_BYTES: u32 = (GPR_BUDGET as u32 + FP_BUDGET as u32) * 8;
 
 pub(super) struct Emission {
@@ -105,10 +109,53 @@ fn emit_backedge_poll(
     );
 }
 
+fn emit_float_leaf_binary(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    relocations: &mut RelocationCapture,
+    left: u8,
+    right: u8,
+    entry: u64,
+    descriptor: RuntimeStubDescriptor,
+    result_offset: u32,
+) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; str D(left), [sp, result_offset]
+        ; str D(right), [sp, result_offset + 8]
+        ; ldr d0, [sp, result_offset]
+        ; ldr d1, [sp, result_offset + 8]
+    );
+    emit_load_symbolic_u64(
+        ops,
+        relocations,
+        16,
+        entry,
+        RelocationTarget::runtime_stub(descriptor),
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; str d0, [sp, result_offset]
+    );
+}
+
 pub(super) fn frame_layout(
+    sequence: &InstructionSequence,
     allocation: &AllocatedSequence,
 ) -> Result<MachineFrameLayout, Unsupported> {
-    MachineFrameLayout::new(allocation, FIXED_FRAME_BYTES, 16)
+    let owns_leaf_result = sequence.instructions().iter().any(|instruction| {
+        matches!(
+            instruction.opcode,
+            MachineOpcode::FloatRem | MachineOpcode::FloatPow | MachineOpcode::FloatLeafResult
+        )
+    });
+    let fixed_bytes = BASE_FIXED_FRAME_BYTES
+        + if owns_leaf_result {
+            LEAF_RESULT_BYTES
+        } else {
+            0
+        };
+    MachineFrameLayout::new(allocation, fixed_bytes, 16)
         .map_err(|_| Unsupported::OperandShape("numeric Machine IR frame layout"))
 }
 
@@ -119,6 +166,8 @@ pub(super) fn emit(
     deopt_runtime: &DeoptRuntime,
     poll_entry: u64,
     deopt_writeback_entry: u64,
+    number_rem_entry: u64,
+    number_pow_entry: u64,
     capture_artifacts: bool,
 ) -> Result<Emission, Unsupported> {
     reject_unimplemented_locations(sequence, allocation)?;
@@ -145,6 +194,9 @@ pub(super) fn emit(
         ; mov x29, sp
         ; stp x19, x20, [sp, #-16]!
     );
+    if frame.fixed_bytes() > BASE_FIXED_FRAME_BYTES {
+        dynasm!(ops ; .arch aarch64 ; stp xzr, xzr, [sp, #-16]!);
+    }
     emit_reserve_spill_area(&mut ops, frame.spill_area_bytes());
     dynasm!(ops
         ; .arch aarch64
@@ -221,6 +273,29 @@ pub(super) fn emit(
                     }
                     _ => unreachable!("matched floating binary operation"),
                 }
+            }
+            MachineOpcode::FloatRem | MachineOpcode::FloatPow => {
+                let left = float_register(locations[0])?;
+                let right = float_register(locations[1])?;
+                let (entry, descriptor) = if instruction.opcode == MachineOpcode::FloatRem {
+                    (number_rem_entry, STUB_NUMBER_REM_F64_LEAF)
+                } else {
+                    (number_pow_entry, STUB_NUMBER_POW_F64_LEAF)
+                };
+                emit_float_leaf_binary(
+                    &mut ops,
+                    &mut relocations,
+                    left,
+                    right,
+                    entry,
+                    descriptor,
+                    frame.spill_area_bytes(),
+                );
+            }
+            MachineOpcode::FloatLeafResult => {
+                let destination = float_register(locations[0])?;
+                let offset = frame.spill_area_bytes();
+                dynasm!(ops ; .arch aarch64 ; ldr D(destination), [sp, offset]);
             }
             MachineOpcode::FloatNeg => {
                 let source = float_register(locations[0])?;
@@ -311,6 +386,18 @@ pub(super) fn emit(
                     ; eor w17, W(left), W(right)
                     ; tbnz w17, #31, =>exit
                     ; =>nonzero
+                    ; mov W(destination), w16
+                );
+            }
+            MachineOpcode::IntegerNeg => {
+                let source = integer_register(locations[0])?;
+                let destination = integer_register(locations[1])?;
+                let exit = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; negs w16, W(source)
+                    ; b.vs =>exit
+                    ; cbz W(source), =>exit
                     ; mov W(destination), w16
                 );
             }
@@ -431,6 +518,36 @@ pub(super) fn emit(
                     }
                     _ => unreachable!("matched int32 comparison"),
                 }
+            }
+            MachineOpcode::IntegerToBoolean => {
+                let source = integer_register(locations[0])?;
+                let destination = integer_register(locations[1])?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; tst W(source), W(source)
+                    ; cset W(destination), ne
+                );
+            }
+            MachineOpcode::FloatToBoolean => {
+                let source = float_register(locations[0])?;
+                let destination = integer_register(locations[1])?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; fmov d31, xzr
+                    ; fcmp D(source), d31
+                    ; cset W(destination), ne
+                    ; cset w16, vc
+                    ; and W(destination), W(destination), w16
+                );
+            }
+            MachineOpcode::BooleanNot => {
+                let source = integer_register(locations[0])?;
+                let destination = integer_register(locations[1])?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; mov w16, #1
+                    ; eor W(destination), W(source), w16
+                );
             }
             MachineOpcode::BackedgePoll => {
                 let exit = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
@@ -800,6 +917,9 @@ fn emit_box_boolean(ops: &mut dynasmrt::aarch64::Assembler, source: u8, destinat
 
 fn emit_epilogue(ops: &mut dynasmrt::aarch64::Assembler, frame: MachineFrameLayout) {
     emit_release_spill_area(ops, frame.spill_area_bytes());
+    if frame.fixed_bytes() > BASE_FIXED_FRAME_BYTES {
+        dynasm!(ops ; .arch aarch64 ; add sp, sp, #16);
+    }
     dynasm!(ops
         ; .arch aarch64
         ; ldp x19, x20, [sp], #16

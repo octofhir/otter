@@ -163,6 +163,7 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
         .iter()
         .map(|node| match node.value_type() {
             NumericType::Int32 => MachineRepresentation::Int32,
+            NumericType::Uint32 => MachineRepresentation::Uint32,
             NumericType::Number => MachineRepresentation::Float64,
             NumericType::Boolean => MachineRepresentation::Int32,
         })
@@ -264,6 +265,13 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         MachineOperand::register_output(result),
                     ],
                 ),
+                NumericNode::WidenUint32(source) => MachineInstruction::plain(
+                    MachineOpcode::Uint32ToFloat64,
+                    vec![
+                        MachineOperand::register_input(machine_value(&values, source)),
+                        MachineOperand::register_output(result),
+                    ],
+                ),
                 NumericNode::IntegerAdd(left, right) => MachineInstruction::plain(
                     MachineOpcode::IntegerAdd,
                     vec![
@@ -274,6 +282,14 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                 ),
                 NumericNode::IntegerSub(left, right) => MachineInstruction::plain(
                     MachineOpcode::IntegerSub,
+                    vec![
+                        MachineOperand::register_input(machine_value(&values, left)),
+                        MachineOperand::register_input(machine_value(&values, right)),
+                        MachineOperand::register_output(result),
+                    ],
+                ),
+                NumericNode::IntegerMul(left, right) => MachineInstruction::plain(
+                    MachineOpcode::IntegerMul,
                     vec![
                         MachineOperand::register_input(machine_value(&values, left)),
                         MachineOperand::register_input(machine_value(&values, right)),
@@ -302,6 +318,14 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         ],
                     )
                 }
+                NumericNode::IntegerShiftRightLogical(left, right) => MachineInstruction::plain(
+                    MachineOpcode::IntegerShiftRightLogical,
+                    vec![
+                        MachineOperand::register_input(machine_value(&values, left)),
+                        MachineOperand::register_input(machine_value(&values, right)),
+                        MachineOperand::register_output(result),
+                    ],
+                ),
                 NumericNode::IntegerNot(source) => MachineInstruction::plain(
                     MachineOpcode::IntegerNot,
                     vec![
@@ -309,6 +333,30 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         MachineOperand::register_output(result),
                     ],
                 ),
+                NumericNode::IntegerEqual(left, right)
+                | NumericNode::IntegerNotEqual(left, right)
+                | NumericNode::IntegerLessThan(left, right)
+                | NumericNode::IntegerLessEqual(left, right)
+                | NumericNode::IntegerGreaterThan(left, right)
+                | NumericNode::IntegerGreaterEqual(left, right) => {
+                    let opcode = match node {
+                        NumericNode::IntegerEqual(..) => MachineOpcode::IntegerEqual,
+                        NumericNode::IntegerNotEqual(..) => MachineOpcode::IntegerNotEqual,
+                        NumericNode::IntegerLessThan(..) => MachineOpcode::IntegerLessThan,
+                        NumericNode::IntegerLessEqual(..) => MachineOpcode::IntegerLessEqual,
+                        NumericNode::IntegerGreaterThan(..) => MachineOpcode::IntegerGreaterThan,
+                        NumericNode::IntegerGreaterEqual(..) => MachineOpcode::IntegerGreaterEqual,
+                        _ => unreachable!("matched int32 comparison node"),
+                    };
+                    MachineInstruction::plain(
+                        opcode,
+                        vec![
+                            MachineOperand::register_input(machine_value(&values, left)),
+                            MachineOperand::register_input(machine_value(&values, right)),
+                            MachineOperand::register_output(result),
+                        ],
+                    )
+                }
                 NumericNode::IntegerAddImmediate(source, immediate)
                 | NumericNode::IntegerSubImmediate(source, immediate)
                 | NumericNode::IntegerAndImmediate(source, immediate)
@@ -371,14 +419,30 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         MachineOperand::register_output(result),
                     ],
                 ),
-                NumericNode::LessThan(left, right) => MachineInstruction::plain(
-                    MachineOpcode::FloatLessThan,
-                    vec![
-                        MachineOperand::register_input(machine_value(&values, left)),
-                        MachineOperand::register_input(machine_value(&values, right)),
-                        MachineOperand::register_output(result),
-                    ],
-                ),
+                NumericNode::Equal(left, right)
+                | NumericNode::NotEqual(left, right)
+                | NumericNode::LessThan(left, right)
+                | NumericNode::LessEqual(left, right)
+                | NumericNode::GreaterThan(left, right)
+                | NumericNode::GreaterEqual(left, right) => {
+                    let opcode = match node {
+                        NumericNode::Equal(..) => MachineOpcode::FloatEqual,
+                        NumericNode::NotEqual(..) => MachineOpcode::FloatNotEqual,
+                        NumericNode::LessThan(..) => MachineOpcode::FloatLessThan,
+                        NumericNode::LessEqual(..) => MachineOpcode::FloatLessEqual,
+                        NumericNode::GreaterThan(..) => MachineOpcode::FloatGreaterThan,
+                        NumericNode::GreaterEqual(..) => MachineOpcode::FloatGreaterEqual,
+                        _ => unreachable!("matched Float64 comparison node"),
+                    };
+                    MachineInstruction::plain(
+                        opcode,
+                        vec![
+                            MachineOperand::register_input(machine_value(&values, left)),
+                            MachineOperand::register_input(machine_value(&values, right)),
+                            MachineOperand::register_output(result),
+                        ],
+                    )
+                }
             };
             if let Some(&deopt) = frame_state_ids.get(&NumericFramePoint::Node(node_value)) {
                 attach_frame_state(hir, &values, deopt, &mut instruction);
@@ -401,12 +465,9 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                 let boxed = push_value(&mut representations, MachineRepresentation::Tagged);
                 let box_opcode = match hir.nodes[value.0].value_type() {
                     NumericType::Int32 => MachineOpcode::BoxInt32,
+                    NumericType::Uint32 => MachineOpcode::BoxUint32,
                     NumericType::Number => MachineOpcode::BoxNumber,
-                    NumericType::Boolean => {
-                        return Err(super::VerificationError::InvalidValue(machine_value(
-                            &values, value,
-                        )));
-                    }
+                    NumericType::Boolean => MachineOpcode::BoxBoolean,
                 };
                 instructions.push(MachineInstruction::plain(
                     box_opcode,
@@ -675,7 +736,12 @@ mod tests {
                     | Op::Mul
                     | Op::Div
                     | Op::Neg
+                    | Op::Equal
+                    | Op::NotEqual
                     | Op::LessThan
+                    | Op::LessEq
+                    | Op::GreaterThan
+                    | Op::GreaterEq
                     | Op::Increment
                     | Op::AddImm
                     | Op::SubImm
@@ -1038,7 +1104,8 @@ mod tests {
         view
     }
 
-    fn checked_sub_view(left: i32, right: i32) -> JitCompileSnapshot {
+    fn checked_binary_view(op: Op, left: i32, right: i32) -> JitCompileSnapshot {
+        assert!(matches!(op, Op::Add | Op::Sub | Op::Mul));
         let mut view = numeric_view(
             0,
             3,
@@ -1052,7 +1119,7 @@ mod tests {
                     vec![Operand::Register(1), Operand::Imm32(right)],
                 ),
                 (
-                    Op::Sub,
+                    op,
                     vec![
                         Operand::Register(2),
                         Operand::Register(0),
@@ -1088,6 +1155,329 @@ mod tests {
             ],
         );
         view.seed_arith_feedback_for_test(1, ArithFeedback::from_bits(ARITH_INT32));
+        view
+    }
+
+    fn ushr_view(left: i32, shift: i32) -> JitCompileSnapshot {
+        numeric_view(
+            0,
+            3,
+            vec![
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(0), Operand::Imm32(left)],
+                ),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(1), Operand::Imm32(shift)],
+                ),
+                (
+                    Op::Ushr,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        )
+    }
+
+    fn ushr_comparison_view() -> JitCompileSnapshot {
+        numeric_view(
+            0,
+            5,
+            vec![
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(0), Operand::Imm32(-1)],
+                ),
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
+                (
+                    Op::Ushr,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(3), Operand::Imm32(i32::MAX)],
+                ),
+                (
+                    Op::GreaterThan,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(2),
+                        Operand::Register(3),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(4)]),
+            ],
+        )
+    }
+
+    fn ushr_backedge_view() -> JitCompileSnapshot {
+        let mut view = numeric_view(
+            0,
+            8,
+            vec![
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(0), Operand::Imm32(-1)],
+                ),
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
+                (
+                    Op::Ushr,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(2), Operand::Imm32(0)],
+                ),
+                (Op::LoadInt32, vec![Operand::Register(3), Operand::Imm32(0)]),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(3), Operand::Imm32(1)],
+                ),
+                (
+                    Op::LessThanImm,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(1),
+                        Operand::Imm32(2),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(5), Operand::Register(4)],
+                ),
+                (
+                    Op::Ushr,
+                    vec![
+                        Operand::Register(5),
+                        Operand::Register(0),
+                        Operand::Register(3),
+                    ],
+                ),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(5), Operand::Imm32(0)],
+                ),
+                (
+                    Op::AddImm,
+                    vec![
+                        Operand::Register(6),
+                        Operand::Register(1),
+                        Operand::Imm32(1),
+                    ],
+                ),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(6), Operand::Imm32(1)],
+                ),
+                (Op::Jump, vec![Operand::Imm32(-7)]),
+                (Op::ReturnValue, vec![Operand::Register(0)]),
+            ],
+        );
+        for pc in [6_u32, 10] {
+            view.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(ARITH_INT32));
+        }
+        view
+    }
+
+    fn integer_comparison_view(op: Op, left: i32, right: i32) -> JitCompileSnapshot {
+        assert!(matches!(
+            op,
+            Op::Equal | Op::NotEqual | Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq
+        ));
+        let mut view = numeric_view(
+            0,
+            3,
+            vec![
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(0), Operand::Imm32(left)],
+                ),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(1), Operand::Imm32(right)],
+                ),
+                (
+                    op,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        );
+        view.seed_arith_feedback_for_test(2, ArithFeedback::from_bits(ARITH_INT32));
+        view
+    }
+
+    fn float_comparison_view(op: Op) -> JitCompileSnapshot {
+        assert!(matches!(
+            op,
+            Op::Equal | Op::NotEqual | Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq
+        ));
+        let mut view = numeric_view(
+            2,
+            3,
+            vec![
+                (
+                    op,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        );
+        view.seed_arith_feedback_for_test(0, ArithFeedback::from_bits(ARITH_FLOAT64));
+        view
+    }
+
+    fn integer_scalar_loop_view() -> JitCompileSnapshot {
+        let mut view = numeric_view(
+            0,
+            13,
+            vec![
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(7), Operand::Imm32(-1)],
+                ),
+                (Op::LoadInt32, vec![Operand::Register(8), Operand::Imm32(0)]),
+                (
+                    Op::Ushr,
+                    vec![
+                        Operand::Register(0),
+                        Operand::Register(7),
+                        Operand::Register(8),
+                    ],
+                ),
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(2), Operand::Imm32(1_000_000)],
+                ),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(3), Operand::Imm32(1023)],
+                ),
+                (Op::LoadInt32, vec![Operand::Register(4), Operand::Imm32(3)]),
+                (
+                    Op::LessThan,
+                    vec![
+                        Operand::Register(7),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(15), Operand::Register(7)],
+                ),
+                (
+                    Op::BitwiseAnd,
+                    vec![
+                        Operand::Register(8),
+                        Operand::Register(1),
+                        Operand::Register(3),
+                    ],
+                ),
+                (Op::LoadLocal, vec![Operand::Register(9), Operand::Imm32(4)]),
+                (
+                    Op::Mul,
+                    vec![
+                        Operand::Register(5),
+                        Operand::Register(8),
+                        Operand::Register(9),
+                    ],
+                ),
+                (
+                    Op::BitwiseAndImm,
+                    vec![
+                        Operand::Register(6),
+                        Operand::Register(1),
+                        Operand::Imm32(7),
+                    ],
+                ),
+                (
+                    Op::BitwiseXor,
+                    vec![
+                        Operand::Register(8),
+                        Operand::Register(0),
+                        Operand::Register(5),
+                    ],
+                ),
+                (Op::LoadLocal, vec![Operand::Register(9), Operand::Imm32(6)]),
+                (
+                    Op::Ushr,
+                    vec![
+                        Operand::Register(10),
+                        Operand::Register(8),
+                        Operand::Register(9),
+                    ],
+                ),
+                (
+                    Op::LoadLocal,
+                    vec![Operand::Register(11), Operand::Imm32(5)],
+                ),
+                (
+                    Op::BitwiseOr,
+                    vec![
+                        Operand::Register(8),
+                        Operand::Register(10),
+                        Operand::Register(11),
+                    ],
+                ),
+                (Op::LoadInt32, vec![Operand::Register(9), Operand::Imm32(0)]),
+                (
+                    Op::Ushr,
+                    vec![
+                        Operand::Register(10),
+                        Operand::Register(8),
+                        Operand::Register(9),
+                    ],
+                ),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(10), Operand::Imm32(0)],
+                ),
+                (
+                    Op::AddImm,
+                    vec![
+                        Operand::Register(11),
+                        Operand::Register(1),
+                        Operand::Imm32(1),
+                    ],
+                ),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(11), Operand::Imm32(1)],
+                ),
+                (Op::Jump, vec![Operand::Imm32(-17)]),
+                (
+                    Op::LoadLocal,
+                    vec![Operand::Register(12), Operand::Imm32(0)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(12)]),
+            ],
+        );
+        for pc in [7_u32, 11, 12, 21] {
+            view.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(ARITH_INT32));
+        }
         view
     }
 
@@ -1733,7 +2123,7 @@ mod tests {
     fn checked_integer_subtraction_reconstructs_pre_operation_frames() {
         let interrupt = 0_u8;
         let mut fuel = i64::MAX as u64;
-        let register = compile_output(&checked_sub_view(i32::MIN, 1), None).code;
+        let register = compile_output(&checked_binary_view(Op::Sub, i32::MIN, 1), None).code;
         let (result, frame, pc) =
             execute_with_poll_cells(&register, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
         assert_eq!(result.status, STATUS_BAILED);
@@ -1768,6 +2158,171 @@ mod tests {
             frame,
             [tag::box_int32(i32::MAX), Value::undefined().to_bits()]
         );
+    }
+
+    #[test]
+    fn checked_integer_multiply_deopts_on_overflow_and_negative_zero() {
+        let success = compile_output(&checked_binary_view(Op::Mul, 12_345, -17), None).code;
+        let (result, _, _) = execute(&success, &[], 0);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, tag::box_int32(-209_865));
+
+        let interrupt = 0_u8;
+        for (left, right) in [(i32::MAX, 2), (0, -1)] {
+            let code = compile_output(&checked_binary_view(Op::Mul, left, right), None).code;
+            let mut fuel = i64::MAX as u64;
+            let (result, frame, pc) =
+                execute_with_poll_cells(&code, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
+            assert_eq!(result.status, STATUS_BAILED);
+            assert_eq!(pc, 2);
+            assert_eq!(
+                frame,
+                [
+                    tag::box_int32(left),
+                    tag::box_int32(right),
+                    Value::undefined().to_bits()
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn unsigned_shift_boxes_and_deopts_as_uint32() {
+        for (left, shift, expected) in [
+            (-1, 0, 4_294_967_295_f64),
+            (-1, 1, 2_147_483_647_f64),
+            (i32::MIN, -1, 1_f64),
+        ] {
+            let code = compile_output(&ushr_view(left, shift), None).code;
+            let (result, _, _) = execute(&code, &[], 0);
+            assert_eq!(result.status, STATUS_RETURNED);
+            assert_eq!(unbox_number(result.value), expected);
+        }
+
+        let comparison = compile_output(&ushr_comparison_view(), None).code;
+        let (result, _, _) = execute(&comparison, &[], 0);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, Value::boolean(true).to_bits());
+
+        let view = ushr_backedge_view();
+        let hir = NumericFunction::build(&view).expect("uint32-loop numeric HIR");
+        let poll_state = hir
+            .frame_states
+            .iter()
+            .find(|state| matches!(state.point, NumericFramePoint::Backedge { .. }))
+            .expect("uint32 backedge FrameState");
+        let uint_value = match poll_state.slots[0] {
+            hir::NumericFrameSlot::Value(value) => value,
+            hir::NumericFrameSlot::Undefined => panic!("uint32 loop value is live"),
+        };
+        assert_eq!(hir.nodes[uint_value.0].value_type(), NumericType::Uint32);
+
+        let code = compile_output(&view, None).code;
+        let interrupt = 1_u8;
+        let mut fuel = i64::MAX as u64;
+        let (result, frame, pc) =
+            execute_with_poll_cells(&code, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(pc, 6);
+        assert_eq!(unbox_number(frame[0]), 4_294_967_295_f64);
+        assert_eq!(frame[1], tag::box_int32(1));
+    }
+
+    #[test]
+    fn register_comparisons_return_canonical_booleans() {
+        for (op, left, right, expected) in [
+            (Op::Equal, 7, 7, true),
+            (Op::NotEqual, 7, 8, true),
+            (Op::LessThan, -1, 0, true),
+            (Op::LessEq, 7, 7, true),
+            (Op::GreaterThan, 8, 7, true),
+            (Op::GreaterEq, 7, 7, true),
+        ] {
+            let code = compile_output(&integer_comparison_view(op, left, right), None).code;
+            let (result, _, _) = execute(&code, &[], 0);
+            assert_eq!(result.status, STATUS_RETURNED);
+            assert_eq!(result.value, Value::boolean(expected).to_bits());
+        }
+
+        for (op, left, right, expected) in [
+            (Op::Equal, 3.5, 3.5, true),
+            (Op::NotEqual, f64::NAN, f64::NAN, true),
+            (Op::LessThan, f64::NAN, 1.0, false),
+            (Op::LessEq, f64::NAN, 1.0, false),
+            (Op::GreaterThan, f64::NAN, 1.0, false),
+            (Op::GreaterEq, f64::NAN, 1.0, false),
+        ] {
+            let code = compile_output(&float_comparison_view(op), None).code;
+            let (result, _, _) = execute(&code, &[boxed_f64(left), boxed_f64(right)], 0);
+            assert_eq!(result.status, STATUS_RETURNED);
+            assert_eq!(result.value, Value::boolean(expected).to_bits());
+        }
+    }
+
+    #[test]
+    fn publishes_combined_integer_scalar_loop_through_machine_ir_backend() {
+        let view = integer_scalar_loop_view();
+        let hir = NumericFunction::build(&view).expect("integer-scalar numeric HIR");
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::IntegerMul(..)))
+        );
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::IntegerShiftRightLogical(..)))
+        );
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::IntegerLessThan(..)))
+        );
+        let sequence = select(&hir).expect("integer-scalar Machine IR");
+        let allocation = sequence
+            .allocate(&TargetRegisterFile::aarch64_numeric_function())
+            .expect("integer-scalar allocation");
+        let frame = arm64::frame_layout(&allocation).expect("integer-scalar frame");
+        lower_deopt_table(
+            &sequence,
+            &allocation,
+            frame,
+            arm64::GPR_BUDGET,
+            arm64::FP_BUDGET,
+            &machine_frame_states(&hir),
+        )
+        .expect("integer-scalar deopt table");
+
+        let output = crate::optimizing::compile_optimized_with_artifacts(
+            &view,
+            7006,
+            &TransitionTable::resolve(),
+            Some(ArtifactRequest {
+                identity: JitArtifactIdentity {
+                    function_name: "engineKernel".to_string(),
+                    module: "benchmarks/scripts/integer-scalar.js".to_string(),
+                },
+                tier: JitDebugTier::Optimizing,
+                entry: JitDebugTarget::Entry,
+            }),
+            false,
+        )
+        .expect("production selector compiles integer-scalar loop");
+        let optimized_ir = std::str::from_utf8(
+            output
+                .artifact
+                .as_ref()
+                .expect("integer-scalar artifact")
+                .file(JitArtifactFileName::OptimizedIr)
+                .expect("integer-scalar optimized IR")
+                .contents(),
+        )
+        .expect("UTF-8 optimized IR");
+        assert!(optimized_ir.starts_with("; backend=otter-machine-ir numeric-function\n"));
+
+        let (result, _, _) = execute(&output.code, &[], 0);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(unbox_number(result.value), 1725.0);
     }
 
     #[test]

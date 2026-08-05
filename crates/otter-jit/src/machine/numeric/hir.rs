@@ -31,6 +31,7 @@ pub(super) struct NumericValue(pub(super) usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NumericType {
     Int32,
+    Uint32,
     Number,
     Boolean,
 }
@@ -42,8 +43,10 @@ pub(super) enum NumericNode {
     IntegerConstant(i32),
     Constant(f64),
     WidenInt32(NumericValue),
+    WidenUint32(NumericValue),
     IntegerAdd(NumericValue, NumericValue),
     IntegerSub(NumericValue, NumericValue),
+    IntegerMul(NumericValue, NumericValue),
     IntegerAddImmediate(NumericValue, i32),
     IntegerSubImmediate(NumericValue, i32),
     IntegerAnd(NumericValue, NumericValue),
@@ -51,17 +54,29 @@ pub(super) enum NumericNode {
     IntegerXor(NumericValue, NumericValue),
     IntegerShiftLeft(NumericValue, NumericValue),
     IntegerShiftRight(NumericValue, NumericValue),
+    IntegerShiftRightLogical(NumericValue, NumericValue),
     IntegerNot(NumericValue),
     IntegerAndImmediate(NumericValue, i32),
     IntegerLessThanImmediate(NumericValue, i32),
     IntegerEqualImmediate(NumericValue, i32),
     IntegerNotEqualImmediate(NumericValue, i32),
+    IntegerEqual(NumericValue, NumericValue),
+    IntegerNotEqual(NumericValue, NumericValue),
+    IntegerLessThan(NumericValue, NumericValue),
+    IntegerLessEqual(NumericValue, NumericValue),
+    IntegerGreaterThan(NumericValue, NumericValue),
+    IntegerGreaterEqual(NumericValue, NumericValue),
     Add(NumericValue, NumericValue),
     Sub(NumericValue, NumericValue),
     Mul(NumericValue, NumericValue),
     Div(NumericValue, NumericValue),
     Neg(NumericValue),
     LessThan(NumericValue, NumericValue),
+    Equal(NumericValue, NumericValue),
+    NotEqual(NumericValue, NumericValue),
+    LessEqual(NumericValue, NumericValue),
+    GreaterThan(NumericValue, NumericValue),
+    GreaterEqual(NumericValue, NumericValue),
 }
 
 impl NumericNode {
@@ -70,6 +85,7 @@ impl NumericNode {
             Self::IntegerConstant(..)
             | Self::IntegerAdd(..)
             | Self::IntegerSub(..)
+            | Self::IntegerMul(..)
             | Self::IntegerAddImmediate(..)
             | Self::IntegerSubImmediate(..)
             | Self::IntegerAnd(..)
@@ -80,7 +96,21 @@ impl NumericNode {
             | Self::IntegerNot(..)
             | Self::IntegerAndImmediate(..)
             | Self::BlockParameter(NumericType::Int32) => NumericType::Int32,
+            Self::IntegerShiftRightLogical(..) | Self::BlockParameter(NumericType::Uint32) => {
+                NumericType::Uint32
+            }
             Self::LessThan(..)
+            | Self::Equal(..)
+            | Self::NotEqual(..)
+            | Self::LessEqual(..)
+            | Self::GreaterThan(..)
+            | Self::GreaterEqual(..)
+            | Self::IntegerEqual(..)
+            | Self::IntegerNotEqual(..)
+            | Self::IntegerLessThan(..)
+            | Self::IntegerLessEqual(..)
+            | Self::IntegerGreaterThan(..)
+            | Self::IntegerGreaterEqual(..)
             | Self::IntegerLessThanImmediate(..)
             | Self::IntegerEqualImmediate(..)
             | Self::IntegerNotEqualImmediate(..)
@@ -89,6 +119,7 @@ impl NumericNode {
             | Self::BlockParameter(NumericType::Number)
             | Self::Constant(..)
             | Self::WidenInt32(..)
+            | Self::WidenUint32(..)
             | Self::Add(..)
             | Self::Sub(..)
             | Self::Mul(..)
@@ -294,11 +325,9 @@ impl NumericFunction {
                         when_true,
                     }
                 }
-                RawTerminator::Return => NumericTerminator::Return(read_number(
-                    &registers,
-                    &nodes,
-                    register(terminal, code, 0)?,
-                )?),
+                RawTerminator::Return => {
+                    NumericTerminator::Return(read_value(&registers, register(terminal, code, 0)?)?)
+                }
             };
 
             out_states.push(registers);
@@ -530,7 +559,13 @@ fn instruction_accesses(
         | Op::BitwiseXor
         | Op::Shl
         | Op::Shr
-        | Op::LessThan => Some((
+        | Op::Ushr
+        | Op::Equal
+        | Op::NotEqual
+        | Op::LessThan
+        | Op::LessEq
+        | Op::GreaterThan
+        | Op::GreaterEq => Some((
             vec![
                 register(instruction, code, 1)?,
                 register(instruction, code, 2)?,
@@ -697,15 +732,16 @@ fn lower_instruction(
             let left = read_number(registers, nodes, register(instruction, code, 1)?)?;
             let right = read_number(registers, nodes, register(instruction, code, 2)?)?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
-            if matches!(op, Op::Add | Op::Sub)
+            if matches!(op, Op::Add | Op::Sub | Op::Mul)
                 && instruction.arith_feedback().is_int32_only()
                 && value_type(nodes, left)? == NumericType::Int32
                 && value_type(nodes, right)? == NumericType::Int32
             {
-                if op == Op::Add {
-                    NumericNode::IntegerAdd(left, right)
-                } else {
-                    NumericNode::IntegerSub(left, right)
+                match op {
+                    Op::Add => NumericNode::IntegerAdd(left, right),
+                    Op::Sub => NumericNode::IntegerSub(left, right),
+                    Op::Mul => NumericNode::IntegerMul(left, right),
+                    _ => unreachable!("matched checked int32 arithmetic"),
                 }
             } else {
                 let left = widen_to_number(left, nodes, block_nodes)?;
@@ -746,9 +782,9 @@ fn lower_instruction(
                 _ => unreachable!("matched immediate int32 comparison"),
             }
         }
-        Op::BitwiseAnd | Op::BitwiseOr | Op::BitwiseXor | Op::Shl | Op::Shr => {
-            let left = read_int32(registers, nodes, register(instruction, code, 1)?)?;
-            let right = read_int32(registers, nodes, register(instruction, code, 2)?)?;
+        Op::BitwiseAnd | Op::BitwiseOr | Op::BitwiseXor | Op::Shl | Op::Shr | Op::Ushr => {
+            let left = read_int32_bits(registers, nodes, register(instruction, code, 1)?)?;
+            let right = read_int32_bits(registers, nodes, register(instruction, code, 2)?)?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
             match op {
                 Op::BitwiseAnd => NumericNode::IntegerAnd(left, right),
@@ -756,11 +792,12 @@ fn lower_instruction(
                 Op::BitwiseXor => NumericNode::IntegerXor(left, right),
                 Op::Shl => NumericNode::IntegerShiftLeft(left, right),
                 Op::Shr => NumericNode::IntegerShiftRight(left, right),
+                Op::Ushr => NumericNode::IntegerShiftRightLogical(left, right),
                 _ => unreachable!("matched binary int32 operation"),
             }
         }
         Op::BitwiseNot => {
-            let source = read_int32(registers, nodes, register(instruction, code, 1)?)?;
+            let source = read_int32_bits(registers, nodes, register(instruction, code, 1)?)?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
             NumericNode::IntegerNot(source)
         }
@@ -773,16 +810,38 @@ fn lower_instruction(
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
             NumericNode::Neg(source)
         }
-        Op::LessThan => {
+        Op::Equal | Op::NotEqual | Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
             if !instruction.arith_feedback().is_numeric_only() {
                 return None;
             }
             let left = read_number(registers, nodes, register(instruction, code, 1)?)?;
             let right = read_number(registers, nodes, register(instruction, code, 2)?)?;
-            NumericNode::LessThan(
-                widen_to_number(left, nodes, block_nodes)?,
-                widen_to_number(right, nodes, block_nodes)?,
-            )
+            if instruction.arith_feedback().is_int32_only()
+                && value_type(nodes, left)? == NumericType::Int32
+                && value_type(nodes, right)? == NumericType::Int32
+            {
+                match op {
+                    Op::Equal => NumericNode::IntegerEqual(left, right),
+                    Op::NotEqual => NumericNode::IntegerNotEqual(left, right),
+                    Op::LessThan => NumericNode::IntegerLessThan(left, right),
+                    Op::LessEq => NumericNode::IntegerLessEqual(left, right),
+                    Op::GreaterThan => NumericNode::IntegerGreaterThan(left, right),
+                    Op::GreaterEq => NumericNode::IntegerGreaterEqual(left, right),
+                    _ => unreachable!("matched int32 comparison"),
+                }
+            } else {
+                let left = widen_to_number(left, nodes, block_nodes)?;
+                let right = widen_to_number(right, nodes, block_nodes)?;
+                match op {
+                    Op::Equal => NumericNode::Equal(left, right),
+                    Op::NotEqual => NumericNode::NotEqual(left, right),
+                    Op::LessThan => NumericNode::LessThan(left, right),
+                    Op::LessEq => NumericNode::LessEqual(left, right),
+                    Op::GreaterThan => NumericNode::GreaterThan(left, right),
+                    Op::GreaterEq => NumericNode::GreaterEqual(left, right),
+                    _ => unreachable!("matched Float64 comparison"),
+                }
+            }
         }
         _ => return None,
     };
@@ -793,6 +852,7 @@ fn lower_instruction(
         node,
         NumericNode::IntegerAdd(..)
             | NumericNode::IntegerSub(..)
+            | NumericNode::IntegerMul(..)
             | NumericNode::IntegerAddImmediate(..)
             | NumericNode::IntegerSubImmediate(..)
     ) {
@@ -857,9 +917,16 @@ fn read_number(
     };
     matches!(
         nodes.get(value.0)?.value_type(),
-        NumericType::Int32 | NumericType::Number
+        NumericType::Int32 | NumericType::Uint32 | NumericType::Number
     )
     .then_some(value)
+}
+
+fn read_value(registers: &[RegisterState], register: u16) -> Option<NumericValue> {
+    let RegisterState::Value(value) = read_state(registers, register)? else {
+        return None;
+    };
+    Some(value)
 }
 
 fn read_int32(
@@ -871,6 +938,21 @@ fn read_int32(
         return None;
     };
     (value_type(nodes, value)? == NumericType::Int32).then_some(value)
+}
+
+fn read_int32_bits(
+    registers: &[RegisterState],
+    nodes: &[NumericNode],
+    register: u16,
+) -> Option<NumericValue> {
+    let RegisterState::Value(value) = read_state(registers, register)? else {
+        return None;
+    };
+    matches!(
+        value_type(nodes, value)?,
+        NumericType::Int32 | NumericType::Uint32
+    )
+    .then_some(value)
 }
 
 fn value_type(nodes: &[NumericNode], value: NumericValue) -> Option<NumericType> {
@@ -886,6 +968,11 @@ fn widen_to_number(
         NumericType::Number => Some(value),
         NumericType::Int32 => {
             let widened = push(nodes, NumericNode::WidenInt32(value));
+            block_nodes.push(widened);
+            Some(widened)
+        }
+        NumericType::Uint32 => {
+            let widened = push(nodes, NumericNode::WidenUint32(value));
             block_nodes.push(widened);
             Some(widened)
         }

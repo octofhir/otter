@@ -153,6 +153,8 @@ pub enum RuntimeStubSignature {
     MutatingLeafValue3 = 6,
     /// `(left: f64, right: f64) -> f64` pure numeric leaf.
     Float64Leaf2 = 7,
+    /// `(value: f64) -> word` pure numeric conversion leaf.
+    Float64ToWordLeaf1 = 8,
 }
 
 /// Safepoint requirement encoded in the descriptor.
@@ -1262,6 +1264,17 @@ pub const STUB_NUMBER_POW_F64_LEAF: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::Float64,
 );
 
+/// Pure ECMAScript ToInt32 conversion for typed numeric machine code.
+pub const STUB_NUMBER_TO_INT32_F64_LEAF: RuntimeStubDescriptor = descriptor(
+    86,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::Float64ToWordLeaf1,
+    1,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::ValueWord,
+);
+
 /// Leaf `Math.abs`.
 ///
 /// A numeric builtin reached through a declared entry rather than a
@@ -1413,6 +1426,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         83 => "collection_map_set_mutating",
         84 => "number_rem_f64_leaf",
         85 => "number_pow_f64_leaf",
+        86 => "number_to_int32_f64_leaf",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1504,6 +1518,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_COLLECTION_MAP_SET_MUTATING,
     STUB_NUMBER_REM_F64_LEAF,
     STUB_NUMBER_POW_F64_LEAF,
+    STUB_NUMBER_TO_INT32_F64_LEAF,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.
@@ -1527,6 +1542,9 @@ pub const fn validate_stub_descriptor(
         }
         RuntimeStubSignature::Float64Leaf2 => {
             matches!(desc.result_abi, RuntimeStubResultAbi::Float64)
+        }
+        RuntimeStubSignature::Float64ToWordLeaf1 => {
+            matches!(desc.result_abi, RuntimeStubResultAbi::ValueWord)
         }
         RuntimeStubSignature::Variadic => !matches!(
             (desc.exception, desc.result_abi),

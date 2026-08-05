@@ -4,11 +4,13 @@
 //! - [`NumericFunction`] — bounded numeric SSA graph with explicit blocks.
 //! - [`NumericBlock`] and [`NumericTerminator`] — predecessor/successor edges,
 //!   block parameters, edge arguments, branches, and returns.
-//! - [`NumericNode`] — typed parameters, constants, arithmetic, and comparison.
+//! - [`NumericNode`] — typed parameters, constants, coercions, arithmetic, and
+//!   comparison.
 //!
 //! # Invariants
 //! - Every accepted parameter is guarded as a JavaScript Number before effects.
-//! - Accepted nodes cannot allocate, call, touch the heap, or throw.
+//! - Accepted nodes cannot allocate, touch the heap, throw, or reenter JS;
+//!   exact scalar coercions may lower to declared pure numeric leaves.
 //! - Register merges become typed block parameters; no interpreter slot reaches
 //!   Machine IR.
 //! - Loop headers receive explicit parameters for every numeric value live from
@@ -41,9 +43,12 @@ pub(super) enum NumericNode {
     Parameter(u16),
     BlockParameter(NumericType),
     IntegerConstant(i32),
+    BooleanConstant(bool),
     Constant(f64),
     WidenInt32(NumericValue),
     WidenUint32(NumericValue),
+    FloatToInt32(NumericValue),
+    BooleanToInt32(NumericValue),
     IntegerAdd(NumericValue, NumericValue),
     IntegerSub(NumericValue, NumericValue),
     IntegerMul(NumericValue, NumericValue),
@@ -89,6 +94,8 @@ impl NumericNode {
     pub(super) const fn value_type(self) -> NumericType {
         match self {
             Self::IntegerConstant(..)
+            | Self::FloatToInt32(..)
+            | Self::BooleanToInt32(..)
             | Self::IntegerAdd(..)
             | Self::IntegerSub(..)
             | Self::IntegerMul(..)
@@ -125,6 +132,7 @@ impl NumericNode {
             | Self::IntegerEqualImmediate(..)
             | Self::IntegerNotEqualImmediate(..)
             | Self::BlockParameter(NumericType::Boolean) => NumericType::Boolean,
+            Self::BooleanConstant(..) => NumericType::Boolean,
             Self::Parameter(..)
             | Self::BlockParameter(NumericType::Number)
             | Self::Constant(..)
@@ -555,7 +563,7 @@ fn instruction_accesses(
             vec![local_index(instruction, code, 1)?],
             vec![register(instruction, code, 0)?],
         )),
-        Op::LoadUndefined | Op::LoadInt32 | Op::LoadNumber => {
+        Op::LoadUndefined | Op::LoadTrue | Op::LoadFalse | Op::LoadInt32 | Op::LoadNumber => {
             Some((Vec::new(), vec![register(instruction, code, 0)?]))
         }
         Op::ToPrimitive
@@ -606,7 +614,7 @@ fn instruction_accesses(
             Some((vec![register(instruction, code, 1)?], Vec::new()))
         }
         Op::ReturnValue => Some((vec![register(instruction, code, 0)?], Vec::new())),
-        Op::Jump => Some((Vec::new(), Vec::new())),
+        Op::Nop | Op::Jump => Some((Vec::new(), Vec::new())),
         _ => None,
     }
 }
@@ -704,6 +712,7 @@ fn lower_instruction(
 ) -> Option<()> {
     let op = instruction.op(code);
     let node = match op {
+        Op::Nop => return Some(()),
         Op::StoreLocal => {
             let value = read_state(registers, register(instruction, code, 0)?)?;
             write(registers, local_index(instruction, code, 1)?, value)?;
@@ -723,6 +732,8 @@ fn lower_instruction(
             return Some(());
         }
         Op::LoadInt32 => NumericNode::IntegerConstant(instruction.imm32(code, 1)?),
+        Op::LoadTrue => NumericNode::BooleanConstant(true),
+        Op::LoadFalse => NumericNode::BooleanConstant(false),
         Op::LoadNumber => {
             instruction.const_index(code, 1)?;
             NumericNode::Constant(instruction.load_number?)
@@ -795,7 +806,7 @@ fn lower_instruction(
                 }
             }
         }
-        Op::Increment | Op::AddImm | Op::SubImm | Op::BitwiseAndImm => {
+        Op::Increment | Op::AddImm | Op::SubImm => {
             if !instruction.arith_feedback().is_int32_only() {
                 return None;
             }
@@ -805,9 +816,19 @@ fn lower_instruction(
             match op {
                 Op::Increment | Op::AddImm => NumericNode::IntegerAddImmediate(source, immediate),
                 Op::SubImm => NumericNode::IntegerSubImmediate(source, immediate),
-                Op::BitwiseAndImm => NumericNode::IntegerAndImmediate(source, immediate),
                 _ => unreachable!("matched immediate int32 operation"),
             }
+        }
+        Op::BitwiseAndImm => {
+            let source = read_int32_bits(
+                registers,
+                nodes,
+                block_nodes,
+                register(instruction, code, 1)?,
+            )?;
+            let immediate = instruction.imm32(code, 2)?;
+            *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
+            NumericNode::IntegerAndImmediate(source, immediate)
         }
         Op::LessThanImm | Op::EqualImm | Op::NotEqualImm => {
             if !instruction.arith_feedback().is_int32_only() {
@@ -823,8 +844,18 @@ fn lower_instruction(
             }
         }
         Op::BitwiseAnd | Op::BitwiseOr | Op::BitwiseXor | Op::Shl | Op::Shr | Op::Ushr => {
-            let left = read_int32_bits(registers, nodes, register(instruction, code, 1)?)?;
-            let right = read_int32_bits(registers, nodes, register(instruction, code, 2)?)?;
+            let left = read_int32_bits(
+                registers,
+                nodes,
+                block_nodes,
+                register(instruction, code, 1)?,
+            )?;
+            let right = read_int32_bits(
+                registers,
+                nodes,
+                block_nodes,
+                register(instruction, code, 2)?,
+            )?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
             match op {
                 Op::BitwiseAnd => NumericNode::IntegerAnd(left, right),
@@ -837,7 +868,12 @@ fn lower_instruction(
             }
         }
         Op::BitwiseNot => {
-            let source = read_int32_bits(registers, nodes, register(instruction, code, 1)?)?;
+            let source = read_int32_bits(
+                registers,
+                nodes,
+                block_nodes,
+                register(instruction, code, 1)?,
+            )?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
             NumericNode::IntegerNot(source)
         }
@@ -988,17 +1024,21 @@ fn read_int32(
 
 fn read_int32_bits(
     registers: &[RegisterState],
-    nodes: &[NumericNode],
+    nodes: &mut Vec<NumericNode>,
+    block_nodes: &mut Vec<NumericValue>,
     register: u16,
 ) -> Option<NumericValue> {
     let RegisterState::Value(value) = read_state(registers, register)? else {
         return None;
     };
-    matches!(
-        value_type(nodes, value)?,
-        NumericType::Int32 | NumericType::Uint32
-    )
-    .then_some(value)
+    let node = match value_type(nodes, value)? {
+        NumericType::Int32 | NumericType::Uint32 => return Some(value),
+        NumericType::Number => NumericNode::FloatToInt32(value),
+        NumericType::Boolean => NumericNode::BooleanToInt32(value),
+    };
+    let coerced = push(nodes, node);
+    block_nodes.push(coerced);
+    Some(coerced)
 }
 
 fn value_type(nodes: &[NumericNode], value: NumericValue) -> Option<NumericType> {

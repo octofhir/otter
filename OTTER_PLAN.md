@@ -370,6 +370,36 @@ Typed scalar leaf publication landed on 2026-08-06:
 The full repository gate passed with 258 JIT tests, 831 VM tests, all-target
 all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
 
+Exact ToInt32 bitwise publication landed on 2026-08-06:
+
+- Float64 and Boolean inputs to `&`, `|`, `^`, `~`, `<<`, `>>`, `>>>`, and
+  immediate AND now lower through the same typed numeric HIR as existing
+  Int32/Uint32 inputs. This removes the parameter/large-constant fallback
+  without weakening Number entry guards;
+- one declared pure `f64 -> word` VM leaf owns the complete ECMAScript ToInt32
+  modulo semantics, including truncation, both zero signs, NaN, infinities,
+  values across the signed boundary, and values beyond 32 bits. The AArch64
+  ABI uses `d0`/`x0`, the common caller-save clobber set, and the existing
+  frame-owned scalar result shuttle; it has no heap, status, exception, or
+  alternate reconstruction channel;
+- Boolean constants and `NOP` are accepted in numeric CFGs. A typed
+  Boolean-to-Int32 conversion preserves the representation boundary instead of
+  treating Boolean HIR values as signed integers implicitly;
+- focused execution covers the full conversion edge matrix, Uint32 result
+  boxing, fractional shift counts, Boolean bitwise input, allocator spills
+  across conversion calls, and exact interrupt reconstruction at a loop
+  header;
+- `benchmarks/scripts/float-bitwise.js` is the real frontend fixture. Its
+  artifact contains `Float64ToInt32` and `IntegerLeafResult` under
+  `otter-machine-ir numeric-function`, native execution returns the Node oracle
+  `120790`, and ten validated samples recorded 13 optimizing entries and zero
+  deopts. The dirty-tree production-tiered median was 1.208 ms versus 2.485 ms
+  for template tier (-51.4%); this is engineering evidence, not a published
+  baseline.
+
+The full repository gate passed with 260 JIT tests, 831 VM tests, all-target
+all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
+
 The remaining legacy optimizer and allocator are fallback for functions whose
 HIR/selection slices have not switched. Delete each old consumer as its final
 operation family moves; do not adapt old allocation or metadata into the new

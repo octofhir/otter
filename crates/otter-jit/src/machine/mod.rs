@@ -27,12 +27,16 @@
 //! # See also
 //! - [`crate::optimizing`] — current semantic lowering being replaced.
 
+mod deopt;
 mod frame;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod numeric;
 mod regalloc;
 mod target;
 
+pub use deopt::{
+    MachineDeoptError, MachineFrameSlot, MachineFrameState, lower_deopt_table, undefined_slot,
+};
 pub use frame::{FrameLayoutError, MachineFrameLayout};
 pub use regalloc::{
     AllocatedLocation, AllocatedMetadata, AllocatedSequence, AllocationEdit, AllocationError,

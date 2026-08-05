@@ -58,13 +58,15 @@
 //!   comparison with the VM's `true` immediate; all other values run the full
 //!   inline `ToBoolean` reduction before selecting an edge. `LogicalNot` uses
 //!   the same reduction and materializes the inverted canonical boolean.
-//! - Every root-frame reentrant transition boxes its operands plus tagged SSA
-//!   values live across the call into their canonical native-frame slots. Its
-//!   precise frame bitmap names every tagged input and live-across value;
+//! - Every reentrant transition boxes its operands plus tagged SSA values live
+//!   across the call into the register window of the frame that names them.
+//!   Its precise frame bitmap names every tagged input and live-across value;
 //!   moving-GC reloads restore live values and load results while numeric
-//!   machine locations remain untouched. A spliced-frame transition exits
-//!   before effects and reconstructs the complete inline chain instead of
-//!   addressing the root frame's register window.
+//!   machine locations remain untouched. A stub runs in the frame that owns
+//!   its instruction: the root's window is the interpreter's, a spliced
+//!   frame's is a reservation in this generation's own stack frame, published
+//!   as a stack-owned activation — together with every spliced frame it is
+//!   paused inside — for the duration of the call.
 //! - A baked global lexical address names a permanent old-space cell. Generated
 //!   code loads the cell's current value and uses the canonical transition for
 //!   TDZ holes.
@@ -96,7 +98,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_bytecode::{Op, Operand};
-use otter_vm::deopt::{DeoptChainCall, DeoptExitDescriptor, DeoptExitId, DeoptRuntime, DeoptTable};
+use otter_vm::deopt::{DeoptExitDescriptor, DeoptExitId, DeoptRuntime, DeoptTable};
 use otter_vm::native_abi::{
     FrameMap, NO_FRAME_STATE, RuntimeStubDescriptor, STUB_JIT_BACKEDGE_POLL, STUB_JIT_CONSTRUCT,
     STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_LOAD_ELEMENT,
@@ -129,14 +131,19 @@ use crate::{
         relocation::{PropertyIcAccess, RelocationCapture, RelocationTarget},
     },
     entry::{
+        ACTIVATION_BASE_OFFSET, ACTIVATION_LIMIT_OFFSET, ACTIVATION_TOP_PTR_OFFSET,
         CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, GLOBAL_THIS_OFFSET_PTR_OFFSET, MAX_METHOD_ARGS,
-        NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
-        NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET, NUMBER_TAG_HI16,
+        NATIVE_FRAME_ACTIVATION_ID_OFFSET, NATIVE_FRAME_FUNCTION_ID_OFFSET,
+        NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
+        NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET,
+        NATIVE_FRAME_SHAPE_WORD_OFFSET, NATIVE_FRAME_STACK_SIZE, NATIVE_FRAME_THIS_OFFSET,
+        NATIVE_FRAME_UPVALUE_BASE_OFFSET, NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NUMBER_TAG_HI16,
         OBJECT_BODY_TYPE_TAG, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THREAD_OFFSET,
         TransitionTable, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL,
-        VALUE_TRUE, VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
+        VALUE_TRUE, VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
+        VM_THREAD_CURRENT_FRAME_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
         VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET, WhiskerIcCell,
-        pack_method_arg_regs,
+        pack_method_arg_regs, stack_register_frame_shape_word,
     },
     ir::{
         cfg::{BlockId, ControlFlowGraph, Terminator},
@@ -177,6 +184,9 @@ const REGISTER_BUDGET: RegisterBudget = RegisterBudget {
 const VALUE_REGISTERS: [u8; ALLOCATABLE_REGISTER_COUNT as usize] = [21, 22, 23, 24, 25, 26, 27, 28];
 /// Where a spilled holder address is materialized for the node that reads it.
 const HEADER_SCRATCH: u8 = 13;
+/// Where the base of a spliced frame's interpreter window is materialized for
+/// the transition that addresses it.
+const WINDOW_SCRATCH: u8 = 8;
 const FP_REGISTERS: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
 const FP_SCRATCH: u8 = 16;
 /// Transient register dump the shared deopt handler pushes below the spill
@@ -202,12 +212,9 @@ struct Eligibility {
     back_edges: BTreeMap<(BlockId, BlockId), (DeoptExitId, u32)>,
     /// Verified loop-header entry state keyed by target block.
     osr_entries: BTreeMap<BlockId, OsrEntrySite>,
-    /// Precise transition protocol per element load/store logical PC.
+    /// Precise transition protocol per reentrant site, keyed by the frame that
+    /// owns the instruction and its logical PC inside that frame.
     element_transitions: ElementTransitionSafepoints,
-    /// Reentrant bytecodes inside spliced frames. Their ordinary machine fast
-    /// paths are lowered before this classification; any remaining operation
-    /// exits before effects and lets the reconstructed interpreter chain run it.
-    inline_transitions: BTreeSet<(InlineId, u32)>,
     /// Sites whose feedback cell has never recorded an execution. Emission
     /// replaces each with an unconditional deopt: if the cold path is ever
     /// reached, the interpreter runs it, records feedback, bumps the epoch,
@@ -234,9 +241,11 @@ struct OsrEntrySite {
     preheader_run: Option<HoistedGroup>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct TaggedLiveAcross {
     value: ValueId,
+    /// Frame whose window slot roots the value while the stub runs.
+    inline: InlineId,
     register: u16,
 }
 
@@ -249,9 +258,114 @@ struct ElementTransitionSite {
 
 #[derive(Debug)]
 struct ElementTransitionSafepoints {
-    sites: BTreeMap<u32, ElementTransitionSite>,
+    sites: BTreeMap<(InlineId, u32), ElementTransitionSite>,
     /// Concatenated immutable frame-map bitmap words owned by the code object.
     bitmap_words: Box<[u64]>,
+}
+
+/// Machine-stack home of one spliced frame's activation.
+///
+/// A runtime stub addresses its operands through the register window of the
+/// frame that is executing it, and reaches that window through the published
+/// activation. The root frame's window is the interpreter's; a spliced frame's
+/// is this reservation, published for the duration of the stub call so the
+/// collector traces and rewrites its slots exactly like any other frame.
+#[derive(Debug, Clone, Copy)]
+struct InlineWindow {
+    /// `sp`-relative byte offset of this frame's `NativeFrame` record.
+    record: u32,
+    /// `sp`-relative byte offset of this frame's register window.
+    window: u32,
+    /// Register-window length of the frame's body.
+    register_count: u16,
+}
+
+/// Every spliced frame that owns, or encloses, a runtime transition.
+#[derive(Debug, Default)]
+struct InlineWindows {
+    frames: BTreeMap<InlineId, InlineWindow>,
+    /// `sp`-relative slot holding the caller's published frame while a spliced
+    /// activation is on the stack.
+    saved_frame: u32,
+    /// Total reservation above `base`, 16-aligned.
+    bytes: u32,
+}
+
+impl InlineWindows {
+    /// Reserve a record and a window for every spliced frame a transition can
+    /// execute in, and for every frame such a transition is paused inside.
+    ///
+    /// A caller frame on the chain owes a window too: values it holds live
+    /// across the call have no home in the callee's namespace, and only a
+    /// published activation makes them collector-visible.
+    fn plan(
+        tree: &InlineTree,
+        ssa: &SsaFunction,
+        sites: &BTreeMap<(InlineId, u32), ElementTransitionSite>,
+        base: u32,
+    ) -> Result<Self, Unsupported> {
+        let mut needed = BTreeSet::new();
+        for &(inline, _) in sites.keys() {
+            let mut current = inline;
+            while current != InlineId::ROOT {
+                if !needed.insert(current) {
+                    break;
+                }
+                current = tree
+                    .frames
+                    .get(current.0 as usize)
+                    .and_then(|frame| frame.call_site.as_ref())
+                    .ok_or(Unsupported::OperandShape("optimizing spliced frame parent"))?
+                    .parent;
+            }
+        }
+        if needed.is_empty() {
+            return Ok(Self::default());
+        }
+        let mut cursor = base;
+        let saved_frame = cursor;
+        cursor = cursor
+            .checked_add(16)
+            .ok_or(Unsupported::OperandShape("optimizing inline window frame"))?;
+        let mut frames = BTreeMap::new();
+        for inline in needed {
+            let register_count = ssa
+                .frames
+                .get(inline.0 as usize)
+                .ok_or(Unsupported::OperandShape("optimizing spliced frame shape"))?
+                .register_count;
+            let record = cursor;
+            let window = record
+                .checked_add(NATIVE_FRAME_STACK_SIZE)
+                .ok_or(Unsupported::OperandShape("optimizing inline window frame"))?;
+            cursor = window
+                .checked_add(u32::from(register_count).saturating_mul(STACK_SLOT_BYTES))
+                .map(|bytes| bytes.next_multiple_of(16))
+                .ok_or(Unsupported::OperandShape("optimizing inline window frame"))?;
+            frames.insert(
+                inline,
+                InlineWindow {
+                    record,
+                    window,
+                    register_count,
+                },
+            );
+        }
+        Ok(Self {
+            frames,
+            saved_frame,
+            bytes: cursor - base,
+        })
+    }
+
+    fn get(&self, inline: InlineId) -> Result<InlineWindow, Unsupported> {
+        self.frames
+            .get(&inline)
+            .copied()
+            .ok_or(Unsupported::OperandShape(
+                "optimizing spliced frame has no published window",
+            ))
+    }
 }
 
 struct EligibilityAnalyses<'a> {
@@ -317,9 +431,6 @@ struct EmissionPlan<'a> {
     to_boolean_entry: ResolvedRuntimeEntry,
     /// Exact non-allocating IEEE-754 remainder probe.
     number_rem_entry: ResolvedRuntimeEntry,
-    /// Owning function id, baked into property/global transitions so the stub
-    /// resolves the name constant against this function's constant pool.
-    function_id: u64,
 }
 
 struct OptimizedEmission {
@@ -373,7 +484,7 @@ pub(super) fn compile_with_artifacts(
     let mut unit = pipeline
         .analyze_tree(view, selected_tree.clone())
         .map_err(OptimizationError::into_unsupported)?;
-    let mut eligibility = check_unit_eligibility(view, &unit)?;
+    let mut eligibility = check_unit_eligibility(&unit)?;
     let mut inline_diagnostics = Vec::new();
     for root_candidate in planned_tree.frames.iter().skip(1).filter(|frame| {
         frame
@@ -415,7 +526,7 @@ pub(super) fn compile_with_artifacts(
                 continue;
             }
         };
-        let trial_eligibility = match check_unit_eligibility(view, &trial_unit) {
+        let trial_eligibility = match check_unit_eligibility(&trial_unit) {
             Ok(eligibility) => eligibility,
             Err(error) => {
                 if capture_events {
@@ -561,7 +672,6 @@ pub(super) fn compile_with_artifacts(
                 otter_vm::runtime_stubs::NUMBER_REM_LEAF.descriptor,
                 otter_vm::runtime_stubs::NUMBER_REM_LEAF.entry_addr() as u64,
             ),
-            function_id: u64::from(view.code_block.id),
         },
         artifact_request.is_some(),
         capture_events,
@@ -647,12 +757,8 @@ pub(super) fn compile_with_artifacts(
     })
 }
 
-fn check_unit_eligibility(
-    view: &JitCompileSnapshot,
-    unit: &OptimizedUnit,
-) -> Result<Eligibility, Unsupported> {
+fn check_unit_eligibility(unit: &OptimizedUnit) -> Result<Eligibility, Unsupported> {
     check_eligibility(
-        view,
         &unit.tree,
         &unit.cfg,
         &unit.dom,
@@ -692,14 +798,17 @@ fn record_inline_subtree_diagnostics(
             .as_ref()
             .expect("a non-root inline frame has one call site");
         let parent = &tree.frames[call_site.parent.0 as usize];
-        let instruction = parent.instructions.get(call_site.call_pc as usize).ok_or(
-            Unsupported::OperandShape("budgeted inline call PC outside parent body"),
-        )?;
+        let instruction = parent
+            .instructions()
+            .get(call_site.call_pc as usize)
+            .ok_or(Unsupported::OperandShape(
+                "budgeted inline call PC outside parent body",
+            ))?;
         diagnostics.push(otter_vm::JitCompilerDiagnostic::InlineLowered {
-            parent_function_id: parent.function_id,
+            parent_function_id: parent.function_id(),
             instruction_pc: call_site.call_pc,
             byte_pc: instruction.byte_pc,
-            callee_function_id: frame.function_id,
+            callee_function_id: frame.function_id(),
             depth: frame.depth(tree),
             cost: frame.cost,
             outcome: match &outcome {
@@ -907,7 +1016,6 @@ fn emit(
         write_barrier_entry,
         to_boolean_entry,
         number_rem_entry,
-        function_id,
     } = plan;
     let allocated_spill_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
     let fused_method_receiver_slot = ssa
@@ -928,8 +1036,23 @@ fn emit(
     } else {
         allocated_spill_bytes
     };
-    let spill_frame_bytes = after_fused_slots
+    let inline_window_base = after_fused_slots
         .checked_add(15)
+        .map(|bytes| bytes & !15)
+        .ok_or(Unsupported::OperandShape("optimizing spill frame overflow"))?;
+    // A spliced frame executing a runtime stub needs a real activation: its own
+    // register window, published so the collector traces and rewrites it. The
+    // reservation lives above the allocation's spill namespace and never
+    // participates in it.
+    let inline_windows = InlineWindows::plan(
+        tree,
+        ssa,
+        &eligibility.element_transitions.sites,
+        inline_window_base,
+    )?;
+    let spill_frame_bytes = inline_window_base
+        .checked_add(inline_windows.bytes)
+        .and_then(|bytes| bytes.checked_add(15))
         .map(|bytes| bytes & !15)
         .ok_or(Unsupported::OperandShape("optimizing spill frame overflow"))?;
     let saved_frame = SavedFrame::from_allocation(allocation, spill_frame_bytes);
@@ -1110,15 +1233,11 @@ fn emit(
             if eligibility
                 .insufficient_feedback
                 .contains(&(instruction.inline, instruction.pc))
-                || eligibility
-                    .inline_transitions
-                    .contains(&(instruction.inline, instruction.pc))
             {
                 // A never-executed feedback site needs the interpreter to
-                // populate its cell. A reentrant operation in a spliced frame
-                // has no physical interpreter window for a runtime stub. Both
-                // exit before effects; exact frame state rebuilds the complete
-                // chain and the interpreter executes the opcode once.
+                // populate its cell: it exits before effects, exact frame state
+                // rebuilds the complete chain, and the interpreter runs the
+                // opcode once. The next compile then sees real types.
                 let deopt = ops.new_dynamic_label();
                 deopt_exits.push((
                     deopt,
@@ -1133,9 +1252,9 @@ fn emit(
                         ops.offset().0,
                         Some(block_id.0),
                         Some(instruction.inline.0),
-                        frame.function_id,
+                        frame.function_id(),
                         instruction.pc,
-                        frame.instructions[instruction.pc as usize].byte_pc(),
+                        frame.instructions()[instruction.pc as usize].byte_pc(),
                         Some(operation_index),
                         format!("{:?}", instruction.op),
                     ));
@@ -1330,7 +1449,7 @@ fn emit(
                         let site = eligibility
                             .element_transitions
                             .sites
-                            .get(&instruction.pc)
+                            .get(&(instruction.inline, instruction.pc))
                             .ok_or(Unsupported::OperandShape(
                                 "optimizing element load missing site",
                             ))?;
@@ -1342,16 +1461,9 @@ fn emit(
                         // so it takes the generic path like every other miss.
                         let miss = ops.new_dynamic_label();
                         let done = ops.new_dynamic_label();
-                        let frame = &tree.frames[instruction.inline.0 as usize];
-                        let byte_pc = frame
-                            .instructions
-                            .get(instruction.pc as usize)
-                            .map(|metadata| metadata.byte_pc)
-                            .ok_or(Unsupported::OperandShape("optimizing element byte PC"))?;
-                        let load_access = (instruction.inline == InlineId::ROOT)
-                            .then(|| element_access_for(view, byte_pc))
-                            .flatten()
-                            .copied();
+                        let frame = frame_of(tree, instruction)?;
+                        let byte_pc = frame_byte_pc(tree, instruction)?;
+                        let load_access = element_access_for(&frame.body, byte_pc).copied();
                         if let Some(access) = load_access.as_ref() {
                             emit_element_address(
                                 &mut ops,
@@ -1390,18 +1502,31 @@ fn emit(
                             dynasm!(ops ; .arch aarch64 ; b =>done);
                         }
                         dynasm!(ops ; .arch aarch64 ; =>miss);
+                        emit_build_transition_frames(
+                            &mut ops,
+                            tree,
+                            &inline_windows,
+                            instruction,
+                            site,
+                        )?;
                         emit_materialize_element_transition(
                             &mut ops,
                             reprs,
                             allocation,
+                            &inline_windows,
                             instruction,
                             site,
                         )?;
-                        emit_load_u32(&mut ops, 9, instruction.pc);
+                        let transition_depth = emit_publish_transition_frame(
+                            &mut ops,
+                            tree,
+                            &inline_windows,
+                            frame_states,
+                            &mut deopt_exits,
+                            instruction,
+                        )?;
                         dynasm!(ops
                             ; .arch aarch64
-                            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-                            ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
                             ; mov x0, x20
                             ; movz x1, dst as u32
                             ; movz x2, receiver as u32
@@ -1412,6 +1537,14 @@ fn emit(
                         dynasm!(ops
                             ; .arch aarch64
                             ; blr x16
+                        );
+                        emit_unpublish_transition_frame(
+                            &mut ops,
+                            &inline_windows,
+                            transition_depth,
+                        )?;
+                        dynasm!(ops
+                            ; .arch aarch64
                             ; cbz x0, =>succeeded
                             ; b =>threw
                             ; =>succeeded
@@ -1419,6 +1552,8 @@ fn emit(
                         emit_reload_element_transition(
                             &mut ops,
                             allocation,
+                            &inline_windows,
+                            instruction.inline,
                             site,
                             Some((
                                 dst,
@@ -1438,7 +1573,7 @@ fn emit(
                         let site = eligibility
                             .element_transitions
                             .sites
-                            .get(&instruction.pc)
+                            .get(&(instruction.inline, instruction.pc))
                             .ok_or(Unsupported::OperandShape(
                                 "optimizing element store missing site",
                             ))?;
@@ -1451,15 +1586,9 @@ fn emit(
                         // observe the store — and a tagged value may be a cell that
                         // needs the generational barrier, so both take the stub.
                         let value_repr = reprs.representation(instruction.inputs[2]);
-                        let frame = &tree.frames[instruction.inline.0 as usize];
-                        let byte_pc = frame
-                            .instructions
-                            .get(instruction.pc as usize)
-                            .map(|metadata| metadata.byte_pc)
-                            .ok_or(Unsupported::OperandShape("optimizing element byte PC"))?;
-                        let store_access = (instruction.inline == InlineId::ROOT)
-                            .then(|| element_access_for(view, byte_pc))
-                            .flatten()
+                        let frame = frame_of(tree, instruction)?;
+                        let byte_pc = frame_byte_pc(tree, instruction)?;
+                        let store_access = element_access_for(&frame.body, byte_pc)
                             .filter(|_| {
                                 matches!(
                                     value_repr,
@@ -1522,18 +1651,31 @@ fn emit(
                             emit_element_write(&mut ops, access.element, miss);
                             dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
                         }
+                        emit_build_transition_frames(
+                            &mut ops,
+                            tree,
+                            &inline_windows,
+                            instruction,
+                            site,
+                        )?;
                         emit_materialize_element_transition(
                             &mut ops,
                             reprs,
                             allocation,
+                            &inline_windows,
                             instruction,
                             site,
                         )?;
-                        emit_load_u32(&mut ops, 9, instruction.pc);
+                        let transition_depth = emit_publish_transition_frame(
+                            &mut ops,
+                            tree,
+                            &inline_windows,
+                            frame_states,
+                            &mut deopt_exits,
+                            instruction,
+                        )?;
                         dynasm!(ops
                             ; .arch aarch64
-                            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-                            ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
                             ; mov x0, x20
                             ; movz x1, receiver as u32
                             ; movz x2, index as u32
@@ -1544,11 +1686,26 @@ fn emit(
                         dynasm!(ops
                             ; .arch aarch64
                             ; blr x16
+                        );
+                        emit_unpublish_transition_frame(
+                            &mut ops,
+                            &inline_windows,
+                            transition_depth,
+                        )?;
+                        dynasm!(ops
+                            ; .arch aarch64
                             ; cbz x0, =>succeeded
                             ; b =>threw
                             ; =>succeeded
                         );
-                        emit_reload_element_transition(&mut ops, allocation, site, None)?;
+                        emit_reload_element_transition(
+                            &mut ops,
+                            allocation,
+                            &inline_windows,
+                            instruction.inline,
+                            site,
+                            None,
+                        )?;
                         dynasm!(ops ; .arch aarch64 ; =>done);
                     }
                     Op::LoadProperty if inline_method_property(tree, instruction).is_some() => {
@@ -1629,11 +1786,13 @@ fn emit(
                                 .result
                                 .expect("eligibility checked property-load result"),
                         );
-                        let name = view.instructions[instruction.pc as usize]
-                            .const_index(view.code_block.as_ref(), 2)
+                        let frame = frame_of(tree, instruction)?;
+                        let metadata = frame_instruction(tree, instruction)?;
+                        let name = metadata
+                            .const_index(frame.code_block(), 2)
                             .ok_or(Unsupported::OperandShape("property-load name constant"))?;
-                        let ic_site = view.instructions[instruction.pc as usize]
-                            .property_ic_site(view.code_block.as_ref())
+                        let ic_site = metadata
+                            .property_ic_site(frame.code_block())
                             .unwrap_or(usize::MAX) as u64;
                         let cell_ordinal = u32::try_from(next_load_ic).map_err(|_| {
                             Unsupported::OperandShape("optimizing property IC ordinal")
@@ -1646,7 +1805,7 @@ fn emit(
                         let site = eligibility
                             .element_transitions
                             .sites
-                            .get(&instruction.pc)
+                            .get(&(instruction.inline, instruction.pc))
                             .ok_or(Unsupported::OperandShape(
                                 "optimizing property load missing site",
                             ))?;
@@ -1659,16 +1818,12 @@ fn emit(
                         // neither allocates nor calls, so it needs no safepoint, no
                         // frame materialize, and no reload — the receiver pointer is
                         // re-derived from its rooted location every access.
-                        let property_byte_pc = tree.frames[instruction.inline.0 as usize]
-                            .instructions
-                            .get(instruction.pc as usize)
-                            .map(|metadata| metadata.byte_pc)
-                            .ok_or(Unsupported::OperandShape("optimizing property byte PC"))?;
+                        let property_byte_pc = metadata.byte_pc;
                         if view.cage_base != 0 {
                             // `.length` on a dense array or a primitive string is
                             // not an own data slot, so no cache program describes
                             // it and the probe below cannot serve it.
-                            if view.instructions[instruction.pc as usize].load_array_length {
+                            if metadata.load_array_length {
                                 let have_length = ops.new_dynamic_label();
                                 let not_length = ops.new_dynamic_label();
                                 emit_load_tagged_location(
@@ -1691,9 +1846,10 @@ fn emit(
                                 &mut ops,
                                 &mut relocations,
                                 view,
-                                (instruction.inline == InlineId::ROOT)
-                                    .then(|| view.property_loads.get(&property_byte_pc))
-                                    .flatten()
+                                frame
+                                    .body
+                                    .property_loads
+                                    .get(&property_byte_pc)
                                     .map(Vec::as_slice),
                                 |ops, register| {
                                     emit_load_tagged_location(
@@ -1714,18 +1870,31 @@ fn emit(
                         // Miss: the window transition resolves full `[[Get]]`
                         // semantics and self-patches this site's cell.
                         dynasm!(ops ; .arch aarch64 ; =>miss);
+                        emit_build_transition_frames(
+                            &mut ops,
+                            tree,
+                            &inline_windows,
+                            instruction,
+                            site,
+                        )?;
                         emit_materialize_element_transition(
                             &mut ops,
                             reprs,
                             allocation,
+                            &inline_windows,
                             instruction,
                             site,
                         )?;
-                        emit_load_u32(&mut ops, 9, instruction.pc);
+                        let transition_depth = emit_publish_transition_frame(
+                            &mut ops,
+                            tree,
+                            &inline_windows,
+                            frame_states,
+                            &mut deopt_exits,
+                            instruction,
+                        )?;
                         dynasm!(ops
                             ; .arch aarch64
-                            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-                            ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
                             ; mov x0, x20
                             ; movz x1, dst as u32
                             ; movz x2, object as u32
@@ -1742,12 +1911,20 @@ fn emit(
                                 ordinal: cell_ordinal,
                             },
                         );
-                        emit_load_u64(&mut ops, 6, function_id);
+                        emit_load_u64(&mut ops, 6, u64::from(frame.function_id()));
                         emit_runtime_entry(&mut ops, &mut relocations, 16, load_property_entry);
                         let succeeded = ops.new_dynamic_label();
                         dynasm!(ops
                             ; .arch aarch64
                             ; blr x16
+                        );
+                        emit_unpublish_transition_frame(
+                            &mut ops,
+                            &inline_windows,
+                            transition_depth,
+                        )?;
+                        dynasm!(ops
+                            ; .arch aarch64
                             ; cbz x0, =>succeeded
                             ; b =>threw
                             ; =>succeeded
@@ -1755,6 +1932,8 @@ fn emit(
                         emit_reload_element_transition(
                             &mut ops,
                             allocation,
+                            &inline_windows,
+                            instruction.inline,
                             site,
                             Some((dst, result_location)),
                         )?;
@@ -1763,11 +1942,13 @@ fn emit(
                     Op::StoreProperty => {
                         let object = instruction.input_registers[0];
                         let value = instruction.input_registers[1];
-                        let name = view.instructions[instruction.pc as usize]
-                            .const_index(view.code_block.as_ref(), 1)
+                        let frame = frame_of(tree, instruction)?;
+                        let metadata = frame_instruction(tree, instruction)?;
+                        let name = metadata
+                            .const_index(frame.code_block(), 1)
                             .ok_or(Unsupported::OperandShape("property-store name constant"))?;
-                        let ic_site = view.instructions[instruction.pc as usize]
-                            .property_ic_site(view.code_block.as_ref())
+                        let ic_site = metadata
+                            .property_ic_site(frame.code_block())
                             .unwrap_or(usize::MAX) as u64;
                         let cell_ordinal = u32::try_from(next_store_ic).map_err(|_| {
                             Unsupported::OperandShape("optimizing store IC ordinal")
@@ -1780,7 +1961,7 @@ fn emit(
                         let site = eligibility
                             .element_transitions
                             .sites
-                            .get(&instruction.pc)
+                            .get(&(instruction.inline, instruction.pc))
                             .ok_or(Unsupported::OperandShape(
                                 "optimizing property store missing site",
                             ))?;
@@ -1795,19 +1976,16 @@ fn emit(
                         // write barrier through the window (receiver and value are
                         // staged into their slots first). Wide primitives and every
                         // failed guard take the window transition.
-                        let store_byte_pc = tree.frames[instruction.inline.0 as usize]
-                            .instructions
-                            .get(instruction.pc as usize)
-                            .map(|metadata| metadata.byte_pc)
-                            .ok_or(Unsupported::OperandShape("optimizing property byte PC"))?;
+                        let store_byte_pc = metadata.byte_pc;
                         if view.cage_base != 0 {
                             ic_probe::emit_property_ic_store_guard(
                                 &mut ops,
                                 &mut relocations,
                                 view,
-                                (instruction.inline == InlineId::ROOT)
-                                    .then(|| view.property_stores.get(&store_byte_pc))
-                                    .flatten()
+                                frame
+                                    .body
+                                    .property_stores
+                                    .get(&store_byte_pc)
                                     .map(Vec::as_slice),
                                 |ops, register| {
                                     emit_load_tagged_location(
@@ -1858,10 +2036,19 @@ fn emit(
                             );
                             // Cell store: stage receiver and value into their window
                             // slots and run the barrier through the window stub.
+                            emit_build_transition_frames(
+                                &mut ops,
+                                tree,
+                                &inline_windows,
+                                instruction,
+                                site,
+                            )?;
                             emit_materialize_frame_value(
                                 &mut ops,
                                 reprs,
                                 allocation,
+                                &inline_windows,
+                                instruction.inline,
                                 instruction.inputs[0],
                                 object,
                             )?;
@@ -1869,9 +2056,26 @@ fn emit(
                                 &mut ops,
                                 reprs,
                                 allocation,
+                                &inline_windows,
+                                instruction.inline,
                                 instruction.inputs[1],
                                 value,
                             )?;
+                            // The barrier reads its two operands out of the
+                            // executing frame's window, so a spliced frame has
+                            // to be published for it; the root already is.
+                            let barrier_depth = if instruction.inline == InlineId::ROOT {
+                                0
+                            } else {
+                                emit_publish_transition_frame(
+                                    &mut ops,
+                                    tree,
+                                    &inline_windows,
+                                    frame_states,
+                                    &mut deopt_exits,
+                                    instruction,
+                                )?
+                            };
                             dynasm!(ops
                                 ; .arch aarch64
                                 ; mov x0, x20
@@ -1879,9 +2083,14 @@ fn emit(
                                 ; movz x2, value as u32
                             );
                             emit_runtime_entry(&mut ops, &mut relocations, 16, write_barrier_entry);
+                            dynasm!(ops ; .arch aarch64 ; blr x16);
+                            emit_unpublish_transition_frame(
+                                &mut ops,
+                                &inline_windows,
+                                barrier_depth,
+                            )?;
                             dynasm!(ops
                                 ; .arch aarch64
-                                ; blr x16
                                 ; cbnz x0, =>threw
                                 ; b =>done
                                 ; =>store_prim
@@ -1895,18 +2104,31 @@ fn emit(
                         // Miss: the window transition resolves the store and
                         // self-patches this site's cell.
                         dynasm!(ops ; .arch aarch64 ; =>miss);
+                        emit_build_transition_frames(
+                            &mut ops,
+                            tree,
+                            &inline_windows,
+                            instruction,
+                            site,
+                        )?;
                         emit_materialize_element_transition(
                             &mut ops,
                             reprs,
                             allocation,
+                            &inline_windows,
                             instruction,
                             site,
                         )?;
-                        emit_load_u32(&mut ops, 9, instruction.pc);
+                        let transition_depth = emit_publish_transition_frame(
+                            &mut ops,
+                            tree,
+                            &inline_windows,
+                            frame_states,
+                            &mut deopt_exits,
+                            instruction,
+                        )?;
                         dynasm!(ops
                             ; .arch aarch64
-                            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-                            ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
                             ; mov x0, x20
                             ; movz x1, object as u32
                         );
@@ -1923,17 +2145,32 @@ fn emit(
                                 ordinal: cell_ordinal,
                             },
                         );
-                        emit_load_u64(&mut ops, 6, function_id);
+                        emit_load_u64(&mut ops, 6, u64::from(frame.function_id()));
                         emit_runtime_entry(&mut ops, &mut relocations, 16, store_property_entry);
                         let succeeded = ops.new_dynamic_label();
                         dynasm!(ops
                             ; .arch aarch64
                             ; blr x16
+                        );
+                        emit_unpublish_transition_frame(
+                            &mut ops,
+                            &inline_windows,
+                            transition_depth,
+                        )?;
+                        dynasm!(ops
+                            ; .arch aarch64
                             ; cbz x0, =>succeeded
                             ; b =>threw
                             ; =>succeeded
                         );
-                        emit_reload_element_transition(&mut ops, allocation, site, None)?;
+                        emit_reload_element_transition(
+                            &mut ops,
+                            allocation,
+                            &inline_windows,
+                            instruction.inline,
+                            site,
+                            None,
+                        )?;
                         dynasm!(ops ; .arch aarch64 ; =>done);
                     }
                     Op::LoadUpvalue => {
@@ -1945,8 +2182,7 @@ fn emit(
                                 .result
                                 .expect("eligibility checked upvalue-load result"),
                         );
-                        let index = view.instructions[instruction.pc as usize]
-                            .imm32(view.code_block.as_ref(), 1)
+                        let index = frame_imm32(tree, instruction, 1)
                             .ok_or(Unsupported::OperandShape("upvalue-load index"))?;
                         let miss = ops.new_dynamic_label();
                         let done = ops.new_dynamic_label();
@@ -1984,11 +2220,16 @@ fn emit(
                             dynasm!(ops ; .arch aarch64 ; b =>done);
                         }
                         dynasm!(ops ; .arch aarch64 ; =>miss);
-                        emit_load_u32(&mut ops, 9, instruction.pc);
+                        let transition_depth = emit_publish_transition_frame(
+                            &mut ops,
+                            tree,
+                            &inline_windows,
+                            frame_states,
+                            &mut deopt_exits,
+                            instruction,
+                        )?;
                         dynasm!(ops
                             ; .arch aarch64
-                            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-                            ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
                             ; mov x0, x20
                             ; movz x1, dst as u32
                         );
@@ -1998,6 +2239,14 @@ fn emit(
                         dynasm!(ops
                             ; .arch aarch64
                             ; blr x16
+                        );
+                        emit_unpublish_transition_frame(
+                            &mut ops,
+                            &inline_windows,
+                            transition_depth,
+                        )?;
+                        dynasm!(ops
+                            ; .arch aarch64
                             ; cbz x0, =>succeeded
                             ; b =>threw
                             ; =>succeeded
@@ -2008,21 +2257,27 @@ fn emit(
                     }
                     Op::StoreUpvalue | Op::StoreUpvalueChecked => {
                         let src = instruction.input_registers[0];
-                        let index = view.instructions[instruction.pc as usize]
-                            .imm32(view.code_block.as_ref(), 1)
+                        let index = frame_imm32(tree, instruction, 1)
                             .ok_or(Unsupported::OperandShape("upvalue-store index"))?;
                         emit_materialize_frame_value(
                             &mut ops,
                             reprs,
                             allocation,
+                            &inline_windows,
+                            instruction.inline,
                             instruction.inputs[0],
                             src,
                         )?;
-                        emit_load_u32(&mut ops, 9, instruction.pc);
+                        let transition_depth = emit_publish_transition_frame(
+                            &mut ops,
+                            tree,
+                            &inline_windows,
+                            frame_states,
+                            &mut deopt_exits,
+                            instruction,
+                        )?;
                         dynasm!(ops
                             ; .arch aarch64
-                            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-                            ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
                             ; mov x0, x20
                             ; movz x1, src as u32
                         );
@@ -2041,6 +2296,14 @@ fn emit(
                         dynasm!(ops
                             ; .arch aarch64
                             ; blr x16
+                        );
+                        emit_unpublish_transition_frame(
+                            &mut ops,
+                            &inline_windows,
+                            transition_depth,
+                        )?;
+                        dynasm!(ops
+                            ; .arch aarch64
                             ; cbz x0, =>succeeded
                             ; b =>threw
                             ; =>succeeded
@@ -2050,9 +2313,10 @@ fn emit(
                         let dst = instruction
                             .result_register
                             .expect("eligibility checked global-load destination");
-                        let metadata = &view.instructions[instruction.pc as usize];
+                        let frame = frame_of(tree, instruction)?;
+                        let metadata = frame_instruction(tree, instruction)?;
                         let name = metadata
-                            .const_index(view.code_block.as_ref(), 1)
+                            .const_index(frame.code_block(), 1)
                             .ok_or(Unsupported::OperandShape("global-load name constant"))?;
                         let result_location = allocation.location(
                             instruction
@@ -2062,14 +2326,14 @@ fn emit(
                         let site = eligibility
                             .element_transitions
                             .sites
-                            .get(&instruction.pc)
+                            .get(&(instruction.inline, instruction.pc))
                             .ok_or(Unsupported::OperandShape(
                                 "optimizing global load missing site",
                             ))?;
                         debug_assert_eq!(site.safepoint_id, site.frame_map.id);
                         let miss = ops.new_dynamic_label();
                         let done = ops.new_dynamic_label();
-                        if let Some(target) = view.global_lexical_loads.get(&metadata.byte_pc)
+                        if let Some(target) = frame.body.global_lexical_loads.get(&metadata.byte_pc)
                             && let Some(cell_addr) =
                                 view.cage_base.checked_add(target.cell_offset as usize)
                         {
@@ -2079,6 +2343,7 @@ fn emit(
                                 13,
                                 cell_addr as u64,
                                 RelocationTarget::GlobalLexicalCell {
+                                    function_id: frame.function_id(),
                                     byte_pc: metadata.byte_pc,
                                 },
                             );
@@ -2094,7 +2359,8 @@ fn emit(
                             );
                             emit_store_tagged_location(&mut ops, result_location, 9)?;
                             dynasm!(ops ; .arch aarch64 ; b =>done);
-                        } else if let Some(target) = view.global_object_loads.get(&metadata.byte_pc)
+                        } else if let Some(target) =
+                            frame.body.global_object_loads.get(&metadata.byte_pc)
                         {
                             dynasm!(ops
                                 ; .arch aarch64
@@ -2159,28 +2425,49 @@ fn emit(
                             dynasm!(ops ; .arch aarch64 ; b =>done);
                         }
                         dynasm!(ops ; .arch aarch64 ; =>miss);
+                        emit_build_transition_frames(
+                            &mut ops,
+                            tree,
+                            &inline_windows,
+                            instruction,
+                            site,
+                        )?;
                         emit_materialize_element_transition(
                             &mut ops,
                             reprs,
                             allocation,
+                            &inline_windows,
                             instruction,
                             site,
                         )?;
-                        emit_load_u32(&mut ops, 9, instruction.pc);
+                        let transition_depth = emit_publish_transition_frame(
+                            &mut ops,
+                            tree,
+                            &inline_windows,
+                            frame_states,
+                            &mut deopt_exits,
+                            instruction,
+                        )?;
                         dynasm!(ops
                             ; .arch aarch64
-                            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-                            ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
                             ; mov x0, x20
                             ; movz x1, dst as u32
                         );
                         emit_load_u64(&mut ops, 2, u64::from(name));
-                        emit_load_u64(&mut ops, 3, function_id);
+                        emit_load_u64(&mut ops, 3, u64::from(frame.function_id()));
                         emit_runtime_entry(&mut ops, &mut relocations, 16, load_global_entry);
                         let succeeded = ops.new_dynamic_label();
                         dynasm!(ops
                             ; .arch aarch64
                             ; blr x16
+                        );
+                        emit_unpublish_transition_frame(
+                            &mut ops,
+                            &inline_windows,
+                            transition_depth,
+                        )?;
+                        dynasm!(ops
+                            ; .arch aarch64
                             ; cbz x0, =>succeeded
                             ; b =>threw
                             ; =>succeeded
@@ -2188,6 +2475,8 @@ fn emit(
                         emit_reload_element_transition(
                             &mut ops,
                             allocation,
+                            &inline_windows,
+                            instruction.inline,
                             site,
                             Some((dst, result_location)),
                         )?;
@@ -2199,32 +2488,48 @@ fn emit(
                         let dst = instruction
                             .result_register
                             .expect("eligibility checked string-load destination");
-                        let constant = view.instructions[instruction.pc as usize]
-                            .const_index(view.code_block.as_ref(), 1)
+                        let constant = frame_const_index(tree, instruction, 1)
                             .ok_or(Unsupported::OperandShape("string-load constant"))?;
                         let site = eligibility
                             .element_transitions
                             .sites
-                            .get(&instruction.pc)
+                            .get(&(instruction.inline, instruction.pc))
                             .ok_or(Unsupported::OperandShape(
                                 "optimizing string load missing site",
                             ))?;
                         debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                        emit_build_transition_frames(
+                            &mut ops,
+                            tree,
+                            &inline_windows,
+                            instruction,
+                            site,
+                        )?;
                         emit_materialize_element_transition(
                             &mut ops,
                             reprs,
                             allocation,
+                            &inline_windows,
                             instruction,
                             site,
                         )?;
-                        emit_load_u32(&mut ops, 9, instruction.pc);
+                        let transition_depth = emit_publish_transition_frame(
+                            &mut ops,
+                            tree,
+                            &inline_windows,
+                            frame_states,
+                            &mut deopt_exits,
+                            instruction,
+                        )?;
                         dynasm!(ops
                             ; .arch aarch64
-                            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-                            ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
                             ; mov x0, x20
                         );
-                        emit_load_u64(&mut ops, 1, function_id);
+                        emit_load_u64(
+                            &mut ops,
+                            1,
+                            u64::from(frame_of(tree, instruction)?.function_id()),
+                        );
                         dynasm!(ops ; .arch aarch64 ; movz x2, dst as u32);
                         emit_load_u64(&mut ops, 3, u64::from(constant));
                         emit_runtime_entry(&mut ops, &mut relocations, 16, load_string_entry);
@@ -2232,6 +2537,14 @@ fn emit(
                         dynasm!(ops
                             ; .arch aarch64
                             ; blr x16
+                        );
+                        emit_unpublish_transition_frame(
+                            &mut ops,
+                            &inline_windows,
+                            transition_depth,
+                        )?;
+                        dynasm!(ops
+                            ; .arch aarch64
                             ; cbz x0, =>succeeded
                             ; b =>threw
                             ; =>succeeded
@@ -2239,6 +2552,8 @@ fn emit(
                         emit_reload_element_transition(
                             &mut ops,
                             allocation,
+                            &inline_windows,
+                            instruction.inline,
                             site,
                             Some((
                                 dst,
@@ -2320,10 +2635,10 @@ fn emit(
                             let site = eligibility
                                 .element_transitions
                                 .sites
-                                .get(&instruction.pc)
+                                .get(&(instruction.inline, instruction.pc))
                                 .ok_or(Unsupported::OperandShape(
-                                "optimizing loose-eq missing site",
-                            ))?;
+                                    "optimizing loose-eq missing site",
+                                ))?;
                             debug_assert_eq!(site.safepoint_id, site.frame_map.id);
                             let slow = ops.new_dynamic_label();
                             let merged = ops.new_dynamic_label();
@@ -2356,18 +2671,31 @@ fn emit(
                                 emit_store_tagged_location(&mut ops, result_location, 9)?;
                                 dynasm!(ops ; .arch aarch64 ; b =>merged ; =>slow);
                             }
+                            emit_build_transition_frames(
+                                &mut ops,
+                                tree,
+                                &inline_windows,
+                                instruction,
+                                site,
+                            )?;
                             emit_materialize_element_transition(
                                 &mut ops,
                                 reprs,
                                 allocation,
+                                &inline_windows,
                                 instruction,
                                 site,
                             )?;
-                            emit_load_u32(&mut ops, 9, instruction.pc);
+                            let transition_depth = emit_publish_transition_frame(
+                                &mut ops,
+                                tree,
+                                &inline_windows,
+                                frame_states,
+                                &mut deopt_exits,
+                                instruction,
+                            )?;
                             dynasm!(ops
                                 ; .arch aarch64
-                                ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-                                ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
                                 ; mov x0, x20
                                 ; movz x1, dst as u32
                                 ; movz x2, lhs as u32
@@ -2379,6 +2707,14 @@ fn emit(
                             dynasm!(ops
                                 ; .arch aarch64
                                 ; blr x16
+                            );
+                            emit_unpublish_transition_frame(
+                                &mut ops,
+                                &inline_windows,
+                                transition_depth,
+                            )?;
+                            dynasm!(ops
+                                ; .arch aarch64
                                 ; cbz x0, =>succeeded
                                 ; b =>threw
                                 ; =>succeeded
@@ -2386,6 +2722,8 @@ fn emit(
                             emit_reload_element_transition(
                                 &mut ops,
                                 allocation,
+                                &inline_windows,
+                                instruction.inline,
                                 site,
                                 Some((dst, result_location)),
                             )?;
@@ -2462,7 +2800,7 @@ fn emit(
 
                         if instruction.inline == InlineId::ROOT {
                             let frame = &tree.frames[instruction.inline.0 as usize];
-                            let byte_pc = frame.instructions[instruction.pc as usize].byte_pc;
+                            let byte_pc = frame.instructions()[instruction.pc as usize].byte_pc;
                             if let (Some(events), Some(target)) = (
                                 direct_call_events.as_mut(),
                                 view.direct_methods
@@ -2490,43 +2828,39 @@ fn emit(
                             .expect("eligibility checked method-call destination");
                         let receiver = instruction.input_registers[0];
                         let arg_regs = &instruction.input_registers[1..];
-                        let name = view.instructions[instruction.pc as usize]
-                            .const_index(view.code_block.as_ref(), 2)
+                        let frame = frame_of(tree, instruction)?;
+                        let name = frame_const_index(tree, instruction, 2)
                             .ok_or(Unsupported::OperandShape("optimizing method call name"))?;
-                        let frame = &tree.frames[instruction.inline.0 as usize];
-                        let byte_pc = frame
-                            .instructions
-                            .get(instruction.pc as usize)
-                            .map(|metadata| metadata.byte_pc)
-                            .ok_or(Unsupported::OperandShape(
-                                "optimizing direct method byte PC",
-                            ))?;
+                        let byte_pc = frame_byte_pc(tree, instruction)?;
                         let site = eligibility
                             .element_transitions
                             .sites
-                            .get(&instruction.pc)
+                            .get(&(instruction.inline, instruction.pc))
                             .ok_or(Unsupported::OperandShape(
                                 "optimizing method call missing site",
                             ))?;
                         debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                        emit_build_transition_frames(
+                            &mut ops,
+                            tree,
+                            &inline_windows,
+                            instruction,
+                            site,
+                        )?;
                         emit_materialize_element_transition(
                             &mut ops,
                             reprs,
                             allocation,
+                            &inline_windows,
                             instruction,
                             site,
                         )?;
-                        emit_load_u32(&mut ops, 9, instruction.pc);
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-                            ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
-                        );
+                        emit_publish_transition_pc(&mut ops, tree, &inline_windows, instruction)?;
 
                         let succeeded = ops.new_dynamic_label();
                         let bail = ops.new_dynamic_label();
                         let native_leaf = (instruction.inline == InlineId::ROOT)
-                            .then(|| view.guarded_method_calls.get(&byte_pc))
+                            .then(|| frame.body.guarded_method_calls.get(&byte_pc))
                             .flatten()
                             .filter(|call| arg_regs.len() == usize::from(call.argument_count))
                             .filter(|call| guarded_method_call_is_supported(view, call));
@@ -2564,7 +2898,7 @@ fn emit(
                             .is_none()
                             .then(|| {
                                 (instruction.inline == InlineId::ROOT)
-                                    .then(|| view.direct_methods.get(&byte_pc))
+                                    .then(|| frame.body.direct_methods.get(&byte_pc))
                                     .flatten()
                             })
                             .flatten();
@@ -2591,7 +2925,7 @@ fn emit(
                             let next_target = ops.new_dynamic_label();
                             let direct_site = DirectCallSite {
                                 target: &method.callee,
-                                caller_function_id: frame.function_id,
+                                caller_function_id: frame.function_id(),
                                 logical_pc: instruction.pc,
                                 byte_pc,
                                 dst,
@@ -2667,6 +3001,14 @@ fn emit(
                             | (u64::from(receiver) << 16)
                             | ((arg_regs.len() as u64) << 32);
                         let packed_args = pack_method_arg_regs(arg_regs);
+                        let transition_depth = emit_publish_transition_frame(
+                            &mut ops,
+                            tree,
+                            &inline_windows,
+                            frame_states,
+                            &mut deopt_exits,
+                            instruction,
+                        )?;
                         dynasm!(ops ; .arch aarch64 ; mov x0, x20);
                         emit_load_u64(&mut ops, 1, u64::from(Op::CallMethodValue as u8));
                         emit_load_u64(&mut ops, 2, packed_meta);
@@ -2676,6 +3018,14 @@ fn emit(
                         dynasm!(ops
                             ; .arch aarch64
                             ; blr x16
+                        );
+                        emit_unpublish_transition_frame(
+                            &mut ops,
+                            &inline_windows,
+                            transition_depth,
+                        )?;
+                        dynasm!(ops
+                            ; .arch aarch64
                             ; cbz x0, =>succeeded
                             ; cmp x0, STATUS_BAILED as u32
                             ; b.eq =>bail
@@ -2687,6 +3037,8 @@ fn emit(
                         emit_reload_element_transition(
                             &mut ops,
                             allocation,
+                            &inline_windows,
+                            instruction.inline,
                             site,
                             Some((
                                 dst,
@@ -2714,23 +3066,36 @@ fn emit(
                         let site = eligibility
                             .element_transitions
                             .sites
-                            .get(&instruction.pc)
+                            .get(&(instruction.inline, instruction.pc))
                             .ok_or(Unsupported::OperandShape(
                                 "optimizing construct missing site",
                             ))?;
                         debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                        emit_build_transition_frames(
+                            &mut ops,
+                            tree,
+                            &inline_windows,
+                            instruction,
+                            site,
+                        )?;
                         emit_materialize_element_transition(
                             &mut ops,
                             reprs,
                             allocation,
+                            &inline_windows,
                             instruction,
                             site,
                         )?;
-                        emit_load_u32(&mut ops, 9, instruction.pc);
+                        let transition_depth = emit_publish_transition_frame(
+                            &mut ops,
+                            tree,
+                            &inline_windows,
+                            frame_states,
+                            &mut deopt_exits,
+                            instruction,
+                        )?;
                         dynasm!(ops
                             ; .arch aarch64
-                            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-                            ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
                             ; mov x0, x20
                             ; movz x1, dst as u32
                             ; movz x2, callee as u32
@@ -2740,9 +3105,14 @@ fn emit(
                         emit_runtime_entry(&mut ops, &mut relocations, 16, construct_entry);
                         let succeeded = ops.new_dynamic_label();
                         let bail = ops.new_dynamic_label();
+                        dynasm!(ops ; .arch aarch64 ; blr x16);
+                        emit_unpublish_transition_frame(
+                            &mut ops,
+                            &inline_windows,
+                            transition_depth,
+                        )?;
                         dynasm!(ops
                             ; .arch aarch64
-                            ; blr x16
                             ; cmp x0, #1
                             ; b.eq =>threw
                             ; cmp x0, #2
@@ -2754,6 +3124,8 @@ fn emit(
                         emit_reload_element_transition(
                             &mut ops,
                             allocation,
+                            &inline_windows,
+                            instruction.inline,
                             site,
                             Some((
                                 dst,
@@ -3443,15 +3815,12 @@ fn emit(
                         let callee = instruction.input_registers[0];
                         let arg_regs = &instruction.input_registers[1..];
                         let bail = ops.new_dynamic_label();
-                        let frame = &tree.frames[instruction.inline.0 as usize];
-                        let byte_pc = frame
-                            .instructions
-                            .get(instruction.pc as usize)
-                            .map(|metadata| metadata.byte_pc)
-                            .ok_or(Unsupported::OperandShape("optimizing direct call byte PC"))?;
-                        let static_target = (instruction.inline == InlineId::ROOT)
-                            .then(|| view.static_native_calls.get(&byte_pc))
-                            .flatten();
+                        let frame = frame_of(tree, instruction)?;
+                        let byte_pc = frame_byte_pc(tree, instruction)?;
+                        // A guarded native leaf reads its arguments out of SSA
+                        // homes, never out of a register window, so it lowers in
+                        // any frame of the unit.
+                        let static_target = frame.body.static_native_calls.get(&byte_pc);
                         if let Some(target) = static_target {
                             let stub_id = target.leaf_stub_id;
                             let name = native_leaf_call_name(stub_id);
@@ -3499,7 +3868,7 @@ fn emit(
                                         "nativeLeafCall",
                                         start,
                                         ops.offset().0,
-                                        frame.function_id,
+                                        frame.function_id(),
                                         instruction.pc,
                                         byte_pc,
                                         name,
@@ -3538,27 +3907,33 @@ fn emit(
                             let site = eligibility
                                 .element_transitions
                                 .sites
-                                .get(&instruction.pc)
-                                .ok_or(Unsupported::OperandShape(
-                                "optimizing call missing site",
-                            ))?;
+                                .get(&(instruction.inline, instruction.pc))
+                                .ok_or(Unsupported::OperandShape("optimizing call missing site"))?;
                             debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                            emit_build_transition_frames(
+                                &mut ops,
+                                tree,
+                                &inline_windows,
+                                instruction,
+                                site,
+                            )?;
                             emit_materialize_element_transition(
                                 &mut ops,
                                 reprs,
                                 allocation,
+                                &inline_windows,
                                 instruction,
                                 site,
                             )?;
-                            emit_load_u32(&mut ops, 9, instruction.pc);
-                            dynasm!(ops
-                                ; .arch aarch64
-                                ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-                                ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
-                            );
+                            emit_publish_transition_pc(
+                                &mut ops,
+                                tree,
+                                &inline_windows,
+                                instruction,
+                            )?;
                             let succeeded = ops.new_dynamic_label();
                             let direct_target = (instruction.inline == InlineId::ROOT)
-                                .then(|| view.direct_callees.get(&byte_pc))
+                                .then(|| frame.body.direct_callees.get(&byte_pc))
                                 .flatten();
                             if let Some(target) = direct_target
                                 .filter(|target| direct_call_target_is_supported(target))
@@ -3569,7 +3944,7 @@ fn emit(
                                     view,
                                     DirectCallSite {
                                         target,
-                                        caller_function_id: frame.function_id,
+                                        caller_function_id: frame.function_id(),
                                         logical_pc: instruction.pc,
                                         byte_pc,
                                         dst,
@@ -3628,6 +4003,8 @@ fn emit(
                             emit_reload_element_transition(
                                 &mut ops,
                                 allocation,
+                                &inline_windows,
+                                instruction.inline,
                                 site,
                                 Some((
                                     dst,
@@ -3689,7 +4066,7 @@ fn emit(
                             ; b.ne =>deopt
                             ; ldr w14, [x13, view.closure_call_layout.function_id_byte]
                         );
-                        emit_load_u32(&mut ops, 15, callee.function_id);
+                        emit_load_u32(&mut ops, 15, callee.function_id());
                         dynasm!(ops
                             ; .arch aarch64
                             ; cmp w14, w15
@@ -3698,7 +4075,7 @@ fn emit(
                         if instruction.inline == InlineId::ROOT {
                             let caller = &tree.frames[instruction.inline.0 as usize];
                             let byte_pc = caller
-                                .instructions
+                                .instructions()
                                 .get(instruction.pc as usize)
                                 .map(|metadata| metadata.byte_pc)
                                 .ok_or(Unsupported::OperandShape(
@@ -3771,13 +4148,13 @@ fn emit(
             }
             if let Some(code_map) = code_map.as_mut() {
                 let frame = &tree.frames[instruction.inline.0 as usize];
-                let byte_pc = frame.instructions[instruction.pc as usize].byte_pc();
+                let byte_pc = frame.instructions()[instruction.pc as usize].byte_pc();
                 code_map.record(CodeRegion::instruction(
                     instruction_start,
                     ops.offset().0,
                     Some(block_id.0),
                     Some(instruction.inline.0),
-                    frame.function_id,
+                    frame.function_id(),
                     instruction.pc,
                     byte_pc,
                     Some(operation_index),
@@ -3928,33 +4305,20 @@ fn emit(
         let frame_state = deopt_table.lookup(exit).ok_or(Unsupported::OperandShape(
             "optimizing deopt exit missing frame state",
         ))?;
-        let mut chain = Vec::with_capacity(frame_state.frames.len().saturating_sub(1));
-        for (depth, frame) in frame_state.frames.iter().enumerate().skip(1) {
-            // The reify stub speaks logical PCs — a frame's `pc` is a canonical
-            // instruction index — while the chain records byte PCs. The caller
-            // resumes one past its call, so the call itself is `resume - 1`.
-            let caller = &frame_state.frames[depth - 1];
-            let call_pc = logical_pc(tree, caller.function_id, caller.byte_pc)?
-                .checked_sub(1)
-                .ok_or(Unsupported::OperandShape(
-                    "optimizing chain caller resumes at its entry",
-                ))?;
-            let callee_pc = logical_pc(tree, frame.function_id, frame.byte_pc)?;
-            chain.push(DeoptChainCall { call_pc, callee_pc });
-        }
-        let outer_resume_pc = logical_pc(
-            tree,
-            frame_state.outermost().function_id,
-            frame_state.outermost().byte_pc,
-        )?;
+        // The reconstruction stub speaks logical PCs — a frame's `pc` is a
+        // canonical instruction index — while the state records byte PCs.
+        let resume_pcs = frame_state
+            .frames
+            .iter()
+            .map(|frame| logical_pc(tree, frame.function_id, frame.byte_pc))
+            .collect::<Result<Vec<_>, _>>()?;
         let index = u32::try_from(exit_descriptors.len())
             .ok()
             .filter(|&index| index <= u32::from(u16::MAX))
             .ok_or(Unsupported::OperandShape("optimizing deopt exit count"))?;
         exit_descriptors.push(DeoptExitDescriptor {
             state: exit,
-            resume_pc: outer_resume_pc,
-            chain: chain.into_boxed_slice(),
+            resume_pcs: resume_pcs.into_boxed_slice(),
         });
         dynasm!(ops
             ; .arch aarch64
@@ -4004,13 +4368,16 @@ fn emit(
         ; mov x5, x19
     );
     emit_runtime_entry(&mut ops, &mut relocations, 16, deopt_writeback_entry);
+    // The stub returns the entry ABI's `(value, status)` pair directly: a
+    // single-frame exit bails with the published resume PC, a rebuilt chain
+    // has already run to completion and returns its result, and a raise takes
+    // the throw epilogue.
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
         ; add sp, sp, #128
-        ; cbz x0, =>threw
-        ; mov x0, xzr
-        ; movz x1, STATUS_BAILED as u32
+        ; cmp x1, STATUS_THREW as u32
+        ; b.eq =>threw
     );
     emit_epilogue(&mut ops, saved_frame);
     if let Some(code_map) = code_map.as_mut() {
@@ -4030,16 +4397,13 @@ fn emit(
         direct_call_events,
         code_map,
         relocations,
-        generated_stack_frame_bytes: if tree.frames.len() == 1 {
-            saved_frame
-                .persistent_bytes()
-                .saturating_add(DEOPT_HANDLER_DUMP_BYTES)
-        } else {
-            // A spliced body's deopt may owe the interpreter a frame chain,
-            // and chain reification rewinds an interpreter caller frame that
-            // a generated direct entry never pushes. Such a body stays
-            // reachable through the interpreter dispatch path only.
-            0
-        },
+        // A spliced body's deopt owes the interpreter a frame chain, and that
+        // chain is constructed from owned storage rather than replayed on top
+        // of a caller's interpreter frame. Nothing about the exit depends on
+        // how this generation was entered, so an inlining unit is a generated
+        // direct-call target like any other.
+        generated_stack_frame_bytes: saved_frame
+            .persistent_bytes()
+            .saturating_add(DEOPT_HANDLER_DUMP_BYTES),
     })
 }

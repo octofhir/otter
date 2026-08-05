@@ -250,6 +250,37 @@ pub(crate) const NATIVE_FRAME_UPVALUE_BASE_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, upvalue_base) as u32;
 pub(crate) const NATIVE_FRAME_UPVALUE_COUNT_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, upvalue_count) as u32;
+pub(crate) const NATIVE_FRAME_NEW_TARGET_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, new_target_bits) as u32;
+pub(crate) const NATIVE_FRAME_ACTIVATION_ID_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, activation_id) as u32;
+/// Byte offset of the identity pair a compiled frame record carries: the VM
+/// function id followed by the immutable code-block id.
+pub(crate) const NATIVE_FRAME_FUNCTION_ID_OFFSET: u32 = (std::mem::offset_of!(NativeFrame, header)
+    + std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, function_id))
+    as u32;
+/// Byte offset of the packed `(register_count, kind, flags)` word. The three
+/// fields are contiguous and little-endian, so one 32-bit store publishes the
+/// whole shape of a frame record.
+pub(crate) const NATIVE_FRAME_SHAPE_WORD_OFFSET: u32 = (std::mem::offset_of!(NativeFrame, header)
+    + std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, register_count))
+    as u32;
+
+// The packed shape word is only a valid encoding while the three fields stay
+// adjacent in this order.
+const _: [(); 12] = [(); std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, register_count)];
+const _: [(); 14] = [(); std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, kind)];
+const _: [(); 15] = [(); std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, flags)];
+
+/// Packed `(register_count, kind, flags)` word for a spliced frame's record:
+/// an optimizing-tier activation whose register window is generated-code stack
+/// storage, so the collector traces and rewrites it in place.
+#[must_use]
+pub(crate) const fn stack_register_frame_shape_word(register_count: u16) -> u32 {
+    (register_count as u32)
+        | ((otter_vm::native_abi::NativeFrameKind::Optimizing as u32) << 16)
+        | ((otter_vm::native_abi::NativeFrameFlags::STACK_REGISTERS as u32) << 24)
+}
 
 // The native entry ABI targets 64-bit engines. These assertions describe the
 // one current VM/JIT layout generated code consumes directly.

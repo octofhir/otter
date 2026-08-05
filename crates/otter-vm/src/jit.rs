@@ -433,25 +433,42 @@ pub struct JitGuardedMethodCall {
     pub argument_count: u8,
 }
 
-/// A callee the baseline may splice into a caller's `Op::Call` site.
+/// A callee the compiler may splice into a caller's `Op::Call` site.
 ///
-/// Carries the callee's own bytecode plus the identity guard. A runtime
-/// callable whose function id does not match [`Self::function_id`] side-exits
-/// at the caller's canonical call PC.
+/// The callee is compiled from its *own* inputs, exactly as it would be as an
+/// outermost function: its constant pool, its instruction overlays, its global
+/// cells, its property and element facts, its call plans. A spliced body whose
+/// facts came from the caller would have nothing to fold against and could only
+/// lower its loads as exits, so the whole baked body travels with the
+/// candidate. A runtime callable whose function id does not match
+/// [`JitInlineCallee::function_id`] side-exits at the caller's canonical call
+/// PC.
 #[derive(Debug, Clone)]
 pub struct JitInlineCallee {
-    /// Authoritative callee execution body owning operand side tables.
-    pub code_block: Arc<CodeBlock>,
+    /// Fully baked compile inputs for the callee body.
+    pub body: Arc<JitCompileSnapshot>,
+}
+
+impl JitInlineCallee {
     /// Callee function id the call-site identity guard is keyed on.
-    pub function_id: u32,
+    #[must_use]
+    pub fn function_id(&self) -> u32 {
+        self.body.code_block.id
+    }
+
     /// Callee formal parameter count; must equal the call's argument count for
     /// the site to inline.
-    pub param_count: u16,
-    /// Callee register-window length; the spliced body runs in a scratch block
-    /// of this many slots.
-    pub register_count: u16,
-    /// Callee instruction overlays in canonical logical-PC order.
-    pub instructions: Vec<JitInstructionMetadata>,
+    #[must_use]
+    pub fn param_count(&self) -> u16 {
+        self.body.code_block.param_count
+    }
+
+    /// Callee register-window length; the spliced body runs in a window of this
+    /// many slots.
+    #[must_use]
+    pub fn register_count(&self) -> u16 {
+        self.body.code_block.register_count
+    }
 }
 
 /// Exact receiver/prototype/method-slot identity for one monomorphic method
@@ -490,18 +507,11 @@ pub struct JitMethodGuard {
 /// of mutation and reentrant execution.
 #[derive(Debug, Clone)]
 pub struct JitInlineMethod {
-    /// Authoritative method execution body owning operand side tables.
-    pub code_block: Arc<CodeBlock>,
+    /// Fully baked compile inputs for the method body, resolved against the
+    /// method's own constant pool and feedback rather than the caller's.
+    pub body: Arc<JitCompileSnapshot>,
     /// Exact receiver/prototype/method-slot guard shared with generated calls.
     pub guard: JitMethodGuard,
-    /// Method formal parameter count (excluding `this`); must equal argc.
-    pub param_count: u16,
-    /// Method virtual-register-window length. A backend may compact the live
-    /// subset into scratch storage but must preserve entry parameter,
-    /// `undefined`, and `this` semantics.
-    pub register_count: u16,
-    /// Method instruction stream, emitted inline.
-    pub instructions: Vec<JitInstructionMetadata>,
     /// Body `LoadProperty`/`StoreProperty` byte-PC → value slab byte offset. A
     /// receiver-shape property is baked from the identity-guarded receiver shape;
     /// a non-receiver property is baked from its own monomorphic site feedback,
@@ -516,6 +526,20 @@ pub struct JitInlineMethod {
     /// baked recursively. Lets the inliner splice a nested call's body inline
     /// with bounded recursion.
     pub nested_methods: rustc_hash::FxHashMap<u32, JitInlineMethod>,
+}
+
+impl JitInlineMethod {
+    /// Method formal parameter count (excluding `this`); must equal argc.
+    #[must_use]
+    pub fn param_count(&self) -> u16 {
+        self.body.code_block.param_count
+    }
+
+    /// Method virtual-register-window length.
+    #[must_use]
+    pub fn register_count(&self) -> u16 {
+        self.body.code_block.register_count
+    }
 }
 
 /// Source opcode represented by compiler-generated call linkage.

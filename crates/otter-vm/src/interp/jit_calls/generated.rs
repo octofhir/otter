@@ -89,6 +89,15 @@ impl Interpreter {
             consecutive_deopts: state.consecutive_deopts,
         });
 
+        // An optimizing generation that exits is a round trip on every entry
+        // that reaches it, wherever that entry came from. Generated linkage is
+        // an entry like any other, so it charges the same bounded
+        // reoptimization budget the interpreter's entry paths do.
+        if state.tier == NativeFrameKind::Optimizing {
+            self.note_jit_optimized_bail(callee_function_id, callee_resume_pc);
+            return Ok(());
+        }
+
         // Baseline generations participate in the bounded recompile/pin
         // policy. A purely consecutive threshold misses workloads where a
         // generated body succeeds just often enough to reset its streak while

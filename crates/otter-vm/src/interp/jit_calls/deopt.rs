@@ -138,6 +138,13 @@ impl Interpreter {
         stack: &mut ActivationStack,
         frames: &[jit::JitDeoptFrame],
     ) -> Result<Value, VmError> {
+        // The chain runs to completion here rather than reporting a bail, so
+        // this is the only place the exit can charge the optimizing tier's
+        // bounded reoptimization budget. An installed generation that keeps
+        // exiting is discarded on the same rule as every other entry path.
+        if let Some(outermost) = frames.first() {
+            self.note_jit_optimized_bail(outermost.callee_fid, outermost.callee_pc);
+        }
         let _window_rollback = self.register_window_rollback();
         let floor = stack.floor();
         let mut materialized: smallvec::SmallVec<[Frame; 4]> = smallvec::SmallVec::new();

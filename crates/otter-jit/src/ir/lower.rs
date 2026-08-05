@@ -41,7 +41,7 @@ use smallvec::SmallVec;
 
 use super::{
     cfg::ControlFlowGraph,
-    inline::{InlineId, InlineTree},
+    inline::InlineTree,
     repr::{ReprMap, Representation},
     ssa::{SsaFunction, SsaInstr, SsaOp, ValueData, ValueDef, ValueId},
 };
@@ -54,19 +54,14 @@ pub fn lower_settled_property_accesses(
     tree: &InlineTree,
     reprs: &ReprMap,
 ) {
-    if view.cage_base == 0
-        || (view.property_loads.is_empty()
-            && view.property_stores.is_empty()
-            && view.property_prototype_loads.is_empty())
-    {
+    if view.cage_base == 0 {
         return;
     }
-    let root = &tree.frames[InlineId::ROOT.0 as usize];
     let mut lowered_any = false;
     for block_index in 0..ssa.blocks.len() {
         if !ssa.blocks[block_index].instrs.iter().any(|instruction| {
-            settled_slot(view, root, reprs, instruction).is_some()
-                || settled_hop(view, root, instruction).is_some()
+            settled_slot(tree, reprs, instruction).is_some()
+                || settled_hop(tree, instruction).is_some()
         }) {
             continue;
         }
@@ -74,11 +69,11 @@ pub fn lower_settled_property_accesses(
         let source = std::mem::take(&mut ssa.blocks[block_index].instrs);
         let mut lowered = Vec::with_capacity(source.len() + 2);
         for instruction in source {
-            if let Some(hop) = settled_hop(view, root, &instruction) {
+            if let Some(hop) = settled_hop(tree, &instruction) {
                 lower_prototype_load(ssa, &mut lowered, instruction, hop, block_index);
                 continue;
             }
-            let Some((shape, byte, writes)) = settled_slot(view, root, reprs, &instruction) else {
+            let Some((shape, byte, writes)) = settled_slot(tree, reprs, &instruction) else {
                 lowered.push(instruction);
                 continue;
             };
@@ -219,13 +214,8 @@ fn lower_prototype_load(
 }
 
 /// The sole prototype hop a load site has settled on.
-fn settled_hop(
-    view: &JitCompileSnapshot,
-    root: &super::inline::InlineFrame,
-    instruction: &SsaInstr,
-) -> Option<JitInlinePropertyHop> {
-    if instruction.inline != InlineId::ROOT
-        || instruction.op != SsaOp::Bytecode(Op::LoadProperty)
+fn settled_hop(tree: &InlineTree, instruction: &SsaInstr) -> Option<JitInlinePropertyHop> {
+    if instruction.op != SsaOp::Bytecode(Op::LoadProperty)
         || instruction.inputs.len() != 1
         || instruction.input_registers.len() != 1
         || instruction.result.is_none()
@@ -233,11 +223,13 @@ fn settled_hop(
     {
         return None;
     }
-    let metadata = root.instructions.get(instruction.pc as usize)?;
+    let frame = tree.frames.get(instruction.inline.0 as usize)?;
+    let metadata = frame.instructions().get(instruction.pc as usize)?;
     if metadata.load_array_length {
         return None;
     }
-    let [only] = view
+    let [only] = frame
+        .body
         .property_prototype_loads
         .get(&metadata.byte_pc)?
         .as_slice()
@@ -409,15 +401,11 @@ pub fn eliminate_redundant_checks(ssa: &mut SsaFunction, cfg: &ControlFlowGraph,
 
 /// The single own slot a property site has settled on, and whether it writes.
 fn settled_slot(
-    view: &JitCompileSnapshot,
-    root: &super::inline::InlineFrame,
+    tree: &InlineTree,
     reprs: &ReprMap,
     instruction: &SsaInstr,
 ) -> Option<(u32, u32, bool)> {
-    if instruction.inline != InlineId::ROOT
-        || instruction.result.is_none()
-        || instruction.result_register.is_none()
-    {
+    if instruction.result.is_none() || instruction.result_register.is_none() {
         return None;
     }
     let writes = match instruction.op {
@@ -438,16 +426,17 @@ fn settled_slot(
         }
         _ => return None,
     };
-    let metadata = root.instructions.get(instruction.pc as usize)?;
+    let frame = tree.frames.get(instruction.inline.0 as usize)?;
+    let metadata = frame.instructions().get(instruction.pc as usize)?;
     // A dense array's or a primitive string's `.length` is not an own data
     // slot, so no settled slot can stand in for it.
     if metadata.load_array_length {
         return None;
     }
     let sites = if writes {
-        &view.property_stores
+        &frame.body.property_stores
     } else {
-        &view.property_loads
+        &frame.body.property_loads
     };
     let [only] = sites.get(&metadata.byte_pc)?.as_slice() else {
         return None;

@@ -216,7 +216,10 @@ pub(super) fn emit_load_global(
             relocations,
             13,
             cell_addr as u64,
-            RelocationTarget::GlobalLexicalCell { byte_pc },
+            RelocationTarget::GlobalLexicalCell {
+                function_id: view.code_block.id,
+                byte_pc,
+            },
         );
         dynasm!(ops ; .arch aarch64 ; ldr x9, [x13, view.upvalue_value_byte]);
         emit_load_u64(ops, 11, VALUE_HOLE);

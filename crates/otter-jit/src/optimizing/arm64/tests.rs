@@ -59,11 +59,7 @@ fn a_spliced_unit_compiles_and_guards_the_callee_identity() {
     view.inline_callees.insert(
         call_byte_pc,
         otter_vm::JitInlineCallee {
-            code_block: Arc::clone(&callee.code_block),
-            function_id: 9,
-            param_count: 1,
-            register_count: callee.code_block.register_count,
-            instructions: callee.instructions,
+            body: Arc::new(callee),
         },
     );
 

@@ -682,11 +682,7 @@ mod tests {
         view.inline_callees.insert(
             call_byte_pc,
             otter_vm::JitInlineCallee {
-                code_block: std::sync::Arc::clone(&callee_view.code_block),
-                function_id: 9,
-                param_count: 1,
-                register_count: callee_view.code_block.register_count,
-                instructions: callee_view.instructions,
+                body: std::sync::Arc::new(callee_view),
             },
         );
         let tree = InlineTree::build(&view);

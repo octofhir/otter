@@ -30,6 +30,7 @@ pub(super) struct NumericValue(pub(super) usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NumericType {
+    Int32,
     Number,
     Boolean,
 }
@@ -38,7 +39,14 @@ pub(super) enum NumericType {
 pub(super) enum NumericNode {
     Parameter(u16),
     BlockParameter(NumericType),
+    IntegerConstant(i32),
     Constant(f64),
+    WidenInt32(NumericValue),
+    IntegerAdd(NumericValue, NumericValue),
+    IntegerAddImmediate(NumericValue, i32),
+    IntegerAndImmediate(NumericValue, i32),
+    IntegerLessThanImmediate(NumericValue, i32),
+    IntegerEqualImmediate(NumericValue, i32),
     Add(NumericValue, NumericValue),
     Sub(NumericValue, NumericValue),
     Mul(NumericValue, NumericValue),
@@ -50,10 +58,19 @@ pub(super) enum NumericNode {
 impl NumericNode {
     pub(super) const fn value_type(self) -> NumericType {
         match self {
-            Self::LessThan(..) | Self::BlockParameter(NumericType::Boolean) => NumericType::Boolean,
+            Self::IntegerConstant(..)
+            | Self::IntegerAdd(..)
+            | Self::IntegerAddImmediate(..)
+            | Self::IntegerAndImmediate(..)
+            | Self::BlockParameter(NumericType::Int32) => NumericType::Int32,
+            Self::LessThan(..)
+            | Self::IntegerLessThanImmediate(..)
+            | Self::IntegerEqualImmediate(..)
+            | Self::BlockParameter(NumericType::Boolean) => NumericType::Boolean,
             Self::Parameter(..)
             | Self::BlockParameter(NumericType::Number)
             | Self::Constant(..)
+            | Self::WidenInt32(..)
             | Self::Add(..)
             | Self::Sub(..)
             | Self::Mul(..)
@@ -98,6 +115,7 @@ pub(super) struct NumericFunction {
     pub(super) register_count: u16,
     pub(super) arithmetic_op_count: usize,
     pub(super) has_backedges: bool,
+    pub(super) requires_integer_lowering: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -134,6 +152,7 @@ impl NumericFunction {
         }
 
         let raw_blocks = build_raw_blocks(view)?;
+        let live_in = build_liveness(view, &raw_blocks, register_count)?;
         let mut nodes = Vec::with_capacity(view.instructions.len() + register_count as usize);
         let mut entry = vec![RegisterState::Unset; usize::from(register_count)];
         let mut entry_nodes = Vec::with_capacity(parameter_count as usize);
@@ -162,9 +181,19 @@ impl NumericFunction {
                     .copied()
                     .filter(|&predecessor| predecessor < block_index)
                     .collect::<Vec<_>>();
-                merge_predecessors(&forward_predecessors, &out_states, &mut nodes)?
+                merge_predecessors(
+                    &forward_predecessors,
+                    &live_in[block_index],
+                    &out_states,
+                    &mut nodes,
+                )?
             } else {
-                merge_predecessors(&raw.predecessors, &out_states, &mut nodes)?
+                merge_predecessors(
+                    &raw.predecessors,
+                    &live_in[block_index],
+                    &out_states,
+                    &mut nodes,
+                )?
             };
             if raw
                 .predecessors
@@ -176,6 +205,7 @@ impl NumericFunction {
                     &mut parameters,
                     &mut parameter_regs,
                     &mut nodes,
+                    &live_in[block_index],
                 )?;
             }
             let mut block_nodes = if block_index == 0 {
@@ -217,7 +247,7 @@ impl NumericFunction {
                         when_true,
                     }
                 }
-                RawTerminator::Return => NumericTerminator::Return(read_numeric(
+                RawTerminator::Return => NumericTerminator::Return(read_number(
                     &registers,
                     &nodes,
                     register(terminal, code, 0)?,
@@ -251,6 +281,16 @@ impl NumericFunction {
             }
         }
 
+        let requires_integer_lowering = nodes.iter().any(|node| {
+            matches!(
+                node,
+                NumericNode::IntegerAdd(..)
+                    | NumericNode::IntegerAddImmediate(..)
+                    | NumericNode::IntegerAndImmediate(..)
+                    | NumericNode::IntegerLessThanImmediate(..)
+                    | NumericNode::IntegerEqualImmediate(..)
+            )
+        });
         Some(Self {
             nodes,
             blocks,
@@ -263,6 +303,7 @@ impl NumericFunction {
                     .iter()
                     .any(|&successor| successor <= predecessor)
             }),
+            requires_integer_lowering,
         })
     }
 }
@@ -327,6 +368,88 @@ fn build_raw_blocks(view: &JitCompileSnapshot) -> Option<Vec<RawBlock>> {
     Some(blocks)
 }
 
+fn build_liveness(
+    view: &JitCompileSnapshot,
+    blocks: &[RawBlock],
+    register_count: u16,
+) -> Option<Vec<Vec<bool>>> {
+    let code = view.code_block.as_ref();
+    let width = usize::from(register_count);
+    let mut uses = vec![vec![false; width]; blocks.len()];
+    let mut definitions = vec![vec![false; width]; blocks.len()];
+    for (block_index, block) in blocks.iter().enumerate() {
+        for pc in block.start..block.end {
+            let instruction = view.instructions.get(pc)?;
+            let op = instruction.op(code);
+            let (reads, writes) = match op {
+                Op::StoreLocal => (
+                    vec![register(instruction, code, 0)?],
+                    vec![local_index(instruction, code, 1)?],
+                ),
+                Op::LoadLocal => (
+                    vec![local_index(instruction, code, 1)?],
+                    vec![register(instruction, code, 0)?],
+                ),
+                Op::LoadUndefined | Op::LoadInt32 | Op::LoadNumber => {
+                    (Vec::new(), vec![register(instruction, code, 0)?])
+                }
+                Op::ToPrimitive | Op::ToNumeric | Op::Neg => (
+                    vec![register(instruction, code, 1)?],
+                    vec![register(instruction, code, 0)?],
+                ),
+                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::LessThan => (
+                    vec![
+                        register(instruction, code, 1)?,
+                        register(instruction, code, 2)?,
+                    ],
+                    vec![register(instruction, code, 0)?],
+                ),
+                Op::AddImm | Op::BitwiseAndImm | Op::LessThanImm | Op::EqualImm => (
+                    vec![register(instruction, code, 1)?],
+                    vec![register(instruction, code, 0)?],
+                ),
+                Op::JumpIfTrue | Op::JumpIfFalse => {
+                    (vec![register(instruction, code, 1)?], Vec::new())
+                }
+                Op::ReturnValue => (vec![register(instruction, code, 0)?], Vec::new()),
+                Op::Jump => (Vec::new(), Vec::new()),
+                _ => return None,
+            };
+            for read in reads {
+                let read = usize::from(read);
+                if !definitions[block_index][read] {
+                    uses[block_index][read] = true;
+                }
+            }
+            for write in writes {
+                definitions[block_index][usize::from(write)] = true;
+            }
+        }
+    }
+
+    let mut live_in = vec![vec![false; width]; blocks.len()];
+    loop {
+        let mut changed = false;
+        for block_index in (0..blocks.len()).rev() {
+            let mut next = uses[block_index].clone();
+            for &successor in &blocks[block_index].successors {
+                for register in 0..width {
+                    if live_in[successor][register] && !definitions[block_index][register] {
+                        next[register] = true;
+                    }
+                }
+            }
+            if next != live_in[block_index] {
+                live_in[block_index] = next;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Some(live_in);
+        }
+    }
+}
+
 fn target_block(
     instruction: &JitInstructionMetadata,
     code: &otter_vm::CodeBlock,
@@ -341,6 +464,7 @@ fn target_block(
 
 fn merge_predecessors(
     predecessors: &[usize],
+    live_in: &[bool],
     out_states: &[Vec<RegisterState>],
     nodes: &mut Vec<NumericNode>,
 ) -> Option<(Vec<RegisterState>, Vec<NumericValue>, Vec<u16>)> {
@@ -349,6 +473,10 @@ fn merge_predecessors(
     let mut parameters = Vec::new();
     let mut parameter_registers = Vec::new();
     for (register, merged_state) in merged.iter_mut().enumerate() {
+        if !live_in.get(register).copied().unwrap_or(false) {
+            *merged_state = RegisterState::Unset;
+            continue;
+        }
         let states = predecessors
             .iter()
             .map(|&predecessor| out_states.get(predecessor)?.get(register).copied())
@@ -380,8 +508,13 @@ fn force_loop_parameters(
     parameters: &mut Vec<NumericValue>,
     parameter_registers: &mut Vec<u16>,
     nodes: &mut Vec<NumericNode>,
+    live_in: &[bool],
 ) -> Option<()> {
     for (register, state) in registers.iter_mut().enumerate() {
+        if !live_in.get(register).copied().unwrap_or(false) {
+            *state = RegisterState::Unset;
+            continue;
+        }
         let RegisterState::Value(value) = *state else {
             continue;
         };
@@ -425,14 +558,14 @@ fn lower_instruction(
             )?;
             return Some(());
         }
-        Op::LoadInt32 => NumericNode::Constant(f64::from(instruction.imm32(code, 1)?)),
+        Op::LoadInt32 => NumericNode::IntegerConstant(instruction.imm32(code, 1)?),
         Op::LoadNumber => {
             instruction.const_index(code, 1)?;
             NumericNode::Constant(instruction.load_number?)
         }
         Op::ToPrimitive => {
             instruction.const_index(code, 2)?;
-            let value = read_numeric(registers, nodes, register(instruction, code, 1)?)?;
+            let value = read_number(registers, nodes, register(instruction, code, 1)?)?;
             write(
                 registers,
                 register(instruction, code, 0)?,
@@ -441,7 +574,7 @@ fn lower_instruction(
             return Some(());
         }
         Op::ToNumeric => {
-            let value = read_numeric(registers, nodes, register(instruction, code, 1)?)?;
+            let value = read_number(registers, nodes, register(instruction, code, 1)?)?;
             write(
                 registers,
                 register(instruction, code, 0)?,
@@ -453,22 +586,58 @@ fn lower_instruction(
             if !instruction.arith_feedback().is_numeric_only() {
                 return None;
             }
-            let left = read_numeric(registers, nodes, register(instruction, code, 1)?)?;
-            let right = read_numeric(registers, nodes, register(instruction, code, 2)?)?;
+            let left = read_number(registers, nodes, register(instruction, code, 1)?)?;
+            let right = read_number(registers, nodes, register(instruction, code, 2)?)?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
-            match op {
-                Op::Add => NumericNode::Add(left, right),
-                Op::Sub => NumericNode::Sub(left, right),
-                Op::Mul => NumericNode::Mul(left, right),
-                Op::Div => NumericNode::Div(left, right),
-                _ => unreachable!("matched numeric binary operation"),
+            if op == Op::Add
+                && instruction.arith_feedback().is_int32_only()
+                && value_type(nodes, left)? == NumericType::Int32
+                && value_type(nodes, right)? == NumericType::Int32
+            {
+                NumericNode::IntegerAdd(left, right)
+            } else {
+                let left = widen_to_number(left, nodes, block_nodes)?;
+                let right = widen_to_number(right, nodes, block_nodes)?;
+                match op {
+                    Op::Add => NumericNode::Add(left, right),
+                    Op::Sub => NumericNode::Sub(left, right),
+                    Op::Mul => NumericNode::Mul(left, right),
+                    Op::Div => NumericNode::Div(left, right),
+                    _ => unreachable!("matched numeric binary operation"),
+                }
+            }
+        }
+        Op::AddImm | Op::BitwiseAndImm => {
+            if !instruction.arith_feedback().is_int32_only() {
+                return None;
+            }
+            let source = read_int32(registers, nodes, register(instruction, code, 1)?)?;
+            let immediate = instruction.imm32(code, 2)?;
+            *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
+            if op == Op::AddImm {
+                NumericNode::IntegerAddImmediate(source, immediate)
+            } else {
+                NumericNode::IntegerAndImmediate(source, immediate)
+            }
+        }
+        Op::LessThanImm | Op::EqualImm => {
+            if !instruction.arith_feedback().is_int32_only() {
+                return None;
+            }
+            let source = read_int32(registers, nodes, register(instruction, code, 1)?)?;
+            let immediate = instruction.imm32(code, 2)?;
+            if op == Op::LessThanImm {
+                NumericNode::IntegerLessThanImmediate(source, immediate)
+            } else {
+                NumericNode::IntegerEqualImmediate(source, immediate)
             }
         }
         Op::Neg => {
             if !instruction.arith_feedback().is_numeric_only() {
                 return None;
             }
-            let source = read_numeric(registers, nodes, register(instruction, code, 1)?)?;
+            let source = read_number(registers, nodes, register(instruction, code, 1)?)?;
+            let source = widen_to_number(source, nodes, block_nodes)?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
             NumericNode::Neg(source)
         }
@@ -476,9 +645,11 @@ fn lower_instruction(
             if !instruction.arith_feedback().is_numeric_only() {
                 return None;
             }
+            let left = read_number(registers, nodes, register(instruction, code, 1)?)?;
+            let right = read_number(registers, nodes, register(instruction, code, 2)?)?;
             NumericNode::LessThan(
-                read_numeric(registers, nodes, register(instruction, code, 1)?)?,
-                read_numeric(registers, nodes, register(instruction, code, 2)?)?,
+                widen_to_number(left, nodes, block_nodes)?,
+                widen_to_number(right, nodes, block_nodes)?,
             )
         }
         _ => return None,
@@ -521,7 +692,7 @@ fn read_state(registers: &[RegisterState], register: u16) -> Option<RegisterStat
     }
 }
 
-fn read_numeric(
+fn read_number(
     registers: &[RegisterState],
     nodes: &[NumericNode],
     register: u16,
@@ -529,7 +700,42 @@ fn read_numeric(
     let RegisterState::Value(value) = read_state(registers, register)? else {
         return None;
     };
-    (nodes.get(value.0)?.value_type() == NumericType::Number).then_some(value)
+    matches!(
+        nodes.get(value.0)?.value_type(),
+        NumericType::Int32 | NumericType::Number
+    )
+    .then_some(value)
+}
+
+fn read_int32(
+    registers: &[RegisterState],
+    nodes: &[NumericNode],
+    register: u16,
+) -> Option<NumericValue> {
+    let RegisterState::Value(value) = read_state(registers, register)? else {
+        return None;
+    };
+    (value_type(nodes, value)? == NumericType::Int32).then_some(value)
+}
+
+fn value_type(nodes: &[NumericNode], value: NumericValue) -> Option<NumericType> {
+    nodes.get(value.0).copied().map(NumericNode::value_type)
+}
+
+fn widen_to_number(
+    value: NumericValue,
+    nodes: &mut Vec<NumericNode>,
+    block_nodes: &mut Vec<NumericValue>,
+) -> Option<NumericValue> {
+    match value_type(nodes, value)? {
+        NumericType::Number => Some(value),
+        NumericType::Int32 => {
+            let widened = push(nodes, NumericNode::WidenInt32(value));
+            block_nodes.push(widened);
+            Some(widened)
+        }
+        NumericType::Boolean => None,
+    }
 }
 
 fn read_boolean(

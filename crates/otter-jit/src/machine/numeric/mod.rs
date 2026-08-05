@@ -43,7 +43,7 @@ pub(crate) fn try_compile(
     };
     // Loop CFG/SSA is constructed now, but publishing native code waits for
     // backedge polls and allocator-driven FrameState reconstruction.
-    if hir.has_backedges {
+    if hir.has_backedges || hir.requires_integer_lowering {
         return Ok(None);
     }
     let sequence = select(&hir)
@@ -126,6 +126,7 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
         .nodes
         .iter()
         .map(|node| match node.value_type() {
+            NumericType::Int32 => MachineRepresentation::Int32,
             NumericType::Number => MachineRepresentation::Float64,
             NumericType::Boolean => MachineRepresentation::Int32,
         })
@@ -203,10 +204,56 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                     instruction
                 }
                 NumericNode::BlockParameter(_) => continue,
+                NumericNode::IntegerConstant(value) => MachineInstruction::plain(
+                    MachineOpcode::IntegerConstant(i64::from(value)),
+                    vec![MachineOperand::register_output(result)],
+                ),
                 NumericNode::Constant(value) => MachineInstruction::plain(
                     MachineOpcode::FloatConstant(value.to_bits()),
                     vec![MachineOperand::register_output(result)],
                 ),
+                NumericNode::WidenInt32(source) => MachineInstruction::plain(
+                    MachineOpcode::Int32ToFloat64,
+                    vec![
+                        MachineOperand::register_input(machine_value(&values, source)),
+                        MachineOperand::register_output(result),
+                    ],
+                ),
+                NumericNode::IntegerAdd(left, right) => MachineInstruction::plain(
+                    MachineOpcode::IntegerAdd,
+                    vec![
+                        MachineOperand::register_input(machine_value(&values, left)),
+                        MachineOperand::register_input(machine_value(&values, right)),
+                        MachineOperand::register_output(result),
+                    ],
+                ),
+                NumericNode::IntegerAddImmediate(source, immediate)
+                | NumericNode::IntegerAndImmediate(source, immediate)
+                | NumericNode::IntegerLessThanImmediate(source, immediate)
+                | NumericNode::IntegerEqualImmediate(source, immediate) => {
+                    let opcode = match node {
+                        NumericNode::IntegerAddImmediate(..) => {
+                            MachineOpcode::IntegerAddImmediate(immediate)
+                        }
+                        NumericNode::IntegerAndImmediate(..) => {
+                            MachineOpcode::IntegerAndImmediate(immediate)
+                        }
+                        NumericNode::IntegerLessThanImmediate(..) => {
+                            MachineOpcode::IntegerLessThanImmediate(immediate)
+                        }
+                        NumericNode::IntegerEqualImmediate(..) => {
+                            MachineOpcode::IntegerEqualImmediate(immediate)
+                        }
+                        _ => unreachable!("matched immediate integer node"),
+                    };
+                    MachineInstruction::plain(
+                        opcode,
+                        vec![
+                            MachineOperand::register_input(machine_value(&values, source)),
+                            MachineOperand::register_output(result),
+                        ],
+                    )
+                }
                 NumericNode::Add(left, right)
                 | NumericNode::Sub(left, right)
                 | NumericNode::Mul(left, right)
@@ -259,8 +306,17 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
             ),
             NumericTerminator::Return(value) => {
                 let boxed = push_value(&mut representations, MachineRepresentation::Tagged);
+                let box_opcode = match hir.nodes[value.0].value_type() {
+                    NumericType::Int32 => MachineOpcode::BoxInt32,
+                    NumericType::Number => MachineOpcode::BoxNumber,
+                    NumericType::Boolean => {
+                        return Err(super::VerificationError::InvalidValue(machine_value(
+                            &values, value,
+                        )));
+                    }
+                };
                 instructions.push(MachineInstruction::plain(
-                    MachineOpcode::BoxNumber,
+                    box_opcode,
                     vec![
                         MachineOperand::register_input(machine_value(&values, value)),
                         MachineOperand::register_output(boxed),
@@ -480,7 +536,16 @@ mod tests {
         for pc in 0..view.instructions.len() {
             if matches!(
                 view.instructions[pc].op(view.code_block.as_ref()),
-                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Neg | Op::LessThan
+                Op::Add
+                    | Op::Sub
+                    | Op::Mul
+                    | Op::Div
+                    | Op::Neg
+                    | Op::LessThan
+                    | Op::AddImm
+                    | Op::BitwiseAndImm
+                    | Op::LessThanImm
+                    | Op::EqualImm
             ) {
                 view.seed_arith_feedback_for_test(
                     pc as u32,
@@ -663,6 +728,101 @@ mod tests {
                 (Op::ReturnValue, vec![Operand::Register(0)]),
             ],
         )
+    }
+
+    fn branch_phi_loop_view() -> JitCompileSnapshot {
+        let mut view = numeric_view(
+            0,
+            12,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(0)]),
+                (Op::LoadInt32, vec![Operand::Register(3), Operand::Imm32(0)]),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(3), Operand::Imm32(1)],
+                ),
+                (
+                    Op::LessThanImm,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(1),
+                        Operand::Imm32(1_000_000),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(13), Operand::Register(4)],
+                ),
+                (
+                    Op::BitwiseAndImm,
+                    vec![
+                        Operand::Register(5),
+                        Operand::Register(1),
+                        Operand::Imm32(1),
+                    ],
+                ),
+                (
+                    Op::EqualImm,
+                    vec![
+                        Operand::Register(6),
+                        Operand::Register(5),
+                        Operand::Imm32(0),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(3), Operand::Register(6)],
+                ),
+                (Op::LoadInt32, vec![Operand::Register(7), Operand::Imm32(2)]),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(7), Operand::Imm32(2)],
+                ),
+                (Op::Jump, vec![Operand::Imm32(2)]),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(8), Operand::Imm32(-14)],
+                ),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(8), Operand::Imm32(2)],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(9),
+                        Operand::Register(0),
+                        Operand::Register(2),
+                    ],
+                ),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(9), Operand::Imm32(0)],
+                ),
+                (
+                    Op::AddImm,
+                    vec![
+                        Operand::Register(10),
+                        Operand::Register(1),
+                        Operand::Imm32(1),
+                    ],
+                ),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(10), Operand::Imm32(1)],
+                ),
+                (Op::Jump, vec![Operand::Imm32(-15)]),
+                (
+                    Op::LoadLocal,
+                    vec![Operand::Register(11), Operand::Imm32(0)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(11)]),
+            ],
+        );
+        for pc in [3_u32, 5, 6, 13, 15] {
+            view.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(ARITH_INT32));
+        }
+        view
     }
 
     fn compile_output(
@@ -893,6 +1053,40 @@ mod tests {
                 .expect("loop compilation decision")
                 .is_none(),
             "native publication waits for poll and FrameState lowering"
+        );
+    }
+
+    #[test]
+    fn builds_branch_phi_as_typed_int32_loop_before_frame_state_publication() {
+        let view = branch_phi_loop_view();
+        let hir = NumericFunction::build(&view).expect("branch-phi numeric HIR");
+        assert!(hir.has_backedges);
+        assert!(hir.requires_integer_lowering);
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::IntegerAndImmediate(_, 1)))
+        );
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::IntegerAddImmediate(_, 1)))
+        );
+        let sequence = select(&hir).expect("branch-phi Machine IR");
+        assert!(sequence.blocks().iter().any(|block| {
+            block.parameters.len() >= 2
+                && block.parameters.iter().all(|parameter| {
+                    sequence.representations()[parameter.0 as usize] == MachineRepresentation::Int32
+                })
+        }));
+        sequence
+            .allocate(&TargetRegisterFile::aarch64_numeric_function())
+            .expect("branch-phi Machine IR allocation");
+        assert!(
+            try_compile(&view, 7003, None)
+                .expect("branch-phi compilation decision")
+                .is_none(),
+            "overflow FrameState and backedge polling must land before publication"
         );
     }
 

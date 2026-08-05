@@ -288,6 +288,16 @@ pub enum MachineOpcode {
     FloatConstant(u64),
     /// Integer addition.
     IntegerAdd,
+    /// Integer addition with a baked right operand and overflow exit.
+    IntegerAddImmediate(i32),
+    /// Integer bitwise AND with a baked right operand.
+    IntegerAndImmediate(i32),
+    /// Signed integer less-than with a baked right operand.
+    IntegerLessThanImmediate(i32),
+    /// Integer equality with a baked right operand.
+    IntegerEqualImmediate(i32),
+    /// Losslessly widen an integer Number into floating-point representation.
+    Int32ToFloat64,
     /// Floating-point addition.
     FloatAdd,
     /// Floating-point subtraction.
@@ -302,6 +312,8 @@ pub enum MachineOpcode {
     FloatLessThan,
     /// Canonically box one floating-point JavaScript Number.
     BoxNumber,
+    /// Canonically box one integer JavaScript Number.
+    BoxInt32,
     /// Target ABI call through a call descriptor.
     Call(u32),
     /// Unconditional control transfer.

@@ -175,6 +175,23 @@ CFG normalization and loop-SSA substrate landed on 2026-08-05:
 The full repository gate passed with 244 JIT tests, 831 VM tests, all-target
 all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
 
+Typed loop-value substrate landed on 2026-08-05:
+
+- backward CFG liveness now determines block parameters; dead bytecode
+  temporaries from mutually exclusive arms do not become phis or reject SSA;
+- Int32 constants, checked add/add-immediate, bitwise-and-immediate, and signed
+  less-than/equality-immediate operations have explicit HIR and Machine IR
+  identities, with lossless Int32-to-Float64 widening and canonical Int32
+  boxing kept separate;
+- the exact `branch-phi` bytecode shape now builds typed loop-header and inner
+  merge parameters and allocates through regalloc2;
+- native publication remains closed for checked integer operations until their
+  overflow exits own complete allocator-driven FrameState records. The HIR and
+  allocation test asserts this boundary directly.
+
+The full repository gate passed with 245 JIT tests, 831 VM tests, all-target
+all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
+
 The remaining legacy optimizer and allocator are fallback for functions whose
 HIR/selection slices have not switched. Delete each old consumer as its final
 operation family moves; do not adapt old allocation or metadata into the new

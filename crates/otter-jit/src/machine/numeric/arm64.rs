@@ -151,11 +151,33 @@ pub(super) fn emit(
                     ; cset W(destination), lt
                 );
             }
+            MachineOpcode::IntegerConstant(value) => {
+                emit_load_u64(
+                    &mut ops,
+                    integer_register(locations[0])?,
+                    value as u32 as u64,
+                );
+            }
+            MachineOpcode::Int32ToFloat64 => {
+                let source = integer_register(locations[0])?;
+                let destination = float_register(locations[1])?;
+                dynasm!(ops ; .arch aarch64 ; scvtf D(destination), W(source));
+            }
             MachineOpcode::BoxNumber => emit_box_number(
                 &mut ops,
                 float_register(locations[0])?,
                 integer_register(locations[1])?,
             ),
+            MachineOpcode::BoxInt32 => {
+                let source = integer_register(locations[0])?;
+                let destination = integer_register(locations[1])?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; mov W(destination), W(source)
+                    ; movz x16, NUMBER_TAG_HI16, lsl #48
+                    ; orr X(destination), X(destination), x16
+                );
+            }
             MachineOpcode::Return => {
                 let source = integer_register(locations[0])?;
                 dynasm!(ops
@@ -188,8 +210,11 @@ pub(super) fn emit(
                 }
                 dynasm!(ops ; .arch aarch64 ; b =>fallthrough);
             }
-            MachineOpcode::IntegerConstant(_)
-            | MachineOpcode::IntegerAdd
+            MachineOpcode::IntegerAdd
+            | MachineOpcode::IntegerAddImmediate(_)
+            | MachineOpcode::IntegerAndImmediate(_)
+            | MachineOpcode::IntegerLessThanImmediate(_)
+            | MachineOpcode::IntegerEqualImmediate(_)
             | MachineOpcode::Call(_) => {
                 return Err(Unsupported::OperandShape(
                     "numeric AArch64 Machine IR opcode",

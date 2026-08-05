@@ -29,8 +29,8 @@ use otter_bytecode::Op;
 use otter_vm::{
     JitCompileSnapshot,
     deopt::{
-        DeoptExitId, DeoptFrame, DeoptLocation, DeoptRepr, DeoptSlot, DeoptTable, DeoptVerifyError,
-        DeoptVerifyLimits, FrameState,
+        DeoptExitId, DeoptFrame, DeoptFrameEntry, DeoptLocation, DeoptRepr, DeoptSlot, DeoptTable,
+        DeoptVerifyError, DeoptVerifyLimits, FrameState,
     },
 };
 
@@ -311,13 +311,13 @@ impl DeoptLowering {
                 let body = tree
                     .frames
                     .iter()
-                    .find(|candidate| candidate.function_id == frame.function_id)
+                    .find(|candidate| candidate.function_id() == frame.function_id)
                     .ok_or(DeoptLoweringError::ReifiedFrameShape {
                         function_id: frame.function_id,
                         declared: frame.slots.len(),
                         expected: 0,
                     })?;
-                let expected = usize::from(body.code_block.register_count);
+                let expected = usize::from(body.code_block().register_count);
                 if frame.slots.len() != expected {
                     return Err(DeoptLoweringError::ReifiedFrameShape {
                         function_id: frame.function_id,
@@ -326,7 +326,7 @@ impl DeoptLowering {
                     });
                 }
                 let resume = body
-                    .instructions
+                    .instructions()
                     .iter()
                     .position(|instruction| instruction.byte_pc == frame.byte_pc)
                     .ok_or(DeoptLoweringError::ResumePcOutOfRange {
@@ -337,10 +337,10 @@ impl DeoptLowering {
                 if is_caller {
                     let call = resume
                         .checked_sub(1)
-                        .and_then(|index| body.instructions.get(index));
+                        .and_then(|index| body.instructions().get(index));
                     let is_call = call.is_some_and(|instruction| {
                         matches!(
-                            instruction.op(body.code_block.as_ref()),
+                            instruction.op(body.code_block()),
                             Op::Call | Op::CallMethodValue
                         )
                     });
@@ -453,8 +453,8 @@ fn validate_inputs(
 
     for state in frame_states.states() {
         let frame = &tree.frames[state.inline.0 as usize];
-        let instruction = &frame.instructions[state.pc as usize];
-        let actual_pc = instruction.instruction_pc(frame.code_block.as_ref());
+        let instruction = &frame.instructions()[state.pc as usize];
+        let actual_pc = instruction.instruction_pc(frame.code_block());
         if actual_pc != state.pc {
             return Err(DeoptLoweringError::InstructionPcMismatch {
                 expected: state.pc,
@@ -561,9 +561,32 @@ fn lower_frame(
         ResumeAt::Instruction => state.pc,
         ResumeAt::AfterCall => state.pc + 1,
     };
+    // A spliced callee's activation is constructed, not replayed: the binding
+    // its call would have established travels with the frame.
+    let entry = frame
+        .call_site
+        .as_ref()
+        .map(|call_site| -> Result<DeoptFrameEntry, DeoptLoweringError> {
+            Ok(DeoptFrameEntry {
+                return_register: call_site.result_register,
+                this: lower_slot(
+                    0,
+                    ssa.frames
+                        .get(state.inline.0 as usize)
+                        .and_then(|frame| frame.this_value),
+                    ssa,
+                    allocation,
+                    reprs,
+                    merges,
+                    state.pc,
+                )?,
+            })
+        })
+        .transpose()?;
     Ok(DeoptFrame {
-        function_id: frame.function_id,
+        function_id: frame.function_id(),
         byte_pc: frame_byte_pc(frame, pc)?,
+        entry,
         slots: slots.into_boxed_slice(),
     })
 }
@@ -706,11 +729,11 @@ fn frame_byte_pc(frame: &InlineFrame, pc: u32) -> Result<u32, DeoptLoweringError
         actual: pc,
     })?;
     frame
-        .instructions
+        .instructions()
         .get(index)
         .map(|instruction| instruction.byte_pc)
         .ok_or(DeoptLoweringError::InstructionPcMismatch {
-            expected: frame.instructions.len().try_into().unwrap_or(u32::MAX),
+            expected: frame.instructions().len().try_into().unwrap_or(u32::MAX),
             actual: pc,
         })
 }

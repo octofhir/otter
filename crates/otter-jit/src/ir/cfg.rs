@@ -267,8 +267,8 @@ impl ControlFlowGraph {
             }
             let built = FrameBlocks::build(
                 frame.id,
-                frame.code_block.as_ref(),
-                &frame.instructions,
+                frame.code_block(),
+                frame.instructions(),
                 &extra_leaders,
                 base,
             )?;
@@ -903,11 +903,7 @@ mod tests {
             )],
         );
         otter_vm::JitInlineCallee {
-            code_block: std::sync::Arc::clone(&view.code_block),
-            function_id: fid,
-            param_count: 1,
-            register_count: view.code_block.register_count,
-            instructions: view.instructions,
+            body: std::sync::Arc::new(view),
         }
     }
 

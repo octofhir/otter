@@ -1104,12 +1104,14 @@ pub const STUB_JIT_RESOLVE_THREW: RuntimeStubDescriptor = descriptor(
 /// A generated exit site passes its site index; the shared handler dumps the
 /// allocatable machine registers and calls this with the code object's baked
 /// [`crate::deopt::DeoptRuntime`], the dump, the frame's stack pointer and its
-/// register window. The stub reconstitutes every slot of every owed frame —
-/// reifying inlined callee frames through the ordinary call path — so exit
-/// sites carry no reconstruction code at all.
+/// register window. The stub reconstitutes every slot of every owed frame, so
+/// exit sites carry no reconstruction code at all.
 ///
-/// Returns 1 on success and 0 when a reification raised (error parked for the
-/// throw epilogue).
+/// An exit owing only the compiled function's own frame writes it into the
+/// published window and reports a bail. An exit owing a chain of spliced
+/// frames *constructs* them all in owned storage and runs the chain to
+/// completion, reporting the outermost frame's return value — nothing about
+/// that depends on how the compiled function was entered.
 pub const STUB_JIT_DEOPT_WRITEBACK: RuntimeStubDescriptor = descriptor(
     65,
     RuntimeStubClass::Reentrant,
@@ -1117,7 +1119,7 @@ pub const STUB_JIT_DEOPT_WRITEBACK: RuntimeStubDescriptor = descriptor(
     VARIADIC_STUB_ARGUMENTS,
     RuntimeStubEffects::reentrant(true),
     RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
+    RuntimeStubResultAbi::StatusPair,
 );
 
 /// Resume one already-started compiler-generated stack call after its native
@@ -1358,7 +1360,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         62 => "jit_class_value_op",
         63 => "jit_module_op",
         64 => "jit_resolve_threw",
-        65 => "jit_deopt_reify_frame",
+        65 => "jit_deopt_rebuild_frames",
         66 => "jit_deopt_stack_call",
         67 => "jit_resolve_direct_entry",
         68 => "string_char_code_at_leaf",

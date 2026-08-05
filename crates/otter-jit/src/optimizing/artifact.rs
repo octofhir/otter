@@ -29,7 +29,7 @@ use super::unit::OptimizedUnit;
 /// Cold serialized byte PC for one SSA instruction in its owning inline frame.
 pub(crate) fn instruction_byte_pc(unit: &OptimizedUnit, instruction: &SsaInstr) -> u32 {
     unit.tree.frames[instruction.inline.0 as usize]
-        .instructions
+        .instructions()
         .get(instruction.pc as usize)
         .map_or(u32::MAX, otter_vm::JitInstructionMetadata::byte_pc)
 }
@@ -53,9 +53,9 @@ pub(crate) fn render_optimized_unit(unit: &OptimizedUnit) -> String {
             out,
             "frame i{} function={} registers={} parameters={} call-site={:?}",
             frame.id.0,
-            frame.function_id,
-            frame.code_block.register_count,
-            frame.code_block.param_count,
+            frame.function_id(),
+            frame.code_block().register_count,
+            frame.code_block().param_count,
             frame.call_site
         )
         .expect("writing to String cannot fail");

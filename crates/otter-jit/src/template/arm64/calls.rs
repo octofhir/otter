@@ -123,14 +123,10 @@ fn inline_scratch_artifact(
 /// PORT NOTE: the deleted legacy baseline emitter decoded the method body a
 /// second time. This port deliberately reuses the current typed TemplatePlan,
 /// keeping operand validation and opcode shapes in one backend-neutral path.
-fn inline_leaf_template_plan(
-    view: &JitCompileSnapshot,
-    code_block: &std::sync::Arc<otter_vm::CodeBlock>,
-    instructions: &[otter_vm::JitInstructionMetadata],
-) -> Result<TemplatePlan, Unsupported> {
-    let mut leaf_view = view.clone();
-    leaf_view.code_block = code_block.clone();
-    leaf_view.instructions = instructions.to_vec();
+fn inline_leaf_template_plan(body: &JitCompileSnapshot) -> Result<TemplatePlan, Unsupported> {
+    // The spliced body is planned from its own baked inputs. Its call sites
+    // stay calls: a leaf body owns no further splice.
+    let mut leaf_view = body.clone();
     leaf_view.inline_callees.clear();
     leaf_view.direct_callees.clear();
     leaf_view.direct_methods.clear();
@@ -139,18 +135,12 @@ fn inline_leaf_template_plan(
     TemplatePlan::build(&leaf_view)
 }
 
-fn inline_method_template_plan(
-    view: &JitCompileSnapshot,
-    method: &JitInlineMethod,
-) -> Result<TemplatePlan, Unsupported> {
-    inline_leaf_template_plan(view, &method.code_block, &method.instructions)
+fn inline_method_template_plan(method: &JitInlineMethod) -> Result<TemplatePlan, Unsupported> {
+    inline_leaf_template_plan(&method.body)
 }
 
-fn inline_callee_template_plan(
-    view: &JitCompileSnapshot,
-    callee: &JitInlineCallee,
-) -> Result<TemplatePlan, Unsupported> {
-    inline_leaf_template_plan(view, &callee.code_block, &callee.instructions)
+fn inline_callee_template_plan(callee: &JitInlineCallee) -> Result<TemplatePlan, Unsupported> {
+    inline_leaf_template_plan(&callee.body)
 }
 
 /// Load one compact inline slot without changing the caller register base.
@@ -623,7 +613,7 @@ fn try_emit_inline_numeric_method(
     guard_miss: DynamicLabel,
     bail: DynamicLabel,
 ) -> Result<bool, Unsupported> {
-    let template_plan = inline_method_template_plan(view, method)?;
+    let template_plan = inline_method_template_plan(method)?;
     let Some(plan) = (view.cage_base != 0)
         .then(|| InlineLeafPlan::build_method(method, &template_plan, usize::from(argc)))
         .flatten()
@@ -633,8 +623,8 @@ fn try_emit_inline_numeric_method(
                 "[otter-jit] template inline method skip fid={} argc={} params={} regs={} ops={:?}",
                 method.guard.method_fid,
                 argc,
-                method.param_count,
-                method.register_count,
+                method.param_count(),
+                method.register_count(),
                 template_plan
                     .instructions
                     .iter()
@@ -649,7 +639,7 @@ fn try_emit_inline_numeric_method(
             "[otter-jit] template inline method emit fid={} argc={} regs={} scratch_slots={} scratch_bytes={}",
             method.guard.method_fid,
             argc,
-            method.register_count,
+            method.register_count(),
             plan.slot_count(),
             plan.aligned_scratch_bytes(),
         );
@@ -710,8 +700,8 @@ fn try_emit_inline_numeric_method(
         &plan,
         InlineBodySpec {
             function_id: method.guard.method_fid,
-            parameter_count: method.param_count,
-            register_count: method.register_count,
+            parameter_count: method.param_count(),
+            register_count: method.register_count(),
             arguments,
             receiver: Some(receiver),
             method: Some(method),
@@ -763,15 +753,15 @@ fn try_emit_inline_numeric_callee(
     done: DynamicLabel,
     bail: DynamicLabel,
 ) -> Result<bool, Unsupported> {
-    let template_plan = inline_callee_template_plan(view, callee)?;
+    let template_plan = inline_callee_template_plan(callee)?;
     let Some(plan) = InlineLeafPlan::build_callee(callee, &template_plan, usize::from(argc)) else {
         if std::env::var_os("OTTER_JIT_TRACE").is_some() {
             eprintln!(
                 "[otter-jit] template inline call skip fid={} argc={} params={} regs={} ops={:?}",
-                callee.function_id,
+                callee.function_id(),
                 argc,
-                callee.param_count,
-                callee.register_count,
+                callee.param_count(),
+                callee.register_count(),
                 template_plan
                     .instructions
                     .iter()
@@ -787,9 +777,9 @@ fn try_emit_inline_numeric_callee(
     if std::env::var_os("OTTER_JIT_TRACE").is_some() {
         eprintln!(
             "[otter-jit] template inline call emit fid={} argc={} regs={} scratch_slots={} scratch_bytes={}",
-            callee.function_id,
+            callee.function_id(),
             argc,
-            callee.register_count,
+            callee.register_count(),
             plan.slot_count(),
             plan.aligned_scratch_bytes(),
         );
@@ -805,7 +795,7 @@ fn try_emit_inline_numeric_callee(
     let guard_start = ops.offset().0;
 
     emit_load_reg(ops, 9, callee_register)?;
-    emit_load_u64(ops, 10, value_tag::box_function_id(callee.function_id));
+    emit_load_u64(ops, 10, value_tag::box_function_id(callee.function_id()));
     dynasm!(ops
         ; .arch aarch64
         ; cmp x9, x10
@@ -837,7 +827,7 @@ fn try_emit_inline_numeric_callee(
         );
     }
     dynasm!(ops ; .arch aarch64 ; ldr w11, [x9, closure_fid_byte]);
-    emit_load_u64(ops, 12, u64::from(callee.function_id));
+    emit_load_u64(ops, 12, u64::from(callee.function_id()));
     dynasm!(ops
         ; .arch aarch64
         ; cmp w11, w12
@@ -852,7 +842,7 @@ fn try_emit_inline_numeric_callee(
             guard_start,
             guard_end,
             inline_site,
-            callee.function_id,
+            callee.function_id(),
         ));
     }
 
@@ -862,9 +852,9 @@ fn try_emit_inline_numeric_callee(
         view,
         &plan,
         InlineBodySpec {
-            function_id: callee.function_id,
-            parameter_count: callee.param_count,
-            register_count: callee.register_count,
+            function_id: callee.function_id(),
+            parameter_count: callee.param_count(),
+            register_count: callee.register_count(),
             arguments,
             receiver: None,
             method: None,

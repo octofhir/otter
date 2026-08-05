@@ -1208,6 +1208,32 @@ impl Interpreter {
         }
     }
 
+    /// Bake one spliced body's own compile inputs.
+    ///
+    /// A body compiled inside another function resolves its constants, global
+    /// cells, hidden classes and call plans against *itself*, exactly as it
+    /// would as an outermost function: a spliced instruction that read the
+    /// caller's tables would find nothing to fold against and could only lower
+    /// as an exit. Only the inline-candidate tables stop here — which of this
+    /// body's own calls get spliced is decided by the frame that splices it.
+    pub(crate) fn bake_inline_body(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+        tier: jit_debug::JitDebugTier,
+    ) -> Option<std::sync::Arc<jit::JitCompileSnapshot>> {
+        let mut body = context.jit_compile_snapshot(fid)?;
+        self.publish_property_feedback_for_view(&body);
+        Self::bake_typed_array_layout(&mut body);
+        Self::bake_string_layout(&mut body);
+        self.bake_global_lexical_loads(&mut body, context, fid);
+        self.bake_call_site_plans(&mut body, context, fid, tier, false, false);
+        self.bake_guarded_method_calls(&mut body);
+        self.bake_element_accesses(&mut body);
+        self.bake_property_loads(&mut body);
+        Some(std::sync::Arc::new(body))
+    }
+
     /// Bake compiler-native direct-call plans and inline-candidate bodies for
     /// `fid`'s call sites.
     ///
@@ -1225,6 +1251,24 @@ impl Interpreter {
         fid: u32,
         tier: jit_debug::JitDebugTier,
         eager_direct_targets: bool,
+    ) {
+        self.bake_call_site_plans(view, context, fid, tier, eager_direct_targets, true);
+    }
+
+    /// Call-site plan baking shared by an outermost body and a spliced one.
+    ///
+    /// `splice_candidates` decides whether the inline-candidate tables are
+    /// filled. A body being baked *as* a candidate leaves them empty: its own
+    /// call sites are described by direct-call and static-native plans, and the
+    /// splicing frame owns every further splice decision.
+    fn bake_call_site_plans(
+        &mut self,
+        view: &mut jit::JitCompileSnapshot,
+        context: &ExecutionContext,
+        fid: u32,
+        tier: jit_debug::JitDebugTier,
+        eager_direct_targets: bool,
+        splice_candidates: bool,
     ) {
         let mut pending_direct_targets = rustc_hash::FxHashSet::default();
         let call_sites: Vec<_> = view
@@ -1385,7 +1429,10 @@ impl Interpreter {
                 1,
                 direct_call_outcome,
             );
-            let Some(callee_view) = context.jit_compile_snapshot(callee_fid) else {
+            if !splice_candidates {
+                continue;
+            }
+            let Some(body) = self.bake_inline_body(context, callee_fid, tier) else {
                 self.record_jit_inline_candidate(
                     fid,
                     instruction_pc,
@@ -1396,16 +1443,8 @@ impl Interpreter {
                 continue;
             };
             self.record_jit_inline_candidate(fid, instruction_pc, tier, Some(callee_fid), None);
-            view.inline_callees.insert(
-                call_byte_pc,
-                jit::JitInlineCallee {
-                    code_block: std::sync::Arc::clone(&callee_view.code_block),
-                    function_id: callee_fid,
-                    param_count: callee_view.code_block.param_count,
-                    register_count: callee_view.code_block.register_count,
-                    instructions: callee_view.instructions,
-                },
-            );
+            view.inline_callees
+                .insert(call_byte_pc, jit::JitInlineCallee { body });
         }
 
         // Method-call sites: snapshot monomorphic and polymorphic feedback for
@@ -1530,9 +1569,12 @@ impl Interpreter {
                 view.direct_methods
                     .insert(snap.call_byte_pc, direct_methods);
             }
+            if !splice_candidates {
+                continue;
+            }
             let mut baked: Vec<jit::JitInlineMethod> = Vec::new();
             for target in &snap.targets {
-                if let Some(method) = self.bake_one_inline_method(context, target) {
+                if let Some(method) = self.bake_one_inline_method(context, target, tier) {
                     baked.push(method);
                 }
             }
@@ -1649,8 +1691,9 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         target: &PolyMethodTarget,
+        tier: jit_debug::JitDebugTier,
     ) -> Option<jit::JitInlineMethod> {
-        self.bake_inline_method_rec(context, target, 0)
+        self.bake_inline_method_rec(context, target, tier, 0)
     }
 
     /// Recursion bound for nested method-body inlining. A method whose tail is a
@@ -1663,6 +1706,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         target: &PolyMethodTarget,
+        tier: jit_debug::JitDebugTier,
         depth: u32,
     ) -> Option<jit::JitInlineMethod> {
         let method = context.exec_function(target.method_fid)?;
@@ -1677,7 +1721,7 @@ impl Interpreter {
         {
             return None;
         }
-        let method_view = context.jit_compile_snapshot(target.method_fid)?;
+        let method_view = self.bake_inline_body(context, target.method_fid, tier)?;
         // Resolve every body `LoadProperty`/`StoreProperty` to a sealed value
         // byte offset; bail out if any property is absent, an accessor, or spills
         // past the inline value capacity. A receiver property resolves against
@@ -1756,17 +1800,16 @@ impl Interpreter {
         let mut nested_methods: rustc_hash::FxHashMap<u32, jit::JitInlineMethod> =
             rustc_hash::FxHashMap::default();
         for (pc, nested_target) in nested_targets {
-            if let Some(nested) = self.bake_inline_method_rec(context, &nested_target, depth + 1) {
+            if let Some(nested) =
+                self.bake_inline_method_rec(context, &nested_target, tier, depth + 1)
+            {
                 nested_methods.insert(pc, nested);
             }
         }
         let guard = self.bake_method_guard(target)?;
         Some(jit::JitInlineMethod {
-            code_block: std::sync::Arc::clone(&method_view.code_block),
+            body: method_view,
             guard,
-            param_count: method_view.code_block.param_count,
-            register_count: method_view.code_block.register_count,
-            instructions: method_view.instructions,
             prop_offsets,
             prop_shapes,
             nested_methods,

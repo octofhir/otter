@@ -544,8 +544,11 @@ pub(crate) fn emit_compress_slot_or_bail(ops: &mut Assembler, bail: DynamicLabel
         ; b.ne =>not_int                            // not an int32
         // int32: keep only a small int in [-2^30, 2^30); wider ints box.
         ; movz w11, #0x4000, lsl #16                // 2^30
-        ; add w10, w9, w11
-        ; tbnz w10, #31, =>bail                     // out of small-int range
+        ; adds w10, w9, w11
+        // Out of small-int range. A test-and-branch reaches only ±32 KiB,
+        // which a large code object outgrows; the sign flag carries the same
+        // bit to a full-range conditional branch.
+        ; b.mi =>bail
         ; lsl w10, w9, #1
         ; orr w10, w10, #1                          // (i << 1) | 1
         ; b =>done

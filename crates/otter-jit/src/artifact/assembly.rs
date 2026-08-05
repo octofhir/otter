@@ -486,8 +486,11 @@ fn symbolic_target(target: &RelocationTarget) -> String {
         } => format!("runtimeStub(id={id},name={name:?},signature={signature:?})"),
         RelocationTarget::GcCageBase => "gcCageBase".to_string(),
         RelocationTarget::DeoptRuntimeData => "deoptRuntimeData".to_string(),
-        RelocationTarget::GlobalLexicalCell { byte_pc } => {
-            format!("globalLexicalCell(bytePc={byte_pc})")
+        RelocationTarget::GlobalLexicalCell {
+            function_id,
+            byte_pc,
+        } => {
+            format!("globalLexicalCell(fid={function_id},bytePc={byte_pc})")
         }
         RelocationTarget::PropertyIcCell { access, ordinal } => format!(
             "propertyIcCell(access={},ordinal={ordinal})",
@@ -716,6 +719,7 @@ mod tests {
         code_map.record_osr(2, 4, 8);
         let deopt = DeoptTable::from_states(vec![FrameState {
             frames: vec![DeoptFrame {
+                entry: None,
                 function_id: 7,
                 byte_pc: 19,
                 slots: vec![DeoptSlot {

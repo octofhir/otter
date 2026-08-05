@@ -475,7 +475,7 @@ impl Interpreter {
     /// when its feedback epoch advances — the same "stop speculating until the
     /// profile actually changes" rule V8 spells `DisableOptimization` and JSC
     /// spells `jettison` plus an exit-site check.
-    fn note_jit_optimized_bail(&mut self, fid: u32, resume_pc: u32) {
+    pub(crate) fn note_jit_optimized_bail(&mut self, fid: u32, resume_pc: u32) {
         self.jit_runtime_stats.optimized_deopts =
             self.jit_runtime_stats.optimized_deopts.saturating_add(1);
         self.jit_optimized_bail_pcs
@@ -1074,81 +1074,6 @@ impl Interpreter {
             return None;
         }
         usize::try_from(header.upvalue_base).ok()
-    }
-
-    /// Rebuild an inlined callee's interpreter frame at a deopt exit.
-    ///
-    /// The optimized code has already written the caller's registers back into
-    /// its window and is about to hand control to the interpreter, but the
-    /// callee body it had spliced in owes the interpreter a frame of its own.
-    ///
-    /// Rather than reproduce the call's frame setup — the upvalue spine, `this`,
-    /// argument binding, the register window — this rewinds the caller to its
-    /// call and runs the interpreter's own ordinary- or method-call path over
-    /// the restored window. The frame that comes out is by construction the
-    /// frame a real call would have produced, including the advanced caller PC,
-    /// exact method receiver, and return destination.
-    ///
-    /// The frame is then fast-forwarded to `callee_pc`, the instruction the
-    /// exit names, and its register-window base is returned so emitted code can
-    /// restore the callee's registers into it.
-    ///
-    /// # Safety
-    /// `stack`'s top frame must be the caller, with its registers already
-    /// restored, and `call_pc` must name an `Op::Call` or
-    /// `Op::CallMethodValue` in the caller's body.
-    pub unsafe fn jit_deopt_reify_inlined_frame(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        call_pc: u32,
-        callee_pc: u32,
-        chain_index: u32,
-        chain_total: u32,
-    ) -> Result<*mut crate::Value, VmError> {
-        let caller_index = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
-        let function_id = stack[caller_index].function_id;
-        let code_block = context
-            .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        let instruction = code_block
-            .instr_at_index(call_pc as usize)
-            .ok_or(VmError::InvalidOperand)?;
-        let op = code_block.op(instruction);
-        stack[caller_index].pc = call_pc;
-        match op {
-            otter_bytecode::Op::Call => {
-                self.do_call_exec(stack, context, code_block, instruction)?
-            }
-            otter_bytecode::Op::CallMethodValue => {
-                self.do_call_method_value_exec(stack, context, code_block, instruction)?;
-            }
-            _ => return Err(VmError::InvalidOperand),
-        }
-        // A bytecode callee is now on top; a native or otherwise non-bytecode
-        // callee would have completed in place, which the identity guard at the
-        // spliced call site rules out.
-        if stack.len() != caller_index + 2 {
-            return Err(VmError::InvalidOperand);
-        }
-        let callee_index = caller_index + 1;
-        // The interpreter's call path starts the callee at its entry; the
-        // optimized code was further in. Fast-forward the frame to the exact
-        // instruction the exit names.
-        let callee_body = context
-            .exec_function(stack[callee_index].function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        if callee_pc as usize >= callee_body.code.len() {
-            return Err(VmError::InvalidOperand);
-        }
-        stack[callee_index].pc = callee_pc;
-        self.record_jit_debug_event(|| crate::JitDebugEvent::InlineDeoptFrame {
-            index: chain_index,
-            total: chain_total,
-            function_id: stack[callee_index].function_id,
-            resume_pc: callee_pc,
-        });
-        Ok(stack[callee_index].registers.as_mut_ptr())
     }
 
     /// Complete one full `Op::New` construct in place for a compiled caller

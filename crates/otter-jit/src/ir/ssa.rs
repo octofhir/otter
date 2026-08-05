@@ -620,10 +620,10 @@ impl UnitLayout {
         let mut instructions = 0u32;
         for frame in &tree.frames {
             register_base.push(variables);
-            register_count.push(frame.code_block.register_count);
+            register_count.push(frame.code_block().register_count);
             instruction_base.push(instructions);
-            variables += u32::from(frame.code_block.register_count);
-            instructions += frame.instructions.len() as u32;
+            variables += u32::from(frame.code_block().register_count);
+            instructions += frame.instructions().len() as u32;
         }
         Self {
             register_base,
@@ -656,7 +656,7 @@ fn frame_has_valueless_return(
         block.inline == frame.id
             && matches!(block.terminator, Terminator::InlineReturn { .. })
             && block.instr_pcs.last().is_some_and(|&pc| {
-                frame.instructions[pc as usize].op(frame.code_block.as_ref()) != Op::ReturnValue
+                frame.instructions()[pc as usize].op(frame.code_block()) != Op::ReturnValue
             })
     })
 }
@@ -705,7 +705,7 @@ impl SsaFunction {
         let mut def_blocks = vec![BTreeSet::new(); layout.total_variables];
         for (index, frame) in tree.frames.iter().enumerate() {
             let entry = cfg.frame_entries[index];
-            for register in 0..frame.code_block.register_count {
+            for register in 0..frame.code_block().register_count {
                 def_blocks[layout.variable(frame.id, register)].insert(entry);
             }
         }
@@ -755,9 +755,9 @@ impl SsaFunction {
 
         for block in &cfg.blocks {
             let frame = &tree.frames[block.inline.0 as usize];
-            let code_block = frame.code_block.as_ref();
+            let code_block = frame.code_block();
             for &pc in &block.instr_pcs {
-                let instruction = &frame.instructions[pc as usize];
+                let instruction = &frame.instructions()[pc as usize];
                 let actual_pc = instruction.instruction_pc(code_block);
                 if actual_pc != pc {
                     return Err(SsaError::InstructionPcMismatch {
@@ -767,7 +767,7 @@ impl SsaFunction {
                 }
                 let mut flow = register_flow(
                     code_block,
-                    &frame.instructions,
+                    frame.instructions(),
                     pc,
                     code_block.register_count,
                 )?;
@@ -854,18 +854,18 @@ impl SsaFunction {
                 for register in 0..register_count {
                     // A spliced frame's parameters alias the caller's argument
                     // values at rename time and get no definition of their own.
-                    if inline != InlineId::ROOT && register < frame.code_block.param_count {
+                    if inline != InlineId::ROOT && register < frame.code_block().param_count {
                         continue;
                     }
-                    let def = if inline == InlineId::ROOT && register < frame.code_block.param_count
-                    {
-                        ValueDef::Param {
-                            register,
-                            index: u32::from(register),
-                        }
-                    } else {
-                        ValueDef::Uninitialized { register }
-                    };
+                    let def =
+                        if inline == InlineId::ROOT && register < frame.code_block().param_count {
+                            ValueDef::Param {
+                                register,
+                                index: u32::from(register),
+                            }
+                        } else {
+                            ValueDef::Uninitialized { register }
+                        };
                     let id = append_value(&mut values, def, block_id)?;
                     blocks[block_index].phis.push(id);
                 }
@@ -905,8 +905,8 @@ impl SsaFunction {
             }
 
             for &pc in &cfg.blocks[block_index].instr_pcs {
-                let instruction = &frame.instructions[pc as usize];
-                let op = SsaOp::Bytecode(instruction.op(frame.code_block.as_ref()));
+                let instruction = &frame.instructions()[pc as usize];
+                let op = SsaOp::Bytecode(instruction.op(frame.code_block()));
                 let flow = &flows[layout.instruction(inline, pc)];
                 let result = if flow.def.is_some() {
                     Some(append_value(
@@ -943,8 +943,8 @@ impl SsaFunction {
                 .frames
                 .iter()
                 .map(|frame| SsaFrame {
-                    register_count: frame.code_block.register_count,
-                    param_count: frame.code_block.param_count,
+                    register_count: frame.code_block().register_count,
+                    param_count: frame.code_block().param_count,
                     this_value: None,
                 })
                 .collect(),
@@ -2070,11 +2070,7 @@ mod tests {
         view.inline_callees.insert(
             call_byte_pc,
             otter_vm::JitInlineCallee {
-                code_block: std::sync::Arc::clone(&callee_view.code_block),
-                function_id: 9,
-                param_count: 1,
-                register_count: callee_view.code_block.register_count,
-                instructions: callee_view.instructions,
+                body: std::sync::Arc::new(callee_view),
             },
         );
         let tree = InlineTree::build(&view);

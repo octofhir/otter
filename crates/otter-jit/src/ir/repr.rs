@@ -38,7 +38,7 @@ use super::{
 /// The constant a `LoadNumber` in one frame materializes.
 fn load_number_at(tree: &InlineTree, inline: InlineId, pc: u32) -> Option<f64> {
     tree.frames[inline.0 as usize]
-        .instructions
+        .instructions()
         .get(pc as usize)
         .and_then(|instruction| instruction.load_number)
 }
@@ -49,7 +49,7 @@ fn load_number_at(tree: &InlineTree, inline: InlineId, pc: u32) -> Option<f64> {
 /// against the root body would read another function's cell.
 fn feedback_at(tree: &InlineTree, inline: InlineId, pc: u32) -> ArithFeedback {
     tree.frames[inline.0 as usize]
-        .instructions
+        .instructions()
         .get(pc as usize)
         .map_or_else(
             ArithFeedback::default,
@@ -958,11 +958,7 @@ mod tests {
         view.inline_callees.insert(
             call_byte_pc,
             otter_vm::JitInlineCallee {
-                code_block: std::sync::Arc::clone(&callee.code_block),
-                function_id: 9,
-                param_count: 1,
-                register_count: callee.code_block.register_count,
-                instructions: callee.instructions,
+                body: std::sync::Arc::new(callee),
             },
         );
         let tree = InlineTree::build(&view);

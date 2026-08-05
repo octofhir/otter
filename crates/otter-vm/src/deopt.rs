@@ -190,6 +190,21 @@ pub struct DeoptSlot {
     pub repr: DeoptRepr,
 }
 
+/// How a spliced callee frame was entered, everything its rebuilt activation
+/// needs that its register window does not carry.
+///
+/// A rebuilt chain is *constructed*, not replayed: the exit hands the
+/// interpreter a complete set of frames rather than re-running the caller's
+/// call instruction, so the binding a call would have established has to be
+/// described here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeoptFrameEntry {
+    /// Caller register the frame's return value is written to.
+    pub return_register: u16,
+    /// Where the frame's `this` binding lives at this exit.
+    pub this: DeoptSlot,
+}
+
 /// One interpreter frame to rebuild at a deopt point.
 ///
 /// Rebuilding it means materializing each [`DeoptSlot`] (read the raw bits at
@@ -201,6 +216,9 @@ pub struct DeoptFrame {
     pub function_id: u32,
     /// Interpreter byte-PC this frame resumes at.
     pub byte_pc: u32,
+    /// How this frame was entered; `None` only for the outermost frame, which
+    /// the compiled entry itself owns.
+    pub entry: Option<DeoptFrameEntry>,
     /// One slot per interpreter virtual register the frame defines, in
     /// register-index order.
     pub slots: Box<[DeoptSlot]>,
@@ -416,30 +434,16 @@ impl DeoptTable {
     }
 }
 
-/// One inlined-frame reification step of a deopt exit's chain: the caller's
-/// call instruction and the PC the rebuilt callee frame fast-forwards to.
-/// Both are logical (canonical instruction-index) PCs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeoptChainCall {
-    /// The caller's call instruction, one before where it resumes.
-    pub call_pc: u32,
-    /// Where the rebuilt callee frame resumes.
-    pub callee_pc: u32,
-}
-
 /// Everything one generated exit site needs beyond its [`FrameState`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeoptExitDescriptor {
     /// The frame state this site rebuilds, an index into the owning table.
     pub state: DeoptExitId,
-    /// Exact logical PC the compiled function's outermost frame resumes at.
-    /// For an inline chain this is the instruction after the first spliced
-    /// call; publishing it prevents the native entry boundary from overwriting
-    /// the caller PC advanced by reification with a stale entry PC.
-    pub resume_pc: u32,
-    /// Reification steps for inlined frames, outermost caller first. Empty for
-    /// a single-frame exit.
-    pub chain: Box<[DeoptChainCall]>,
+    /// Logical (canonical instruction-index) resume PC per frame of the state,
+    /// outermost first. The state stores byte PCs, which the interpreter's
+    /// frames do not speak; this is the same sequence in their namespace.
+    /// Index `0` is the compiled function's own frame.
+    pub resume_pcs: Box<[u32]>,
 }
 
 /// Deopt metadata a generated exit reads at run time.
@@ -629,6 +633,7 @@ mod tests {
             frames: Box::new([DeoptFrame {
                 function_id: 7,
                 byte_pc,
+                entry: None,
                 slots: slots.into(),
             }]),
         }
@@ -647,11 +652,16 @@ mod tests {
                 DeoptFrame {
                     function_id: 7,
                     byte_pc: 12,
+                    entry: None,
                     slots: vec![shared].into(),
                 },
                 DeoptFrame {
                     function_id: 9,
                     byte_pc: 0,
+                    entry: Some(DeoptFrameEntry {
+                        return_register: 1,
+                        this: shared,
+                    }),
                     slots: vec![shared].into(),
                 },
             ]),

@@ -3,7 +3,7 @@
 //! # Contents
 //! - Which inline bodies and method splices the backend can lower.
 //! - Per-instruction operand, representation and constant checks.
-//! - OSR entry sites, root-frame safepoints, and spliced-frame chain exits.
+//! - OSR entry sites and per-frame reentrant-transition safepoints.
 //!
 //! # Invariants
 //! - Nothing here emits machine code. A function that answers "can this be
@@ -11,6 +11,10 @@
 //!   [`super::emit_support`].
 //! - Every rejection is an [`Unsupported`], so an unlowerable body keeps the
 //!   template tier rather than failing the compile.
+//! - Every per-instruction fact is read from the frame that owns the
+//!   instruction. A logical PC and a byte PC name an instruction only inside
+//!   their own body, so the outermost function's tables are never consulted
+//!   for a spliced one.
 
 use super::*;
 use crate::ir::licm::natural_loop_blocks;
@@ -25,7 +29,7 @@ pub(super) fn inline_method_property<'a>(
     }
     let frame = tree.frames.get(instruction.inline.0 as usize)?;
     let method = frame.method.as_ref()?;
-    let byte_pc = frame.instructions.get(instruction.pc as usize)?.byte_pc;
+    let byte_pc = frame.instructions().get(instruction.pc as usize)?.byte_pc;
     let value_byte = *method.prop_offsets.get(&byte_pc)?;
     let guard = match &frame.call_site.as_ref()?.kind {
         InlineCallKind::Method { guard, .. } => guard,
@@ -71,12 +75,17 @@ pub(super) fn fused_inline_method_property<'a>(
         return None;
     }
     let property_pc = usize::try_from(instruction.pc).ok()?;
-    if frame.instructions.iter().take(property_pc).any(|metadata| {
-        !matches!(
-            metadata.op(frame.code_block.as_ref()),
-            Op::LoadLocal | Op::LoadThis
-        )
-    }) {
+    if frame
+        .instructions()
+        .iter()
+        .take(property_pc)
+        .any(|metadata| {
+            !matches!(
+                metadata.op(frame.code_block()),
+                Op::LoadLocal | Op::LoadThis
+            )
+        })
+    {
         return None;
     }
     Some((frame, guard, value_byte))
@@ -215,10 +224,10 @@ pub(super) fn logical_pc(
     let frame = tree
         .frames
         .iter()
-        .find(|frame| frame.function_id == function_id)
+        .find(|frame| frame.function_id() == function_id)
         .ok_or(Unsupported::OperandShape("optimizing chain frame body"))?;
     frame
-        .instructions
+        .instructions()
         .iter()
         .position(|instruction| instruction.byte_pc == byte_pc)
         .map(|position| position as u32)
@@ -243,7 +252,7 @@ pub(super) fn frame_feedback(
     instruction: &SsaInstr,
 ) -> otter_vm::jit_feedback::ArithFeedback {
     tree.frames[instruction.inline.0 as usize]
-        .instructions
+        .instructions()
         .get(instruction.pc as usize)
         .map_or_else(
             otter_vm::jit_feedback::ArithFeedback::default,
@@ -252,7 +261,6 @@ pub(super) fn frame_feedback(
 }
 
 pub(super) fn check_eligibility(
-    view: &JitCompileSnapshot,
     tree: &InlineTree,
     cfg: &ControlFlowGraph,
     dom: &DominatorTree,
@@ -334,7 +342,6 @@ pub(super) fn check_eligibility(
     let mut guarded_uses = BTreeMap::<(u32, ValueId), Option<u32>>::new();
     let mut allowed_conversions = BTreeSet::<(InlineId, u32, usize)>::new();
     let mut element_transition_instructions = Vec::new();
-    let mut inline_transitions = BTreeSet::new();
     let mut insufficient_feedback = BTreeSet::new();
     for block in dom.reverse_postorder().iter().copied() {
         for (instruction_index, instruction) in
@@ -485,6 +492,7 @@ pub(super) fn check_eligibility(
                     )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
+                        instruction.inline,
                         instruction.pc,
                         block,
                         instruction_index,
@@ -511,6 +519,7 @@ pub(super) fn check_eligibility(
                     )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
+                        instruction.inline,
                         instruction.pc,
                         block,
                         instruction_index,
@@ -559,6 +568,7 @@ pub(super) fn check_eligibility(
                     )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
+                        instruction.inline,
                         instruction.pc,
                         block,
                         instruction_index,
@@ -590,6 +600,7 @@ pub(super) fn check_eligibility(
                     )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
+                        instruction.inline,
                         instruction.pc,
                         block,
                         instruction_index,
@@ -611,6 +622,7 @@ pub(super) fn check_eligibility(
                         "global load shape",
                     )?;
                     element_transition_instructions.push((
+                        instruction.inline,
                         instruction.pc,
                         block,
                         instruction_index,
@@ -633,6 +645,7 @@ pub(super) fn check_eligibility(
                         "string load shape",
                     )?;
                     element_transition_instructions.push((
+                        instruction.inline,
                         instruction.pc,
                         block,
                         instruction_index,
@@ -662,6 +675,7 @@ pub(super) fn check_eligibility(
                     )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
+                        instruction.inline,
                         instruction.pc,
                         block,
                         instruction_index,
@@ -698,6 +712,7 @@ pub(super) fn check_eligibility(
                     )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
+                        instruction.inline,
                         instruction.pc,
                         block,
                         instruction_index,
@@ -749,6 +764,7 @@ pub(super) fn check_eligibility(
                     )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
+                        instruction.inline,
                         instruction.pc,
                         block,
                         instruction_index,
@@ -990,16 +1006,15 @@ pub(super) fn check_eligibility(
                         "tagged result repr",
                     )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
-                    let frame = &tree.frames[instruction.inline.0 as usize];
-                    let byte_pc = frame
-                        .instructions
-                        .get(instruction.pc as usize)
-                        .map(|metadata| metadata.byte_pc)
-                        .ok_or(Unsupported::OperandShape("optimizing call byte PC"))?;
-                    if instruction.inline != InlineId::ROOT
-                        || !view.static_native_calls.contains_key(&byte_pc)
-                    {
+                    // A guarded native leaf reads its arguments from SSA homes
+                    // and neither allocates nor re-enters, so it owes no
+                    // transition. Its plan is the site's own body's, never the
+                    // outermost function's.
+                    let frame = frame_of(tree, instruction)?;
+                    let byte_pc = frame_byte_pc(tree, instruction)?;
+                    if !frame.body.static_native_calls.contains_key(&byte_pc) {
                         element_transition_instructions.push((
+                            instruction.inline,
                             instruction.pc,
                             block,
                             instruction_index,
@@ -1088,9 +1103,11 @@ pub(super) fn check_eligibility(
                         "upvalue store shape",
                     )?;
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
-                    if instruction.inline != InlineId::ROOT {
-                        inline_transitions.insert((instruction.inline, instruction.pc));
-                    }
+                    require(
+                        instruction.inline == InlineId::ROOT,
+                        op,
+                        "spliced captured-binding window",
+                    )?;
                 }
                 // A captured-binding read is a leaf: it reaches the upvalue
                 // cell through pointers, never allocates or runs JS, and only
@@ -1107,9 +1124,11 @@ pub(super) fn check_eligibility(
                         op,
                         "upvalue load shape",
                     )?;
-                    if instruction.inline != InlineId::ROOT {
-                        inline_transitions.insert((instruction.inline, instruction.pc));
-                    }
+                    require(
+                        instruction.inline == InlineId::ROOT,
+                        op,
+                        "spliced captured-binding window",
+                    )?;
                 }
                 Op::Jump => {
                     if instruction.result.is_some() || !instruction.inputs.is_empty() {
@@ -1199,21 +1218,11 @@ pub(super) fn check_eligibility(
     }
     guarded_numeric_uses.sort_by_key(|guarded| guarded.use_pc);
     guarded_numeric_uses.dedup_by_key(|guarded| guarded.use_pc);
-    // A reentrant stub addresses operands through a physical interpreter
-    // window. The root owns one; a spliced frame deliberately does not.
-    // Reentrant bytecodes in a spliced frame therefore become exact-PC exits
-    // before effects, while root sites retain the precise safepoint transition.
-    element_transition_instructions.retain(|&(pc, block, _)| {
-        let inline = cfg.blocks[block.0 as usize].inline;
-        if inline == InlineId::ROOT {
-            true
-        } else {
-            inline_transitions.insert((inline, pc));
-            false
-        }
-    });
-    element_transition_instructions.sort_unstable_by_key(|&(pc, _, _)| pc);
-    element_transition_instructions.dedup_by_key(|instruction| instruction.0);
+    // A reentrant bytecode names its transition inside its own frame: a byte
+    // PC is canonical only within the body it came from, and a spliced frame's
+    // site must never share an entry with the root's.
+    element_transition_instructions.sort_unstable_by_key(|&(inline, pc, _, _)| (inline, pc));
+    element_transition_instructions.dedup_by_key(|instruction| (instruction.0, instruction.1));
     let element_transitions = build_element_transition_sites(
         ssa,
         liveness,
@@ -1228,7 +1237,6 @@ pub(super) fn check_eligibility(
         back_edges,
         osr_entries,
         element_transitions,
-        inline_transitions,
         insufficient_feedback,
         cached_method_guard,
     })
@@ -1359,16 +1367,13 @@ pub(super) fn build_element_transition_sites(
     liveness: &Liveness,
     reprs: &ReprMap,
     frame_states: &FrameStateTable,
-    instructions: Vec<(u32, BlockId, usize)>,
+    instructions: Vec<(InlineId, u32, BlockId, usize)>,
 ) -> Result<ElementTransitionSafepoints, Unsupported> {
     let merges = MergeLiveness::compute(ssa);
-    let bitmap_word_count = usize::from(ssa.register_count).div_ceil(u64::BITS as usize);
-    let bitmap_word_count_u16 = u16::try_from(bitmap_word_count)
-        .map_err(|_| Unsupported::OperandShape("optimizing frame-map word count overflow"))?;
     let mut bitmap_words = Vec::<u64>::new();
     let mut sites = BTreeMap::new();
 
-    for (id, (pc, block, instruction_index)) in instructions.into_iter().enumerate() {
+    for (id, (inline, pc, block, instruction_index)) in instructions.into_iter().enumerate() {
         let safepoint_id = u32::try_from(id)
             .map_err(|_| Unsupported::OperandShape("optimizing safepoint id overflow"))?;
         let instruction = ssa.blocks[block.0 as usize]
@@ -1377,13 +1382,28 @@ pub(super) fn build_element_transition_sites(
             .ok_or(Unsupported::OperandShape(
                 "optimizing element-transition instruction boundary",
             ))?;
-        // Eligibility confines reentrant transitions to the root frame — a
-        // spliced callee has no interpreter window for the stub to address.
+        // The stub runs in the frame that owns the instruction, so the site is
+        // described in that frame's register namespace and every frame it is
+        // paused inside contributes the values it holds.
         let frame_state = frame_states
-            .at(InlineId::ROOT, pc)
+            .at(inline, pc)
             .ok_or(Unsupported::OperandShape(
                 "optimizing element-transition abstract frame state",
             ))?;
+        let mut chain = vec![frame_state];
+        while let Some(caller) = chain
+            .last()
+            .and_then(|state: &&AbstractFrameState| state.caller)
+        {
+            chain.push(
+                frame_states
+                    .states()
+                    .get(caller)
+                    .ok_or(Unsupported::OperandShape(
+                        "optimizing element-transition caller state",
+                    ))?,
+            );
+        }
         let live_after = liveness
             .live_after_instruction(ssa, block, instruction_index)
             .ok_or(Unsupported::OperandShape(
@@ -1404,26 +1424,48 @@ pub(super) fn build_element_transition_sites(
             if rematerialized_deopt_slot(ssa, reprs, &merges, Some(value)).is_some() {
                 continue;
             }
-            let register =
-                frame_register_for_value(frame_state, value).ok_or(Unsupported::OperandShape(
+            let mut homed = false;
+            for state in &chain {
+                if let Some(register) = frame_register_for_value(state, value) {
+                    tagged_live_across.push(TaggedLiveAcross {
+                        value,
+                        inline: state.inline,
+                        register,
+                    });
+                    homed = true;
+                }
+            }
+            if !homed {
+                return Err(Unsupported::OperandShape(
                     "optimizing tagged live-out value is absent from frame state",
-                ))?;
-            tagged_live_across.push(TaggedLiveAcross { value, register });
+                ));
+            }
         }
-        tagged_live_across.sort_unstable_by_key(|live| (live.register, live.value));
+        tagged_live_across.sort_unstable_by_key(|live| (live.inline, live.register, live.value));
         tagged_live_across.dedup();
 
-        let mut root_registers = tagged_live_across
+        // The frame map names the executing frame's own window; the callers it
+        // is paused inside keep their windows rooted through their own
+        // published activations.
+        let register_count = ssa
+            .frames
+            .get(inline.0 as usize)
+            .ok_or(Unsupported::OperandShape(
+                "optimizing element-transition frame shape",
+            ))?
+            .register_count;
+        let mut own_registers = tagged_live_across
             .iter()
+            .filter(|live| live.inline == inline)
             .map(|live| live.register)
             .collect::<BTreeSet<_>>();
         for (&value, &register) in instruction.inputs.iter().zip(&instruction.input_registers) {
             if reprs.representation(value) == Representation::Tagged {
-                root_registers.insert(register);
+                own_registers.insert(register);
             }
         }
         if instruction.op == SsaOp::Bytecode(Op::StoreProperty)
-            && root_registers.contains(
+            && own_registers.contains(
                 &instruction
                     .result_register
                     .expect("eligibility checked property-store scratch"),
@@ -1434,10 +1476,13 @@ pub(super) fn build_element_transition_sites(
             ));
         }
 
+        let bitmap_word_count = usize::from(register_count).div_ceil(u64::BITS as usize);
+        let bitmap_word_count_u16 = u16::try_from(bitmap_word_count)
+            .map_err(|_| Unsupported::OperandShape("optimizing frame-map word count overflow"))?;
         let bitmap_offset = u32::try_from(bitmap_words.len())
             .map_err(|_| Unsupported::OperandShape("optimizing frame-map bitmap overflow"))?;
         let mut site_words = vec![0_u64; bitmap_word_count];
-        for register in root_registers {
+        for register in own_registers {
             let register = usize::from(register);
             site_words[register / u64::BITS as usize] |= 1_u64 << (register % u64::BITS as usize);
         }
@@ -1446,10 +1491,10 @@ pub(super) fn build_element_transition_sites(
             id: safepoint_id,
             bitmap_offset,
             bitmap_word_count: bitmap_word_count_u16,
-            slot_count: ssa.register_count,
+            slot_count: register_count,
         };
         sites.insert(
-            pc,
+            (inline, pc),
             ElementTransitionSite {
                 safepoint_id,
                 frame_map,
@@ -1844,9 +1889,39 @@ pub(super) fn check_tagged_constant_result(
 pub(super) fn load_number(tree: &InlineTree, instruction: &SsaInstr) -> Result<f64, Unsupported> {
     tree.frames
         .get(instruction.inline.0 as usize)
-        .and_then(|frame| frame.instructions.get(instruction.pc as usize))
+        .and_then(|frame| frame.instructions().get(instruction.pc as usize))
         .and_then(|instruction| instruction.load_number)
         .ok_or(Unsupported::OperandShape("optimizing LoadNumber metadata"))
+}
+
+/// The body an instruction belongs to.
+///
+/// Every per-instruction fact — operands, constants, baked cells, property and
+/// element facts, call plans — is resolved here and nowhere else. A logical PC
+/// and a byte PC both name an instruction only inside their own body.
+pub(super) fn frame_of<'a>(
+    tree: &'a InlineTree,
+    instruction: &SsaInstr,
+) -> Result<&'a InlineFrame, Unsupported> {
+    tree.frames
+        .get(instruction.inline.0 as usize)
+        .ok_or(Unsupported::OperandShape("optimizing instruction frame"))
+}
+
+/// The instruction overlay for one instruction, read from its own body.
+pub(super) fn frame_instruction<'a>(
+    tree: &'a InlineTree,
+    instruction: &SsaInstr,
+) -> Result<&'a otter_vm::JitInstructionMetadata, Unsupported> {
+    frame_of(tree, instruction)?
+        .instructions()
+        .get(instruction.pc as usize)
+        .ok_or(Unsupported::OperandShape("optimizing instruction overlay"))
+}
+
+/// Byte PC of one instruction inside its own body.
+pub(super) fn frame_byte_pc(tree: &InlineTree, instruction: &SsaInstr) -> Result<u32, Unsupported> {
+    Ok(frame_instruction(tree, instruction)?.byte_pc)
 }
 
 pub(super) fn frame_operand(
@@ -1856,9 +1931,9 @@ pub(super) fn frame_operand(
 ) -> Option<Operand> {
     let frame = tree.frames.get(instruction.inline.0 as usize)?;
     frame
-        .instructions
+        .instructions()
         .get(instruction.pc as usize)?
-        .operand(frame.code_block.as_ref(), operand)
+        .operand(frame.code_block(), operand)
 }
 
 pub(super) fn frame_imm32(
@@ -1868,9 +1943,9 @@ pub(super) fn frame_imm32(
 ) -> Option<i32> {
     let frame = tree.frames.get(instruction.inline.0 as usize)?;
     frame
-        .instructions
+        .instructions()
         .get(instruction.pc as usize)?
-        .imm32(frame.code_block.as_ref(), operand)
+        .imm32(frame.code_block(), operand)
 }
 
 pub(super) fn frame_const_index(
@@ -1880,9 +1955,9 @@ pub(super) fn frame_const_index(
 ) -> Option<u32> {
     let frame = tree.frames.get(instruction.inline.0 as usize)?;
     frame
-        .instructions
+        .instructions()
         .get(instruction.pc as usize)?
-        .const_index(frame.code_block.as_ref(), operand)
+        .const_index(frame.code_block(), operand)
 }
 
 pub(super) fn is_exact_i32(number: f64) -> bool {

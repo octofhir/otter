@@ -151,8 +151,8 @@ impl<'a> InlineLeafPlan<'a> {
         argc: usize,
     ) -> Option<Self> {
         Self::build_leaf(
-            method.param_count,
-            method.register_count,
+            method.param_count(),
+            method.register_count(),
             Some(method),
             template,
             argc,
@@ -170,8 +170,8 @@ impl<'a> InlineLeafPlan<'a> {
         argc: usize,
     ) -> Option<Self> {
         Self::build_leaf(
-            callee.param_count,
-            callee.register_count,
+            callee.param_count(),
+            callee.register_count(),
             None,
             template,
             argc,

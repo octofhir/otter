@@ -106,7 +106,11 @@ pub(crate) enum RelocationTarget {
     /// the code object owns exactly one.
     DeoptRuntimeData,
     /// Permanent global-declarative cell read by one `LoadGlobalOrThrow`.
+    ///
+    /// A byte PC names an instruction only inside its own body, so a spliced
+    /// frame's read is identified by that body's function id as well.
     GlobalLexicalCell {
+        function_id: u32,
         byte_pc: u32,
     },
     PropertyIcCell {
@@ -976,8 +980,12 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
         }
         RelocationTarget::GcCageBase => output.push(TARGET_GC_CAGE_BASE),
         RelocationTarget::DeoptRuntimeData => output.push(TARGET_DEOPT_RUNTIME_DATA),
-        RelocationTarget::GlobalLexicalCell { byte_pc } => {
+        RelocationTarget::GlobalLexicalCell {
+            function_id,
+            byte_pc,
+        } => {
             output.push(TARGET_GLOBAL_LEXICAL_CELL);
+            put_u32(output, *function_id);
             put_u32(output, *byte_pc);
         }
         RelocationTarget::PropertyIcCell { access, ordinal } => {

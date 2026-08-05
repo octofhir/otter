@@ -472,27 +472,63 @@ pub(super) fn emit_osr_materialization(
     Ok(())
 }
 
+/// Register holding the base of `inline`'s interpreter window.
+///
+/// The root frame's window is the one the entry loaded into `x19`. A spliced
+/// frame's window is a reservation in this generation's own stack frame, so its
+/// base is materialized into the transition scratch register on demand.
+pub(super) fn emit_window_base(
+    ops: &mut Assembler,
+    windows: &InlineWindows,
+    inline: InlineId,
+) -> Result<u8, Unsupported> {
+    if inline == InlineId::ROOT {
+        return Ok(19);
+    }
+    let offset = windows.get(inline)?.window;
+    // `sp` is only addressable through the fixed-register forms, so the
+    // window base always materializes in the same scratch register.
+    if offset <= 4095 {
+        dynasm!(ops ; .arch aarch64 ; add x8, sp, offset);
+    } else {
+        emit_load_u32(ops, 12, offset);
+        dynasm!(ops ; .arch aarch64 ; add x8, sp, x12);
+    }
+    Ok(WINDOW_SCRATCH)
+}
+
 /// Materialize only the transition operands and tagged values live across the
-/// call. Optimizing spills are private and unscanned, so live tagged spills
-/// take the same interpreter-window rooting path as tagged machine registers.
+/// call, each into the window of the frame that names it. Optimizing spills are
+/// private and unscanned, so live tagged spills take the same window rooting
+/// path as tagged machine registers.
 pub(super) fn emit_materialize_element_transition(
     ops: &mut Assembler,
     reprs: &ReprMap,
     allocation: &Allocation,
+    windows: &InlineWindows,
     instruction: &SsaInstr,
     site: &ElementTransitionSite,
 ) -> Result<(), Unsupported> {
-    let mut materialized_registers = BTreeSet::new();
+    let mut materialized = BTreeSet::new();
     for (&value, &register) in instruction.inputs.iter().zip(&instruction.input_registers) {
-        emit_materialize_frame_value(ops, reprs, allocation, value, register)?;
-        materialized_registers.insert(register);
+        emit_materialize_frame_value(
+            ops,
+            reprs,
+            allocation,
+            windows,
+            instruction.inline,
+            value,
+            register,
+        )?;
+        materialized.insert((instruction.inline, register));
     }
     for live in &site.tagged_live_across {
-        if !materialized_registers.insert(live.register) {
+        if !materialized.insert((live.inline, live.register)) {
             continue;
         }
         emit_load_tagged_location(ops, allocation.location(live.value), 9)?;
-        emit_store_frame_register(ops, u32::from(live.register), 9)?;
+        let window = emit_window_base(ops, windows, live.inline)?;
+        emit_store_frame_register_in(ops, window, u32::from(live.register), 9)?;
     }
     Ok(())
 }
@@ -501,6 +537,8 @@ pub(super) fn emit_materialize_frame_value(
     ops: &mut Assembler,
     reprs: &ReprMap,
     allocation: &Allocation,
+    windows: &InlineWindows,
+    inline: InlineId,
     value: ValueId,
     register: u16,
 ) -> Result<(), Unsupported> {
@@ -517,7 +555,238 @@ pub(super) fn emit_materialize_frame_value(
             emit_box_double(ops, FP_SCRATCH, 9);
         }
     }
-    emit_store_frame_register(ops, u32::from(register), 9)
+    let window = emit_window_base(ops, windows, inline)?;
+    emit_store_frame_register_in(ops, window, u32::from(register), 9)
+}
+
+/// Build the activation record of every spliced frame a transition needs, and
+/// seed the window slots the transition itself does not write.
+///
+/// Publication makes a window a collector root wholesale, so every slot must
+/// hold a real `Value`, not just the slots this site materializes. The whole
+/// construction belongs on the transition path: an entry that never misses an
+/// inline cache never builds a frame at all, and that is the common case.
+pub(super) fn emit_build_transition_frames(
+    ops: &mut Assembler,
+    tree: &InlineTree,
+    windows: &InlineWindows,
+    instruction: &SsaInstr,
+    site: &ElementTransitionSite,
+) -> Result<(), Unsupported> {
+    if instruction.inline == InlineId::ROOT {
+        return Ok(());
+    }
+    let mut written = site
+        .tagged_live_across
+        .iter()
+        .map(|live| (live.inline, live.register))
+        .collect::<BTreeSet<_>>();
+    written.extend(
+        instruction
+            .input_registers
+            .iter()
+            .map(|&register| (instruction.inline, register)),
+    );
+    for (inline, _) in transition_chain(tree, instruction)? {
+        let layout = windows.get(inline)?;
+        let function_id = tree
+            .frames
+            .get(inline.0 as usize)
+            .ok_or(Unsupported::OperandShape("optimizing spliced frame body"))?
+            .function_id();
+        emit_load_u64(
+            ops,
+            9,
+            u64::from(function_id) | (u64::from(function_id) << 32),
+        );
+        emit_sp_str_x(ops, 9, layout.record + NATIVE_FRAME_FUNCTION_ID_OFFSET);
+        emit_load_u32(
+            ops,
+            9,
+            stack_register_frame_shape_word(layout.register_count),
+        );
+        emit_sp_str_w(ops, 9, layout.record + NATIVE_FRAME_SHAPE_WORD_OFFSET);
+        if layout.window <= 4095 {
+            dynasm!(ops ; .arch aarch64 ; add x9, sp, layout.window);
+        } else {
+            emit_load_u32(ops, 12, layout.window);
+            dynasm!(ops ; .arch aarch64 ; add x9, sp, x12);
+        }
+        emit_sp_str_x(ops, 9, layout.record + NATIVE_FRAME_REGISTER_BASE_OFFSET);
+        dynasm!(ops ; .arch aarch64 ; mov x9, xzr);
+        emit_sp_str_x(ops, 9, layout.record + NATIVE_FRAME_UPVALUE_BASE_OFFSET);
+        emit_sp_str_x(ops, 9, layout.record + NATIVE_FRAME_UPVALUE_COUNT_OFFSET);
+        debug_assert_eq!(
+            NATIVE_FRAME_ACTIVATION_ID_OFFSET,
+            NATIVE_FRAME_UPVALUE_COUNT_OFFSET + 4,
+            "the upvalue count and activation id are one aligned pair"
+        );
+        emit_load_u64(ops, 9, VALUE_UNDEFINED);
+        emit_sp_str_x(ops, 9, layout.record + NATIVE_FRAME_THIS_OFFSET);
+        emit_sp_str_x(ops, 9, layout.record + NATIVE_FRAME_NEW_TARGET_OFFSET);
+        emit_sp_str_x(ops, 9, layout.record + NATIVE_FRAME_SELF_OFFSET);
+        for slot in 0..layout.register_count {
+            if written.contains(&(inline, slot)) {
+                continue;
+            }
+            emit_sp_str_x(ops, 9, layout.window + u32::from(slot) * STACK_SLOT_BYTES);
+        }
+    }
+    Ok(())
+}
+
+/// Every spliced frame a transition at `instruction` is executing or paused
+/// inside, outermost first, with the PC each of them resumes at.
+fn transition_chain(
+    tree: &InlineTree,
+    instruction: &SsaInstr,
+) -> Result<Vec<(InlineId, u32)>, Unsupported> {
+    let mut chain = Vec::new();
+    let mut current = instruction.inline;
+    let mut resume = instruction.pc;
+    while current != InlineId::ROOT {
+        chain.push((current, resume));
+        let call_site = tree
+            .frames
+            .get(current.0 as usize)
+            .and_then(|frame| frame.call_site.as_ref())
+            .ok_or(Unsupported::OperandShape("optimizing spliced frame parent"))?;
+        resume = call_site.call_pc;
+        current = call_site.parent;
+    }
+    chain.reverse();
+    Ok(chain)
+}
+
+/// Publish the exact resume PC of the frame an operation is about to run in,
+/// and of every spliced frame it is paused inside.
+///
+/// A logical PC is canonical only within its own body, so writing a spliced
+/// frame's PC into the root's record would name a different instruction.
+pub(super) fn emit_publish_transition_pc(
+    ops: &mut Assembler,
+    tree: &InlineTree,
+    windows: &InlineWindows,
+    instruction: &SsaInstr,
+) -> Result<(), Unsupported> {
+    let chain = transition_chain(tree, instruction)?;
+    // The root frame is paused at the call that entered the outermost spliced
+    // frame; without a chain it is the frame running the operation itself.
+    let root_pc = match chain.first() {
+        None => instruction.pc,
+        Some(&(outermost, _)) => {
+            tree.frames
+                .get(outermost.0 as usize)
+                .and_then(|frame| frame.call_site.as_ref())
+                .ok_or(Unsupported::OperandShape("optimizing spliced frame parent"))?
+                .call_pc
+        }
+    };
+    emit_load_u32(ops, 9, root_pc);
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+        ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+    );
+    for (frame, frame_pc) in chain {
+        let layout = windows.get(frame)?;
+        emit_load_u32(ops, 9, frame_pc);
+        emit_sp_str_w(ops, 9, layout.record + NATIVE_FRAME_PC_OFFSET);
+    }
+    Ok(())
+}
+
+pub(super) fn emit_publish_transition_frame(
+    ops: &mut Assembler,
+    tree: &InlineTree,
+    windows: &InlineWindows,
+    frame_states: &FrameStateTable,
+    deopt_exits: &mut Vec<(DynamicLabel, DeoptExitId, u32)>,
+    instruction: &SsaInstr,
+) -> Result<usize, Unsupported> {
+    emit_publish_transition_pc(ops, tree, windows, instruction)?;
+    if instruction.inline == InlineId::ROOT {
+        return Ok(0);
+    }
+    let chain = transition_chain(tree, instruction)?;
+    let depth = u32::try_from(chain.len())
+        .map_err(|_| Unsupported::OperandShape("optimizing spliced chain depth"))?;
+    let overflow = ops.new_dynamic_label();
+    deopt_exits.push((
+        overflow,
+        deopt_exit_at(frame_states, instruction)?,
+        instruction.pc,
+    ));
+    // The activation array is both the publication capacity and the generated
+    // recursion bound; exceeding it side-exits before any effect.
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
+        ; ldr x10, [x9]
+        ; ldr x11, [x20, ACTIVATION_LIMIT_OFFSET]
+        ; add x12, x10, depth
+        ; cmp x12, x11
+        ; b.hi =>overflow
+        ; ldr x11, [x20, ACTIVATION_BASE_OFFSET]
+        ; add x11, x11, x10, lsl #3
+    );
+    for &(frame, _) in &chain {
+        let layout = windows.get(frame)?;
+        if layout.record <= 4095 {
+            dynasm!(ops ; .arch aarch64 ; add x14, sp, layout.record);
+        } else {
+            emit_load_u32(ops, 13, layout.record);
+            dynasm!(ops ; .arch aarch64 ; add x14, sp, x13);
+        }
+        dynasm!(ops ; .arch aarch64 ; str x14, [x11], #8);
+    }
+    dynasm!(ops
+        ; .arch aarch64
+        ; str x12, [x9]
+        ; ldr x13, [x20, NATIVE_FRAME_OFFSET]
+    );
+    emit_sp_str_x(ops, 13, windows.saved_frame);
+    dynasm!(ops
+        ; .arch aarch64
+        ; str x14, [x20, NATIVE_FRAME_OFFSET]
+        ; ldr x15, [x20, THREAD_OFFSET]
+        ; str x14, [x15, VM_THREAD_CURRENT_FRAME_OFFSET]
+    );
+    Ok(chain.len())
+}
+
+/// Unpublish everything [`emit_publish_transition_frame`] pushed and restore
+/// the caller's published activation.
+pub(super) fn emit_unpublish_transition_frame(
+    ops: &mut Assembler,
+    windows: &InlineWindows,
+    depth: usize,
+) -> Result<(), Unsupported> {
+    if depth == 0 {
+        return Ok(());
+    }
+    let depth = u32::try_from(depth)
+        .map_err(|_| Unsupported::OperandShape("optimizing spliced chain depth"))?;
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
+        ; ldr x10, [x9]
+        ; sub x10, x10, depth
+        ; str x10, [x9]
+        ; ldr x11, [x20, ACTIVATION_BASE_OFFSET]
+        ; add x11, x11, x10, lsl #3
+    );
+    for _ in 0..depth {
+        dynasm!(ops ; .arch aarch64 ; str xzr, [x11], #8);
+    }
+    emit_sp_ldr_x(ops, 13, windows.saved_frame);
+    dynasm!(ops
+        ; .arch aarch64
+        ; str x13, [x20, NATIVE_FRAME_OFFSET]
+        ; ldr x15, [x20, THREAD_OFFSET]
+        ; str x13, [x15, VM_THREAD_CURRENT_FRAME_OFFSET]
+    );
+    Ok(())
 }
 
 pub(super) fn emit_load_boxed_value(
@@ -545,11 +814,14 @@ pub(super) fn emit_load_boxed_value(
     }
 }
 
-/// Reload every tagged value live across moving GC, then optionally load an
-/// element-load result last. Numeric homes and indices stay untouched.
+/// Reload every tagged value live across moving GC from the window that rooted
+/// it, then optionally load a result last. Numeric homes and indices stay
+/// untouched.
 pub(super) fn emit_reload_element_transition(
     ops: &mut Assembler,
     allocation: &Allocation,
+    windows: &InlineWindows,
+    inline: InlineId,
     site: &ElementTransitionSite,
     load_result: Option<(u16, Location)>,
 ) -> Result<(), Unsupported> {
@@ -558,11 +830,13 @@ pub(super) fn emit_reload_element_transition(
         if !reloaded.insert(live.value) {
             continue;
         }
-        emit_load_frame_register(ops, u32::from(live.register), 9)?;
+        let window = emit_window_base(ops, windows, live.inline)?;
+        emit_load_frame_register_in(ops, window, u32::from(live.register), 9)?;
         emit_store_tagged_location(ops, allocation.location(live.value), 9)?;
     }
     if let Some((result_register, dst_location)) = load_result {
-        emit_load_frame_register(ops, u32::from(result_register), 9)?;
+        let window = emit_window_base(ops, windows, inline)?;
+        emit_load_frame_register_in(ops, window, u32::from(result_register), 9)?;
         emit_store_tagged_location(ops, dst_location, 9)?;
     }
     Ok(())
@@ -573,16 +847,26 @@ pub(super) fn emit_load_frame_register(
     register: u32,
     scratch: u8,
 ) -> Result<(), Unsupported> {
+    emit_load_frame_register_in(ops, 19, register, scratch)
+}
+
+/// Read from an interpreter register window addressed by `window`.
+pub(super) fn emit_load_frame_register_in(
+    ops: &mut Assembler,
+    window: u8,
+    register: u32,
+    scratch: u8,
+) -> Result<(), Unsupported> {
     let offset = register
         .checked_mul(STACK_SLOT_BYTES)
         .ok_or(Unsupported::OperandShape(
             "optimizing frame register offset",
         ))?;
     if offset <= MAX_PARAMETER_OFFSET {
-        dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [x19, offset]);
+        dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [X(window), offset]);
     } else {
         emit_load_u32(ops, 12, offset);
-        dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [x19, x12]);
+        dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [X(window), x12]);
     }
     Ok(())
 }
@@ -597,9 +881,9 @@ pub(super) fn emit_store_frame_register(
 
 /// Store into an interpreter register window addressed by `window`.
 ///
-/// The compiled frame's own window is `x19`; a frame reified for an inlined
-/// callee lives in the window its reify handed back, and the callee's registers
-/// belong there and not in its caller's.
+/// The root frame's window is `x19`; a spliced frame's is a reservation in
+/// this generation's own stack frame, and the callee's registers belong there
+/// and not in its caller's.
 pub(super) fn emit_store_frame_register_in(
     ops: &mut Assembler,
     window: u8,
@@ -669,9 +953,22 @@ pub(super) fn emit_sp_str_x(ops: &mut Assembler, reg: u8, offset: u32) {
     }
 }
 
+/// Largest unsigned scaled immediate offset for a 32-bit `ldr`/`str`.
+pub(super) const MAX_SP_IMM_OFFSET_W: u32 = 4095 * 4;
+
+/// `str W(reg), [sp, offset]` for any spill offset.
+pub(super) fn emit_sp_str_w(ops: &mut Assembler, reg: u8, offset: u32) {
+    if offset <= MAX_SP_IMM_OFFSET_W {
+        dynasm!(ops ; .arch aarch64 ; str W(reg), [sp, offset]);
+    } else {
+        emit_load_u32(ops, 12, offset);
+        dynasm!(ops ; .arch aarch64 ; str W(reg), [sp, x12]);
+    }
+}
+
 /// `ldr W(reg), [sp, offset]` for any spill offset.
 pub(super) fn emit_sp_ldr_w(ops: &mut Assembler, reg: u8, offset: u32) {
-    if offset <= MAX_SP_IMM_OFFSET {
+    if offset <= MAX_SP_IMM_OFFSET_W {
         dynasm!(ops ; .arch aarch64 ; ldr W(reg), [sp, offset]);
     } else {
         emit_load_u32(ops, 12, offset);

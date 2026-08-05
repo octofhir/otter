@@ -5,6 +5,7 @@
 //!   exception, and result ABI for every dense [`RuntimeStubId`].
 //! - [`RuntimeStubAllocContext`] is the rooted allocation packet passed by
 //!   every allocating entry.
+//! - Typed scalar leaves keep unboxed numeric values in their machine ABI.
 //!
 //! # Invariants
 //! - The inventory is dense and unique; descriptor `id == index + 1`.
@@ -150,6 +151,8 @@ pub enum RuntimeStubSignature {
     /// The same rules apply: rewrite in place, run the matching write
     /// barriers, never allocate, collect, or re-enter JS.
     MutatingLeafValue3 = 6,
+    /// `(left: f64, right: f64) -> f64` pure numeric leaf.
+    Float64Leaf2 = 7,
 }
 
 /// Safepoint requirement encoded in the descriptor.
@@ -183,6 +186,8 @@ pub enum RuntimeStubResultAbi {
     StatusWord = 1,
     /// Single raw value word with no status channel.
     ValueWord = 2,
+    /// One unboxed IEEE-754 binary64 value in the platform FP result register.
+    Float64 = 3,
 }
 
 /// Machine-callable runtime-stub descriptor.
@@ -1235,6 +1240,28 @@ pub const STUB_COLLECTION_MAP_SET_MUTATING: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusPair,
 );
 
+/// Pure unboxed Number remainder for typed numeric machine code.
+pub const STUB_NUMBER_REM_F64_LEAF: RuntimeStubDescriptor = descriptor(
+    84,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::Float64Leaf2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::Float64,
+);
+
+/// Pure unboxed ECMAScript Number exponentiation for typed numeric machine code.
+pub const STUB_NUMBER_POW_F64_LEAF: RuntimeStubDescriptor = descriptor(
+    85,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::Float64Leaf2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::Float64,
+);
+
 /// Leaf `Math.abs`.
 ///
 /// A numeric builtin reached through a declared entry rather than a
@@ -1384,6 +1411,8 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         81 => "math_max_leaf",
         82 => "math_min_leaf",
         83 => "collection_map_set_mutating",
+        84 => "number_rem_f64_leaf",
+        85 => "number_pow_f64_leaf",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1473,6 +1502,8 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_MATH_MAX_LEAF,
     STUB_MATH_MIN_LEAF,
     STUB_COLLECTION_MAP_SET_MUTATING,
+    STUB_NUMBER_REM_F64_LEAF,
+    STUB_NUMBER_POW_F64_LEAF,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.
@@ -1493,6 +1524,9 @@ pub const fn validate_stub_descriptor(
         }
         RuntimeStubSignature::Poll1 => {
             matches!(desc.result_abi, RuntimeStubResultAbi::StatusWord)
+        }
+        RuntimeStubSignature::Float64Leaf2 => {
+            matches!(desc.result_abi, RuntimeStubResultAbi::Float64)
         }
         RuntimeStubSignature::Variadic => !matches!(
             (desc.exception, desc.result_abi),

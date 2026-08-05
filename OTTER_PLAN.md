@@ -343,6 +343,33 @@ Checked multiply, Uint32, and comparison publication landed on 2026-08-05:
 The full repository gate passed with 255 JIT tests, 831 VM tests, all-target
 all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
 
+Typed scalar leaf publication landed on 2026-08-06:
+
+- checked Int32 negation now lowers through typed HIR and Machine IR. AArch64
+  deopts on signed overflow and on the JavaScript negative-zero case before
+  committing the result, using the existing allocator-driven frame state;
+- Number remainder and exponentiation remain unboxed across allocation and use
+  one declared `f64, f64 -> f64` leaf ABI. The calls have explicit caller-save
+  clobbers and a frame-owned result slot, with no heap argument, tagged-value
+  conversion, status pair, local recovery format, or parallel bailout path;
+- `ToNumber` over an already numeric value, Int32/Float64 `ToBoolean`, and
+  logical-not now lower directly. Float truthiness rejects both zero signs and
+  unordered NaN while preserving canonical Boolean results;
+- focused native execution covers `INT_MIN`, negative zero, remainder and
+  exponentiation edge cases, forced spills across FP leaf calls, several loop
+  iterations, and exact interrupt reconstruction before the next iteration;
+- `benchmarks/scripts/float-leaf-math.js` is a real frontend fixture combining
+  all new families with a checked/polled mixed Int32/Float64 loop. Its artifact
+  proves `otter-machine-ir numeric-function`, native execution returns the Node
+  oracle `199999`, and ten-sample validation recorded 12 optimizing entries and
+  zero deopts. The typed ABI reduced the local production-tiered median from
+  19.670 ms with tagged leaf calls to 17.045 ms, within 1.1% of the 16.852 ms
+  template result; these dirty-tree measurements are engineering evidence, not
+  a published baseline.
+
+The full repository gate passed with 258 JIT tests, 831 VM tests, all-target
+all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
+
 The remaining legacy optimizer and allocator are fallback for functions whose
 HIR/selection slices have not switched. Delete each old consumer as its final
 operation family moves; do not adapt old allocation or metadata into the new

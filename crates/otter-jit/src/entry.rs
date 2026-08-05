@@ -409,6 +409,7 @@ mod tests {
                 !matches!(
                     descriptor.signature,
                     RuntimeStubSignature::LeafValue2
+                        | RuntimeStubSignature::Float64Leaf2
                         | RuntimeStubSignature::MutatingLeafValue2
                         | RuntimeStubSignature::MutatingLeafValue3
                         | RuntimeStubSignature::AllocValue3

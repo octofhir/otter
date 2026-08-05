@@ -104,8 +104,7 @@ use otter_vm::native_abi::{
     STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_LOAD_ELEMENT,
     STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROPERTY, STUB_JIT_LOAD_STRING, STUB_JIT_LOAD_UPVALUE,
     STUB_JIT_LOOSE_EQ, STUB_JIT_SPREAD_CALL_OP, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY,
-    STUB_JIT_STORE_UPVALUE, STUB_JIT_STORE_UPVALUE_CHECKED, STUB_JIT_WRITE_BARRIER, SafepointId,
-    SafepointRecord,
+    STUB_JIT_STORE_UPVALUE, STUB_JIT_STORE_UPVALUE_CHECKED, SafepointId, SafepointRecord,
 };
 use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG};
 
@@ -425,8 +424,6 @@ struct EmissionPlan<'a> {
     store_upvalue_entry: ResolvedRuntimeEntry,
     /// TDZ-checked captured-binding write.
     store_upvalue_checked_entry: ResolvedRuntimeEntry,
-    /// Generational barrier for the inline property-store hit path.
-    write_barrier_entry: ResolvedRuntimeEntry,
     /// Total leaf `ToBoolean` probe used by tagged truthiness reduction.
     to_boolean_entry: ResolvedRuntimeEntry,
     /// Exact non-allocating IEEE-754 remainder probe.
@@ -659,10 +656,6 @@ pub(super) fn compile_with_artifacts(
             store_upvalue_checked_entry: ResolvedRuntimeEntry::new(
                 STUB_JIT_STORE_UPVALUE_CHECKED,
                 transitions.variadic_entry(STUB_JIT_STORE_UPVALUE_CHECKED),
-            ),
-            write_barrier_entry: ResolvedRuntimeEntry::new(
-                STUB_JIT_WRITE_BARRIER,
-                transitions.entry(STUB_JIT_WRITE_BARRIER),
             ),
             to_boolean_entry: ResolvedRuntimeEntry::new(
                 otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.descriptor,
@@ -1013,7 +1006,6 @@ fn emit(
         load_upvalue_entry,
         store_upvalue_entry,
         store_upvalue_checked_entry,
-        write_barrier_entry,
         to_boolean_entry,
         number_rem_entry,
     } = plan;
@@ -2026,7 +2018,6 @@ fn emit(
                                 }
                             }
                             let store_prim = ops.new_dynamic_label();
-                            let barrier_slow = ops.new_dynamic_label();
                             dynasm!(ops
                                 ; .arch aarch64
                                 ; movz x11, NUMBER_TAG_HI16, lsl #48
@@ -2035,82 +2026,14 @@ fn emit(
                                 ; b.ne =>store_prim        // primitive: no barrier
                                 ; str w9, [x13, x17]
                             );
-                            // The barrier runs inline against the guarded
-                            // receiver's header; only a real unrecorded
-                            // old->young edge or a live marking cycle reaches
-                            // the runtime.
-                            crate::template::arm64::values::emit_write_barrier_fast(
+                            crate::template::arm64::values::emit_write_barrier(
                                 &mut ops,
                                 &mut relocations,
                                 view,
                                 12,
                                 9,
-                                barrier_slow,
-                                done,
                             );
-                            // Cell store the barrier could not settle inline:
-                            // stage receiver and value into their window slots
-                            // and complete through the window stub.
-                            dynasm!(ops ; .arch aarch64 ; =>barrier_slow);
-                            emit_build_transition_frames(
-                                &mut ops,
-                                tree,
-                                &inline_windows,
-                                instruction,
-                                site,
-                            )?;
-                            emit_materialize_frame_value(
-                                &mut ops,
-                                reprs,
-                                allocation,
-                                &inline_windows,
-                                instruction.inline,
-                                instruction.inputs[0],
-                                object,
-                            )?;
-                            emit_materialize_frame_value(
-                                &mut ops,
-                                reprs,
-                                allocation,
-                                &inline_windows,
-                                instruction.inline,
-                                instruction.inputs[1],
-                                value,
-                            )?;
-                            // The barrier reads its two operands out of the
-                            // executing frame's window, so a spliced frame has
-                            // to be published for it; the root already is.
-                            let barrier_depth = if instruction.inline == InlineId::ROOT {
-                                0
-                            } else {
-                                emit_publish_transition_frame(
-                                    &mut ops,
-                                    tree,
-                                    &inline_windows,
-                                    frame_states,
-                                    &mut deopt_exits,
-                                    instruction,
-                                )?
-                            };
-                            dynasm!(ops
-                                ; .arch aarch64
-                                ; mov x0, x20
-                                ; movz x1, object as u32
-                                ; movz x2, value as u32
-                            );
-                            emit_runtime_entry(&mut ops, &mut relocations, 16, write_barrier_entry);
-                            dynasm!(ops ; .arch aarch64 ; blr x16);
-                            emit_unpublish_transition_frame(
-                                &mut ops,
-                                &inline_windows,
-                                barrier_depth,
-                            )?;
-                            dynasm!(ops
-                                ; .arch aarch64
-                                ; cbnz x0, =>threw
-                                ; b =>done
-                                ; =>store_prim
-                            );
+                            dynasm!(ops ; .arch aarch64 ; b =>done ; =>store_prim);
                             crate::template::arm64::values::emit_compress_slot_or_bail(
                                 &mut ops, miss,
                             );

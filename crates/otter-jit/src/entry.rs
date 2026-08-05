@@ -250,10 +250,6 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_store_upvalue_checked_stub as *const () as usize,
         ),
         binding(
-            abi::STUB_JIT_WRITE_BARRIER,
-            jit_write_barrier_stub as *const () as usize,
-        ),
-        binding(
             abi::STUB_JIT_WRITE_BARRIER_WINDOW,
             jit_write_barrier_stub as *const () as usize,
         ),

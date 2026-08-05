@@ -2169,6 +2169,32 @@ impl GcHeap {
         value.visit_gc_edges(&mut record);
     }
 
+    /// Write barrier for a caller that already holds the parent's header
+    /// address rather than a typed [`Gc`].
+    ///
+    /// Generated code derives the header once for the store itself and hands
+    /// it straight to the barrier; re-deriving a `Gc` from it would only throw
+    /// the address away and rebuild it.
+    ///
+    /// # Safety
+    /// `parent_header` must name a live object's header for the call.
+    pub unsafe fn record_write_at<V: GcStore + ?Sized>(
+        &mut self,
+        parent_header: *mut GcHeader,
+        value: &V,
+    ) {
+        if parent_header.is_null() {
+            return;
+        }
+        let marking = &mut self.marking;
+        let remembered = &mut self.remembered_parents;
+        value.visit_gc_edges(&mut |edge: crate::GcEdge| {
+            // SAFETY: forwarded from this function's contract; the edge is an
+            // in-cage child offset by construction.
+            unsafe { crate::barrier::write_barrier(parent_header, edge.raw(), marking, remembered) }
+        });
+    }
+
     /// Address of the incremental-marking flag byte.
     ///
     /// The insertion half of [`crate::barrier::write_barrier`] fires only

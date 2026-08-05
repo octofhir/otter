@@ -287,6 +287,40 @@ pub(super) fn emit(
                     );
                 }
             }
+            MachineOpcode::IntegerAnd
+            | MachineOpcode::IntegerOr
+            | MachineOpcode::IntegerXor
+            | MachineOpcode::IntegerShiftLeft
+            | MachineOpcode::IntegerShiftRight => {
+                let left = integer_register(locations[0])?;
+                let right = integer_register(locations[1])?;
+                let destination = integer_register(locations[2])?;
+                match instruction.opcode {
+                    MachineOpcode::IntegerAnd => {
+                        dynasm!(ops ; .arch aarch64 ; and W(destination), W(left), W(right));
+                    }
+                    MachineOpcode::IntegerOr => {
+                        dynasm!(ops ; .arch aarch64 ; orr W(destination), W(left), W(right));
+                    }
+                    MachineOpcode::IntegerXor => {
+                        dynasm!(ops ; .arch aarch64 ; eor W(destination), W(left), W(right));
+                    }
+                    // AArch64 variable 32-bit shifts use only the low five count bits,
+                    // exactly matching JavaScript's shift-count normalization.
+                    MachineOpcode::IntegerShiftLeft => {
+                        dynasm!(ops ; .arch aarch64 ; lsl W(destination), W(left), W(right));
+                    }
+                    MachineOpcode::IntegerShiftRight => {
+                        dynasm!(ops ; .arch aarch64 ; asr W(destination), W(left), W(right));
+                    }
+                    _ => unreachable!("matched binary integer operation"),
+                }
+            }
+            MachineOpcode::IntegerNot => {
+                let source = integer_register(locations[0])?;
+                let destination = integer_register(locations[1])?;
+                dynasm!(ops ; .arch aarch64 ; mvn W(destination), W(source));
+            }
             MachineOpcode::IntegerAndImmediate(immediate) => {
                 let source = integer_register(locations[0])?;
                 let destination = integer_register(locations[1])?;

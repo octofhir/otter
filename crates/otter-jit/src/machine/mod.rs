@@ -298,6 +298,18 @@ pub enum MachineOpcode {
     IntegerAddImmediate(i32),
     /// Integer subtraction with a baked right operand and overflow exit.
     IntegerSubImmediate(i32),
+    /// Integer bitwise AND.
+    IntegerAnd,
+    /// Integer bitwise OR.
+    IntegerOr,
+    /// Integer bitwise XOR.
+    IntegerXor,
+    /// Integer left shift with JavaScript's masked count.
+    IntegerShiftLeft,
+    /// Signed integer right shift with JavaScript's masked count.
+    IntegerShiftRight,
+    /// Integer bitwise complement.
+    IntegerNot,
     /// Integer bitwise AND with a baked right operand.
     IntegerAndImmediate(i32),
     /// Signed integer less-than with a baked right operand.

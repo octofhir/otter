@@ -280,6 +280,35 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         MachineOperand::register_output(result),
                     ],
                 ),
+                NumericNode::IntegerAnd(left, right)
+                | NumericNode::IntegerOr(left, right)
+                | NumericNode::IntegerXor(left, right)
+                | NumericNode::IntegerShiftLeft(left, right)
+                | NumericNode::IntegerShiftRight(left, right) => {
+                    let opcode = match node {
+                        NumericNode::IntegerAnd(..) => MachineOpcode::IntegerAnd,
+                        NumericNode::IntegerOr(..) => MachineOpcode::IntegerOr,
+                        NumericNode::IntegerXor(..) => MachineOpcode::IntegerXor,
+                        NumericNode::IntegerShiftLeft(..) => MachineOpcode::IntegerShiftLeft,
+                        NumericNode::IntegerShiftRight(..) => MachineOpcode::IntegerShiftRight,
+                        _ => unreachable!("matched binary int32 node"),
+                    };
+                    MachineInstruction::plain(
+                        opcode,
+                        vec![
+                            MachineOperand::register_input(machine_value(&values, left)),
+                            MachineOperand::register_input(machine_value(&values, right)),
+                            MachineOperand::register_output(result),
+                        ],
+                    )
+                }
+                NumericNode::IntegerNot(source) => MachineInstruction::plain(
+                    MachineOpcode::IntegerNot,
+                    vec![
+                        MachineOperand::register_input(machine_value(&values, source)),
+                        MachineOperand::register_output(result),
+                    ],
+                ),
                 NumericNode::IntegerAddImmediate(source, immediate)
                 | NumericNode::IntegerSubImmediate(source, immediate)
                 | NumericNode::IntegerAndImmediate(source, immediate)
@@ -909,6 +938,106 @@ mod tests {
         view
     }
 
+    fn bitwise_loop_view() -> JitCompileSnapshot {
+        let mut view = numeric_view(
+            0,
+            13,
+            vec![
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(0), Operand::Imm32(0x1234_5678)],
+                ),
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(2), Operand::Imm32(-1)],
+                ),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(3), Operand::Imm32(i32::MAX)],
+                ),
+                (
+                    Op::LessThanImm,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(1),
+                        Operand::Imm32(35),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(10), Operand::Register(4)],
+                ),
+                (
+                    Op::Shl,
+                    vec![
+                        Operand::Register(5),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::Shr,
+                    vec![
+                        Operand::Register(7),
+                        Operand::Register(0),
+                        Operand::Register(2),
+                    ],
+                ),
+                (
+                    Op::BitwiseXor,
+                    vec![
+                        Operand::Register(8),
+                        Operand::Register(5),
+                        Operand::Register(7),
+                    ],
+                ),
+                (
+                    Op::BitwiseOr,
+                    vec![
+                        Operand::Register(9),
+                        Operand::Register(8),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::BitwiseAnd,
+                    vec![
+                        Operand::Register(10),
+                        Operand::Register(9),
+                        Operand::Register(3),
+                    ],
+                ),
+                (
+                    Op::BitwiseNot,
+                    vec![Operand::Register(11), Operand::Register(10)],
+                ),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(11), Operand::Imm32(0)],
+                ),
+                (
+                    Op::AddImm,
+                    vec![
+                        Operand::Register(12),
+                        Operand::Register(1),
+                        Operand::Imm32(1),
+                    ],
+                ),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(12), Operand::Imm32(1)],
+                ),
+                (Op::Jump, vec![Operand::Imm32(-12)]),
+                (Op::ReturnValue, vec![Operand::Register(0)]),
+            ],
+        );
+        for pc in [4_u32, 13] {
+            view.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(ARITH_INT32));
+        }
+        view
+    }
+
     fn checked_sub_view(left: i32, right: i32) -> JitCompileSnapshot {
         let mut view = numeric_view(
             0,
@@ -1520,6 +1649,84 @@ mod tests {
         let (result, _, _) = execute(&output.code, &[], 0);
         assert_eq!(result.status, STATUS_RETURNED);
         assert_eq!(result.value, tag::box_int32(15));
+    }
+
+    #[test]
+    fn executes_register_bitwise_loop_through_machine_ir_backend() {
+        let view = bitwise_loop_view();
+        let hir = NumericFunction::build(&view).expect("bitwise-loop numeric HIR");
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::IntegerAnd(..)))
+        );
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::IntegerOr(..)))
+        );
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::IntegerXor(..)))
+        );
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::IntegerShiftLeft(..)))
+        );
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::IntegerShiftRight(..)))
+        );
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::IntegerNot(..)))
+        );
+
+        let sequence = select(&hir).expect("bitwise-loop Machine IR");
+        sequence
+            .allocate(&TargetRegisterFile::aarch64_numeric_function())
+            .expect("bitwise-loop Machine IR allocation");
+
+        let output = crate::optimizing::compile_optimized_with_artifacts(
+            &view,
+            7005,
+            &TransitionTable::resolve(),
+            Some(ArtifactRequest {
+                identity: JitArtifactIdentity {
+                    function_name: "bitwiseKernel".to_string(),
+                    module: "benchmarks/scripts/bitwise-mix.js".to_string(),
+                },
+                tier: JitDebugTier::Optimizing,
+                entry: JitDebugTarget::Entry,
+            }),
+            false,
+        )
+        .expect("production optimizing selector compiles bitwise loop");
+        let optimized_ir = std::str::from_utf8(
+            output
+                .artifact
+                .as_ref()
+                .expect("bitwise-loop artifact")
+                .file(JitArtifactFileName::OptimizedIr)
+                .expect("bitwise-loop optimized IR")
+                .contents(),
+        )
+        .expect("UTF-8 optimized IR");
+        assert!(optimized_ir.starts_with("; backend=otter-machine-ir numeric-function\n"));
+
+        let (result, _, _) = execute(&output.code, &[], 0);
+        let mut expected = 0x1234_5678_i32;
+        for index in 0_i32..35 {
+            let left = expected.wrapping_shl(index as u32 & 31);
+            let right = expected >> 31;
+            expected = !(((left ^ right) | index) & i32::MAX);
+        }
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, tag::box_int32(expected));
     }
 
     #[test]

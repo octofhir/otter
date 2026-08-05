@@ -46,6 +46,12 @@ pub(super) enum NumericNode {
     IntegerSub(NumericValue, NumericValue),
     IntegerAddImmediate(NumericValue, i32),
     IntegerSubImmediate(NumericValue, i32),
+    IntegerAnd(NumericValue, NumericValue),
+    IntegerOr(NumericValue, NumericValue),
+    IntegerXor(NumericValue, NumericValue),
+    IntegerShiftLeft(NumericValue, NumericValue),
+    IntegerShiftRight(NumericValue, NumericValue),
+    IntegerNot(NumericValue),
     IntegerAndImmediate(NumericValue, i32),
     IntegerLessThanImmediate(NumericValue, i32),
     IntegerEqualImmediate(NumericValue, i32),
@@ -66,6 +72,12 @@ impl NumericNode {
             | Self::IntegerSub(..)
             | Self::IntegerAddImmediate(..)
             | Self::IntegerSubImmediate(..)
+            | Self::IntegerAnd(..)
+            | Self::IntegerOr(..)
+            | Self::IntegerXor(..)
+            | Self::IntegerShiftLeft(..)
+            | Self::IntegerShiftRight(..)
+            | Self::IntegerNot(..)
             | Self::IntegerAndImmediate(..)
             | Self::BlockParameter(NumericType::Int32) => NumericType::Int32,
             Self::LessThan(..)
@@ -505,11 +517,20 @@ fn instruction_accesses(
         Op::LoadUndefined | Op::LoadInt32 | Op::LoadNumber => {
             Some((Vec::new(), vec![register(instruction, code, 0)?]))
         }
-        Op::ToPrimitive | Op::ToNumeric | Op::Neg | Op::Increment => Some((
+        Op::ToPrimitive | Op::ToNumeric | Op::Neg | Op::Increment | Op::BitwiseNot => Some((
             vec![register(instruction, code, 1)?],
             vec![register(instruction, code, 0)?],
         )),
-        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::LessThan => Some((
+        Op::Add
+        | Op::Sub
+        | Op::Mul
+        | Op::Div
+        | Op::BitwiseAnd
+        | Op::BitwiseOr
+        | Op::BitwiseXor
+        | Op::Shl
+        | Op::Shr
+        | Op::LessThan => Some((
             vec![
                 register(instruction, code, 1)?,
                 register(instruction, code, 2)?,
@@ -724,6 +745,24 @@ fn lower_instruction(
                 Op::NotEqualImm => NumericNode::IntegerNotEqualImmediate(source, immediate),
                 _ => unreachable!("matched immediate int32 comparison"),
             }
+        }
+        Op::BitwiseAnd | Op::BitwiseOr | Op::BitwiseXor | Op::Shl | Op::Shr => {
+            let left = read_int32(registers, nodes, register(instruction, code, 1)?)?;
+            let right = read_int32(registers, nodes, register(instruction, code, 2)?)?;
+            *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
+            match op {
+                Op::BitwiseAnd => NumericNode::IntegerAnd(left, right),
+                Op::BitwiseOr => NumericNode::IntegerOr(left, right),
+                Op::BitwiseXor => NumericNode::IntegerXor(left, right),
+                Op::Shl => NumericNode::IntegerShiftLeft(left, right),
+                Op::Shr => NumericNode::IntegerShiftRight(left, right),
+                _ => unreachable!("matched binary int32 operation"),
+            }
+        }
+        Op::BitwiseNot => {
+            let source = read_int32(registers, nodes, register(instruction, code, 1)?)?;
+            *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
+            NumericNode::IntegerNot(source)
         }
         Op::Neg => {
             if !instruction.arith_feedback().is_numeric_only() {

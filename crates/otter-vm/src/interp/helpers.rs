@@ -596,7 +596,11 @@ pub(crate) fn step_iterator(
         | IteratorState::Filter { .. }
         | IteratorState::Take { .. }
         | IteratorState::Drop { .. }
-        | IteratorState::FlatMap { .. } => FastIteratorSnapshot::Slow,
+        | IteratorState::FlatMap { .. }
+        | IteratorState::Chunks { .. }
+        | IteratorState::Windows { .. }
+        | IteratorState::Concat { .. }
+        | IteratorState::Zip { .. } => FastIteratorSnapshot::Slow,
     });
 
     let outcome = match snapshot {

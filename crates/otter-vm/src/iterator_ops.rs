@@ -16,7 +16,12 @@
 //! - Iterator helper callbacks never hold a GC payload borrow across VM
 //!   dispatch; state is snapshotted first.
 //! - Iterator records are reloaded from traced anchors after every property
-//!   lookup or callback that may move the young generation.
+//!   lookup or callback that may move the young generation. The `chunks` /
+//!   `windows` element buffer follows the same rule: it is read back from the
+//!   state slot at every use and never carried across a step.
+//! - A freshly allocated child stored into an existing iterator state (the
+//!   `flatMap` inner iterator, the `chunks` replacement buffer) is followed by
+//!   an explicit write barrier — the parent state may already be tenured.
 //! - IteratorClose holds its iterator and discovered `return` method in
 //!   canonical handles, reloading the receiver after accessor/call re-entry.
 //!
@@ -53,6 +58,19 @@ fn string_iterator_values(s: JsString, heap: &mut otter_gc::GcHeap) -> Result<Ve
         index += advance;
     }
     Ok(out)
+}
+
+/// Which of a `Zip` helper's traced lists an append targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ZipList {
+    /// Per-input iterator records.
+    Inputs,
+    /// `"longest"` padding values.
+    Padding,
+    /// `zipKeyed` result keys.
+    Keys,
+    /// Scratch values for the round being assembled.
+    Results,
 }
 
 /// Cloned snapshot of an [`IteratorState`] taken before driving a
@@ -95,6 +113,30 @@ enum IteratorStateSnapshot {
         running: bool,
         inner: Option<IteratorHandle>,
         counter: u64,
+    },
+    // The retained element buffer is deliberately absent: it is a
+    // nursery array that any user callback can move, so it is re-read
+    // from the (traced) state slot at every use instead of snapshotted.
+    Chunks {
+        source: IteratorHandle,
+        chunk_size: u32,
+        running: bool,
+    },
+    Windows {
+        source: IteratorHandle,
+        window_size: u32,
+        allow_partial: bool,
+        running: bool,
+    },
+    Concat {
+        inner: Option<IteratorHandle>,
+        index: usize,
+        running: bool,
+    },
+    Zip {
+        mode: crate::iterator_state::ZipMode,
+        keyed: bool,
+        running: bool,
     },
 }
 
@@ -555,6 +597,48 @@ impl Interpreter {
                     running: *running,
                     inner: *inner,
                     counter: *counter,
+                }),
+                IteratorState::Chunks {
+                    source,
+                    chunk_size,
+                    running,
+                    ..
+                } => Some(IteratorStateSnapshot::Chunks {
+                    source: *source,
+                    chunk_size: *chunk_size,
+                    running: *running,
+                }),
+                IteratorState::Windows {
+                    source,
+                    window_size,
+                    allow_partial,
+                    running,
+                    ..
+                } => Some(IteratorStateSnapshot::Windows {
+                    source: *source,
+                    window_size: *window_size,
+                    allow_partial: *allow_partial,
+                    running: *running,
+                }),
+                IteratorState::Concat {
+                    inner,
+                    index,
+                    running,
+                    ..
+                } => Some(IteratorStateSnapshot::Concat {
+                    inner: *inner,
+                    index: *index,
+                    running: *running,
+                }),
+                IteratorState::Zip {
+                    mode,
+                    keyed,
+                    running,
+                    ..
+                } => Some(IteratorStateSnapshot::Zip {
+                    mode: *mode,
+                    keyed: *keyed,
+                    running: *running,
                 }),
                 _ => None,
             });
@@ -1126,9 +1210,795 @@ impl Interpreter {
                         *slot = Some(new_inner);
                     }
                 });
+                // A freshly allocated inner iterator is young; the helper
+                // holding it may already be old.
+                self.gc_heap.write_barrier(*iter, new_inner);
                 inner = Some(new_inner);
             },
+            IteratorStateSnapshot::Chunks {
+                source,
+                chunk_size,
+                running,
+            } => {
+                // §27.5.3.2 GeneratorValidate step 6 — see Take above.
+                if running {
+                    return Err(
+                        self.err_type(("Iterator helper is already running".to_string()).into())
+                    );
+                }
+                self.gc_heap.with_payload(*iter, |state| {
+                    if let IteratorState::Chunks { running, .. } = state {
+                        *running = true;
+                    }
+                });
+                // Pull until the buffer holds a full chunk, or the
+                // source runs dry.
+                let step = (|| {
+                    loop {
+                        let (v, done) = self.iterator_next_full(context, stack, &source)?;
+                        if done {
+                            return Ok(false);
+                        }
+                        self.append_to_iterator_buffer(*iter, source, v)?;
+                        let Some(buffer) = self.iterator_helper_buffer(*iter) else {
+                            // Re-entrant close folded the helper away.
+                            return Ok(false);
+                        };
+                        if array::len(buffer, &self.gc_heap) as u64 >= u64::from(chunk_size) {
+                            return Ok(true);
+                        }
+                    }
+                })();
+                self.gc_heap.with_payload(*iter, |state| {
+                    if let IteratorState::Chunks { running, .. } = state {
+                        *running = false;
+                    }
+                });
+                let full = match step {
+                    Ok(full) => full,
+                    Err(err) => {
+                        // Abrupt completion completes the helper
+                        // generator (§27.5.3.3 GeneratorResume).
+                        self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                        return Err(err);
+                    }
+                };
+                let buffer = self.iterator_helper_buffer(*iter);
+                if !full {
+                    // Source exhausted: a non-empty buffer is emitted as
+                    // the trailing partial chunk, and the helper reports
+                    // `done` on the following step.
+                    let pending = buffer.filter(|b| array::len(*b, &self.gc_heap) > 0);
+                    self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                    return Ok(match pending {
+                        Some(chunk) => (Value::array(chunk), false),
+                        None => (Value::undefined(), true),
+                    });
+                }
+                let Some(buffer) = buffer else {
+                    self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                    return Ok((Value::undefined(), true));
+                };
+                // Hand the buffer out as-is and start collecting into a
+                // fresh array, so every yielded chunk is distinct.
+                let yielded = Value::array(buffer);
+                let fresh = self.alloc_runtime_rooted_array_from_values(
+                    std::iter::empty(),
+                    &[&yielded],
+                    &[],
+                )?;
+                self.gc_heap.with_payload(*iter, |state| {
+                    if let IteratorState::Chunks { buffer: slot, .. } = state {
+                        *slot = fresh;
+                    }
+                });
+                // The helper state may already have been promoted, so the
+                // fresh nursery buffer is an old→young edge the scavenger
+                // has to know about.
+                self.gc_heap.write_barrier(*iter, fresh);
+                Ok((yielded, false))
+            }
+            IteratorStateSnapshot::Windows {
+                source,
+                window_size,
+                allow_partial,
+                running,
+            } => {
+                // §27.5.3.2 GeneratorValidate step 6 — see Take above.
+                if running {
+                    return Err(
+                        self.err_type(("Iterator helper is already running".to_string()).into())
+                    );
+                }
+                self.gc_heap.with_payload(*iter, |state| {
+                    if let IteratorState::Windows { running, .. } = state {
+                        *running = true;
+                    }
+                });
+                let step = (|| {
+                    loop {
+                        let (v, done) = self.iterator_next_full(context, stack, &source)?;
+                        if done {
+                            return Ok(false);
+                        }
+                        let Some(buffer) = self.iterator_helper_buffer(*iter) else {
+                            return Ok(false);
+                        };
+                        // The window slides: once full, the oldest
+                        // element leaves before the new one is appended.
+                        if array::len(buffer, &self.gc_heap) as u64 >= u64::from(window_size) {
+                            let _evicted = array::dense_shift(buffer, &mut self.gc_heap);
+                        }
+                        self.append_to_iterator_buffer(*iter, source, v)?;
+                        let Some(buffer) = self.iterator_helper_buffer(*iter) else {
+                            return Ok(false);
+                        };
+                        if array::len(buffer, &self.gc_heap) as u64 >= u64::from(window_size) {
+                            return Ok(true);
+                        }
+                    }
+                })();
+                self.gc_heap.with_payload(*iter, |state| {
+                    if let IteratorState::Windows { running, .. } = state {
+                        *running = false;
+                    }
+                });
+                let full = match step {
+                    Ok(full) => full,
+                    Err(err) => {
+                        self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                        return Err(err);
+                    }
+                };
+                let buffer = self.iterator_helper_buffer(*iter);
+                if !full {
+                    // The window never filled. `"allow-partial"` emits
+                    // what was collected; `"only-full"` emits nothing.
+                    // `!full` already implies the buffer is shorter than
+                    // `window_size`, so only emptiness is left to check.
+                    let short =
+                        buffer.filter(|b| allow_partial && array::len(*b, &self.gc_heap) > 0);
+                    let partial = match short {
+                        Some(buffer) => Some(self.copy_iterator_buffer(buffer)?),
+                        None => None,
+                    };
+                    self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                    return Ok(match partial {
+                        Some(window) => (window, false),
+                        None => (Value::undefined(), true),
+                    });
+                }
+                let Some(buffer) = buffer else {
+                    self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                    return Ok((Value::undefined(), true));
+                };
+                // The retained buffer keeps sliding, so each window is
+                // handed out as a copy.
+                let window = self.copy_iterator_buffer(buffer)?;
+                Ok((window, false))
+            }
+            IteratorStateSnapshot::Concat {
+                mut inner,
+                mut index,
+                running,
+            } => {
+                // §27.5.3.2 GeneratorValidate step 6 — see Take above.
+                if running {
+                    return Err(
+                        self.err_type(("Iterator helper is already running".to_string()).into())
+                    );
+                }
+                self.gc_heap.with_payload(*iter, |state| {
+                    if let IteratorState::Concat { running, .. } = state {
+                        *running = true;
+                    }
+                });
+                let step = (|| {
+                    loop {
+                        if let Some(open) = inner {
+                            let (v, done) = self.iterator_next_full(context, stack, &open)?;
+                            if !done {
+                                return Ok(Some(v));
+                            }
+                            self.gc_heap.with_payload(*iter, |state| {
+                                if let IteratorState::Concat { inner: slot, .. } = state {
+                                    *slot = None;
+                                }
+                            });
+                            inner = None;
+                        }
+                        // Open the next captured `(iterable, method)`
+                        // pair. The sources array is re-read every time:
+                        // driving the previous inner iterator can have
+                        // moved it.
+                        let Some(sources) = self.iterator_concat_sources(*iter) else {
+                            return Ok(None);
+                        };
+                        let slot = index.saturating_mul(2);
+                        if slot >= array::len(sources, &self.gc_heap) {
+                            return Ok(None);
+                        }
+                        let iterable = array::get(sources, &self.gc_heap, slot);
+                        let method = array::get(sources, &self.gc_heap, slot + 1);
+                        index += 1;
+                        self.gc_heap.with_payload(*iter, |state| {
+                            if let IteratorState::Concat { index: slot, .. } = state {
+                                *slot = index;
+                            }
+                        });
+                        let opened = self.run_callable_sync_rooted(
+                            stack,
+                            context,
+                            &method,
+                            iterable,
+                            SmallVec::new(),
+                        )?;
+                        // Built-in iterators are their own value family,
+                        // so "is an Object" is the primitive test, not
+                        // `as_object`.
+                        if crate::abstract_ops::is_primitive(&opened) {
+                            return Err(self.err_type(
+                                ("Iterator.concat: iterator method did not return an object"
+                                    .to_string())
+                                .into(),
+                            ));
+                        }
+                        // §7.4.4 GetIteratorDirect — `next` is cached
+                        // once per opened iterator.
+                        let key = VmPropertyKey::String("next");
+                        let next_method = match self
+                            .ordinary_get_value(stack, context, opened, opened, &key, 0)?
+                        {
+                            VmGetOutcome::Value(v) => v,
+                            VmGetOutcome::InvokeGetter { getter } => self
+                                .run_callable_sync_rooted(
+                                    stack,
+                                    context,
+                                    &getter,
+                                    opened,
+                                    SmallVec::new(),
+                                )?,
+                        };
+                        let iter_root = Value::iterator(*iter);
+                        let new_inner = self.alloc_runtime_rooted_iterator_state(
+                            IteratorState::User {
+                                iterator: opened,
+                                next_method: Some(next_method),
+                            },
+                            &[&iter_root, &opened, &next_method],
+                            &[],
+                        )?;
+                        self.gc_heap.with_payload(*iter, |state| {
+                            if let IteratorState::Concat { inner: slot, .. } = state {
+                                *slot = Some(new_inner);
+                            }
+                        });
+                        // Freshly allocated child into a possibly
+                        // tenured parent.
+                        self.gc_heap.write_barrier(*iter, new_inner);
+                        inner = Some(new_inner);
+                    }
+                })();
+                self.gc_heap.with_payload(*iter, |state| {
+                    if let IteratorState::Concat { running, .. } = state {
+                        *running = false;
+                    }
+                });
+                match step {
+                    Ok(Some(v)) => Ok((v, false)),
+                    Ok(None) => {
+                        self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                        Ok((Value::undefined(), true))
+                    }
+                    Err(err) => {
+                        // Abrupt completion completes the helper
+                        // generator (§27.5.3.3 GeneratorResume).
+                        self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                        Err(err)
+                    }
+                }
+            }
+            IteratorStateSnapshot::Zip {
+                mode,
+                keyed,
+                running,
+            } => {
+                // §27.5.3.2 GeneratorValidate step 6 — see Take above.
+                if running {
+                    return Err(
+                        self.err_type(("Iterator helper is already running".to_string()).into())
+                    );
+                }
+                self.gc_heap.with_payload(*iter, |state| {
+                    if let IteratorState::Zip {
+                        running, started, ..
+                    } = state
+                    {
+                        *running = true;
+                        *started = true;
+                    }
+                });
+                let step = self.iterator_zip_step(stack, context, *iter, mode);
+                self.gc_heap.with_payload(*iter, |state| {
+                    if let IteratorState::Zip { running, .. } = state {
+                        *running = false;
+                    }
+                });
+                match step {
+                    Ok(Some(())) => {}
+                    Ok(None) => {
+                        self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                        return Ok((Value::undefined(), true));
+                    }
+                    Err(err) => {
+                        self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                        return Err(err);
+                    }
+                };
+                let finished = self.iterator_zip_finish(*iter, keyed)?;
+                Ok((finished, false))
+            }
         }
+    }
+
+    /// Captured `(iterable, method)` pairs of an `Iterator.concat`
+    /// sequence. Re-read from the traced state slot at every use for the
+    /// same reason as [`Self::iterator_helper_buffer`].
+    fn iterator_concat_sources(&self, iter: IteratorHandle) -> Option<array::JsArray> {
+        self.gc_heap.read_payload(iter, |state| match state {
+            IteratorState::Concat { sources, .. } => Some(*sources),
+            _ => None,
+        })
+    }
+
+    /// The `iters` / `padding` / `keys` arrays of a `Zip` helper,
+    /// re-read from the traced state slots.
+    fn iterator_zip_arrays(
+        &self,
+        iter: IteratorHandle,
+    ) -> Option<(array::JsArray, array::JsArray, array::JsArray)> {
+        self.gc_heap.read_payload(iter, |state| match state {
+            IteratorState::Zip {
+                iters,
+                padding,
+                keys,
+                ..
+            } => Some((*iters, *padding, *keys)),
+            _ => None,
+        })
+    }
+
+    /// The `results` scratch array of a `Zip` helper.
+    fn iterator_zip_results(&self, iter: IteratorHandle) -> Option<array::JsArray> {
+        self.gc_heap.read_payload(iter, |state| match state {
+            IteratorState::Zip { results, .. } => Some(*results),
+            _ => None,
+        })
+    }
+
+    /// Which list a `Zip` helper is being filled into while it is built.
+    pub(crate) fn zip_append(
+        &mut self,
+        iter: IteratorHandle,
+        list: ZipList,
+        value: Value,
+    ) -> Result<(), VmError> {
+        let Some(target) = self.zip_list(iter, list) else {
+            return Ok(());
+        };
+        let target_root = Value::array(target);
+        let iter_root = Value::iterator(iter);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            target_root.trace_value_slots(visitor);
+            iter_root.trace_value_slots(visitor);
+            value.trace_value_slots(visitor);
+        };
+        array::push_with_roots(target, &mut self.gc_heap, value, &mut external_visit)
+            .map_err(VmError::from)?;
+        Ok(())
+    }
+
+    /// Re-point a freshly allocated `Zip` helper at its lists.
+    ///
+    /// The state body is filled in *after* the allocation that creates
+    /// it, so a collection driven by that allocation updates only the
+    /// caller's rooted `Value` locals — the handles copied into the body
+    /// beforehand can be stale. Rewriting them here from the rooted
+    /// values is the fixup, and each store needs a barrier because the
+    /// helper may already have been tenured.
+    pub(crate) fn zip_relink_lists(&mut self, iter: IteratorHandle, lists: [Value; 4]) {
+        let arrays: [array::JsArray; 4] = match [
+            lists[0].as_array(),
+            lists[1].as_array(),
+            lists[2].as_array(),
+            lists[3].as_array(),
+        ] {
+            [Some(iters), Some(padding), Some(keys), Some(results)] => {
+                [iters, padding, keys, results]
+            }
+            _ => return,
+        };
+        self.gc_heap.with_payload(iter, |state| {
+            if let IteratorState::Zip {
+                iters,
+                padding,
+                keys,
+                results,
+                ..
+            } = state
+            {
+                *iters = arrays[0];
+                *padding = arrays[1];
+                *keys = arrays[2];
+                *results = arrays[3];
+            }
+        });
+        for array in arrays {
+            self.gc_heap.write_barrier(iter, array);
+        }
+    }
+
+    /// Snapshot the still-open inputs of a `Zip` helper.
+    ///
+    /// Taken before anything that can fold the helper to `Exhausted`
+    /// (a close from suspended-start does exactly that). Iterator
+    /// records live in old space, so the snapshot cannot go stale.
+    pub(crate) fn zip_open_inputs(&self, iter: IteratorHandle) -> Vec<Value> {
+        (0..self.zip_list_len(iter, ZipList::Inputs))
+            .map(|index| self.zip_list_entry(iter, ZipList::Inputs, index))
+            .collect()
+    }
+
+    /// Length of one of a `Zip` helper's traced lists.
+    pub(crate) fn zip_list_len(&self, iter: IteratorHandle, list: ZipList) -> usize {
+        self.zip_list(iter, list)
+            .map_or(0, |array| array::len(array, &self.gc_heap))
+    }
+
+    /// One entry of a `Zip` helper's traced list.
+    pub(crate) fn zip_list_entry(
+        &self,
+        iter: IteratorHandle,
+        list: ZipList,
+        index: usize,
+    ) -> Value {
+        self.zip_list(iter, list)
+            .map_or(Value::undefined(), |array| {
+                array::get(array, &self.gc_heap, index)
+            })
+    }
+
+    fn zip_list(&self, iter: IteratorHandle, list: ZipList) -> Option<array::JsArray> {
+        self.gc_heap.read_payload(iter, |state| match state {
+            IteratorState::Zip {
+                iters,
+                padding,
+                keys,
+                results,
+                ..
+            } => Some(match list {
+                ZipList::Inputs => *iters,
+                ZipList::Padding => *padding,
+                ZipList::Keys => *keys,
+                ZipList::Results => *results,
+            }),
+            _ => None,
+        })
+    }
+
+    /// Close every input a partially built `Zip` helper has collected.
+    pub(crate) fn zip_close_inputs(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        iter: IteratorHandle,
+    ) {
+        let open = self.zip_open_inputs(iter);
+        let saved = self.take_pending_uncaught_throw();
+        let _ = self.iterator_zip_close_all(stack, context, open, false);
+        let _ = self.take_pending_uncaught_throw();
+        if let Some(value) = saved {
+            self.set_pending_uncaught_throw(value);
+        }
+    }
+
+    /// IteratorCloseAll — close every still-open input in reverse list
+    /// order.
+    ///
+    /// §7.4.10 IteratorClose step 5: once the running completion is a
+    /// throw it wins over anything a later `return` raises. `throwing`
+    /// says the caller already holds such a completion, in which case
+    /// every `return` still runs but none of them can win. A losing
+    /// throw is also lifted off the interpreter, or its value would
+    /// overwrite the winner's on the way out.
+    fn iterator_zip_close_all(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        open: Vec<Value>,
+        throwing: bool,
+    ) -> Result<(), VmError> {
+        let incoming = if throwing {
+            self.take_pending_uncaught_throw()
+        } else {
+            None
+        };
+        let mut outcome = Ok(());
+        let mut thrown: Option<Value> = None;
+        for entry in open.into_iter().rev() {
+            if entry.is_null() || entry.is_undefined() {
+                continue;
+            }
+            let closed = self.iterator_close_value_sync(stack, context, entry);
+            if !throwing && outcome.is_ok() {
+                if closed.is_err() {
+                    thrown = self.take_pending_uncaught_throw();
+                }
+                outcome = closed;
+            } else {
+                let _ = self.take_pending_uncaught_throw();
+            }
+        }
+        if let Some(value) = incoming.or(thrown) {
+            self.set_pending_uncaught_throw(value);
+        }
+        outcome
+    }
+
+    /// One `IteratorZip` round: step every still-open input once and
+    /// collect the per-input results. `Ok(None)` means the join is over.
+    fn iterator_zip_step(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        iter: IteratorHandle,
+        mode: crate::iterator_state::ZipMode,
+    ) -> Result<Option<()>, VmError> {
+        use crate::iterator_state::ZipMode;
+        let Some((iters, _, _)) = self.iterator_zip_arrays(iter) else {
+            return Ok(None);
+        };
+        let count = array::len(iters, &self.gc_heap);
+        if count == 0 {
+            return Ok(None);
+        }
+        // The round's values are staged in the state's traced scratch
+        // array; a Rust-side `Vec` would go stale across the `next`
+        // calls that fill it.
+        if let Some(results) = self.iterator_zip_results(iter) {
+            array::set_length(results, &mut self.gc_heap, 0).map_err(VmError::from)?;
+        }
+        for index in 0..count {
+            let Some((iters, padding, _)) = self.iterator_zip_arrays(iter) else {
+                return Ok(None);
+            };
+            let entry = array::get(iters, &self.gc_heap, index);
+            if entry.is_null() {
+                // Already exhausted; only `"longest"` gets this far.
+                let pad = array::get(padding, &self.gc_heap, index);
+                self.zip_append(iter, ZipList::Results, pad)?;
+                continue;
+            }
+            let Some(handle) = entry.as_iterator() else {
+                return Ok(None);
+            };
+            let stepped = self.iterator_next_full(context, stack, &handle);
+            let Some((_, padding, _)) = self.iterator_zip_arrays(iter) else {
+                return Ok(None);
+            };
+            let (value, done) = match stepped {
+                Ok(step) => step,
+                Err(err) => {
+                    self.zip_forget_input(iter, index);
+                    let _ = self.iterator_zip_close_all(
+                        stack,
+                        context,
+                        self.zip_open_inputs(iter),
+                        true,
+                    );
+                    return Err(err);
+                }
+            };
+            if !done {
+                self.zip_append(iter, ZipList::Results, value)?;
+                continue;
+            }
+            // This input is finished: drop it from the open set first so
+            // the close-all below never re-enters it.
+            self.zip_forget_input(iter, index);
+            match mode {
+                ZipMode::Shortest => {
+                    self.iterator_zip_close_all(stack, context, self.zip_open_inputs(iter), false)?;
+                    return Ok(None);
+                }
+                ZipMode::Strict => {
+                    if index != 0 {
+                        // The completion is the strict-mode TypeError, so
+                        // the closes below cannot override it.
+                        let error = self.err_type(
+                            ("Iterator.zip: inputs of unequal length in strict mode".to_string())
+                                .into(),
+                        );
+                        let _ = self.iterator_zip_close_all(
+                            stack,
+                            context,
+                            self.zip_open_inputs(iter),
+                            true,
+                        );
+                        return Err(error);
+                    }
+                    // The first input finished, so every other one must
+                    // finish on this same step.
+                    for other in 1..count {
+                        let Some((iters, _, _)) = self.iterator_zip_arrays(iter) else {
+                            return Ok(None);
+                        };
+                        let entry = array::get(iters, &self.gc_heap, other);
+                        let Some(handle) = entry.as_iterator() else {
+                            continue;
+                        };
+                        let stepped = self.iterator_next_full(context, stack, &handle);
+                        if self.iterator_zip_arrays(iter).is_none() {
+                            return Ok(None);
+                        }
+                        match stepped {
+                            Ok((_, true)) => self.zip_forget_input(iter, other),
+                            Ok((_, false)) => {
+                                let error = self.err_type(
+                                    ("Iterator.zip: inputs of unequal length in strict mode"
+                                        .to_string())
+                                    .into(),
+                                );
+                                let _ = self.iterator_zip_close_all(
+                                    stack,
+                                    context,
+                                    self.zip_open_inputs(iter),
+                                    true,
+                                );
+                                return Err(error);
+                            }
+                            Err(err) => {
+                                self.zip_forget_input(iter, other);
+                                let _ = self.iterator_zip_close_all(
+                                    stack,
+                                    context,
+                                    self.zip_open_inputs(iter),
+                                    true,
+                                );
+                                return Err(err);
+                            }
+                        }
+                    }
+                    return Ok(None);
+                }
+                ZipMode::Longest => {
+                    if self.zip_all_inputs_done(iter) {
+                        return Ok(None);
+                    }
+                    let pad = array::get(padding, &self.gc_heap, index);
+                    self.zip_append(iter, ZipList::Results, pad)?;
+                }
+            }
+        }
+        Ok(Some(()))
+    }
+
+    /// Replace a finished input with `null` so it leaves the open set.
+    /// Storing `null` writes no pointer, so no barrier is needed.
+    fn zip_forget_input(&mut self, iter: IteratorHandle, index: usize) {
+        let Some((iters, _, _)) = self.iterator_zip_arrays(iter) else {
+            return;
+        };
+        let _stored = array::set(iters, &mut self.gc_heap, index, Value::null());
+    }
+
+    /// Whether every `Zip` input has reported done.
+    fn zip_all_inputs_done(&self, iter: IteratorHandle) -> bool {
+        let Some((iters, _, _)) = self.iterator_zip_arrays(iter) else {
+            return true;
+        };
+        (0..array::len(iters, &self.gc_heap))
+            .all(|index| array::get(iters, &self.gc_heap, index).is_null())
+    }
+
+    /// `finishResults` — an Array for `Iterator.zip`, an object keyed by
+    /// the captured property keys for `Iterator.zipKeyed`.
+    fn iterator_zip_finish(&mut self, iter: IteratorHandle, keyed: bool) -> Result<Value, VmError> {
+        let Some(scratch) = self.iterator_zip_results(iter) else {
+            return Ok(Value::undefined());
+        };
+        let results: Vec<Value> = (0..array::len(scratch, &self.gc_heap))
+            .map(|index| array::get(scratch, &self.gc_heap, index))
+            .collect();
+        let results = results.as_slice();
+        if !keyed {
+            let array = self.alloc_runtime_rooted_array_from_values(
+                results.iter().copied(),
+                &[],
+                &[results],
+            )?;
+            return Ok(Value::array(array));
+        }
+        let Some((_, _, keys)) = self.iterator_zip_arrays(iter) else {
+            return Ok(Value::undefined());
+        };
+        let keys: Vec<Value> = (0..array::len(keys, &self.gc_heap))
+            .map(|index| array::get(keys, &self.gc_heap, index))
+            .collect();
+        let object = self.alloc_runtime_rooted_object_with_roots(&[], &[results, &keys])?;
+        // Each define can relocate the receiver; the in-place form
+        // writes the new location back into `object`.
+        let mut object = object;
+        for (key, value) in keys.iter().zip(results.iter()) {
+            let descriptor = crate::object::PropertyDescriptor::data(*value, true, true, true);
+            let heap = &mut self.gc_heap;
+            if let Some(text) = key.as_string(heap) {
+                let text = text.to_lossy_string(heap);
+                crate::object::define_own_property_in_place(&mut object, heap, &text, descriptor);
+            } else if let Some(symbol) = key.as_symbol(heap) {
+                crate::object::define_own_symbol_property(object, heap, symbol, descriptor);
+            }
+        }
+        Ok(Value::object(object))
+    }
+
+    /// Current element buffer of a lazy `chunks` / `windows` helper.
+    ///
+    /// The buffer is a nursery array: any user callback driven between
+    /// two uses can move it, and only the traced state slot is updated.
+    /// Every use therefore re-reads it here instead of caching a handle.
+    /// `None` means the helper is no longer collecting (a re-entrant
+    /// close folded it to `Exhausted`).
+    fn iterator_helper_buffer(&self, iter: IteratorHandle) -> Option<array::JsArray> {
+        self.gc_heap.read_payload(iter, |state| match state {
+            IteratorState::Chunks { buffer, .. } | IteratorState::Windows { buffer, .. } => {
+                Some(*buffer)
+            }
+            _ => None,
+        })
+    }
+
+    /// Append `value` to a lazy helper's retained buffer, keeping the
+    /// buffer, its owning source iterator, and the pending value rooted
+    /// across the dense-storage growth.
+    fn append_to_iterator_buffer(
+        &mut self,
+        iter: IteratorHandle,
+        source: IteratorHandle,
+        value: Value,
+    ) -> Result<(), VmError> {
+        let Some(buffer) = self.iterator_helper_buffer(iter) else {
+            return Ok(());
+        };
+        let buffer_root = Value::array(buffer);
+        let source_root = Value::iterator(source);
+        let iter_root = Value::iterator(iter);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            buffer_root.trace_value_slots(visitor);
+            source_root.trace_value_slots(visitor);
+            iter_root.trace_value_slots(visitor);
+            value.trace_value_slots(visitor);
+        };
+        array::push_with_roots(buffer, &mut self.gc_heap, value, &mut external_visit)
+            .map_err(VmError::from)?;
+        Ok(())
+    }
+
+    /// CreateArrayFromList over a helper's retained buffer — the copy is
+    /// what the helper yields, so later slides cannot mutate a window a
+    /// consumer already holds.
+    fn copy_iterator_buffer(&mut self, buffer: array::JsArray) -> Result<Value, VmError> {
+        let len = array::len(buffer, &self.gc_heap);
+        let elements: Vec<Value> = (0..len)
+            .map(|index| array::get(buffer, &self.gc_heap, index))
+            .collect();
+        let buffer_root = Value::array(buffer);
+        let copy = self.alloc_runtime_rooted_array_from_values(
+            elements.iter().copied(),
+            &[&buffer_root],
+            &[&elements],
+        )?;
+        Ok(Value::array(copy))
     }
 
     pub(crate) fn get_iterator_sync(
@@ -1332,6 +2202,16 @@ impl Interpreter {
                 source: IteratorHandle,
                 inner: Option<IteratorHandle>,
             },
+            /// `Iterator.concat` — only the currently open iterable is
+            /// closed; the not-yet-opened ones were never started.
+            ConcatInner(Option<IteratorHandle>),
+            /// `Iterator.zip` — close every still-open input.
+            ZipAll {
+                started: bool,
+            },
+            /// A close re-entered the helper while its own close was
+            /// still running.
+            HelperRunning,
             Builtin,
             None,
         }
@@ -1348,7 +2228,9 @@ impl Interpreter {
                 IteratorState::Map { source, .. }
                 | IteratorState::Filter { source, .. }
                 | IteratorState::Take { source, .. }
-                | IteratorState::Drop { source, .. } => CloseAction::Helper {
+                | IteratorState::Drop { source, .. }
+                | IteratorState::Chunks { source, .. }
+                | IteratorState::Windows { source, .. } => CloseAction::Helper {
                     source: *source,
                     inner: None,
                 },
@@ -1356,6 +2238,28 @@ impl Interpreter {
                     source: *source,
                     inner: *inner,
                 },
+                // §27.1.4.x — `Iterator.concat` owns no single source:
+                // a close forwards only to whichever iterable is open.
+                // §27.5.3.2 GeneratorValidate step 6 — a close that
+                // re-enters from the forwarded `return` throws.
+                IteratorState::Concat { inner, running, .. } => {
+                    if *running {
+                        CloseAction::HelperRunning
+                    } else {
+                        CloseAction::ConcatInner(*inner)
+                    }
+                }
+                // A zip close forwards to every still-open input, in
+                // reverse order (IteratorCloseAll).
+                IteratorState::Zip {
+                    running, started, ..
+                } => {
+                    if *running {
+                        CloseAction::HelperRunning
+                    } else {
+                        CloseAction::ZipAll { started: *started }
+                    }
+                }
                 // Array / TypedArray / String / Map / Set iterators
                 // expose no `return`, so IteratorClose is a no-op.
                 IteratorState::Exhausted { .. } => CloseAction::None,
@@ -1390,6 +2294,61 @@ impl Interpreter {
                 };
                 self.iterator_close_value_sync(stack, context, Value::iterator(source))?;
                 inner_result?;
+            }
+            CloseAction::ConcatInner(inner) => {
+                // Mark running (rather than exhausted) so a `return`
+                // that re-enters this same helper is rejected instead of
+                // silently becoming a no-op.
+                if let Some(handle) = iterator.as_iterator() {
+                    self.gc_heap.with_payload(handle, |state| {
+                        if let IteratorState::Concat { running, .. } = state {
+                            *running = true;
+                        }
+                    });
+                }
+                let inner_result = match inner {
+                    Some(inner) => {
+                        self.iterator_close_value_sync(stack, context, Value::iterator(inner))
+                    }
+                    None => Ok(()),
+                };
+                if let Some(handle) = iterator.as_iterator() {
+                    self.gc_heap.with_payload(handle, |state| state.exhaust());
+                }
+                inner_result?;
+            }
+            CloseAction::ZipAll { started } => {
+                // §27.1.2.1.2 step 4 — from suspended-start the helper
+                // is completed *before* the inputs are closed, so a
+                // re-entrant close returns normally. From suspended-yield
+                // it is marked running, so a re-entrant close throws.
+                let handle = iterator.as_iterator();
+                let Some(handle_for_close) = handle else {
+                    return Ok(());
+                };
+                // Snapshot before the state is folded away below.
+                let open = self.zip_open_inputs(handle_for_close);
+                if let Some(handle) = handle {
+                    if started {
+                        self.gc_heap.with_payload(handle, |state| {
+                            if let IteratorState::Zip { running, .. } = state {
+                                *running = true;
+                            }
+                        });
+                    } else {
+                        self.gc_heap.with_payload(handle, |state| state.exhaust());
+                    }
+                }
+                let closed = self.iterator_zip_close_all(stack, context, open, false);
+                if let Some(handle) = handle {
+                    self.gc_heap.with_payload(handle, |state| state.exhaust());
+                }
+                closed?;
+            }
+            CloseAction::HelperRunning => {
+                return Err(
+                    self.err_type(("Iterator helper is already running".to_string()).into())
+                );
             }
             CloseAction::Builtin | CloseAction::None => {}
         }
@@ -2164,6 +3123,10 @@ impl Interpreter {
                     | IteratorState::Take { .. }
                     | IteratorState::Drop { .. }
                     | IteratorState::FlatMap { .. }
+                    | IteratorState::Chunks { .. }
+                    | IteratorState::Windows { .. }
+                    | IteratorState::Concat { .. }
+                    | IteratorState::Zip { .. }
                     | IteratorState::RegExpString { .. }
             )
         });

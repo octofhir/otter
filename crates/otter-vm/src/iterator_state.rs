@@ -4,8 +4,8 @@
 //! one of these states; every `Op::IteratorNext` advances the state
 //! by one step. Built-in iterators (Array / String / Map / Set /
 //! RegExp-String) plus the iterator-helpers proposal wrappers (map /
-//! filter / take / drop / flatMap) share this enum so the dispatcher
-//! can drive every shape with one opcode.
+//! filter / take / drop / flatMap / chunks / windows) share this enum
+//! so the dispatcher can drive every shape with one opcode.
 //!
 //! # Contents
 //! - [`IteratorState`] — variant enum, one variant per iterator
@@ -316,6 +316,105 @@ pub enum IteratorState {
         #[pelt(skip)]
         counter: u64,
     },
+    /// Lazy `Iterator.prototype.chunks(chunkSize)` wrapper.
+    Chunks {
+        /// Underlying iterator handle.
+        source: IteratorHandle,
+        /// Elements collected for the chunk still under construction.
+        /// Handed out as-is once it reaches `chunk_size` entries (or on
+        /// source exhaustion while non-empty), so every yielded chunk is
+        /// a distinct Array.
+        buffer: JsArray,
+        /// Elements per full chunk. Validated to `1..=2**32 - 1` before
+        /// the wrapper is built.
+        #[pelt(skip)]
+        chunk_size: u32,
+        /// True while a `next()` step is in flight — re-entry from the
+        /// underlying iterator throws per §27.5.3.2 GeneratorValidate.
+        #[pelt(skip)]
+        running: bool,
+    },
+    /// Lazy `Iterator.prototype.windows(windowSize, undersized)` wrapper.
+    Windows {
+        /// Underlying iterator handle.
+        source: IteratorHandle,
+        /// Sliding window contents. The oldest element is dropped once
+        /// the window is full and a further element arrives; each yield
+        /// hands out a fresh copy so the retained buffer stays private.
+        buffer: JsArray,
+        /// Elements per emitted window. Validated to `1..=2**32 - 1`.
+        #[pelt(skip)]
+        window_size: u32,
+        /// `undersized` is `"allow-partial"` — emit the trailing short
+        /// window when the source runs dry before the window ever
+        /// filled. `"only-full"` emits nothing in that case.
+        #[pelt(skip)]
+        allow_partial: bool,
+        /// True while a `next()` step is in flight.
+        #[pelt(skip)]
+        running: bool,
+    },
+    /// Lazy `Iterator.concat(...items)` sequence.
+    Concat {
+        /// Flat `[iterable, @@iterator method, …]` pairs captured
+        /// eagerly by `Iterator.concat`: the methods are read up front,
+        /// the iterator objects are opened one at a time on demand.
+        sources: JsArray,
+        /// Iterator currently being drained, when one is open.
+        inner: Option<IteratorHandle>,
+        /// Index of the next pair to open, counted in pairs.
+        #[pelt(skip)]
+        index: usize,
+        /// True while a `next()` step is in flight.
+        #[pelt(skip)]
+        running: bool,
+    },
+    /// Lazy `Iterator.zip` / `Iterator.zipKeyed` join.
+    Zip {
+        /// One entry per input iterator. An entry is replaced by `null`
+        /// once that iterator reports done — in `"longest"` mode the
+        /// remaining ones keep stepping and the null slots pad.
+        iters: JsArray,
+        /// `"longest"` padding values, one per input. Empty in the
+        /// other modes, where it is never read.
+        padding: JsArray,
+        /// `zipKeyed` result keys, parallel to `iters`. Empty for
+        /// `zip`, whose results are Arrays.
+        keys: JsArray,
+        /// Scratch buffer for the round being assembled. Lives in the
+        /// state (rather than a Rust `Vec`) so the collected values stay
+        /// traced across the `next` calls that produce them.
+        results: JsArray,
+        /// What to do when one input runs out before the others.
+        #[pelt(skip)]
+        mode: ZipMode,
+        /// Result shape: `true` builds an object keyed by `keys`,
+        /// `false` builds an Array.
+        #[pelt(skip)]
+        keyed: bool,
+        /// Whether `next()` has run at least once. A close from the
+        /// suspended-start state completes the helper before forwarding,
+        /// so a re-entrant close observes a completed generator rather
+        /// than an executing one.
+        #[pelt(skip)]
+        started: bool,
+        /// True while a `next()` step is in flight.
+        #[pelt(skip)]
+        running: bool,
+    },
+}
+
+/// `Iterator.zip` / `Iterator.zipKeyed` `mode` option — what happens
+/// when the inputs have different lengths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ZipMode {
+    /// Stop as soon as any input is done (the default).
+    #[default]
+    Shortest,
+    /// Keep going until every input is done, padding the finished ones.
+    Longest,
+    /// Every input must finish on the same step; otherwise `TypeError`.
+    Strict,
 }
 
 impl IteratorState {
@@ -345,7 +444,11 @@ impl IteratorState {
             | IteratorState::Filter { .. }
             | IteratorState::Take { .. }
             | IteratorState::Drop { .. }
-            | IteratorState::FlatMap { .. } => Some(BuiltinIteratorOrigin::Helper),
+            | IteratorState::FlatMap { .. }
+            | IteratorState::Chunks { .. }
+            | IteratorState::Windows { .. }
+            | IteratorState::Concat { .. }
+            | IteratorState::Zip { .. } => Some(BuiltinIteratorOrigin::Helper),
             // §27.1.3.2 — wrapped user / generator iterators expose
             // `%WrapForValidIteratorPrototype%` (own `next` / `return`).
             IteratorState::User { .. } | IteratorState::Generator { .. } => {

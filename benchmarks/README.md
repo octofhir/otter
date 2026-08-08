@@ -75,6 +75,7 @@ print output, access the filesystem, install packages, or depend on host APIs.
 | `boxed-double-property.js` | Repeated double-valued object property loads | `4000000` |
 | `dense-array.js` | Repeated dense indexed array loads | `5234688` |
 | `numeric-leaf.js` | Repeated calls into a straight-line eight-operation Number leaf | `-700000` |
+| `typed-parameter-loop.js` | Int32 parameter guards, loop phis, checked arithmetic, and OSR | `300000` |
 
 Run one fixture per isolate. Warmups and measured samples reuse that isolate
 and the same precompiled invocation stub, but every invocation must return the
@@ -127,12 +128,19 @@ non-scoreable failures. Do not rewrite them into a spread-call workload.
 
 The compile fixture calls the target function directly with the declared
 numeric arguments, seeds feedback, then retains the final measured machine-code
-artifact. It installs that exact object through an isolate-local validation
+artifact. Feedback seed calls stay in the interpreter so a hot loop cannot OSR
+before its complete body has updated the snapshot. The harness installs the
+exact measured object through an isolate-local validation
 hook, enters it with the same direct arguments, and checks the result before
 emitter samples are accepted. Source parsing, bytecode lowering, feedback
-seeding, snapshot construction, backend-marker preflight, and compiler-hook
-construction remain outside the timer; emitter work and executable-buffer
-finalization remain inside it.
+seeding, snapshot construction, the untimed backend artifact proof, and
+compiler-hook construction remain outside the timer; emitter work and
+executable-buffer finalization remain inside it.
+
+Numeric CLI arguments use the VM's canonical JavaScript Number representation:
+an exact signed 32-bit integer is passed as Int32, while fractions, values
+outside that range, and negative zero remain Float64. The printed decimal is
+therefore not a hidden request to force every argument into Float64.
 
 ```bash
 cargo run --release -p otter-benchmark --features engine \
@@ -144,8 +152,11 @@ cargo run --release -p otter-benchmark --features engine \
 ```
 
 The optimizing numeric-leaf row exercises the same optimizing pipeline as
-every other function. The exact returned result validates the generated code;
-there is no backend-specific preflight or benchmark parameter.
+every other function. Before accepting optimizing samples, an untimed compile
+of the same snapshot must identify `otter-machine-ir numeric-function`; the
+validation hook then executes the exact measured code object. The validation
+marker records `backend=otter-machine-ir`. There is no backend-selection
+benchmark parameter or legacy fallback result.
 
 ### Managed memory
 

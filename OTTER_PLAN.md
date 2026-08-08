@@ -430,6 +430,56 @@ The full repository gate passed with 264 JIT tests, 831 VM tests, all-target
 all-feature Clippy, compile-fail/rooting checks, and all 17
 interpreter/tier/GC-stress differential cases.
 
+Feedback-specialized numeric parameters landed on 2026-08-09:
+
+- numeric HIR now computes parameter-origin dataflow to a fixpoint across the
+  complete CFG. Arithmetic feedback specializes an incoming value only when a
+  checked Int32 operand directly proves it; copies and numeric identity
+  coercions retain origins, while Float64 results, Boolean conversions, and
+  ECMAScript bitwise coercions deliberately clear them;
+- specialized entry values select `DecodeInt32`, whose AArch64 guard rejects a
+  non-Int32 tagged value before the body. Its output has an explicit allocator
+  reuse constraint, so the checked tagged input becomes the Int32 value in
+  place without an entry copy. Parameters outside the exact entry live-in set
+  have no HIR value, load, guard, or interval. General Number parameters keep
+  the existing Float64 decoder; there is no mixed decoder, retry, or alternate
+  entry path;
+- the exact `engineNumericLeaf` body now keeps both parameters and its first
+  six arithmetic operations in checked Int32 form, then inserts exactly two
+  representation widenings at the Float64 division boundary. Entry rejection
+  leaves the VM window untouched, and checked overflow reconstructs the two
+  arguments plus the exact operation PC through the existing MachineFrameState
+  and VM DeoptTable;
+- the `jit-compile` harness now rejects an optimizing observation unless an
+  untimed artifact for the identical snapshot starts with
+  `otter-machine-ir numeric-function`. It then installs and executes the exact
+  measured code object, and records `backend=otter-machine-ir` in the
+  validation marker, so legacy fallback is no longer scoreable for this row.
+  CLI integers use canonical VM Int32 values while fractions, out-of-range
+  values, and negative zero remain Float64; feedback seed loops are prevented
+  from OSR until every operation has been observed;
+- `typed-parameter-loop.js` proves the complete frontend path for two Int32
+  parameters, loop-header phis, checked ADD/ADD_IMM, comparison, backedge poll,
+  native entry, and OSR. Its direct compile validates the Machine IR marker,
+  executes the exact 720-byte object, and returns `300000`; mismatched loop-edge
+  representations now decline in HIR instead of reaching a verifier failure;
+- focused proof covers typed lowering through the first Float64 boundary,
+  copy-alias inference, deliberate non-specialization of bitwise coercions,
+  dead-parameter elimination, in-place decode allocation, early Float64
+  rejection, exact entry-frame overflow recovery, a complete integer loop, and
+  both real frontend compile fixtures. The cost/vs kernel ledgers now retain
+  the parameter loop as a permanent performance signal;
+- the final twenty-sample gate measured 298,013,093 template retired
+  instructions versus 151,496,173 production-tiered (-49.2%). Wall medians
+  were 0.334 ms versus 0.209 ms (-37.5%), with one optimizing OSR
+  entry and zero deopts. The straight-line numeric leaf remains slightly behind
+  template, exposing generated-call/entry overhead as the next bottleneck.
+
+The full repository gate passed with 270 JIT tests, 831 VM tests, 19 focused
+engine-harness tests, all-target all-feature Clippy, compile-fail/rooting
+checks, and all 17 interpreter/tier/GC-stress differential cases. Test262 was
+not run.
+
 The remaining legacy optimizer and allocator are fallback for functions whose
 HIR/selection slices have not switched. Delete each old consumer as its final
 operation family moves; do not adapt old allocation or metadata into the new

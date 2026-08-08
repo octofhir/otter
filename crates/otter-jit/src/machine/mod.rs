@@ -205,6 +205,18 @@ impl MachineOperand {
         }
     }
 
+    /// Construct a late definition tied to an earlier register input.
+    #[must_use]
+    pub const fn register_reuse_output(value: MachineValue, input: u8) -> Self {
+        Self {
+            value,
+            constraint: OperandConstraint::Reuse(input),
+            role: OperandRole::Definition,
+            timing: OperandTiming::Late,
+            purpose: OperandPurpose::Output,
+        }
+    }
+
     /// Keep a tagged GC root live through a safepoint instruction.
     #[must_use]
     pub const fn tagged_root(value: MachineValue) -> Self {
@@ -329,6 +341,8 @@ pub enum MachineOpcode {
     EntryValue(u16),
     /// Guard and decode one tagged JavaScript Number.
     DecodeNumber,
+    /// Guard and decode one tagged JavaScript Int32.
+    DecodeInt32,
     /// Materialize an integer constant.
     IntegerConstant(i64),
     /// Materialize a floating-point constant by exact bit pattern.

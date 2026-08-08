@@ -193,12 +193,36 @@ impl MachineOperand {
         }
     }
 
+    /// Construct an ordinary early input in one ABI-mandated register.
+    #[must_use]
+    pub const fn fixed_register_input(value: MachineValue, register: PhysicalRegister) -> Self {
+        Self {
+            value,
+            constraint: OperandConstraint::Fixed(register),
+            role: OperandRole::Use,
+            timing: OperandTiming::Early,
+            purpose: OperandPurpose::Input,
+        }
+    }
+
     /// Construct an ordinary late register definition.
     #[must_use]
     pub const fn register_output(value: MachineValue) -> Self {
         Self {
             value,
             constraint: OperandConstraint::Register,
+            role: OperandRole::Definition,
+            timing: OperandTiming::Late,
+            purpose: OperandPurpose::Output,
+        }
+    }
+
+    /// Construct an ordinary late definition in one ABI-mandated register.
+    #[must_use]
+    pub const fn fixed_register_output(value: MachineValue, register: PhysicalRegister) -> Self {
+        Self {
+            value,
+            constraint: OperandConstraint::Fixed(register),
             role: OperandRole::Definition,
             timing: OperandTiming::Late,
             purpose: OperandPurpose::Output,
@@ -399,8 +423,6 @@ pub enum MachineOpcode {
     Uint32ToFloat64,
     /// Convert an unboxed Float64 through ECMAScript ToInt32.
     Float64ToInt32,
-    /// Load the Int32 result deposited by the preceding numeric leaf call.
-    IntegerLeafResult,
     /// Reinterpret canonical Boolean bits as Int32.
     BooleanToInt32,
     /// Floating-point addition.
@@ -415,8 +437,6 @@ pub enum MachineOpcode {
     FloatRem,
     /// Floating-point exponentiation through the canonical no-allocation leaf.
     FloatPow,
-    /// Load the Float64 result deposited by the preceding numeric leaf call.
-    FloatLeafResult,
     /// Floating-point negation.
     FloatNeg,
     /// Convert an Int32 or Uint32 value to canonical Boolean bits.

@@ -350,14 +350,16 @@ Typed scalar leaf publication landed on 2026-08-06:
   committing the result, using the existing allocator-driven frame state;
 - Number remainder and exponentiation remain unboxed across allocation and use
   one declared `f64, f64 -> f64` leaf ABI. The calls have explicit caller-save
-  clobbers and a frame-owned result slot, with no heap argument, tagged-value
-  conversion, status pair, local recovery format, or parallel bailout path;
+  clobbers and allocation-owned fixed ABI operands, with no heap argument,
+  tagged-value conversion, status pair, local recovery format, or parallel
+  bailout path;
 - `ToNumber` over an already numeric value, Int32/Float64 `ToBoolean`, and
   logical-not now lower directly. Float truthiness rejects both zero signs and
   unordered NaN while preserving canonical Boolean results;
 - focused native execution covers `INT_MIN`, negative zero, remainder and
-  exponentiation edge cases, forced spills across FP leaf calls, several loop
-  iterations, and exact interrupt reconstruction before the next iteration;
+  exponentiation edge cases, callee-saved values and forced spills across FP
+  leaf calls, several loop iterations, and exact interrupt reconstruction
+  before the next iteration;
 - `benchmarks/scripts/float-leaf-math.js` is a real frontend fixture combining
   all new families with a checked/polled mixed Int32/Float64 loop. Its artifact
   proves `otter-machine-ir numeric-function`, native execution returns the Node
@@ -380,8 +382,8 @@ Exact ToInt32 bitwise publication landed on 2026-08-06:
   modulo semantics, including truncation, both zero signs, NaN, infinities,
   values across the signed boundary, and values beyond 32 bits. The AArch64
   ABI uses `d0`/`x0`, the common caller-save clobber set, and the existing
-  frame-owned scalar result shuttle; it has no heap, status, exception, or
-  alternate reconstruction channel;
+  fixed `d0 -> x0` operands; it has no heap, status, exception, frame shuttle,
+  or alternate reconstruction channel;
 - Boolean constants and `NOP` are accepted in numeric CFGs. A typed
   Boolean-to-Int32 conversion preserves the representation boundary instead of
   treating Boolean HIR values as signed integers implicitly;
@@ -390,7 +392,7 @@ Exact ToInt32 bitwise publication landed on 2026-08-06:
   across conversion calls, and exact interrupt reconstruction at a loop
   header;
 - `benchmarks/scripts/float-bitwise.js` is the real frontend fixture. Its
-  artifact contains `Float64ToInt32` and `IntegerLeafResult` under
+  artifact contains `Float64ToInt32` with no separate result pseudo-op under
   `otter-machine-ir numeric-function`, native execution returns the Node oracle
   `120790`, and ten validated samples recorded 13 optimizing entries and zero
   deopts. The dirty-tree production-tiered median was 1.208 ms versus 2.485 ms
@@ -417,7 +419,7 @@ Numeric Machine IR OSR publication landed on 2026-08-06:
   fuel semantics have no OSR-specific recovery or replay path;
 - focused native execution covers successful mid-loop entry, atomic type
   rejection, exact overflow reconstruction, interrupt before phi moves, all
-  four scalar contracts, and a 23-value loop header that forces OSR operands
+  four scalar contracts, and a 33-value loop header that forces OSR operands
   into allocator spill slots. Artifact coverage records the published OSR
   range and retains the `otter-machine-ir numeric-function` identity;
 - the exact `benchmarks/scripts/branch-phi.js` kernel with OSR threshold 10
@@ -479,6 +481,39 @@ The full repository gate passed with 270 JIT tests, 831 VM tests, 19 focused
 engine-harness tests, all-target all-feature Clippy, compile-fail/rooting
 checks, and all 17 interpreter/tier/GC-stress differential cases. Test262 was
 not run.
+
+Allocation-driven numeric leaf linkage landed on 2026-08-09:
+
+- the numeric AArch64 register file now exposes AAPCS64 callee-saved
+  `x20..x28` and `d8..d15` to regalloc2. The emitter derives one exact used
+  prefix from the final allocation and makes that same set authoritative for
+  frame sizing, prologue saves, every normal/cold epilogue, and OSR entry;
+- pure scalar leaves express their ABI directly as fixed Machine IR operands:
+  remainder/power are `d0,d1 -> d0`, and ToInt32 is `d0 -> x0`. regalloc2 owns
+  argument/result moves around the declared caller-save clobbers. The old
+  `FloatLeafResult`/`IntegerLeafResult` pseudo-operations and 16-byte result
+  shuttle were deleted rather than retained as another path;
+- the allocator-driven deopt namespace now spans physical `x0..x29` followed
+  by `d0..d15`; unused encodings remain deterministic holes. The shared cold
+  dump and existing VM `DeoptTable` consume that same map. A focused native
+  test keeps a parameter in a callee-saved register across an FP leaf, then
+  proves checked ADD overflow restores its exact operation PC and VM slots;
+- backedge-poll late operands may remain in callee-saved registers instead of
+  being forced to stack homes. The OSR pressure fixture now carries 33 live
+  header values, so direct spill materialization remains exercised after the
+  wider register file. Float leaf, ToInt32 edge, interrupt-before-phi, fuel,
+  spill, and OSR execution all remain on the one Machine IR backend;
+- fresh detached-parent/current A/B runs used 20 samples plus eight warmups.
+  `float-leaf-math` fell from 2,641,852,733 to 2,501,745,783 retired
+  instructions (-5.3%) and from 16.455 to 14.544 ms median (-11.6%).
+  `float-bitwise` fell from 777,452,571 to 655,294,314 retired (-15.7%) and
+  from 1.056 to 0.833 ms (-21.1%). Both exact fixtures returned their Node
+  oracles through `otter-machine-ir numeric-function` with zero deopts.
+
+The full repository gate passed with 271 JIT tests, 831 VM tests, all-target
+all-feature Clippy, compile-fail/rooting checks, and all 17
+interpreter/tier/GC-stress differential cases. The permanent kernel ledger
+retained a 0.208 ms typed-parameter loop with zero deopts. Test262 was not run.
 
 The remaining legacy optimizer and allocator are fallback for functions whose
 HIR/selection slices have not switched. Delete each old consumer as its final

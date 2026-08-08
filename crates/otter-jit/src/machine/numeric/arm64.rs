@@ -7,11 +7,11 @@
 //! - regalloc2 edit emission between selected instructions.
 //!
 //! # Invariants
-//! - Callee-saved `x19` retains the entry context; `x16`/`x17` and `d30`/`d31` are
-//!   emitter-only scratch registers excluded from allocation.
+//! - Callee-saved `x19` retains the entry context; allocated `x20..x28` and
+//!   `d8..d15` have one exact allocation-driven save/restore set.
+//! - `x15..x18`, `d16..d31` are emitter/platform scratch excluded from
+//!   allocation; cold deopt dumps use the target's complete register-id map.
 //! - Spill storage and offsets come only from [`MachineFrameLayout`].
-//! - Callee-saved allocations remain excluded until shared save/restore maps
-//!   land with general-function lowering.
 //! - A failed Number guard writes logical PC zero and returns `BAILED` before
 //!   any externally visible effect.
 //! - Checked integer overflow uses the allocator-driven VM [`DeoptRuntime`];
@@ -21,8 +21,8 @@
 //! - OSR trampolines decode only live loop-header inputs into the exact
 //!   late-use locations selected by regalloc2; rejection never mutates VM slots.
 //! - Successful results use the VM's canonical Number or Boolean representation.
-//! - Pure numeric leaves exchange unboxed scalar values and use only the
-//!   frame-owned result shuttle; they have no heap or status channel.
+//! - Pure numeric leaves exchange unboxed scalars in fixed ABI operands;
+//!   regalloc2 owns every argument/result move and no frame shuttle exists.
 
 // dynasm's dynamic-register expansion calls `.into()` on the required u8
 // register encoding. Clippy sees the macro expansion as an identity conversion.
@@ -55,11 +55,51 @@ use crate::{
 };
 use std::collections::BTreeMap;
 
-pub(super) const GPR_BUDGET: u16 = 16;
-pub(super) const FP_BUDGET: u16 = 8;
+// The deopt namespace preserves physical encodings. It includes one unused
+// x29 slot so the following FP bank remains naturally 16-byte aligned.
+pub(super) const GPR_BUDGET: u16 = 30;
+pub(super) const FP_BUDGET: u16 = 16;
 const BASE_FIXED_FRAME_BYTES: u32 = 32;
-const LEAF_RESULT_BYTES: u32 = 16;
 const DEOPT_DUMP_BYTES: u32 = (GPR_BUDGET as u32 + FP_BUDGET as u32) * 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SavedFrame {
+    gpr_count: u8,
+    fp_count: u8,
+}
+
+impl SavedFrame {
+    fn from_allocation(allocation: &AllocatedSequence) -> Self {
+        let mut gpr_count = 0;
+        let mut fp_count = 0;
+        for register in allocation
+            .used_registers()
+            .filter(|register| register.is_integer() && (20..=28).contains(&register.encoding()))
+        {
+            gpr_count = gpr_count.max(register.encoding() - 19);
+        }
+        for register in allocation
+            .used_registers()
+            .filter(|register| register.is_float() && (8..=15).contains(&register.encoding()))
+        {
+            fp_count = fp_count.max(register.encoding() - 7);
+        }
+        Self {
+            gpr_count,
+            fp_count,
+        }
+    }
+
+    fn fixed_bytes(self) -> u32 {
+        BASE_FIXED_FRAME_BYTES
+            + u32::from(self.gpr_count.saturating_sub(1))
+                .saturating_mul(8)
+                .next_multiple_of(16)
+            + u32::from(self.fp_count)
+                .saturating_mul(8)
+                .next_multiple_of(16)
+    }
+}
 
 pub(super) struct Emission {
     pub(super) code: CompiledCode,
@@ -128,19 +168,9 @@ fn emit_backedge_poll(
 fn emit_float_leaf_binary(
     ops: &mut dynasmrt::aarch64::Assembler,
     relocations: &mut RelocationCapture,
-    left: u8,
-    right: u8,
     entry: u64,
     descriptor: RuntimeStubDescriptor,
-    result_offset: u32,
 ) {
-    dynasm!(ops
-        ; .arch aarch64
-        ; str D(left), [sp, result_offset]
-        ; str D(right), [sp, result_offset + 8]
-        ; ldr d0, [sp, result_offset]
-        ; ldr d1, [sp, result_offset + 8]
-    );
     emit_load_symbolic_u64(
         ops,
         relocations,
@@ -148,25 +178,14 @@ fn emit_float_leaf_binary(
         entry,
         RelocationTarget::runtime_stub(descriptor),
     );
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; str d0, [sp, result_offset]
-    );
+    dynasm!(ops ; .arch aarch64 ; blr x16);
 }
 
 fn emit_float_to_int32_leaf(
     ops: &mut dynasmrt::aarch64::Assembler,
     relocations: &mut RelocationCapture,
-    source: u8,
     entry: u64,
-    result_offset: u32,
 ) {
-    dynasm!(ops
-        ; .arch aarch64
-        ; str D(source), [sp, result_offset]
-        ; ldr d0, [sp, result_offset]
-    );
     emit_load_symbolic_u64(
         ops,
         relocations,
@@ -174,35 +193,18 @@ fn emit_float_to_int32_leaf(
         entry,
         RelocationTarget::runtime_stub(STUB_NUMBER_TO_INT32_F64_LEAF),
     );
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; str x0, [sp, result_offset]
-    );
+    dynasm!(ops ; .arch aarch64 ; blr x16);
 }
 
 pub(super) fn frame_layout(
-    sequence: &InstructionSequence,
     allocation: &AllocatedSequence,
 ) -> Result<MachineFrameLayout, Unsupported> {
-    let owns_leaf_result = sequence.instructions().iter().any(|instruction| {
-        matches!(
-            instruction.opcode,
-            MachineOpcode::FloatRem
-                | MachineOpcode::FloatPow
-                | MachineOpcode::FloatLeafResult
-                | MachineOpcode::Float64ToInt32
-                | MachineOpcode::IntegerLeafResult
-        )
-    });
-    let fixed_bytes = BASE_FIXED_FRAME_BYTES
-        + if owns_leaf_result {
-            LEAF_RESULT_BYTES
-        } else {
-            0
-        };
-    MachineFrameLayout::new(allocation, fixed_bytes, 16)
-        .map_err(|_| Unsupported::OperandShape("numeric Machine IR frame layout"))
+    MachineFrameLayout::new(
+        allocation,
+        SavedFrame::from_allocation(allocation).fixed_bytes(),
+        16,
+    )
+    .map_err(|_| Unsupported::OperandShape("numeric Machine IR frame layout"))
 }
 
 pub(super) fn emit(
@@ -218,6 +220,12 @@ pub(super) fn emit(
     capture_artifacts: bool,
 ) -> Result<Emission, Unsupported> {
     reject_unimplemented_locations(sequence, allocation)?;
+    let saved = SavedFrame::from_allocation(allocation);
+    if frame.fixed_bytes() != saved.fixed_bytes() {
+        return Err(Unsupported::OperandShape(
+            "numeric Machine IR saved frame layout",
+        ));
+    }
     let mut ops = dynasmrt::aarch64::Assembler::new()
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
     let bail = ops.new_dynamic_label();
@@ -254,7 +262,7 @@ pub(super) fn emit(
         });
     }
 
-    emit_prologue(&mut ops, frame);
+    emit_prologue(&mut ops, frame, saved);
 
     for (index, instruction) in sequence.instructions().iter().enumerate() {
         let id = MachineInstructionId(index as u32);
@@ -344,41 +352,24 @@ pub(super) fn emit(
                 }
             }
             MachineOpcode::FloatRem | MachineOpcode::FloatPow => {
-                let left = float_register(locations[0])?;
-                let right = float_register(locations[1])?;
+                if float_register(locations[0])? != 0
+                    || float_register(locations[1])? != 1
+                    || float_register(locations[2])? != 0
+                {
+                    return Err(Unsupported::OperandShape("numeric FP leaf ABI"));
+                }
                 let (entry, descriptor) = if instruction.opcode == MachineOpcode::FloatRem {
                     (number_rem_entry, STUB_NUMBER_REM_F64_LEAF)
                 } else {
                     (number_pow_entry, STUB_NUMBER_POW_F64_LEAF)
                 };
-                emit_float_leaf_binary(
-                    &mut ops,
-                    &mut relocations,
-                    left,
-                    right,
-                    entry,
-                    descriptor,
-                    frame.spill_area_bytes(),
-                );
-            }
-            MachineOpcode::FloatLeafResult => {
-                let destination = float_register(locations[0])?;
-                let offset = frame.spill_area_bytes();
-                dynasm!(ops ; .arch aarch64 ; ldr D(destination), [sp, offset]);
+                emit_float_leaf_binary(&mut ops, &mut relocations, entry, descriptor);
             }
             MachineOpcode::Float64ToInt32 => {
-                emit_float_to_int32_leaf(
-                    &mut ops,
-                    &mut relocations,
-                    float_register(locations[0])?,
-                    number_to_int32_entry,
-                    frame.spill_area_bytes(),
-                );
-            }
-            MachineOpcode::IntegerLeafResult => {
-                let destination = integer_register(locations[0])?;
-                let offset = frame.spill_area_bytes();
-                dynasm!(ops ; .arch aarch64 ; ldr X(destination), [sp, offset]);
+                if float_register(locations[0])? != 0 || integer_register(locations[1])? != 0 {
+                    return Err(Unsupported::OperandShape("numeric ToInt32 leaf ABI"));
+                }
+                emit_float_to_int32_leaf(&mut ops, &mut relocations, number_to_int32_entry);
             }
             MachineOpcode::FloatNeg => {
                 let source = float_register(locations[0])?;
@@ -673,7 +664,7 @@ pub(super) fn emit(
                     ; mov x0, X(source)
                     ; movz x1, STATUS_RETURNED as u32
                 );
-                emit_epilogue(&mut ops, frame);
+                emit_epilogue(&mut ops, frame, saved);
             }
             MachineOpcode::Jump => {
                 let block = &sequence.blocks()[block_index];
@@ -722,7 +713,7 @@ pub(super) fn emit(
         ; mov x0, xzr
         ; movz x1, STATUS_BAILED as u32
     );
-    emit_epilogue(&mut ops, frame);
+    emit_epilogue(&mut ops, frame, saved);
 
     dynasm!(ops
         ; .arch aarch64
@@ -730,7 +721,7 @@ pub(super) fn emit(
         ; mov x0, xzr
         ; movz x1, STATUS_THREW as u32
     );
-    emit_epilogue(&mut ops, frame);
+    emit_epilogue(&mut ops, frame, saved);
 
     if !deopt_labels.is_empty() {
         for (index, &label) in deopt_labels.iter().enumerate() {
@@ -746,15 +737,27 @@ pub(super) fn emit(
             );
         }
 
-        // Dump layout consumed by `jit_deopt_writeback_stub`: x0..x15 followed by
-        // d0..d7 at ascending addresses. `x19` retains the context across the call.
+        // Dump layout consumed by `jit_deopt_writeback_stub`: physical x0..x29
+        // followed by d0..d15 at ascending addresses. x15..x18 and x29 are
+        // namespace holes; x19 retains the context across the call.
         dynasm!(ops
             ; .arch aarch64
             ; =>shared_deopt
+            ; stp d14, d15, [sp, #-16]!
+            ; stp d12, d13, [sp, #-16]!
+            ; stp d10, d11, [sp, #-16]!
+            ; stp d8, d9, [sp, #-16]!
             ; stp d6, d7, [sp, #-16]!
             ; stp d4, d5, [sp, #-16]!
             ; stp d2, d3, [sp, #-16]!
             ; stp d0, d1, [sp, #-16]!
+            ; stp x28, xzr, [sp, #-16]!
+            ; stp x26, x27, [sp, #-16]!
+            ; stp x24, x25, [sp, #-16]!
+            ; stp x22, x23, [sp, #-16]!
+            ; stp x20, x21, [sp, #-16]!
+            ; stp x18, x19, [sp, #-16]!
+            ; stp x16, x17, [sp, #-16]!
             ; stp x14, x15, [sp, #-16]!
             ; stp x12, x13, [sp, #-16]!
             ; stp x10, x11, [sp, #-16]!
@@ -792,7 +795,7 @@ pub(super) fn emit(
             ; blr x16
             ; add sp, sp, DEOPT_DUMP_BYTES
         );
-        emit_epilogue(&mut ops, frame);
+        emit_epilogue(&mut ops, frame, saved);
     }
 
     let mut osr_entries = BTreeMap::new();
@@ -800,7 +803,7 @@ pub(super) fn emit(
     for site in &osr_sites {
         let offset = ops.offset().0;
         let representation_bail = ops.new_dynamic_label();
-        emit_prologue(&mut ops, frame);
+        emit_prologue(&mut ops, frame, saved);
         let locations = allocation
             .instruction_locations(site.instruction)
             .ok_or(Unsupported::OperandShape("numeric OSR allocation coverage"))?;
@@ -833,7 +836,7 @@ pub(super) fn emit(
             ; mov x0, xzr
             ; movz x1, STATUS_BAILED as u32
         );
-        emit_epilogue(&mut ops, frame);
+        emit_epilogue(&mut ops, frame, saved);
         let end = ops.offset().0;
         if osr_entries.insert(site.logical_pc, offset).is_some() {
             return Err(Unsupported::OperandShape(
@@ -889,18 +892,16 @@ fn reject_unimplemented_locations(
         for &location in locations {
             match location {
                 AllocatedLocation::Register(register)
-                    if register.is_integer() && register.encoding() >= 19 =>
+                    if register.is_integer()
+                        && !((register.encoding() <= 14)
+                            || (20..=28).contains(&register.encoding())) =>
                 {
-                    return Err(Unsupported::OperandShape(
-                        "numeric Machine IR callee-saved GPR",
-                    ));
+                    return Err(Unsupported::OperandShape("numeric Machine IR GPR"));
                 }
                 AllocatedLocation::Register(register)
-                    if register.is_float() && (8..=15).contains(&register.encoding()) =>
+                    if register.is_float() && register.encoding() > 15 =>
                 {
-                    return Err(Unsupported::OperandShape(
-                        "numeric Machine IR callee-saved FP register",
-                    ));
+                    return Err(Unsupported::OperandShape("numeric Machine IR FP register"));
                 }
                 AllocatedLocation::Register(_) | AllocatedLocation::Stack(_) => {}
             }
@@ -1067,15 +1068,36 @@ fn emit_box_boolean(ops: &mut dynasmrt::aarch64::Assembler, source: u8, destinat
     dynasm!(ops ; .arch aarch64 ; =>done);
 }
 
-fn emit_prologue(ops: &mut dynasmrt::aarch64::Assembler, frame: MachineFrameLayout) {
+fn emit_prologue(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    frame: MachineFrameLayout,
+    saved: SavedFrame,
+) {
     dynasm!(ops
         ; .arch aarch64
         ; stp x29, x30, [sp, #-16]!
         ; mov x29, sp
-        ; stp x19, x20, [sp, #-16]!
     );
-    if frame.fixed_bytes() > BASE_FIXED_FRAME_BYTES {
-        dynasm!(ops ; .arch aarch64 ; stp xzr, xzr, [sp, #-16]!);
+    if saved.gpr_count == 0 {
+        dynasm!(ops ; .arch aarch64 ; str x19, [sp, #-16]!);
+    } else {
+        dynasm!(ops ; .arch aarch64 ; stp x19, x20, [sp, #-16]!);
+    }
+    for pair in 0..(saved.gpr_count.saturating_sub(1) / 2) {
+        let first = 21 + pair * 2;
+        dynasm!(ops ; .arch aarch64 ; stp X(first), X(first + 1), [sp, #-16]!);
+    }
+    if !saved.gpr_count.saturating_sub(1).is_multiple_of(2) {
+        let last = 19 + saved.gpr_count;
+        dynasm!(ops ; .arch aarch64 ; str X(last), [sp, #-16]!);
+    }
+    for pair in 0..(saved.fp_count / 2) {
+        let first = 8 + pair * 2;
+        dynasm!(ops ; .arch aarch64 ; stp D(first), D(first + 1), [sp, #-16]!);
+    }
+    if !saved.fp_count.is_multiple_of(2) {
+        let last = 7 + saved.fp_count;
+        dynasm!(ops ; .arch aarch64 ; str D(last), [sp, #-16]!);
     }
     emit_reserve_spill_area(ops, frame.spill_area_bytes());
     dynasm!(ops
@@ -1234,14 +1256,35 @@ fn emit_osr_materialization(
     }
 }
 
-fn emit_epilogue(ops: &mut dynasmrt::aarch64::Assembler, frame: MachineFrameLayout) {
+fn emit_epilogue(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    frame: MachineFrameLayout,
+    saved: SavedFrame,
+) {
     emit_release_spill_area(ops, frame.spill_area_bytes());
-    if frame.fixed_bytes() > BASE_FIXED_FRAME_BYTES {
-        dynasm!(ops ; .arch aarch64 ; add sp, sp, #16);
+    if !saved.fp_count.is_multiple_of(2) {
+        let last = 7 + saved.fp_count;
+        dynasm!(ops ; .arch aarch64 ; ldr D(last), [sp], #16);
+    }
+    for pair in (0..(saved.fp_count / 2)).rev() {
+        let first = 8 + pair * 2;
+        dynasm!(ops ; .arch aarch64 ; ldp D(first), D(first + 1), [sp], #16);
+    }
+    if !saved.gpr_count.saturating_sub(1).is_multiple_of(2) {
+        let last = 19 + saved.gpr_count;
+        dynasm!(ops ; .arch aarch64 ; ldr X(last), [sp], #16);
+    }
+    for pair in (0..(saved.gpr_count.saturating_sub(1) / 2)).rev() {
+        let first = 21 + pair * 2;
+        dynasm!(ops ; .arch aarch64 ; ldp X(first), X(first + 1), [sp], #16);
+    }
+    if saved.gpr_count == 0 {
+        dynasm!(ops ; .arch aarch64 ; ldr x19, [sp], #16);
+    } else {
+        dynasm!(ops ; .arch aarch64 ; ldp x19, x20, [sp], #16);
     }
     dynasm!(ops
         ; .arch aarch64
-        ; ldp x19, x20, [sp], #16
         ; ldp x29, x30, [sp], #16
         ; ret
     );

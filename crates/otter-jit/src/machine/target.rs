@@ -112,16 +112,17 @@ impl TargetRegisterFile {
 
     pub(super) fn aarch64_numeric_function() -> Self {
         let mut registers = Self::aarch64();
-        // The first executable Machine IR slice intentionally owns no
-        // callee-saved allocation protocol. The emitter owns saved x19 for
-        // the context, reserves x15..x17 and v31, and exposes a dense
-        // caller-saved register namespace that its deopt dump can publish.
-        // Later general-function lowering can widen this inventory together
-        // with its prologue and dump map.
+        // x19 retains the context, x15..x18 are emitter/platform scratch, and
+        // v16..v31 stay outside the numeric contract. Values live across leaf
+        // calls may use the remaining AAPCS64 callee-saved file; the numeric
+        // emitter derives its exact save set and deopt dump from this one
+        // inventory.
         registers.preferred[RegClass::Int as usize].retain(|register| register.encoding != 15);
-        registers.non_preferred[RegClass::Int as usize].clear();
+        registers.non_preferred[RegClass::Int as usize]
+            .retain(|register| (20..=28).contains(&register.encoding));
         registers.preferred[RegClass::Float as usize].retain(|register| register.encoding <= 7);
-        registers.non_preferred[RegClass::Float as usize].clear();
+        registers.non_preferred[RegClass::Float as usize]
+            .retain(|register| (8..=15).contains(&register.encoding));
         registers
     }
 

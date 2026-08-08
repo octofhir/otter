@@ -111,9 +111,12 @@ impl AllocatedSequence {
         &self.metadata
     }
 
-    /// Number of distinct physical registers named by operands or edits.
-    #[must_use]
-    pub fn used_register_count(&self) -> u32 {
+    /// Distinct physical registers named by operands or allocator edits.
+    ///
+    /// Target frame builders use this exact post-allocation set to derive
+    /// callee-saved state; metadata locations are already a subset of operand
+    /// locations and therefore need no parallel scan.
+    pub fn used_registers(&self) -> impl Iterator<Item = PhysicalRegister> + '_ {
         self.operand_locations
             .iter()
             .flatten()
@@ -123,7 +126,13 @@ impl AllocatedSequence {
                 AllocatedLocation::Stack(_) => None,
             })
             .collect::<std::collections::BTreeSet<_>>()
-            .len() as u32
+            .into_iter()
+    }
+
+    /// Number of distinct physical registers named by operands or edits.
+    #[must_use]
+    pub fn used_register_count(&self) -> u32 {
+        self.used_registers().count() as u32
     }
 
     /// Deterministic post-allocation identity used by artifacts and tests.

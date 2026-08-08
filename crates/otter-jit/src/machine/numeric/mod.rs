@@ -29,7 +29,7 @@ use self::hir::{NumericFramePoint, NumericFunction, NumericNode, NumericTerminat
 use super::{
     ControlFlow, DeoptId, InstructionSequence, MachineBlock, MachineBlockData, MachineInstruction,
     MachineInstructionId, MachineOpcode, MachineOperand, MachineOsrInput, MachineOsrType,
-    MachineRepresentation, MachineValue, TargetRegisterFile, lower_deopt_table,
+    MachineRepresentation, MachineValue, PhysicalRegister, TargetRegisterFile, lower_deopt_table,
 };
 use crate::{
     Unsupported,
@@ -52,7 +52,7 @@ pub(crate) fn try_compile(
     let allocation = sequence
         .allocate(&TargetRegisterFile::aarch64_numeric_function())
         .map_err(|_| Unsupported::OperandShape("numeric Machine IR allocation"))?;
-    let frame = arm64::frame_layout(&sequence, &allocation)?;
+    let frame = arm64::frame_layout(&allocation)?;
     let deopt_table = lower_deopt_table(
         &sequence,
         &allocation,
@@ -291,16 +291,18 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
             if let NumericNode::FloatToInt32(source) = node {
                 let mut call = MachineInstruction::plain(
                     MachineOpcode::Float64ToInt32,
-                    vec![MachineOperand::register_input(machine_value(
-                        &values, source,
-                    ))],
+                    vec![
+                        MachineOperand::fixed_register_input(
+                            machine_value(&values, source),
+                            PhysicalRegister::float(0),
+                        ),
+                        MachineOperand::fixed_register_output(result, PhysicalRegister::integer(0)),
+                    ],
                 );
                 call.clobbers = TargetRegisterFile::aarch64_numeric_call_clobbers();
+                call.clobbers
+                    .retain(|register| *register != PhysicalRegister::integer(0));
                 instructions.push(call);
-                instructions.push(MachineInstruction::plain(
-                    MachineOpcode::IntegerLeafResult,
-                    vec![MachineOperand::register_output(result)],
-                ));
                 continue;
             }
             if let NumericNode::Rem(left, right) | NumericNode::Pow(left, right) = node {
@@ -312,16 +314,21 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                 let mut call = MachineInstruction::plain(
                     opcode,
                     vec![
-                        MachineOperand::register_input(machine_value(&values, left)),
-                        MachineOperand::register_input(machine_value(&values, right)),
+                        MachineOperand::fixed_register_input(
+                            machine_value(&values, left),
+                            PhysicalRegister::float(0),
+                        ),
+                        MachineOperand::fixed_register_input(
+                            machine_value(&values, right),
+                            PhysicalRegister::float(1),
+                        ),
+                        MachineOperand::fixed_register_output(result, PhysicalRegister::float(0)),
                     ],
                 );
                 call.clobbers = TargetRegisterFile::aarch64_numeric_call_clobbers();
+                call.clobbers
+                    .retain(|register| *register != PhysicalRegister::float(0));
                 instructions.push(call);
-                instructions.push(MachineInstruction::plain(
-                    MachineOpcode::FloatLeafResult,
-                    vec![MachineOperand::register_output(result)],
-                ));
                 continue;
             }
             let mut instruction = match node {
@@ -1025,6 +1032,45 @@ mod tests {
             ],
         );
         view.seed_arith_feedback_for_test(0, ArithFeedback::from_bits(ARITH_INT32));
+        view
+    }
+
+    fn typed_parameter_leaf_overflow_view() -> JitCompileSnapshot {
+        let mut view = numeric_view(
+            1,
+            7,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(5)]),
+                (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(2)]),
+                (
+                    Op::Div,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                (
+                    Op::Rem,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(3),
+                        Operand::Register(2),
+                    ],
+                ),
+                (Op::LoadInt32, vec![Operand::Register(5), Operand::Imm32(1)]),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(6),
+                        Operand::Register(0),
+                        Operand::Register(5),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(6)]),
+            ],
+        );
+        view.seed_arith_feedback_for_test(5, ArithFeedback::from_bits(ARITH_INT32));
         view
     }
 
@@ -2217,7 +2263,13 @@ mod tests {
     }
 
     fn osr_spill_pressure_loop_view() -> JitCompileSnapshot {
-        let mut instructions = (0_u16..20)
+        const LIVE_VALUES: u16 = 30;
+        let loop_index = LIVE_VALUES;
+        let loop_limit = LIVE_VALUES + 1;
+        let condition = LIVE_VALUES + 2;
+        let accumulator = LIVE_VALUES + 3;
+        let scratch = LIVE_VALUES + 4;
+        let mut instructions = (0_u16..LIVE_VALUES)
             .map(|register| {
                 (
                     Op::LoadInt32,
@@ -2231,65 +2283,78 @@ mod tests {
         instructions.extend([
             (
                 Op::LoadInt32,
-                vec![Operand::Register(20), Operand::Imm32(0)],
+                vec![Operand::Register(loop_index), Operand::Imm32(0)],
             ),
             (
                 Op::LoadInt32,
-                vec![Operand::Register(21), Operand::Imm32(1)],
+                vec![Operand::Register(loop_limit), Operand::Imm32(1)],
             ),
             (
                 Op::LoadInt32,
-                vec![Operand::Register(23), Operand::Imm32(0)],
+                vec![Operand::Register(accumulator), Operand::Imm32(0)],
             ),
             (
                 Op::LessThan,
                 vec![
-                    Operand::Register(22),
-                    Operand::Register(20),
-                    Operand::Register(21),
+                    Operand::Register(condition),
+                    Operand::Register(loop_index),
+                    Operand::Register(loop_limit),
                 ],
             ),
             (
                 Op::JumpIfFalse,
-                vec![Operand::Imm32(43), Operand::Register(22)],
+                vec![
+                    Operand::Imm32(i32::from(LIVE_VALUES) * 2 + 3),
+                    Operand::Register(condition),
+                ],
             ),
         ]);
-        for register in 0_u16..20 {
+        for register in 0_u16..LIVE_VALUES {
             instructions.push((
                 Op::Add,
                 vec![
-                    Operand::Register(24),
-                    Operand::Register(23),
+                    Operand::Register(scratch),
+                    Operand::Register(accumulator),
                     Operand::Register(register),
                 ],
             ));
             instructions.push((
                 Op::StoreLocal,
-                vec![Operand::Register(24), Operand::Imm32(23)],
+                vec![
+                    Operand::Register(scratch),
+                    Operand::Imm32(i32::from(accumulator)),
+                ],
             ));
         }
         instructions.extend([
             (
                 Op::AddImm,
                 vec![
-                    Operand::Register(24),
-                    Operand::Register(20),
+                    Operand::Register(scratch),
+                    Operand::Register(loop_index),
                     Operand::Imm32(1),
                 ],
             ),
             (
                 Op::StoreLocal,
-                vec![Operand::Register(24), Operand::Imm32(20)],
+                vec![
+                    Operand::Register(scratch),
+                    Operand::Imm32(i32::from(loop_index)),
+                ],
             ),
-            (Op::Jump, vec![Operand::Imm32(-45)]),
-            (Op::ReturnValue, vec![Operand::Register(23)]),
+            (
+                Op::Jump,
+                vec![Operand::Imm32(-(i32::from(LIVE_VALUES) * 2 + 5))],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(accumulator)]),
         ]);
-        let mut view = numeric_view(0, 25, instructions);
-        for pc in 23_u32..=65 {
-            if pc == 24 || (25..65).contains(&pc) && pc % 2 == 0 {
-                continue;
+        let mut view = numeric_view(0, LIVE_VALUES + 5, instructions);
+        let header_pc = u32::from(LIVE_VALUES + 3);
+        let add_imm_pc = header_pc + u32::from(LIVE_VALUES) * 2 + 2;
+        for pc in header_pc..=add_imm_pc {
+            if pc == header_pc || (pc - header_pc >= 2 && (pc - header_pc).is_multiple_of(2)) {
+                view.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(ARITH_INT32));
             }
-            view.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(ARITH_INT32));
         }
         view
     }
@@ -2970,16 +3035,26 @@ mod tests {
                 .metadata()
                 .iter()
                 .filter(|metadata| metadata.deopt == Some(DeoptId(2)))
-                .all(|metadata| matches!(metadata.location, AllocatedLocation::Stack(_))),
-            "poll operands must survive the leaf call in allocator spill homes"
+                .all(|metadata| match metadata.location {
+                    AllocatedLocation::Stack(_) => true,
+                    AllocatedLocation::Register(register) => {
+                        register.is_integer() && (20..=28).contains(&register.encoding())
+                    }
+                }),
+            "poll operands must survive the leaf call outside caller-saved registers"
         );
-        let layout = arm64::frame_layout(&sequence, &allocation).expect("branch-phi frame layout");
+        assert!(allocation.metadata().iter().any(|metadata| {
+            metadata.deopt == Some(DeoptId(2))
+                && matches!(metadata.location, AllocatedLocation::Register(register)
+                    if register.is_integer() && (20..=28).contains(&register.encoding()))
+        }));
+        let layout = arm64::frame_layout(&allocation).expect("branch-phi frame layout");
         let deopt_table = lower_deopt_table(
             &sequence,
             &allocation,
             layout,
-            16,
-            8,
+            arm64::GPR_BUDGET,
+            arm64::FP_BUDGET,
             &machine_frame_states(&hir),
         )
         .expect("branch-phi allocator-driven FrameState");
@@ -3404,6 +3479,37 @@ mod tests {
     }
 
     #[test]
+    fn callee_saved_value_survives_leaf_call_and_overflow_deopt() {
+        let view = typed_parameter_leaf_overflow_view();
+        let hir = NumericFunction::build(&view).expect("typed leaf overflow numeric HIR");
+        let sequence = select(&hir).expect("typed leaf overflow Machine IR");
+        let allocation = sequence
+            .allocate(&TargetRegisterFile::aarch64_numeric_function())
+            .expect("typed leaf overflow allocation");
+        assert!(allocation.metadata().iter().any(|metadata| {
+            metadata.deopt.is_some()
+                && matches!(metadata.location, AllocatedLocation::Register(register)
+                    if (register.is_integer() && (20..=28).contains(&register.encoding()))
+                        || (register.is_float() && (8..=15).contains(&register.encoding())))
+        }));
+
+        let code = compile_output(&view, None).code;
+        let interrupt = 0_u8;
+        let mut fuel = i64::MAX as u64;
+        let (result, frame, pc) = execute_with_poll_cells(
+            &code,
+            &[tag::box_int32(i32::MAX)],
+            0,
+            std::ptr::addr_of!(interrupt),
+            &mut fuel,
+        );
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(pc, 5);
+        assert_eq!(frame[0], tag::box_int32(i32::MAX));
+        assert_eq!(frame[5], tag::box_int32(1));
+    }
+
+    #[test]
     fn register_comparisons_return_canonical_booleans() {
         for (op, left, right, expected) in [
             (Op::Equal, 7, 7, true),
@@ -3457,7 +3563,7 @@ mod tests {
         let allocation = sequence
             .allocate(&TargetRegisterFile::aarch64_numeric_function())
             .expect("integer-scalar allocation");
-        let frame = arm64::frame_layout(&sequence, &allocation).expect("integer-scalar frame");
+        let frame = arm64::frame_layout(&allocation).expect("integer-scalar frame");
         lower_deopt_table(
             &sequence,
             &allocation,
@@ -3531,12 +3637,31 @@ mod tests {
         );
 
         let sequence = select(&hir).expect("float-leaf-loop Machine IR");
+        let leaf = sequence
+            .instructions()
+            .iter()
+            .find(|instruction| instruction.opcode == MachineOpcode::FloatRem)
+            .expect("fixed-ABI FP leaf");
+        assert_eq!(
+            leaf.operands
+                .iter()
+                .map(|operand| operand.constraint)
+                .collect::<Vec<_>>(),
+            [
+                OperandConstraint::Fixed(PhysicalRegister::float(0)),
+                OperandConstraint::Fixed(PhysicalRegister::float(1)),
+                OperandConstraint::Fixed(PhysicalRegister::float(0)),
+            ]
+        );
         let allocation = sequence
             .allocate(&TargetRegisterFile::aarch64_numeric_function())
             .expect("float-leaf-loop allocation");
         assert!(
-            allocation.spill_slots() > 0,
-            "values live across leaf calls must leave caller-saved registers"
+            allocation.used_registers().any(|register| {
+                (register.is_integer() && (20..=28).contains(&register.encoding()))
+                    || (register.is_float() && (8..=15).contains(&register.encoding()))
+            }),
+            "values live across leaf calls must occupy callee-saved registers"
         );
         let output = crate::optimizing::compile_optimized_with_artifacts(
             &view,
@@ -3566,7 +3691,7 @@ mod tests {
         assert!(optimized_ir.starts_with("; backend=otter-machine-ir numeric-function\n"));
         assert!(optimized_ir.contains("FloatRem"));
         assert!(optimized_ir.contains("FloatPow"));
-        assert!(optimized_ir.contains("FloatLeafResult"));
+        assert!(!optimized_ir.contains("FloatLeafResult"));
 
         let (result, _, _) = execute(&output.code, &[], 0);
         assert_eq!(result.status, STATUS_RETURNED);
@@ -3600,12 +3725,30 @@ mod tests {
                 >= 2
         );
         let sequence = select(&hir).expect("float-bitwise-loop Machine IR");
+        let leaf = sequence
+            .instructions()
+            .iter()
+            .find(|instruction| instruction.opcode == MachineOpcode::Float64ToInt32)
+            .expect("fixed-ABI ToInt32 leaf");
+        assert_eq!(
+            leaf.operands
+                .iter()
+                .map(|operand| operand.constraint)
+                .collect::<Vec<_>>(),
+            [
+                OperandConstraint::Fixed(PhysicalRegister::float(0)),
+                OperandConstraint::Fixed(PhysicalRegister::integer(0)),
+            ]
+        );
         let allocation = sequence
             .allocate(&TargetRegisterFile::aarch64_numeric_function())
             .expect("float-bitwise-loop allocation");
         assert!(
-            allocation.spill_slots() > 0,
-            "loop-carried values live across ToInt32 leaves must spill"
+            allocation.used_registers().any(|register| {
+                (register.is_integer() && (20..=28).contains(&register.encoding()))
+                    || (register.is_float() && (8..=15).contains(&register.encoding()))
+            }),
+            "loop-carried values live across ToInt32 leaves must occupy callee-saved registers"
         );
 
         let output = crate::optimizing::compile_optimized_with_artifacts(
@@ -3635,7 +3778,7 @@ mod tests {
         .expect("UTF-8 optimized IR");
         assert!(optimized_ir.starts_with("; backend=otter-machine-ir numeric-function\n"));
         assert!(optimized_ir.contains("Float64ToInt32"));
-        assert!(optimized_ir.contains("IntegerLeafResult"));
+        assert!(!optimized_ir.contains("IntegerLeafResult"));
 
         let (result, _, _) = execute(&output.code, &[], 0);
         assert_eq!(result.status, STATUS_RETURNED);
@@ -3865,6 +4008,8 @@ mod tests {
 
     #[test]
     fn numeric_osr_materializes_allocator_spill_homes() {
+        const LIVE_VALUES: usize = 30;
+        const HEADER_PC: u32 = LIVE_VALUES as u32 + 3;
         let view = osr_spill_pressure_loop_view();
         let hir = NumericFunction::build(&view).expect("OSR spill-pressure HIR");
         let sequence = select(&hir).expect("OSR spill-pressure Machine IR");
@@ -3887,20 +4032,25 @@ mod tests {
         );
 
         let code = compile_output(&view, None).code;
-        let mut frame = vec![Value::undefined().to_bits(); 25];
-        for (register, slot) in frame.iter_mut().enumerate().take(20) {
+        let mut frame = vec![Value::undefined().to_bits(); LIVE_VALUES + 5];
+        for (register, slot) in frame.iter_mut().enumerate().take(LIVE_VALUES) {
             *slot = tag::box_int32(register as i32 + 1);
         }
-        frame[20] = tag::box_int32(0);
-        frame[21] = tag::box_int32(1);
-        frame[23] = tag::box_int32(0);
+        frame[LIVE_VALUES] = tag::box_int32(0);
+        frame[LIVE_VALUES + 1] = tag::box_int32(1);
+        frame[LIVE_VALUES + 3] = tag::box_int32(0);
         let original = frame.clone();
         let interrupt = 0_u8;
         let mut fuel = i64::MAX as u64;
-        let (result, after, _) =
-            execute_osr_with_poll_cells(&code, 23, frame, std::ptr::addr_of!(interrupt), &mut fuel);
+        let (result, after, _) = execute_osr_with_poll_cells(
+            &code,
+            HEADER_PC,
+            frame,
+            std::ptr::addr_of!(interrupt),
+            &mut fuel,
+        );
         assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(210));
+        assert_eq!(result.value, tag::box_int32(465));
         assert_eq!(after, original);
     }
 

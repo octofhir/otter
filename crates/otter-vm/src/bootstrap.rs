@@ -679,7 +679,11 @@ mod tests {
         // heap string: a `&'static str` is a rodata address that could
         // never survive a page dump, so the name must live in the heap
         // for the bootstrap snapshot to carry it.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 3433;
+        // The four `%Iterator.prototype%` additions (`chunks` /
+        // `windows` / `includes` / `join`) and the three `%Iterator%`
+        // statics (`concat` / `zip` / `zipKeyed`) each cost a callable
+        // plus its heap-resident display name.
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 3458;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 600 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");

@@ -6,8 +6,15 @@
 //! `@@iterator` and `@@toStringTag` once the well-known symbol table
 //! is materialised.
 //!
+//! Beyond the ES2025 helper set, `%Iterator.prototype%` also carries
+//! the chunking (`chunks` / `windows`), `includes`, and `join`
+//! helpers.
+//!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-iterator-constructor>
+//! - <https://tc39.es/proposal-iterator-chunking/>
+//! - <https://tc39.es/proposal-iterator-includes/>
+//! - <https://tc39.es/proposal-iterator-join/>
 
 use crate::Value;
 use crate::bootstrap::native_static_with_value_roots;
@@ -92,7 +99,10 @@ otter_macros::couch! {
     intrinsic = IteratorIntrinsic,
     constructor = (length = 0, call = iterator_ctor_call),
     statics = {
-        "from" / 1 => iterator_from_native,
+        "from"     / 1 => iterator_from_native,
+        "concat"   / 0 => iterator_concat_native,
+        "zip"      / 1 => iterator_zip_native,
+        "zipKeyed" / 1 => iterator_zip_keyed_native,
     },
     prototype = {
         methods = {
@@ -107,6 +117,10 @@ otter_macros::couch! {
             "some"    / 1 => iterator_proto_some,
             "every"   / 1 => iterator_proto_every,
             "find"    / 1 => iterator_proto_find,
+            "chunks"  / 1 => iterator_proto_chunks,
+            "windows" / 1 => iterator_proto_windows,
+            "includes" / 1 => iterator_proto_includes,
+            "join"    / 1 => iterator_proto_join,
             // §27.1.2 — `%Iterator.prototype%` itself carries NO own
             // `next` / `return` / `throw`; those live on the concrete
             // iterator prototypes (`%IteratorHelperPrototype%`,
@@ -966,6 +980,155 @@ fn iterator_proto_flat_map(
     Ok(Value::iterator(handle))
 }
 
+/// `chunkSize` / `windowSize` validation shared by
+/// `Iterator.prototype.chunks` and `Iterator.prototype.windows`: the
+/// argument must already be an integral Number in `1..=2**32 - 1`.
+/// Nothing is coerced, so a non-Number throws before any user-visible
+/// `valueOf` / `toString` hook can run.
+fn iterator_span_size_arg(args: &[Value], name: &'static str) -> Result<u32, crate::NativeError> {
+    let arg = args.first().copied().unwrap_or(Value::undefined());
+    let Some(number) = arg.as_number() else {
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "size must be a Number".to_string(),
+        });
+    };
+    let raw = number.as_f64();
+    if !raw.is_finite() || raw.fract() != 0.0 {
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "size must be an integral Number".to_string(),
+        });
+    }
+    // `-0` is integral but below the inclusive lower bound.
+    if !(1.0..=f64::from(u32::MAX)).contains(&raw) {
+        return Err(crate::NativeError::RangeError {
+            name,
+            reason: "size must be in the inclusive range 1 to 2**32 - 1".to_string(),
+        });
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "range-checked integral Number in 1..=u32::MAX"
+    )]
+    Ok(raw as u32)
+}
+
+/// Allocate the empty backing buffer a lazy `chunks` / `windows`
+/// wrapper collects into, keeping the already-built source iterator
+/// rooted across the allocation.
+fn iterator_span_buffer(
+    ctx: &mut crate::NativeCtx<'_>,
+    source_value: &Value,
+    name: &'static str,
+) -> Result<crate::array::JsArray, crate::NativeError> {
+    ctx.array_from_elements_with_roots(std::iter::empty::<Value>(), &[source_value], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name,
+            reason: "buffer allocation failed".to_string(),
+        })
+}
+
+/// §27.1.4.x `Iterator.prototype.chunks(chunkSize)` — lazily groups the
+/// source into `chunkSize`-element Arrays, emitting a shorter trailing
+/// chunk when the source runs dry mid-chunk.
+///
+/// <https://tc39.es/proposal-iterator-chunking/>
+fn iterator_proto_chunks(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let this_value = *ctx.this_value();
+    require_object_receiver(&this_value, "Iterator.prototype.chunks")?;
+    let chunk_size = match iterator_span_size_arg(args, "Iterator.prototype.chunks") {
+        Ok(size) => size,
+        Err(err) => return Err(close_receiver_on_validation_failure(ctx, this_value, err)),
+    };
+    let source = iterator_receiver(ctx, "Iterator.prototype.chunks")?;
+    let source_value = Value::iterator(source);
+    let buffer = iterator_span_buffer(ctx, &source_value, "Iterator.prototype.chunks")?;
+    let buffer_value = Value::array(buffer);
+    let state = crate::IteratorState::Chunks {
+        source,
+        buffer,
+        chunk_size,
+        running: false,
+    };
+    let handle = ctx
+        .alloc_iterator_state(state, &[&source_value, &buffer_value], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.prototype.chunks",
+            reason: "iterator allocation failed".to_string(),
+        })?;
+    Ok(Value::iterator(handle))
+}
+
+/// §27.1.4.x `Iterator.prototype.windows(windowSize [, undersized])` —
+/// lazily emits sliding windows of `windowSize` elements. `undersized`
+/// selects what happens when the source never fills a window:
+/// `"only-full"` (default) emits nothing, `"allow-partial"` emits the
+/// short trailing window.
+///
+/// <https://tc39.es/proposal-iterator-chunking/>
+fn iterator_proto_windows(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let this_value = *ctx.this_value();
+    require_object_receiver(&this_value, "Iterator.prototype.windows")?;
+    let window_size = match iterator_span_size_arg(args, "Iterator.prototype.windows") {
+        Ok(size) => size,
+        Err(err) => return Err(close_receiver_on_validation_failure(ctx, this_value, err)),
+    };
+    // `undersized` is matched literally — an unrecognized value (of any
+    // type) throws rather than coercing.
+    let undersized = args.get(1).copied().unwrap_or(Value::undefined());
+    let allow_partial = if undersized.is_undefined() {
+        false
+    } else {
+        let matched = undersized.as_string(ctx.heap()).map(|s| {
+            s.with_utf16(ctx.heap(), |units| {
+                if units.iter().copied().eq("only-full".encode_utf16()) {
+                    Some(false)
+                } else if units.iter().copied().eq("allow-partial".encode_utf16()) {
+                    Some(true)
+                } else {
+                    None
+                }
+            })
+        });
+        match matched.flatten() {
+            Some(allow_partial) => allow_partial,
+            None => {
+                let err = crate::NativeError::TypeError {
+                    name: "Iterator.prototype.windows",
+                    reason: "undersized must be \"only-full\" or \"allow-partial\"".to_string(),
+                };
+                return Err(close_receiver_on_validation_failure(ctx, this_value, err));
+            }
+        }
+    };
+    let source = iterator_receiver(ctx, "Iterator.prototype.windows")?;
+    let source_value = Value::iterator(source);
+    let buffer = iterator_span_buffer(ctx, &source_value, "Iterator.prototype.windows")?;
+    let buffer_value = Value::array(buffer);
+    let state = crate::IteratorState::Windows {
+        source,
+        buffer,
+        window_size,
+        allow_partial,
+        running: false,
+    };
+    let handle = ctx
+        .alloc_iterator_state(state, &[&source_value, &buffer_value], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.prototype.windows",
+            reason: "iterator allocation failed".to_string(),
+        })?;
+    Ok(Value::iterator(handle))
+}
+
 fn iterator_arg_count_native(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
@@ -1017,6 +1180,15 @@ fn iterator_arg_count_native(
         return Err(crate::NativeError::RangeError {
             name,
             reason: "argument must be a non-negative integer".to_string(),
+        });
+    }
+    // §27.1.4.x step 7 — a finite limit above 2**53 - 1 is rejected
+    // before `ToIntegerOrInfinity`, so an unrepresentable count never
+    // silently truncates. `Infinity` stays legal.
+    if n.is_finite() && n > 9_007_199_254_740_991.0 {
+        return Err(crate::NativeError::RangeError {
+            name,
+            reason: "argument must not exceed 2**53 - 1".to_string(),
         });
     }
     let trunc = n.trunc();
@@ -1298,6 +1470,199 @@ fn iterator_proto_find(
     Ok(Value::undefined())
 }
 
+/// `skippedElements` validation for `Iterator.prototype.includes`: the
+/// argument stays uncoerced, so anything other than `undefined` or a
+/// Number that is `±Infinity` or integral throws a `TypeError`; a
+/// negative or above-2**53-1 count throws a `RangeError`.
+fn iterator_skipped_elements_arg(
+    args: &[Value],
+    name: &'static str,
+) -> Result<f64, crate::NativeError> {
+    let arg = args.get(1).copied().unwrap_or(Value::undefined());
+    if arg.is_undefined() {
+        return Ok(0.0);
+    }
+    let Some(number) = arg.as_number() else {
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "skippedElements must be a Number".to_string(),
+        });
+    };
+    let raw = number.as_f64();
+    if raw.is_nan() || (raw.is_finite() && raw.fract() != 0.0) {
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "skippedElements must be an integral Number or ±Infinity".to_string(),
+        });
+    }
+    // `-Infinity` reaches here as a valid shape and is rejected by the
+    // sign check, matching the spec's ordering.
+    if raw < 0.0 {
+        return Err(crate::NativeError::RangeError {
+            name,
+            reason: "skippedElements must not be negative".to_string(),
+        });
+    }
+    if raw.is_finite() && raw > 9_007_199_254_740_991.0 {
+        return Err(crate::NativeError::RangeError {
+            name,
+            reason: "skippedElements must not exceed 2**53 - 1".to_string(),
+        });
+    }
+    Ok(raw)
+}
+
+/// `Iterator.prototype.includes(searchElement [, skippedElements])` —
+/// drains the source looking for a SameValueZero match after skipping
+/// the first `skippedElements` values. A match closes the source; a
+/// natural exhaustion does not.
+///
+/// <https://tc39.es/proposal-iterator-includes/>
+fn iterator_proto_includes(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let this_value = *ctx.this_value();
+    require_object_receiver(&this_value, "Iterator.prototype.includes")?;
+    let to_skip = match iterator_skipped_elements_arg(args, "Iterator.prototype.includes") {
+        Ok(to_skip) => to_skip,
+        Err(err) => return Err(close_receiver_on_validation_failure(ctx, this_value, err)),
+    };
+    let search = args.first().copied().unwrap_or(Value::undefined());
+    let handle = iterator_receiver(ctx, "Iterator.prototype.includes")?;
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name: "Iterator.prototype.includes",
+                reason: "missing execution context".to_string(),
+            })?;
+    let mut skipped: f64 = 0.0;
+    loop {
+        let next = ctx
+            .cx
+            .with_parts(|interp, stack| interp.iterator_next_full(&exec_ctx, stack, &handle));
+        let (v, done) = next.map_err(|e| {
+            crate::native_function::vm_to_native_error(
+                ctx.cx.interp,
+                e,
+                "Iterator.prototype.includes",
+            )
+        })?;
+        if done {
+            return Ok(Value::boolean(false));
+        }
+        if skipped < to_skip {
+            skipped += 1.0;
+            continue;
+        }
+        if crate::abstract_ops::same_value_zero(&v, &search, ctx.heap()) {
+            let close = ctx.with_turn_parts(|interp, stack| {
+                interp.iterator_close_value_sync(stack, &exec_ctx, Value::iterator(handle))
+            });
+            close.map_err(|e| {
+                crate::native_function::vm_to_native_error(
+                    ctx.cx.interp,
+                    e,
+                    "Iterator.prototype.includes",
+                )
+            })?;
+            return Ok(Value::boolean(true));
+        }
+    }
+}
+
+/// `Iterator.prototype.join([separator])` — the `Array.prototype.join`
+/// shape over an iterator. The separator is coerced *before* `next` is
+/// read off the receiver, and a throwing coercion (of the separator or
+/// of any yielded value) closes the receiver.
+///
+/// <https://tc39.es/proposal-iterator-join/>
+fn iterator_proto_join(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let this_value = *ctx.this_value();
+    require_object_receiver(&this_value, "Iterator.prototype.join")?;
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name: "Iterator.prototype.join",
+                reason: "missing execution context".to_string(),
+            })?;
+    let separator_arg = args.first().copied().unwrap_or(Value::undefined());
+    let separator: Vec<u16> = if separator_arg.is_undefined() {
+        vec![u16::from(b',')]
+    } else {
+        let coerced = ctx.with_turn_parts(|interp, stack| {
+            crate::coerce::to_js_string_units(interp, stack, Some(&exec_ctx), &separator_arg)
+        });
+        match coerced {
+            Ok(units) => units,
+            Err(err) => {
+                let native = crate::native_function::vm_to_native_error(
+                    ctx.cx.interp,
+                    err,
+                    "Iterator.prototype.join",
+                );
+                return Err(close_receiver_on_validation_failure(
+                    ctx, this_value, native,
+                ));
+            }
+        }
+    };
+    // GetIteratorDirect runs only once the separator is settled.
+    let handle = iterator_receiver(ctx, "Iterator.prototype.join")?;
+    let mut units: Vec<u16> = Vec::new();
+    let mut first = true;
+    loop {
+        let next = ctx
+            .cx
+            .with_parts(|interp, stack| interp.iterator_next_full(&exec_ctx, stack, &handle));
+        let (v, done) = next.map_err(|e| {
+            crate::native_function::vm_to_native_error(ctx.cx.interp, e, "Iterator.prototype.join")
+        })?;
+        if done {
+            break;
+        }
+        if first {
+            first = false;
+        } else {
+            units.extend_from_slice(&separator);
+        }
+        // §23.1.3.15 shape — nullish elements contribute nothing.
+        if v.is_undefined() || v.is_null() {
+            continue;
+        }
+        let coerced = ctx.with_turn_parts(|interp, stack| {
+            crate::coerce::to_js_string_units(interp, stack, Some(&exec_ctx), &v)
+        });
+        match coerced {
+            Ok(element) => units.extend_from_slice(&element),
+            Err(err) => {
+                ctx.with_turn_parts(|interp, stack| {
+                    interp.close_iterator_preserving_throw(stack, &exec_ctx, &handle);
+                });
+                return Err(crate::native_function::vm_to_native_error(
+                    ctx.cx.interp,
+                    err,
+                    "Iterator.prototype.join",
+                ));
+            }
+        }
+    }
+    let joined = ctx
+        .with_turn_parts(|interp, _| {
+            crate::JsString::from_utf16_units(&units, interp.gc_heap_mut())
+        })
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.prototype.join",
+            reason: "string allocation failed".to_string(),
+        })?;
+    Ok(Value::string(joined))
+}
+
 /// §27.1.5.1.2 `%IteratorPrototype%.next()` — drive one step on the
 /// receiver iterator and wrap the (value, done) pair in the spec's
 /// result record.
@@ -1327,7 +1692,8 @@ pub(crate) fn iterator_proto_next(
 
 /// §27.1.4 — the `%IteratorHelperPrototype%` `next` / `return` methods
 /// require the receiver to carry an iterator-helper `[[UnderlyingIterator]]`
-/// (the lazy map / filter / take / drop / flatMap state). A plain
+/// (the lazy map / filter / take / drop / flatMap / chunks / windows
+/// state). A plain
 /// generator or any other iterator lacks that slot, so the method throws
 /// rather than silently driving an unrelated iterator.
 fn require_iterator_helper(
@@ -1344,6 +1710,10 @@ fn require_iterator_helper(
                     | crate::IteratorState::Take { .. }
                     | crate::IteratorState::Drop { .. }
                     | crate::IteratorState::FlatMap { .. }
+                    | crate::IteratorState::Chunks { .. }
+                    | crate::IteratorState::Windows { .. }
+                    | crate::IteratorState::Concat { .. }
+                    | crate::IteratorState::Zip { .. }
                     | crate::IteratorState::Exhausted {
                         origin: Some(crate::iterator_state::BuiltinIteratorOrigin::Helper),
                     }
@@ -1698,6 +2068,880 @@ fn iterator_predicate_drain(
 /// results already inheriting `%Iterator.prototype%` return
 /// unwrapped; everything else wraps as `IteratorState::User` with the
 /// `next` method cached per §7.4.4 GetIteratorDirect.
+/// `Iterator.concat(...items)` — a lazy sequence over `items`. Every
+/// item must be an Object with a callable `@@iterator`; all of those
+/// methods are read up front, in argument order, while the iterator
+/// objects themselves are opened one at a time as the result advances.
+///
+/// <https://tc39.es/proposal-iterator-sequencing/>
+fn iterator_concat_native(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name: "Iterator.concat",
+                reason: "missing execution context".to_string(),
+            })?;
+    let iterator_sym = ctx
+        .cx
+        .interp
+        .well_known_symbols()
+        .get(crate::symbol::WellKnown::Iterator);
+    let key = crate::VmPropertyKey::Symbol(iterator_sym);
+    // Flat `[iterable, method, …]` pairs; the state keeps them in one
+    // traced array rather than a Rust-side list.
+    let mut pairs: Vec<Value> = Vec::with_capacity(args.len() * 2);
+    for item in args {
+        let item = *item;
+        if crate::abstract_ops::is_primitive(&item) {
+            return Err(crate::NativeError::TypeError {
+                name: "Iterator.concat",
+                reason: "argument is not an object".to_string(),
+            });
+        }
+        let outcome = ctx.with_turn_parts(|interp, stack| {
+            interp
+                .ordinary_get_value(stack, &exec_ctx, item, item, &key, 0)
+                .map_err(|e| {
+                    crate::native_function::vm_to_native_error(interp, e, "Iterator.concat")
+                })
+        })?;
+        let method = match outcome {
+            crate::VmGetOutcome::Value(v) => v,
+            crate::VmGetOutcome::InvokeGetter { getter } => ctx.call(getter, item, &[])?,
+        };
+        // §7.3.11 GetMethod — nullish is "absent", anything else must
+        // be callable.
+        if method.is_nullish() || !ctx.interp_mut().is_callable_runtime(&method) {
+            return Err(crate::NativeError::TypeError {
+                name: "Iterator.concat",
+                reason: "argument is not iterable".to_string(),
+            });
+        }
+        pairs.push(item);
+        pairs.push(method);
+    }
+    let sources = ctx
+        .array_from_elements_with_roots(pairs.iter().copied(), &[], &[pairs.as_slice()])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.concat",
+            reason: "source list allocation failed".to_string(),
+        })?;
+    let sources_value = Value::array(sources);
+    let state = crate::IteratorState::Concat {
+        sources,
+        inner: None,
+        index: 0,
+        running: false,
+    };
+    let handle = ctx
+        .alloc_iterator_state(state, &[&sources_value], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.concat",
+            reason: "iterator allocation failed".to_string(),
+        })?;
+    Ok(Value::iterator(handle))
+}
+
+/// `Iterator.zip` / `Iterator.zipKeyed` `options` reading: the options
+/// bag itself, then `mode`, then (only in `"longest"` mode) `padding`.
+/// Reads stop at the first rejection, so an invalid `mode` never
+/// observes the `padding` getter.
+fn zip_options(
+    ctx: &mut crate::NativeCtx<'_>,
+    exec_ctx: &crate::ExecutionContext,
+    options: Value,
+    name: &'static str,
+) -> Result<(crate::iterator_state::ZipMode, Value), crate::NativeError> {
+    use crate::iterator_state::ZipMode;
+    if options.is_undefined() {
+        return Ok((ZipMode::Shortest, Value::undefined()));
+    }
+    if crate::abstract_ops::is_primitive(&options) {
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "options must be an object".to_string(),
+        });
+    }
+    let mode_value = zip_get(ctx, exec_ctx, options, "mode", name)?;
+    // The mode is matched literally: a `String` wrapper is not a mode.
+    let mode = if mode_value.is_undefined() {
+        ZipMode::Shortest
+    } else {
+        let matched = mode_value.as_string(ctx.heap()).and_then(|s| {
+            s.with_utf16(ctx.heap(), |units| {
+                if units.iter().copied().eq("shortest".encode_utf16()) {
+                    Some(ZipMode::Shortest)
+                } else if units.iter().copied().eq("longest".encode_utf16()) {
+                    Some(ZipMode::Longest)
+                } else if units.iter().copied().eq("strict".encode_utf16()) {
+                    Some(ZipMode::Strict)
+                } else {
+                    None
+                }
+            })
+        });
+        match matched {
+            Some(mode) => mode,
+            None => {
+                return Err(crate::NativeError::TypeError {
+                    name,
+                    reason: "mode must be \"shortest\", \"longest\", or \"strict\"".to_string(),
+                });
+            }
+        }
+    };
+    if mode != ZipMode::Longest {
+        return Ok((mode, Value::undefined()));
+    }
+    let padding = zip_get(ctx, exec_ctx, options, "padding", name)?;
+    if !padding.is_undefined() && crate::abstract_ops::is_primitive(&padding) {
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "padding must be an object".to_string(),
+        });
+    }
+    Ok((mode, padding))
+}
+
+/// `Get(receiver, key)` with the accessor re-entry the options bag may
+/// carry.
+fn zip_get(
+    ctx: &mut crate::NativeCtx<'_>,
+    exec_ctx: &crate::ExecutionContext,
+    receiver: Value,
+    key: &'static str,
+    name: &'static str,
+) -> Result<Value, crate::NativeError> {
+    let key = crate::VmPropertyKey::String(key);
+    let receiver_slot = zip_value_push(ctx, receiver);
+    let receiver = zip_value(ctx, receiver_slot);
+    let outcome = ctx.with_turn_parts(|interp, stack| {
+        interp
+            .ordinary_get_value(stack, exec_ctx, receiver, receiver, &key, 0)
+            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))
+    });
+    let result = match outcome {
+        Ok(crate::VmGetOutcome::Value(v)) => Ok(v),
+        Ok(crate::VmGetOutcome::InvokeGetter { getter }) => {
+            let receiver = zip_value(ctx, receiver_slot);
+            ctx.call(getter, receiver, &[])
+        }
+        Err(err) => Err(err),
+    };
+    zip_anchor_pop(ctx, receiver_slot);
+    result
+}
+
+/// §7.4.2 `GetIteratorFlattenable(obj, reject-primitives)` — the input
+/// must be an Object; a missing `@@iterator` means the object is used
+/// as its own iterator.
+fn zip_iterator_flattenable(
+    ctx: &mut crate::NativeCtx<'_>,
+    exec_ctx: &crate::ExecutionContext,
+    input: Value,
+    name: &'static str,
+) -> Result<crate::IteratorHandle, crate::NativeError> {
+    if crate::abstract_ops::is_primitive(&input) {
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "iterable must be an object".to_string(),
+        });
+    }
+    let iterator_sym = ctx
+        .cx
+        .interp
+        .well_known_symbols()
+        .get(crate::symbol::WellKnown::Iterator);
+    let key = crate::VmPropertyKey::Symbol(iterator_sym);
+    let input_slot = zip_value_push(ctx, input);
+    let result = (|ctx: &mut crate::NativeCtx<'_>| {
+        let input = zip_value(ctx, input_slot);
+        let outcome = ctx.with_turn_parts(|interp, stack| {
+            interp
+                .ordinary_get_value(stack, exec_ctx, input, input, &key, 0)
+                .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))
+        })?;
+        let method = match outcome {
+            crate::VmGetOutcome::Value(v) => v,
+            crate::VmGetOutcome::InvokeGetter { getter } => {
+                let input = zip_value(ctx, input_slot);
+                ctx.call(getter, input, &[])?
+            }
+        };
+        let iterator = if method.is_nullish() {
+            zip_value(ctx, input_slot)
+        } else if ctx.interp_mut().is_callable_runtime(&method) {
+            let input = zip_value(ctx, input_slot);
+            ctx.call(method, input, &[])?
+        } else {
+            return Err(crate::NativeError::TypeError {
+                name,
+                reason: "@@iterator is not callable".to_string(),
+            });
+        };
+        if crate::abstract_ops::is_primitive(&iterator) {
+            return Err(crate::NativeError::TypeError {
+                name,
+                reason: "@@iterator did not return an object".to_string(),
+            });
+        }
+        zip_iterator_direct(ctx, exec_ctx, iterator, name)
+    })(ctx);
+    zip_anchor_pop(ctx, input_slot);
+    result
+}
+
+/// §7.4.3 `GetIterator(obj, sync)` — unlike the flattenable variant, a
+/// missing or non-callable `@@iterator` is a `TypeError`.
+fn zip_strict_iterator(
+    ctx: &mut crate::NativeCtx<'_>,
+    exec_ctx: &crate::ExecutionContext,
+    input: Value,
+    name: &'static str,
+) -> Result<crate::IteratorHandle, crate::NativeError> {
+    let iterator_sym = ctx
+        .cx
+        .interp
+        .well_known_symbols()
+        .get(crate::symbol::WellKnown::Iterator);
+    let key = crate::VmPropertyKey::Symbol(iterator_sym);
+    let input_slot = zip_value_push(ctx, input);
+    let input = zip_value(ctx, input_slot);
+    let outcome = ctx.with_turn_parts(|interp, stack| {
+        interp
+            .ordinary_get_value(stack, exec_ctx, input, input, &key, 0)
+            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))
+    });
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            zip_anchor_pop(ctx, input_slot);
+            return Err(err);
+        }
+    };
+    let method = match outcome {
+        crate::VmGetOutcome::Value(v) => v,
+        crate::VmGetOutcome::InvokeGetter { getter } => {
+            let input = zip_value(ctx, input_slot);
+            match ctx.call(getter, input, &[]) {
+                Ok(value) => value,
+                Err(err) => {
+                    zip_anchor_pop(ctx, input_slot);
+                    return Err(err);
+                }
+            }
+        }
+    };
+    if method.is_nullish() || !ctx.interp_mut().is_callable_runtime(&method) {
+        zip_anchor_pop(ctx, input_slot);
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "value is not iterable".to_string(),
+        });
+    }
+    let input = zip_value(ctx, input_slot);
+    let iterator = match ctx.call(method, input, &[]) {
+        Ok(value) => value,
+        Err(err) => {
+            zip_anchor_pop(ctx, input_slot);
+            return Err(err);
+        }
+    };
+    zip_anchor_pop(ctx, input_slot);
+    if crate::abstract_ops::is_primitive(&iterator) {
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "@@iterator did not return an object".to_string(),
+        });
+    }
+    zip_iterator_direct(ctx, exec_ctx, iterator, name)
+}
+
+/// §7.4.4 `GetIteratorDirect(obj)` — cache `next` once and wrap the
+/// pair in an iterator record.
+fn zip_iterator_direct(
+    ctx: &mut crate::NativeCtx<'_>,
+    exec_ctx: &crate::ExecutionContext,
+    iterator: Value,
+    name: &'static str,
+) -> Result<crate::IteratorHandle, crate::NativeError> {
+    let next_key = crate::VmPropertyKey::String("next");
+    let iterator_slot = zip_value_push(ctx, iterator);
+    let result = (|ctx: &mut crate::NativeCtx<'_>| {
+        let iterator = zip_value(ctx, iterator_slot);
+        let outcome = ctx.with_turn_parts(|interp, stack| {
+            interp
+                .ordinary_get_value(stack, exec_ctx, iterator, iterator, &next_key, 0)
+                .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))
+        })?;
+        let next_method = match outcome {
+            crate::VmGetOutcome::Value(v) => v,
+            crate::VmGetOutcome::InvokeGetter { getter } => {
+                let iterator = zip_value(ctx, iterator_slot);
+                ctx.call(getter, iterator, &[])?
+            }
+        };
+        let iterator = zip_value(ctx, iterator_slot);
+        ctx.alloc_iterator_state(
+            crate::IteratorState::User {
+                iterator,
+                next_method: Some(next_method),
+            },
+            &[&iterator, &next_method],
+            &[],
+        )
+        .map_err(|_| crate::NativeError::TypeError {
+            name,
+            reason: "iterator allocation failed".to_string(),
+        })
+    })(ctx);
+    zip_anchor_pop(ctx, iterator_slot);
+    result
+}
+
+/// Park a plain value on the interpreter's traced anchor stack and
+/// return its slot. Arguments and option values are raw `Value`s: they
+/// go stale across the allocations and user getters that run between
+/// reading them and using them.
+fn zip_value_push(ctx: &mut crate::NativeCtx<'_>, value: Value) -> usize {
+    ctx.with_turn_parts(|interp, _| interp.push_iteration_anchor(value)) - 1
+}
+
+/// Read an anchored plain value back.
+fn zip_value(ctx: &crate::NativeCtx<'_>, slot: usize) -> Value {
+    ctx.cx.interp.iteration_anchor(slot)
+}
+
+/// Park an iterator handle on the interpreter's traced anchor stack.
+///
+/// `Gc` handles are cage offsets: a local one goes stale the moment
+/// user code allowed a scavenge. The anchor slot is a GC root, so the
+/// collector rewrites it in place and the handle is re-read from there
+/// before every use.
+fn zip_anchor_push(ctx: &mut crate::NativeCtx<'_>, handle: crate::IteratorHandle) -> usize {
+    ctx.with_turn_parts(|interp, _| interp.push_iteration_anchor(Value::iterator(handle))) - 1
+}
+
+/// Read an anchored iterator handle back.
+fn zip_anchor(ctx: &crate::NativeCtx<'_>, slot: usize) -> crate::IteratorHandle {
+    ctx.cx
+        .interp
+        .iteration_anchor(slot)
+        .as_iterator()
+        .expect("anchored zip handle")
+}
+
+/// Drop every anchor from `depth` upwards.
+fn zip_anchor_pop(ctx: &mut crate::NativeCtx<'_>, depth: usize) {
+    ctx.with_turn_parts(|interp, _| interp.pop_iteration_anchors_to(depth));
+}
+
+/// Allocate the `Zip` helper up front with empty lists.
+///
+/// The lists live in the (traced) helper state from the first moment,
+/// so every value appended while the inputs are still being collected
+/// survives the user code that produces the next one — a Rust-side
+/// `Vec` would go stale across those calls.
+fn zip_new_state(
+    ctx: &mut crate::NativeCtx<'_>,
+    mode: crate::iterator_state::ZipMode,
+    keyed: bool,
+    name: &'static str,
+) -> Result<crate::IteratorHandle, crate::NativeError> {
+    let oom = |_| crate::NativeError::TypeError {
+        name,
+        reason: "iterator allocation failed".to_string(),
+    };
+    let iters = ctx
+        .array_from_elements_with_roots(std::iter::empty::<Value>(), &[], &[])
+        .map_err(oom)?;
+    let iters_value = Value::array(iters);
+    let padding = ctx
+        .array_from_elements_with_roots(std::iter::empty::<Value>(), &[&iters_value], &[])
+        .map_err(oom)?;
+    let padding_value = Value::array(padding);
+    let keys = ctx
+        .array_from_elements_with_roots(
+            std::iter::empty::<Value>(),
+            &[&iters_value, &padding_value],
+            &[],
+        )
+        .map_err(oom)?;
+    let keys_value = Value::array(keys);
+    let results = ctx
+        .array_from_elements_with_roots(
+            std::iter::empty::<Value>(),
+            &[&iters_value, &padding_value, &keys_value],
+            &[],
+        )
+        .map_err(oom)?;
+    let results_value = Value::array(results);
+    // Each allocation above can relocate the arrays built before it;
+    // only the rooted `Value` locals were rewritten.
+    let stale = || crate::NativeError::TypeError {
+        name,
+        reason: "iterator allocation failed".to_string(),
+    };
+    let state = crate::IteratorState::Zip {
+        iters: iters_value.as_array().ok_or_else(stale)?,
+        padding: padding_value.as_array().ok_or_else(stale)?,
+        keys: keys_value.as_array().ok_or_else(stale)?,
+        results: results_value.as_array().ok_or_else(stale)?,
+        mode,
+        keyed,
+        running: false,
+        started: false,
+    };
+    let handle = ctx
+        .alloc_iterator_state(
+            state,
+            &[&iters_value, &padding_value, &keys_value, &results_value],
+            &[],
+        )
+        .map_err(oom)?;
+    // The body was copied in before the allocation settled; re-point it
+    // at the lists through the roots the collector actually rewrote.
+    ctx.with_turn_parts(|interp, _| {
+        interp.zip_relink_lists(
+            handle,
+            [iters_value, padding_value, keys_value, results_value],
+        );
+    });
+    Ok(handle)
+}
+
+/// Append one value to a list of the helper being built.
+fn zip_append(
+    ctx: &mut crate::NativeCtx<'_>,
+    slot: usize,
+    list: crate::iterator_ops::ZipList,
+    value: Value,
+    name: &'static str,
+) -> Result<(), crate::NativeError> {
+    let handle = zip_anchor(ctx, slot);
+    ctx.with_turn_parts(|interp, _| {
+        interp
+            .zip_append(handle, list, value)
+            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))
+    })
+}
+
+/// IteratorCloseAll over the inputs gathered so far, used when input
+/// collection itself fails part-way.
+fn zip_close_collected(
+    ctx: &mut crate::NativeCtx<'_>,
+    exec_ctx: &crate::ExecutionContext,
+    slot: usize,
+) {
+    let handle = zip_anchor(ctx, slot);
+    ctx.with_turn_parts(|interp, stack| {
+        interp.zip_close_inputs(stack, exec_ctx, handle);
+    });
+}
+
+/// Number of inputs collected so far.
+fn zip_input_count(ctx: &crate::NativeCtx<'_>, slot: usize) -> usize {
+    ctx.cx
+        .interp
+        .zip_list_len(zip_anchor(ctx, slot), crate::iterator_ops::ZipList::Inputs)
+}
+
+/// `"longest"` padding list: `iterCount` values pulled from the
+/// `padding` option, `undefined` beyond its end.
+fn zip_padding_list(
+    ctx: &mut crate::NativeCtx<'_>,
+    exec_ctx: &crate::ExecutionContext,
+    slot: usize,
+    padding_slot: usize,
+    name: &'static str,
+) -> Result<(), crate::NativeError> {
+    let count = zip_input_count(ctx, slot);
+    if zip_value(ctx, padding_slot).is_undefined() {
+        for _ in 0..count {
+            zip_append(
+                ctx,
+                slot,
+                crate::iterator_ops::ZipList::Padding,
+                Value::undefined(),
+                name,
+            )?;
+        }
+        return Ok(());
+    }
+    // §7.4.3 GetIterator — the padding option is iterated, not
+    // flattened, so a missing `@@iterator` is a TypeError even when
+    // there is nothing to pad.
+    let padding_option = zip_value(ctx, padding_slot);
+    let padding_iter = zip_strict_iterator(ctx, exec_ctx, padding_option, name)?;
+    let padding_iter_slot = zip_anchor_push(ctx, padding_iter);
+    let mut exhausted = false;
+    for _ in 0..count {
+        let value = if exhausted {
+            Value::undefined()
+        } else {
+            let padding_iter = zip_anchor(ctx, padding_iter_slot);
+            let step = ctx.cx.with_parts(|interp, stack| {
+                interp.iterator_next_full(exec_ctx, stack, &padding_iter)
+            });
+            let (value, done) = step
+                .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, name))?;
+            if done {
+                exhausted = true;
+                Value::undefined()
+            } else {
+                value
+            }
+        };
+        zip_append(
+            ctx,
+            slot,
+            crate::iterator_ops::ZipList::Padding,
+            value,
+            name,
+        )?;
+    }
+    let outcome = if exhausted {
+        Ok(())
+    } else {
+        let padding_iter = zip_anchor(ctx, padding_iter_slot);
+        ctx.with_turn_parts(|interp, stack| {
+            interp.iterator_close_value_sync(stack, exec_ctx, Value::iterator(padding_iter))
+        })
+        .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, name))
+    };
+    zip_anchor_pop(ctx, padding_iter_slot);
+    outcome
+}
+
+/// `Iterator.zip(iterables [, options])` — steps every input in lockstep
+/// and yields one Array per round.
+///
+/// <https://tc39.es/proposal-joint-iteration/>
+fn iterator_zip_native(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    const NAME: &str = "Iterator.zip";
+    let iterables = args.first().copied().unwrap_or(Value::undefined());
+    if crate::abstract_ops::is_primitive(&iterables) {
+        return Err(crate::NativeError::TypeError {
+            name: NAME,
+            reason: "iterables must be an object".to_string(),
+        });
+    }
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name: NAME,
+                reason: "missing execution context".to_string(),
+            })?;
+    let options = args.get(1).copied().unwrap_or(Value::undefined());
+    let iterables_slot = zip_value_push(ctx, iterables);
+    let (mode, padding_option) = match zip_options(ctx, &exec_ctx, options, NAME) {
+        Ok(options) => options,
+        Err(err) => {
+            zip_anchor_pop(ctx, iterables_slot);
+            return Err(err);
+        }
+    };
+    let padding_slot = zip_value_push(ctx, padding_option);
+    let handle = match zip_new_state(ctx, mode, false, NAME) {
+        Ok(handle) => handle,
+        Err(err) => {
+            zip_anchor_pop(ctx, iterables_slot);
+            return Err(err);
+        }
+    };
+    let slot = zip_anchor_push(ctx, handle);
+    let built = iterator_zip_collect(ctx, &exec_ctx, slot, iterables_slot, mode, padding_slot);
+    let result = built.map(|()| Value::iterator(zip_anchor(ctx, slot)));
+    zip_anchor_pop(ctx, iterables_slot);
+    result
+}
+
+/// Collect `Iterator.zip`'s inputs (and its padding) into the helper
+/// anchored at `slot`.
+fn iterator_zip_collect(
+    ctx: &mut crate::NativeCtx<'_>,
+    exec_ctx: &crate::ExecutionContext,
+    slot: usize,
+    iterables_slot: usize,
+    mode: crate::iterator_state::ZipMode,
+    padding_slot: usize,
+) -> Result<(), crate::NativeError> {
+    const NAME: &str = "Iterator.zip";
+    // §7.4.3 GetIterator(iterables, sync) — unlike the per-input
+    // flattenable walk, a missing `@@iterator` here is a TypeError.
+    let iterables = zip_value(ctx, iterables_slot);
+    let input_iter = zip_strict_iterator(ctx, exec_ctx, iterables, NAME)?;
+    let input_slot = zip_anchor_push(ctx, input_iter);
+    loop {
+        let input_iter = zip_anchor(ctx, input_slot);
+        let step = ctx
+            .cx
+            .with_parts(|interp, stack| interp.iterator_next_full(exec_ctx, stack, &input_iter));
+        let (value, done) = match step {
+            Ok(step) => step,
+            Err(err) => {
+                zip_close_collected(ctx, exec_ctx, slot);
+                zip_anchor_pop(ctx, input_slot);
+                return Err(crate::native_function::vm_to_native_error(
+                    ctx.cx.interp,
+                    err,
+                    NAME,
+                ));
+            }
+        };
+        if done {
+            break;
+        }
+        match zip_iterator_flattenable(ctx, exec_ctx, value, NAME) {
+            Ok(input) => zip_append(
+                ctx,
+                slot,
+                crate::iterator_ops::ZipList::Inputs,
+                Value::iterator(input),
+                NAME,
+            )?,
+            Err(err) => {
+                zip_close_collected(ctx, exec_ctx, slot);
+                let input_iter = zip_anchor(ctx, input_slot);
+                ctx.with_turn_parts(|interp, stack| {
+                    interp.close_iterator_preserving_throw(stack, exec_ctx, &input_iter);
+                });
+                zip_anchor_pop(ctx, input_slot);
+                return Err(err);
+            }
+        }
+    }
+    zip_anchor_pop(ctx, input_slot);
+    if mode == crate::iterator_state::ZipMode::Longest
+        && let Err(err) = zip_padding_list(ctx, exec_ctx, slot, padding_slot, NAME)
+    {
+        // IfAbruptCloseIterators — the inputs collected so far are
+        // closed before the padding failure propagates.
+        zip_close_collected(ctx, exec_ctx, slot);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// `Iterator.zipKeyed(iterables [, options])` — like
+/// [`iterator_zip_native`], but the inputs come from the own enumerable
+/// properties of `iterables` and each round yields a keyed object.
+///
+/// <https://tc39.es/proposal-joint-iteration/>
+fn iterator_zip_keyed_native(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    const NAME: &str = "Iterator.zipKeyed";
+    let iterables = args.first().copied().unwrap_or(Value::undefined());
+    if crate::abstract_ops::is_primitive(&iterables) {
+        return Err(crate::NativeError::TypeError {
+            name: NAME,
+            reason: "iterables must be an object".to_string(),
+        });
+    }
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name: NAME,
+                reason: "missing execution context".to_string(),
+            })?;
+    let options = args.get(1).copied().unwrap_or(Value::undefined());
+    let iterables_slot = zip_value_push(ctx, iterables);
+    let (mode, padding_option) = match zip_options(ctx, &exec_ctx, options, NAME) {
+        Ok(options) => options,
+        Err(err) => {
+            zip_anchor_pop(ctx, iterables_slot);
+            return Err(err);
+        }
+    };
+    let padding_slot = zip_value_push(ctx, padding_option);
+    let handle = match zip_new_state(ctx, mode, true, NAME) {
+        Ok(handle) => handle,
+        Err(err) => {
+            zip_anchor_pop(ctx, iterables_slot);
+            return Err(err);
+        }
+    };
+    let slot = zip_anchor_push(ctx, handle);
+    let built =
+        iterator_zip_keyed_collect(ctx, &exec_ctx, slot, iterables_slot, mode, padding_slot);
+    let result = built.map(|()| Value::iterator(zip_anchor(ctx, slot)));
+    zip_anchor_pop(ctx, iterables_slot);
+    result
+}
+
+/// Collect `Iterator.zipKeyed`'s inputs, keys, and padding into the
+/// helper anchored at `slot`.
+fn iterator_zip_keyed_collect(
+    ctx: &mut crate::NativeCtx<'_>,
+    exec_ctx: &crate::ExecutionContext,
+    slot: usize,
+    iterables_slot: usize,
+    mode: crate::iterator_state::ZipMode,
+    padding_slot: usize,
+) -> Result<(), crate::NativeError> {
+    const NAME: &str = "Iterator.zipKeyed";
+    let iterables = zip_value(ctx, iterables_slot);
+    let all_keys = ctx
+        .with_turn_parts(|interp, stack| {
+            interp.own_property_keys_value(stack, exec_ctx, &iterables)
+        })
+        .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, NAME))?;
+    let keys_slot = zip_value_push(ctx, Value::undefined());
+    for key in all_keys {
+        // Both the pending key and the receiver survive the descriptor
+        // and getter re-entry through the anchor stack.
+        ctx.with_turn_parts(|interp, _| interp.set_iteration_anchor(keys_slot, key));
+        let key = zip_value(ctx, keys_slot);
+        let iterables = zip_value(ctx, iterables_slot);
+        let Some(vm_key) = zip_property_key(&key, ctx.heap()) else {
+            continue;
+        };
+        let descriptor = ctx.with_turn_parts(|interp, stack| {
+            interp
+                .ordinary_get_own_property_descriptor_value(stack, exec_ctx, iterables, &vm_key, 0)
+        });
+        let descriptor = match descriptor {
+            Ok(descriptor) => descriptor,
+            Err(err) => {
+                zip_close_collected(ctx, exec_ctx, slot);
+                return Err(crate::native_function::vm_to_native_error(
+                    ctx.cx.interp,
+                    err,
+                    NAME,
+                ));
+            }
+        };
+        if !descriptor.as_ref().is_some_and(|d| d.enumerable()) {
+            continue;
+        }
+        let outcome = ctx.with_turn_parts(|interp, stack| {
+            interp.ordinary_get_value(stack, exec_ctx, iterables, iterables, &vm_key, 0)
+        });
+        let value = match outcome {
+            Ok(crate::VmGetOutcome::Value(v)) => v,
+            Ok(crate::VmGetOutcome::InvokeGetter { getter }) => {
+                match ctx.call(getter, iterables, &[]) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        zip_close_collected(ctx, exec_ctx, slot);
+                        return Err(err);
+                    }
+                }
+            }
+            Err(err) => {
+                zip_close_collected(ctx, exec_ctx, slot);
+                return Err(crate::native_function::vm_to_native_error(
+                    ctx.cx.interp,
+                    err,
+                    NAME,
+                ));
+            }
+        };
+        if value.is_undefined() {
+            continue;
+        }
+        match zip_iterator_flattenable(ctx, exec_ctx, value, NAME) {
+            Ok(input) => {
+                let key = zip_value(ctx, keys_slot);
+                zip_append(ctx, slot, crate::iterator_ops::ZipList::Keys, key, NAME)?;
+                zip_append(
+                    ctx,
+                    slot,
+                    crate::iterator_ops::ZipList::Inputs,
+                    Value::iterator(input),
+                    NAME,
+                )?;
+            }
+            Err(err) => {
+                zip_close_collected(ctx, exec_ctx, slot);
+                return Err(err);
+            }
+        }
+    }
+    zip_anchor_pop(ctx, keys_slot);
+    if mode == crate::iterator_state::ZipMode::Longest
+        && let Err(err) = zip_keyed_padding_list(ctx, exec_ctx, slot, padding_slot, NAME)
+    {
+        zip_close_collected(ctx, exec_ctx, slot);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// `"longest"` padding for `zipKeyed`: one `Get(padding, key)` per
+/// captured key.
+fn zip_keyed_padding_list(
+    ctx: &mut crate::NativeCtx<'_>,
+    exec_ctx: &crate::ExecutionContext,
+    slot: usize,
+    padding_slot: usize,
+    name: &'static str,
+) -> Result<(), crate::NativeError> {
+    let count = zip_input_count(ctx, slot);
+    for index in 0..count {
+        let padding_option = zip_value(ctx, padding_slot);
+        let value = if padding_option.is_undefined() {
+            Value::undefined()
+        } else {
+            let key = ctx.cx.interp.zip_list_entry(
+                zip_anchor(ctx, slot),
+                crate::iterator_ops::ZipList::Keys,
+                index,
+            );
+            let Some(vm_key) = zip_property_key(&key, ctx.heap()) else {
+                zip_append(
+                    ctx,
+                    slot,
+                    crate::iterator_ops::ZipList::Padding,
+                    Value::undefined(),
+                    name,
+                )?;
+                continue;
+            };
+            let outcome = ctx.with_turn_parts(|interp, stack| {
+                interp
+                    .ordinary_get_value(stack, exec_ctx, padding_option, padding_option, &vm_key, 0)
+                    .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))
+            })?;
+            match outcome {
+                crate::VmGetOutcome::Value(v) => v,
+                crate::VmGetOutcome::InvokeGetter { getter } => {
+                    ctx.call(getter, padding_option, &[])?
+                }
+            }
+        };
+        zip_append(
+            ctx,
+            slot,
+            crate::iterator_ops::ZipList::Padding,
+            value,
+            name,
+        )?;
+    }
+    Ok(())
+}
+
+/// String / Symbol property key from an own-keys entry.
+fn zip_property_key(key: &Value, heap: &otter_gc::GcHeap) -> Option<crate::VmPropertyKey<'static>> {
+    if let Some(text) = key.as_string(heap) {
+        return Some(crate::VmPropertyKey::OwnedString(
+            text.to_lossy_string(heap),
+        ));
+    }
+    key.as_symbol(heap).map(crate::VmPropertyKey::Symbol)
+}
+
 fn iterator_from_native(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],

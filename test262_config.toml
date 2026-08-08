@@ -46,10 +46,6 @@ skip_features = [
     # --- Immutable ArrayBuffer (Stage 3, not finalized) ---
     "immutable-arraybuffer",
 
-    # --- Iterator sequencing & joint iteration (Stage 2.7/3) ---
-    "iterator-sequencing",
-    "joint-iteration",
-
     # --- Decorators (Stage 3, not yet in ECMA-262) ---
     "decorators",
 ]

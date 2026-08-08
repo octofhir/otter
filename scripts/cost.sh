@@ -26,6 +26,7 @@ WARMUP="${WARMUP:-8}"
 KERNELS=(
   "method-call-monomorphic 500003500000"
   "numeric-leaf           -700000"
+  "typed-parameter-loop    300000"
   "branch-phi             -6000000"
   "dense-array            5234688"
   "boxed-double-property  4000000"

@@ -8,7 +8,10 @@
 //!   comparison.
 //!
 //! # Invariants
-//! - Every accepted parameter is guarded as a JavaScript Number before effects.
+//! - Every accepted parameter is guarded as the inferred numeric representation
+//!   before effects; inference specializes only feedback-proven Int32 inputs.
+//! - Parameters outside the exact entry live-in set have no HIR value, load,
+//!   guard, or allocator interval.
 //! - Accepted nodes cannot allocate, touch the heap, throw, or reenter JS;
 //!   exact scalar coercions may lower to declared pure numeric leaves.
 //! - Register merges become typed block parameters. Only loop-header OSR
@@ -40,7 +43,10 @@ pub(super) enum NumericType {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum NumericNode {
-    Parameter(u16),
+    Parameter {
+        register: u16,
+        value_type: NumericType,
+    },
     BlockParameter(NumericType),
     IntegerConstant(i32),
     BooleanConstant(bool),
@@ -133,8 +139,8 @@ impl NumericNode {
             | Self::IntegerNotEqualImmediate(..)
             | Self::BlockParameter(NumericType::Boolean) => NumericType::Boolean,
             Self::BooleanConstant(..) => NumericType::Boolean,
-            Self::Parameter(..)
-            | Self::BlockParameter(NumericType::Number)
+            Self::Parameter { value_type, .. } => value_type,
+            Self::BlockParameter(NumericType::Number)
             | Self::Constant(..)
             | Self::WidenInt32(..)
             | Self::WidenUint32(..)
@@ -242,6 +248,8 @@ impl NumericFunction {
         }
 
         let raw_blocks = build_raw_blocks(view)?;
+        let parameter_types =
+            infer_parameter_types(view, &raw_blocks, parameter_count, register_count)?;
         let live_in = build_liveness(view, &raw_blocks, register_count)?;
         let instruction_live_in =
             build_instruction_liveness(view, &raw_blocks, &live_in, register_count)?;
@@ -249,7 +257,16 @@ impl NumericFunction {
         let mut entry = vec![RegisterState::Unset; usize::from(register_count)];
         let mut entry_nodes = Vec::with_capacity(parameter_count as usize);
         for parameter in 0..parameter_count {
-            let value = push(&mut nodes, NumericNode::Parameter(parameter));
+            if !live_in[0][usize::from(parameter)] {
+                continue;
+            }
+            let value = push(
+                &mut nodes,
+                NumericNode::Parameter {
+                    register: parameter,
+                    value_type: parameter_types[usize::from(parameter)],
+                },
+            );
             entry[usize::from(parameter)] = RegisterState::Value(value);
             entry_nodes.push(value);
         }
@@ -368,7 +385,7 @@ impl NumericFunction {
             for edge in 0..blocks[predecessor].successors.len() {
                 let successor = blocks[predecessor].successors[edge];
                 let successor_registers = blocks[successor].parameter_registers.clone();
-                blocks[predecessor].successor_arguments[edge] = successor_registers
+                let arguments = successor_registers
                     .iter()
                     .map(
                         |&register| match out_states[predecessor][usize::from(register)] {
@@ -377,6 +394,14 @@ impl NumericFunction {
                         },
                     )
                     .collect::<Option<Vec<_>>>()?;
+                if arguments.iter().zip(&blocks[successor].parameters).any(
+                    |(&argument, &parameter)| {
+                        value_type(&nodes, argument) != value_type(&nodes, parameter)
+                    },
+                ) {
+                    return None;
+                }
+                blocks[predecessor].successor_arguments[edge] = arguments;
             }
         }
 
@@ -412,6 +437,143 @@ impl NumericFunction {
             arithmetic_op_count,
         })
     }
+}
+
+fn infer_parameter_types(
+    view: &JitCompileSnapshot,
+    blocks: &[RawBlock],
+    parameter_count: u16,
+    register_count: u16,
+) -> Option<Vec<NumericType>> {
+    let code = view.code_block.as_ref();
+    let width = usize::from(register_count);
+    let mut entry = vec![0_u16; width];
+    for parameter in 0..parameter_count {
+        entry[usize::from(parameter)] = 1_u16.checked_shl(u32::from(parameter))?;
+    }
+    let mut out_origins = vec![vec![0_u16; width]; blocks.len()];
+    let mut int32_parameters = 0_u16;
+
+    loop {
+        let mut changed = false;
+        for (block_index, block) in blocks.iter().enumerate() {
+            let mut origins = if block_index == 0 {
+                entry.clone()
+            } else {
+                let mut merged = vec![0_u16; width];
+                for &predecessor in &block.predecessors {
+                    for (destination, &source) in merged.iter_mut().zip(&out_origins[predecessor]) {
+                        *destination |= source;
+                    }
+                }
+                merged
+            };
+            for pc in block.start..block.end {
+                infer_instruction_parameters(
+                    view.instructions.get(pc)?,
+                    code,
+                    &mut origins,
+                    &mut int32_parameters,
+                )?;
+            }
+            if origins != out_origins[block_index] {
+                out_origins[block_index] = origins;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Some(
+                (0..parameter_count)
+                    .map(|parameter| {
+                        let bit = 1_u16 << parameter;
+                        if int32_parameters & bit != 0 {
+                            NumericType::Int32
+                        } else {
+                            NumericType::Number
+                        }
+                    })
+                    .collect(),
+            );
+        }
+    }
+}
+
+fn infer_instruction_parameters(
+    instruction: &JitInstructionMetadata,
+    code: &otter_vm::CodeBlock,
+    origins: &mut [u16],
+    int32_parameters: &mut u16,
+) -> Option<()> {
+    let read = |register: u16| origins.get(usize::from(register)).copied();
+    let op = instruction.op(code);
+    match op {
+        Op::StoreLocal => {
+            let source = read(register(instruction, code, 0)?)?;
+            *origins.get_mut(usize::from(local_index(instruction, code, 1)?))? = source;
+        }
+        Op::LoadLocal => {
+            let source = read(local_index(instruction, code, 1)?)?;
+            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = source;
+        }
+        Op::LoadUndefined | Op::LoadTrue | Op::LoadFalse | Op::LoadInt32 | Op::LoadNumber => {
+            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
+        }
+        Op::ToPrimitive | Op::ToNumeric | Op::ToNumber => {
+            let source = read(register(instruction, code, 1)?)?;
+            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = source;
+        }
+        Op::Neg | Op::Increment | Op::AddImm | Op::SubImm => {
+            let source = read(register(instruction, code, 1)?)?;
+            if instruction.arith_feedback().is_int32_only() {
+                *int32_parameters |= source;
+                *origins.get_mut(usize::from(register(instruction, code, 0)?))? = source;
+            } else {
+                *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
+            }
+        }
+        Op::Add | Op::Sub | Op::Mul => {
+            let left = read(register(instruction, code, 1)?)?;
+            let right = read(register(instruction, code, 2)?)?;
+            let destination = usize::from(register(instruction, code, 0)?);
+            if instruction.arith_feedback().is_int32_only() {
+                *int32_parameters |= left | right;
+                *origins.get_mut(destination)? = left | right;
+            } else {
+                *origins.get_mut(destination)? = 0;
+            }
+        }
+        Op::Equal | Op::NotEqual | Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
+            if instruction.arith_feedback().is_int32_only() {
+                *int32_parameters |=
+                    read(register(instruction, code, 1)?)? | read(register(instruction, code, 2)?)?;
+            }
+            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
+        }
+        Op::LessThanImm | Op::EqualImm | Op::NotEqualImm => {
+            if instruction.arith_feedback().is_int32_only() {
+                *int32_parameters |= read(register(instruction, code, 1)?)?;
+            }
+            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
+        }
+        Op::Div
+        | Op::Rem
+        | Op::Pow
+        | Op::ToBoolean
+        | Op::LogicalNot
+        | Op::BitwiseNot
+        | Op::BitwiseAndImm
+        | Op::BitwiseAnd
+        | Op::BitwiseOr
+        | Op::BitwiseXor
+        | Op::Shl
+        | Op::Shr
+        | Op::Ushr => {
+            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
+        }
+        Op::JumpIfTrue | Op::JumpIfFalse | Op::ReturnValue | Op::Nop | Op::Jump => {}
+        _ => return None,
+    }
+    Some(())
 }
 
 fn build_raw_blocks(view: &JitCompileSnapshot) -> Option<Vec<RawBlock>> {

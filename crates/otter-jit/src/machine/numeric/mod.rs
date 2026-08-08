@@ -181,10 +181,15 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
     let values = (0..hir.nodes.len())
         .map(|index| MachineValue(index as u32))
         .collect::<Vec<_>>();
-    let mut tagged_parameters = Vec::with_capacity(hir.parameter_count as usize);
-    for _ in 0..hir.parameter_count {
-        let tagged = push_value(&mut representations, MachineRepresentation::Tagged);
-        tagged_parameters.push(tagged);
+    let mut tagged_parameters = vec![None; hir.parameter_count as usize];
+    for node in &hir.nodes {
+        let NumericNode::Parameter { register, .. } = node else {
+            continue;
+        };
+        tagged_parameters[usize::from(*register)] = Some(push_value(
+            &mut representations,
+            MachineRepresentation::Tagged,
+        ));
     }
 
     let selection_cfg = SelectionCfg::build(hir);
@@ -236,12 +241,13 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
         };
         let block = &hir.blocks[block_index];
         if block_index == 0 {
-            for parameter in 0..hir.parameter_count {
+            for (parameter, &tagged) in tagged_parameters.iter().enumerate() {
+                let Some(tagged) = tagged else {
+                    continue;
+                };
                 instructions.push(MachineInstruction::plain(
-                    MachineOpcode::EntryValue(parameter),
-                    vec![MachineOperand::register_output(
-                        tagged_parameters[usize::from(parameter)],
-                    )],
+                    MachineOpcode::EntryValue(parameter as u16),
+                    vec![MachineOperand::register_output(tagged)],
                 ));
             }
         }
@@ -319,14 +325,27 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                 continue;
             }
             let mut instruction = match node {
-                NumericNode::Parameter(parameter) => {
-                    let tagged = tagged_parameters[usize::from(parameter)];
+                NumericNode::Parameter {
+                    register,
+                    value_type,
+                } => {
+                    let tagged = tagged_parameters[usize::from(register)]
+                        .expect("live HIR parameter has an entry value");
+                    let opcode = match value_type {
+                        NumericType::Int32 => MachineOpcode::DecodeInt32,
+                        NumericType::Number => MachineOpcode::DecodeNumber,
+                        NumericType::Uint32 | NumericType::Boolean => {
+                            unreachable!("parameter inference emits only Int32 or Number")
+                        }
+                    };
+                    let output = if value_type == NumericType::Int32 {
+                        MachineOperand::register_reuse_output(result, 0)
+                    } else {
+                        MachineOperand::register_output(result)
+                    };
                     MachineInstruction::plain(
-                        MachineOpcode::DecodeNumber,
-                        vec![
-                            MachineOperand::register_input(tagged),
-                            MachineOperand::register_output(result),
-                        ],
+                        opcode,
+                        vec![MachineOperand::register_input(tagged), output],
                     )
                 }
                 NumericNode::BlockParameter(_) => continue,
@@ -918,6 +937,176 @@ mod tests {
         numeric_view(1, 10, instructions)
     }
 
+    fn typed_parameter_leaf_view() -> JitCompileSnapshot {
+        let mut view = numeric_view(
+            2,
+            10,
+            vec![
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::Mul,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(2),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::Sub,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(3),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(5),
+                        Operand::Register(4),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::Mul,
+                    vec![
+                        Operand::Register(6),
+                        Operand::Register(5),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::Sub,
+                    vec![
+                        Operand::Register(7),
+                        Operand::Register(6),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::Div,
+                    vec![
+                        Operand::Register(8),
+                        Operand::Register(7),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::Neg, vec![Operand::Register(9), Operand::Register(8)]),
+                (Op::ReturnValue, vec![Operand::Register(9)]),
+            ],
+        );
+        for pc in 0..=5 {
+            view.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(ARITH_INT32));
+        }
+        view
+    }
+
+    fn typed_parameter_overflow_view() -> JitCompileSnapshot {
+        let mut view = numeric_view(
+            2,
+            3,
+            vec![
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        );
+        view.seed_arith_feedback_for_test(0, ArithFeedback::from_bits(ARITH_INT32));
+        view
+    }
+
+    fn typed_parameter_alias_view() -> JitCompileSnapshot {
+        let mut view = numeric_view(
+            1,
+            4,
+            vec![
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(0), Operand::Imm32(2)],
+                ),
+                (Op::LoadLocal, vec![Operand::Register(1), Operand::Imm32(2)]),
+                (
+                    Op::AddImm,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(1),
+                        Operand::Imm32(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(3)]),
+            ],
+        );
+        view.seed_arith_feedback_for_test(2, ArithFeedback::from_bits(ARITH_INT32));
+        view
+    }
+
+    fn typed_parameter_loop_view() -> JitCompileSnapshot {
+        let mut view = numeric_view(
+            2,
+            8,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(0)]),
+                (Op::LoadInt32, vec![Operand::Register(3), Operand::Imm32(0)]),
+                (
+                    Op::LessThan,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(3),
+                        Operand::Register(0),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(5), Operand::Register(4)],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(5),
+                        Operand::Register(2),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(5), Operand::Imm32(2)],
+                ),
+                (
+                    Op::AddImm,
+                    vec![
+                        Operand::Register(6),
+                        Operand::Register(3),
+                        Operand::Imm32(1),
+                    ],
+                ),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(6), Operand::Imm32(3)],
+                ),
+                (Op::Jump, vec![Operand::Imm32(-7)]),
+                (Op::LoadLocal, vec![Operand::Register(7), Operand::Imm32(2)]),
+                (Op::ReturnValue, vec![Operand::Register(7)]),
+            ],
+        );
+        for pc in [2_u32, 4, 6] {
+            view.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(ARITH_INT32));
+        }
+        view
+    }
+
     fn small_leaf_view() -> JitCompileSnapshot {
         numeric_view(
             1,
@@ -925,6 +1114,17 @@ mod tests {
             vec![
                 (Op::Neg, vec![Operand::Register(1), Operand::Register(0)]),
                 (Op::ReturnValue, vec![Operand::Register(1)]),
+            ],
+        )
+    }
+
+    fn unused_parameter_view() -> JitCompileSnapshot {
+        numeric_view(
+            2,
+            3,
+            vec![
+                (Op::Neg, vec![Operand::Register(2), Operand::Register(1)]),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
             ],
         )
     }
@@ -2355,6 +2555,191 @@ mod tests {
 
         assert_eq!(ret.status, STATUS_RETURNED);
         assert_eq!(ret.value, tag::box_int32(-9));
+    }
+
+    #[test]
+    fn feedback_specializes_numeric_parameters_until_a_float64_boundary() {
+        let view = typed_parameter_leaf_view();
+        let hir = NumericFunction::build(&view).expect("typed parameter numeric HIR");
+        assert!(matches!(
+            hir.nodes[0],
+            NumericNode::Parameter {
+                register: 0,
+                value_type: NumericType::Int32
+            }
+        ));
+        assert!(matches!(
+            hir.nodes[1],
+            NumericNode::Parameter {
+                register: 1,
+                value_type: NumericType::Int32
+            }
+        ));
+        assert_eq!(
+            hir.nodes
+                .iter()
+                .filter(|node| matches!(node, NumericNode::WidenInt32(..)))
+                .count(),
+            2
+        );
+
+        let sequence = select(&hir).expect("typed parameter Machine IR");
+        assert_eq!(
+            sequence
+                .instructions()
+                .iter()
+                .filter(|instruction| instruction.opcode == MachineOpcode::DecodeInt32)
+                .count(),
+            2
+        );
+        assert!(sequence.instructions().iter().all(|instruction| {
+            instruction.opcode != MachineOpcode::DecodeInt32
+                || instruction.operands[1].constraint == OperandConstraint::Reuse(0)
+        }));
+        assert_eq!(
+            sequence
+                .instructions()
+                .iter()
+                .filter(|instruction| {
+                    matches!(
+                        instruction.opcode,
+                        MachineOpcode::IntegerAdd
+                            | MachineOpcode::IntegerSub
+                            | MachineOpcode::IntegerMul
+                    )
+                })
+                .count(),
+            6
+        );
+
+        let code = compile_output(&view, None).code;
+        let (result, _, _) = execute(&code, &[tag::box_int32(2), tag::box_int32(2)], 0);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, tag::box_int32(-7));
+
+        let (bail, frame, pc) = execute(&code, &[boxed_f64(2.5), tag::box_int32(2)], 77);
+        assert_eq!(bail.status, STATUS_BAILED);
+        assert_eq!(pc, 0);
+        assert_eq!(frame[0], boxed_f64(2.5));
+        assert_eq!(frame[1], tag::box_int32(2));
+    }
+
+    #[test]
+    fn parameter_inference_tracks_copy_aliases_without_specializing_bitwise_coercions() {
+        let alias = NumericFunction::build(&typed_parameter_alias_view())
+            .expect("copy-alias typed parameter HIR");
+        assert!(matches!(
+            alias.nodes[0],
+            NumericNode::Parameter {
+                value_type: NumericType::Int32,
+                ..
+            }
+        ));
+        let (result, _, _) = execute(
+            &compile_output(&typed_parameter_alias_view(), None).code,
+            &[tag::box_int32(41)],
+            0,
+        );
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, tag::box_int32(42));
+
+        let bitwise = NumericFunction::build(&float_bitwise_view(Op::BitwiseAnd))
+            .expect("bitwise numeric HIR");
+        assert!(matches!(
+            bitwise.nodes[0],
+            NumericNode::Parameter {
+                value_type: NumericType::Number,
+                ..
+            }
+        ));
+        assert!(matches!(
+            bitwise.nodes[1],
+            NumericNode::Parameter {
+                value_type: NumericType::Number,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn typed_parameter_overflow_reconstructs_the_exact_entry_frame() {
+        let code = compile_output(&typed_parameter_overflow_view(), None).code;
+        let (result, frame, pc) =
+            execute(&code, &[tag::box_int32(i32::MAX), tag::box_int32(1)], 91);
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(pc, 0);
+        assert_eq!(
+            frame,
+            [
+                tag::box_int32(i32::MAX),
+                tag::box_int32(1),
+                Value::undefined().to_bits()
+            ]
+        );
+    }
+
+    #[test]
+    fn dead_parameters_have_no_entry_load_guard_or_allocator_value() {
+        let view = unused_parameter_view();
+        let hir = NumericFunction::build(&view).expect("live-only parameter HIR");
+        assert_eq!(
+            hir.nodes
+                .iter()
+                .filter_map(|node| match node {
+                    NumericNode::Parameter { register, .. } => Some(*register),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        let sequence = select(&hir).expect("live-only parameter Machine IR");
+        assert_eq!(
+            sequence
+                .instructions()
+                .iter()
+                .filter_map(|instruction| match instruction.opcode {
+                    MachineOpcode::EntryValue(parameter) => Some(parameter),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [1]
+        );
+
+        let code = compile_output(&view, None).code;
+        let (result, _, _) = execute(&code, &[Value::undefined().to_bits(), tag::box_int32(9)], 0);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, tag::box_int32(-9));
+    }
+
+    #[test]
+    fn typed_parameters_publish_a_complete_integer_loop() {
+        let view = typed_parameter_loop_view();
+        let hir = NumericFunction::build(&view).expect("typed parameter loop HIR");
+        assert!(hir.nodes[..2].iter().all(|node| matches!(
+            node,
+            NumericNode::Parameter {
+                value_type: NumericType::Int32,
+                ..
+            }
+        )));
+        let sequence = select(&hir).expect("typed parameter loop Machine IR");
+        sequence
+            .allocate(&TargetRegisterFile::aarch64_numeric_function())
+            .expect("typed parameter loop allocation");
+
+        let code = compile_output(&view, None).code;
+        let (result, _, _) = execute(&code, &[tag::box_int32(10), tag::box_int32(3)], 0);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, tag::box_int32(30));
+        // SAFETY: the code object remains alive for the pointer lookup.
+        assert!(unsafe { code.osr_entry_ptr_for_test(2) }.is_some());
+    }
+
+    #[test]
+    fn inconsistent_loop_backedge_representations_decline_before_selection() {
+        let mut view = typed_parameter_loop_view();
+        view.seed_arith_feedback_for_test(4, ArithFeedback::from_bits(ARITH_INT32 | ARITH_FLOAT64));
+        assert!(NumericFunction::build(&view).is_none());
     }
 
     #[test]

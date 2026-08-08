@@ -305,6 +305,16 @@ pub(super) fn emit(
                     bail,
                 );
             }
+            MachineOpcode::DecodeInt32 => {
+                let source = integer_register(locations[0])?;
+                let destination = integer_register(locations[1])?;
+                if source != destination {
+                    return Err(Unsupported::OperandShape(
+                        "numeric Int32 decode reuse allocation",
+                    ));
+                }
+                emit_decode_int32(&mut ops, source, bail);
+            }
             MachineOpcode::FloatConstant(bits) => {
                 emit_load_u64(&mut ops, 16, bits);
                 let destination = float_register(locations[0])?;
@@ -980,6 +990,20 @@ fn emit_decode_number(
         ; sub x17, X(source), x16
         ; fmov D(destination), x17
         ; =>done
+    );
+}
+
+fn emit_decode_int32(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    source: u8,
+    bail: dynasmrt::DynamicLabel,
+) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz x16, NUMBER_TAG_HI16, lsl #48
+        ; and x17, X(source), x16
+        ; cmp x17, x16
+        ; b.ne =>bail
     );
 }
 

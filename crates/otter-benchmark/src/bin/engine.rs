@@ -19,6 +19,10 @@
 //!   prepared module once.
 //! - Feedback seeding, JIT snapshot construction, and compiler-hook
 //!   construction are outside native-emitter samples.
+//! - Feedback seed calls stay interpreted so hot loops cannot OSR before every
+//!   operation has contributed type feedback to the measured snapshot.
+//! - Optimizing compile samples are accepted only when an untimed artifact
+//!   proof identifies the replacement Machine IR backend for the same snapshot.
 //! - Every idle-memory sample owns a fresh release process and runtime.
 //! - Idle-memory diagnostics allocate only in the benchmark process; ordinary
 //!   runtime construction does not enable background sampling.
@@ -51,9 +55,9 @@ use otter_jit::OtterJitCompiler;
 use otter_runtime::{JitSelection, Runtime, SourceInput, module_graph::ModulePhaseTimings};
 use otter_syntax::SourceKind;
 use otter_vm::{
-    ExecutionContext, Interpreter, JitArtifactIdentity, JitCompileError, JitCompileRequest,
-    JitCompileStatus, JitCompilerHook, JitDebugRequest, JitExecOutcome, JitFunctionCode,
-    JitRuntimeStats, JitRuntimeStubBinding, VmRuntimeActivation,
+    ExecutionContext, Interpreter, JitArtifactFileName, JitArtifactIdentity, JitCompileError,
+    JitCompileRequest, JitCompileStatus, JitCompilerHook, JitDebugRequest, JitExecOutcome,
+    JitFunctionCode, JitRuntimeStats, JitRuntimeStubBinding, VmRuntimeActivation,
 };
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -1375,13 +1379,25 @@ fn invoke_numeric_target(
     arguments: &[f64],
 ) -> Result<otter_vm::Value, otter_vm::VmError> {
     let mut values = SmallVec::<[otter_vm::Value; 8]>::new();
-    values.extend(arguments.iter().copied().map(otter_vm::Value::number_f64));
+    values.extend(arguments.iter().copied().map(canonical_benchmark_number));
     interpreter.run_callable_sync(
         context,
         &otter_vm::Value::function_id(function_id),
         otter_vm::Value::undefined(),
         values,
     )
+}
+
+fn canonical_benchmark_number(value: f64) -> otter_vm::Value {
+    if value.fract() == 0.0
+        && !(value == 0.0 && value.is_sign_negative())
+        && value >= f64::from(i32::MIN)
+        && value <= f64::from(i32::MAX)
+    {
+        otter_vm::Value::number_i32(value as i32)
+    } else {
+        otter_vm::Value::number_f64(value)
+    }
 }
 
 #[derive(Debug)]
@@ -1648,6 +1664,7 @@ fn run_jit_compile(
     if compile_tier == CompileTier::Optimizing {
         let feedback_hook: Arc<dyn JitCompilerHook> = compiler.clone();
         feedback_interpreter.set_jit_compiler(Some(feedback_hook));
+        feedback_interpreter.set_jit_osr_threshold(u32::MAX);
     }
     for seed in 0..ENGINE_COMPILE_FEEDBACK_SEED_CALLS {
         let value = match invoke_numeric_target(
@@ -1749,6 +1766,58 @@ fn run_jit_compile(
             "measured artifact is OSR-only and cannot validate function entry".into(),
         );
     }
+    let backend = if compile_tier == CompileTier::Optimizing {
+        let request = compile_request(&view, &function_name, &module_name, true);
+        let (_, artifact) = match compile_once(compiler.as_ref(), compile_tier, request) {
+            Ok(compiled) => compiled,
+            Err(error) => {
+                return fail(
+                    RunFailureKind::Compile,
+                    format!("backend artifact proof failed: {error}"),
+                );
+            }
+        };
+        let Some(artifact) = artifact else {
+            return fail(
+                RunFailureKind::Validation,
+                "optimizing compiler omitted the requested backend artifact".into(),
+            );
+        };
+        let Some(optimized_ir) = artifact.file(JitArtifactFileName::OptimizedIr) else {
+            return fail(
+                RunFailureKind::Validation,
+                "optimizing backend artifact omitted optimized-ir.txt".into(),
+            );
+        };
+        if !optimized_ir
+            .contents()
+            .starts_with(b"; backend=otter-machine-ir numeric-function\n")
+        {
+            let feedback = view
+                .instructions
+                .iter()
+                .filter_map(|instruction| {
+                    let feedback = instruction.arith_feedback();
+                    (!feedback.is_empty()).then(|| {
+                        format!(
+                            "{}:{:?}=0x{:02x}",
+                            instruction.instruction_pc(&view.code_block),
+                            instruction.op(&view.code_block),
+                            feedback.bits()
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            return fail(
+                RunFailureKind::Validation,
+                format!("optimizing compile escaped to the legacy backend; feedback={feedback}"),
+            );
+        }
+        "otter-machine-ir"
+    } else {
+        "template"
+    };
     let returned_entries = Arc::new(AtomicU64::new(0));
     let observed_code: Arc<dyn JitFunctionCode> = Arc::new(ObservedJitCode {
         code: validation_code,
@@ -1815,7 +1884,7 @@ fn run_jit_compile(
         primary_metric: "compile-time",
         measurements,
         validation_marker: Some(format!(
-            "return={expected};bits=0x{:016x};compiled={function_name};tier={};arguments={};code_bytes={code_bytes}",
+            "return={expected};bits=0x{:016x};compiled={function_name};tier={};backend={backend};arguments={};code_bytes={code_bytes}",
             expected.to_bits(),
             compile_tier.cli(),
             arguments
@@ -2764,6 +2833,14 @@ mod tests {
     }
 
     #[test]
+    fn compile_arguments_use_canonical_javascript_number_representations() {
+        assert!(canonical_benchmark_number(2.0).is_int32());
+        assert!(!canonical_benchmark_number(2.5).is_int32());
+        assert!(!canonical_benchmark_number(-0.0).is_int32());
+        assert_eq!(canonical_benchmark_number(-0.0).as_f64(), Some(-0.0));
+    }
+
+    #[test]
     fn kernel_reuses_one_interpreter_and_rejects_wrong_checksum() {
         let source_path = std::env::temp_dir().join(format!(
             "otter-engine-kernel-test-{}.js",
@@ -2851,7 +2928,29 @@ mod tests {
             record
                 .validation_marker
                 .as_deref()
-                .is_some_and(|marker| marker.contains("tier=optimizing"))
+                .is_some_and(|marker| marker.contains("tier=optimizing;backend=otter-machine-ir"))
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn jit_compile_executes_typed_parameter_loop_through_machine_ir() {
+        let record = run_jit_compile(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../benchmarks/scripts/typed-parameter-loop.js"),
+            "engineTypedParameterLoop".into(),
+            300_000.0,
+            CompileTier::Optimizing,
+            vec![100_000.0, 3.0],
+            1,
+            0,
+        );
+        assert!(record.failure.is_none(), "{:?}", record.failure);
+        assert!(
+            record
+                .validation_marker
+                .as_deref()
+                .is_some_and(|marker| marker.contains("backend=otter-machine-ir"))
         );
     }
 

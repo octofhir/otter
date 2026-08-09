@@ -1,19 +1,17 @@
-//! Compiled class-construction transitions.
+//! Interpreter-owned class-construction helpers.
 //!
 //! # Contents
 //! - Single-implementation value/register helpers for `BindThisValue`,
 //!   `ClassCheck`, and `SetFunctionName`, shared by interpreter and compiled
-//!   transitions.
+//!   dispatch.
 //!
 //! # Invariants
-//! - No class-construction semantics are duplicated in JIT code; interpreter
-//!   and JIT entries call the same VM value operation.
+//! - Compiled activations use [`crate::RuntimeCall::class_op`] and never recover
+//!   a materialized frame index through this module.
 //! - A committed binding/name effect is never replayed by an exact side exit.
 //!
 //! # See also
 //! - [`crate::abstract_ops::is_constructor`]
-
-use otter_bytecode::Op;
 
 use crate::{
     ExecutionContext, Interpreter, VmError, abstract_ops, activation_stack::ActivationStack,
@@ -179,45 +177,6 @@ impl Interpreter {
             })?;
         }
         stack[top_idx].advance_pc()?;
-        Ok(())
-    }
-
-    /// Complete one class-construction opcode for a published compiled frame.
-    pub fn jit_runtime_class_op(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        frame_index: usize,
-        opcode: u8,
-        arg0: u64,
-        arg1: u64,
-        arg2: u64,
-    ) -> Result<(), VmError> {
-        self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-        if frame_index + 1 != stack.len() {
-            return Err(VmError::InvalidOperand);
-        }
-        let saved_pc = stack[frame_index].pc;
-        match opcode {
-            value if value == Op::BindThisValue as u8 => {
-                self.run_bind_this_value_reg(stack, frame_index, arg0 as u16)?;
-            }
-            value if value == Op::ClassCheck as u8 => {
-                self.run_class_check_reg(context, stack, frame_index, arg1 as u32, arg0 as u16)?;
-            }
-            value if value == Op::SetFunctionName as u8 => {
-                self.run_set_function_name_reg(
-                    context,
-                    stack,
-                    frame_index,
-                    arg0 as u16,
-                    arg2 as u16,
-                    arg1 as u32,
-                )?;
-            }
-            _ => return Err(VmError::InvalidOperand),
-        }
-        stack[frame_index].pc = saved_pc;
         Ok(())
     }
 }

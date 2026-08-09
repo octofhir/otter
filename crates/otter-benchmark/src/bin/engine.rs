@@ -3134,6 +3134,45 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
+    fn typed_runtime_boundary_kernel_stays_stack_owned() {
+        let record = run_kernel(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../benchmarks/scripts/typed-runtime-boundary.js"),
+            "engineKernel".into(),
+            10_000_400_000.0,
+            EngineJitTier::ProductionTiered,
+            None,
+            1,
+            1,
+        );
+        assert!(record.failure.is_none(), "{:?}", record.failure);
+        let counter = |needle| {
+            record
+                .measurements
+                .jit_counters
+                .iter()
+                .find(|(name, _)| *name == needle)
+                .map_or(0, |(_, value)| *value)
+        };
+        assert!(
+            counter("jit-generated-calls") > 0,
+            "both typed-boundary callees must execute generated linkage"
+        );
+        assert_eq!(counter("jit-generated-call-deopts"), 0);
+        assert_eq!(counter("jit-generated-template-deopts"), 0);
+        assert_eq!(
+            counter("jit-to-rust-call-transitions"),
+            0,
+            "typed runtime operations must not eject their direct caller"
+        );
+        assert!(
+            counter("jit-compile-attempts") <= 8,
+            "typed completion must not consume the recompilation budget"
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
     fn jit_compile_executes_numeric_leaf_through_production_optimizer() {
         let record = run_jit_compile(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))

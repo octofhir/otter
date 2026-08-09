@@ -10,7 +10,7 @@
 //! - Every result matches the interpreter oracle exactly.
 //!
 //! # See also
-//! - `otter_vm::Interpreter::jit_runtime_scalar_op`
+//! - `otter_vm::RuntimeCall::scalar_op`
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 

@@ -29,11 +29,17 @@
 //! - [`crate::jit::VmRuntimeActivation`] owns the opaque entry-lifetime record.
 //! - [`crate::active_frame`] validates the machine-published frame windows.
 
+mod class_ops;
 mod control;
 mod iterators;
+mod scalar_ops;
+mod value_loads;
 mod value_ops;
 
+pub use class_ops::ClassRuntimeOp;
 pub use iterators::IteratorRuntimeOutcome;
+pub use scalar_ops::ScalarRuntimeOp;
+pub use value_loads::ValueLoadRuntimeOp;
 
 use std::{marker::PhantomData, ptr::NonNull};
 

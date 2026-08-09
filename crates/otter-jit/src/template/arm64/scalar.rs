@@ -3,7 +3,7 @@
 //! # Contents
 //! - Native guarded fast paths for string length, array length, and
 //!   `Array.isArray`.
-//! - Reentrant fallback to the VM-owned scalar register helper.
+//! - Reentrant fallback to the VM-owned typed scalar boundary.
 //! - Uniform success, throw, and exact pre-effect bailout routing.
 //!
 //! # Invariants
@@ -17,7 +17,7 @@
 //!   any observable coercion hook or wrapper allocation.
 //!
 //! # See also
-//! - `otter_vm::Interpreter::jit_runtime_scalar_op`
+//! - `otter_vm::RuntimeCall::scalar_op`
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_bytecode::Op;

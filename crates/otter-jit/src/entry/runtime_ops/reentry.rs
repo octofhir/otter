@@ -6,6 +6,8 @@
 //! - Reentrant construction and closure/function creation.
 //! - Generated base-constructor receiver preparation and return substitution.
 //! - Stack-owned built-in Array iterator collection and spread-result append.
+//! - Typed scalar, static value-load, and class-construction completion for both
+//!   materialized and stack-owned frames.
 //! - Reentrant equality, typed numeric-family, and unary-coercion completion.
 //! - Cooperative backedge polling.
 //!
@@ -13,7 +15,8 @@
 //! Every entry receives a live JIT context whose canonical
 //! [`NativeFrame`](otter_vm::native_abi::NativeFrame) publishes frame/register
 //! roots for the entire call. Raw numeric opcodes and unary-coercion modes are
-//! decoded exactly once at this ABI edge; coercion hint constants are resolved
+//! decoded exactly once at this ABI edge; scalar/load/class opcode words become
+//! typed VM descriptors before semantics begin, and coercion hint constants are resolved
 //! through the canonical frame owner before VM semantics receive typed
 //! requests. Built-in Array spread collection accepts both materialized and
 //! stack-owned frames; observable iterator overrides bail before effects.
@@ -23,7 +26,10 @@
 //! - `super::super::abi` — machine-visible entry context.
 //! - `super::calls` — native activation and generated-call deoptimization.
 
-use otter_vm::{JitExceptionOutcome, NumericRuntimeOp, UnaryCoercionOp, VmError};
+use otter_vm::{
+    ClassRuntimeOp, JitExceptionOutcome, NumericRuntimeOp, ScalarRuntimeOp, UnaryCoercionOp,
+    ValueLoadRuntimeOp, VmError,
+};
 
 use super::super::{JitCtx, JitRet, STATUS_BAILED, STATUS_CONTINUE, STATUS_RETURNED, STATUS_THREW};
 use super::decode_register;
@@ -677,10 +683,9 @@ pub(crate) extern "C" fn jit_variadic_op_stub(
     }
 }
 
-/// Complete one class-construction opcode (`BindThisValue`, `ClassCheck`,
-/// `SetFunctionName`). `0` means the VM committed the opcode and the template
-/// may fall through; `1` reports a parked throw; `2` remains an exact pre-effect
-/// side exit for an absent activation.
+/// Complete one decoded class-construction operation through the canonical
+/// stack-owned runtime boundary. An absent activation is the only pre-effect
+/// side exit; a started operation either commits once or throws.
 pub(crate) extern "C" fn jit_class_op_stub(
     ctx: *mut JitCtx,
     opcode: u64,
@@ -703,28 +708,33 @@ pub(crate) extern "C" fn jit_class_op_stub(
             }
         }
     }
-    let frame_index = match ctx.materialized_frame_index() {
-        Ok(index) => index,
-        Err(_) => return STATUS_BAILED,
-    };
-    let Some(activation) = ctx.checked_activation() else {
-        return STATUS_BAILED;
-    };
-    let vm = unsafe { &mut *activation.vm_ptr() };
-    let stack = unsafe { &mut *activation.stack_ptr() };
-    let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_class_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2) {
-        Ok(()) => {
-            if opcode as u8 == otter_bytecode::Op::BindThisValue as u8
-                && let Err(err) = ctx
-                    .runtime_call()
-                    .and_then(|mut call| call.refresh_materialized_this_value())
-            {
-                park_jit_error(ctx, err);
-                return STATUS_THREW;
+    let operation = match opcode as u8 {
+        value if value == otter_bytecode::Op::BindThisValue as u8 => ClassRuntimeOp::BindThis {
+            source: arg0 as u16,
+        },
+        value if value == otter_bytecode::Op::ClassCheck as u8 => ClassRuntimeOp::Check {
+            register: arg0 as u16,
+            kind: arg1 as u32,
+        },
+        value if value == otter_bytecode::Op::SetFunctionName as u8 => {
+            ClassRuntimeOp::SetFunctionName {
+                function: arg0 as u16,
+                key: arg2 as u16,
+                prefix_index: arg1 as u32,
             }
-            0
         }
+        _ => {
+            park_jit_error(ctx, VmError::InvalidOperand);
+            return STATUS_THREW;
+        }
+    };
+    let result = match ctx.try_runtime_call() {
+        Ok(Some(mut runtime)) => runtime.class_op(operation),
+        Ok(None) => return STATUS_BAILED,
+        Err(err) => Err(err),
+    };
+    match result {
+        Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
             STATUS_THREW
@@ -811,10 +821,8 @@ pub(crate) extern "C" fn jit_construct_op_stub(
     }
 }
 
-/// Complete one static value-load opcode (`MathLoad`, `SymbolLoad`,
-/// `TemporalLoad`, `LoadBigInt`, `GetStringIndex`). `0` means the VM committed
-/// the opcode and the template may fall through; `1` reports a parked throw; `2`
-/// remains an exact pre-effect side exit for an absent activation.
+/// Complete one decoded static value load through the canonical stack-owned
+/// runtime boundary. Allocation keeps the published source window rooted.
 pub(crate) extern "C" fn jit_value_load_op_stub(
     ctx: *mut JitCtx,
     opcode: u64,
@@ -824,18 +832,41 @@ pub(crate) extern "C" fn jit_value_load_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let frame_index = match ctx.materialized_frame_index() {
-        Ok(index) => index,
-        Err(_) => return STATUS_BAILED,
+    let operation = match opcode as u8 {
+        value if value == otter_bytecode::Op::MathLoad as u8 => ValueLoadRuntimeOp::Math {
+            dst: arg0 as u16,
+            name_index: arg1 as u32,
+        },
+        value if value == otter_bytecode::Op::SymbolLoad as u8 => ValueLoadRuntimeOp::Symbol {
+            dst: arg0 as u16,
+            name_index: arg1 as u32,
+        },
+        value if value == otter_bytecode::Op::TemporalLoad as u8 => ValueLoadRuntimeOp::Temporal {
+            dst: arg0 as u16,
+            name_index: arg1 as u32,
+        },
+        value if value == otter_bytecode::Op::LoadBigInt as u8 => ValueLoadRuntimeOp::BigInt {
+            dst: arg0 as u16,
+            constant_index: arg1 as u32,
+        },
+        value if value == otter_bytecode::Op::GetStringIndex as u8 => {
+            ValueLoadRuntimeOp::StringIndex {
+                dst: arg0 as u16,
+                receiver: arg1 as u16,
+                index: arg2 as u16,
+            }
+        }
+        _ => {
+            park_jit_error(ctx, VmError::InvalidOperand);
+            return STATUS_THREW;
+        }
     };
-    let Some(activation) = ctx.checked_activation() else {
-        return STATUS_BAILED;
+    let result = match ctx.try_runtime_call() {
+        Ok(Some(mut runtime)) => runtime.value_load_op(operation),
+        Ok(None) => return STATUS_BAILED,
+        Err(err) => Err(err),
     };
-    let vm = unsafe { &mut *activation.vm_ptr() };
-    let stack = unsafe { &mut *activation.stack_ptr() };
-    let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_value_load_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2)
-    {
+    match result {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -908,11 +939,8 @@ pub(crate) extern "C" fn jit_super_op_stub(
     }
 }
 
-/// Complete one scalar value-query/coercion opcode (`ToObject`,
-/// `ToPropertyKey`, `TypeOf`, `LoadNewTarget`, `SameValue`, `IsArray`,
-/// `ArrayLength`, `LoadLength`). `0` means the VM committed the opcode and the
-/// template may fall through; `1` reports a parked throw; `2` remains an exact
-/// pre-effect side exit for an absent activation.
+/// Complete one decoded scalar query/coercion through the canonical stack-owned
+/// runtime boundary. Observable coercion is never replayed.
 pub(crate) extern "C" fn jit_scalar_op_stub(
     ctx: *mut JitCtx,
     opcode: u64,
@@ -922,17 +950,46 @@ pub(crate) extern "C" fn jit_scalar_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let frame_index = match ctx.materialized_frame_index() {
-        Ok(index) => index,
-        Err(_) => return STATUS_BAILED,
+    let binary =
+        |constructor: fn(u16, u16) -> ScalarRuntimeOp| constructor(arg0 as u16, arg1 as u16);
+    let operation = match opcode as u8 {
+        value if value == otter_bytecode::Op::ToObject as u8 => {
+            binary(|dst, src| ScalarRuntimeOp::ToObject { dst, src })
+        }
+        value if value == otter_bytecode::Op::ToPropertyKey as u8 => {
+            binary(|dst, src| ScalarRuntimeOp::ToPropertyKey { dst, src })
+        }
+        value if value == otter_bytecode::Op::TypeOf as u8 => {
+            binary(|dst, src| ScalarRuntimeOp::TypeOf { dst, src })
+        }
+        value if value == otter_bytecode::Op::LoadNewTarget as u8 => {
+            ScalarRuntimeOp::LoadNewTarget { dst: arg0 as u16 }
+        }
+        value if value == otter_bytecode::Op::SameValue as u8 => ScalarRuntimeOp::SameValue {
+            dst: arg0 as u16,
+            lhs: arg1 as u16,
+            rhs: arg2 as u16,
+        },
+        value if value == otter_bytecode::Op::IsArray as u8 => {
+            binary(|dst, src| ScalarRuntimeOp::IsArray { dst, src })
+        }
+        value if value == otter_bytecode::Op::ArrayLength as u8 => {
+            binary(|dst, src| ScalarRuntimeOp::ArrayLength { dst, src })
+        }
+        value if value == otter_bytecode::Op::LoadLength as u8 => {
+            binary(|dst, src| ScalarRuntimeOp::LoadLength { dst, src })
+        }
+        _ => {
+            park_jit_error(ctx, VmError::InvalidOperand);
+            return STATUS_THREW;
+        }
     };
-    let Some(activation) = ctx.checked_activation() else {
-        return STATUS_BAILED;
+    let result = match ctx.try_runtime_call() {
+        Ok(Some(mut runtime)) => runtime.scalar_op(operation),
+        Ok(None) => return STATUS_BAILED,
+        Err(err) => Err(err),
     };
-    let vm = unsafe { &mut *activation.vm_ptr() };
-    let stack = unsafe { &mut *activation.stack_ptr() };
-    let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_scalar_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2) {
+    match result {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);

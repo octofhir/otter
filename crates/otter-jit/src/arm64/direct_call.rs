@@ -24,6 +24,8 @@
 //!   compiler-created dense array, after every allocating receiver-preparation
 //!   transition and before frame publication. Eligibility excludes rest and
 //!   `arguments`, so ignored trailing values are unobservable to the callee.
+//!   The prepared receiver is parked in the unpublished frame while caller
+//!   roots refresh, so a recycled destination may alias the callee register.
 //! - A callee bailout is not replayed. The live published frame enters the
 //!   cold stack-call deoptimizer, which resumes the already-started callee.
 //! - Callers load the current generation through a stable per-function cell.
@@ -918,7 +920,7 @@ where
         dynasm!(ops ; .arch aarch64 ; =>locals_ready);
     }
 
-    if let (Some(callable), Some(receiver)) = (
+    if let (Some(callable), Some(_receiver)) = (
         site.form.construct_callable(),
         site.form.prepared_receiver(),
     ) {
@@ -951,10 +953,16 @@ where
             ; cmp x1, STATUS_RETURNED as u32
             ; b.ne =>construct_prepare_threw
         );
-        root_receiver(ops, 0, layout.frame_bytes)?;
+        // The bytecode destination may recycle the callable register (the
+        // canonical `NewSpread r2 r2 r3` shape). Preserve the returned
+        // receiver outside the caller window, refresh any values moved by
+        // prototype lookup, and load the callable before publishing the
+        // receiver in its caller-owned root home.
+        dynasm!(ops ; .arch aarch64 ; str x0, [sp, NATIVE_FRAME_THIS_OFFSET]);
         refresh_roots(ops, layout.frame_bytes)?;
         load(ops, callable, 9, layout.frame_bytes)?;
-        load(ops, receiver, 12, layout.frame_bytes)?;
+        dynasm!(ops ; .arch aarch64 ; ldr x12, [sp, NATIVE_FRAME_THIS_OFFSET]);
+        root_receiver(ops, 12, layout.frame_bytes)?;
         if site.form.inherits_new_target() {
             dynasm!(ops
                 ; .arch aarch64

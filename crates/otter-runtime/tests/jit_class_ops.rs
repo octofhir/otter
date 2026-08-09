@@ -10,7 +10,7 @@
 //!   transition; every result matches the interpreter oracle.
 //!
 //! # See also
-//! - `otter_vm::Interpreter::jit_runtime_class_op`
+//! - `otter_vm::RuntimeCall::class_op`
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 

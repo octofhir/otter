@@ -8,7 +8,7 @@
 //!   reentrant transition; every result matches the interpreter oracle.
 //!
 //! # See also
-//! - `otter_vm::Interpreter::jit_runtime_value_load_op`
+//! - `otter_vm::RuntimeCall::value_load_op`
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 

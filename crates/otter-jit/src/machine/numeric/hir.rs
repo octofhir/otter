@@ -119,6 +119,7 @@ pub(super) enum NumericNode {
 pub(super) enum NumericDirectCallKind {
     Plain,
     Method(otter_vm::jit::JitMethodGuard),
+    Construct,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -421,6 +422,7 @@ impl NumericFunction {
                     code.id,
                     u32::try_from(pc).ok()?,
                     &view.direct_callees,
+                    &view.direct_constructs,
                     &view.direct_methods,
                     &mut direct_call_targets,
                     &mut direct_call_arguments,
@@ -646,7 +648,7 @@ fn infer_instruction_parameters(
         | Op::LoadThis => {
             *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
-        Op::Call => {
+        Op::Call | Op::New => {
             let count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
             for index in 0..count {
                 let _ = read(register(instruction, code, 3 + index)?)?;
@@ -768,12 +770,14 @@ fn build_raw_blocks(view: &JitCompileSnapshot) -> Option<Vec<RawBlock>> {
         .collect::<std::collections::BTreeSet<_>>();
     for (pc, instruction) in view.instructions.iter().enumerate() {
         let pc = u32::try_from(pc).ok()?;
-        if matches!(instruction.op(code), Op::Call | Op::CallMethodValue)
-            && code
-                .control_flow()
-                .enclosing_exception_region(pc)
-                .and_then(|region| region.catch_pc)
-                .is_some()
+        if matches!(
+            instruction.op(code),
+            Op::Call | Op::CallMethodValue | Op::New
+        ) && code
+            .control_flow()
+            .enclosing_exception_region(pc)
+            .and_then(|region| region.catch_pc)
+            .is_some()
             && usize::try_from(pc + 1).ok()? < view.instructions.len()
         {
             starts.insert(pc + 1);
@@ -815,7 +819,7 @@ fn build_raw_blocks(view: &JitCompileSnapshot) -> Option<Vec<RawBlock>> {
             Op::ReturnUndefined => (Vec::new(), RawTerminator::ReturnUndefined),
             _ => (vec![*by_pc.get(&end)?], RawTerminator::Jump),
         };
-        let exceptional = matches!(op, Op::Call | Op::CallMethodValue)
+        let exceptional = matches!(op, Op::Call | Op::CallMethodValue | Op::New)
             .then(|| code.control_flow().enclosing_exception_region(terminal_pc))
             .flatten()
             .and_then(|region| Some((*by_pc.get(&region.catch_pc?)?, region.exception_register)));
@@ -959,7 +963,7 @@ fn instruction_accesses(
         | Op::LoadInt32
         | Op::LoadNumber
         | Op::LoadThis => Some((Vec::new(), vec![register(instruction, code, 0)?])),
-        Op::Call => {
+        Op::Call | Op::New => {
             let count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
             let mut reads = Vec::with_capacity(count + 1);
             reads.push(register(instruction, code, 1)?);
@@ -1156,6 +1160,7 @@ fn lower_instruction(
     function_id: u32,
     logical_pc: u32,
     direct_callees: &rustc_hash::FxHashMap<u32, otter_vm::JitDirectCallee>,
+    direct_constructs: &rustc_hash::FxHashMap<u32, otter_vm::JitDirectCallee>,
     direct_methods: &rustc_hash::FxHashMap<u32, Vec<otter_vm::jit::JitDirectMethod>>,
     direct_call_targets: &mut Vec<NumericDirectCallTarget>,
     direct_call_arguments: &mut Vec<NumericValue>,
@@ -1188,6 +1193,55 @@ fn lower_instruction(
             let target = NumericDirectCallTarget {
                 kind: NumericDirectCallKind::Plain,
                 callee: *direct_callees.get(&instruction.byte_pc)?,
+            };
+            let source = read_value(registers, register(instruction, code, 1)?)?;
+            let argument_count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
+            let argument_start = u16::try_from(direct_call_arguments.len()).ok()?;
+            for index in 0..argument_count {
+                direct_call_arguments.push(read_value(
+                    registers,
+                    register(instruction, code, 3 + index)?,
+                )?);
+            }
+            let target_index = direct_call_targets
+                .iter()
+                .position(|candidate| *candidate == target)
+                .unwrap_or_else(|| {
+                    direct_call_targets.push(target);
+                    direct_call_targets.len() - 1
+                });
+            let value = push(
+                nodes,
+                NumericNode::DirectCall {
+                    source,
+                    target: u16::try_from(target_index).ok()?,
+                    argument_start,
+                    argument_count: u8::try_from(argument_count).ok()?,
+                    logical_pc,
+                    byte_pc: instruction.byte_pc,
+                    exceptional_edge: exceptional_edge.map(u16::try_from).transpose().ok()?,
+                },
+            );
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
+            write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            )?;
+            return Some(());
+        }
+        Op::New => {
+            let target = NumericDirectCallTarget {
+                kind: NumericDirectCallKind::Construct,
+                callee: *direct_constructs.get(&instruction.byte_pc)?,
             };
             let source = read_value(registers, register(instruction, code, 1)?)?;
             let argument_count = usize::try_from(instruction.const_index(code, 2)?).ok()?;

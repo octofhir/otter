@@ -46,18 +46,19 @@ that fires before the isolate replies may have no partial batch to write.
 `compilePrepared.globalLoadSites` counts all analyzed global reads.
 `globalLexicalLoads` counts permanent global-declarative cells available for
 direct generated reads, while `globalObjectLoads` counts guarded
-global-object dictionary slots. `directCallees`, `directMethodSites`, and
-`directMethodTargets` report stable function links whose current generations
-were available for generated plain and bounded polymorphic method linkage,
+global-object dictionary slots. `directCallees`, `directConstructs`,
+`directMethodSites`, and `directMethodTargets` report stable function links
+whose current generations were available for generated plain, base-construct,
+and bounded polymorphic method linkage,
 separately from `inlineCallees` /
 `inlineMethods`, which count bodies offered to the inliner. A
 `directCallPlan` event records every observed call target inspected.
 `targetIndex` / `targetCount` identify its position in the bounded chain.
-`callKind` is `plain` or `method`. Its typed result is either
+`callKind` is `plain`, `method`, or `construct`. Its typed result is either
 `available`, with the planning-time code-object id, target tier, and
-`thisMode`, or
+`thisMode` (`constructReceiver` for base construction), or
 `rejected` with one of `missingCallee`, `ineligibleFunction`,
-`selfRecursive`, `ownUpvalues`, `methodGuardUnavailable`, or
+`ownUpvalues`, `methodGuardUnavailable`, or
 `noEntryGeneration`.
 
 For every available plan in a successful compile, `directCallLowered` records
@@ -70,6 +71,14 @@ publication switches the selected generation without recompiling the caller.
 `callerCodeObjectId` identifies the exact successful caller generation.
 Planning and lowering are separate events so diagnostics never claim a native
 call edge that the backend did not emit.
+
+Base-construct artifacts add `directConstructPrepare` between the shared guard
+and frame publication. Generation and stack-entry validation happen first;
+the region then performs the observable `new.target.prototype` lookup, roots
+the receiver in the Machine safepoint area, and initializes the same
+stack-owned `NativeFrame` used by plain and method calls. A later callee deopt
+resumes that already-started construct and retains constructor return
+substitution; it never replays the prototype lookup.
 
 For every monomorphic body admitted by the optimizing tier's inline budget,
 `inlineLowered` records the owning code object, parent/callee function ids,

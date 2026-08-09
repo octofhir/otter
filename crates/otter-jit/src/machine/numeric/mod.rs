@@ -16,9 +16,10 @@
 //! - Allocating calls save every live tagged value from its exact late-use
 //!   location into the frame's collector-visible root area and reload it after
 //!   moving GC; no interpreter-window shuttle or emitter-local map exists.
-//! - Guarded methods and plain calls share one typed descriptor and generated
-//!   linkage emitter. Calls inside supported catch regions own explicit
-//!   exceptional CFG successors rather than leaving compiled code.
+//! - Guarded methods, plain calls, and base constructs share one typed
+//!   descriptor and generated linkage emitter. Calls inside supported catch
+//!   regions own explicit exceptional CFG successors rather than leaving
+//!   compiled code.
 
 mod arm64;
 mod hir;
@@ -27,8 +28,8 @@ use otter_vm::{
     JitArtifactFileName, JitCompileSnapshot,
     deopt::{DeoptExitDescriptor, DeoptExitId, DeoptRuntime},
     native_abi::{
-        STUB_JIT_BACKEDGE_POLL, STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK,
-        STUB_JIT_RESOLVE_DIRECT_ENTRY,
+        STUB_JIT_BACKEDGE_POLL, STUB_JIT_BASE_CONSTRUCT_RESULT, STUB_JIT_DEOPT_STACK_CALL,
+        STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_PREPARE_BASE_CONSTRUCT, STUB_JIT_RESOLVE_DIRECT_ENTRY,
     },
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -111,6 +112,8 @@ pub(crate) fn try_compile(
         transitions.variadic_entry(STUB_JIT_DEOPT_WRITEBACK),
         transitions.entry(STUB_JIT_DEOPT_STACK_CALL),
         transitions.entry(STUB_JIT_RESOLVE_DIRECT_ENTRY),
+        transitions.entry(STUB_JIT_PREPARE_BASE_CONSTRUCT),
+        transitions.entry(STUB_JIT_BASE_CONSTRUCT_RESULT),
         otter_vm::runtime_stubs::STRING_CONCAT_ALLOC
             .entry_addr()
             .ok_or(Unsupported::OperandShape(
@@ -772,6 +775,18 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         .direct_call_targets
                         .get(usize::from(target))
                         .ok_or(super::VerificationError::InvalidValue(result))?;
+                    let construct_receiver =
+                        matches!(&target.kind, NumericDirectCallKind::Construct).then(|| {
+                            let receiver =
+                                push_value(&mut representations, MachineRepresentation::Tagged);
+                            instructions.push(MachineInstruction::plain(
+                                MachineOpcode::TaggedConstant(
+                                    otter_vm::Value::undefined().to_bits(),
+                                ),
+                                vec![MachineOperand::register_output(receiver)],
+                            ));
+                            receiver
+                        });
                     let descriptor_index = intern_call_descriptor(
                         &mut call_descriptors,
                         direct_call_descriptor(
@@ -796,6 +811,9 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                     operands.push(MachineOperand::register_input(source_value));
                     operands.extend(arguments.into_iter().map(MachineOperand::register_input));
                     operands.push(MachineOperand::register_output(result));
+                    if let Some(receiver) = construct_receiver {
+                        operands.push(MachineOperand::tagged_root(receiver));
+                    }
                     let mut call = MachineInstruction::plain(
                         MachineOpcode::Call(descriptor_index as u32),
                         operands,
@@ -997,6 +1015,7 @@ fn direct_call_descriptor(
                 NumericDirectCallKind::Method(guard) => DirectCallKind::Method {
                     guard: guard.clone(),
                 },
+                NumericDirectCallKind::Construct => DirectCallKind::Construct,
             },
             callee: target.callee,
             caller_function_id: hir.function_id,

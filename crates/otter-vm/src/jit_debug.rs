@@ -444,6 +444,8 @@ pub enum JitDebugEvent {
         global_object_loads: u32,
         /// Exact installed generations available for generated native linkage.
         direct_callees: u32,
+        /// Base-constructor sites available for generated construct linkage.
+        direct_constructs: u32,
         /// Method sites carrying at least one guarded generated-link plan.
         direct_method_sites: u32,
         /// Total guarded method targets across those sites.
@@ -957,6 +959,7 @@ mod tests {
             global_lexical_loads: 4,
             global_object_loads: 5,
             direct_callees: 1,
+            direct_constructs: 2,
             direct_method_sites: 2,
             direct_method_targets: 5,
             static_native_calls: 1,
@@ -984,6 +987,7 @@ mod tests {
                     "globalLexicalLoads": 4,
                     "globalObjectLoads": 5,
                     "directCallees": 1,
+                    "directConstructs": 2,
                     "directMethodSites": 2,
                     "directMethodTargets": 5,
                     "staticNativeCalls": 1,

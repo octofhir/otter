@@ -8,11 +8,14 @@
 //!   value locations and caller-provided root restoration.
 //!
 //! # Invariants
-//! - Normal call entry and return execute entirely in generated code. No
-//!   resolver, prepare record, owner arena, generic call adapter, or shared
-//!   machine trampoline participates in the hit path.
+//! - Plain and method call entry/return execute entirely in generated code.
+//!   Base construction adds one typed receiver-preparation transition; body
+//!   entry, frame linkage, return substitution, and cleanup remain generated.
 //! - Every failure before native entry is effect-free and branches to the
 //!   caller's canonical deopt exit while its original call PC is published.
+//!   Base constructs finish generation/stack validation before their
+//!   observable prototype lookup, so no post-effect rejection can replay
+//!   `New`.
 //! - Callee registers published by the copied frame header are initialized
 //!   tagged slots on the machine stack. Safepoint-free scalar generations may
 //!   publish only their parameter prefix; every cold exit expands it before
@@ -20,10 +23,10 @@
 //! - A callee bailout is not replayed. The live published frame enters the
 //!   cold stack-call deoptimizer, which resumes the already-started callee.
 //! - Callers load the current generation through a stable per-function cell.
-//!   Isolate execution is single-mutator: after selection no registry mutation
-//!   can occur before native entry, and executable retirement is deferred while
-//!   any native activation is published. Generated calls therefore need no
-//!   per-entry exclusive lease loop.
+//!   Executable retirement is deferred while an outer native activation is
+//!   published. Plain/method calls enter immediately. Base constructs may
+//!   reenter while preparing the receiver, but retain the already-selected
+//!   generation and enter through its normal dependency guards.
 //! - Tier publication patches the function cell; a missing target enters one
 //!   no-allocation cold resolver and never invalidates the generated caller.
 //! - The activation cursor is both the publication and generated-recursion
@@ -55,12 +58,12 @@ use crate::{
         CODE_ENTRY_GENERATED_ENTRIES_OFFSET, CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET,
         CODE_ENTRY_GENERATED_THROWS_OFFSET, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET,
         FUNCTION_ENTRY_GENERATION_CELL_OFFSET, GENERATED_FEEDBACK_CLEAN_OFFSET,
-        GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
-        NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE, NATIVE_FRAME_THIS_OFFSET,
-        NATIVE_FRAME_UPVALUE_BASE_OFFSET, NATIVE_FRAME_UPVALUE_COUNT_OFFSET,
-        NATIVE_STACK_LIMIT_OFFSET, STATUS_BAILED, STATUS_RETURNED, THREAD_OFFSET, Unsupported,
-        VALUE_UNDEFINED, VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_CURRENT_FRAME_OFFSET,
-        reg_offset,
+        GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_OFFSET,
+        NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE,
+        NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
+        NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NATIVE_STACK_LIMIT_OFFSET, STATUS_BAILED,
+        STATUS_RETURNED, THREAD_OFFSET, Unsupported, VALUE_UNDEFINED,
+        VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_CURRENT_FRAME_OFFSET, reg_offset,
     },
 };
 
@@ -77,6 +80,9 @@ pub(crate) enum DirectCallForm {
     Plain { callable: u16 },
     /// Consume the exact callable and receiver proven by a method guard.
     Method { callable: u8, receiver: u16 },
+    /// Reload an exact base-constructor callable and use one dedicated Machine
+    /// root home for its prepared receiver.
+    Construct { callable: u16, receiver: u16 },
 }
 
 /// One compiler-native call site.
@@ -317,6 +323,7 @@ fn layout_and_artifact(
         call_kind: match site.form {
             DirectCallForm::Plain { .. } => DirectCallKindArtifact::Plain,
             DirectCallForm::Method { .. } => DirectCallKindArtifact::Method,
+            DirectCallForm::Construct { .. } => DirectCallKindArtifact::Construct,
         },
         target_function_id: site.target.plan.function_id,
         target_code_object_id: site.target.plan.code_object_id,
@@ -329,6 +336,7 @@ fn layout_and_artifact(
         },
         this_mode: match site.form {
             DirectCallForm::Method { .. } => DirectCallThisModeArtifact::MethodReceiver,
+            DirectCallForm::Construct { .. } => DirectCallThisModeArtifact::ConstructReceiver,
             DirectCallForm::Plain { .. } => match site.target.plan.this_mode {
                 JitDirectCallThisMode::StrictOrLexical => {
                     DirectCallThisModeArtifact::StrictOrLexical
@@ -336,6 +344,11 @@ fn layout_and_artifact(
                 JitDirectCallThisMode::SloppyGlobal => DirectCallThisModeArtifact::SloppyGlobal,
                 JitDirectCallThisMode::MethodReceiver => {
                     return Err(Unsupported::OperandShape("plain call receiver binding"));
+                }
+                JitDirectCallThisMode::ConstructReceiver => {
+                    return Err(Unsupported::OperandShape(
+                        "plain call constructor receiver binding",
+                    ));
                 }
             },
         },
@@ -379,6 +392,8 @@ pub(crate) fn emit_direct_call(
         site,
         deopt_entry,
         resolve_direct_entry,
+        0,
+        0,
         code_map,
         bail,
         threw,
@@ -395,6 +410,12 @@ pub(crate) fn emit_direct_call(
             Ok(())
         },
         |_| Ok(()),
+        |_, _, _| {
+            Err(Unsupported::OperandShape(
+                "template construct receiver root",
+            ))
+        },
+        |_, _| Ok(()),
     )
 }
 
@@ -405,13 +426,15 @@ pub(crate) fn emit_direct_call(
 /// effect-free rejection, normal return, or throw, with the original stack
 /// pointer restored and before the result is committed.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_direct_call_with_access<Load, Store, Restore>(
+pub(crate) fn emit_direct_call_with_access<Load, Store, Restore, RootReceiver, Refresh>(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     site: DirectCallSite<'_>,
     deopt_entry: u64,
     resolve_direct_entry: u64,
+    prepare_construct_entry: u64,
+    construct_result_entry: u64,
     mut code_map: Option<&mut CodeMapCapture>,
     bail: DynamicLabel,
     threw: DynamicLabel,
@@ -420,11 +443,15 @@ pub(crate) fn emit_direct_call_with_access<Load, Store, Restore>(
     mut load: Load,
     mut store: Store,
     mut restore_roots: Restore,
+    mut root_receiver: RootReceiver,
+    mut refresh_roots: Refresh,
 ) -> Result<(), Unsupported>
 where
     Load: FnMut(&mut Assembler, u16, u8, u32) -> Result<(), Unsupported>,
     Store: FnMut(&mut Assembler, u16, u8, u32) -> Result<(), Unsupported>,
     Restore: FnMut(&mut Assembler) -> Result<(), Unsupported>,
+    RootReceiver: FnMut(&mut Assembler, u8, u32) -> Result<(), Unsupported>,
+    Refresh: FnMut(&mut Assembler, u32) -> Result<(), Unsupported>,
 {
     let (layout, direct_call) = layout_and_artifact(view, site)?;
 
@@ -440,6 +467,7 @@ where
     let returned = ops.new_dynamic_label();
     let cleanup_threw = ops.new_dynamic_label();
     let caller_bail = ops.new_dynamic_label();
+    let construct_prepare_threw = ops.new_dynamic_label();
 
     let guard_start = ops.offset().0;
     // The effective activation limit combines physical publication capacity
@@ -557,6 +585,51 @@ where
                 emit_load_sloppy_global_this(ops, relocations, view, context_register);
             }
         }
+        DirectCallForm::Construct { callable, .. } => {
+            load(ops, callable, 9, 0)?;
+            emit_load_u64(
+                ops,
+                10,
+                value_tag::box_function_id(site.target.plan.function_id),
+            );
+            dynasm!(ops
+                ; .arch aarch64
+                ; cmp x9, x10
+                ; b.eq =>direct_function
+                ; cbz x9, =>caller_bail
+            );
+            emit_cell_test(ops, 9, 10, CellTest::IsNotCell, caller_bail);
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldrb w10, [x9]
+                ; cmp w10, JS_CLOSURE_BODY_TYPE_TAG as u32
+                ; b.ne =>caller_bail
+                ; ldr w13, [x9, view.closure_call_layout.flags_byte]
+            );
+            emit_load_u64(
+                ops,
+                10,
+                u64::from(view.closure_call_layout.runtime_setup_flags),
+            );
+            dynasm!(ops
+                ; .arch aarch64
+                ; tst w13, w10
+                ; b.ne =>caller_bail
+                ; ldr w10, [x9, view.closure_call_layout.function_id_byte]
+            );
+            emit_load_u64(ops, 11, u64::from(site.target.plan.function_id));
+            dynasm!(ops
+                ; .arch aarch64
+                ; cmp w10, w11
+                ; b.ne =>caller_bail
+                ; ldr x10, [x9, view.closure_call_layout.upvalue_base_byte]
+                ; ldr w11, [x9, view.closure_call_layout.upvalue_count_byte]
+                ; b =>callable_ready
+                ; =>direct_function
+                ; mov x10, xzr
+                ; mov w11, wzr
+            );
+        }
     }
     dynasm!(ops ; .arch aarch64 ; =>callable_ready);
     record_region(
@@ -580,12 +653,27 @@ where
         ; str x9, [sp, NATIVE_FRAME_SELF_OFFSET]
         ; str x10, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
     );
-    emit_load_u64(ops, 13, VALUE_UNDEFINED);
-    dynasm!(ops
-        ; .arch aarch64
-        ; stp x12, x13, [sp, NATIVE_FRAME_THIS_OFFSET as i32]
-        ; str x11, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
-    );
+    match site.form {
+        DirectCallForm::Construct { .. } => {
+            emit_load_u64(ops, 13, VALUE_UNDEFINED);
+            dynasm!(ops
+                ; .arch aarch64
+                ; str x13, [sp, NATIVE_FRAME_SELF_OFFSET]
+                ; str x13, [sp, NATIVE_FRAME_THIS_OFFSET]
+                ; str x13, [sp, NATIVE_FRAME_NEW_TARGET_OFFSET]
+                ; str xzr, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
+                ; str wzr, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
+            );
+        }
+        DirectCallForm::Plain { .. } | DirectCallForm::Method { .. } => {
+            emit_load_u64(ops, 13, VALUE_UNDEFINED);
+            dynasm!(ops
+                ; .arch aarch64
+                ; stp x12, x13, [sp, NATIVE_FRAME_THIS_OFFSET as i32]
+                ; str x11, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
+            );
+        }
+    }
 
     // Copy arguments before the cold generation resolver can clobber
     // allocator-owned caller-saved locations. The target plan fixes the
@@ -658,10 +746,9 @@ where
         ; ldr x11, [X(context_register), NATIVE_STACK_LIMIT_OFFSET]
         ; cmp x12, x11
         ; b.lo =>uncommitted_rejected
-        // The isolate is single-mutator. No VM transition occurs between the
-        // stable generation load and this entry-address load, while the outer
-        // published activation defers executable retirement across any later
-        // reentry from the callee.
+        // The outer published activation defers executable retirement. Plain
+        // and method calls enter immediately; constructs retain this selected
+        // address across receiver preparation and then enter its normal guards.
         ; ldr x16, [x25]
         ; cbz x16, =>entry_rejected
         ; str x16, [sp, layout.entry_addr]
@@ -687,6 +774,78 @@ where
         );
         emit_initialize_register_range(ops, param_count, local_count);
         dynasm!(ops ; .arch aarch64 ; =>locals_ready);
+    }
+
+    if let DirectCallForm::Construct { callable, receiver } = site.form {
+        let prepare_start = ops.offset().0;
+        load(ops, callable, 9, layout.frame_bytes)?;
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov x0, X(context_register)
+            ; mov x1, x9
+        );
+        emit_runtime_stub(
+            ops,
+            relocations,
+            16,
+            prepare_construct_entry,
+            abi::STUB_JIT_PREPARE_BASE_CONSTRUCT,
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; cmp x1, STATUS_RETURNED as u32
+            ; b.ne =>construct_prepare_threw
+        );
+        root_receiver(ops, 0, layout.frame_bytes)?;
+        refresh_roots(ops, layout.frame_bytes)?;
+        load(ops, callable, 9, layout.frame_bytes)?;
+        load(ops, receiver, 12, layout.frame_bytes)?;
+        let direct_constructor = ops.new_dynamic_label();
+        let constructor_state_ready = ops.new_dynamic_label();
+        emit_load_u64(
+            ops,
+            10,
+            value_tag::box_function_id(site.target.plan.function_id),
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp x9, x10
+            ; b.eq =>direct_constructor
+            ; ldr x10, [x9, view.closure_call_layout.upvalue_base_byte]
+            ; ldr w11, [x9, view.closure_call_layout.upvalue_count_byte]
+            ; b =>constructor_state_ready
+            ; =>direct_constructor
+            ; mov x10, xzr
+            ; mov w11, wzr
+            ; =>constructor_state_ready
+            ; str x9, [sp, NATIVE_FRAME_SELF_OFFSET]
+            ; str x12, [sp, NATIVE_FRAME_THIS_OFFSET]
+            ; str x9, [sp, NATIVE_FRAME_NEW_TARGET_OFFSET]
+            ; str x10, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
+            ; str w11, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
+        );
+        for (argument, &source) in site
+            .arguments
+            .iter()
+            .take(copied_argument_count)
+            .enumerate()
+        {
+            let destination_offset = NATIVE_FRAME_STACK_SIZE
+                + u32::try_from(argument)
+                    .map_err(|_| Unsupported::OperandShape("construct argument index"))?
+                    * 8;
+            load(ops, source, 15, layout.frame_bytes)?;
+            dynasm!(ops ; .arch aarch64 ; str x15, [sp, destination_offset]);
+        }
+        record_region(
+            &mut code_map,
+            "directConstructPrepare",
+            prepare_start,
+            ops.offset().0,
+            site,
+            direct_call,
+        );
     }
     dynasm!(ops
         ; .arch aarch64
@@ -745,6 +904,26 @@ where
     emit_increment_feedback_u64(ops, CODE_ENTRY_GENERATED_THROWS_OFFSET);
     emit_reset_generated_bail_streak(ops);
     dynasm!(ops ; .arch aarch64 ; b =>result_ready ; =>callee_returned);
+    if matches!(site.form, DirectCallForm::Construct { .. }) {
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov x1, x0
+            ; ldr x2, [sp, NATIVE_FRAME_THIS_OFFSET]
+            ; mov x0, X(context_register)
+        );
+        emit_runtime_stub(
+            ops,
+            relocations,
+            16,
+            construct_result_entry,
+            abi::STUB_JIT_BASE_CONSTRUCT_RESULT,
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; mov x1, xzr
+        );
+    }
     emit_reset_generated_bail_streak(ops);
     dynasm!(ops
         ; .arch aarch64
@@ -771,6 +950,7 @@ where
         match site.form {
             DirectCallForm::Plain { .. } => 0,
             DirectCallForm::Method { .. } => 1,
+            DirectCallForm::Construct { .. } => 2,
         },
     );
     emit_runtime_stub(
@@ -862,6 +1042,15 @@ where
     dynasm!(ops ; .arch aarch64 ; =>caller_bail);
     restore_roots(ops)?;
     dynasm!(ops ; .arch aarch64 ; b =>bail);
+
+    dynasm!(ops
+        ; .arch aarch64
+        ; =>construct_prepare_threw
+        ; ldr x25, [sp, layout.saved_x25]
+        ; add sp, sp, layout.frame_bytes
+    );
+    restore_roots(ops)?;
+    dynasm!(ops ; .arch aarch64 ; b =>threw);
 
     Ok(())
 }

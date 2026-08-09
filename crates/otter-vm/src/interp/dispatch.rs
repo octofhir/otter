@@ -414,14 +414,44 @@ impl Interpreter {
                 }
                 Op::New => {
                     let depth_before = stack.len();
+                    let direct_construct_fid = if jit_installed {
+                        register_operand(function.operand(instr, 1))
+                            .ok()
+                            .and_then(|register| {
+                                stack
+                                    .get(top_idx)
+                                    .and_then(|frame| frame.registers.get(register as usize))
+                                    .copied()
+                            })
+                            .and_then(|value| {
+                                value.as_function().or_else(|| {
+                                    value
+                                        .as_closure(&self.gc_heap)
+                                        .map(|closure| closure.function_id())
+                                })
+                            })
+                    } else {
+                        None
+                    };
                     self.do_construct_exec(stack, context, function, instr)?;
                     // Tier-up hook, mirroring `Op::Call`: a bytecode
                     // constructor frame pushed by `new` can enter JIT at pc=0.
-                    if jit_installed
-                        && stack.len() > depth_before
-                        && let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)?
-                    {
-                        return Ok(value);
+                    if jit_installed && stack.len() > depth_before {
+                        if direct_construct_fid == Some(stack[stack.len() - 1].function_id) {
+                            let transition = self.record_ordinary_call_feedback(
+                                function,
+                                instr.instruction_pc,
+                                crate::feedback::OrdinaryCallTarget::Bytecode(
+                                    stack[stack.len() - 1].function_id,
+                                ),
+                            );
+                            if transition.evict_for_reopt() {
+                                self.evict_compiled_for_reopt(function_id);
+                            }
+                        }
+                        if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)? {
+                            return Ok(value);
+                        }
                     }
                     continue;
                 }

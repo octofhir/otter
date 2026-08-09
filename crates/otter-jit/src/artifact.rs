@@ -119,6 +119,7 @@ impl DirectCallTierArtifact {
 pub(crate) enum DirectCallKindArtifact {
     Plain,
     Method,
+    Construct,
 }
 
 impl DirectCallKindArtifact {
@@ -126,6 +127,7 @@ impl DirectCallKindArtifact {
         match self {
             Self::Plain => "plain",
             Self::Method => "method",
+            Self::Construct => "construct",
         }
     }
 }
@@ -137,6 +139,7 @@ pub(crate) enum DirectCallThisModeArtifact {
     StrictOrLexical,
     SloppyGlobal,
     MethodReceiver,
+    ConstructReceiver,
 }
 
 impl DirectCallThisModeArtifact {
@@ -145,6 +148,7 @@ impl DirectCallThisModeArtifact {
             Self::StrictOrLexical => "strictOrLexical",
             Self::SloppyGlobal => "sloppyGlobal",
             Self::MethodReceiver => "methodReceiver",
+            Self::ConstructReceiver => "constructReceiver",
         }
     }
 }

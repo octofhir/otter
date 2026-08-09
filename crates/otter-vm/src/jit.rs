@@ -271,6 +271,11 @@ pub struct JitCompileSnapshot {
     /// entry-cell lease no longer matches; no runtime resolver is part of the
     /// compiled hit path.
     pub direct_callees: rustc_hash::FxHashMap<u32, JitDirectCallee>,
+    /// Compiler-native base constructors keyed by the caller's `Op::New`
+    /// byte-PC. The dynamic callee must be the exact function or closure
+    /// identity; receiver creation and `new.target` publication are part of
+    /// the generated construct boundary.
+    pub direct_constructs: rustc_hash::FxHashMap<u32, JitDirectCallee>,
     /// Compiler-native direct-method chains keyed by the caller's
     /// `Op::CallMethodValue` byte-PC. Each target carries one exact receiver /
     /// prototype / method-slot guard and one current entry-capable callee
@@ -544,6 +549,8 @@ pub enum JitDirectCallKind {
     Plain,
     /// Guarded `Op::CallMethodValue`.
     Method,
+    /// Base `Op::New` construction.
+    Construct,
 }
 
 /// `this` binding performed by compiler-generated call linkage.
@@ -559,6 +566,9 @@ pub enum JitDirectCallThisMode {
     SloppyGlobal,
     /// A guarded method call passes its exact object receiver.
     MethodReceiver,
+    /// A base constructor receives its freshly prepared object receiver and
+    /// publishes the guarded callable as `new.target`.
+    ConstructReceiver,
 }
 
 /// A settled prototype-hop load: the two shapes it guards and the slot it
@@ -1027,6 +1037,7 @@ impl JitCompileSnapshot {
             global_object_loads: rustc_hash::FxHashMap::default(),
             static_native_calls: rustc_hash::FxHashMap::default(),
             direct_callees: rustc_hash::FxHashMap::default(),
+            direct_constructs: rustc_hash::FxHashMap::default(),
             direct_methods: rustc_hash::FxHashMap::default(),
             inline_callees: rustc_hash::FxHashMap::default(),
             inline_methods: rustc_hash::FxHashMap::default(),

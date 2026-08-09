@@ -402,6 +402,42 @@ pub(crate) struct LeanCallbackState {
 }
 
 impl Interpreter {
+    /// Prepare the receiver for one compiler-generated base constructor.
+    ///
+    /// The dynamic callable has already passed the generated identity guard.
+    /// This owns the observable `new.target.prototype` lookup and
+    /// `OrdinaryCreateFromConstructor` allocation, but does not start the
+    /// constructor body. The caller's Machine root record keeps its arguments
+    /// live while this local root provider protects the callable, prototype,
+    /// and freshly allocated receiver across reentrant accessors and moving GC.
+    pub fn jit_prepare_base_construct_receiver(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        callee: Value,
+    ) -> Result<Value, VmError> {
+        self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
+        self.jit_runtime_stats.runtime_constructs =
+            self.jit_runtime_stats.runtime_constructs.saturating_add(1);
+        let roots = SyncJsCallRoots::construct(callee, callee, SmallVec::new());
+        let _roots_guard = self
+            .gc_heap
+            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+        let new_target = roots.new_target.get();
+        let proto = self
+            .construct_prototype_for_callee(stack, context, &new_target)?
+            .unwrap_or(self.constructor_prototype_value("Object")?);
+        roots.scratch_0.set(proto);
+        let receiver = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
+        roots.receiver.set(Value::object(receiver));
+        crate::object::set_prototype_value(
+            receiver,
+            &mut self.gc_heap,
+            Some(roots.scratch_0.get()),
+        );
+        Ok(roots.receiver.get())
+    }
+
     pub(crate) fn lean_callback_parent_upvalue(
         &self,
         state: &LeanCallbackState,

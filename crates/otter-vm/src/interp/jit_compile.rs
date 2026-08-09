@@ -123,6 +123,7 @@ impl Interpreter {
                 .unwrap_or(u32::MAX),
             global_object_loads: u32::try_from(view.global_object_loads.len()).unwrap_or(u32::MAX),
             direct_callees: u32::try_from(view.direct_callees.len()).unwrap_or(u32::MAX),
+            direct_constructs: u32::try_from(view.direct_constructs.len()).unwrap_or(u32::MAX),
             direct_method_sites: u32::try_from(view.direct_methods.len()).unwrap_or(u32::MAX),
             direct_method_targets: u32::try_from(
                 view.direct_methods.values().map(Vec::len).sum::<usize>(),
@@ -1272,10 +1273,20 @@ impl Interpreter {
                 let state = view
                     .code_block
                     .call_distribution_at(instruction_pc as usize)?;
-                Some((instruction_pc, instr.byte_pc, state))
+                Some((
+                    instruction_pc,
+                    instr.byte_pc,
+                    instr.op(&view.code_block) == Op::New,
+                    state,
+                ))
             })
             .collect();
-        for (instruction_pc, call_byte_pc, state) in call_sites {
+        for (instruction_pc, call_byte_pc, is_construct, state) in call_sites {
+            let call_kind = if is_construct {
+                jit::JitDirectCallKind::Construct
+            } else {
+                jit::JitDirectCallKind::Plain
+            };
             let feedback::CallSiteDistribution::Mono(target) = state else {
                 self.record_jit_inline_candidate(
                     fid,
@@ -1326,7 +1337,7 @@ impl Interpreter {
                     Some(jit_debug::JitInlineRejectionReason::MissingCallee),
                 );
                 self.record_jit_direct_call_plan(
-                    jit::JitDirectCallKind::Plain,
+                    call_kind,
                     fid,
                     instruction_pc,
                     tier,
@@ -1346,6 +1357,7 @@ impl Interpreter {
                 || callee.has_rest
                 || callee.contains_direct_eval
                 || callee.is_derived_constructor
+                || (is_construct && callee.is_method)
             {
                 self.record_jit_inline_candidate(
                     fid,
@@ -1364,7 +1376,7 @@ impl Interpreter {
                     }),
                 );
                 self.record_jit_direct_call_plan(
-                    jit::JitDirectCallKind::Plain,
+                    call_kind,
                     fid,
                     instruction_pc,
                     tier,
@@ -1387,8 +1399,12 @@ impl Interpreter {
                 self.ensure_direct_callee_plan(context, callee, eager_direct_targets)
             {
                 debug_assert_eq!(plan.function_id, callee_fid);
-                view.direct_callees
-                    .insert(call_byte_pc, jit::JitDirectCallee { plan });
+                let callee = jit::JitDirectCallee { plan };
+                if is_construct {
+                    view.direct_constructs.insert(call_byte_pc, callee);
+                } else {
+                    view.direct_callees.insert(call_byte_pc, callee);
+                }
                 jit_debug::JitDirectCallPlanOutcome::Available {
                     code_object_id: plan.code_object_id,
                     target_tier: match plan.tier {
@@ -1400,7 +1416,11 @@ impl Interpreter {
                             unreachable!("interpreter has no entry-capable code generation")
                         }
                     },
-                    this_mode: plan.this_mode,
+                    this_mode: if is_construct {
+                        jit::JitDirectCallThisMode::ConstructReceiver
+                    } else {
+                        plan.this_mode
+                    },
                 }
             } else {
                 pending_direct_targets.insert(callee_fid);
@@ -1409,7 +1429,7 @@ impl Interpreter {
                 }
             };
             self.record_jit_direct_call_plan(
-                jit::JitDirectCallKind::Plain,
+                call_kind,
                 fid,
                 instruction_pc,
                 tier,
@@ -1418,6 +1438,9 @@ impl Interpreter {
                 1,
                 direct_call_outcome,
             );
+            if is_construct {
+                continue;
+            }
             if !splice_candidates {
                 continue;
             }

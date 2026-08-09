@@ -4,6 +4,8 @@
 //! - [`DirectCallSite`] — one baked monomorphic call-site description.
 //! - [`emit_direct_call`] — exact callable guard, stack-owned callee frame,
 //!   native entry, return, and cold deoptimization.
+//! - [`emit_direct_call_with_access`] — the same linkage over allocator-owned
+//!   value locations and caller-provided root restoration.
 //!
 //! # Invariants
 //! - Normal call entry and return execute entirely in generated code. No
@@ -247,10 +249,11 @@ fn emit_load_sloppy_global_this(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
+    context_register: u8,
 ) {
     dynasm!(ops
         ; .arch aarch64
-        ; ldr x14, [x20, GLOBAL_THIS_OFFSET_PTR_OFFSET]
+        ; ldr x14, [X(context_register), GLOBAL_THIS_OFFSET_PTR_OFFSET]
         ; ldr w12, [x14]
     );
     emit_symbol(
@@ -364,11 +367,65 @@ pub(crate) fn emit_direct_call(
     site: DirectCallSite<'_>,
     deopt_entry: u64,
     resolve_direct_entry: u64,
-    mut code_map: Option<&mut CodeMapCapture>,
+    code_map: Option<&mut CodeMapCapture>,
     bail: DynamicLabel,
     threw: DynamicLabel,
     done: DynamicLabel,
 ) -> Result<(), Unsupported> {
+    emit_direct_call_with_access(
+        ops,
+        relocations,
+        view,
+        site,
+        deopt_entry,
+        resolve_direct_entry,
+        code_map,
+        bail,
+        threw,
+        done,
+        20,
+        |ops, source, target, _| {
+            let offset = reg_offset(source)?;
+            dynasm!(ops ; .arch aarch64 ; ldr X(target), [x19, offset]);
+            Ok(())
+        },
+        |ops, destination, source, _| {
+            let offset = reg_offset(destination)?;
+            dynasm!(ops ; .arch aarch64 ; str X(source), [x19, offset]);
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+}
+
+/// Emit generated linkage whose values live outside the interpreter window.
+///
+/// `load` and `store` receive an opaque site value id and the current stack
+/// bias introduced by the linkage frame. `restore_roots` runs after every
+/// effect-free rejection, normal return, or throw, with the original stack
+/// pointer restored and before the result is committed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_direct_call_with_access<Load, Store, Restore>(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    site: DirectCallSite<'_>,
+    deopt_entry: u64,
+    resolve_direct_entry: u64,
+    mut code_map: Option<&mut CodeMapCapture>,
+    bail: DynamicLabel,
+    threw: DynamicLabel,
+    done: DynamicLabel,
+    context_register: u8,
+    mut load: Load,
+    mut store: Store,
+    mut restore_roots: Restore,
+) -> Result<(), Unsupported>
+where
+    Load: FnMut(&mut Assembler, u16, u8, u32) -> Result<(), Unsupported>,
+    Store: FnMut(&mut Assembler, u16, u8, u32) -> Result<(), Unsupported>,
+    Restore: FnMut(&mut Assembler) -> Result<(), Unsupported>,
+{
     let (layout, direct_call) = layout_and_artifact(view, site)?;
 
     let direct_function = ops.new_dynamic_label();
@@ -382,22 +439,22 @@ pub(crate) fn emit_direct_call(
     let cleanup = ops.new_dynamic_label();
     let returned = ops.new_dynamic_label();
     let cleanup_threw = ops.new_dynamic_label();
+    let caller_bail = ops.new_dynamic_label();
 
     let guard_start = ops.offset().0;
     // The effective activation limit combines physical publication capacity
     // with the outer entry's remaining recursion budget.
     dynasm!(ops
         ; .arch aarch64
-        ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
+        ; ldr x9, [X(context_register), ACTIVATION_TOP_PTR_OFFSET]
         ; ldr x10, [x9]
-        ; ldr x11, [x20, ACTIVATION_LIMIT_OFFSET]
+        ; ldr x11, [X(context_register), ACTIVATION_LIMIT_OFFSET]
         ; cmp x10, x11
-        ; b.hs =>bail
+        ; b.hs =>caller_bail
     );
 
     match site.form {
         DirectCallForm::Method { callable, receiver } => {
-            let receiver_offset = reg_offset(receiver)?;
             dynasm!(ops ; .arch aarch64 ; mov x9, X(callable));
             emit_load_u64(
                 ops,
@@ -413,18 +470,18 @@ pub(crate) fn emit_direct_call(
                 ; ldr x10, [x9, view.closure_call_layout.upvalue_base_byte]
                 ; ldr w11, [x9, view.closure_call_layout.upvalue_count_byte]
             );
+            load(ops, receiver, 12, 0)?;
             dynasm!(ops
-                ; ldr x12, [x19, receiver_offset]
+                ; .arch aarch64
                 ; b =>callable_ready
                 ; =>direct_function
                 ; mov x10, xzr
                 ; mov w11, wzr
-                ; ldr x12, [x19, receiver_offset]
             );
+            load(ops, receiver, 12, 0)?;
         }
         DirectCallForm::Plain { callable } => {
-            let callee_offset = reg_offset(callable)?;
-            dynasm!(ops ; .arch aarch64 ; ldr x9, [x19, callee_offset]);
+            load(ops, callable, 9, 0)?;
             emit_load_u64(
                 ops,
                 10,
@@ -434,14 +491,14 @@ pub(crate) fn emit_direct_call(
                 ; .arch aarch64
                 ; cmp x9, x10
                 ; b.eq =>direct_function
-                ; cbz x9, =>bail
+                ; cbz x9, =>caller_bail
             );
-            emit_cell_test(ops, 9, 10, CellTest::IsNotCell, bail);
+            emit_cell_test(ops, 9, 10, CellTest::IsNotCell, caller_bail);
             dynasm!(ops
                 ; .arch aarch64
                 ; ldrb w10, [x9]
                 ; cmp w10, JS_CLOSURE_BODY_TYPE_TAG as u32
-                ; b.ne =>bail
+                ; b.ne =>caller_bail
                 ; ldr w13, [x9, view.closure_call_layout.flags_byte]
             );
             emit_load_u64(
@@ -452,14 +509,14 @@ pub(crate) fn emit_direct_call(
             dynasm!(ops
                 ; .arch aarch64
                 ; tst w13, w10
-                ; b.ne =>bail
+                ; b.ne =>caller_bail
                 ; ldr w10, [x9, view.closure_call_layout.function_id_byte]
             );
             emit_load_u64(ops, 11, u64::from(site.target.plan.function_id));
             dynasm!(ops
                 ; .arch aarch64
                 ; cmp w10, w11
-                ; b.ne =>bail
+                ; b.ne =>caller_bail
                 ; ldr x10, [x9, view.closure_call_layout.upvalue_base_byte]
                 ; ldr w11, [x9, view.closure_call_layout.upvalue_count_byte]
             );
@@ -487,9 +544,9 @@ pub(crate) fn emit_direct_call(
                 dynasm!(ops
                     ; .arch aarch64
                     ; tst w13, w14
-                    ; b.ne =>bail
+                    ; b.ne =>caller_bail
                 );
-                emit_load_sloppy_global_this(ops, relocations, view);
+                emit_load_sloppy_global_this(ops, relocations, view, context_register);
                 dynasm!(ops
                     ; .arch aarch64
                     ; b =>callable_ready
@@ -497,7 +554,7 @@ pub(crate) fn emit_direct_call(
                     ; mov x10, xzr
                     ; mov w11, wzr
                 );
-                emit_load_sloppy_global_this(ops, relocations, view);
+                emit_load_sloppy_global_this(ops, relocations, view, context_register);
             }
         }
     }
@@ -530,6 +587,30 @@ pub(crate) fn emit_direct_call(
         ; str x11, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
     );
 
+    // Copy arguments before the cold generation resolver can clobber
+    // allocator-owned caller-saved locations. The target plan fixes the
+    // parameter offsets even while its current generation is unpublished.
+    let copied_argument_count = site
+        .arguments
+        .len()
+        .min(usize::from(site.target.plan.param_count));
+    for (argument, &source) in site
+        .arguments
+        .iter()
+        .take(copied_argument_count)
+        .enumerate()
+    {
+        let destination_offset = NATIVE_FRAME_STACK_SIZE
+            + u32::try_from(argument)
+                .map_err(|_| Unsupported::OperandShape("direct call argument index"))?
+                * 8;
+        load(ops, source, 15, layout.frame_bytes)?;
+        dynasm!(ops
+            ; .arch aarch64
+            ; str x15, [sp, destination_offset]
+        );
+    }
+
     // Generated callers bake the permanent function-cell address. The hot
     // load selects its current generation; only an empty publication enters
     // the single no-allocation cold resolver.
@@ -548,7 +629,7 @@ pub(crate) fn emit_direct_call(
         ; add x2, x1, FUNCTION_ENTRY_GENERATION_CELL_OFFSET
         ; ldar x25, [x2]
         ; cbnz x25, =>generation_ready
-        ; mov x0, x20
+        ; mov x0, X(context_register)
     );
     emit_runtime_stub(
         ops,
@@ -574,7 +655,7 @@ pub(crate) fn emit_direct_call(
         // deepest stack address without shared byte accounting.
         ; subs x12, sp, x15
         ; b.lo =>uncommitted_rejected
-        ; ldr x11, [x20, NATIVE_STACK_LIMIT_OFFSET]
+        ; ldr x11, [X(context_register), NATIVE_STACK_LIMIT_OFFSET]
         ; cmp x12, x11
         ; b.lo =>uncommitted_rejected
         // The isolate is single-mutator. No VM transition occurs between the
@@ -590,10 +671,6 @@ pub(crate) fn emit_direct_call(
         ; str x14, [sp, NATIVE_FRAME_REGISTER_BASE_OFFSET]
     );
 
-    let copied_argument_count = site
-        .arguments
-        .len()
-        .min(usize::from(site.target.plan.param_count));
     let param_count = usize::from(site.target.plan.param_count);
     emit_initialize_register_range(
         ops,
@@ -611,40 +688,22 @@ pub(crate) fn emit_direct_call(
         emit_initialize_register_range(ops, param_count, local_count);
         dynasm!(ops ; .arch aarch64 ; =>locals_ready);
     }
-    for (argument, &source) in site
-        .arguments
-        .iter()
-        .take(copied_argument_count)
-        .enumerate()
-    {
-        let source_offset = reg_offset(source)?;
-        let destination_offset = NATIVE_FRAME_STACK_SIZE
-            + u32::try_from(argument)
-                .map_err(|_| Unsupported::OperandShape("direct call argument index"))?
-                * 8;
-        dynasm!(ops
-            ; .arch aarch64
-            ; ldr x15, [x19, source_offset]
-            ; str x15, [sp, destination_offset]
-        );
-    }
-
     dynasm!(ops
         ; .arch aarch64
-        ; ldr x13, [x20, NATIVE_FRAME_OFFSET]
-        ; ldr x14, [x20, THREAD_OFFSET]
+        ; ldr x13, [X(context_register), NATIVE_FRAME_OFFSET]
+        ; ldr x14, [X(context_register), THREAD_OFFSET]
         ; ldr x15, [x14, VM_THREAD_CODE_OBJECT_ID_OFFSET]
         ; str x13, [sp, layout.caller_frame]
         ; str x15, [sp, layout.caller_code_object_id]
-        ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
+        ; ldr x9, [X(context_register), ACTIVATION_TOP_PTR_OFFSET]
         ; ldr x10, [x9]
-        ; ldr x11, [x20, ACTIVATION_BASE_OFFSET]
+        ; ldr x11, [X(context_register), ACTIVATION_BASE_OFFSET]
         ; add x12, x11, x10, lsl #3
         ; mov x15, sp
         ; str x15, [x12]
         ; add x10, x10, #1
         ; str x10, [x9]
-        ; str x15, [x20, NATIVE_FRAME_OFFSET]
+        ; str x15, [X(context_register), NATIVE_FRAME_OFFSET]
         ; ldr x13, [x25, CODE_ENTRY_CODE_OBJECT_ID_OFFSET]
         ; stp x15, x13, [x14, VM_THREAD_CURRENT_FRAME_OFFSET as i32]
         ; ldr x16, [sp, layout.entry_addr]
@@ -662,8 +721,8 @@ pub(crate) fn emit_direct_call(
     emit_increment_feedback_u64(ops, CODE_ENTRY_GENERATED_ENTRIES_OFFSET);
     dynasm!(ops
         ; .arch aarch64
-        ; str xzr, [x20, GENERATED_FEEDBACK_CLEAN_OFFSET]
-        ; mov x0, x20
+        ; str xzr, [X(context_register), GENERATED_FEEDBACK_CLEAN_OFFSET]
+        ; mov x0, X(context_register)
         ; blr x16
     );
     record_region(
@@ -687,12 +746,8 @@ pub(crate) fn emit_direct_call(
     emit_reset_generated_bail_streak(ops);
     dynasm!(ops ; .arch aarch64 ; b =>result_ready ; =>callee_returned);
     emit_reset_generated_bail_streak(ops);
-    let destination_offset = reg_offset(site.dst)?;
     dynasm!(ops
         ; .arch aarch64
-        // Root the returned value in the still-live caller window before any
-        // callee activation or lease is removed.
-        ; str x0, [x19, destination_offset]
         ; b =>result_ready
         ; =>callee_bailed
     );
@@ -700,7 +755,7 @@ pub(crate) fn emit_direct_call(
     emit_increment_feedback_u32(ops, CODE_ENTRY_GENERATED_BAIL_STREAK_OFFSET);
     dynasm!(ops
         ; .arch aarch64
-        ; mov x0, x20
+        ; mov x0, X(context_register)
         ; mov x1, sp
     );
     emit_load_u64(ops, 2, u64::from(site.caller_function_id));
@@ -730,10 +785,8 @@ pub(crate) fn emit_direct_call(
         ; blr x16
         ; cmp x1, STATUS_RETURNED as u32
         ; b.ne =>result_ready
-        ; str x0, [x19, destination_offset]
-        ; =>result_ready
-        ; b =>cleanup
     );
+    dynasm!(ops ; .arch aarch64 ; =>result_ready ; b =>cleanup);
     record_region(
         &mut code_map,
         "directCallReturn",
@@ -750,14 +803,14 @@ pub(crate) fn emit_direct_call(
         // Restore caller publication before retiring the callee generation.
         ; ldr x13, [sp, layout.caller_frame]
         ; ldr x15, [sp, layout.caller_code_object_id]
-        ; str x13, [x20, NATIVE_FRAME_OFFSET]
-        ; ldr x14, [x20, THREAD_OFFSET]
+        ; str x13, [X(context_register), NATIVE_FRAME_OFFSET]
+        ; ldr x14, [X(context_register), THREAD_OFFSET]
         ; stp x13, x15, [x14, VM_THREAD_CURRENT_FRAME_OFFSET as i32]
-        ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
+        ; ldr x9, [X(context_register), ACTIVATION_TOP_PTR_OFFSET]
         ; ldr x10, [x9]
         ; sub x10, x10, #1
         ; str x10, [x9]
-        ; ldr x11, [x20, ACTIVATION_BASE_OFFSET]
+        ; ldr x11, [X(context_register), ACTIVATION_BASE_OFFSET]
         ; add x12, x11, x10, lsl #3
         ; str xzr, [x12]
     );
@@ -768,11 +821,13 @@ pub(crate) fn emit_direct_call(
         ; cmp x1, STATUS_RETURNED as u32
         ; b.eq =>returned
         ; b =>cleanup_threw
-        ; =>returned
-        ; b =>done
-        ; =>cleanup_threw
-        ; b =>threw
     );
+    dynasm!(ops ; .arch aarch64 ; =>returned);
+    restore_roots(ops)?;
+    store(ops, site.dst, 0, 0)?;
+    dynasm!(ops ; .arch aarch64 ; b =>done ; =>cleanup_threw);
+    restore_roots(ops)?;
+    dynasm!(ops ; .arch aarch64 ; b =>threw);
     record_region(
         &mut code_map,
         "directCallCleanup",
@@ -789,11 +844,11 @@ pub(crate) fn emit_direct_call(
         ; =>entry_rejected
         ; ldr x25, [sp, layout.saved_x25]
         ; add sp, sp, layout.frame_bytes
-        ; b =>bail
+        ; b =>caller_bail
         ; =>uncommitted_rejected
         ; ldr x25, [sp, layout.saved_x25]
         ; add sp, sp, layout.frame_bytes
-        ; b =>bail
+        ; b =>caller_bail
     );
     record_region(
         &mut code_map,
@@ -803,6 +858,10 @@ pub(crate) fn emit_direct_call(
         site,
         direct_call,
     );
+
+    dynasm!(ops ; .arch aarch64 ; =>caller_bail);
+    restore_roots(ops)?;
+    dynasm!(ops ; .arch aarch64 ; b =>bail);
 
     Ok(())
 }

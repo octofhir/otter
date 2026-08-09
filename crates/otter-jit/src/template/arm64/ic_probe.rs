@@ -344,7 +344,7 @@ where
         dynasm!(ops
             ; .arch aarch64
             ; cbz x13, =>miss
-            ; ldr w9, [x13, x17]
+            ; ldr x9, [x13, x17]
         );
     } else {
         emit_load_symbol_u64(

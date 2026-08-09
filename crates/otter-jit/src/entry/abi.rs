@@ -24,7 +24,8 @@ use otter_vm::{
 /// state. Registers, SELF, `this`, upvalues, PC, and tier state live only in
 /// [`NativeFrame`]; every compiled tier resolves them through that canonical
 /// activation. Nested calls reuse this context and swap only its active-frame
-/// pointer for the dynamic extent of the callee.
+/// pointer for the dynamic extent of the callee. Machine IR safepoints link
+/// allocator-owned tagged homes through the VM-owned root-chain head.
 #[repr(C)]
 pub(crate) struct JitCtx {
     /// Sole machine-visible VM state pointer.
@@ -51,6 +52,8 @@ pub(crate) struct JitCtx {
     /// generated linkage clears it with one idempotent store. Exact aggregate
     /// counts come from per-generation feedback during cold reconciliation.
     pub(crate) generated_feedback_clean: u64,
+    /// Address of the VM-owned Machine IR root-chain head.
+    pub(crate) machine_roots_ptr: *mut u64,
 }
 
 impl JitCtx {
@@ -207,6 +210,20 @@ pub(crate) const ACTIVATION_TOP_PTR_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, activation_top_ptr) as u32;
 pub(crate) const ACTIVATION_LIMIT_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, activation_limit) as u32;
+pub(crate) const MACHINE_ROOTS_PTR_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, machine_roots_ptr) as u32;
+pub(crate) const MACHINE_ROOT_RECORD_PREVIOUS_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::jit::JitMachineRootRecord, previous) as u32;
+pub(crate) const MACHINE_ROOT_RECORD_BASE_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::jit::JitMachineRootRecord, root_base) as u32;
+pub(crate) const MACHINE_ROOT_RECORD_CODE_OBJECT_ID_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::jit::JitMachineRootRecord, code_object_id) as u32;
+pub(crate) const MACHINE_ROOT_RECORD_COUNT_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::jit::JitMachineRootRecord, root_count) as u32;
+pub(crate) const MACHINE_ROOT_RECORD_SAFEPOINT_ID_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::jit::JitMachineRootRecord, safepoint_id) as u32;
+pub(crate) const MACHINE_ROOT_RECORD_SIZE: u32 =
+    std::mem::size_of::<otter_vm::jit::JitMachineRootRecord>() as u32;
 pub(crate) const GLOBAL_THIS_OFFSET_PTR_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, global_this_offset) as u32;
 pub(crate) const NATIVE_STACK_LIMIT_OFFSET: u32 =
@@ -292,7 +309,7 @@ pub(crate) const fn stack_register_frame_shape_word(register_count: u16) -> u32 
 // The native entry ABI targets 64-bit engines. These assertions describe the
 // one current VM/JIT layout generated code consumes directly.
 #[cfg(target_pointer_width = "64")]
-const _: [(); 72] = [(); std::mem::size_of::<JitCtx>()];
+const _: [(); 80] = [(); std::mem::size_of::<JitCtx>()];
 
 /// Compiled-code entry signature.
 pub(crate) type JitEntry = extern "C" fn(*mut JitCtx) -> JitRet;

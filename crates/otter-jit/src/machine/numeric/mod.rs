@@ -22,7 +22,10 @@ mod hir;
 use otter_vm::{
     JitArtifactFileName, JitCompileSnapshot,
     deopt::{DeoptExitDescriptor, DeoptExitId, DeoptRuntime},
-    native_abi::{STUB_JIT_BACKEDGE_POLL, STUB_JIT_DEOPT_WRITEBACK},
+    native_abi::{
+        STUB_JIT_BACKEDGE_POLL, STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK,
+        STUB_JIT_RESOLVE_DIRECT_ENTRY,
+    },
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -91,6 +94,7 @@ pub(crate) fn try_compile(
         gpr_budget: arm64::GPR_BUDGET,
     });
     let emission = arm64::emit(
+        view,
         &sequence,
         &allocation,
         frame,
@@ -98,6 +102,8 @@ pub(crate) fn try_compile(
         &machine_safepoints,
         transitions.entry(STUB_JIT_BACKEDGE_POLL),
         transitions.variadic_entry(STUB_JIT_DEOPT_WRITEBACK),
+        transitions.entry(STUB_JIT_DEOPT_STACK_CALL),
+        transitions.entry(STUB_JIT_RESOLVE_DIRECT_ENTRY),
         otter_vm::runtime_stubs::STRING_CONCAT_ALLOC
             .entry_addr()
             .ok_or(Unsupported::OperandShape(
@@ -719,6 +725,64 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         .expect("bounded scalar function safepoint count");
                     call
                 }
+                NumericNode::DirectCall {
+                    callee,
+                    target,
+                    argument_start,
+                    argument_count,
+                    logical_pc,
+                    byte_pc,
+                } => {
+                    let callee_value = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        callee,
+                    );
+                    let argument_start = usize::from(argument_start);
+                    let argument_end = argument_start
+                        .checked_add(usize::from(argument_count))
+                        .ok_or(super::VerificationError::InvalidValue(result))?;
+                    let arguments = hir
+                        .direct_call_arguments
+                        .get(argument_start..argument_end)
+                        .ok_or(super::VerificationError::InvalidValue(result))?
+                        .iter()
+                        .copied()
+                        .map(|argument| {
+                            tagged_call_argument(
+                                hir,
+                                &values,
+                                &mut representations,
+                                &mut instructions,
+                                argument,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let target = *hir
+                        .direct_call_targets
+                        .get(usize::from(target))
+                        .ok_or(super::VerificationError::InvalidValue(result))?;
+                    let descriptor_index = intern_call_descriptor(
+                        &mut call_descriptors,
+                        direct_call_descriptor(target, hir, logical_pc, byte_pc, arguments.len()),
+                    );
+                    let mut operands = Vec::with_capacity(arguments.len() + 2);
+                    operands.push(MachineOperand::register_input(callee_value));
+                    operands.extend(arguments.into_iter().map(MachineOperand::register_input));
+                    operands.push(MachineOperand::register_output(result));
+                    let mut call = MachineInstruction::plain(
+                        MachineOpcode::Call(descriptor_index as u32),
+                        operands,
+                    );
+                    call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
+                    call.safepoint = Some(super::SafepointId(next_safepoint));
+                    next_safepoint = next_safepoint
+                        .checked_add(1)
+                        .expect("bounded scalar function safepoint count");
+                    call
+                }
                 NumericNode::FloatToBoolean(source) => MachineInstruction::plain(
                     MachineOpcode::FloatToBoolean,
                     vec![
@@ -890,6 +954,32 @@ fn string_concat_call_descriptor() -> CallDescriptor {
         effects: CallEffects::READS_HEAP,
         clobbers,
         exceptional: ExceptionalEdge::None,
+        safepoint: SafepointKind::Gc,
+    }
+}
+
+fn direct_call_descriptor(
+    callee: otter_vm::JitDirectCallee,
+    hir: &NumericFunction,
+    logical_pc: u32,
+    byte_pc: u32,
+    argument_count: usize,
+) -> CallDescriptor {
+    CallDescriptor {
+        target: CallTarget::Direct {
+            callee,
+            caller_function_id: hir.function_id,
+            logical_pc,
+            byte_pc,
+        },
+        arguments: vec![MachineRepresentation::Tagged; argument_count + 1],
+        result: Some(MachineRepresentation::Tagged),
+        effects: CallEffects::READS_HEAP
+            .union(CallEffects::WRITES_HEAP)
+            .union(CallEffects::INVALIDATES_SHAPES)
+            .union(CallEffects::REENTRANT),
+        clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+        exceptional: ExceptionalEdge::Propagate,
         safepoint: SafepointKind::Gc,
     }
 }
@@ -3124,6 +3214,7 @@ mod tests {
         thread.gc_heap = heap as u64;
         thread.backedge_fuel_cell = std::ptr::from_mut(fuel) as u64;
         let mut error = None;
+        let mut machine_roots = 0;
         let mut ctx = JitCtx {
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::addr_of_mut!(native_frame),
@@ -3131,6 +3222,7 @@ mod tests {
             activation_base: std::ptr::null_mut(),
             activation_top_ptr: std::ptr::null_mut(),
             activation_limit: 0,
+            machine_roots_ptr: std::ptr::addr_of_mut!(machine_roots),
             global_this_offset: std::ptr::null(),
             native_stack_limit: 0,
             generated_feedback_clean: 1,

@@ -162,6 +162,7 @@ impl Interpreter {
                 crate::DEFAULT_MAX_STACK_DEPTH as usize
             ],
             jit_native_activation_top: 0,
+            jit_machine_roots: 0,
             runtime_budget: crate::RuntimeBudget::default(),
             runtime_budget_stats: crate::RuntimeBudgetStats::default(),
             runtime_budget_depth: 0,

@@ -710,11 +710,9 @@ pub struct JitDirectMethod {
 
 /// VM-owned root descriptor for one native JIT activation.
 ///
-/// The pointer names the canonical [`crate::native_abi::NativeFrame`]. The
-/// descriptor owns no executable state and copies no `Value`: the collector
-/// reaches SELF, `this`, `new.target`, and the explicit upvalue spine through
-/// the active-frame API and rewrites the exact fields every tier reloads after
-/// a safepoint.
+/// The pointer names the canonical [`crate::native_abi::NativeFrame`]. Machine
+/// IR values that live across reentrant calls are published separately through
+/// the interpreter-owned [`JitMachineRootRecord`] chain.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct JitNativeActivation {
@@ -728,6 +726,32 @@ impl JitNativeActivation {
         frame: std::ptr::null_mut(),
     };
 }
+
+/// One stack-owned Machine IR root publication linked into the interpreter's
+/// active native-root chain.
+#[repr(C, align(8))]
+#[derive(Clone, Copy, Debug)]
+pub struct JitMachineRootRecord {
+    /// Previous record address, or zero at the outermost Machine safepoint.
+    pub previous: u64,
+    /// Base of compact initialized tagged root homes.
+    pub root_base: *mut u64,
+    /// Code generation whose safepoint table owns the homes.
+    pub code_object_id: u64,
+    /// Number of initialized tagged homes.
+    pub root_count: u16,
+    /// Reserved padding kept zero by generated publishers.
+    pub reserved: u16,
+    /// Dense code-object-local safepoint identity.
+    pub safepoint_id: crate::native_abi::SafepointId,
+}
+
+const _: [(); 32] = [(); std::mem::size_of::<JitMachineRootRecord>()];
+const _: [(); 0] = [(); std::mem::offset_of!(JitMachineRootRecord, previous)];
+const _: [(); 8] = [(); std::mem::offset_of!(JitMachineRootRecord, root_base)];
+const _: [(); 16] = [(); std::mem::offset_of!(JitMachineRootRecord, code_object_id)];
+const _: [(); 24] = [(); std::mem::offset_of!(JitMachineRootRecord, root_count)];
+const _: [(); 28] = [(); std::mem::offset_of!(JitMachineRootRecord, safepoint_id)];
 
 const _: [(); 8] = [(); std::mem::size_of::<JitNativeActivation>()];
 const _: [(); 8] = [(); std::mem::align_of::<JitNativeActivation>()];

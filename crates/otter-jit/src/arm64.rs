@@ -25,7 +25,7 @@ mod method_guard;
 
 pub(crate) use direct_call::{
     DirectCallForm, DirectCallSite, direct_call_artifact, emit_direct_call,
-    target_is_supported as direct_call_target_is_supported,
+    emit_direct_call_with_access, target_is_supported as direct_call_target_is_supported,
 };
 pub(crate) use method_guard::{
     MethodGuardSite, emit_method_guard, emit_method_guard_from_tagged_register,

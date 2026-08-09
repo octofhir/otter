@@ -1179,6 +1179,8 @@ pub struct Interpreter {
     jit_native_activations: Vec<jit::JitNativeActivation>,
     /// Live prefix of [`Self::jit_native_activations`].
     jit_native_activation_top: usize,
+    /// Top of the linked Machine IR allocator-root record chain.
+    jit_machine_roots: u64,
     /// Optional per-turn resource policy. This slice records observations but
     /// does not yet yield or reject when a limit is exceeded.
     runtime_budget: RuntimeBudget,

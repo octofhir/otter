@@ -37,6 +37,9 @@ It already owns:
 - Tagged, Int32, Uint32, Float64, and Boolean values, including arbitrary
   tagged parameters, constants, locals, `this`, ordinary returns, tagged
   block parameters, tagged OSR inputs, checked arithmetic, and scalar VM leaves;
+- descriptor-driven leaf calls for exact tagged truthiness and strict equality,
+  including heap-cell semantics, scalar argument boxing, allocator clobbers,
+  and exact miss deopt without a VM-window shuttle;
 - allocator-driven spills, AAPCS64 callee-saved allocation, exact frame sizing,
   fixed leaf ABI operands, and deterministic normalized allocation artifacts;
 - `MachineFrameState -> lower_deopt_table -> VM DeoptTable`, shared cold exits,
@@ -52,28 +55,39 @@ The old optimizing compiler and template emitter remain in the active graph
 only for operations and function shapes not yet selected by the replacement
 pipeline. They are fallback, not contracts to preserve.
 
-Latest accepted gate: 276 JIT tests, 832 VM tests, all-target/all-feature
+Latest accepted gate: 280 JIT tests, 832 VM tests, all-target/all-feature
 Clippy, compile-fail/rooting checks, and 19/19 differential
 interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.
 
 ## Active work
 
-### 1. Generalize typed HIR and Machine IR beyond numeric functions
+### 1. Publish exact roots for allocating and reentrant calls
 
-Move complete function bodies rather than adding emitter detours:
+Make the existing universal call descriptor safe for moving-GC calls:
 
-- calls and constructs through the universal call descriptor and exceptional
-  edge model;
-- settled property/element loads and stores with explicit dependency tokens,
-  guards, barriers, safepoints, and stack maps;
-- allocation and reentrant operations with exact tagged roots;
-- structured exceptional control flow and multi-frame FrameState chains.
+- derive live Tagged roots at each safepoint from Machine IR liveness;
+- assign save homes after regalloc2 and encode them in the one stack-map format;
+- publish the active code object, safepoint, and spill base in `NativeFrame`;
+- let moving GC rewrite those homes, then reload live values before continuing;
+- prove normal return, throw, bail, and nested collection without conservative
+  scanning or an interpreter-register-window ABI.
 
-Each operation family must delete its old selector/emitter consumer from the
-active path in the same slice. Do not translate new IR back into legacy SSA or
-legacy allocation.
+Leaf calls remain the no-safepoint case of this same descriptor boundary; do
+not add a second call format.
 
-### 2. Complete target parity
+### 2. Move complete operation families onto Machine IR
+
+Implement in this order:
+
+1. ordinary calls and constructs with exceptional edges and multi-frame state;
+2. settled fields and elements with dependency tokens, guards, and barriers;
+3. inline object allocation, constructors, and virtual objects;
+4. OSR at every reducible loop and incremental-GC handshakes.
+
+Each slice must delete its old selector/emitter consumer from the active path.
+Do not translate new IR back into legacy SSA or legacy allocation.
+
+### 3. Complete target parity
 
 - implement x86-64 selection, legalization, frame emission, calls, polls,
   safepoints, and deopt exits over the same Machine IR;
@@ -82,7 +96,7 @@ legacy allocation.
   and unrelated source edits;
 - require cross-target verifier and allocation tests for every shared opcode.
 
-### 3. Perform the atomic compiler switch
+### 4. Perform the atomic compiler switch
 
 Once one complete supported-language boundary exists on both targets:
 
@@ -94,22 +108,12 @@ Once one complete supported-language boundary exists on both targets:
 - leave the interpreter as the semantic oracle and tier fallback, not as a
   compiled-code ABI.
 
-### 4. Shared semantic optimization
+### 5. Shared semantic optimization
 
 After the atomic switch, add representation propagation, dependency-aware
 guard elimination, inlining, GVN, LICM, loop scheduling, and cold outlining.
 Quick compilation skips expensive global passes; it does not use a different
 backend or value/frame format.
-
-### 5. Scaling slices
-
-Implement in order:
-
-1. typed fields and elements;
-2. inline object allocation;
-3. inline constructors and virtual objects;
-4. OSR at every reducible loop;
-5. incremental-GC handshakes using compiled stack maps.
 
 ## Required gates
 

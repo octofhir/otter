@@ -35,11 +35,12 @@ use otter_vm::{
     native_abi::{
         RuntimeStubDescriptor, STUB_JIT_BACKEDGE_POLL, STUB_JIT_DEOPT_WRITEBACK,
         STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF,
+        STUB_STRICT_EQ_LEAF, STUB_TO_BOOLEAN_LEAF,
     },
 };
 
 use super::super::{
-    AllocatedLocation, AllocatedSequence, AllocationEdit, AllocationPoint, DeoptId,
+    AllocatedLocation, AllocatedSequence, AllocationEdit, AllocationPoint, CallTarget, DeoptId,
     InstructionSequence, MachineFrameLayout, MachineInstructionId, MachineOpcode, MachineOsrInput,
     MachineOsrType, MachineRepresentation,
 };
@@ -51,7 +52,7 @@ use crate::{
         NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_REGISTER_COUNT_OFFSET,
         NATIVE_FRAME_THIS_OFFSET, NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
         THREAD_OFFSET, VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
-        VM_THREAD_INTERRUPT_CELL_OFFSET,
+        VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
 };
 use std::collections::BTreeMap;
@@ -218,6 +219,8 @@ pub(super) fn emit(
     number_rem_entry: u64,
     number_pow_entry: u64,
     number_to_int32_entry: u64,
+    strict_eq_entry: u64,
+    to_boolean_entry: u64,
     vm_register_count: u16,
     capture_artifacts: bool,
 ) -> Result<Emission, Unsupported> {
@@ -702,10 +705,62 @@ pub(super) fn emit(
                 }
                 dynasm!(ops ; .arch aarch64 ; b =>fallthrough);
             }
-            MachineOpcode::Call(_) => {
-                return Err(Unsupported::OperandShape(
-                    "numeric AArch64 Machine IR opcode",
-                ));
+            MachineOpcode::Call(descriptor_index) => {
+                let descriptor = sequence
+                    .call_descriptors()
+                    .get(descriptor_index as usize)
+                    .ok_or(Unsupported::OperandShape("scalar call descriptor"))?;
+                let (target, entry, result_index) = match descriptor.target {
+                    CallTarget::RuntimeStub(target) if target == STUB_TO_BOOLEAN_LEAF => {
+                        if locations.len() < 3
+                            || integer_register(locations[0])? != 1
+                            || integer_register(locations[1])? != 2
+                        {
+                            return Err(Unsupported::OperandShape("scalar ToBoolean call"));
+                        }
+                        (target, to_boolean_entry, 2)
+                    }
+                    CallTarget::RuntimeStub(target) if target == STUB_STRICT_EQ_LEAF => {
+                        if locations.len() < 3
+                            || integer_register(locations[0])? != 1
+                            || integer_register(locations[1])? != 2
+                        {
+                            return Err(Unsupported::OperandShape("scalar strict equality call"));
+                        }
+                        (target, strict_eq_entry, 2)
+                    }
+                    CallTarget::RuntimeStub(_) => {
+                        return Err(Unsupported::OperandShape("scalar runtime call target"));
+                    }
+                };
+                if integer_register(locations[result_index])? != 0 {
+                    return Err(Unsupported::OperandShape("scalar runtime call result"));
+                }
+                let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr x0, [x19, THREAD_OFFSET]
+                    ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+                );
+                emit_load_symbolic_u64(
+                    &mut ops,
+                    &mut relocations,
+                    16,
+                    entry,
+                    RelocationTarget::runtime_stub(target),
+                );
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; blr x16
+                    ; and x1, x1, #0xff
+                    ; cbnz x1, =>deopt
+                );
+                emit_load_u64(&mut ops, 16, Value::boolean(true).to_bits());
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; cmp x0, x16
+                    ; cset w0, eq
+                );
             }
         }
         if !is_terminator {

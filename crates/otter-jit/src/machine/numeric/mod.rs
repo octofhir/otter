@@ -27,9 +27,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use self::hir::{NumericFramePoint, NumericFunction, NumericNode, NumericTerminator, NumericType};
 use super::{
-    ControlFlow, DeoptId, InstructionSequence, MachineBlock, MachineBlockData, MachineInstruction,
-    MachineInstructionId, MachineOpcode, MachineOperand, MachineOsrInput, MachineOsrType,
-    MachineRepresentation, MachineValue, PhysicalRegister, TargetRegisterFile, lower_deopt_table,
+    CallDescriptor, CallEffects, CallTarget, ControlFlow, DeoptId, ExceptionalEdge,
+    InstructionSequence, MachineBlock, MachineBlockData, MachineInstruction, MachineInstructionId,
+    MachineOpcode, MachineOperand, MachineOsrInput, MachineOsrType, MachineRepresentation,
+    MachineValue, PhysicalRegister, SafepointKind, TargetRegisterFile, lower_deopt_table,
 };
 use crate::{
     Unsupported,
@@ -94,6 +95,8 @@ pub(crate) fn try_compile(
         otter_vm::runtime_stubs::NUMBER_REM_F64_LEAF.entry_addr() as u64,
         otter_vm::runtime_stubs::NUMBER_POW_F64_LEAF.entry_addr() as u64,
         otter_vm::runtime_stubs::NUMBER_TO_INT32_F64_LEAF.entry_addr() as u64,
+        otter_vm::runtime_stubs::STRICT_EQ_LEAF.entry_addr() as u64,
+        otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
         view.code_block.register_count,
         artifact_request.is_some(),
     )?;
@@ -206,6 +209,7 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
 
     let selection_cfg = SelectionCfg::build(hir);
     let mut instructions = Vec::with_capacity(hir.nodes.len() + hir.parameter_count as usize + 4);
+    let mut call_descriptors = Vec::<CallDescriptor>::new();
     let mut blocks = Vec::with_capacity(selection_cfg.order.len());
     let frame_state_ids = hir
         .frame_states
@@ -577,6 +581,77 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         MachineOperand::register_output(result),
                     ],
                 ),
+                NumericNode::TaggedToBoolean(source) => {
+                    let padding = push_value(&mut representations, MachineRepresentation::Tagged);
+                    instructions.push(MachineInstruction::plain(
+                        MachineOpcode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
+                        vec![MachineOperand::register_output(padding)],
+                    ));
+                    let descriptor_index = intern_leaf_boolean_call_descriptor(
+                        &mut call_descriptors,
+                        otter_vm::native_abi::STUB_TO_BOOLEAN_LEAF,
+                        2,
+                    );
+                    let mut call = MachineInstruction::plain(
+                        MachineOpcode::Call(descriptor_index as u32),
+                        vec![
+                            MachineOperand::fixed_register_input(
+                                machine_value(&values, source),
+                                PhysicalRegister::integer(1),
+                            ),
+                            MachineOperand::fixed_register_input(
+                                padding,
+                                PhysicalRegister::integer(2),
+                            ),
+                            MachineOperand::fixed_register_output(
+                                result,
+                                PhysicalRegister::integer(0),
+                            ),
+                        ],
+                    );
+                    call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
+                    call
+                }
+                NumericNode::TaggedStrictEqual(left, right) => {
+                    let left = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        left,
+                    );
+                    let right = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        right,
+                    );
+                    let descriptor_index = intern_leaf_boolean_call_descriptor(
+                        &mut call_descriptors,
+                        otter_vm::native_abi::STUB_STRICT_EQ_LEAF,
+                        2,
+                    );
+                    let mut call = MachineInstruction::plain(
+                        MachineOpcode::Call(descriptor_index as u32),
+                        vec![
+                            MachineOperand::fixed_register_input(
+                                left,
+                                PhysicalRegister::integer(1),
+                            ),
+                            MachineOperand::fixed_register_input(
+                                right,
+                                PhysicalRegister::integer(2),
+                            ),
+                            MachineOperand::fixed_register_output(
+                                result,
+                                PhysicalRegister::integer(0),
+                            ),
+                        ],
+                    );
+                    call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
+                    call
+                }
                 NumericNode::FloatToBoolean(source) => MachineInstruction::plain(
                     MachineOpcode::FloatToBoolean,
                     vec![
@@ -706,10 +781,70 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
     InstructionSequence::new(
         selection_cfg.originals[0],
         representations,
-        Vec::new(),
+        call_descriptors,
         blocks,
         instructions,
     )
+}
+
+fn intern_leaf_boolean_call_descriptor(
+    descriptors: &mut Vec<CallDescriptor>,
+    target: otter_vm::native_abi::RuntimeStubDescriptor,
+    argument_count: usize,
+) -> usize {
+    if let Some(index) = descriptors
+        .iter()
+        .position(|descriptor| descriptor.target == CallTarget::RuntimeStub(target))
+    {
+        return index;
+    }
+    descriptors.push(leaf_boolean_call_descriptor(target, argument_count));
+    descriptors.len() - 1
+}
+
+fn leaf_boolean_call_descriptor(
+    target: otter_vm::native_abi::RuntimeStubDescriptor,
+    argument_count: usize,
+) -> CallDescriptor {
+    let mut clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
+    clobbers.retain(|register| *register != PhysicalRegister::integer(0));
+    CallDescriptor {
+        target: CallTarget::RuntimeStub(target),
+        arguments: vec![MachineRepresentation::Tagged; argument_count],
+        result: Some(MachineRepresentation::Int32),
+        effects: CallEffects::READS_HEAP,
+        clobbers,
+        exceptional: ExceptionalEdge::None,
+        safepoint: SafepointKind::None,
+    }
+}
+
+fn tagged_call_argument(
+    hir: &NumericFunction,
+    values: &[MachineValue],
+    representations: &mut Vec<MachineRepresentation>,
+    instructions: &mut Vec<MachineInstruction>,
+    source: hir::NumericValue,
+) -> MachineValue {
+    if hir.nodes[source.0].value_type() == NumericType::Tagged {
+        return machine_value(values, source);
+    }
+    let tagged = push_value(representations, MachineRepresentation::Tagged);
+    let opcode = match hir.nodes[source.0].value_type() {
+        NumericType::Tagged => unreachable!("tagged call argument returned early"),
+        NumericType::Int32 => MachineOpcode::BoxInt32,
+        NumericType::Uint32 => MachineOpcode::BoxUint32,
+        NumericType::Number => MachineOpcode::BoxNumber,
+        NumericType::Boolean => MachineOpcode::BoxBoolean,
+    };
+    instructions.push(MachineInstruction::plain(
+        opcode,
+        vec![
+            MachineOperand::register_input(machine_value(values, source)),
+            MachineOperand::register_output(tagged),
+        ],
+    ));
+    tagged
 }
 
 fn attach_frame_state(
@@ -905,7 +1040,9 @@ mod tests {
 
     use super::*;
     use crate::entry::{JitCtx, JitEntry, JitRet, STATUS_BAILED, STATUS_RETURNED};
-    use crate::machine::{AllocatedLocation, OperandConstraint, OperandTiming, lower_deopt_table};
+    use crate::machine::{
+        AllocatedLocation, OperandConstraint, OperandPurpose, OperandTiming, lower_deopt_table,
+    };
 
     fn numeric_view(
         param_count: u16,
@@ -1302,6 +1439,83 @@ mod tests {
             view.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(ARITH_INT32));
         }
         view
+    }
+
+    fn tagged_truthiness_branch_view() -> JitCompileSnapshot {
+        numeric_view(
+            3,
+            3,
+            vec![
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(1), Operand::Register(0)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(1)]),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        )
+    }
+
+    fn tagged_logical_not_view() -> JitCompileSnapshot {
+        numeric_view(
+            1,
+            2,
+            vec![
+                (
+                    Op::LogicalNot,
+                    vec![Operand::Register(1), Operand::Register(0)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(1)]),
+            ],
+        )
+    }
+
+    fn tagged_strict_equality_view(op: Op) -> JitCompileSnapshot {
+        JitCompileSnapshot::without_feedback(
+            72,
+            2,
+            3,
+            vec![
+                JitTestInstruction::new(
+                    op,
+                    0,
+                    0,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 1, 8, vec![Operand::Register(2)]),
+            ],
+        )
+    }
+
+    fn tagged_mixed_strict_equality_view() -> JitCompileSnapshot {
+        JitCompileSnapshot::without_feedback(
+            73,
+            1,
+            3,
+            vec![
+                JitTestInstruction::new(
+                    Op::LoadInt32,
+                    0,
+                    0,
+                    vec![Operand::Register(1), Operand::Imm32(7)],
+                ),
+                JitTestInstruction::new(
+                    Op::Equal,
+                    1,
+                    8,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 2, 16, vec![Operand::Register(2)]),
+            ],
+        )
     }
 
     fn unused_parameter_view() -> JitCompileSnapshot {
@@ -2699,10 +2913,36 @@ mod tests {
     fn execute_at_with_register_count(
         code: &OptimizedCode,
         entry: JitEntry,
+        frame: Vec<u64>,
+        initial_pc: u32,
+        initialized_register_count: u16,
+        this_value: Value,
+        interrupt: *const u8,
+        fuel: &mut u64,
+    ) -> (JitRet, Vec<u64>, u32, u16) {
+        let heap = otter_gc::GcHeap::new().expect("execution-test heap");
+        execute_at_with_heap(
+            code,
+            entry,
+            frame,
+            initial_pc,
+            initialized_register_count,
+            this_value,
+            std::ptr::from_ref(&heap),
+            interrupt,
+            fuel,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_at_with_heap(
+        code: &OptimizedCode,
+        entry: JitEntry,
         mut frame: Vec<u64>,
         initial_pc: u32,
         initialized_register_count: u16,
         this_value: Value,
+        heap: *const otter_gc::GcHeap,
         interrupt: *const u8,
         fuel: &mut u64,
     ) -> (JitRet, Vec<u64>, u32, u16) {
@@ -2726,6 +2966,7 @@ mod tests {
         thread.current_frame = std::ptr::addr_of_mut!(native_frame) as u64;
         thread.current_code_object_id = metadata.code_object_id;
         thread.interrupt_cell = interrupt as u64;
+        thread.gc_heap = heap as u64;
         thread.backedge_fuel_cell = std::ptr::from_mut(fuel) as u64;
         let mut error = None;
         let mut ctx = JitCtx {
@@ -2958,6 +3199,254 @@ mod tests {
         assert_eq!(bail.status, STATUS_BAILED);
         assert_eq!(pc, 2);
         assert_eq!(after[0], Value::boolean(true).to_bits());
+    }
+
+    #[test]
+    fn tagged_truthiness_uses_the_verified_leaf_call_descriptor() {
+        let view = tagged_truthiness_branch_view();
+        let hir = NumericFunction::build(&view).expect("tagged truthiness HIR");
+        assert_eq!(hir.frame_states.len(), 1);
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::TaggedToBoolean(_)))
+        );
+
+        let sequence = select(&hir).expect("tagged truthiness Machine IR");
+        assert_eq!(sequence.call_descriptors().len(), 1);
+        let descriptor = &sequence.call_descriptors()[0];
+        assert_eq!(
+            descriptor.target,
+            CallTarget::RuntimeStub(otter_vm::native_abi::STUB_TO_BOOLEAN_LEAF)
+        );
+        assert_eq!(
+            descriptor.arguments,
+            [MachineRepresentation::Tagged, MachineRepresentation::Tagged]
+        );
+        assert_eq!(descriptor.result, Some(MachineRepresentation::Int32));
+        assert_eq!(descriptor.effects, CallEffects::READS_HEAP);
+        assert_eq!(descriptor.exceptional, ExceptionalEdge::None);
+        assert_eq!(descriptor.safepoint, SafepointKind::None);
+
+        let (call_id, call) = sequence
+            .instructions()
+            .iter()
+            .enumerate()
+            .find(|(_, instruction)| matches!(instruction.opcode, MachineOpcode::Call(0)))
+            .map(|(index, instruction)| (MachineInstructionId(index as u32), instruction))
+            .expect("tagged truthiness call");
+        assert_eq!(
+            call.operands[0].constraint,
+            OperandConstraint::Fixed(PhysicalRegister::integer(1))
+        );
+        assert_eq!(
+            call.operands[2].constraint,
+            OperandConstraint::Fixed(PhysicalRegister::integer(0))
+        );
+        assert!(call.deopt.is_some());
+        assert_eq!(
+            call.operands
+                .iter()
+                .filter(|operand| operand.purpose == OperandPurpose::Deopt)
+                .count(),
+            3
+        );
+        let allocation = sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("tagged truthiness allocation");
+        let locations = allocation
+            .instruction_locations(call_id)
+            .expect("tagged truthiness locations");
+        assert_eq!(
+            locations[0],
+            AllocatedLocation::Register(PhysicalRegister::integer(1))
+        );
+        assert_eq!(
+            locations[2],
+            AllocatedLocation::Register(PhysicalRegister::integer(0))
+        );
+    }
+
+    #[test]
+    fn tagged_truthiness_executes_all_immediate_classes_and_exact_miss_deopt() {
+        let code = compile_output(&tagged_truthiness_branch_view(), None).code;
+        let selected = Value::null().to_bits();
+        let rejected = Value::undefined().to_bits();
+        for condition in [
+            Value::boolean(true).to_bits(),
+            tag::box_int32(1),
+            boxed_f64(2.5),
+        ] {
+            let (result, _, _) = execute(&code, &[condition, selected, rejected], 0);
+            assert_eq!(result.status, STATUS_RETURNED);
+            assert_eq!(result.value, selected);
+        }
+        for condition in [
+            Value::boolean(false).to_bits(),
+            Value::null().to_bits(),
+            Value::undefined().to_bits(),
+            tag::box_int32(0),
+            boxed_f64(-0.0),
+            boxed_f64(f64::NAN),
+        ] {
+            let (result, _, _) = execute(&code, &[condition, selected, rejected], 0);
+            assert_eq!(result.status, STATUS_RETURNED);
+            assert_eq!(result.value, rejected);
+        }
+
+        let logical_not = compile_output(&tagged_logical_not_view(), None).code;
+        for (condition, expected) in [
+            (Value::null().to_bits(), true),
+            (Value::boolean(false).to_bits(), true),
+            (tag::box_int32(7), false),
+        ] {
+            let (result, _, _) = execute(&logical_not, &[condition], 0);
+            assert_eq!(result.status, STATUS_RETURNED);
+            assert_eq!(result.value, Value::boolean(expected).to_bits());
+        }
+
+        let entry: JitEntry = unsafe { std::mem::transmute(code.compiled_code().entry_ptr()) };
+        let frame = vec![Value::boolean(true).to_bits(), selected, rejected];
+        let interrupt = 0_u8;
+        let mut fuel = i64::MAX as u64;
+        let (result, after, pc, register_count) = execute_at_with_heap(
+            &code,
+            entry,
+            frame.clone(),
+            91,
+            code.metadata().param_count,
+            Value::undefined(),
+            std::ptr::null(),
+            std::ptr::addr_of!(interrupt),
+            &mut fuel,
+        );
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(pc, 0);
+        assert_eq!(register_count, code.metadata().register_count);
+        assert_eq!(after, frame);
+    }
+
+    #[test]
+    fn tagged_strict_equality_uses_verified_leaf_call_and_boxes_scalars() {
+        let view = tagged_mixed_strict_equality_view();
+        let hir = NumericFunction::build(&view).expect("tagged strict equality HIR");
+        assert_eq!(hir.frame_states.len(), 1);
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::TaggedStrictEqual(..)))
+        );
+
+        let sequence = select(&hir).expect("tagged strict equality Machine IR");
+        assert_eq!(sequence.call_descriptors().len(), 1);
+        let descriptor = &sequence.call_descriptors()[0];
+        assert_eq!(
+            descriptor.target,
+            CallTarget::RuntimeStub(otter_vm::native_abi::STUB_STRICT_EQ_LEAF)
+        );
+        assert_eq!(
+            descriptor.arguments,
+            [MachineRepresentation::Tagged, MachineRepresentation::Tagged]
+        );
+        assert_eq!(descriptor.result, Some(MachineRepresentation::Int32));
+        assert_eq!(descriptor.effects, CallEffects::READS_HEAP);
+        assert_eq!(descriptor.exceptional, ExceptionalEdge::None);
+        assert_eq!(descriptor.safepoint, SafepointKind::None);
+        assert!(
+            sequence
+                .instructions()
+                .iter()
+                .any(|instruction| instruction.opcode == MachineOpcode::BoxInt32)
+        );
+
+        let (call_id, call) = sequence
+            .instructions()
+            .iter()
+            .enumerate()
+            .find(|(_, instruction)| matches!(instruction.opcode, MachineOpcode::Call(0)))
+            .map(|(index, instruction)| (MachineInstructionId(index as u32), instruction))
+            .expect("tagged strict equality call");
+        for (operand, register) in call.operands[..3]
+            .iter()
+            .zip([1_u8, 2, 0].map(PhysicalRegister::integer))
+        {
+            assert_eq!(operand.constraint, OperandConstraint::Fixed(register));
+        }
+        assert!(call.deopt.is_some());
+        let allocation = sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("tagged strict equality allocation");
+        let locations = allocation
+            .instruction_locations(call_id)
+            .expect("tagged strict equality locations");
+        for (&location, register) in locations[..3]
+            .iter()
+            .zip([1_u8, 2, 0].map(PhysicalRegister::integer))
+        {
+            assert_eq!(location, AllocatedLocation::Register(register));
+        }
+    }
+
+    #[test]
+    fn tagged_strict_equality_executes_full_number_semantics_and_exact_miss_deopt() {
+        let code = compile_output(&tagged_strict_equality_view(Op::Equal), None).code;
+        for (left, right, expected) in [
+            (Value::null().to_bits(), Value::null().to_bits(), true),
+            (
+                Value::undefined().to_bits(),
+                Value::undefined().to_bits(),
+                true,
+            ),
+            (
+                Value::boolean(true).to_bits(),
+                Value::boolean(true).to_bits(),
+                true,
+            ),
+            (tag::box_int32(7), tag::box_int32(7), true),
+            (tag::box_int32(7), boxed_f64(7.0), true),
+            (boxed_f64(0.0), boxed_f64(-0.0), true),
+            (boxed_f64(f64::NAN), boxed_f64(f64::NAN), false),
+            (Value::null().to_bits(), Value::undefined().to_bits(), false),
+            (Value::boolean(true).to_bits(), tag::box_int32(1), false),
+        ] {
+            let (result, _, _) = execute(&code, &[left, right], 0);
+            assert_eq!(result.status, STATUS_RETURNED);
+            assert_eq!(result.value, Value::boolean(expected).to_bits());
+        }
+
+        let not_equal = compile_output(&tagged_strict_equality_view(Op::NotEqual), None).code;
+        let (result, _, _) = execute(&not_equal, &[tag::box_int32(7), boxed_f64(8.0)], 0);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, Value::boolean(true).to_bits());
+
+        let mixed = compile_output(&tagged_mixed_strict_equality_view(), None).code;
+        let (result, _, _) = execute(&mixed, &[boxed_f64(7.0)], 0);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, Value::boolean(true).to_bits());
+
+        let entry: JitEntry = unsafe { std::mem::transmute(code.compiled_code().entry_ptr()) };
+        let frame = vec![
+            tag::box_int32(3),
+            tag::box_int32(4),
+            Value::undefined().to_bits(),
+        ];
+        let interrupt = 0_u8;
+        let mut fuel = i64::MAX as u64;
+        let (result, after, pc, register_count) = execute_at_with_heap(
+            &code,
+            entry,
+            frame.clone(),
+            17,
+            code.metadata().param_count,
+            Value::undefined(),
+            std::ptr::null(),
+            std::ptr::addr_of!(interrupt),
+            &mut fuel,
+        );
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(pc, 0);
+        assert_eq!(register_count, code.metadata().register_count);
+        assert_eq!(after, frame);
     }
 
     #[test]

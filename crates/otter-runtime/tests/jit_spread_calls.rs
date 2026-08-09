@@ -12,8 +12,9 @@
 //! - Interpreter/template/production-tiered completion parity.
 //!
 //! # Invariants
-//! - Every compiled call/construct completes through the VM's synchronous
-//!   helper and is never replayed after a committed side effect.
+//! - Monomorphic spread calls/constructs use shared generated linkage;
+//!   unsupported and polymorphic sites retain synchronous VM completion and
+//!   are never replayed after a committed side effect.
 //! - Compiled output is byte-identical to the interpreter oracle.
 //!
 //! # See also

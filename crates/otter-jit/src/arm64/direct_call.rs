@@ -8,7 +8,7 @@
 //!   value locations and caller-provided root restoration.
 //!
 //! # Invariants
-//! - Plain and method call entry/return execute entirely in generated code.
+//! - Plain, method, and spread call entry/return execute entirely in generated code.
 //!   Base construction adds one typed receiver-preparation transition; body
 //!   entry, frame linkage, return substitution, and cleanup remain generated.
 //! - Every failure before native entry is effect-free and branches to the
@@ -20,6 +20,10 @@
 //!   tagged slots on the machine stack. Safepoint-free scalar generations may
 //!   publish only their parameter prefix; every cold exit expands it before
 //!   VM reentry. Moving GC therefore sees exactly the initialized window.
+//! - A spread call copies only the target's declared parameter prefix from the
+//!   compiler-created dense array, after every allocating receiver-preparation
+//!   transition and before frame publication. Eligibility excludes rest and
+//!   `arguments`, so ignored trailing values are unobservable to the callee.
 //! - A callee bailout is not replayed. The live published frame enters the
 //!   cold stack-call deoptimizer, which resumes the already-started callee.
 //! - Callers load the current generation through a stable per-function cell.
@@ -47,8 +51,8 @@ use otter_vm::{
 
 use crate::{
     artifact::{
-        CodeMapCapture, CodeRegion, DirectCallArtifact, DirectCallKindArtifact,
-        DirectCallThisModeArtifact, DirectCallTierArtifact,
+        CodeMapCapture, CodeRegion, DirectCallArgumentModeArtifact, DirectCallArtifact,
+        DirectCallKindArtifact, DirectCallThisModeArtifact, DirectCallTierArtifact,
         relocation::{RelocationCapture, RelocationTarget},
     },
     entry::{
@@ -78,6 +82,10 @@ const PARAMETER_PREFIX_FLAG_BIT: u32 = abi::CODE_ENTRY_PARAMETER_PREFIX.trailing
 pub(crate) enum DirectCallForm {
     /// Reload and validate an ordinary `Op::Call` callee.
     Plain { callable: u16 },
+    /// Reload an ordinary callable and consume an explicit `CallSpread`
+    /// receiver. The generated path currently accepts the canonical
+    /// `undefined` receiver; other receiver coercions side-exit pre-effect.
+    CallWithThis { callable: u16, receiver: u16 },
     /// Consume the exact callable and receiver proven by a method guard.
     Method { callable: u8, receiver: u16 },
     /// Reload an exact base-constructor callable and use one dedicated Machine
@@ -95,7 +103,10 @@ pub(crate) enum DirectCallForm {
 
 impl DirectCallForm {
     const fn is_construct(self) -> bool {
-        !matches!(self, Self::Plain { .. } | Self::Method { .. })
+        !matches!(
+            self,
+            Self::Plain { .. } | Self::CallWithThis { .. } | Self::Method { .. }
+        )
     }
 
     const fn is_derived(self) -> bool {
@@ -118,7 +129,7 @@ impl DirectCallForm {
             | Self::DerivedConstruct { callable }
             | Self::SuperConstruct { callable, .. }
             | Self::DerivedSuperConstruct { callable } => Some(callable),
-            Self::Plain { .. } | Self::Method { .. } => None,
+            Self::Plain { .. } | Self::CallWithThis { .. } | Self::Method { .. } => None,
         }
     }
 
@@ -128,6 +139,7 @@ impl DirectCallForm {
                 Some(receiver)
             }
             Self::Plain { .. }
+            | Self::CallWithThis { .. }
             | Self::Method { .. }
             | Self::DerivedConstruct { .. }
             | Self::DerivedSuperConstruct { .. } => None,
@@ -144,7 +156,16 @@ pub(crate) struct DirectCallSite<'a> {
     pub(crate) byte_pc: u32,
     pub(crate) dst: u16,
     pub(crate) form: DirectCallForm,
-    pub(crate) arguments: &'a [u16],
+    pub(crate) arguments: DirectCallArguments<'a>,
+}
+
+/// Source of the declared parameter prefix for one shared generated call.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DirectCallArguments<'a> {
+    /// Statically enumerated allocator or interpreter register values.
+    Fixed(&'a [u16]),
+    /// One compiler-created dense array containing already-evaluated values.
+    Spread(u16),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -349,14 +370,18 @@ fn layout_and_artifact(
 ) -> Result<(StackLayout, DirectCallArtifact), Unsupported> {
     let layout = StackLayout::for_target(site.target)
         .ok_or(Unsupported::OperandShape("direct call stack frame"))?;
-    if matches!(site.form, DirectCallForm::Plain { .. })
-        && site.target.plan.this_mode == JitDirectCallThisMode::SloppyGlobal
+    if matches!(
+        site.form,
+        DirectCallForm::Plain { .. } | DirectCallForm::CallWithThis { .. }
+    ) && site.target.plan.this_mode == JitDirectCallThisMode::SloppyGlobal
         && view.cage_base == 0
     {
         return Err(Unsupported::OperandShape("sloppy direct call cage base"));
     }
-    if matches!(site.form, DirectCallForm::Plain { .. })
-        && site.target.plan.this_mode == JitDirectCallThisMode::MethodReceiver
+    if matches!(
+        site.form,
+        DirectCallForm::Plain { .. } | DirectCallForm::CallWithThis { .. }
+    ) && site.target.plan.this_mode == JitDirectCallThisMode::MethodReceiver
     {
         return Err(Unsupported::OperandShape("plain call receiver binding"));
     }
@@ -371,7 +396,9 @@ fn layout_and_artifact(
         .ok_or(Unsupported::OperandShape("direct call stack reservation"))?;
     let direct_call = DirectCallArtifact {
         call_kind: match site.form {
-            DirectCallForm::Plain { .. } => DirectCallKindArtifact::Plain,
+            DirectCallForm::Plain { .. } | DirectCallForm::CallWithThis { .. } => {
+                DirectCallKindArtifact::Plain
+            }
             DirectCallForm::Method { .. } => DirectCallKindArtifact::Method,
             DirectCallForm::Construct { .. } => DirectCallKindArtifact::Construct,
             DirectCallForm::DerivedConstruct { .. } => DirectCallKindArtifact::DerivedConstruct,
@@ -379,6 +406,10 @@ fn layout_and_artifact(
             DirectCallForm::DerivedSuperConstruct { .. } => {
                 DirectCallKindArtifact::DerivedSuperConstruct
             }
+        },
+        argument_mode: match site.arguments {
+            DirectCallArguments::Fixed(_) => DirectCallArgumentModeArtifact::Fixed,
+            DirectCallArguments::Spread(_) => DirectCallArgumentModeArtifact::Spread,
         },
         target_function_id: site.target.plan.function_id,
         target_code_object_id: site.target.plan.code_object_id,
@@ -397,25 +428,27 @@ fn layout_and_artifact(
             | DirectCallForm::DerivedSuperConstruct { .. } => {
                 DirectCallThisModeArtifact::DerivedConstructor
             }
-            DirectCallForm::Plain { .. } => match site.target.plan.this_mode {
-                JitDirectCallThisMode::StrictOrLexical => {
-                    DirectCallThisModeArtifact::StrictOrLexical
+            DirectCallForm::Plain { .. } | DirectCallForm::CallWithThis { .. } => {
+                match site.target.plan.this_mode {
+                    JitDirectCallThisMode::StrictOrLexical => {
+                        DirectCallThisModeArtifact::StrictOrLexical
+                    }
+                    JitDirectCallThisMode::SloppyGlobal => DirectCallThisModeArtifact::SloppyGlobal,
+                    JitDirectCallThisMode::MethodReceiver => {
+                        return Err(Unsupported::OperandShape("plain call receiver binding"));
+                    }
+                    JitDirectCallThisMode::ConstructReceiver => {
+                        return Err(Unsupported::OperandShape(
+                            "plain call constructor receiver binding",
+                        ));
+                    }
+                    JitDirectCallThisMode::DerivedConstructor => {
+                        return Err(Unsupported::OperandShape(
+                            "plain call derived-constructor binding",
+                        ));
+                    }
                 }
-                JitDirectCallThisMode::SloppyGlobal => DirectCallThisModeArtifact::SloppyGlobal,
-                JitDirectCallThisMode::MethodReceiver => {
-                    return Err(Unsupported::OperandShape("plain call receiver binding"));
-                }
-                JitDirectCallThisMode::ConstructReceiver => {
-                    return Err(Unsupported::OperandShape(
-                        "plain call constructor receiver binding",
-                    ));
-                }
-                JitDirectCallThisMode::DerivedConstructor => {
-                    return Err(Unsupported::OperandShape(
-                        "plain call derived-constructor binding",
-                    ));
-                }
-            },
+            }
         },
         callee_native_frame_bytes,
         linkage_bytes: layout.frame_bytes,
@@ -457,6 +490,7 @@ pub(crate) fn emit_direct_call(
         site,
         deopt_entry,
         resolve_direct_entry,
+        0,
         0,
         0,
         0,
@@ -502,6 +536,7 @@ pub(crate) fn emit_direct_call_with_access<Load, Store, Restore, RootReceiver, R
     prepare_construct_entry: u64,
     construct_result_entry: u64,
     derived_construct_result_entry: u64,
+    copy_spread_arguments_entry: u64,
     mut code_map: Option<&mut CodeMapCapture>,
     bail: DynamicLabel,
     threw: DynamicLabel,
@@ -575,7 +610,11 @@ where
             );
             load(ops, receiver, 12, 0)?;
         }
-        DirectCallForm::Plain { callable } => {
+        DirectCallForm::Plain { callable } | DirectCallForm::CallWithThis { callable, .. } => {
+            let explicit_receiver = match site.form {
+                DirectCallForm::CallWithThis { receiver, .. } => Some(receiver),
+                _ => None,
+            };
             load(ops, callable, 9, 0)?;
             emit_load_u64(
                 ops,
@@ -617,7 +656,11 @@ where
             );
 
             if site.target.plan.this_mode == JitDirectCallThisMode::StrictOrLexical {
-                emit_load_u64(ops, 12, VALUE_UNDEFINED);
+                if let Some(receiver) = explicit_receiver {
+                    load(ops, receiver, 12, 0)?;
+                } else {
+                    emit_load_u64(ops, 12, VALUE_UNDEFINED);
+                }
                 emit_load_u64(ops, 14, u64::from(view.closure_call_layout.bound_this_flag));
                 dynasm!(ops
                     ; .arch aarch64
@@ -629,7 +672,11 @@ where
                     ; mov x10, xzr
                     ; mov w11, wzr
                 );
-                emit_load_u64(ops, 12, VALUE_UNDEFINED);
+                if let Some(receiver) = explicit_receiver {
+                    load(ops, receiver, 12, 0)?;
+                } else {
+                    emit_load_u64(ops, 12, VALUE_UNDEFINED);
+                }
             } else {
                 // Plain `Op::Call` supplies `undefined`, which sloppy call
                 // binding normalizes to the active realm's global object. An
@@ -641,6 +688,15 @@ where
                     ; tst w13, w14
                     ; b.ne =>caller_bail
                 );
+                if let Some(receiver) = explicit_receiver {
+                    load(ops, receiver, 12, 0)?;
+                    emit_load_u64(ops, 14, VALUE_UNDEFINED);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; cmp x12, x14
+                        ; b.ne =>caller_bail
+                    );
+                }
                 emit_load_sloppy_global_this(ops, relocations, view, context_register);
                 dynasm!(ops
                     ; .arch aarch64
@@ -749,7 +805,9 @@ where
                 ; str wzr, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
             );
         }
-        DirectCallForm::Plain { .. } | DirectCallForm::Method { .. } => {
+        DirectCallForm::Plain { .. }
+        | DirectCallForm::CallWithThis { .. }
+        | DirectCallForm::Method { .. } => {
             emit_load_u64(ops, 13, VALUE_UNDEFINED);
             dynasm!(ops
                 ; .arch aarch64
@@ -763,25 +821,24 @@ where
     // Copy arguments before the cold generation resolver can clobber
     // allocator-owned caller-saved locations. The target plan fixes the
     // parameter offsets even while its current generation is unpublished.
-    let copied_argument_count = site
-        .arguments
-        .len()
-        .min(usize::from(site.target.plan.param_count));
-    for (argument, &source) in site
-        .arguments
-        .iter()
-        .take(copied_argument_count)
-        .enumerate()
-    {
-        let destination_offset = NATIVE_FRAME_STACK_SIZE
-            + u32::try_from(argument)
-                .map_err(|_| Unsupported::OperandShape("direct call argument index"))?
-                * 8;
-        load(ops, source, 15, layout.frame_bytes)?;
-        dynasm!(ops
-            ; .arch aarch64
-            ; str x15, [sp, destination_offset]
-        );
+    let copied_argument_count = match site.arguments {
+        DirectCallArguments::Fixed(arguments) => arguments
+            .len()
+            .min(usize::from(site.target.plan.param_count)),
+        DirectCallArguments::Spread(_) => 0,
+    };
+    if let DirectCallArguments::Fixed(arguments) = site.arguments {
+        for (argument, &source) in arguments.iter().take(copied_argument_count).enumerate() {
+            let destination_offset = NATIVE_FRAME_STACK_SIZE
+                + u32::try_from(argument)
+                    .map_err(|_| Unsupported::OperandShape("direct call argument index"))?
+                    * 8;
+            load(ops, source, 15, layout.frame_bytes)?;
+            dynasm!(ops
+                ; .arch aarch64
+                ; str x15, [sp, destination_offset]
+            );
+        }
     }
 
     // Generated callers bake the permanent function-cell address. The hot
@@ -939,18 +996,15 @@ where
             ; str x10, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
             ; str w11, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
         );
-        for (argument, &source) in site
-            .arguments
-            .iter()
-            .take(copied_argument_count)
-            .enumerate()
-        {
-            let destination_offset = NATIVE_FRAME_STACK_SIZE
-                + u32::try_from(argument)
-                    .map_err(|_| Unsupported::OperandShape("construct argument index"))?
-                    * 8;
-            load(ops, source, 15, layout.frame_bytes)?;
-            dynasm!(ops ; .arch aarch64 ; str x15, [sp, destination_offset]);
+        if let DirectCallArguments::Fixed(arguments) = site.arguments {
+            for (argument, &source) in arguments.iter().take(copied_argument_count).enumerate() {
+                let destination_offset = NATIVE_FRAME_STACK_SIZE
+                    + u32::try_from(argument)
+                        .map_err(|_| Unsupported::OperandShape("construct argument index"))?
+                        * 8;
+                load(ops, source, 15, layout.frame_bytes)?;
+                dynasm!(ops ; .arch aarch64 ; str x15, [sp, destination_offset]);
+            }
         }
         record_region(
             &mut code_map,
@@ -1013,6 +1067,37 @@ where
             ; ldrb w15, [sp, NATIVE_FRAME_FLAGS_OFFSET]
             ; orr w15, w15, abi::NativeFrameFlags::DERIVED_CONSTRUCTOR as u32
             ; strb w15, [sp, NATIVE_FRAME_FLAGS_OFFSET]
+        );
+    }
+    if let DirectCallArguments::Spread(arguments) = site.arguments {
+        if copy_spread_arguments_entry == 0 {
+            return Err(Unsupported::OperandShape(
+                "spread direct call argument transition",
+            ));
+        }
+        // Resolve the target and prepare a base receiver before reading the
+        // spread array again: either path may clobber allocator registers, and
+        // receiver preparation may move the array. The Machine root record is
+        // the sole owner of that live value across both transitions.
+        refresh_roots(ops, layout.frame_bytes)?;
+        load(ops, arguments, 1, layout.frame_bytes)?;
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov x0, X(context_register)
+            ; mov x2, sp
+        );
+        emit_load_u64(ops, 3, u64::from(site.target.plan.param_count));
+        emit_runtime_stub(
+            ops,
+            relocations,
+            16,
+            copy_spread_arguments_entry,
+            abi::STUB_JIT_COPY_SPREAD_ARGUMENTS,
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; cbnz x0, =>uncommitted_rejected
         );
     }
     dynasm!(ops
@@ -1133,6 +1218,7 @@ where
         6,
         match site.form {
             DirectCallForm::Plain { .. } => 0,
+            DirectCallForm::CallWithThis { .. } => 0,
             DirectCallForm::Method { .. } => 1,
             DirectCallForm::Construct { .. } => 2,
             DirectCallForm::DerivedConstruct { .. } => 3,

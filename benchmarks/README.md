@@ -76,6 +76,7 @@ print output, access the filesystem, install packages, or depend on host APIs.
 | `dense-array.js` | Repeated dense indexed array loads | `5234688` |
 | `numeric-leaf.js` | Repeated calls into a straight-line eight-operation Number leaf | `-700000` |
 | `derived-constructor.js` | Fixed-arity derived construction, `super()` linkage, initialized `this`, and result property reads | `10000200000` |
+| `spread-call-family.js` | Plain calls, base construction, derived construction, and `super()` over compiler-collected spread arrays | `15000750000` |
 | `string-concat.js` | Allocating primitive concat with a tagged result live across the second safepoint | `600000` |
 | `typed-parameter-loop.js` | Int32 parameter guards, loop phis, checked arithmetic, and OSR | `300000` |
 

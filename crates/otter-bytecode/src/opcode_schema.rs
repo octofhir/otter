@@ -1108,9 +1108,12 @@ const fn feedback(op: Op) -> FeedbackKind {
         Op::Call
         | Op::CallWithThis
         | Op::CallMethodValue
+        | Op::CallSpread
         | Op::TailCall
         | Op::New
-        | Op::SuperConstruct => FeedbackKind::Call,
+        | Op::NewSpread
+        | Op::SuperConstruct
+        | Op::SuperConstructSpread => FeedbackKind::Call,
         Op::LoadGlobalOrThrow
         | Op::LoadGlobalOrUndefined
         | Op::StoreGlobalBinding

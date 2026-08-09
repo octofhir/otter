@@ -138,6 +138,23 @@ impl DirectCallKindArtifact {
     }
 }
 
+/// How one generated call materializes its callee parameter prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum DirectCallArgumentModeArtifact {
+    Fixed,
+    Spread,
+}
+
+impl DirectCallArgumentModeArtifact {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Spread => "spread",
+        }
+    }
+}
+
 /// ECMAScript receiver source used by one generated call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -170,6 +187,7 @@ impl DirectCallThisModeArtifact {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DirectCallArtifact {
     pub(crate) call_kind: DirectCallKindArtifact,
+    pub(crate) argument_mode: DirectCallArgumentModeArtifact,
     pub(crate) target_function_id: u32,
     pub(crate) target_code_object_id: u64,
     pub(crate) target_tier: DirectCallTierArtifact,
@@ -811,6 +829,7 @@ mod tests {
             19,
             DirectCallArtifact {
                 call_kind: DirectCallKindArtifact::Plain,
+                argument_mode: DirectCallArgumentModeArtifact::Fixed,
                 target_function_id: 11,
                 target_code_object_id: 29,
                 target_tier: DirectCallTierArtifact::Optimizing,

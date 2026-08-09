@@ -121,8 +121,8 @@ use super::{
 use crate::{
     CompiledCode,
     arm64::{
-        DirectCallForm, DirectCallSite, direct_call_target_is_supported, emit_direct_call,
-        emit_method_guard_from_tagged_register,
+        DirectCallArguments, DirectCallForm, DirectCallSite, direct_call_target_is_supported,
+        emit_direct_call, emit_method_guard_from_tagged_register,
     },
     artifact::{
         ArtifactRequest, CodeMapCapture, CodeRegion, NativeCompileOutput, build_bundle,
@@ -3762,7 +3762,7 @@ fn emit(
                                         byte_pc,
                                         dst,
                                         form: DirectCallForm::Plain { callable: callee },
-                                        arguments: arg_regs,
+                                        arguments: DirectCallArguments::Fixed(arg_regs),
                                     },
                                     deopt_stack_call_entry.address,
                                     resolve_direct_entry.address,

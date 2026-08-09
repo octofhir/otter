@@ -31,7 +31,8 @@ use otter_vm::native_abi::{RuntimeStubDescriptor, RuntimeStubSignature, runtime_
 use serde::Serialize;
 
 use super::{
-    DirectCallArtifact, DirectCallKindArtifact, DirectCallThisModeArtifact, DirectCallTierArtifact,
+    DirectCallArgumentModeArtifact, DirectCallArtifact, DirectCallKindArtifact,
+    DirectCallThisModeArtifact, DirectCallTierArtifact,
 };
 
 const NORMALIZED_MAGIC: &[u8; 8] = b"OTJNCODE";
@@ -1045,6 +1046,10 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
                 DirectCallKindArtifact::SuperConstruct => 4,
                 DirectCallKindArtifact::DerivedSuperConstruct => 5,
             });
+            output.push(match direct_call.argument_mode {
+                DirectCallArgumentModeArtifact::Fixed => 0,
+                DirectCallArgumentModeArtifact::Spread => 1,
+            });
             output.push(match direct_call.target_tier {
                 DirectCallTierArtifact::Template => 0,
                 DirectCallTierArtifact::Optimizing => 1,
@@ -1120,6 +1125,7 @@ mod tests {
             byte_pc: 13,
             direct_call: DirectCallArtifact {
                 call_kind: DirectCallKindArtifact::Plain,
+                argument_mode: DirectCallArgumentModeArtifact::Fixed,
                 target_function_id: 12,
                 target_code_object_id,
                 target_tier,

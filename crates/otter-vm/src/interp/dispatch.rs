@@ -408,8 +408,24 @@ impl Interpreter {
                     continue;
                 }
                 Op::CallSpread => {
+                    let depth_before = stack.len();
                     let operands = function.operand_view(instr);
                     self.do_call_spread(stack, context, operands)?;
+                    if jit_installed && stack.len() > depth_before {
+                        let transition = self.record_ordinary_call_feedback(
+                            function,
+                            instr.instruction_pc,
+                            crate::feedback::OrdinaryCallTarget::Bytecode(
+                                stack[stack.len() - 1].function_id,
+                            ),
+                        );
+                        if transition.evict_for_reopt() {
+                            self.evict_compiled_for_reopt(function_id);
+                        }
+                        if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)? {
+                            return Ok(value);
+                        }
+                    }
                     continue;
                 }
                 Op::New => {
@@ -519,13 +535,101 @@ impl Interpreter {
                     continue;
                 }
                 Op::NewSpread => {
+                    let depth_before = stack.len();
+                    let direct_construct_fid = if jit_installed {
+                        register_operand(function.operand(instr, 1))
+                            .ok()
+                            .and_then(|register| stack[top_idx].registers.get(register as usize))
+                            .copied()
+                            .and_then(|value| {
+                                value
+                                    .as_function()
+                                    .or_else(|| {
+                                        value
+                                            .as_closure(&self.gc_heap)
+                                            .map(|closure| closure.function_id())
+                                    })
+                                    .or_else(|| {
+                                        value.as_class_constructor().and_then(|class| {
+                                            let ctor = class.ctor(&self.gc_heap);
+                                            ctor.as_function().or_else(|| {
+                                                ctor.as_closure(&self.gc_heap)
+                                                    .map(|closure| closure.function_id())
+                                            })
+                                        })
+                                    })
+                            })
+                    } else {
+                        None
+                    };
                     let operands = function.operand_view(instr);
                     self.do_construct_spread(stack, context, operands)?;
+                    if jit_installed && stack.len() > depth_before {
+                        if direct_construct_fid == Some(stack[stack.len() - 1].function_id) {
+                            let transition = self.record_ordinary_call_feedback(
+                                function,
+                                instr.instruction_pc,
+                                crate::feedback::OrdinaryCallTarget::Bytecode(
+                                    stack[stack.len() - 1].function_id,
+                                ),
+                            );
+                            if transition.evict_for_reopt() {
+                                self.evict_compiled_for_reopt(function_id);
+                            }
+                        }
+                        if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)? {
+                            return Ok(value);
+                        }
+                    }
                     continue;
                 }
                 Op::SuperConstructSpread => {
+                    let depth_before = stack.len();
+                    let direct_construct_fid = if jit_installed {
+                        register_operand(function.operand(instr, 1))
+                            .ok()
+                            .and_then(|register| stack[top_idx].registers.get(register as usize))
+                            .copied()
+                            .and_then(|value| {
+                                value
+                                    .as_function()
+                                    .or_else(|| {
+                                        value
+                                            .as_closure(&self.gc_heap)
+                                            .map(|closure| closure.function_id())
+                                    })
+                                    .or_else(|| {
+                                        value.as_class_constructor().and_then(|class| {
+                                            let ctor = class.ctor(&self.gc_heap);
+                                            ctor.as_function().or_else(|| {
+                                                ctor.as_closure(&self.gc_heap)
+                                                    .map(|closure| closure.function_id())
+                                            })
+                                        })
+                                    })
+                            })
+                    } else {
+                        None
+                    };
                     let operands = function.operand_view(instr);
                     self.do_super_construct_spread(stack, context, operands)?;
+                    if jit_installed && stack.len() > depth_before {
+                        if direct_construct_fid == Some(stack[stack.len() - 1].function_id) {
+                            let transition = self.record_ordinary_call_feedback(
+                                function,
+                                instr.instruction_pc,
+                                crate::feedback::OrdinaryCallTarget::Bytecode(
+                                    stack[stack.len() - 1].function_id,
+                                ),
+                            );
+                            if transition.evict_for_reopt() {
+                                self.evict_compiled_for_reopt(function_id);
+                            }
+                        }
+                        if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)? {
+                            return Ok(value);
+                        }
+                    }
                     continue;
                 }
                 Op::BindThisValue => {

@@ -16,8 +16,11 @@
 //! - Allocating calls save every live tagged value from its exact late-use
 //!   location into the frame's collector-visible root area and reload it after
 //!   moving GC; no interpreter-window shuttle or emitter-local map exists.
-//! - Guarded methods, plain calls, and fixed-arity base/derived/super
+//! - Guarded methods, plain calls, and fixed/spread base/derived/super
 //!   construction share one typed descriptor and generated linkage emitter.
+//!   Spread lowering consumes the compiler-created dense argument array;
+//!   eligible callees cannot observe discarded arguments through rest or the
+//!   `arguments` object.
 //!   Calls inside supported catch regions own explicit exceptional CFG
 //!   successors rather than leaving compiled code.
 
@@ -29,23 +32,24 @@ use otter_vm::{
     deopt::{DeoptExitDescriptor, DeoptExitId, DeoptRuntime},
     native_abi::{
         STUB_JIT_BACKEDGE_POLL, STUB_JIT_BASE_CONSTRUCT_RESULT, STUB_JIT_BIND_DERIVED_THIS,
-        STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK,
-        STUB_JIT_DERIVED_CONSTRUCT_RESULT, STUB_JIT_LOAD_UPVALUE_VALUE,
-        STUB_JIT_PREPARE_BASE_CONSTRUCT, STUB_JIT_RESOLVE_DIRECT_ENTRY,
+        STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_COPY_SPREAD_ARGUMENTS,
+        STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_DERIVED_CONSTRUCT_RESULT,
+        STUB_JIT_LOAD_UPVALUE_VALUE, STUB_JIT_PREPARE_BASE_CONSTRUCT,
+        STUB_JIT_RESOLVE_DIRECT_ENTRY,
     },
 };
 use std::collections::{BTreeMap, BTreeSet};
 
 use self::hir::{
-    NumericDirectCallKind, NumericDirectCallTarget, NumericFramePoint, NumericFunction,
-    NumericNode, NumericTerminator, NumericType,
+    NumericDirectCallArguments, NumericDirectCallKind, NumericDirectCallTarget, NumericFramePoint,
+    NumericFunction, NumericNode, NumericTerminator, NumericType,
 };
 use super::{
-    CallDescriptor, CallEffects, CallTarget, ControlFlow, DeoptId, DirectCallKind, ExceptionalEdge,
-    InstructionSequence, MachineBlock, MachineBlockData, MachineInstruction, MachineInstructionId,
-    MachineOpcode, MachineOperand, MachineOsrInput, MachineOsrType, MachineRepresentation,
-    MachineValue, PhysicalRegister, SafepointKind, TargetRegisterFile, lower_deopt_table,
-    lower_safepoints,
+    CallDescriptor, CallEffects, CallTarget, ControlFlow, DeoptId, DirectCallArgumentMode,
+    DirectCallKind, ExceptionalEdge, InstructionSequence, MachineBlock, MachineBlockData,
+    MachineInstruction, MachineInstructionId, MachineOpcode, MachineOperand, MachineOsrInput,
+    MachineOsrType, MachineRepresentation, MachineValue, PhysicalRegister, SafepointKind,
+    TargetRegisterFile, lower_deopt_table, lower_safepoints,
 };
 use crate::{
     Unsupported,
@@ -117,6 +121,7 @@ pub(crate) fn try_compile(
         transitions.entry(STUB_JIT_PREPARE_BASE_CONSTRUCT),
         transitions.entry(STUB_JIT_BASE_CONSTRUCT_RESULT),
         transitions.entry(STUB_JIT_DERIVED_CONSTRUCT_RESULT),
+        transitions.entry(STUB_JIT_COPY_SPREAD_ARGUMENTS),
         transitions.entry(STUB_JIT_BIND_DERIVED_THIS),
         transitions.entry(STUB_JIT_CLASS_SUPER_CONSTRUCTOR),
         transitions.entry(STUB_JIT_LOAD_UPVALUE_VALUE),
@@ -835,8 +840,7 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                 NumericNode::DirectCall {
                     source,
                     target,
-                    argument_start,
-                    argument_count,
+                    arguments,
                     logical_pc,
                     byte_pc,
                     exceptional_edge,
@@ -848,26 +852,41 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         &mut instructions,
                         source,
                     );
-                    let argument_start = usize::from(argument_start);
-                    let argument_end = argument_start
-                        .checked_add(usize::from(argument_count))
-                        .ok_or(super::VerificationError::InvalidValue(result))?;
-                    let arguments = hir
-                        .direct_call_arguments
-                        .get(argument_start..argument_end)
-                        .ok_or(super::VerificationError::InvalidValue(result))?
-                        .iter()
-                        .copied()
-                        .map(|argument| {
-                            tagged_call_argument(
+                    let (argument_mode, arguments) = match arguments {
+                        NumericDirectCallArguments::Fixed { start, count } => {
+                            let argument_start = usize::from(start);
+                            let argument_end = argument_start
+                                .checked_add(usize::from(count))
+                                .ok_or(super::VerificationError::InvalidValue(result))?;
+                            let arguments = hir
+                                .direct_call_arguments
+                                .get(argument_start..argument_end)
+                                .ok_or(super::VerificationError::InvalidValue(result))?
+                                .iter()
+                                .copied()
+                                .map(|argument| {
+                                    tagged_call_argument(
+                                        hir,
+                                        &values,
+                                        &mut representations,
+                                        &mut instructions,
+                                        argument,
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            (DirectCallArgumentMode::Fixed, arguments)
+                        }
+                        NumericDirectCallArguments::Spread(argument) => (
+                            DirectCallArgumentMode::Spread,
+                            vec![tagged_call_argument(
                                 hir,
                                 &values,
                                 &mut representations,
                                 &mut instructions,
                                 argument,
-                            )
-                        })
-                        .collect::<Vec<_>>();
+                            )],
+                        ),
+                    };
                     let target = hir
                         .direct_call_targets
                         .get(usize::from(target))
@@ -892,6 +911,7 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                             hir,
                             logical_pc,
                             byte_pc,
+                            argument_mode,
                             arguments.len(),
                             exceptional_edge.map(|edge| {
                                 let edge = usize::from(edge);
@@ -1103,6 +1123,7 @@ fn direct_call_descriptor(
     hir: &NumericFunction,
     logical_pc: u32,
     byte_pc: u32,
+    argument_mode: DirectCallArgumentMode,
     argument_count: usize,
     landing_pad: Option<MachineBlock>,
 ) -> CallDescriptor {
@@ -1120,6 +1141,7 @@ fn direct_call_descriptor(
                     DirectCallKind::DerivedSuperConstruct
                 }
             },
+            argument_mode,
             callee: target.callee,
             caller_function_id: hir.function_id,
             logical_pc,

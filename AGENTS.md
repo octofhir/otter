@@ -433,23 +433,26 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     complete iteration. Any miss, accessor/proxy path, or non-number keeps the
     original property operation; cached slots contain no GC references and are
     reset on every non-backedge loop entry and OSR activation.
-- Compiler-generated plain, method, and base-constructor calls expose `directCallGuard`,
-    `directCallFrameSetup`, `directCallNativeEntry`, `directCallReturn`,
-`directCallCleanup`, and `directCallEntryReject`; methods additionally
-expose `directMethodGuard`, while constructors expose
-`directConstructPrepare`. `functionId` is the caller. Typed `directCall`
-    metadata names call kind, target function, planning-time
-    `targetCodeObjectId`, tier, `thisMode`, captured callee-native-frame bytes,
-    caller linkage bytes, captured total reservation, and register count.
+- Compiler-generated plain, method, fixed-argument constructor, and spread
+    call-family operations expose `directCallGuard`, `directCallFrameSetup`,
+    `directCallNativeEntry`, `directCallReturn`, `directCallCleanup`, and
+    `directCallEntryReject`; methods additionally expose `directMethodGuard`,
+    while constructors expose `directConstructPrepare`. `functionId` is the
+    caller. Typed `directCall` metadata names call kind, target function,
+    planning-time `targetCodeObjectId`, tier, `thisMode`, `argumentMode`,
+    captured callee-native-frame bytes, caller linkage bytes, captured total
+    reservation, and register count. `argumentMode` is `fixed` or `spread`;
+    spread arguments are copied from the rooted dense array into the same
+    unpublished callee frame through the leaf/no-allocation runtime stub.
     Generated code links through the permanent function cell and reads the
     selected generation's actual code-object id, tier, and frame reservation
     before entry; tier publication does not recompile callers. `methodGuard`
     names the receiver register, receiver/prototype shapes, method function,
     and slot byte. Portable normalized code excludes generation-local
-`targetCodeObjectId`; call kind, captured target tier, `thisMode`, and
-layout semantics remain portable. Construct generation validation precedes
-observable prototype lookup; pre-entry misses deopt at the original opcode
-and started callees are never replayed.
+    `targetCodeObjectId`; call kind, argument mode, captured target tier,
+    `thisMode`, and layout semantics remain portable. Construct generation
+    validation precedes observable prototype lookup; pre-entry misses deopt at
+    the original opcode and started callees are never replayed.
   - Assembly decoding and formatting run only when `--jit-artifacts` is
     requested. The disabled path does not clone code, disassemble it, or build
     artifact text.

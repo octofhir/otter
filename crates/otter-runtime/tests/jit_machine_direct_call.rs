@@ -5,6 +5,7 @@
 //! - Exact return, callee-deopt, and throw semantics against the interpreter.
 //! - Own/prototype guarded methods, exact receiver binding, and guard misses.
 //! - Base constructors with `new.target`, receiver substitution, and accessors.
+//! - Plain, base, derived, and superclass spread calls sharing that linkage.
 //! - Nested generated calls retaining a tagged value across moving GC.
 //!
 //! # Invariants
@@ -455,14 +456,141 @@ JSON.stringify([
 ]);
 "#;
 
+const SPREAD_CALL_FAMILY: &str = r#"
+function spreadTarget(a, b) {
+  if (a === -7) throw "spread-boom";
+  return a + b;
+}
+
+function callSpread(fn, args, tail) {
+  const value = fn(...args);
+  return value + tail;
+}
+
+function SpreadBase(a, b) {
+  if (a === -7) throw "construct-spread-boom";
+  this.total = a + b;
+  this.targetMatches = new.target === SpreadBase;
+  if (a && a.override) return a;
+}
+
+function constructSpreadBase(Ctor, args) {
+  return new Ctor(...args);
+}
+
+function constructSpreadDerived(Ctor, args) {
+  return new Ctor(...args);
+}
+
+class SpreadSuper {
+  constructor(a, b) {
+    this.total = a * 3 + b;
+  }
+}
+
+class SpreadDerived extends SpreadSuper {
+  constructor(args) {
+    super(...args);
+  }
+}
+
+const callArgs = [1, 2];
+const baseArgs = [1, 2];
+const derivedArgs = [[1, 2]];
+for (let i = 0; i < 5000; i++) {
+  spreadTarget(i, 2);
+  new SpreadBase(i, 2);
+  new SpreadDerived([i, 2]);
+  callArgs[0] = i;
+  baseArgs[0] = i;
+  derivedArgs[0][0] = i;
+  callSpread(spreadTarget, callArgs, 1);
+  constructSpreadBase(SpreadBase, baseArgs);
+  constructSpreadDerived(SpreadDerived, derivedArgs);
+}
+
+callArgs[0] = 2147483647;
+callArgs[1] = 1;
+const overflow = callSpread(spreadTarget, callArgs, 0);
+callArgs[0] = -7;
+let callThrow = "missing";
+try { callSpread(spreadTarget, callArgs, 0); } catch (error) { callThrow = error; }
+
+baseArgs[0] = 40;
+baseArgs[1] = 2;
+const base = constructSpreadBase(SpreadBase, baseArgs);
+const override = { override: true, marker: "spread-override" };
+const returned = constructSpreadBase(SpreadBase, [override, 9]);
+let constructThrow = "missing";
+try { constructSpreadBase(SpreadBase, [-7, 1]); } catch (error) { constructThrow = error; }
+
+derivedArgs[0][0] = 13;
+derivedArgs[0][1] = 2;
+const derived = constructSpreadDerived(SpreadDerived, derivedArgs);
+callArgs[0] = 40;
+callArgs[1] = 2;
+const reused = callSpread(spreadTarget, callArgs, 0);
+JSON.stringify([
+  overflow,
+  callThrow,
+  base.total,
+  base.targetMatches,
+  returned === override,
+  constructThrow,
+  derived.total,
+  reused
+]);
+"#;
+
+const SPREAD_CONSTRUCT_GC: &str = r#"
+let spreadGcProbe = false;
+const spreadGcPrototype = { marker: "spread-gc-prototype" };
+globalThis.__spreadGcSink = [];
+
+function SpreadGcBase(marker) {
+  this.marker = marker;
+}
+
+Object.defineProperty(SpreadGcBase, "prototype", {
+  configurable: true,
+  get() {
+    if (spreadGcProbe) {
+      for (let i = 0; i < 200000; i++) {
+        globalThis.__spreadGcSink.push({ i, padding: "spread-gc-" + i });
+      }
+    }
+    return spreadGcPrototype;
+  }
+});
+
+function constructSpreadGc(Ctor, args) {
+  return new Ctor(...args);
+}
+
+const warmArgs = ["warm"];
+for (let i = 0; i < 5000; i++) constructSpreadGc(SpreadGcBase, warmArgs);
+spreadGcProbe = true;
+const liveArgs = ["kept:42"];
+const result = constructSpreadGc(SpreadGcBase, liveArgs);
+JSON.stringify([
+  result.marker,
+  Object.getPrototypeOf(result) === spreadGcPrototype,
+  globalThis.__spreadGcSink.length
+]);
+"#;
+
 struct RunResult {
     completion: String,
     stats: RuntimeExecutionStats,
     used_machine_direct_call: bool,
     used_machine_method_call: bool,
     used_machine_construct: bool,
+    used_generated_construct: bool,
     used_machine_derived_construct: bool,
     used_machine_super_construct: bool,
+    used_generated_super_construct: bool,
+    used_machine_spread_arguments: bool,
+    compile_diagnostics: Vec<String>,
 }
 
 fn run(source: &'static str, name: &'static str, selection: JitSelection) -> RunResult {
@@ -471,7 +599,9 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
         .jit_selection(selection)
         .jit_osr_threshold(u32::MAX);
     let mut runtime = if artifacts {
-        builder.jit_debug(JitDebugRequest::artifacts()).build()
+        builder
+            .jit_debug(JitDebugRequest::artifacts().with_events(true))
+            .build()
     } else {
         builder.build()
     }
@@ -481,15 +611,16 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
         .unwrap_or_else(|error| {
             panic!("Machine direct-call fixture {name} ({selection:?}): {error:?}")
         });
-    let artifact_has = |needle: &str| {
+    let artifact_has = |needle: &str, machine_only: bool| {
         result.jit_artifacts().is_some_and(|batch| {
             batch.bundles().iter().any(|bundle| {
-                bundle
-                    .file(JitArtifactFileName::OptimizedIr)
-                    .is_some_and(|file| {
-                        file.contents()
-                            .starts_with(b"; backend=otter-machine-ir scalar-function\n")
-                    })
+                (!machine_only
+                    || bundle
+                        .file(JitArtifactFileName::OptimizedIr)
+                        .is_some_and(|file| {
+                            file.contents()
+                                .starts_with(b"; backend=otter-machine-ir scalar-function\n")
+                        }))
                     && bundle
                         .file(JitArtifactFileName::Relocations)
                         .is_some_and(|file| {
@@ -499,24 +630,52 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
             })
         })
     };
-    let used_machine_direct_call = artifact_has("directCallEntryCell");
-    let used_machine_method_call =
-        artifact_has("\"callKind\": \"method\"") || artifact_has("\"callKind\":\"method\"");
-    let used_machine_construct =
-        artifact_has("\"callKind\": \"construct\"") || artifact_has("\"callKind\":\"construct\"");
-    let used_machine_derived_construct = artifact_has("\"callKind\": \"derivedConstruct\"")
-        || artifact_has("\"callKind\":\"derivedConstruct\"");
-    let used_machine_super_construct = artifact_has("\"callKind\": \"superConstruct\"")
-        || artifact_has("\"callKind\":\"superConstruct\"");
+    let used_machine_direct_call = artifact_has("directCallEntryCell", true);
+    let used_machine_method_call = artifact_has("\"callKind\": \"method\"", true)
+        || artifact_has("\"callKind\":\"method\"", true);
+    let used_machine_construct = artifact_has("\"callKind\": \"construct\"", true)
+        || artifact_has("\"callKind\":\"construct\"", true);
+    let used_generated_construct = artifact_has("\"callKind\": \"construct\"", false)
+        || artifact_has("\"callKind\":\"construct\"", false);
+    let used_machine_derived_construct = artifact_has("\"callKind\": \"derivedConstruct\"", true)
+        || artifact_has("\"callKind\":\"derivedConstruct\"", true);
+    let used_machine_super_construct = artifact_has("\"callKind\": \"superConstruct\"", true)
+        || artifact_has("\"callKind\":\"superConstruct\"", true);
+    let used_generated_super_construct = artifact_has("\"callKind\": \"superConstruct\"", false)
+        || artifact_has("\"callKind\":\"superConstruct\"", false);
+    let used_machine_spread_arguments = artifact_has("\"argumentMode\": \"spread\"", false)
+        || artifact_has("\"argumentMode\":\"spread\"", false);
+    let compile_diagnostics = result
+        .jit_debug_report()
+        .map(|report| {
+            report
+                .events()
+                .iter()
+                .map(|event| format!("{event:?}"))
+                .collect()
+        })
+        .unwrap_or_default();
     RunResult {
         completion: result.completion_string().to_owned(),
         stats: runtime.execution_stats(),
         used_machine_direct_call,
         used_machine_method_call,
         used_machine_construct,
+        used_generated_construct,
         used_machine_derived_construct,
         used_machine_super_construct,
+        used_generated_super_construct,
+        used_machine_spread_arguments,
+        compile_diagnostics,
     }
+}
+
+fn assert_generated_spread_call(result: &RunResult) {
+    assert!(result.stats.jit_generated_calls > 0);
+    assert!(
+        result.used_machine_spread_arguments,
+        "fixture must publish spread argument materialization on shared direct linkage"
+    );
 }
 
 fn assert_machine_construct(result: &RunResult) {
@@ -550,7 +709,8 @@ fn assert_machine_method_call(result: &RunResult) {
 fn assert_machine_direct_call(result: &RunResult) {
     assert!(
         result.stats.jit_generated_calls > 0,
-        "fixture must enter a generated callee"
+        "fixture must enter a generated callee; diagnostics={:?}",
+        result.compile_diagnostics
     );
     assert!(
         result.used_machine_direct_call,
@@ -647,6 +807,44 @@ fn derived_and_super_construct_execute_through_machine_ir() {
     assert_eq!(compiled.completion, oracle.completion);
     assert_eq!(compiled.completion, "[42,true,true,5001]");
     assert_machine_derived_construct(&compiled);
+}
+
+#[test]
+fn complete_spread_call_family_uses_shared_generated_linkage() {
+    let oracle = run(
+        SPREAD_CALL_FAMILY,
+        "jit-machine-spread-call-family.js",
+        JitSelection::InterpreterOnly,
+    );
+    let compiled = run(
+        SPREAD_CALL_FAMILY,
+        "jit-machine-spread-call-family.js",
+        JitSelection::ProductionTiered,
+    );
+
+    assert_eq!(compiled.completion, oracle.completion);
+    assert_eq!(
+        compiled.completion,
+        r#"[2147483648,"spread-boom",42,true,true,"construct-spread-boom",41,42]"#
+    );
+    assert_generated_spread_call(&compiled);
+    assert!(compiled.used_generated_construct);
+    assert!(compiled.used_generated_super_construct);
+    assert!(compiled.stats.jit_generated_call_deopts > 0);
+}
+
+#[test]
+fn spread_array_survives_receiver_preparation_moving_gc() {
+    let compiled = run(
+        SPREAD_CONSTRUCT_GC,
+        "jit-machine-spread-construct-gc.js",
+        JitSelection::ProductionTiered,
+    );
+
+    assert_eq!(compiled.completion, r#"["kept:42",true,200000]"#);
+    assert_generated_spread_call(&compiled);
+    assert!(compiled.used_generated_construct);
+    assert!(compiled.stats.gc_minor_cycles > 0);
 }
 
 #[test]

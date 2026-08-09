@@ -270,8 +270,8 @@ exit. No path replays an already-started inline body.
 
 ### Compiler-generated call regions
 
-A monomorphic non-inlined plain or method call may contain these
-generated-linkage regions:
+A monomorphic non-inlined plain call, method call, constructor, or spread
+call-family operation may contain these generated-linkage regions:
 
 | Region kind | Meaning |
 | --- | --- |
@@ -293,6 +293,7 @@ and carries one typed `directCall` object:
   "targetCodeObjectId": 29,
   "targetTier": "template",
   "thisMode": "methodReceiver",
+  "argumentMode": "fixed",
   "calleeNativeFrameBytes": 160,
   "linkageBytes": 112,
   "reservedStackBytes": 272,
@@ -300,11 +301,16 @@ and carries one typed `directCall` object:
 }
 ```
 
-`callKind` is `plain` or `method`. `targetCodeObjectId`, `targetTier`, and
-`calleeNativeFrameBytes` describe the generation current when this caller
-compiled; they are planning diagnostics, not a permanently baked dispatch
-target. `thisMode` is `strictOrLexical`, `sloppyGlobal`, or `methodReceiver`
-and records the call binding emitted before frame publication.
+`callKind` is `plain`, `method`, `construct`, `derivedConstruct`,
+`superConstruct`, or `derivedSuperConstruct`. `targetCodeObjectId`,
+`targetTier`, and `calleeNativeFrameBytes` describe the generation current
+when this caller compiled; they are planning diagnostics, not a permanently
+baked dispatch target. `thisMode` records the call binding emitted before
+frame publication. `argumentMode` is `fixed` or `spread`. A spread operation
+keeps its source array rooted across cold resolution and receiver preparation,
+then copies the declared-parameter prefix directly into the same unpublished
+callee frame with a leaf/no-allocation runtime stub. It does not introduce a
+second frame, call ABI, result transition, or replay path.
 `linkageBytes` is the exact caller-owned `NativeFrame`, tagged register window,
 bookkeeping, and alignment. `reservedStackBytes` is the planning-time sum with
 the captured target prologue. At runtime the permanent function cell selects
@@ -374,7 +380,7 @@ use these stable forms:
 ```text
   ; region kind=<kind> range=+0x<start>..+0x<end> ... pc=<pc> byte-pc=<byte-pc> tier-op="<operation>"
   ; region kind=inlineScratchSetup ... inline-site=caller:<function>:pc:<pc>:byte:<byte-pc> receiver-property=<bool> parameters=<n> virtual-registers=<n> scratch-slots=<n> slot-bytes=8 stack-alignment=16 scratch-bytes=<n> offset-basis=postAllocationSp register-slots=[...] receiver-slot=<slot|-> entry-values=[...]
-  ; region kind=directCallNativeEntry ... call-target-function=<id> call-target-code-object-id=<id> call-target-tier=<tier> call-this-mode=<mode> call-callee-native-frame-bytes=<n> call-linkage-bytes=<n> call-reserved-stack-bytes=<n> call-callee-register-count=<n>
+  ; region kind=directCallNativeEntry ... call-target-function=<id> call-target-code-object-id=<id> call-target-tier=<tier> call-this-mode=<mode> call-argument-mode=<fixed|spread> call-callee-native-frame-bytes=<n> call-linkage-bytes=<n> call-reserved-stack-bytes=<n> call-callee-register-count=<n>
 L<8-hex-offset>:
 +0x<8-hex>: <8-hex-word>  <decoded instruction or .word fallback>
 +0x<8-hex>: relocation <register>, <symbolic target> ; encoded-bytes=<n> redacted
@@ -427,7 +433,7 @@ relocation itself denotes the permanent function cell.
 
 `code-normalized.bin` starts with the `OTJNCODE` marker, architecture id, and
 logical-item count. Its typed `directCallEntryCell` token
-contains target tier, `thisMode`, and stack/register layout while deliberately
+contains target tier, `thisMode`, `argumentMode`, and stack/register layout while deliberately
 omitting generation-local `targetCodeObjectId`, so otherwise identical
 recompilations normalize equally. It is a semantic comparison stream, not
 ARM64 executable code:

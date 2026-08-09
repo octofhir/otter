@@ -1343,6 +1343,23 @@ pub const STUB_JIT_LOAD_UPVALUE_VALUE: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusPair,
 );
 
+/// Copy the dense values collected for one spread construct into the
+/// parameter prefix of an unpublished stack-owned callee frame.
+///
+/// Eligible generated callees neither observe `arguments` nor own a rest
+/// parameter, so values beyond the declared parameter count are intentionally
+/// ignored. The source is the compiler-created dense argument array; a
+/// different value reports a pre-entry guard miss.
+pub const STUB_JIT_COPY_SPREAD_ARGUMENTS: RuntimeStubDescriptor = descriptor(
+    93,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::Variadic,
+    3,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::ValueWord,
+);
+
 /// Leaf `Math.abs`.
 ///
 /// A numeric builtin reached through a declared entry rather than a
@@ -1501,6 +1518,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         90 => "jit_bind_derived_this",
         91 => "jit_class_super_constructor",
         92 => "jit_load_upvalue_value",
+        93 => "jit_copy_spread_arguments",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1599,6 +1617,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_BIND_DERIVED_THIS,
     STUB_JIT_CLASS_SUPER_CONSTRUCTOR,
     STUB_JIT_LOAD_UPVALUE_VALUE,
+    STUB_JIT_COPY_SPREAD_ARGUMENTS,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

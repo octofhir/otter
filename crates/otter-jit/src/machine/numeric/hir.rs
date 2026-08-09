@@ -12,8 +12,8 @@
 //!   inferred Number/Int32 parameters are guarded before effects.
 //! - Parameters outside the exact entry live-in set have no HIR value, load,
 //!   guard, or allocator interval.
-//! - Accepted nodes cannot allocate, touch the heap, throw, or reenter JS;
-//!   exact scalar coercions may lower to declared pure numeric leaves.
+//! - Accepted nodes cannot allocate, throw, or reenter JS; tagged coercions
+//!   and equality may read the heap only through declared leaf stubs.
 //! - Register merges become typed block parameters. Only loop-header OSR
 //!   metadata retains the aligned VM-register sources needed at the entry ABI.
 //! - Loop headers receive explicit parameters for every numeric value live from
@@ -51,6 +51,8 @@ pub(super) enum NumericNode {
     BlockParameter(NumericType),
     TaggedConstant(u64),
     This,
+    TaggedToBoolean(NumericValue),
+    TaggedStrictEqual(NumericValue, NumericValue),
     IntegerConstant(i32),
     BooleanConstant(bool),
     Constant(f64),
@@ -137,6 +139,8 @@ impl NumericNode {
             | Self::IntegerLessEqual(..)
             | Self::IntegerGreaterThan(..)
             | Self::IntegerGreaterEqual(..)
+            | Self::TaggedToBoolean(..)
+            | Self::TaggedStrictEqual(..)
             | Self::IntegerToBoolean(..)
             | Self::FloatToBoolean(..)
             | Self::BooleanNot(..)
@@ -368,7 +372,18 @@ impl NumericFunction {
             let terminator = match raw.terminator {
                 RawTerminator::Jump => NumericTerminator::Jump,
                 RawTerminator::Branch { when_true } => {
-                    let condition = read_boolean(&registers, &nodes, register(terminal, code, 1)?)?;
+                    let source = read_value(&registers, register(terminal, code, 1)?)?;
+                    let condition = to_boolean(source, &mut nodes, &mut block_nodes)?;
+                    if matches!(nodes[condition.0], NumericNode::TaggedToBoolean(..)) {
+                        push_frame_state(
+                            &mut frame_states,
+                            NumericFramePoint::Node(condition),
+                            code.id,
+                            terminal.byte_pc,
+                            &registers,
+                            &instruction_live_in[terminal_pc],
+                        );
+                    }
                     NumericTerminator::Branch {
                         condition,
                         when_true,
@@ -576,7 +591,18 @@ fn infer_instruction_parameters(
                 *origins.get_mut(destination)? = 0;
             }
         }
-        Op::Equal | Op::NotEqual | Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
+        Op::Equal | Op::NotEqual => {
+            let inputs =
+                read(register(instruction, code, 1)?)? | read(register(instruction, code, 2)?)?;
+            if instruction.arith_feedback().is_numeric_only() {
+                *number_parameters |= inputs;
+                if instruction.arith_feedback().is_int32_only() {
+                    *int32_parameters |= inputs;
+                }
+            }
+            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
+        }
+        Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
             let inputs =
                 read(register(instruction, code, 1)?)? | read(register(instruction, code, 2)?)?;
             *number_parameters |= inputs;
@@ -606,7 +632,10 @@ fn infer_instruction_parameters(
                 read(register(instruction, code, 1)?)? | read(register(instruction, code, 2)?)?;
             *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
-        Op::ToBoolean | Op::LogicalNot | Op::BitwiseNot | Op::BitwiseAndImm => {
+        Op::ToBoolean | Op::LogicalNot => {
+            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
+        }
+        Op::BitwiseNot | Op::BitwiseAndImm => {
             *number_parameters |= read(register(instruction, code, 1)?)?;
             *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
@@ -971,6 +1000,16 @@ fn lower_instruction(
         Op::ToBoolean | Op::LogicalNot => {
             let source = read_value(registers, register(instruction, code, 1)?)?;
             let boolean = to_boolean(source, nodes, block_nodes)?;
+            if matches!(nodes[boolean.0], NumericNode::TaggedToBoolean(..)) {
+                push_frame_state(
+                    frame_states,
+                    NumericFramePoint::Node(boolean),
+                    function_id,
+                    instruction.byte_pc,
+                    registers,
+                    live_in,
+                );
+            }
             let value = if op == Op::LogicalNot {
                 let value = push(nodes, NumericNode::BooleanNot(boolean));
                 block_nodes.push(value);
@@ -1102,9 +1141,33 @@ fn lower_instruction(
                 NumericNode::Neg(widen_to_number(source, nodes, block_nodes)?)
             }
         }
-        Op::Equal | Op::NotEqual | Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
+        Op::Equal | Op::NotEqual => {
             if !instruction.arith_feedback().is_numeric_only() {
-                return None;
+                let left = read_value(registers, register(instruction, code, 1)?)?;
+                let right = read_value(registers, register(instruction, code, 2)?)?;
+                let equal = push(nodes, NumericNode::TaggedStrictEqual(left, right));
+                block_nodes.push(equal);
+                push_frame_state(
+                    frame_states,
+                    NumericFramePoint::Node(equal),
+                    function_id,
+                    instruction.byte_pc,
+                    registers,
+                    live_in,
+                );
+                let value = if op == Op::NotEqual {
+                    let value = push(nodes, NumericNode::BooleanNot(equal));
+                    block_nodes.push(value);
+                    value
+                } else {
+                    equal
+                };
+                write(
+                    registers,
+                    register(instruction, code, 0)?,
+                    RegisterState::Value(value),
+                )?;
+                return Some(());
             }
             let left = read_number(registers, nodes, register(instruction, code, 1)?)?;
             let right = read_number(registers, nodes, register(instruction, code, 2)?)?;
@@ -1115,6 +1178,29 @@ fn lower_instruction(
                 match op {
                     Op::Equal => NumericNode::IntegerEqual(left, right),
                     Op::NotEqual => NumericNode::IntegerNotEqual(left, right),
+                    _ => unreachable!("matched strict equality"),
+                }
+            } else {
+                let left = widen_to_number(left, nodes, block_nodes)?;
+                let right = widen_to_number(right, nodes, block_nodes)?;
+                match op {
+                    Op::Equal => NumericNode::Equal(left, right),
+                    Op::NotEqual => NumericNode::NotEqual(left, right),
+                    _ => unreachable!("matched strict equality"),
+                }
+            }
+        }
+        Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
+            if !instruction.arith_feedback().is_numeric_only() {
+                return None;
+            }
+            let left = read_number(registers, nodes, register(instruction, code, 1)?)?;
+            let right = read_number(registers, nodes, register(instruction, code, 2)?)?;
+            if instruction.arith_feedback().is_int32_only()
+                && value_type(nodes, left)? == NumericType::Int32
+                && value_type(nodes, right)? == NumericType::Int32
+            {
+                match op {
                     Op::LessThan => NumericNode::IntegerLessThan(left, right),
                     Op::LessEq => NumericNode::IntegerLessEqual(left, right),
                     Op::GreaterThan => NumericNode::IntegerGreaterThan(left, right),
@@ -1125,8 +1211,6 @@ fn lower_instruction(
                 let left = widen_to_number(left, nodes, block_nodes)?;
                 let right = widen_to_number(right, nodes, block_nodes)?;
                 match op {
-                    Op::Equal => NumericNode::Equal(left, right),
-                    Op::NotEqual => NumericNode::NotEqual(left, right),
                     Op::LessThan => NumericNode::LessThan(left, right),
                     Op::LessEq => NumericNode::LessEqual(left, right),
                     Op::GreaterThan => NumericNode::GreaterThan(left, right),
@@ -1149,24 +1233,42 @@ fn lower_instruction(
             | NumericNode::IntegerAddImmediate(..)
             | NumericNode::IntegerSubImmediate(..)
     ) {
-        frame_states.push(NumericFrameState {
-            point: NumericFramePoint::Node(value),
+        push_frame_state(
+            frame_states,
+            NumericFramePoint::Node(value),
             function_id,
-            byte_pc: instruction.byte_pc,
-            slots: registers
-                .iter()
-                .copied()
-                .zip(live_in.iter().copied())
-                .map(|(state, live)| match (state, live) {
-                    (RegisterState::Value(value), true) => NumericFrameSlot::Value(value),
-                    (RegisterState::Unset, _) | (RegisterState::Value(_), false) => {
-                        NumericFrameSlot::Undefined
-                    }
-                })
-                .collect(),
-        });
+            instruction.byte_pc,
+            registers,
+            live_in,
+        );
     }
     write(registers, destination, RegisterState::Value(value))
+}
+
+fn push_frame_state(
+    frame_states: &mut Vec<NumericFrameState>,
+    point: NumericFramePoint,
+    function_id: u32,
+    byte_pc: u32,
+    registers: &[RegisterState],
+    live_in: &[bool],
+) {
+    frame_states.push(NumericFrameState {
+        point,
+        function_id,
+        byte_pc,
+        slots: registers
+            .iter()
+            .copied()
+            .zip(live_in.iter().copied())
+            .map(|(state, live)| match (state, live) {
+                (RegisterState::Value(value), true) => NumericFrameSlot::Value(value),
+                (RegisterState::Unset, _) | (RegisterState::Value(_), false) => {
+                    NumericFrameSlot::Undefined
+                }
+            })
+            .collect(),
+    });
 }
 
 fn push(nodes: &mut Vec<NumericNode>, node: NumericNode) -> NumericValue {
@@ -1267,7 +1369,7 @@ fn to_boolean(
         NumericType::Boolean => return Some(value),
         NumericType::Int32 | NumericType::Uint32 => NumericNode::IntegerToBoolean(value),
         NumericType::Number => NumericNode::FloatToBoolean(value),
-        NumericType::Tagged => return None,
+        NumericType::Tagged => NumericNode::TaggedToBoolean(value),
     };
     let boolean = push(nodes, node);
     block_nodes.push(boolean);
@@ -1294,17 +1396,6 @@ fn widen_to_number(
         NumericType::Boolean => None,
         NumericType::Tagged => None,
     }
-}
-
-fn read_boolean(
-    registers: &[RegisterState],
-    nodes: &[NumericNode],
-    register: u16,
-) -> Option<NumericValue> {
-    let RegisterState::Value(value) = read_state(registers, register)? else {
-        return None;
-    };
-    (nodes.get(value.0)?.value_type() == NumericType::Boolean).then_some(value)
 }
 
 fn write(registers: &mut [RegisterState], register: u16, value: RegisterState) -> Option<()> {

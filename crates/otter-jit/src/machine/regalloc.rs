@@ -441,10 +441,10 @@ fn convert_location(allocation: Allocation) -> Result<AllocatedLocation, Allocat
 mod tests {
     use super::*;
     use crate::machine::{
-        CallDescriptor, CallEffects, ControlFlow, DeoptId, ExceptionalEdge, InstructionSequence,
-        MachineBlock, MachineBlockData, MachineInstruction, MachineOpcode, MachineOperand,
-        MachineRepresentation, OperandConstraint, OperandPurpose, OperandRole, OperandTiming,
-        SafepointId, SafepointKind,
+        CallDescriptor, CallEffects, CallTarget, ControlFlow, DeoptId, ExceptionalEdge,
+        InstructionSequence, MachineBlock, MachineBlockData, MachineInstruction, MachineOpcode,
+        MachineOperand, MachineRepresentation, OperandConstraint, OperandPurpose, OperandRole,
+        OperandTiming, SafepointId, SafepointKind,
     };
 
     fn sequence() -> InstructionSequence {
@@ -465,7 +465,12 @@ mod tests {
             OperandConstraint::Fixed(PhysicalRegister::integer(1));
         let mut call = MachineInstruction::plain(
             MachineOpcode::Call(0),
-            vec![MachineOperand::tagged_root(tagged)],
+            vec![
+                MachineOperand::register_input(tagged),
+                MachineOperand::register_input(tagged),
+                MachineOperand::register_input(tagged),
+                MachineOperand::tagged_root(tagged),
+            ],
         );
         call.safepoint = Some(SafepointId(0));
         call.clobbers = (0..=18).map(PhysicalRegister::integer).collect();
@@ -494,7 +499,8 @@ mod tests {
                 MachineRepresentation::Int64,
             ],
             vec![CallDescriptor {
-                arguments: vec![],
+                target: CallTarget::RuntimeStub(otter_vm::native_abi::STUB_STRING_CONCAT_ALLOC),
+                arguments: vec![MachineRepresentation::Tagged; 3],
                 result: None,
                 effects: CallEffects::READS_HEAP,
                 clobbers: call_clobbers,

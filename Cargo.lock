@@ -2624,6 +2624,7 @@ dependencies = [
  "dynasm",
  "dynasmrt",
  "otter-bytecode",
+ "otter-gc",
  "otter-vm",
  "regalloc2",
  "rustc-hash",

@@ -10,6 +10,7 @@
 //! # Contents
 //! - [`InstructionSequence`] — verified block, value, and instruction storage.
 //! - [`MachineInstruction`] — one selected operation and its allocator inputs.
+//! - [`CallDescriptor`] — complete semantic target, ABI, effects, and exits.
 //! - [`TargetRegisterFile`] — complete allocatable target register inventory.
 //! - [`AllocatedSequence`] — allocator edits, per-operand locations, and exact
 //!   safepoint/deoptimization locations.
@@ -343,9 +344,18 @@ pub enum SafepointKind {
     Gc,
 }
 
+/// Semantic destination selected before target emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallTarget {
+    /// VM-owned runtime entry with one statically declared ABI.
+    RuntimeStub(otter_vm::native_abi::RuntimeStubDescriptor),
+}
+
 /// Complete target-neutral call contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallDescriptor {
+    /// Semantic entry selected above target emission.
+    pub target: CallTarget,
     /// Ordered argument representations.
     pub arguments: Vec<MachineRepresentation>,
     /// Result representation, or no result.
@@ -848,6 +858,17 @@ impl InstructionSequence {
                     }
                     if matches!(descriptor.safepoint, SafepointKind::Gc)
                         != instruction.safepoint.is_some()
+                    {
+                        return Err(VerificationError::CallSafepointMismatch(id));
+                    }
+                    let CallTarget::RuntimeStub(target) = descriptor.target;
+                    if usize::from(target.argument_count) != descriptor.arguments.len() {
+                        return Err(VerificationError::CallSignatureMismatch(id));
+                    }
+                    if matches!(
+                        target.safepoint,
+                        otter_vm::native_abi::RuntimeStubSafepoint::Required
+                    ) != matches!(descriptor.safepoint, SafepointKind::Gc)
                     {
                         return Err(VerificationError::CallSafepointMismatch(id));
                     }

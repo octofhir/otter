@@ -39,3 +39,4 @@ yaxpeax-arch = { workspace = true }
 yaxpeax-arm = { workspace = true }
 
 [dev-dependencies]
+otter-gc = { workspace = true }

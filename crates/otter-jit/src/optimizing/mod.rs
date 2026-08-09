@@ -82,7 +82,8 @@ pub struct OptimizedMetadata {
     pub machine_register_count: u8,
     /// GPR and FP spill slots forced by linear scan before deopt legalization.
     pub linear_scan_spill_slot_count: u32,
-    /// Number of eight-byte stack spill slots reserved by the emitter.
+    /// Number of eight-byte allocator-spill and GC-root-save slots reserved by
+    /// the emitter.
     pub spill_slot_count: u32,
 }
 

@@ -385,12 +385,13 @@ pub unsafe fn alloc_safepoint_record(
     Ok(unsafe { &*record })
 }
 
-/// Validate that `safepoint` can be published from `ctx`'s frame-slot window.
+/// Validate that `safepoint` can be published from `ctx`'s frame and native
+/// spill windows.
 ///
-/// Baseline spills every tagged value live at an allocating collection call
-/// into the interpreter-visible register window. Register and native-spill
-/// stack maps are intentionally rejected until the machine frame layout can
-/// publish those locations directly.
+/// Baseline names interpreter-visible frame slots. Machine IR names only its
+/// allocator-driven native save homes after copying register/spill roots into
+/// the packet's rewriteable spill window. Raw machine-register roots remain
+/// invalid because the collector cannot rewrite a live register directly.
 pub fn validate_alloc_safepoint_frame_roots(
     ctx: &RuntimeStubAllocContext,
     safepoint: &SafepointRecord,
@@ -436,7 +437,8 @@ pub fn validate_alloc_safepoint_frame_roots(
     Ok(())
 }
 
-/// Root publisher for an allocating runtime-stub safepoint backed by frame slots.
+/// Root publisher for an allocating runtime-stub safepoint backed by frame or
+/// native spill slots.
 ///
 /// This type is the VM-native equivalent of the ad hoc native-call root scopes:
 /// it exposes the active frame-window slots named by a [`SafepointRecord`] to
@@ -448,7 +450,7 @@ pub struct AllocSafepointFrameRoots<'a> {
 }
 
 impl<'a> AllocSafepointFrameRoots<'a> {
-    /// Build a frame-slot root publisher for a validated safepoint.
+    /// Build a root publisher for a validated safepoint.
     ///
     /// # Safety
     ///

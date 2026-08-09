@@ -75,6 +75,7 @@ print output, access the filesystem, install packages, or depend on host APIs.
 | `boxed-double-property.js` | Repeated double-valued object property loads | `4000000` |
 | `dense-array.js` | Repeated dense indexed array loads | `5234688` |
 | `numeric-leaf.js` | Repeated calls into a straight-line eight-operation Number leaf | `-700000` |
+| `string-concat.js` | Allocating primitive concat with a tagged result live across the second safepoint | `600000` |
 | `typed-parameter-loop.js` | Int32 parameter guards, loop phis, checked arithmetic, and OSR | `300000` |
 
 Run one fixture per isolate. Warmups and measured samples reuse that isolate

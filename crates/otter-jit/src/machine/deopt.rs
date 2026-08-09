@@ -265,7 +265,7 @@ mod tests {
         let allocation = sequence
             .allocate(&TargetRegisterFile::aarch64_scalar_function())
             .expect("deopt sequence allocation");
-        let layout = MachineFrameLayout::new(&allocation, 16, 16).expect("deopt frame layout");
+        let layout = MachineFrameLayout::new(&allocation, 0, 16, 16).expect("deopt frame layout");
         (sequence, allocation, layout)
     }
 

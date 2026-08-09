@@ -37,6 +37,18 @@ function scalarStrictNe(left, right) {
   return left !== right;
 }
 
+function scalarConcat3(left, middle, right) {
+  return (left + middle) + right;
+}
+
+function scalarConcatInt(prefix, value, suffix) {
+  return (prefix + value) + suffix;
+}
+
+function scalarConcatMiss(left, middle, right) {
+  return (left + middle) + right;
+}
+
 const receiver = { marker: "receiver", scalarThis };
 
 // Tier the callees independently before their final tagged inputs are created.
@@ -47,6 +59,11 @@ eval(
 );
 eval("scalarTruth(true, null, false); scalarNot(false);\n".repeat(12000));
 eval("scalarStrictEq(null, null); scalarStrictNe(null, false);\n".repeat(12000));
+eval(
+  'scalarConcat3("otter-", "machine-", "ir"); scalarConcatInt("key", 42, "!"); scalarConcatMiss("a", "b", "c");\n'.repeat(
+    12000,
+  ),
+);
 
 const left = { marker: "left" };
 const right = { marker: "right" };
@@ -57,6 +74,19 @@ const objectTruth = scalarTruth({ marker: "object" }, left, right);
 const stringTruth = scalarTruth("otter", left, right);
 const emptyStringTruth = scalarTruth("", left, right);
 const equalString = scalarStrictEq("otter", "otter");
+const concat = scalarConcat3("otter-", "machine-", "ir");
+const concatInt = scalarConcatInt("key", 42, "!");
+let concatCoercions = 0;
+const concatMiss = scalarConcatMiss(
+  {
+    toString() {
+      concatCoercions++;
+      return "object";
+    },
+  },
+  "-",
+  "tail",
+);
 
 JSON.stringify({
   identity: identity.marker,
@@ -76,4 +106,8 @@ JSON.stringify({
   nanStrictEqual: scalarStrictEq(0 / 0, 0 / 0),
   mixedStrictEqual: scalarStrictEq(1, true),
   strictNotEqual: scalarStrictNe(left, right),
+  concat,
+  concatInt,
+  concatMiss,
+  concatCoercions,
 });

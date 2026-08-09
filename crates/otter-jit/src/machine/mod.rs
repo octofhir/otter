@@ -15,6 +15,7 @@
 //! - [`AllocatedSequence`] — allocator edits, per-operand locations, and exact
 //!   safepoint/deoptimization locations.
 //! - [`MachineFrameLayout`] — aligned post-allocation spill-frame contract.
+//! - [`MachineSafepointTable`] — allocator roots and VM spill-slot records.
 //!
 //! # Invariants
 //! - Virtual values are dense and have one machine representation.
@@ -37,6 +38,7 @@ mod frame;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod numeric;
 mod regalloc;
+mod safepoint;
 mod target;
 
 pub use deopt::{
@@ -46,6 +48,10 @@ pub use frame::{FrameLayoutError, MachineFrameLayout};
 pub use regalloc::{
     AllocatedLocation, AllocatedMetadata, AllocatedSequence, AllocationEdit, AllocationError,
     AllocationPoint,
+};
+pub use safepoint::{
+    MachineSafepointError, MachineSafepointRoot, MachineSafepointSite, MachineSafepointTable,
+    lower_safepoints,
 };
 pub use target::{PhysicalRegister, TargetArchitecture, TargetRegisterFile};
 

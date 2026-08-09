@@ -47,6 +47,10 @@ pub(crate) fn try_compile(
     let Some(hir) = NumericFunction::build(view) else {
         return Ok(None);
     };
+    let parameter_prefix_entry = !hir
+        .frame_states
+        .iter()
+        .any(|state| matches!(state.point, NumericFramePoint::Backedge { .. }));
     let sequence = select(&hir)
         .map_err(|_| Unsupported::OperandShape("numeric HIR to Machine IR selection"))?;
     let allocation = sequence
@@ -90,6 +94,7 @@ pub(crate) fn try_compile(
         otter_vm::runtime_stubs::NUMBER_REM_F64_LEAF.entry_addr() as u64,
         otter_vm::runtime_stubs::NUMBER_POW_F64_LEAF.entry_addr() as u64,
         otter_vm::runtime_stubs::NUMBER_TO_INT32_F64_LEAF.entry_addr() as u64,
+        view.code_block.register_count,
         artifact_request.is_some(),
     )?;
     let machine_register_count = u8::try_from(allocation.used_register_count())
@@ -155,6 +160,7 @@ pub(crate) fn try_compile(
             function_id: view.code_block.id,
             param_count: view.code_block.param_count,
             register_count: view.code_block.register_count,
+            parameter_prefix_entry,
             machine_register_count,
             linear_scan_spill_slot_count: allocation.spill_slots(),
             spill_slot_count: allocation.spill_slots(),
@@ -2537,11 +2543,33 @@ mod tests {
     fn execute_at(
         code: &OptimizedCode,
         entry: JitEntry,
-        mut frame: Vec<u64>,
+        frame: Vec<u64>,
         initial_pc: u32,
         interrupt: *const u8,
         fuel: &mut u64,
     ) -> (JitRet, Vec<u64>, u32) {
+        let register_count = code.metadata().register_count;
+        let (result, frame, pc, _) = execute_at_with_register_count(
+            code,
+            entry,
+            frame,
+            initial_pc,
+            register_count,
+            interrupt,
+            fuel,
+        );
+        (result, frame, pc)
+    }
+
+    fn execute_at_with_register_count(
+        code: &OptimizedCode,
+        entry: JitEntry,
+        mut frame: Vec<u64>,
+        initial_pc: u32,
+        initialized_register_count: u16,
+        interrupt: *const u8,
+        fuel: &mut u64,
+    ) -> (JitRet, Vec<u64>, u32, u16) {
         assert_eq!(frame.len(), code.metadata().register_count as usize);
         let metadata = code.metadata();
         let mut native_frame = NativeFrame::new(
@@ -2549,7 +2577,7 @@ mod tests {
                 function_id: metadata.function_id,
                 code_block_id: metadata.function_id,
                 pc: initial_pc,
-                register_count: metadata.register_count,
+                register_count: initialized_register_count,
                 kind: NativeFrameKind::Optimizing,
                 flags: NativeFrameFlags::empty(),
             },
@@ -2576,7 +2604,12 @@ mod tests {
             generated_feedback_clean: 1,
         };
         let result = entry(&mut ctx);
-        (result, frame, native_frame.header.pc)
+        (
+            result,
+            frame,
+            native_frame.header.pc,
+            native_frame.header.register_count,
+        )
     }
 
     fn boxed_f64(value: f64) -> u64 {
@@ -2616,6 +2649,7 @@ mod tests {
     #[test]
     fn small_numeric_leaf_is_not_hidden_behind_a_fixture_size_threshold() {
         let code = compile_output(&small_leaf_view(), None).code;
+        assert!(code.metadata().parameter_prefix_entry);
         let (ret, _, _) = execute(&code, &[tag::box_int32(9)], 0);
 
         assert_eq!(ret.status, STATUS_RETURNED);
@@ -2733,6 +2767,71 @@ mod tests {
             execute(&code, &[tag::box_int32(i32::MAX), tag::box_int32(1)], 91);
         assert_eq!(result.status, STATUS_BAILED);
         assert_eq!(pc, 0);
+        assert_eq!(
+            frame,
+            [
+                tag::box_int32(i32::MAX),
+                tag::box_int32(1),
+                Value::undefined().to_bits()
+            ]
+        );
+    }
+
+    #[test]
+    fn parameter_prefix_cold_exits_publish_a_complete_vm_window() {
+        let interrupt = 0_u8;
+        let mut fuel = i64::MAX as u64;
+
+        let guard = compile_output(&small_leaf_view(), None).code;
+        let guard_entry: JitEntry =
+            unsafe { std::mem::transmute(guard.compiled_code().entry_ptr()) };
+        let (result, frame, _, register_count) = execute_at_with_register_count(
+            &guard,
+            guard_entry,
+            vec![tag::box_int32(9), 0xdead_beef_dead_beef],
+            91,
+            guard.metadata().param_count,
+            std::ptr::addr_of!(interrupt),
+            &mut fuel,
+        );
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, tag::box_int32(-9));
+        assert_eq!(register_count, guard.metadata().param_count);
+        assert_eq!(frame[1], 0xdead_beef_dead_beef);
+
+        let (result, frame, pc, register_count) = execute_at_with_register_count(
+            &guard,
+            guard_entry,
+            vec![Value::undefined().to_bits(), 0xdead_beef_dead_beef],
+            91,
+            guard.metadata().param_count,
+            std::ptr::addr_of!(interrupt),
+            &mut fuel,
+        );
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(pc, 0);
+        assert_eq!(register_count, guard.metadata().register_count);
+        assert_eq!(frame[1], Value::undefined().to_bits());
+
+        let overflow = compile_output(&typed_parameter_overflow_view(), None).code;
+        let overflow_entry: JitEntry =
+            unsafe { std::mem::transmute(overflow.compiled_code().entry_ptr()) };
+        let (result, frame, pc, register_count) = execute_at_with_register_count(
+            &overflow,
+            overflow_entry,
+            vec![
+                tag::box_int32(i32::MAX),
+                tag::box_int32(1),
+                0xdead_beef_dead_beef,
+            ],
+            91,
+            overflow.metadata().param_count,
+            std::ptr::addr_of!(interrupt),
+            &mut fuel,
+        );
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(pc, 0);
+        assert_eq!(register_count, overflow.metadata().register_count);
         assert_eq!(
             frame,
             [
@@ -2939,6 +3038,7 @@ mod tests {
             .expect("loop Machine IR allocation");
 
         let code = compile_output(&view, None).code;
+        assert!(!code.metadata().parameter_prefix_entry);
         for (input, expected) in [(-2, 1), (0, 1), (1, 1), (3, 3)] {
             let (result, _, _) = execute(&code, &[tag::box_int32(input)], 0);
             assert_eq!(result.status, STATUS_RETURNED);

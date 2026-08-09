@@ -48,9 +48,9 @@ use crate::{
     artifact::relocation::{RelocationCapture, RelocationTarget},
     entry::{
         CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
-        NATIVE_FRAME_REGISTER_BASE_OFFSET, NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED,
-        STATUS_THREW, THREAD_OFFSET, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
-        VM_THREAD_INTERRUPT_CELL_OFFSET,
+        NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_REGISTER_COUNT_OFFSET, NUMBER_TAG_HI16,
+        STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THREAD_OFFSET, VALUE_UNDEFINED,
+        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
 };
 use std::collections::BTreeMap;
@@ -217,6 +217,7 @@ pub(super) fn emit(
     number_rem_entry: u64,
     number_pow_entry: u64,
     number_to_int32_entry: u64,
+    vm_register_count: u16,
     capture_artifacts: bool,
 ) -> Result<Emission, Unsupported> {
     reject_unimplemented_locations(sequence, allocation)?;
@@ -705,9 +706,10 @@ pub(super) fn emit(
         }
     }
 
+    dynasm!(ops ; .arch aarch64 ; =>bail);
+    emit_materialize_vm_window(&mut ops, vm_register_count);
     dynasm!(ops
         ; .arch aarch64
-        ; =>bail
         ; ldr x17, [x19, NATIVE_FRAME_OFFSET]
         ; str wzr, [x17, NATIVE_FRAME_PC_OFFSET]
         ; mov x0, xzr
@@ -868,6 +870,37 @@ pub(super) fn emit(
         osr_entries,
         osr_regions,
     })
+}
+
+/// Expand a parameter-prefix frame before shared VM machinery can observe it.
+///
+/// This is cold, allocation-free, and publishes the full count only after all
+/// newly visible slots contain canonical tagged `undefined` values.
+fn emit_materialize_vm_window(ops: &mut dynasmrt::aarch64::Assembler, register_count: u16) {
+    let done = ops.new_dynamic_label();
+    let loop_label = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x17, [x19, NATIVE_FRAME_OFFSET]
+        ; ldrh w16, [x17, NATIVE_FRAME_REGISTER_COUNT_OFFSET]
+        ; movz w15, register_count as u32
+        ; cmp w16, w15
+        ; b.eq =>done
+        ; ldr x14, [x17, NATIVE_FRAME_REGISTER_BASE_OFFSET]
+        ; add x14, x14, x16, lsl #3
+        ; sub w15, w15, w16
+    );
+    emit_load_u64(ops, 16, VALUE_UNDEFINED);
+    dynasm!(ops
+        ; .arch aarch64
+        ; =>loop_label
+        ; str x16, [x14], #8
+        ; subs w15, w15, #1
+        ; b.ne =>loop_label
+        ; movz w16, register_count as u32
+        ; strh w16, [x17, NATIVE_FRAME_REGISTER_COUNT_OFFSET]
+        ; =>done
+    );
 }
 
 fn block_for_instruction(

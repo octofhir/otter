@@ -3,557 +3,107 @@
 This is the sole repository-level implementation tracker. Otter is pre-user
 and pre-stability: internal APIs, ABI, bytecode, metadata, artifacts, fixtures,
 and tests may break whenever that produces the intended final architecture.
-There are no compatibility readers, dual writers, legacy modes, or parallel
-engine stacks.
+Completed slice history and measurements live in git and the ignored
+`scratchpad/LEDGER.md`, not in this active plan.
 
 ## Objective
 
-Replace the interpreter-window-based compiled execution model with one typed,
-target-neutral compiler pipeline whose ABI is machine locations plus immutable
-metadata:
+Replace every compiled execution path with one typed, target-neutral pipeline:
 
 ```text
 bytecode + feedback
         |
         v
 typed CFG HIR -> Machine IR -> target selection/legalization
-        -> instruction sequence -> register allocation
-        -> code + stack maps + deopt maps
+        -> regalloc2 -> code + stack maps + deopt maps
 ```
 
-Quick and optimizing compilation share HIR, Machine IR, target backends, frame
+Quick and optimizing tiers share HIR, Machine IR, target backends, frame
 layout, call descriptors, safepoints, deopt reconstruction, dispatch cells,
 and artifact schemas. They differ only in optimization budget and tier policy.
 
-## Accepted gates
-
-### Compiler walking skeleton
-
-Accepted on 2026-08-05, then deleted rather than landed beside the old
-compiler:
-
-- one typed Machine IR selected and encoded real AArch64 and x86-64 code;
-- regalloc2 Ion allocation supplied exact final deopt and root locations;
-- a tagged root survived an allocating call's caller-saved clobbers;
-- unrelated source identity and serialized byte-PC changes left normalized
-  function-local artifacts identical;
-- x86-64 required no JavaScript-semantic lowering fork.
-
-### Property-slot representation
-
-Accepted on 2026-08-05 and implemented as the first breaking slice:
-
-- every object property slot stores the ordinary 8-byte `Value`;
-- `CompressedValue`, heap-number boxes, and JIT slot codecs are deleted;
-- generated loads/stores are direct 64-bit operations;
-- cell stores retain the precise generational/incremental barrier;
-- three inline values preserve the previous 88-byte `ObjectBody` footprint.
-
-The official release memory harness (100,000 iterations, five samples) kept
-allocations at 300,004, improved median execution by 1.21% and full-GC time by
-4.36%, and increased retained heap by 5,504 bytes (1.37%). VM, JIT, runtime,
-and focused GC-stress gates passed.
-
-### Optimizing-backend consolidation
-
-Accepted on 2026-08-05 and implemented before the compiler switch:
-
-- the Cranelift numeric-leaf fork and its backend-specific benchmark contract
-  are deleted;
-- numeric leaf functions now use the shared optimizing CFG/SSA backend;
-- the 20-sample compile median improved from 100,687.5 ns to 70,437.5 ns
-  (-30.0%); generated code grew from 252 to 852 bytes;
-- the 20-sample production-tiered kernel median improved from 10,138,583 ns to
-  2,175,729 ns (-78.5%), with 2.1 million optimizing returns and no deopts.
-
-The shared optimizer is still slower than the current template tier on this
-kernel (2.176 ms versus 1.418 ms); backend consolidation removes the much worse
-fork but does not close the remaining optimizer/code-generation gap.
-
-## Active implementation
-
-### 1. Atomic compiler and execution-contract switch
-
-Land one complete replacement, not a bridge:
-
-- typed CFG HIR with explicit effects, representations, guards, FrameState,
-  dependency tokens, and call descriptors;
-- target-neutral Machine IR with blocks, phis, legal machine operations,
-  virtual registers, clobbers, and safepoint/deopt annotations;
-- complete AArch64 and x86-64 selectors/legalizers over the same Machine IR;
-- regalloc2 allocation followed by final stack-map and deopt-map construction;
-- universal JS call ABI, native frame walk, stable dispatch cells, and
-  generation-independent caller linkage;
-- deterministic normalized IR, allocation, code, relocation, stack-map, and
-  deopt artifacts.
-
-Landed substrate on 2026-08-05:
-
-- verified target-selected instruction sequences contain dense values, blocks,
-  block parameters, physical constraints, explicit clobbers, safepoints, and
-  deopt operands without bytecode or interpreter-slot identities;
-- every call requires a checked descriptor for argument/result
-  representations, effects, clobbers, exceptional transfer, and GC behavior;
-- regalloc2 Ion allocates the complete AArch64 and System V x86-64 register
-  files, including fixed operands and inserted moves;
-- root and deopt values are late allocator uses, and one post-allocation table
-  supplies their exact register/spill locations;
-- normalized Machine IR and allocation are deterministic, and tests prove a
-  tagged root survives the AArch64 caller-saved clobber set.
-
-The repository gate passed with 235 JIT tests, 831 VM tests, and all 17
-interpreter/tier/GC-stress differential cases.
-
-First production execution slice landed on 2026-08-05:
-
-- eligible straight-line Number leaves now lower from bytecode into a typed,
-  side-effect-free numeric HIR, then into the shared Machine IR;
-- eligibility has no fixture-sized arithmetic-count threshold; even a
-  one-operation leaf uses the replacement pipeline once feedback proves Number
-  inputs;
-- regalloc2's exact operand locations drive a new AArch64 emitter directly;
-- Number entry guards bail before effects, and result boxing preserves int32,
-  double, `NaN`, infinities, and negative zero semantics;
-- the installed code object and artifact bundle identify
-  `otter-machine-ir numeric-leaf`; the previous optimizing CFG/SSA emitter is
-  not entered for eligible leaves;
-- one shared post-allocation frame layout now turns allocator spill slots into
-  aligned frame bytes and exact stack offsets; the AArch64 emitter executes
-  register/spill and spill/spill edits and unwinds the same frame on return or
-  bailout;
-- native-entry coverage forces 33 simultaneously live numeric values, proves
-  real FP spills, validates the returned result, and bails from the spill frame
-  without corrupting the VM window or stack;
-- the 20-sample compile median is 14,625 ns with 256-byte code, versus 70,437.5
-  ns for the consolidated legacy optimizer (-79.2%) and 100,687.5 ns for the
-  published baseline (-85.5%);
-- the production-tiered kernel median is 1,578,541.5 ns, down from 2,175,729 ns
-  (-27.5%), with 2.1 million optimizing returns and zero deopts.
-
-The full repository gate passed with 241 JIT tests, 831 VM tests, all-target
-all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
-
-First control-flow slice landed on 2026-08-05:
-
-- the numeric HIR now builds an explicit acyclic CFG from authoritative
-  bytecode block boundaries, with typed Number/Boolean values, predecessors,
-  successors, block parameters, and per-edge arguments;
-- ordered Float64 less-than, both conditional-branch polarities, unconditional
-  jumps, and multi-block returns select into the one Machine IR;
-- the AArch64 emitter binds block labels and executes regalloc2 edge moves
-  before terminators; `NaN` remains unordered and therefore compares false;
-- the Machine IR verifier now checks reverse predecessor edges, terminator
-  successor counts, and block-parameter/edge-argument representations;
-- critical edges carrying arguments are declined until edge splitting lands;
-  loops, int32 operations, FrameState, and OSR still use the legacy fallback;
-- the current artifact identity is `otter-machine-ir numeric-function` with a
-  `machineNumericFunction` code-map region; the obsolete leaf-only identity was
-  changed in place;
-- a production frontend fixture executes a real diamond and validates its
-  merged return. On the same 50-sample harness, compile median fell from
-  136,312.5 ns on the parent legacy optimizer to 65,708 ns (-51.8%), with both
-  versions producing 468-byte code. The straight-line numeric fixture remains
-  256 bytes and measured 13,833 ns versus the previously accepted 14,625 ns.
-
-The full repository gate passed with 243 JIT tests, 831 VM tests, all-target
-all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
-
-CFG normalization and loop-SSA substrate landed on 2026-08-05:
-
-- selection splits every critical edge into an explicit Machine IR block, so
-  allocator edge moves never execute speculatively on the untaken successor;
-- a production frontend fixture validates the split critical-edge path through
-  native execution, including the merged Number result;
-- numeric HIR now constructs cyclic CFGs, forces typed parameters for values
-  live into loop headers, and attaches both preheader and backedge arguments
-  after all blocks are lowered;
-- regalloc2 accepts the resulting cyclic Machine IR. Native loop publication
-  remains explicitly disabled until backedge polling and allocator-driven
-  FrameState reconstruction land; this is a safety boundary, not a fallback
-  compatibility mode.
-
-The full repository gate passed with 244 JIT tests, 831 VM tests, all-target
-all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
-
-Typed loop-value substrate landed on 2026-08-05:
-
-- backward CFG liveness now determines block parameters; dead bytecode
-  temporaries from mutually exclusive arms do not become phis or reject SSA;
-- Int32 constants, checked add/add-immediate, bitwise-and-immediate, and signed
-  less-than/equality-immediate operations have explicit HIR and Machine IR
-  identities, with lossless Int32-to-Float64 widening and canonical Int32
-  boxing kept separate;
-- the exact `branch-phi` bytecode shape now builds typed loop-header and inner
-  merge parameters and allocates through regalloc2;
-- native publication remains closed for checked integer operations until their
-  overflow exits own complete allocator-driven FrameState records. The HIR and
-  allocation test asserts this boundary directly.
-
-The full repository gate passed with 245 JIT tests, 831 VM tests, all-target
-all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
-
-Machine FrameState lowering substrate landed on 2026-08-05:
-
-- `MachineFrameState` records one register-ordered VM snapshot using only
-  Machine values or tagged literal recipes;
-- late deopt operands are the sole source of post-regalloc locations;
-- one target-neutral lowering unifies GPR, FP, and spill namespaces and emits
-  the VM's existing `DeoptTable`, including its schema verification;
-- focused coverage proves mixed Int32/Float64 allocator locations and an
-  undefined literal reconstruct into one exact frame. Numeric checked exits
-  and backedge polls are the next consumers; no emitter-local reconstruction
-  format was introduced.
-
-The full repository gate passed with 246 JIT tests, 831 VM tests, all-target
-all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
-
-Checked-integer FrameState wiring landed on 2026-08-05:
-
-- backward liveness is now exact at every numeric instruction, not only at
-  block entry;
-- checked Int32 add and add-immediate nodes own dense frame-state identities
-  at their exact byte PCs and keep only live VM registers as late deopt uses;
-- the exact `branch-phi` body lowers both overflow exits through regalloc2 into
-  complete 12-slot VM frames: three allocated values at `ADD`, two at
-  `ADD_IMM`, and tagged `undefined` literals everywhere else;
-- native publication remains closed only on backedge polling and cold-exit
-  emission. Integer overflow metadata itself no longer depends on the legacy
-  optimizer.
-
-The full repository gate passed with 246 JIT tests, 831 VM tests, all-target
-all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
-
-Backedge FrameState wiring landed on 2026-08-05:
-
-- every numeric loop backedge, conditional or unconditional, now passes
-  through an explicit split-edge Machine IR block;
-- that block owns one `BackedgePoll` before its phi moves, so late allocator
-  uses describe predecessor values while the exit resumes at the loop header;
-- HIR records a complete loop-header VM snapshot for each backedge, masked by
-  header liveness. The exact `branch-phi` body lowers its poll into a third
-  complete 12-slot frame with two allocated values and tagged `undefined`
-  literals everywhere else;
-- native publication remains closed until the AArch64 emitter implements the
-  poll and shared cold deopt exits. CFG placement, state identity, and
-  post-regalloc value locations no longer depend on the legacy optimizer.
-
-The full repository gate passed with 246 JIT tests, 831 VM tests, all-target
-all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
-
-Native integer-loop publication landed on 2026-08-05:
-
-- the numeric AArch64 emitter now lowers checked Int32 add/add-immediate,
-  bitwise-and-immediate, signed less-than/equality-immediate, and
-  `BackedgePoll` directly from allocated Machine IR;
-- one post-regalloc frame layout owns spills, the saved `x19` context, and the
-  exact generated-stack reservation. Checked overflow and interrupt exits
-  branch by dense deopt id into one cold register dump and the existing VM
-  `DeoptRuntime`; no emitter-local reconstruction format or replay path was
-  added;
-- poll clobbers are explicit allocator input. Loop-header values therefore
-  remain in exact late-use spill homes until an interrupt deopt completes, and
-  the successful fuel-refill call returns before allocator edge/phi moves run;
-- native publication no longer has loop/integer-family guards. Focused native
-  execution covers both branch-phi arms, multiple iterations, exact `ADD` and
-  `ADD_IMM` overflow PCs/windows, forced poll spills, fuel refill, and an
-  interrupt exit at the next complete loop-header state;
-- the production optimizing selector compiles the exact
-  `benchmarks/scripts/branch-phi.js` bytecode shape as
-  `otter-machine-ir numeric-function`. The real kernel validated
-  `return=-6000000` with seven optimizing entries, zero optimizing OSR entries,
-  and zero deopts; a local three-sample median was 2.767 ms versus the
-  published 7.366 ms baseline (-62.4%).
-
-The full repository gate passed with 248 JIT tests, 831 VM tests, all-target
-all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
-
-Descending integer-loop publication landed on 2026-08-05:
-
-- checked Int32 register subtraction and immediate subtraction now have
-  distinct typed HIR and Machine IR operations; AArch64 `subs` overflow exits
-  reuse the same allocator-driven `MachineFrameState` and shared VM
-  `DeoptRuntime` as checked addition;
-- `Increment` selects the existing checked add-immediate operation, while
-  immediate inequality has its own Boolean-producing machine operation. No
-  bytecode identity reaches the emitter and no second recovery path was added;
-- focused native execution covers successful register subtraction,
-  subtraction-immediate and increment in a cyclic CFG, plus positive and
-  negative overflow with the exact pre-operation VM window and resume PC;
-- `benchmarks/scripts/countdown-phi.js` is a real frontend fixture whose loop
-  bytecode contains `NE_IMM`, `SUB_IMM`, `INCREMENT`, and a backedge. The
-  production optimizing selector test proves the corresponding shape starts
-  with `otter-machine-ir numeric-function` and returns `3000000`;
-- the validated three-sample production-tiered median was 2.288 ms with seven
-  optimizing entries and zero deopts, versus 7.010 ms for template tier
-  (-67.4%). Unsupported call and OSR-entry forms remain closed.
-
-The full repository gate passed with 250 JIT tests, 831 VM tests, all-target
-all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
-
-Register bitwise loop publication landed on 2026-08-05:
-
-- Int32 `AND`, `OR`, `XOR`, complement, signed left shift, and arithmetic right
-  shift now have explicit typed HIR and Machine IR operations and emit directly
-  from regalloc2 locations on AArch64;
-- variable shifts rely on AArch64's architected low-five-bit count behavior,
-  which exactly implements JavaScript's Int32 shift normalization without
-  modifying an allocator-owned live right operand;
-- focused cyclic-CFG execution covers all six operations, negative and
-  greater-than-31 shift counts, allocation, native publication, and canonical
-  Int32 return boxing;
-- `benchmarks/scripts/bitwise-mix.js` is the real frontend fixture. Its loop
-  bytecode contains `SHL`, `SHR`, `BIT_XOR`, `BIT_OR`, `BIT_AND`, `BIT_NOT`,
-  checked increment, and a polled backedge; the production selector artifact
-  proves it uses `otter-machine-ir numeric-function`;
-- the validated three-sample production-tiered median was 3.629 ms with seven
-  optimizing entries and zero deopts, versus 18.564 ms for template tier
-  (-80.4%). `USHR` remains on fallback because its Uint32 result needs an
-  explicit representation decision instead of pretending it is always Int32.
-
-The full repository gate passed with 251 JIT tests, 831 VM tests, all-target
-all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
-
-Checked multiply, Uint32, and comparison publication landed on 2026-08-05:
-
-- checked Int32 multiply now stays unboxed through typed HIR and Machine IR.
-  The AArch64 widening multiply deopts before committing the destination on
-  either signed overflow or a JavaScript negative-zero result, preserving the
-  exact pre-operation PC and VM window through the shared deopt runtime;
-- logical right shift has an explicit `Uint32` representation from HIR through
-  regalloc2, VM `DeoptTable` reconstruction, Float64 widening, and return
-  boxing. Values above `i32::MAX` therefore remain exact rather than being
-  mislabeled signed integers or forced through an eager boxed detour;
-- all six register numeric comparisons select distinct Int32 or Float64
-  machine operations and return canonical tagged booleans. Ordered Float64
-  comparisons explicitly reject unordered NaN flags while numeric inequality
-  remains true for NaN;
-- deopt frames now permit several VM slots to read the same immutable machine
-  snapshot location. This is the correct final contract for ordinary
-  `LoadLocal` aliases and removes a false verifier rejection without adding a
-  second recovery representation;
-- `benchmarks/scripts/integer-scalar.js` combines checked multiply, Uint32
-  loop-header phis, logical shifts, register comparison, bitwise operations,
-  checked increment, and a polled backedge. Its production-selector artifact
-  proves `otter-machine-ir numeric-function` and native execution returns the
-  Node oracle `1725`;
-- with a focused OSR threshold of 10, the validated five-sample median was
-  3.104 ms with nine optimizing entries and zero deopts, versus 24.778 ms for
-  template tier (-87.5%). Unsupported call and OSR-entry forms remain closed.
-
-The full repository gate passed with 255 JIT tests, 831 VM tests, all-target
-all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
-
-Typed scalar leaf publication landed on 2026-08-06:
-
-- checked Int32 negation now lowers through typed HIR and Machine IR. AArch64
-  deopts on signed overflow and on the JavaScript negative-zero case before
-  committing the result, using the existing allocator-driven frame state;
-- Number remainder and exponentiation remain unboxed across allocation and use
-  one declared `f64, f64 -> f64` leaf ABI. The calls have explicit caller-save
-  clobbers and allocation-owned fixed ABI operands, with no heap argument,
-  tagged-value conversion, status pair, local recovery format, or parallel
-  bailout path;
-- `ToNumber` over an already numeric value, Int32/Float64 `ToBoolean`, and
-  logical-not now lower directly. Float truthiness rejects both zero signs and
-  unordered NaN while preserving canonical Boolean results;
-- focused native execution covers `INT_MIN`, negative zero, remainder and
-  exponentiation edge cases, callee-saved values and forced spills across FP
-  leaf calls, several loop iterations, and exact interrupt reconstruction
-  before the next iteration;
-- `benchmarks/scripts/float-leaf-math.js` is a real frontend fixture combining
-  all new families with a checked/polled mixed Int32/Float64 loop. Its artifact
-  proves `otter-machine-ir numeric-function`, native execution returns the Node
-  oracle `199999`, and ten-sample validation recorded 12 optimizing entries and
-  zero deopts. The typed ABI reduced the local production-tiered median from
-  19.670 ms with tagged leaf calls to 17.045 ms, within 1.1% of the 16.852 ms
-  template result; these dirty-tree measurements are engineering evidence, not
-  a published baseline.
-
-The full repository gate passed with 258 JIT tests, 831 VM tests, all-target
-all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
-
-Exact ToInt32 bitwise publication landed on 2026-08-06:
-
-- Float64 and Boolean inputs to `&`, `|`, `^`, `~`, `<<`, `>>`, `>>>`, and
-  immediate AND now lower through the same typed numeric HIR as existing
-  Int32/Uint32 inputs. This removes the parameter/large-constant fallback
-  without weakening Number entry guards;
-- one declared pure `f64 -> word` VM leaf owns the complete ECMAScript ToInt32
-  modulo semantics, including truncation, both zero signs, NaN, infinities,
-  values across the signed boundary, and values beyond 32 bits. The AArch64
-  ABI uses `d0`/`x0`, the common caller-save clobber set, and the existing
-  fixed `d0 -> x0` operands; it has no heap, status, exception, frame shuttle,
-  or alternate reconstruction channel;
-- Boolean constants and `NOP` are accepted in numeric CFGs. A typed
-  Boolean-to-Int32 conversion preserves the representation boundary instead of
-  treating Boolean HIR values as signed integers implicitly;
-- focused execution covers the full conversion edge matrix, Uint32 result
-  boxing, fractional shift counts, Boolean bitwise input, allocator spills
-  across conversion calls, and exact interrupt reconstruction at a loop
-  header;
-- `benchmarks/scripts/float-bitwise.js` is the real frontend fixture. Its
-  artifact contains `Float64ToInt32` with no separate result pseudo-op under
-  `otter-machine-ir numeric-function`, native execution returns the Node oracle
-  `120790`, and ten validated samples recorded 13 optimizing entries and zero
-  deopts. The dirty-tree production-tiered median was 1.208 ms versus 2.485 ms
-  for template tier (-51.4%); this is engineering evidence, not a published
-  baseline.
-
-The full repository gate passed with 260 JIT tests, 831 VM tests, all-target
-all-feature Clippy, and all 17 interpreter/tier/GC-stress differential cases.
-
-Numeric Machine IR OSR publication landed on 2026-08-06:
-
-- every reducible numeric loop header now owns an explicit `OsrEntry` marker.
-  Its immutable metadata aligns live VM-register sources and scalar contracts
-  with ordinary late-use Machine IR operands; regalloc2's operand locations
-  are the only physical destination map;
-- the AArch64 emitter publishes one cold trampoline per marker using the same
-  prologue, frame layout, and loop body as normal entry. It decodes exact
-  Int32, Uint32, Float64, and Boolean values directly into allocator registers
-  or spill homes, then joins after the marker's `Before` edits and before its
-  `After` edits;
-- a failed representation check writes the loop-header PC and unwinds without
-  touching the interpreter window. Successful entry reaches the existing
-  checked-operation deopt table and backedge poll, so overflow, interrupt, and
-  fuel semantics have no OSR-specific recovery or replay path;
-- focused native execution covers successful mid-loop entry, atomic type
-  rejection, exact overflow reconstruction, interrupt before phi moves, all
-  four scalar contracts, and a 33-value loop header that forces OSR operands
-  into allocator spill slots. Artifact coverage records the published OSR
-  range and retains the `otter-machine-ir numeric-function` identity;
-- the exact `benchmarks/scripts/branch-phi.js` kernel with OSR threshold 10
-  validated `return=-6000000`, one optimizing OSR entry, zero optimizing
-  deopts, and a five-sample production-tiered median of 2.286 ms versus
-  5.386 ms for template (-57.5%). These dirty-tree measurements are engineering
-  evidence, not a published baseline.
-
-The full repository gate passed with 264 JIT tests, 831 VM tests, all-target
-all-feature Clippy, compile-fail/rooting checks, and all 17
-interpreter/tier/GC-stress differential cases.
-
-Feedback-specialized numeric parameters landed on 2026-08-09:
-
-- numeric HIR now computes parameter-origin dataflow to a fixpoint across the
-  complete CFG. Arithmetic feedback specializes an incoming value only when a
-  checked Int32 operand directly proves it; copies and numeric identity
-  coercions retain origins, while Float64 results, Boolean conversions, and
-  ECMAScript bitwise coercions deliberately clear them;
-- specialized entry values select `DecodeInt32`, whose AArch64 guard rejects a
-  non-Int32 tagged value before the body. Its output has an explicit allocator
-  reuse constraint, so the checked tagged input becomes the Int32 value in
-  place without an entry copy. Parameters outside the exact entry live-in set
-  have no HIR value, load, guard, or interval. General Number parameters keep
-  the existing Float64 decoder; there is no mixed decoder, retry, or alternate
-  entry path;
-- the exact `engineNumericLeaf` body now keeps both parameters and its first
-  six arithmetic operations in checked Int32 form, then inserts exactly two
-  representation widenings at the Float64 division boundary. Entry rejection
-  leaves the VM window untouched, and checked overflow reconstructs the two
-  arguments plus the exact operation PC through the existing MachineFrameState
-  and VM DeoptTable;
-- the `jit-compile` harness now rejects an optimizing observation unless an
-  untimed artifact for the identical snapshot starts with
-  `otter-machine-ir numeric-function`. It then installs and executes the exact
-  measured code object, and records `backend=otter-machine-ir` in the
-  validation marker, so legacy fallback is no longer scoreable for this row.
-  CLI integers use canonical VM Int32 values while fractions, out-of-range
-  values, and negative zero remain Float64; feedback seed loops are prevented
-  from OSR until every operation has been observed;
-- `typed-parameter-loop.js` proves the complete frontend path for two Int32
-  parameters, loop-header phis, checked ADD/ADD_IMM, comparison, backedge poll,
-  native entry, and OSR. Its direct compile validates the Machine IR marker,
-  executes the exact 720-byte object, and returns `300000`; mismatched loop-edge
-  representations now decline in HIR instead of reaching a verifier failure;
-- focused proof covers typed lowering through the first Float64 boundary,
-  copy-alias inference, deliberate non-specialization of bitwise coercions,
-  dead-parameter elimination, in-place decode allocation, early Float64
-  rejection, exact entry-frame overflow recovery, a complete integer loop, and
-  both real frontend compile fixtures. The cost/vs kernel ledgers now retain
-  the parameter loop as a permanent performance signal;
-- the final twenty-sample gate measured 298,013,093 template retired
-  instructions versus 151,496,173 production-tiered (-49.2%). Wall medians
-  were 0.334 ms versus 0.209 ms (-37.5%), with one optimizing OSR
-  entry and zero deopts. The straight-line numeric leaf remains slightly behind
-  template, exposing generated-call/entry overhead as the next bottleneck.
-
-The full repository gate passed with 270 JIT tests, 831 VM tests, 19 focused
-engine-harness tests, all-target all-feature Clippy, compile-fail/rooting
-checks, and all 17 interpreter/tier/GC-stress differential cases. Test262 was
-not run.
-
-Allocation-driven numeric leaf linkage landed on 2026-08-09:
-
-- the numeric AArch64 register file now exposes AAPCS64 callee-saved
-  `x20..x28` and `d8..d15` to regalloc2. The emitter derives one exact used
-  prefix from the final allocation and makes that same set authoritative for
-  frame sizing, prologue saves, every normal/cold epilogue, and OSR entry;
-- pure scalar leaves express their ABI directly as fixed Machine IR operands:
-  remainder/power are `d0,d1 -> d0`, and ToInt32 is `d0 -> x0`. regalloc2 owns
-  argument/result moves around the declared caller-save clobbers. The old
-  `FloatLeafResult`/`IntegerLeafResult` pseudo-operations and 16-byte result
-  shuttle were deleted rather than retained as another path;
-- the allocator-driven deopt namespace now spans physical `x0..x29` followed
-  by `d0..d15`; unused encodings remain deterministic holes. The shared cold
-  dump and existing VM `DeoptTable` consume that same map. A focused native
-  test keeps a parameter in a callee-saved register across an FP leaf, then
-  proves checked ADD overflow restores its exact operation PC and VM slots;
-- backedge-poll late operands may remain in callee-saved registers instead of
-  being forced to stack homes. The OSR pressure fixture now carries 33 live
-  header values, so direct spill materialization remains exercised after the
-  wider register file. Float leaf, ToInt32 edge, interrupt-before-phi, fuel,
-  spill, and OSR execution all remain on the one Machine IR backend;
-- fresh detached-parent/current A/B runs used 20 samples plus eight warmups.
-  `float-leaf-math` fell from 2,641,852,733 to 2,501,745,783 retired
-  instructions (-5.3%) and from 16.455 to 14.544 ms median (-11.6%).
-  `float-bitwise` fell from 777,452,571 to 655,294,314 retired (-15.7%) and
-  from 1.056 to 0.833 ms (-21.1%). Both exact fixtures returned their Node
-  oracles through `otter-machine-ir numeric-function` with zero deopts.
-
-The full repository gate passed with 271 JIT tests, 831 VM tests, all-target
-all-feature Clippy, compile-fail/rooting checks, and all 17
-interpreter/tier/GC-stress differential cases. The permanent kernel ledger
-retained a 0.208 ms typed-parameter loop with zero deopts. Test262 was not run.
-
-The remaining legacy optimizer and allocator are fallback for functions whose
-HIR/selection slices have not switched. Delete each old consumer as its final
-operation family moves; do not adapt old allocation or metadata into the new
-pipeline.
-
-In the same switch delete the template compiler, current optimizing SSA path,
-interpreter-window compiled ABI, status-return protocol, duplicated direct
-emitters, and caller-visible callee tier/frame contracts.
-
-Correctness gates:
-
-- recursive and mutually recursive calls;
-- exceptions and reentrant natives;
-- moving-GC stress across supported strides;
-- nested inline deopt reconstruction;
-- OSR entry/exit representation round trips;
-- identical function-local artifacts under unrelated source edits;
-- no conservative compiled-stack scan and no interpreter-window root ABI.
-
-Performance gates:
-
-- exact instruction counts for settled binding, monomorphic property load and
-  store, shape guard, and 0-2 argument monomorphic call;
-- current engine `call`, `kernel`, `module`, `jit-compile`, `memory`, and
-  `idle-memory` harnesses;
-- no benchmark result is scoreable without validation markers and explicit
-  tier/GC/runtime-reuse configuration.
-
-### 2. Shared semantic optimization
+## Current state
+
+The active replacement path is:
+
+```text
+typed numeric HIR -> Machine IR -> regalloc2 -> AArch64 emitter
+```
+
+It already owns:
+
+- straight-line and reducible cyclic numeric CFGs, critical-edge splitting,
+  block parameters, edge moves, instruction-exact liveness, and loop OSR;
+- Int32, Uint32, Float64, and Boolean numeric operations currently selected by
+  the numeric HIR, including checked arithmetic and scalar VM leaves;
+- allocator-driven spills, AAPCS64 callee-saved allocation, exact frame sizing,
+  fixed leaf ABI operands, and deterministic normalized allocation artifacts;
+- `MachineFrameState -> lower_deopt_table -> VM DeoptTable`, shared cold exits,
+  exact overflow PCs/windows, and backedge poll before phi moves;
+- stack-owned nested `NativeFrame` publication, stable generation cells, and
+  generated calls into template or optimizing callees; safepoint-free acyclic
+  scalar generations initially publish only their initialized parameter
+  prefix, while every cold exit expands the canonical VM window before reentry;
+- representation-checked entry and OSR guards with no replay after a started
+  operation.
+
+The old optimizing compiler and template emitter remain in the active graph
+only for operations and function shapes not yet selected by the replacement
+pipeline. They are fallback, not contracts to preserve.
+
+Latest accepted gate: 272 JIT tests, 832 VM tests, all-target/all-feature
+Clippy, compile-fail/rooting checks, and 18/18 differential
+interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.
+
+## Active work
+
+### 1. Generalize typed HIR and Machine IR beyond numeric functions
+
+Move complete function bodies rather than adding emitter detours:
+
+- tagged constants, moves, arguments, locals, `this`, and ordinary returns;
+- calls and constructs through the universal call descriptor and exceptional
+  edge model;
+- settled property/element loads and stores with explicit dependency tokens,
+  guards, barriers, safepoints, and stack maps;
+- allocation and reentrant operations with exact tagged roots;
+- structured exceptional control flow and multi-frame FrameState chains.
+
+Each operation family must delete its old selector/emitter consumer from the
+active path in the same slice. Do not translate new IR back into legacy SSA or
+legacy allocation.
+
+### 2. Complete target parity
+
+- implement x86-64 selection, legalization, frame emission, calls, polls,
+  safepoints, and deopt exits over the same Machine IR;
+- keep JavaScript semantics above target selection;
+- make normalized function-local artifacts insensitive to runtime addresses
+  and unrelated source edits;
+- require cross-target verifier and allocation tests for every shared opcode.
+
+### 3. Perform the atomic compiler switch
+
+Once one complete supported-language boundary exists on both targets:
+
+- make quick and optimizing compilation choose budgets over the same pipeline;
+- delete the template compiler, legacy optimizing SSA/regalloc/emitter, their
+  interpreter-window ABI, duplicated direct emitters, and obsolete artifacts;
+- remove caller-visible callee tier/frame assumptions that are no longer part
+  of stable dispatch cells;
+- leave the interpreter as the semantic oracle and tier fallback, not as a
+  compiled-code ABI.
+
+### 4. Shared semantic optimization
 
 After the atomic switch, add representation propagation, dependency-aware
-guard facts, inlining, GVN, LICM, loop scheduling, and cold outlining to the
-shared HIR/Machine IR pipeline. Quick compilation skips expensive global
-passes; it does not use a different backend or value/frame format.
+guard elimination, inlining, GVN, LICM, loop scheduling, and cold outlining.
+Quick compilation skips expensive global passes; it does not use a different
+backend or value/frame format.
 
-### 3. Scaling slices
+### 5. Scaling slices
 
-Implement in this order, each as a vertical behavior/metadata/test/artifact
-slice:
+Implement in order:
 
 1. typed fields and elements;
 2. inline object allocation;
@@ -561,8 +111,31 @@ slice:
 4. OSR at every reducible loop;
 5. incremental-GC handshakes using compiled stack maps.
 
-No slice may introduce a second IR, call path, frame layout, value format,
-deopt schema, or runtime stack.
+## Required gates
+
+Every substantial slice must prove the affected invariants with focused native
+execution before the full gate. Before committing run:
+
+```text
+cargo fmt --all
+cargo test -p otter-jit
+cargo clippy -p otter-jit --all-targets --all-features -- -D warnings
+bash scripts/gate.sh
+```
+
+Additional correctness gates for the final switch:
+
+- recursive and mutually recursive calls;
+- exceptions and reentrant natives;
+- moving-GC stress across supported strides;
+- nested inline deopt reconstruction;
+- OSR entry/exit representation round trips;
+- identical normalized artifacts under unrelated source edits;
+- no conservative compiled-stack scan and no interpreter-window root ABI.
+
+Performance claims require validated fresh-process A/B measurements. Retired
+instructions are primary; wall time is a sanity check. Failed, unavailable, or
+unvalidated observations remain visible and are never scoreable.
 
 ## Stop conditions
 
@@ -578,14 +151,13 @@ Revise the architecture instead of adding a workaround if any occurs:
 
 ## Working rules
 
-- The interpreter remains the semantic oracle during replacement, not the
-  compiled ABI.
-- JavaScript semantics lower once above target selection.
-- Target backends own legalization, instruction selection, register classes,
-  calling convention details, and encoding only.
-- Every substantial change updates runtime behavior, tests, artifacts, and
-  contributor docs together.
-- Use focused tests during development. Before a commit run `scripts/gate.sh`
-  and compare the relevant Test262 failing set when semantics changed.
-- Performance claims require fresh-process, randomized A/B measurements with
-  medians, dispersion, and validation markers.
+- Parse JS/TS only through the existing AST frontend.
+- Keep `otter-gc -> otter-vm -> otter-runtime -> product crates` dependency
+  direction and never add `crates-legacy` to the active graph.
+- Do not add compatibility readers, schema versions, adapters, replay paths,
+  dual writers, or parallel IR/frame/value formats.
+- Keep GC roots explicit and allocation-driven; native value building uses
+  handle scopes.
+- Keep `lib.rs` as a crate map and small glue surface.
+- Use focused tests during development and update this plan only with current
+  state, next work, and accepted gates.

@@ -727,6 +727,7 @@ pub(super) fn compile_with_artifacts(
             function_id: view.code_block.id,
             param_count: view.code_block.param_count,
             register_count: view.code_block.register_count,
+            parameter_prefix_entry: false,
             machine_register_count: unit
                 .allocation
                 .register_budget

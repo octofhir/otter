@@ -180,6 +180,10 @@ pub(crate) const NATIVE_FRAME_OFFSET: u32 = std::mem::offset_of!(JitCtx, native_
 pub(crate) const NATIVE_FRAME_PC_OFFSET: u32 = (std::mem::offset_of!(NativeFrame, header)
     + std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, pc))
     as u32;
+/// Byte offset of the initialized tagged-register prefix published by a frame.
+pub(crate) const NATIVE_FRAME_REGISTER_COUNT_OFFSET: u32 =
+    (std::mem::offset_of!(NativeFrame, header)
+        + std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, register_count)) as u32;
 /// Byte offsets of the isolate-published cells on [`VmThread`] read by
 /// emitted code: interrupt poll byte, back-edge fuel counter, and the
 /// leaf-stub heap pointer.
@@ -236,6 +240,7 @@ pub(crate) const CODE_ENTRY_CODE_OBJECT_ID_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, code_object_id) as u32;
 pub(crate) const CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, generated_stack_frame_bytes) as u32;
+pub(crate) const CODE_ENTRY_FLAGS_OFFSET: u32 = std::mem::offset_of!(CodeEntryCell, flags) as u32;
 pub(crate) const CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, native_frame_header) as u32;
 /// 16-aligned machine-stack reservation for a nested callee's compact frame.

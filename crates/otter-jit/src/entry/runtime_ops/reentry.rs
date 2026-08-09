@@ -190,12 +190,16 @@ pub(crate) extern "C" fn jit_deopt_writeback_stub(
     };
 
     if state.is_single_frame() {
+        let Ok(register_count) = u16::try_from(state.outermost().slots.len()) else {
+            return threw(ctx, VmError::InvalidOperand);
+        };
         write_frame(state.outermost(), window as *mut otter_vm::Value);
         // SAFETY: runtime-capable JIT contexts publish this native frame for
         // the full compiled entry dynamic extent.
         let Some(native_frame) = (unsafe { ctx.native_frame.as_mut() }) else {
             return threw(ctx, VmError::InvalidOperand);
         };
+        native_frame.header.register_count = register_count;
         native_frame.header.pc = exit.resume_pcs[0];
         return JitRet {
             value: 0,

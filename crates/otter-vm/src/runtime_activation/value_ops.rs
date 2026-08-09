@@ -11,6 +11,66 @@ use crate::{NumericRuntimeOp, UnaryCoercionOp, UnaryPrimitiveHint, Value, VmErro
 use super::{RuntimeCall, RuntimeFrameIdentity};
 
 impl RuntimeCall<'_> {
+    /// Bind `super()`'s result into a stack-owned derived constructor without
+    /// materializing an interpreter frame.
+    pub fn bind_derived_this(&mut self, src: u16) -> Result<(), VmError> {
+        if self.identity != RuntimeFrameIdentity::StackOwned {
+            return Err(VmError::InvalidOperand);
+        }
+        let value = self.read(src)?;
+        self.bind_derived_this_value(value)
+    }
+
+    /// Value-form of [`Self::bind_derived_this`] used by Machine IR after the
+    /// `super` result has left its bytecode register identity.
+    pub fn bind_derived_this_value(&mut self, value: Value) -> Result<(), VmError> {
+        if let RuntimeFrameIdentity::Materialized(frame_index) = self.identity {
+            let vm = unsafe { &mut *self.vm.as_ptr() };
+            let stack = unsafe { &mut *self.stack.as_ptr() };
+            vm.run_bind_this_value(stack, frame_index as usize, value)?;
+            return self.refresh_materialized_this_value();
+        }
+        let frame_ptr = self.frame.as_ptr();
+        // SAFETY: RuntimeCall exclusively owns the validated published frame.
+        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame_ptr) }
+            .map_err(|_| VmError::InvalidOperand)?;
+        let flags = frame.header().flags;
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        if !flags.contains(crate::NativeFrameFlags::DERIVED_CONSTRUCTOR) {
+            return Err(vm.err_this_uninit(
+                "super called outside a derived constructor"
+                    .to_string()
+                    .into(),
+            ));
+        }
+        if !frame.this_value().is_hole() {
+            return Err(vm.err_this_uninit(
+                "super constructor may only be called once"
+                    .to_string()
+                    .into(),
+            ));
+        }
+        frame.set_this_value(value);
+        Ok(())
+    }
+
+    /// Mirror a committed materialized derived-`this` binding into the native
+    /// descriptor used by the rest of the current compiled entry.
+    pub fn refresh_materialized_this_value(&mut self) -> Result<(), VmError> {
+        let RuntimeFrameIdentity::Materialized(frame_index) = self.identity else {
+            return Ok(());
+        };
+        let stack = unsafe { self.stack.as_ref() };
+        let value = stack
+            .get(frame_index as usize)
+            .ok_or(VmError::InvalidOperand)?
+            .this_value;
+        self.with_frame(|frame| {
+            frame.set_this_value(value);
+            Ok(())
+        })
+    }
+
     /// Complete a generic method-call guard miss on either physical frame
     /// representation and commit the result without materializing the caller.
     pub fn call_method(
@@ -305,6 +365,23 @@ impl RuntimeCall<'_> {
         let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
         vm.jit_runtime_load_upvalue(&mut frame, dst, index)
+    }
+
+    /// Read a captured binding as an SSA value without assigning a bytecode
+    /// destination register.
+    pub fn load_upvalue_value(&self, index: i32) -> Result<Value, VmError> {
+        let index = u32::try_from(index).map_err(|_| VmError::InvalidOperand)?;
+        let frame = self.frame.as_ptr();
+        // SAFETY: RuntimeCall owns the validated published descriptor.
+        let frame = unsafe { crate::ActiveFrameRef::from_native_ptr(frame) }
+            .map_err(|_| VmError::InvalidOperand)?;
+        let value =
+            crate::read_upvalue(unsafe { &self.vm.as_ref().gc_heap }, frame.upvalue(index)?);
+        if value.is_hole() {
+            Err(VmError::TemporalDeadZone { local_index: index })
+        } else {
+            Ok(value)
+        }
     }
 
     /// Write a captured binding.

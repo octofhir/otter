@@ -289,6 +289,9 @@ pub(crate) const NATIVE_FRAME_FUNCTION_ID_OFFSET: u32 = (std::mem::offset_of!(Na
 pub(crate) const NATIVE_FRAME_SHAPE_WORD_OFFSET: u32 = (std::mem::offset_of!(NativeFrame, header)
     + std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, register_count))
     as u32;
+pub(crate) const NATIVE_FRAME_FLAGS_OFFSET: u32 = (std::mem::offset_of!(NativeFrame, header)
+    + std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, flags))
+    as u32;
 
 // The packed shape word is only a valid encoding while the three fields stay
 // adjacent in this order.

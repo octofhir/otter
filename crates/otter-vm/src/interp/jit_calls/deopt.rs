@@ -116,10 +116,21 @@ impl Interpreter {
         );
         frame.self_value = self_value;
         frame.pc = native.header.pc;
-        if matches!(call_kind, jit::JitDirectCallKind::Construct) {
+        if matches!(
+            call_kind,
+            jit::JitDirectCallKind::Construct | jit::JitDirectCallKind::SuperConstruct
+        ) {
             let receiver = this_value.as_object().ok_or(VmError::InvalidOperand)?;
             let cold = self.frame_ensure_cold(&mut frame);
             cold.construct_target = Some(receiver);
+            cold.new_target = Some(active.new_target_value());
+        } else if matches!(
+            call_kind,
+            jit::JitDirectCallKind::DerivedConstruct
+                | jit::JitDirectCallKind::DerivedSuperConstruct
+        ) {
+            let cold = self.frame_ensure_cold(&mut frame);
+            cold.is_derived_constructor = true;
             cold.new_target = Some(active.new_target_value());
         }
 

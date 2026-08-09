@@ -327,6 +327,7 @@ impl JitCodeRegistry {
             } else {
                 JitDirectCallThisMode::SloppyGlobal
             },
+            is_derived_constructor: function.is_derived_constructor,
             generated_stack_frame_bytes: Some(generation.generated_stack_frame_bytes),
             param_count: function.param_count,
             register_count: function.register_count,

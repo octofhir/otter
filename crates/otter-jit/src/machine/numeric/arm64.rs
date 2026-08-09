@@ -27,8 +27,8 @@
 //! - Successful results use the VM's canonical tagged representation.
 //! - Pure scalar leaves exchange unboxed scalars in fixed ABI operands;
 //!   regalloc2 owns every argument/result move and no frame shuttle exists.
-//! - Plain, guarded-method, and base-constructor JavaScript calls reuse the
-//!   shared generated linkage emitter; the allocator supplies only
+//! - Plain, guarded-method, and fixed-arity base/derived/super JavaScript calls
+//!   reuse the shared generated linkage emitter; the allocator supplies only
 //!   location-aware loads, stores, root reloads, and landing-pad result homes.
 
 // dynasm's dynamic-register expansion calls `.into()` on the required u8
@@ -40,7 +40,8 @@ use otter_vm::{
     JitCompileSnapshot, Value,
     deopt::DeoptRuntime,
     native_abi::{
-        RuntimeStubDescriptor, STUB_JIT_BACKEDGE_POLL, STUB_JIT_DEOPT_WRITEBACK,
+        RuntimeStubDescriptor, STUB_JIT_BACKEDGE_POLL, STUB_JIT_BIND_DERIVED_THIS,
+        STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_LOAD_UPVALUE_VALUE,
         STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF,
         STUB_STRICT_EQ_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF,
     },
@@ -242,6 +243,10 @@ pub(super) fn emit(
     resolve_direct_entry: u64,
     prepare_construct_entry: u64,
     construct_result_entry: u64,
+    derived_construct_result_entry: u64,
+    bind_derived_this_entry: u64,
+    class_super_constructor_entry: u64,
+    load_upvalue_value_entry: u64,
     string_concat_entry: u64,
     number_rem_entry: u64,
     number_pow_entry: u64,
@@ -794,6 +799,18 @@ pub(super) fn emit(
                                 Unsupported::OperandShape("scalar construct receiver root")
                             })?,
                         },
+                        DirectCallKind::DerivedConstruct => {
+                            DirectCallForm::DerivedConstruct { callable: 0 }
+                        }
+                        DirectCallKind::SuperConstruct => DirectCallForm::SuperConstruct {
+                            callable: 0,
+                            receiver: u16::try_from(result_index + 1).map_err(|_| {
+                                Unsupported::OperandShape("scalar super receiver root")
+                            })?,
+                        },
+                        DirectCallKind::DerivedSuperConstruct => {
+                            DirectCallForm::DerivedSuperConstruct { callable: 0 }
+                        }
                     };
                     let arguments = (1..result_index)
                         .map(|index| {
@@ -821,6 +838,7 @@ pub(super) fn emit(
                         resolve_direct_entry,
                         prepare_construct_entry,
                         construct_result_entry,
+                        derived_construct_result_entry,
                         None,
                         direct_bail,
                         direct_threw,
@@ -929,6 +947,158 @@ pub(super) fn emit(
                     }
                     dynasm!(ops ; .arch aarch64 ; =>direct_done);
                 } else {
+                    if matches!(
+                        descriptor.target,
+                        CallTarget::RuntimeStub(target) if target == STUB_JIT_LOAD_UPVALUE_VALUE
+                    ) {
+                        if locations.len() < 2 {
+                            return Err(Unsupported::OperandShape(
+                                "scalar upvalue-value load call",
+                            ));
+                        }
+                        let load_done = ops.new_dynamic_label();
+                        emit_load_allocated_tagged(&mut ops, frame, locations[0], 1, 0)?;
+                        dynasm!(ops ; .arch aarch64 ; mov x0, x19);
+                        emit_load_symbolic_u64(
+                            &mut ops,
+                            &mut relocations,
+                            16,
+                            load_upvalue_value_entry,
+                            RelocationTarget::runtime_stub(STUB_JIT_LOAD_UPVALUE_VALUE),
+                        );
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; blr x16
+                            ; and x5, x1, #0xff
+                            ; cbz x5, =>load_done
+                        );
+                        match descriptor.exceptional {
+                            super::super::ExceptionalEdge::LandingPad(target) => {
+                                emit_store_allocated_tagged(&mut ops, frame, locations[1], 0, 0)?;
+                                let target = block_labels[target.0 as usize];
+                                dynasm!(ops ; .arch aarch64 ; b =>target);
+                            }
+                            super::super::ExceptionalEdge::Propagate => {
+                                dynasm!(ops ; .arch aarch64 ; b =>threw);
+                            }
+                            super::super::ExceptionalEdge::None => {
+                                return Err(Unsupported::OperandShape(
+                                    "scalar upvalue-value load exceptional edge",
+                                ));
+                            }
+                        }
+                        dynasm!(ops ; .arch aarch64 ; =>load_done);
+                        emit_store_allocated_tagged(&mut ops, frame, locations[1], 0, 0)?;
+                        if !is_terminator {
+                            emit_edits(
+                                &mut ops,
+                                allocation.edits(),
+                                AllocationPoint::After(id),
+                                frame,
+                            )?;
+                        }
+                        continue;
+                    }
+                    if matches!(
+                        descriptor.target,
+                        CallTarget::RuntimeStub(target)
+                            if target == STUB_JIT_CLASS_SUPER_CONSTRUCTOR
+                    ) {
+                        if locations.len() < 2 {
+                            return Err(Unsupported::OperandShape("scalar class-super load call"));
+                        }
+                        let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                        emit_load_allocated_tagged(&mut ops, frame, locations[0], 1, 0)?;
+                        dynasm!(ops ; .arch aarch64 ; mov x0, x19);
+                        emit_load_symbolic_u64(
+                            &mut ops,
+                            &mut relocations,
+                            16,
+                            class_super_constructor_entry,
+                            RelocationTarget::runtime_stub(STUB_JIT_CLASS_SUPER_CONSTRUCTOR),
+                        );
+                        dynasm!(ops ; .arch aarch64 ; blr x16);
+                        emit_load_u64(&mut ops, 16, Value::hole().to_bits());
+                        dynasm!(ops ; .arch aarch64 ; cmp x0, x16 ; b.eq =>deopt);
+                        emit_store_allocated_tagged(&mut ops, frame, locations[1], 0, 0)?;
+                        if !is_terminator {
+                            emit_edits(
+                                &mut ops,
+                                allocation.edits(),
+                                AllocationPoint::After(id),
+                                frame,
+                            )?;
+                        }
+                        continue;
+                    }
+                    if matches!(
+                        descriptor.target,
+                        CallTarget::RuntimeStub(target) if target == STUB_JIT_BIND_DERIVED_THIS
+                    ) {
+                        if locations.len() < 2 {
+                            return Err(Unsupported::OperandShape("scalar derived-this bind call"));
+                        }
+                        let site = safepoints
+                            .site(id)
+                            .filter(|site| instruction.safepoint == Some(site.id))
+                            .ok_or(Unsupported::OperandShape(
+                                "scalar derived-this bind safepoint",
+                            ))?;
+                        let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                        let bind_done = ops.new_dynamic_label();
+                        emit_save_safepoint_roots(&mut ops, frame, site)?;
+                        emit_load_allocated_tagged(&mut ops, frame, locations[0], 1, 0)?;
+                        emit_publish_machine_roots(&mut ops, frame, site)?;
+                        dynasm!(ops ; .arch aarch64 ; mov x0, x19);
+                        emit_load_symbolic_u64(
+                            &mut ops,
+                            &mut relocations,
+                            16,
+                            bind_derived_this_entry,
+                            RelocationTarget::runtime_stub(STUB_JIT_BIND_DERIVED_THIS),
+                        );
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; blr x16
+                            ; mov x6, x0
+                            ; and x5, x1, #0xff
+                        );
+                        emit_clear_machine_roots(&mut ops);
+                        emit_reload_safepoint_roots(&mut ops, frame, site)?;
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; mov x0, x6
+                            ; cbz x5, =>bind_done
+                            ; cmp x5, STATUS_THREW as u32
+                            ; b.ne =>deopt
+                        );
+                        match descriptor.exceptional {
+                            super::super::ExceptionalEdge::LandingPad(target) => {
+                                emit_store_allocated_tagged(&mut ops, frame, locations[1], 0, 0)?;
+                                let target = block_labels[target.0 as usize];
+                                dynasm!(ops ; .arch aarch64 ; b =>target);
+                            }
+                            super::super::ExceptionalEdge::Propagate => {
+                                dynasm!(ops ; .arch aarch64 ; b =>threw);
+                            }
+                            super::super::ExceptionalEdge::None => {
+                                return Err(Unsupported::OperandShape(
+                                    "scalar derived-this bind exceptional edge",
+                                ));
+                            }
+                        }
+                        dynasm!(ops ; .arch aarch64 ; =>bind_done);
+                        emit_store_allocated_tagged(&mut ops, frame, locations[1], 0, 0)?;
+                        if !is_terminator {
+                            emit_edits(
+                                &mut ops,
+                                allocation.edits(),
+                                AllocationPoint::After(id),
+                                frame,
+                            )?;
+                        }
+                        continue;
+                    }
                     let (target, entry, result_index, allocating) = match &descriptor.target {
                         CallTarget::RuntimeStub(target) if *target == STUB_TO_BOOLEAN_LEAF => {
                             if locations.len() < 3

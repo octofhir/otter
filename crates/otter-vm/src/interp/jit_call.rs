@@ -1076,12 +1076,13 @@ impl Interpreter {
         usize::try_from(header.upvalue_base).ok()
     }
 
-    /// Complete one full `Op::New` construct in place for a compiled caller
-    /// whose New site fell outside the compiled subset. Reads the callee and
+    /// Complete one full fixed-arity construct in place for a compiled caller
+    /// whose fixed-arity construction site fell outside the compiled subset.
+    /// Reads the callee and
     /// argument registers from the caller's live window and runs the
-    /// interpreter's own `Construct(callee, args, callee)` synchronously under
-    /// the caller's published activation, writing the constructed value into
-    /// `dst`.
+    /// interpreter's own `Construct(callee, args, new_target)` synchronously
+    /// under the caller's published activation, writing the constructed value
+    /// into `dst`. `inherited_new_target` is present only for `super()`.
     ///
     /// A non-constructor callee reports `Ok(false)` and side-exits, keeping the
     /// interpreter the sole owner of the thrown `TypeError`. On `Ok(true)` the
@@ -1110,6 +1111,9 @@ impl Interpreter {
         callee_reg: u16,
         arg_regs: &[u16],
         caller_regs: *mut Value,
+        inherited_new_target: Option<Value>,
+        caller_function_id: u32,
+        call_pc: u32,
     ) -> Result<bool, VmError> {
         self.record_jit_runtime_stub_class(native_abi::RuntimeStubClass::Reentrant);
         self.jit_runtime_stats.runtime_constructs =
@@ -1121,14 +1125,35 @@ impl Interpreter {
         if !crate::interp::helpers::is_constructor_runtime(&callee, context, &self.gc_heap) {
             return Ok(false);
         }
+        let callable = callee
+            .as_class_constructor()
+            .map(|class| class.ctor(&self.gc_heap))
+            .unwrap_or(callee);
+        let target_function_id = callable.as_function().or_else(|| {
+            callable
+                .as_closure(&self.gc_heap)
+                .map(|closure| closure.function_id())
+        });
+        if let (Some(caller), Some(target_function_id)) = (
+            context.exec_function(caller_function_id),
+            target_function_id,
+        ) {
+            let transition = self.record_ordinary_call_feedback(
+                caller,
+                call_pc,
+                crate::feedback::OrdinaryCallTarget::Bytecode(target_function_id),
+            );
+            if transition.evict_for_reopt() {
+                self.evict_compiled_for_reopt(caller_function_id);
+            }
+        }
         let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
         for &arg in arg_regs {
             // SAFETY: compiler-emitted argument indices into the caller window.
             args.push(unsafe { *caller_regs.add(arg as usize) });
         }
-        // A plain `new callee(args…)` uses the callee itself as `new.target`,
-        // matching `do_construct`'s `effective_new_target`.
-        let result = self.run_construct_sync_rooted(stack, context, &callee, callee, args)?;
+        let new_target = inherited_new_target.unwrap_or(callee);
+        let result = self.run_construct_sync_rooted(stack, context, &callee, new_target, args)?;
         // SAFETY: `dst_reg` is a compiler-emitted index into the caller
         // window; the window slab is pinned, so the pointer survived the
         // nested dispatch.

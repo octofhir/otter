@@ -98,6 +98,10 @@ impl NativeFrameFlags {
     /// sequence owns synchronous-depth and native-stack-byte accounting until
     /// return, throw, or cold deoptimization completes.
     pub const STACK_REGISTERS: u8 = 1 << 2;
+    /// Activation uses derived-constructor return and `this` binding
+    /// semantics. The bit is representation-neutral: materialized entries and
+    /// generated stack calls publish the same fact.
+    pub const DERIVED_CONSTRUCTOR: u8 = 1 << 3;
 
     /// Empty flag set.
     #[must_use]
@@ -273,6 +277,21 @@ impl NativeFrame {
             (self.header.flags.bits() | NativeFrameFlags::STACK_REGISTERS)
                 & !NativeFrameFlags::MATERIALIZED,
         );
+    }
+
+    /// Mark this activation as a derived constructor.
+    pub fn set_derived_constructor(&mut self) {
+        self.header.flags = NativeFrameFlags::from_bits(
+            self.header.flags.bits() | NativeFrameFlags::DERIVED_CONSTRUCTOR,
+        );
+    }
+
+    /// Whether this activation owns derived-constructor semantics.
+    #[must_use]
+    pub const fn is_derived_constructor(&self) -> bool {
+        self.header
+            .flags
+            .contains(NativeFrameFlags::DERIVED_CONSTRUCTOR)
     }
 
     /// Switch this activation to interpreter dispatch without moving or

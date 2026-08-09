@@ -112,6 +112,9 @@ pub(crate) extern "C" fn jit_deopt_stack_call_stub(
         0 => otter_vm::JitDirectCallKind::Plain,
         1 => otter_vm::JitDirectCallKind::Method,
         2 => otter_vm::JitDirectCallKind::Construct,
+        3 => otter_vm::JitDirectCallKind::DerivedConstruct,
+        4 => otter_vm::JitDirectCallKind::SuperConstruct,
+        5 => otter_vm::JitDirectCallKind::DerivedSuperConstruct,
         _ => {
             park_jit_error(ctx, VmError::InvalidOperand);
             return JitRet {

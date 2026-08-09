@@ -122,6 +122,16 @@ pub struct JitClosureCallLayout {
     pub runtime_setup_flags: u32,
 }
 
+/// Machine-readable class-constructor wrapper layout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JitClassConstructorLayout {
+    /// GC body tag proving the wrapper family.
+    pub type_tag: u8,
+    /// Byte offset from the decompressed body pointer to its underlying
+    /// callable value.
+    pub callable_byte: u32,
+}
+
 const _: [(); 36] = [(); std::mem::size_of::<JitClosureCallLayout>()];
 const _: [(); 4] = [(); std::mem::align_of::<JitClosureCallLayout>()];
 const _: [(); 0] = [(); std::mem::offset_of!(JitClosureCallLayout, function_id_byte)];
@@ -240,6 +250,8 @@ pub struct JitCompileSnapshot {
     /// its function-id offset; native call linkage additionally consumes its
     /// flags, immutable upvalue spine, and canonical bound-value metadata.
     pub closure_call_layout: JitClosureCallLayout,
+    /// VM-baked class wrapper layout used by generated construct guards.
+    pub class_constructor_layout: JitClassConstructorLayout,
     /// Ready-to-use byte offsets and type tags for baseline collection method
     /// IC guards.
     pub collection_layout: JitCollectionLayout,
@@ -271,10 +283,10 @@ pub struct JitCompileSnapshot {
     /// entry-cell lease no longer matches; no runtime resolver is part of the
     /// compiled hit path.
     pub direct_callees: rustc_hash::FxHashMap<u32, JitDirectCallee>,
-    /// Compiler-native base constructors keyed by the caller's `Op::New`
-    /// byte-PC. The dynamic callee must be the exact function or closure
-    /// identity; receiver creation and `new.target` publication are part of
-    /// the generated construct boundary.
+    /// Compiler-native constructors keyed by the caller's `Op::New` or
+    /// `Op::SuperConstruct` byte-PC. The dynamic callee must be the exact
+    /// function or closure identity; receiver creation, derived-`this`, and
+    /// `new.target` publication/inheritance are part of the generated boundary.
     pub direct_constructs: rustc_hash::FxHashMap<u32, JitDirectCallee>,
     /// Compiler-native direct-method chains keyed by the caller's
     /// `Op::CallMethodValue` byte-PC. Each target carries one exact receiver /
@@ -551,6 +563,12 @@ pub enum JitDirectCallKind {
     Method,
     /// Base `Op::New` construction.
     Construct,
+    /// `Op::New` targeting a derived constructor.
+    DerivedConstruct,
+    /// `Op::SuperConstruct` targeting a base constructor.
+    SuperConstruct,
+    /// `Op::SuperConstruct` targeting another derived constructor.
+    DerivedSuperConstruct,
 }
 
 /// `this` binding performed by compiler-generated call linkage.
@@ -566,9 +584,12 @@ pub enum JitDirectCallThisMode {
     SloppyGlobal,
     /// A guarded method call passes its exact object receiver.
     MethodReceiver,
-    /// A base constructor receives its freshly prepared object receiver and
-    /// publishes the guarded callable as `new.target`.
+    /// Construction linkage owns the receiver state and `new.target`; derived
+    /// entry uses the hole sentinel until `super()` commits `this`.
     ConstructReceiver,
+    /// A derived constructor enters with an uninitialized `this` binding and
+    /// applies the derived-return contract after `super()` or object return.
+    DerivedConstructor,
 }
 
 /// A settled prototype-hop load: the two shapes it guards and the slot it
@@ -657,6 +678,9 @@ pub struct JitDirectCallPlan {
     pub tier: NativeFrameKind,
     /// Exact plain-call `this` binding the generated linkage must perform.
     pub this_mode: JitDirectCallThisMode,
+    /// Whether the target enters with an uninitialized `this` binding and
+    /// applies derived-constructor return semantics.
+    pub is_derived_constructor: bool,
     /// Persistent machine-stack bytes reserved by the target after native
     /// entry, when that tier can safely cold-deopt from a stack-owned caller.
     ///
@@ -1029,6 +1053,7 @@ impl JitCompileSnapshot {
             gc_barrier: JitGcBarrierLayout::default(),
             jit_proto_byte: 0,
             closure_call_layout: JitClosureCallLayout::default(),
+            class_constructor_layout: JitClassConstructorLayout::default(),
             upvalue_value_byte: 0,
             collection_layout: JitCollectionLayout::default(),
             native_ref_byte: 0,
@@ -1240,6 +1265,11 @@ pub struct VmRuntimeActivation {
     pub(crate) context: *const crate::ExecutionContext,
     /// Index of the executing (compiled) frame within `stack`.
     frame_index: usize,
+    /// Exact lexical `new.target` copied from the materialized cold sidecar at
+    /// the interpreter-to-native boundary.
+    new_target: crate::Value,
+    /// Derived-constructor semantic bit for the entered frame.
+    is_derived_constructor: bool,
 }
 
 impl VmRuntimeActivation {
@@ -1250,11 +1280,22 @@ impl VmRuntimeActivation {
         context: &crate::ExecutionContext,
         frame_index: usize,
     ) -> Self {
+        let (new_target, is_derived_constructor) = stack
+            .get(frame_index)
+            .and_then(|frame| vm.frame_cold(frame))
+            .map_or((crate::Value::undefined(), false), |cold| {
+                (
+                    cold.new_target.unwrap_or_else(crate::Value::undefined),
+                    cold.is_derived_constructor,
+                )
+            });
         Self {
             vm,
             stack,
             context,
             frame_index,
+            new_target,
+            is_derived_constructor,
         }
     }
 
@@ -1283,6 +1324,18 @@ impl VmRuntimeActivation {
         self.frame_index
     }
 
+    /// Exact lexical `new.target` for the entered frame.
+    #[must_use]
+    pub const fn new_target(self) -> crate::Value {
+        self.new_target
+    }
+
+    /// Whether the entered frame is a derived constructor.
+    #[must_use]
+    pub const fn is_derived_constructor(self) -> bool {
+        self.is_derived_constructor
+    }
+
     #[cfg(test)]
     pub(crate) const fn for_test(vm: *mut crate::Interpreter) -> Self {
         Self {
@@ -1290,16 +1343,20 @@ impl VmRuntimeActivation {
             stack: std::ptr::null_mut(),
             context: std::ptr::null(),
             frame_index: 0,
+            new_target: crate::Value::UNDEFINED,
+            is_derived_constructor: false,
         }
     }
 }
 
-const _: [(); 32] = [(); std::mem::size_of::<VmRuntimeActivation>()];
+const _: [(); 48] = [(); std::mem::size_of::<VmRuntimeActivation>()];
 const _: [(); 8] = [(); std::mem::align_of::<VmRuntimeActivation>()];
 const _: [(); 0] = [(); std::mem::offset_of!(VmRuntimeActivation, vm)];
 const _: [(); 8] = [(); std::mem::offset_of!(VmRuntimeActivation, stack)];
 const _: [(); 16] = [(); std::mem::offset_of!(VmRuntimeActivation, context)];
 const _: [(); 24] = [(); std::mem::offset_of!(VmRuntimeActivation, frame_index)];
+const _: [(); 32] = [(); std::mem::offset_of!(VmRuntimeActivation, new_target)];
+const _: [(); 40] = [(); std::mem::offset_of!(VmRuntimeActivation, is_derived_constructor)];
 
 /// Outcome of executing compiled code for one function entry.
 ///

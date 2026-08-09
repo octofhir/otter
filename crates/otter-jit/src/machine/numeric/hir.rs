@@ -55,6 +55,17 @@ pub(super) enum NumericNode {
     BlockParameter(NumericType),
     TaggedConstant(u64),
     This,
+    ClassSuperConstructor(NumericValue),
+    Upvalue {
+        index: i32,
+        exceptional_edge: Option<u16>,
+    },
+    BindThis {
+        source: NumericValue,
+        logical_pc: u32,
+        byte_pc: u32,
+        exceptional_edge: Option<u16>,
+    },
     TaggedToBoolean(NumericValue),
     TaggedStrictEqual(NumericValue, NumericValue),
     TaggedStringConcat(NumericValue, NumericValue),
@@ -120,6 +131,9 @@ pub(super) enum NumericDirectCallKind {
     Plain,
     Method(otter_vm::jit::JitMethodGuard),
     Construct,
+    DerivedConstruct,
+    SuperConstruct,
+    DerivedSuperConstruct,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +147,9 @@ impl NumericNode {
         match self {
             Self::TaggedConstant(..)
             | Self::This
+            | Self::ClassSuperConstructor(..)
+            | Self::Upvalue { .. }
+            | Self::BindThis { .. }
             | Self::TaggedStringConcat(..)
             | Self::DirectCall { .. }
             | Self::BlockParameter(NumericType::Tagged) => NumericType::Tagged,
@@ -413,6 +430,7 @@ impl NumericFunction {
                 lower_instruction(
                     instruction,
                     code,
+                    view.derived_constructor,
                     &mut registers,
                     &mut nodes,
                     &mut block_nodes,
@@ -645,10 +663,18 @@ fn infer_instruction_parameters(
         | Op::LoadFalse
         | Op::LoadInt32
         | Op::LoadNumber
-        | Op::LoadThis => {
+        | Op::LoadThis
+        | Op::LoadUpvalue => {
             *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
-        Op::Call | Op::New => {
+        Op::GetPrototype => {
+            let _ = read(register(instruction, code, 1)?)?;
+            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
+        }
+        Op::BindThisValue => {
+            let _ = read(register(instruction, code, 0)?)?;
+        }
+        Op::Call | Op::New | Op::SuperConstruct => {
             let count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
             for index in 0..count {
                 let _ = read(register(instruction, code, 3 + index)?)?;
@@ -772,7 +798,7 @@ fn build_raw_blocks(view: &JitCompileSnapshot) -> Option<Vec<RawBlock>> {
         let pc = u32::try_from(pc).ok()?;
         if matches!(
             instruction.op(code),
-            Op::Call | Op::CallMethodValue | Op::New
+            Op::Call | Op::CallMethodValue | Op::New | Op::SuperConstruct
         ) && code
             .control_flow()
             .enclosing_exception_region(pc)
@@ -819,10 +845,13 @@ fn build_raw_blocks(view: &JitCompileSnapshot) -> Option<Vec<RawBlock>> {
             Op::ReturnUndefined => (Vec::new(), RawTerminator::ReturnUndefined),
             _ => (vec![*by_pc.get(&end)?], RawTerminator::Jump),
         };
-        let exceptional = matches!(op, Op::Call | Op::CallMethodValue | Op::New)
-            .then(|| code.control_flow().enclosing_exception_region(terminal_pc))
-            .flatten()
-            .and_then(|region| Some((*by_pc.get(&region.catch_pc?)?, region.exception_register)));
+        let exceptional = matches!(
+            op,
+            Op::Call | Op::CallMethodValue | Op::New | Op::SuperConstruct
+        )
+        .then(|| code.control_flow().enclosing_exception_region(terminal_pc))
+        .flatten()
+        .and_then(|region| Some((*by_pc.get(&region.catch_pc?)?, region.exception_register)));
         let (exceptional_edge, exception_register) = if let Some((handler, register)) = exceptional
         {
             let edge = successors.len();
@@ -962,8 +991,14 @@ fn instruction_accesses(
         | Op::LoadFalse
         | Op::LoadInt32
         | Op::LoadNumber
-        | Op::LoadThis => Some((Vec::new(), vec![register(instruction, code, 0)?])),
-        Op::Call | Op::New => {
+        | Op::LoadThis
+        | Op::LoadUpvalue => Some((Vec::new(), vec![register(instruction, code, 0)?])),
+        Op::GetPrototype => Some((
+            vec![register(instruction, code, 1)?],
+            vec![register(instruction, code, 0)?],
+        )),
+        Op::BindThisValue => Some((vec![register(instruction, code, 0)?], Vec::new())),
+        Op::Call | Op::New | Op::SuperConstruct => {
             let count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
             let mut reads = Vec::with_capacity(count + 1);
             reads.push(register(instruction, code, 1)?);
@@ -1151,6 +1186,7 @@ fn force_loop_parameters(
 fn lower_instruction(
     instruction: &JitInstructionMetadata,
     code: &otter_vm::CodeBlock,
+    derived_constructor: bool,
     registers: &mut [RegisterState],
     nodes: &mut Vec<NumericNode>,
     block_nodes: &mut Vec<NumericValue>,
@@ -1182,6 +1218,76 @@ fn lower_instruction(
         Op::LoadUndefined => NumericNode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
         Op::LoadNull => NumericNode::TaggedConstant(otter_vm::Value::null().to_bits()),
         Op::LoadThis => NumericNode::This,
+        Op::LoadUpvalue => {
+            let value = push(
+                nodes,
+                NumericNode::Upvalue {
+                    index: instruction.imm32(code, 1)?,
+                    exceptional_edge: exceptional_edge.map(u16::try_from).transpose().ok()?,
+                },
+            );
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
+            write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            )?;
+            return Some(());
+        }
+        Op::GetPrototype if derived_constructor => {
+            let value = push(
+                nodes,
+                NumericNode::ClassSuperConstructor(read_value(
+                    registers,
+                    register(instruction, code, 1)?,
+                )?),
+            );
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
+            write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            )?;
+            return Some(());
+        }
+        Op::BindThisValue => {
+            let source = read_value(registers, register(instruction, code, 0)?)?;
+            let value = push(
+                nodes,
+                NumericNode::BindThis {
+                    source,
+                    logical_pc,
+                    byte_pc: instruction.byte_pc,
+                    exceptional_edge: exceptional_edge.map(u16::try_from).transpose().ok()?,
+                },
+            );
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
+            return Some(());
+        }
         Op::LoadInt32 => NumericNode::IntegerConstant(instruction.imm32(code, 1)?),
         Op::LoadTrue => NumericNode::BooleanConstant(true),
         Op::LoadFalse => NumericNode::BooleanConstant(false),
@@ -1238,10 +1344,17 @@ fn lower_instruction(
             )?;
             return Some(());
         }
-        Op::New => {
+        Op::New | Op::SuperConstruct => {
+            let callee = *direct_constructs.get(&instruction.byte_pc)?;
             let target = NumericDirectCallTarget {
-                kind: NumericDirectCallKind::Construct,
-                callee: *direct_constructs.get(&instruction.byte_pc)?,
+                kind: match (op, callee.plan.is_derived_constructor) {
+                    (Op::New, false) => NumericDirectCallKind::Construct,
+                    (Op::New, true) => NumericDirectCallKind::DerivedConstruct,
+                    (Op::SuperConstruct, false) => NumericDirectCallKind::SuperConstruct,
+                    (Op::SuperConstruct, true) => NumericDirectCallKind::DerivedSuperConstruct,
+                    _ => return None,
+                },
+                callee,
             };
             let source = read_value(registers, register(instruction, code, 1)?)?;
             let argument_count = usize::try_from(instruction.const_index(code, 2)?).ok()?;

@@ -120,6 +120,9 @@ pub(crate) enum DirectCallKindArtifact {
     Plain,
     Method,
     Construct,
+    DerivedConstruct,
+    SuperConstruct,
+    DerivedSuperConstruct,
 }
 
 impl DirectCallKindArtifact {
@@ -128,6 +131,9 @@ impl DirectCallKindArtifact {
             Self::Plain => "plain",
             Self::Method => "method",
             Self::Construct => "construct",
+            Self::DerivedConstruct => "derivedConstruct",
+            Self::SuperConstruct => "superConstruct",
+            Self::DerivedSuperConstruct => "derivedSuperConstruct",
         }
     }
 }
@@ -140,6 +146,7 @@ pub(crate) enum DirectCallThisModeArtifact {
     SloppyGlobal,
     MethodReceiver,
     ConstructReceiver,
+    DerivedConstructor,
 }
 
 impl DirectCallThisModeArtifact {
@@ -149,6 +156,7 @@ impl DirectCallThisModeArtifact {
             Self::SloppyGlobal => "sloppyGlobal",
             Self::MethodReceiver => "methodReceiver",
             Self::ConstructReceiver => "constructReceiver",
+            Self::DerivedConstructor => "derivedConstructor",
         }
     }
 }

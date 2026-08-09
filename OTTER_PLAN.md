@@ -43,11 +43,11 @@ It already owns:
 - descriptor-driven allocating primitive string concatenation with exact
   pre-operation deopt, allocator late-use roots, a reusable native root-save
   area, VM `SafepointRecord` spill locations, and post-GC reloads;
-- descriptor-driven monomorphic plain, guarded-method, and base-constructor
-  JavaScript calls from Machine IR through the shared generated-linkage
-  emitter, with exact pre-call FrameState, allocator-owned
-  receiver/arguments/results, own/prototype guards, `new.target`, and no
-  interpreter-window shuttle;
+- descriptor-driven monomorphic plain, guarded-method, and fixed-arity base,
+  derived, and superclass JavaScript calls from Machine IR through the shared
+  generated-linkage emitter, with exact pre-call FrameState, allocator-owned
+  receiver/arguments/results, own/prototype guards, inherited `new.target`,
+  derived-`this` binding, and no interpreter-window shuttle;
 - allocator-driven spills, AAPCS64 callee-saved allocation, exact frame sizing,
   fixed leaf ABI operands, and deterministic normalized allocation artifacts;
 - `MachineFrameState -> lower_deopt_table -> VM DeoptTable`, shared cold exits,
@@ -71,7 +71,7 @@ The old optimizing compiler and template emitter remain in the active graph
 only for operations and function shapes not yet selected by the replacement
 pipeline. They are fallback, not contracts to preserve.
 
-Latest accepted gate: 282 JIT tests, 833 VM tests, all-target/all-feature
+Latest accepted gate: 282 JIT tests, 834 VM tests, all-target/all-feature
 Clippy, compile-fail/rooting checks, and 21/21 differential
 interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.
 
@@ -79,15 +79,16 @@ interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.
 
 ### 1. Complete reentrant operation families
 
-Plain calls, guarded methods, and base constructs now use the same descriptor,
-allocator roots, stable entry cells, stack-owned frame publication, cold deopt
-machinery, and explicit catch landing edges. Base construction validates the
-generation before observable prototype lookup, roots the prepared receiver,
-publishes `new.target`, and applies object/primitive return substitution without
-replaying `New`. Extend that one boundary to the remaining reentrant forms:
+Plain calls, guarded methods, and fixed-arity base, derived, and superclass
+constructs now use the same descriptor, allocator roots, stable entry cells,
+frame publication, cold deopt machinery, and explicit catch landing edges.
+Construction validates the generation before observable receiver work,
+publishes or inherits `new.target`, preserves the derived-`this` TDZ, and
+applies the one base/derived return contract without replaying `New` or
+`SuperConstruct`. Extend that one boundary to the remaining reentrant forms:
 
-- lower derived construction, `super(...)`, and spread construction without a
-  second call, frame, root, or result format;
+- lower spread construction without a second call, frame, root, or result
+  format;
 - admit nested catch/finally regions and complete multi-frame state through
   `lower_deopt_table`;
 - move reentrant natives onto typed descriptors instead of opcode-specific
@@ -102,7 +103,7 @@ not add a second call format.
 
 Implement in this order:
 
-1. derived/spread constructs, nested/finally exceptional edges, and multi-frame state;
+1. spread constructs, nested/finally exceptional edges, and multi-frame state;
 2. settled fields and elements with dependency tokens, guards, and barriers;
 3. inline object allocation, constructors, and virtual objects;
 4. OSR at every reducible loop and incremental-GC handshakes.

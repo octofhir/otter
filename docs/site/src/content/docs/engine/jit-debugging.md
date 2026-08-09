@@ -54,9 +54,11 @@ separately from `inlineCallees` /
 `inlineMethods`, which count bodies offered to the inliner. A
 `directCallPlan` event records every observed call target inspected.
 `targetIndex` / `targetCount` identify its position in the bounded chain.
-`callKind` is `plain`, `method`, or `construct`. Its typed result is either
+`callKind` is `plain`, `method`, `construct`, `derivedConstruct`,
+`superConstruct`, or `derivedSuperConstruct`. Its typed result is either
 `available`, with the planning-time code-object id, target tier, and
-`thisMode` (`constructReceiver` for base construction), or
+`thisMode` (`constructReceiver` or `derivedConstructor` for construct
+planning), or
 `rejected` with one of `missingCallee`, `ineligibleFunction`,
 `ownUpvalues`, `methodGuardUnavailable`, or
 `noEntryGeneration`.
@@ -76,9 +78,12 @@ Base-construct artifacts add `directConstructPrepare` between the shared guard
 and frame publication. Generation and stack-entry validation happen first;
 the region then performs the observable `new.target.prototype` lookup, roots
 the receiver in the Machine safepoint area, and initializes the same
-stack-owned `NativeFrame` used by plain and method calls. A later callee deopt
-resumes that already-started construct and retains constructor return
-substitution; it never replays the prototype lookup.
+stack-owned `NativeFrame` used by plain and method calls. Derived construction
+publishes a hole `this`, while `superConstruct` inherits the caller's live
+`new.target`; `BindThisValue` commits the returned superclass receiver in both
+stack-owned and materialized compiled activations. A later callee deopt resumes
+the already-started construct and retains the base/derived return contract; it
+never replays prototype lookup or `super(...)`.
 
 For every monomorphic body admitted by the optimizing tier's inline budget,
 `inlineLowered` records the owning code object, parent/callee function ids,

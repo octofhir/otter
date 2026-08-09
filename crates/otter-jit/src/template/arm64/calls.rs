@@ -1104,7 +1104,7 @@ fn direct_call_lowering_event(
     }
 }
 
-/// Emit `dst = new callee(args…)` (`Op::New`).
+/// Emit fixed-arity `new callee(args…)` or `super(args…)`.
 ///
 /// The construct opcode has no direct-call fast path: it completes through
 /// the single generic in-place construct transition, which runs the
@@ -1121,6 +1121,7 @@ pub(super) fn emit_construct(
     argc: u16,
     packed_args: u64,
     packed_args_tail: Option<TemplateTail>,
+    super_construct: bool,
     bail: DynamicLabel,
     threw: DynamicLabel,
 ) {
@@ -1129,8 +1130,8 @@ pub(super) fn emit_construct(
         ; mov x0, x20
         ; movz x1, dst as u32
         ; movz x2, callee as u32
-        ; movz x3, argc as u32
     );
+    emit_load_u64(ops, 3, u64::from(argc) | (u64::from(super_construct) << 63));
     emit_packed_args(
         ops,
         relocations,

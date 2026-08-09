@@ -401,12 +401,68 @@ JSON.stringify([
 ]);
 "#;
 
+const DERIVED_CONSTRUCT: &str = r#"
+let baseRuns = 0;
+
+class Base {
+  constructor(value) {
+    baseRuns++;
+    this.value = value;
+  }
+}
+
+class Derived extends Base {
+  constructor(value) {
+    super(value);
+  }
+}
+
+class Returner extends Base {
+  constructor(value) {
+    return value;
+  }
+}
+
+// Promote the derived body before generated callers begin selecting it. The
+// generated-entry counters are reconciled at the outer activation boundary,
+// independently of the constructor-linkage contract exercised below.
+for (let i = 0; i < 5000; i++) {
+  new Derived(i);
+}
+baseRuns = 0;
+
+function constructDerived(Ctor, value) {
+  return new Ctor(value);
+}
+
+function constructReturner(Ctor, value) {
+  return new Ctor(value);
+}
+
+for (let i = 0; i < 5000; i++) {
+  constructDerived(Derived, i);
+  constructReturner(Returner, { warm: i });
+}
+
+const result = constructDerived(Derived, 42);
+const override = { marker: "override" };
+const returned = constructReturner(Returner, override);
+JSON.stringify([
+  result.value,
+  Object.getPrototypeOf(result) === Derived.prototype,
+  returned === override,
+  baseRuns
+]);
+"#;
+
 struct RunResult {
     completion: String,
     stats: RuntimeExecutionStats,
     used_machine_direct_call: bool,
     used_machine_method_call: bool,
     used_machine_construct: bool,
+    used_machine_derived_construct: bool,
+    used_machine_super_construct: bool,
 }
 
 fn run(source: &'static str, name: &'static str, selection: JitSelection) -> RunResult {
@@ -448,12 +504,18 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
         artifact_has("\"callKind\": \"method\"") || artifact_has("\"callKind\":\"method\"");
     let used_machine_construct =
         artifact_has("\"callKind\": \"construct\"") || artifact_has("\"callKind\":\"construct\"");
+    let used_machine_derived_construct = artifact_has("\"callKind\": \"derivedConstruct\"")
+        || artifact_has("\"callKind\":\"derivedConstruct\"");
+    let used_machine_super_construct = artifact_has("\"callKind\": \"superConstruct\"")
+        || artifact_has("\"callKind\":\"superConstruct\"");
     RunResult {
         completion: result.completion_string().to_owned(),
         stats: runtime.execution_stats(),
         used_machine_direct_call,
         used_machine_method_call,
         used_machine_construct,
+        used_machine_derived_construct,
+        used_machine_super_construct,
     }
 }
 
@@ -462,6 +524,18 @@ fn assert_machine_construct(result: &RunResult) {
     assert!(
         result.used_machine_construct,
         "fixture must publish a typed Machine IR construct target"
+    );
+}
+
+fn assert_machine_derived_construct(result: &RunResult) {
+    assert_machine_direct_call(result);
+    assert!(
+        result.used_machine_derived_construct,
+        "fixture must publish a typed Machine IR derived construct target"
+    );
+    assert!(
+        result.used_machine_super_construct,
+        "fixture must publish a typed Machine IR super construct target"
     );
 }
 
@@ -555,6 +629,24 @@ fn construct_receiver_and_arguments_survive_reentrant_moving_gc() {
         compiled.stats.gc_minor_cycles > 0,
         "prototype getter must trigger moving GC while construct roots are published"
     );
+}
+
+#[test]
+fn derived_and_super_construct_execute_through_machine_ir() {
+    let oracle = run(
+        DERIVED_CONSTRUCT,
+        "jit-machine-derived-construct.js",
+        JitSelection::InterpreterOnly,
+    );
+    let compiled = run(
+        DERIVED_CONSTRUCT,
+        "jit-machine-derived-construct.js",
+        JitSelection::ProductionTiered,
+    );
+
+    assert_eq!(compiled.completion, oracle.completion);
+    assert_eq!(compiled.completion, "[42,true,true,5001]");
+    assert_machine_derived_construct(&compiled);
 }
 
 #[test]

@@ -19,11 +19,10 @@ use crate::*;
 /// `super(args...)` lowering. Per §13.3.7.3 SuperCall, super-calls
 /// must run `[[Construct]]` on the parent constructor with the
 /// derived class's `new.target` inherited from the enclosing frame
-/// — NOT an ordinary `[[Call]]`. Lower to `Op::SuperConstructSpread`
-/// after packing every argument (spread or not) into a fresh array
-/// so the VM dispatch picks up `frame.new_target` and routes through
-/// `dispatch_construct_with_new_target`. The result of super() is
-/// the constructed value, which the dispatcher returns directly.
+/// — NOT an ordinary `[[Call]]`. Fixed argument lists use the typed
+/// `Op::SuperConstruct` form; only an actual spread materializes the array
+/// consumed by `Op::SuperConstructSpread`. Both forms forward the frame's
+/// `new.target`. The result of super() is the constructed value.
 pub(crate) fn compile_super_call(
     cx: &mut Compiler,
     arguments: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
@@ -47,17 +46,30 @@ pub(crate) fn compile_super_call(
     } else {
         load_synthetic_capture(cx, SUPER_CTOR_NAME, span)?
     };
-    let args_reg = compile_spread_call_args(cx, arguments, span)?;
     let dst = cx.alloc_scratch();
-    cx.emit(
-        Op::SuperConstructSpread,
-        vec![
-            Operand::Register(dst),
-            Operand::Register(super_ctor),
-            Operand::Register(args_reg),
-        ],
-        span,
-    );
+    let has_spread = arguments
+        .iter()
+        .any(|arg| matches!(arg, oxc_ast::ast::Argument::SpreadElement(_)));
+    if has_spread {
+        let args_reg = compile_spread_call_args(cx, arguments, span)?;
+        cx.emit(
+            Op::SuperConstructSpread,
+            vec![
+                Operand::Register(dst),
+                Operand::Register(super_ctor),
+                Operand::Register(args_reg),
+            ],
+            span,
+        );
+    } else {
+        let arg_regs = compile_call_args(cx, arguments, span)?;
+        let mut operands = Vec::with_capacity(3 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::Register(super_ctor));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::SuperConstruct, operands, span);
+    }
     // §13.3.7.3 steps 7–9 — bind the derived constructor's `this` to
     // the constructed value. The result of the `super(...)`
     // expression is this same bound `this`.

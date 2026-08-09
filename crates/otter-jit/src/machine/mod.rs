@@ -368,6 +368,12 @@ pub enum DirectCallKind {
     /// Base construction with receiver creation and `new.target` publication
     /// owned by the generated call boundary.
     Construct,
+    /// Derived construction with `this = hole` and `new.target = callee`.
+    DerivedConstruct,
+    /// Base superclass construction with the caller's `new.target`.
+    SuperConstruct,
+    /// Derived superclass construction with the caller's `new.target`.
+    DerivedSuperConstruct,
 }
 
 /// Semantic destination selected before target emission.

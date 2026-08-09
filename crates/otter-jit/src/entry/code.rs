@@ -108,6 +108,10 @@ pub(crate) unsafe fn enter_compiled(
             this_value,
         );
         native_frame.set_upvalue_window(upvalue_base, upvalue_count);
+        native_frame.set_new_target(activation.new_target());
+        if activation.is_derived_constructor() {
+            native_frame.set_derived_constructor();
+        }
         native_frame.set_materialized_activation(activation.frame_index() as u32);
         let mut thread = VmThread::empty();
         thread.current_frame = std::ptr::addr_of_mut!(native_frame) as u64;

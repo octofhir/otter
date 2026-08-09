@@ -255,6 +255,11 @@ impl CodeBlock {
                 bound_new_target_flag: crate::closure::CLOSURE_CALL_FLAG_BOUND_NEW_TARGET,
                 runtime_setup_flags: crate::closure::CLOSURE_CALL_RUNTIME_SETUP_FLAGS,
             },
+            class_constructor_layout: crate::jit::JitClassConstructorLayout {
+                type_tag: crate::class_constructor::CLASS_CONSTRUCTOR_BODY_TYPE_TAG,
+                callable_byte: gc_header_bytes
+                    + crate::class_constructor::CLASS_CONSTRUCTOR_BODY_CTOR_OFFSET as u32,
+            },
             upvalue_value_byte: otter_gc::header::HEADER_SIZE as u32
                 + std::mem::offset_of!(crate::upvalue::UpvalueCellBody, value) as u32,
             collection_layout: crate::jit::JitCollectionLayout {

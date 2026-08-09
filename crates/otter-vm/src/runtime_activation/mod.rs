@@ -30,7 +30,10 @@
 //! - [`crate::active_frame`] validates the machine-published frame windows.
 
 mod control;
+mod iterators;
 mod value_ops;
+
+pub use iterators::IteratorRuntimeOutcome;
 
 use std::{marker::PhantomData, ptr::NonNull};
 

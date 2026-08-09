@@ -20,7 +20,7 @@
 //! # See also
 //! - `otter_vm::Interpreter::jit_runtime_spread_call_op`
 
-use otter_runtime::{JitSelection, Runtime, SourceInput};
+use otter_runtime::{JitSelection, Runtime, RuntimeExecutionStats, SourceInput};
 
 const SOURCE: &str = r#"
 let getterEffects = 0;
@@ -96,6 +96,110 @@ fn spread_call_family_matches_oracle_with_single_getter_evaluation() {
     assert!(
         reentrant > 0,
         "spread/call opcodes must use the shared reentrant transition"
+    );
+}
+
+const STACK_OWNED_ARRAY_SPREAD: &str = r#"
+const stackOwnedArgs = [0, 2];
+function stackOwnedTarget(a, b) { return a + b; }
+function stackOwnedSpread(fn, args) { return fn(...args); }
+function stackOwnedCaller(rounds) {
+  let sum = 0;
+  for (let i = 0; i < rounds; i++) {
+    stackOwnedArgs[0] = i;
+    sum += stackOwnedSpread(stackOwnedTarget, stackOwnedArgs);
+  }
+  return sum;
+}
+String(stackOwnedCaller(5000));
+"#;
+
+fn run_stack_owned_array_spread() -> (String, RuntimeExecutionStats) {
+    let mut runtime = Runtime::builder()
+        .jit_selection(JitSelection::ProductionTiered)
+        .jit_osr_threshold(8)
+        .build()
+        .expect("stack-owned spread runtime");
+    let completion = runtime
+        .run_script(
+            SourceInput::from_javascript(STACK_OWNED_ARRAY_SPREAD),
+            "jit-stack-owned-array-spread.js",
+        )
+        .expect("stack-owned spread completion")
+        .completion_string()
+        .to_owned();
+    (completion, runtime.execution_stats())
+}
+
+#[test]
+fn generated_spread_wrapper_completes_without_entry_deopt() {
+    let (completion, stats) = run_stack_owned_array_spread();
+    assert_eq!(completion, "12507500");
+    assert!(
+        stats.jit_generated_template_returns > 1000,
+        "the generated wrapper must complete natively: {stats:?}"
+    );
+    assert_eq!(
+        stats.jit_generated_template_deopts, 0,
+        "default Array spread must not side-exit at iterator collection"
+    );
+}
+
+const OBSERVABLE_ARRAY_ITERATOR: &str = r#"
+const observableArgs = [20, 22];
+function observableTarget(a, b) { return a + b; }
+function observableSpread(fn, args) { return fn(...args); }
+for (let i = 0; i < 5000; i++) observableSpread(observableTarget, observableArgs);
+
+let iteratorEffects = 0;
+Array.prototype[Symbol.iterator] = function() {
+  iteratorEffects++;
+  let index = 0;
+  const receiver = this;
+  return {
+    next() {
+      if (index >= receiver.length) return { value: undefined, done: true };
+      return { value: receiver[index++], done: false };
+    }
+  };
+};
+JSON.stringify([observableSpread(observableTarget, observableArgs), iteratorEffects]);
+"#;
+
+#[test]
+fn custom_array_iterator_bails_before_observable_effects() {
+    let mut oracle = Runtime::builder()
+        .jit_selection(JitSelection::InterpreterOnly)
+        .build()
+        .expect("iterator oracle runtime");
+    let expected = oracle
+        .run_script(
+            SourceInput::from_javascript(OBSERVABLE_ARRAY_ITERATOR),
+            "jit-observable-array-iterator-oracle.js",
+        )
+        .expect("iterator oracle")
+        .completion_string()
+        .to_owned();
+
+    let mut runtime = Runtime::builder()
+        .jit_selection(JitSelection::ProductionTiered)
+        .jit_osr_threshold(8)
+        .build()
+        .expect("observable iterator runtime");
+    let actual = runtime
+        .run_script(
+            SourceInput::from_javascript(OBSERVABLE_ARRAY_ITERATOR),
+            "jit-observable-array-iterator.js",
+        )
+        .expect("observable iterator completion")
+        .completion_string()
+        .to_owned();
+
+    assert_eq!(actual, expected);
+    assert_eq!(actual, "[42,1]");
+    assert!(
+        runtime.execution_stats().jit_generated_calls > 0,
+        "warm phase must establish generated linkage before the override"
     );
 }
 

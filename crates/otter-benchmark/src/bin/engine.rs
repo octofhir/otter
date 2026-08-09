@@ -3103,15 +3103,32 @@ mod tests {
             1,
         );
         assert!(record.failure.is_none(), "{:?}", record.failure);
-        let generated_calls = record
-            .measurements
-            .jit_counters
-            .iter()
-            .find(|(name, _)| *name == "jit-generated-calls")
-            .map_or(0, |(_, value)| *value);
+        let counter = |needle| {
+            record
+                .measurements
+                .jit_counters
+                .iter()
+                .find(|(name, _)| *name == needle)
+                .map_or(0, |(_, value)| *value)
+        };
+        let generated_calls = counter("jit-generated-calls");
         assert!(
-            generated_calls > 400_000,
+            generated_calls > 500_000,
             "kernel must execute generated linkage for every spread-call form; got {generated_calls}"
+        );
+        assert_eq!(
+            counter("jit-generated-call-deopts"),
+            0,
+            "built-in Array spread collection must complete inside generated callees"
+        );
+        assert_eq!(
+            counter("jit-to-rust-call-transitions"),
+            0,
+            "the spread kernel must not return to the generic Rust call boundary"
+        );
+        assert!(
+            counter("jit-compile-attempts") <= 8,
+            "structural iterator collection must not consume the recompile budget"
         );
     }
 

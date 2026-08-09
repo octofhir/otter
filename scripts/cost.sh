@@ -31,6 +31,7 @@ KERNELS=(
   "string-concat             600000"
   "dense-array            5234688"
   "boxed-double-property  4000000"
+  "derived-constructor 10000200000"
   "property-polymorphic   80011800000"
   "native-boundary       27000000"
 )

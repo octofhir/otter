@@ -163,7 +163,11 @@ Additional correctness gates for the final switch:
 
 Performance claims require validated fresh-process A/B measurements. Retired
 instructions are primary; wall time is a sanity check. Failed, unavailable, or
-unvalidated observations remain visible and are never scoreable.
+unvalidated observations remain visible and are never scoreable. The focused
+kernel harness times actual tier-up compiler-hook invocations, snapshots final
+native-code residency, and carries a derived-constructor workload that proves
+hot fixed-arity `new Derived(...)` and `super(...)` linkage before a
+construction performance claim is accepted.
 
 ## Stop conditions
 

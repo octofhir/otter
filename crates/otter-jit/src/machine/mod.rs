@@ -337,6 +337,8 @@ impl CallEffects {
 pub enum ExceptionalEdge {
     /// Call cannot throw.
     None,
+    /// A throw leaves the compiled function through its shared abrupt exit.
+    Propagate,
     /// A thrown exception transfers to this landing-pad block.
     LandingPad(MachineBlock),
 }
@@ -355,6 +357,18 @@ pub enum SafepointKind {
 pub enum CallTarget {
     /// VM-owned runtime entry with one statically declared ABI.
     RuntimeStub(otter_vm::native_abi::RuntimeStubDescriptor),
+    /// VM-planned monomorphic JavaScript callee entered through generated
+    /// stack-owned linkage.
+    Direct {
+        /// Exact callee generation plan and stable function entry cell.
+        callee: otter_vm::JitDirectCallee,
+        /// Calling function identity used by started-call deoptimization.
+        caller_function_id: u32,
+        /// Canonical caller instruction index.
+        logical_pc: u32,
+        /// Caller byte offset used by diagnostics and relocations.
+        byte_pc: u32,
+    },
 }
 
 /// Complete target-neutral call contract.
@@ -867,16 +881,17 @@ impl InstructionSequence {
                     {
                         return Err(VerificationError::CallSafepointMismatch(id));
                     }
-                    let CallTarget::RuntimeStub(target) = descriptor.target;
-                    if usize::from(target.argument_count) != descriptor.arguments.len() {
-                        return Err(VerificationError::CallSignatureMismatch(id));
-                    }
-                    if matches!(
-                        target.safepoint,
-                        otter_vm::native_abi::RuntimeStubSafepoint::Required
-                    ) != matches!(descriptor.safepoint, SafepointKind::Gc)
-                    {
-                        return Err(VerificationError::CallSafepointMismatch(id));
+                    if let CallTarget::RuntimeStub(target) = descriptor.target {
+                        if usize::from(target.argument_count) != descriptor.arguments.len() {
+                            return Err(VerificationError::CallSignatureMismatch(id));
+                        }
+                        if matches!(
+                            target.safepoint,
+                            otter_vm::native_abi::RuntimeStubSafepoint::Required
+                        ) != matches!(descriptor.safepoint, SafepointKind::Gc)
+                        {
+                            return Err(VerificationError::CallSafepointMismatch(id));
+                        }
                     }
                     if instruction.clobbers != descriptor.clobbers {
                         return Err(VerificationError::CallSignatureMismatch(id));

@@ -865,7 +865,7 @@ impl Interpreter {
         new_target_for_callee: Option<Value>,
         derived_this_cell: Option<crate::UpvalueCell>,
         callee_eval_env: Option<crate::eval_env::EvalEnvHandle>,
-        effective_args: SmallVec<[Value; 8]>,
+        mut effective_args: SmallVec<[Value; 8]>,
         dst: u16,
     ) -> Result<(), VmError> {
         self.record_runtime_bytecode_call();
@@ -898,13 +898,39 @@ impl Interpreter {
         } else {
             (Some(dst), None)
         };
-        let upvalues =
-            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
-        let this_for_callee = self.this_for_bytecode_call_stack_rooted(
+        let mut this_for_callee = self.this_for_bytecode_call_stack_rooted(
             function,
             stack,
             this_for_callee,
             &[effective_args.as_slice()],
+        )?;
+        let mut self_value = callee_closure
+            .map(Value::closure)
+            .unwrap_or_else(|| Value::function(function_id));
+        let mut new_target_for_callee = new_target_for_callee;
+        let mut derived_this_cell = derived_this_cell;
+        let mut callee_eval_env = callee_eval_env;
+        let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            self_value.trace_value_slot_mut(visitor);
+            this_for_callee.trace_value_slot_mut(visitor);
+            if let Some(value) = &mut new_target_for_callee {
+                value.trace_value_slot_mut(visitor);
+            }
+            if let Some(cell) = &mut derived_this_cell {
+                visitor(cell as *mut crate::UpvalueCell as *mut RawGc);
+            }
+            if let Some(env) = &mut callee_eval_env {
+                visitor(env as *mut crate::eval_env::EvalEnvHandle as *mut RawGc);
+            }
+            for value in &mut effective_args {
+                value.trace_value_slot_mut(visitor);
+            }
+        };
+        let upvalues = Frame::build_upvalues_for_exec_with_roots(
+            &mut self.gc_heap,
+            function,
+            parent_upvalues,
+            &mut build_roots,
         )?;
         let window_rollback = self.register_window_rollback();
         let window = self.alloc_reg_window(function.register_count as usize)?;
@@ -915,9 +941,7 @@ impl Interpreter {
             this_for_callee,
             window,
         );
-        new_frame.self_value = callee_closure
-            .map(Value::closure)
-            .unwrap_or_else(|| Value::function(function_id));
+        new_frame.self_value = self_value;
         if let Some(async_state) = async_state {
             self.frame_set_async_state(&mut new_frame, async_state);
         }
@@ -1002,10 +1026,29 @@ impl Interpreter {
         return_register: Option<u16>,
         async_state: Option<AsyncFrameState>,
     ) -> Result<Frame, VmError> {
-        let upvalues =
-            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
-        let this_for_callee =
+        let mut this_for_callee =
             self.this_for_bytecode_call_stack_rooted(function, stack, this_for_callee, &[])?;
+        let mut new_target_for_callee = new_target_for_callee;
+        let mut derived_this_cell = derived_this_cell;
+        let mut callee_eval_env = callee_eval_env;
+        let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            this_for_callee.trace_value_slot_mut(visitor);
+            if let Some(value) = &mut new_target_for_callee {
+                value.trace_value_slot_mut(visitor);
+            }
+            if let Some(cell) = &mut derived_this_cell {
+                visitor(cell as *mut crate::UpvalueCell as *mut RawGc);
+            }
+            if let Some(env) = &mut callee_eval_env {
+                visitor(env as *mut crate::eval_env::EvalEnvHandle as *mut RawGc);
+            }
+        };
+        let upvalues = Frame::build_upvalues_for_exec_with_roots(
+            &mut self.gc_heap,
+            function,
+            parent_upvalues,
+            &mut build_roots,
+        )?;
         let window_rollback = self.register_window_rollback();
         let window = self.alloc_reg_window(function.register_count as usize)?;
         let mut frame = Frame::with_exec_return_upvalues_and_this(

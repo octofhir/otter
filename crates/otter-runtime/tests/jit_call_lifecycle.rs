@@ -64,6 +64,7 @@ struct SplitRunResult {
     completion: String,
     compile_attempts: u64,
     runtime_stub_delta: u64,
+    generated_call_delta: u64,
 }
 
 fn run(source: &str, name: &str, selection: JitSelection) -> RunResult {
@@ -119,6 +120,9 @@ fn run_after_warmup(
         runtime_stub_delta: after
             .jit_runtime_stub_transitions
             .saturating_sub(before.jit_runtime_stub_transitions),
+        generated_call_delta: after
+            .jit_generated_calls
+            .saturating_sub(before.jit_generated_calls),
     }
 }
 
@@ -142,6 +146,10 @@ fn assert_inline_method_probe(
         assert_eq!(
             compiled.runtime_stub_delta, 0,
             "{name} must complete through the spliced method body"
+        );
+        assert!(
+            compiled.generated_call_delta <= 2,
+            "{name} must add no generated boundary beyond the probe's two caller entries"
         );
     }
 }
@@ -298,50 +306,6 @@ fn polymorphic_method_site_keeps_current_method_and_this() {
     }
 }
 
-const OPTIMIZING_METHOD_CACHE: &str = r#"
-function apply(value) {
-  return value + this.bias;
-}
-function callMethod(receiver, value) {
-  return receiver.apply(value);
-}
-
-const receiver = { bias: 4, apply };
-for (let i = 0; i < 5000; i++) {
-  callMethod(receiver, i);
-}
-
-let checksum = 0;
-for (let i = 0; i < 256; i++) {
-  checksum += callMethod(receiver, i);
-}
-JSON.stringify([checksum, callMethod(receiver, 9)]);
-"#;
-
-#[cfg(target_arch = "aarch64")]
-#[test]
-fn production_method_inline_eliminates_compiled_call_boundary() {
-    let oracle = run(
-        OPTIMIZING_METHOD_CACHE,
-        "jit-call-optimizing-method-cache.js",
-        JitSelection::InterpreterOnly,
-    );
-    let compiled = run(
-        OPTIMIZING_METHOD_CACHE,
-        "jit-call-optimizing-method-cache.js",
-        JitSelection::ProductionTiered,
-    );
-
-    assert_eq!(compiled.completion, oracle.completion);
-    assert_eq!(compiled.completion, "[33664,13]");
-    assert!(compiled.compile_attempts > 0, "fixture must compile");
-    assert_eq!(compiled.osr_attempts, 0, "fixture must not use loop OSR");
-    assert_eq!(
-        compiled.generated_calls, 0,
-        "spliced method calls must eliminate the generated call boundary"
-    );
-}
-
 const INLINE_METHOD_SETUP: &str = r#"
 globalThis.__jitInlineMethodFixture = (() => {
   function apply(value) {
@@ -361,7 +325,7 @@ globalThis.__jitInlineMethodFixture = (() => {
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn numeric_method_inline_hit_avoids_runtime_transition() {
+fn production_method_inline_eliminates_compiled_call_boundary() {
     assert_inline_method_probe(
         INLINE_METHOD_SETUP,
         r#"

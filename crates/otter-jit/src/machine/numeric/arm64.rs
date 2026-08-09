@@ -13,8 +13,9 @@
 //!   allocation; cold deopt dumps use the target's complete register-id map.
 //! - Spill storage and offsets come only from [`MachineFrameLayout`].
 //! - Allocating calls copy late-use tagged roots into the layout's native save
-//!   area before constructing the VM allocation packet, then reload every
-//!   collector-rewritten value before success or exact deoptimization.
+//!   area before constructing the VM allocation packet. Reentrant direct calls
+//!   link those same homes through the VM-owned root chain. Both reload every
+//!   collector-rewritten value before success, throw, or exact deoptimization.
 //! - A failed Number guard writes logical PC zero and returns `BAILED` before
 //!   any externally visible effect.
 //! - Checked integer overflow uses the allocator-driven VM [`DeoptRuntime`];
@@ -26,6 +27,8 @@
 //! - Successful results use the VM's canonical tagged representation.
 //! - Pure scalar leaves exchange unboxed scalars in fixed ABI operands;
 //!   regalloc2 owns every argument/result move and no frame shuttle exists.
+//! - Direct JavaScript calls reuse the shared generated linkage emitter; the
+//!   allocator supplies only location-aware loads, stores, and root reloads.
 
 // dynasm's dynamic-register expansion calls `.into()` on the required u8
 // register encoding. Clippy sees the macro expansion as an identity conversion.
@@ -33,7 +36,7 @@
 
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 use otter_vm::{
-    Value,
+    JitCompileSnapshot, Value,
     deopt::DeoptRuntime,
     native_abi::{
         RuntimeStubDescriptor, STUB_JIT_BACKEDGE_POLL, STUB_JIT_DEOPT_WRITEBACK,
@@ -49,14 +52,19 @@ use super::super::{
 };
 use crate::{
     CompiledCode, Unsupported,
+    arm64::{DirectCallForm, DirectCallSite, emit_direct_call_with_access},
     artifact::relocation::{RelocationCapture, RelocationTarget},
     entry::{
         ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET,
         ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET,
-        CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
-        NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_REGISTER_COUNT_OFFSET,
-        NATIVE_FRAME_THIS_OFFSET, NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
-        THREAD_OFFSET, VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
+        CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, MACHINE_ROOT_RECORD_BASE_OFFSET,
+        MACHINE_ROOT_RECORD_CODE_OBJECT_ID_OFFSET, MACHINE_ROOT_RECORD_COUNT_OFFSET,
+        MACHINE_ROOT_RECORD_PREVIOUS_OFFSET, MACHINE_ROOT_RECORD_SAFEPOINT_ID_OFFSET,
+        MACHINE_ROOT_RECORD_SIZE, MACHINE_ROOTS_PTR_OFFSET, NATIVE_FRAME_OFFSET,
+        NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
+        NATIVE_FRAME_REGISTER_COUNT_OFFSET, NATIVE_FRAME_THIS_OFFSET, NUMBER_TAG_HI16,
+        STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THREAD_OFFSET, VALUE_UNDEFINED,
+        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_CODE_OBJECT_ID_OFFSET,
         VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
 };
@@ -217,6 +225,7 @@ pub(super) fn frame_layout(
 }
 
 pub(super) fn emit(
+    view: &JitCompileSnapshot,
     sequence: &InstructionSequence,
     allocation: &AllocatedSequence,
     frame: MachineFrameLayout,
@@ -224,6 +233,8 @@ pub(super) fn emit(
     safepoints: &MachineSafepointTable,
     poll_entry: u64,
     deopt_writeback_entry: u64,
+    deopt_stack_call_entry: u64,
+    resolve_direct_entry: u64,
     string_concat_entry: u64,
     number_rem_entry: u64,
     number_pow_entry: u64,
@@ -719,84 +730,174 @@ pub(super) fn emit(
                     .call_descriptors()
                     .get(descriptor_index as usize)
                     .ok_or(Unsupported::OperandShape("scalar call descriptor"))?;
-                let (target, entry, result_index, allocating) = match descriptor.target {
-                    CallTarget::RuntimeStub(target) if target == STUB_TO_BOOLEAN_LEAF => {
-                        if locations.len() < 3
-                            || integer_register(locations[0])? != 1
-                            || integer_register(locations[1])? != 2
-                        {
-                            return Err(Unsupported::OperandShape("scalar ToBoolean call"));
-                        }
-                        (target, to_boolean_entry, 2, false)
-                    }
-                    CallTarget::RuntimeStub(target) if target == STUB_STRICT_EQ_LEAF => {
-                        if locations.len() < 3
-                            || integer_register(locations[0])? != 1
-                            || integer_register(locations[1])? != 2
-                        {
-                            return Err(Unsupported::OperandShape("scalar strict equality call"));
-                        }
-                        (target, strict_eq_entry, 2, false)
-                    }
-                    CallTarget::RuntimeStub(target) if target == STUB_STRING_CONCAT_ALLOC => {
-                        if locations.len() < 4
-                            || integer_register(locations[0])? != 2
-                            || integer_register(locations[1])? != 3
-                            || integer_register(locations[2])? != 4
-                        {
-                            return Err(Unsupported::OperandShape("scalar string concat call"));
-                        }
-                        (target, string_concat_entry, 3, true)
-                    }
-                    CallTarget::RuntimeStub(_) => {
-                        return Err(Unsupported::OperandShape("scalar runtime call target"));
-                    }
-                };
-                if integer_register(locations[result_index])? != 0 {
-                    return Err(Unsupported::OperandShape("scalar runtime call result"));
-                }
-                let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
-                if allocating {
+                if let CallTarget::Direct {
+                    callee,
+                    caller_function_id,
+                    logical_pc,
+                    byte_pc,
+                } = descriptor.target
+                {
                     let site = safepoints
                         .site(id)
                         .filter(|site| instruction.safepoint == Some(site.id))
-                        .ok_or(Unsupported::OperandShape(
-                            "scalar allocating call safepoint",
-                        ))?;
-                    emit_allocating_call(
+                        .ok_or(Unsupported::OperandShape("scalar direct call safepoint"))?;
+                    let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                    let direct_done = ops.new_dynamic_label();
+                    let direct_threw = ops.new_dynamic_label();
+                    let direct_bail = ops.new_dynamic_label();
+                    emit_save_safepoint_roots(&mut ops, frame, site)?;
+                    emit_publish_machine_roots(&mut ops, frame, site)?;
+                    let result_index = descriptor.arguments.len();
+                    let arguments = (1..result_index)
+                        .map(|index| {
+                            u16::try_from(index).map_err(|_| {
+                                Unsupported::OperandShape("scalar direct call argument count")
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    emit_direct_call_with_access(
                         &mut ops,
                         &mut relocations,
-                        frame,
-                        site,
-                        entry,
-                        target,
-                        deopt,
+                        view,
+                        DirectCallSite {
+                            target: &callee,
+                            caller_function_id,
+                            logical_pc,
+                            byte_pc,
+                            dst: u16::try_from(result_index).map_err(|_| {
+                                Unsupported::OperandShape("scalar direct call result")
+                            })?,
+                            form: DirectCallForm::Plain { callable: 0 },
+                            arguments: &arguments,
+                        },
+                        deopt_stack_call_entry,
+                        resolve_direct_entry,
+                        None,
+                        direct_bail,
+                        direct_threw,
+                        direct_done,
+                        19,
+                        |ops, source, target, sp_bias| {
+                            let location = *locations
+                                .get(usize::from(source))
+                                .ok_or(Unsupported::OperandShape("scalar direct call source"))?;
+                            emit_load_allocated_tagged(
+                                ops,
+                                frame,
+                                location,
+                                target,
+                                sp_bias.checked_add(MACHINE_ROOT_RECORD_SIZE).ok_or(
+                                    Unsupported::OperandShape("scalar direct call stack bias"),
+                                )?,
+                            )
+                        },
+                        |ops, destination, source, sp_bias| {
+                            let location = *locations.get(usize::from(destination)).ok_or(
+                                Unsupported::OperandShape("scalar direct call destination"),
+                            )?;
+                            emit_store_allocated_tagged(ops, frame, location, source, sp_bias)
+                        },
+                        |ops| {
+                            // x17 is outside regalloc2's allocatable bank and
+                            // survives the activation-root descriptor cleanup.
+                            dynasm!(ops ; .arch aarch64 ; mov x17, x0);
+                            emit_clear_machine_roots(ops);
+                            emit_reload_safepoint_roots(ops, frame, site)?;
+                            dynasm!(ops ; .arch aarch64 ; mov x0, x17);
+                            Ok(())
+                        },
                     )?;
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; =>direct_bail
+                        ; b =>deopt
+                        ; =>direct_threw
+                        ; b =>threw
+                        ; =>direct_done
+                    );
                 } else {
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; ldr x0, [x19, THREAD_OFFSET]
-                        ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
-                    );
-                    emit_load_symbolic_u64(
-                        &mut ops,
-                        &mut relocations,
-                        16,
-                        entry,
-                        RelocationTarget::runtime_stub(target),
-                    );
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; blr x16
-                        ; and x1, x1, #0xff
-                        ; cbnz x1, =>deopt
-                    );
-                    emit_load_u64(&mut ops, 16, Value::boolean(true).to_bits());
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; cmp x0, x16
-                        ; cset w0, eq
-                    );
+                    let (target, entry, result_index, allocating) = match descriptor.target {
+                        CallTarget::RuntimeStub(target) if target == STUB_TO_BOOLEAN_LEAF => {
+                            if locations.len() < 3
+                                || integer_register(locations[0])? != 1
+                                || integer_register(locations[1])? != 2
+                            {
+                                return Err(Unsupported::OperandShape("scalar ToBoolean call"));
+                            }
+                            (target, to_boolean_entry, 2, false)
+                        }
+                        CallTarget::RuntimeStub(target) if target == STUB_STRICT_EQ_LEAF => {
+                            if locations.len() < 3
+                                || integer_register(locations[0])? != 1
+                                || integer_register(locations[1])? != 2
+                            {
+                                return Err(Unsupported::OperandShape(
+                                    "scalar strict equality call",
+                                ));
+                            }
+                            (target, strict_eq_entry, 2, false)
+                        }
+                        CallTarget::RuntimeStub(target) if target == STUB_STRING_CONCAT_ALLOC => {
+                            if locations.len() < 4
+                                || integer_register(locations[0])? != 2
+                                || integer_register(locations[1])? != 3
+                                || integer_register(locations[2])? != 4
+                            {
+                                return Err(Unsupported::OperandShape("scalar string concat call"));
+                            }
+                            (target, string_concat_entry, 3, true)
+                        }
+                        CallTarget::RuntimeStub(_) => {
+                            return Err(Unsupported::OperandShape("scalar runtime call target"));
+                        }
+                        CallTarget::Direct { .. } => unreachable!("handled direct call above"),
+                    };
+                    if integer_register(locations[result_index])? != 0 {
+                        return Err(Unsupported::OperandShape("scalar runtime call result"));
+                    }
+                    let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                    if allocating {
+                        let site = safepoints
+                            .site(id)
+                            .filter(|site| instruction.safepoint == Some(site.id))
+                            .ok_or(Unsupported::OperandShape(
+                                "scalar allocating call safepoint",
+                            ))?;
+                        emit_allocating_call(
+                            &mut ops,
+                            &mut relocations,
+                            frame,
+                            site,
+                            entry,
+                            target,
+                            deopt,
+                        )?;
+                    } else {
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr x0, [x19, THREAD_OFFSET]
+                            ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+                        );
+                        emit_load_symbolic_u64(
+                            &mut ops,
+                            &mut relocations,
+                            16,
+                            entry,
+                            RelocationTarget::runtime_stub(target),
+                        );
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; blr x16
+                            ; and x1, x1, #0xff
+                            ; cbnz x1, =>deopt
+                        );
+                        emit_load_u64(&mut ops, 16, Value::boolean(true).to_bits());
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; cmp x0, x16
+                            ; cset w0, eq
+                        );
+                    }
                 }
             }
         }
@@ -1087,6 +1188,117 @@ fn emit_reload_safepoint_roots(
             AllocatedLocation::Register(_) => {
                 return Err(Unsupported::OperandShape("scalar tagged root reload"));
             }
+        }
+    }
+    Ok(())
+}
+
+fn emit_publish_machine_roots(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    frame: MachineFrameLayout,
+    site: &MachineSafepointSite,
+) -> Result<(), Unsupported> {
+    dynasm!(ops ; .arch aarch64 ; sub sp, sp, MACHINE_ROOT_RECORD_SIZE);
+    if site.roots.is_empty() {
+        dynasm!(ops ; .arch aarch64 ; mov x13, xzr);
+    } else {
+        let offset = root_offset(frame, 0)?
+            .checked_add(MACHINE_ROOT_RECORD_SIZE)
+            .ok_or(Unsupported::OperandShape("scalar machine root base"))?;
+        if offset <= 4095 {
+            dynasm!(ops ; .arch aarch64 ; add x13, sp, offset);
+        } else {
+            emit_load_u64(ops, 13, u64::from(offset));
+            dynasm!(ops ; .arch aarch64 ; add x13, sp, x13);
+        }
+    }
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x9, [x19, MACHINE_ROOTS_PTR_OFFSET]
+        ; ldr x10, [x9]
+        ; str x10, [sp, MACHINE_ROOT_RECORD_PREVIOUS_OFFSET]
+        ; str x13, [sp, MACHINE_ROOT_RECORD_BASE_OFFSET]
+        ; movz w11, site.roots.len() as u32
+        // One word initializes both root_count and the reserved zero field.
+        ; str w11, [sp, MACHINE_ROOT_RECORD_COUNT_OFFSET]
+        ; movz w11, site.id.0
+        ; str w11, [sp, MACHINE_ROOT_RECORD_SAFEPOINT_ID_OFFSET]
+        ; ldr x11, [x19, THREAD_OFFSET]
+        ; ldr x11, [x11, VM_THREAD_CODE_OBJECT_ID_OFFSET]
+        ; str x11, [sp, MACHINE_ROOT_RECORD_CODE_OBJECT_ID_OFFSET]
+        ; mov x12, sp
+        ; str x12, [x9]
+    );
+    Ok(())
+}
+
+fn emit_clear_machine_roots(ops: &mut dynasmrt::aarch64::Assembler) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x9, [x19, MACHINE_ROOTS_PTR_OFFSET]
+        ; ldr x10, [sp, MACHINE_ROOT_RECORD_PREVIOUS_OFFSET]
+        ; str x10, [x9]
+        ; add sp, sp, MACHINE_ROOT_RECORD_SIZE
+    );
+}
+
+fn emit_load_allocated_tagged(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    frame: MachineFrameLayout,
+    location: AllocatedLocation,
+    target: u8,
+    sp_bias: u32,
+) -> Result<(), Unsupported> {
+    match location {
+        AllocatedLocation::Register(register) if register.is_integer() => {
+            dynasm!(ops ; .arch aarch64 ; mov X(target), X(register.encoding()));
+        }
+        AllocatedLocation::Stack(slot) => {
+            let offset = spill_offset(frame, slot)?
+                .checked_add(sp_bias)
+                .ok_or(Unsupported::OperandShape("scalar direct call spill offset"))?;
+            if offset <= 32_760 {
+                dynasm!(ops ; .arch aarch64 ; ldr X(target), [sp, offset]);
+            } else {
+                emit_load_u64(ops, 16, u64::from(offset));
+                dynasm!(ops ; .arch aarch64 ; ldr X(target), [sp, x16]);
+            }
+        }
+        AllocatedLocation::Register(_) => {
+            return Err(Unsupported::OperandShape(
+                "scalar direct call tagged source",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn emit_store_allocated_tagged(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    frame: MachineFrameLayout,
+    location: AllocatedLocation,
+    source: u8,
+    sp_bias: u32,
+) -> Result<(), Unsupported> {
+    match location {
+        AllocatedLocation::Register(register) if register.is_integer() => {
+            dynasm!(ops ; .arch aarch64 ; mov X(register.encoding()), X(source));
+        }
+        AllocatedLocation::Stack(slot) => {
+            let offset = spill_offset(frame, slot)?
+                .checked_add(sp_bias)
+                .ok_or(Unsupported::OperandShape("scalar direct call spill offset"))?;
+            if offset <= 32_760 {
+                dynasm!(ops ; .arch aarch64 ; str X(source), [sp, offset]);
+            } else {
+                emit_load_u64(ops, 16, u64::from(offset));
+                dynasm!(ops ; .arch aarch64 ; str X(source), [sp, x16]);
+            }
+        }
+        AllocatedLocation::Register(_) => {
+            return Err(Unsupported::OperandShape(
+                "scalar direct call tagged destination",
+            ));
         }
     }
     Ok(())

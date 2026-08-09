@@ -76,6 +76,7 @@ pub(crate) unsafe fn enter_compiled(
         // SAFETY: same contract; the activation array is isolate-owned, never
         // resized, and outlives every compiled activation.
         let activation_base = unsafe { (*vm).jit_native_activation_base() };
+        let machine_roots_ptr = unsafe { (*vm).jit_machine_roots_addr() };
         let activation_top_ptr = unsafe { (*vm).jit_native_activation_top_addr() };
         let activation_limit = unsafe { (*vm).jit_generated_activation_limit() };
         let gc_heap = unsafe { (*vm).jit_gc_heap_ptr() };
@@ -129,6 +130,7 @@ pub(crate) unsafe fn enter_compiled(
             activation_base: activation_base.cast(),
             activation_top_ptr,
             activation_limit,
+            machine_roots_ptr,
             global_this_offset,
             native_stack_limit,
             generated_feedback_clean: 1,

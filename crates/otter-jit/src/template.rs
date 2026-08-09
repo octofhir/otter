@@ -174,6 +174,7 @@ mod tests {
             activation_base: activation_probe.as_mut_ptr().cast(),
             activation_top_ptr: std::ptr::addr_of_mut!(activation_top_probe),
             activation_limit: 16,
+            machine_roots_ptr: std::ptr::null_mut(),
             global_this_offset: std::ptr::null(),
             native_stack_limit: 0,
             generated_feedback_clean: 1,

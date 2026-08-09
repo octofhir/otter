@@ -4,12 +4,14 @@
 //! Register allocation/reclaim on the contiguous register stack, ActivationStack
 //! draw/return, cold-frame attach/detach, frame pop/unwind
 //! (`pop_frame`, `unwind_abrupt`, `return_running_finally`), canonical native
-//! JIT activation publication, and the raw pointers compiled code uses to
-//! address the reg window.
+//! JIT activation publication, linked Machine IR safepoint roots, and the raw
+//! pointers compiled code uses to address the reg window.
 //!
 //! # Invariants
 //! The reg stack is a GC root region: windows must be zeroed on alloc
 //! and truncated on reclaim so stale slots never masquerade as values.
+//! Stack-owned native frames and Machine root records remain published for the
+//! complete dynamic extent of every allocating or reentrant compiled call.
 #![allow(unused_imports)]
 use crate::*;
 
@@ -209,6 +211,11 @@ impl Interpreter {
         &mut self.jit_native_activation_top
     }
 
+    /// Address of the linked Machine IR allocator-root chain head.
+    pub fn jit_machine_roots_addr(&mut self) -> *mut u64 {
+        &mut self.jit_machine_roots
+    }
+
     /// Capacity of the native JIT activation array — the overflow bound
     /// compiled code checks before an inline publish.
     pub fn jit_native_activation_limit(&self) -> usize {
@@ -291,6 +298,28 @@ impl Interpreter {
                 frame.trace_stack_register_slots(visitor);
             }
             frame.trace_non_register_slots(visitor);
+        }
+        let mut record = self.jit_machine_roots;
+        let mut depth = 0usize;
+        while record != 0 {
+            assert!(
+                depth < self.jit_native_activations.len(),
+                "Machine IR root chain must be bounded by native activation capacity"
+            );
+            // SAFETY: generated publication keeps every record and root window
+            // live until it atomically restores the previous chain head.
+            let roots = unsafe { &*(record as *const crate::jit::JitMachineRootRecord) };
+            debug_assert_ne!(roots.code_object_id, 0);
+            debug_assert_ne!(roots.safepoint_id, crate::native_abi::NO_SAFEPOINT);
+            debug_assert!(roots.root_count == 0 || !roots.root_base.is_null());
+            for index in 0..usize::from(roots.root_count) {
+                // SAFETY: the record publishes initialized mutable Value homes
+                // for its complete linked lifetime.
+                let value = unsafe { roots.root_base.add(index).cast::<crate::Value>() };
+                unsafe { (&mut *value).trace_value_slot_mut(visitor) };
+            }
+            record = roots.previous;
+            depth += 1;
         }
     }
 

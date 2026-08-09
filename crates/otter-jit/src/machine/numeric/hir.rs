@@ -5,16 +5,16 @@
 //! - [`NumericBlock`] and [`NumericTerminator`] — predecessor/successor edges,
 //!   block parameters, edge arguments, branches, and returns.
 //! - [`NumericNode`] — tagged/scalar parameters, constants, moves, coercions,
-//!   arithmetic, and comparison.
+//!   arithmetic, comparison, and planned direct calls.
 //!
 //! # Invariants
 //! - Parameters remain tagged unless their uses prove a numeric representation;
 //!   inferred Number/Int32 parameters are guarded before effects.
 //! - Parameters outside the exact entry live-in set have no HIR value, load,
 //!   guard, or allocator interval.
-//! - Accepted nodes cannot reenter JS. Tagged coercions/equality use declared
-//!   leaf stubs; primitive string concatenation is the sole allocating node
-//!   and carries an exact pre-operation FrameState for miss/OOM deopt.
+//! - Reentrant calls require one VM-planned direct target and carry an exact
+//!   pre-call FrameState. All other tagged coercions/equality use declared leaf
+//!   stubs; primitive string concatenation uses the allocating stub family.
 //! - Register merges become typed block parameters. Only loop-header OSR
 //!   metadata retains the aligned VM-register sources needed at the entry ABI.
 //! - Loop headers receive explicit parameters for every numeric value live from
@@ -55,6 +55,14 @@ pub(super) enum NumericNode {
     TaggedToBoolean(NumericValue),
     TaggedStrictEqual(NumericValue, NumericValue),
     TaggedStringConcat(NumericValue, NumericValue),
+    DirectCall {
+        callee: NumericValue,
+        target: u16,
+        argument_start: u16,
+        argument_count: u8,
+        logical_pc: u32,
+        byte_pc: u32,
+    },
     IntegerConstant(i32),
     BooleanConstant(bool),
     Constant(f64),
@@ -109,6 +117,7 @@ impl NumericNode {
             Self::TaggedConstant(..)
             | Self::This
             | Self::TaggedStringConcat(..)
+            | Self::DirectCall { .. }
             | Self::BlockParameter(NumericType::Tagged) => NumericType::Tagged,
             Self::IntegerConstant(..)
             | Self::FloatToInt32(..)
@@ -198,9 +207,12 @@ pub(super) struct NumericBlock {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct NumericFunction {
+    pub(super) function_id: u32,
     pub(super) nodes: Vec<NumericNode>,
     pub(super) blocks: Vec<NumericBlock>,
     pub(super) frame_states: Vec<NumericFrameState>,
+    pub(super) direct_call_targets: Vec<otter_vm::JitDirectCallee>,
+    pub(super) direct_call_arguments: Vec<NumericValue>,
     pub(super) parameter_count: u16,
     pub(super) register_count: u16,
     pub(super) arithmetic_op_count: usize,
@@ -288,6 +300,8 @@ impl NumericFunction {
         let mut out_states = Vec::<Vec<RegisterState>>::with_capacity(raw_blocks.len());
         let mut arithmetic_op_count = 0usize;
         let mut frame_states = Vec::new();
+        let mut direct_call_targets = Vec::new();
+        let mut direct_call_arguments = Vec::new();
 
         for (block_index, raw) in raw_blocks.iter().enumerate() {
             let (mut registers, mut parameters, mut parameter_regs) = if block_index == 0 {
@@ -368,6 +382,10 @@ impl NumericFunction {
                     instruction_live,
                     &mut frame_states,
                     code.id,
+                    u32::try_from(pc).ok()?,
+                    &view.direct_callees,
+                    &mut direct_call_targets,
+                    &mut direct_call_arguments,
                 )?;
             }
 
@@ -467,9 +485,12 @@ impl NumericFunction {
         }
 
         Some(Self {
+            function_id: code.id,
             nodes,
             blocks,
             frame_states,
+            direct_call_targets,
+            direct_call_arguments,
             parameter_count,
             register_count,
             arithmetic_op_count,
@@ -565,6 +586,14 @@ fn infer_instruction_parameters(
         | Op::LoadInt32
         | Op::LoadNumber
         | Op::LoadThis => {
+            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
+        }
+        Op::Call => {
+            let count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
+            for index in 0..count {
+                let _ = read(register(instruction, code, 3 + index)?)?;
+            }
+            let _ = read(register(instruction, code, 1)?)?;
             *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
         Op::ToPrimitive | Op::ToNumeric | Op::ToNumber => {
@@ -821,6 +850,15 @@ fn instruction_accesses(
         | Op::LoadInt32
         | Op::LoadNumber
         | Op::LoadThis => Some((Vec::new(), vec![register(instruction, code, 0)?])),
+        Op::Call => {
+            let count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
+            let mut reads = Vec::with_capacity(count + 1);
+            reads.push(register(instruction, code, 1)?);
+            for index in 0..count {
+                reads.push(register(instruction, code, 3 + index)?);
+            }
+            Some((reads, vec![register(instruction, code, 0)?]))
+        }
         Op::ToPrimitive
         | Op::ToNumeric
         | Op::ToNumber
@@ -964,6 +1002,10 @@ fn lower_instruction(
     live_in: &[bool],
     frame_states: &mut Vec<NumericFrameState>,
     function_id: u32,
+    logical_pc: u32,
+    direct_callees: &rustc_hash::FxHashMap<u32, otter_vm::JitDirectCallee>,
+    direct_call_targets: &mut Vec<otter_vm::JitDirectCallee>,
+    direct_call_arguments: &mut Vec<NumericValue>,
 ) -> Option<()> {
     let op = instruction.op(code);
     let node = match op {
@@ -987,6 +1029,51 @@ fn lower_instruction(
         Op::LoadNumber => {
             instruction.const_index(code, 1)?;
             NumericNode::Constant(instruction.load_number?)
+        }
+        Op::Call => {
+            let target = *direct_callees.get(&instruction.byte_pc)?;
+            let callee = read_value(registers, register(instruction, code, 1)?)?;
+            let argument_count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
+            let argument_start = u16::try_from(direct_call_arguments.len()).ok()?;
+            for index in 0..argument_count {
+                direct_call_arguments.push(read_value(
+                    registers,
+                    register(instruction, code, 3 + index)?,
+                )?);
+            }
+            let target_index = direct_call_targets
+                .iter()
+                .position(|candidate| *candidate == target)
+                .unwrap_or_else(|| {
+                    direct_call_targets.push(target);
+                    direct_call_targets.len() - 1
+                });
+            let value = push(
+                nodes,
+                NumericNode::DirectCall {
+                    callee,
+                    target: u16::try_from(target_index).ok()?,
+                    argument_start,
+                    argument_count: u8::try_from(argument_count).ok()?,
+                    logical_pc,
+                    byte_pc: instruction.byte_pc,
+                },
+            );
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
+            write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            )?;
+            return Some(());
         }
         Op::ToPrimitive => {
             instruction.const_index(code, 2)?;

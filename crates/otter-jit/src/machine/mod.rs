@@ -3,14 +3,16 @@
 //! This module is the final boundary between JavaScript-semantic lowering and
 //! target code emission. Instructions carry only machine operations, virtual
 //! registers, physical constraints, clobbers, and metadata operands. They do
-//! not contain bytecode opcodes, shapes, or access plans. The explicit OSR
-//! entry marker is the sole operation allowed to map live interpreter-frame
+//! not contain bytecode opcodes or emitter-local access plans; typed call
+//! descriptors own any VM-baked semantic guards they require. The explicit
+//! OSR entry marker is the sole operation allowed to map live interpreter-frame
 //! registers into allocator operands.
 //!
 //! # Contents
 //! - [`InstructionSequence`] — verified block, value, and instruction storage.
 //! - [`MachineInstruction`] — one selected operation and its allocator inputs.
-//! - [`CallDescriptor`] — complete semantic target, ABI, effects, and exits.
+//! - [`CallDescriptor`] and [`DirectCallKind`] — complete semantic target,
+//!   guard, ABI, effects, and normal/exceptional exits.
 //! - [`TargetRegisterFile`] — complete allocatable target register inventory.
 //! - [`AllocatedSequence`] — allocator edits, per-operand locations, and exact
 //!   safepoint/deoptimization locations.
@@ -352,14 +354,29 @@ pub enum SafepointKind {
     Gc,
 }
 
+/// JavaScript entry semantics for one compiler-generated call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectCallKind {
+    /// Ordinary call whose dynamic callable is an allocator-owned operand.
+    Plain,
+    /// Method call whose receiver/prototype chain and current callable must be
+    /// revalidated immediately before native entry.
+    Method {
+        /// Exact VM-baked receiver, prototype, and method-slot identity.
+        guard: otter_vm::jit::JitMethodGuard,
+    },
+}
+
 /// Semantic destination selected before target emission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallTarget {
     /// VM-owned runtime entry with one statically declared ABI.
     RuntimeStub(otter_vm::native_abi::RuntimeStubDescriptor),
     /// VM-planned monomorphic JavaScript callee entered through generated
     /// stack-owned linkage.
     Direct {
+        /// Plain or receiver-bound method entry through the shared linkage.
+        kind: DirectCallKind,
         /// Exact callee generation plan and stable function entry cell.
         callee: otter_vm::JitDirectCallee,
         /// Calling function identity used by started-call deoptimization.
@@ -805,6 +822,27 @@ impl InstructionSequence {
                     return Err(VerificationError::InvalidValue(parameter));
                 }
             }
+            let exceptional_successors = (block.first.0..block.end.0)
+                .filter_map(|instruction_index| {
+                    let instruction = &self.instructions[instruction_index as usize];
+                    let MachineOpcode::Call(descriptor_index) = instruction.opcode else {
+                        return None;
+                    };
+                    match self
+                        .call_descriptors
+                        .get(descriptor_index as usize)?
+                        .exceptional
+                    {
+                        ExceptionalEdge::LandingPad(target) => Some(target),
+                        ExceptionalEdge::None | ExceptionalEdge::Propagate => None,
+                    }
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            let normal_successor_count = block
+                .successors
+                .iter()
+                .filter(|successor| !exceptional_successors.contains(successor))
+                .count();
             for instruction_index in block.first.0..block.end.0 {
                 let id = MachineInstructionId(instruction_index);
                 let instruction = &self.instructions[instruction_index as usize];
@@ -817,10 +855,10 @@ impl InstructionSequence {
                         return Err(VerificationError::MissingTerminator(block_id));
                     }
                     match instruction.opcode {
-                        MachineOpcode::Jump if block.successors.len() != 1 => {
+                        MachineOpcode::Jump if normal_successor_count != 1 => {
                             return Err(VerificationError::TerminatorSuccessors(block_id));
                         }
-                        MachineOpcode::BranchIf(_) if block.successors.len() != 2 => {
+                        MachineOpcode::BranchIf(_) if normal_successor_count != 2 => {
                             return Err(VerificationError::TerminatorSuccessors(block_id));
                         }
                         MachineOpcode::Return if !block.successors.is_empty() => {

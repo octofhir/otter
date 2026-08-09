@@ -214,9 +214,6 @@ pub enum JitDirectCallRejectionReason {
     /// The bytecode function requires call semantics outside the synchronous
     /// direct-entry subset.
     IneligibleFunction,
-    /// The call targets the body currently being compiled. Initial self-linking
-    /// needs a post-install entry cell rather than a prior generation.
-    SelfRecursive,
     /// Entry must allocate fresh callee-owned capture cells before execution.
     OwnUpvalues {
         /// Number of fresh cells required by every invocation.

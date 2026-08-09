@@ -12,7 +12,7 @@
 //!   resolver, prepare record, owner arena, generic call adapter, or shared
 //!   machine trampoline participates in the hit path.
 //! - Every failure before native entry is effect-free and branches to the
-//!   caller's canonical deopt exit while its original `Call` PC is published.
+//!   caller's canonical deopt exit while its original call PC is published.
 //! - Callee registers published by the copied frame header are initialized
 //!   tagged slots on the machine stack. Safepoint-free scalar generations may
 //!   publish only their parameter prefix; every cold exit expands it before

@@ -1,7 +1,8 @@
 //! Production scalar-function lowering through the shared Machine IR pipeline.
 //!
 //! # Contents
-//! - `hir` — typed, side-effect-free scalar semantic graph.
+//! - `hir` — typed scalar semantic graph with explicit reentrant calls and
+//!   catch landing pads.
 //! - `arm64` — allocation-driven AArch64 emission.
 //! - [`try_compile`] — production optimizing-tier entry for this vertical slice.
 //!
@@ -15,6 +16,9 @@
 //! - Allocating calls save every live tagged value from its exact late-use
 //!   location into the frame's collector-visible root area and reload it after
 //!   moving GC; no interpreter-window shuttle or emitter-local map exists.
+//! - Guarded methods and plain calls share one typed descriptor and generated
+//!   linkage emitter. Calls inside supported catch regions own explicit
+//!   exceptional CFG successors rather than leaving compiled code.
 
 mod arm64;
 mod hir;
@@ -29,9 +33,12 @@ use otter_vm::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-use self::hir::{NumericFramePoint, NumericFunction, NumericNode, NumericTerminator, NumericType};
+use self::hir::{
+    NumericDirectCallKind, NumericDirectCallTarget, NumericFramePoint, NumericFunction,
+    NumericNode, NumericTerminator, NumericType,
+};
 use super::{
-    CallDescriptor, CallEffects, CallTarget, ControlFlow, DeoptId, ExceptionalEdge,
+    CallDescriptor, CallEffects, CallTarget, ControlFlow, DeoptId, DirectCallKind, ExceptionalEdge,
     InstructionSequence, MachineBlock, MachineBlockData, MachineInstruction, MachineInstructionId,
     MachineOpcode, MachineOperand, MachineOsrInput, MachineOsrType, MachineRepresentation,
     MachineValue, PhysicalRegister, SafepointKind, TargetRegisterFile, lower_deopt_table,
@@ -726,19 +733,20 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                     call
                 }
                 NumericNode::DirectCall {
-                    callee,
+                    source,
                     target,
                     argument_start,
                     argument_count,
                     logical_pc,
                     byte_pc,
+                    exceptional_edge,
                 } => {
-                    let callee_value = tagged_call_argument(
+                    let source_value = tagged_call_argument(
                         hir,
                         &values,
                         &mut representations,
                         &mut instructions,
-                        callee,
+                        source,
                     );
                     let argument_start = usize::from(argument_start);
                     let argument_end = argument_start
@@ -760,16 +768,32 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                             )
                         })
                         .collect::<Vec<_>>();
-                    let target = *hir
+                    let target = hir
                         .direct_call_targets
                         .get(usize::from(target))
                         .ok_or(super::VerificationError::InvalidValue(result))?;
                     let descriptor_index = intern_call_descriptor(
                         &mut call_descriptors,
-                        direct_call_descriptor(target, hir, logical_pc, byte_pc, arguments.len()),
+                        direct_call_descriptor(
+                            target,
+                            hir,
+                            logical_pc,
+                            byte_pc,
+                            arguments.len(),
+                            exceptional_edge.map(|edge| {
+                                let edge = usize::from(edge);
+                                selection_cfg
+                                    .split_edges
+                                    .get(&(block_index, edge))
+                                    .copied()
+                                    .unwrap_or_else(|| {
+                                        selection_cfg.originals[block.successors[edge]]
+                                    })
+                            }),
+                        ),
                     );
                     let mut operands = Vec::with_capacity(arguments.len() + 2);
-                    operands.push(MachineOperand::register_input(callee_value));
+                    operands.push(MachineOperand::register_input(source_value));
                     operands.extend(arguments.into_iter().map(MachineOperand::register_input));
                     operands.push(MachineOperand::register_output(result));
                     let mut call = MachineInstruction::plain(
@@ -936,7 +960,7 @@ fn intern_call_descriptor(
 ) -> usize {
     if let Some(index) = descriptors
         .iter()
-        .position(|candidate| candidate.target == descriptor.target)
+        .position(|candidate| *candidate == descriptor)
     {
         return index;
     }
@@ -959,15 +983,22 @@ fn string_concat_call_descriptor() -> CallDescriptor {
 }
 
 fn direct_call_descriptor(
-    callee: otter_vm::JitDirectCallee,
+    target: &NumericDirectCallTarget,
     hir: &NumericFunction,
     logical_pc: u32,
     byte_pc: u32,
     argument_count: usize,
+    landing_pad: Option<MachineBlock>,
 ) -> CallDescriptor {
     CallDescriptor {
         target: CallTarget::Direct {
-            callee,
+            kind: match &target.kind {
+                NumericDirectCallKind::Plain => DirectCallKind::Plain,
+                NumericDirectCallKind::Method(guard) => DirectCallKind::Method {
+                    guard: guard.clone(),
+                },
+            },
+            callee: target.callee,
             caller_function_id: hir.function_id,
             logical_pc,
             byte_pc,
@@ -979,7 +1010,9 @@ fn direct_call_descriptor(
             .union(CallEffects::INVALIDATES_SHAPES)
             .union(CallEffects::REENTRANT),
         clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
-        exceptional: ExceptionalEdge::Propagate,
+        exceptional: landing_pad
+            .map(ExceptionalEdge::LandingPad)
+            .unwrap_or(ExceptionalEdge::Propagate),
         safepoint: SafepointKind::Gc,
     }
 }

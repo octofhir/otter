@@ -83,6 +83,8 @@ impl FunctionEntryCell {
 
 /// The compiled generation owns precise safepoint metadata.
 pub const CODE_ENTRY_HAS_SAFEPOINTS: u32 = 1 << 0;
+/// Generated callers initially publish only the initialized parameter prefix.
+pub const CODE_ENTRY_PARAMETER_PREFIX: u32 = 1 << 1;
 /// The compiled generation belongs to the optimizing tier.
 pub const CODE_ENTRY_OPTIMIZING_TIER: u32 = 1 << 2;
 
@@ -98,7 +100,7 @@ pub struct CodeEntryCell {
     pub function_id: u32,
     /// Formal parameter count used by frame construction.
     pub param_count: u16,
-    /// Full initialized register-window length.
+    /// Full tagged register-window capacity.
     pub register_count: u16,
     /// Static properties of this compiled generation.
     pub flags: u32,
@@ -153,6 +155,11 @@ impl CodeEntryCell {
             frame_flag_bits |= NativeFrameFlags::HAS_SAFEPOINTS;
         }
         let frame_flags = NativeFrameFlags::from_bits(frame_flag_bits);
+        let initialized_register_count = if flags & CODE_ENTRY_PARAMETER_PREFIX != 0 {
+            param_count
+        } else {
+            register_count
+        };
         Self {
             entry_addr: AtomicU64::new(entry_addr as u64),
             code_object_id,
@@ -165,7 +172,7 @@ impl CodeEntryCell {
                 function_id,
                 code_block_id: function_id,
                 pc: 0,
-                register_count,
+                register_count: initialized_register_count,
                 kind,
                 flags: frame_flags,
             },
@@ -332,5 +339,12 @@ mod tests {
         cell.active_count.store(u32::MAX, Ordering::Release);
         assert!(cell.try_acquire().is_none());
         assert_eq!(cell.active_count(), u32::MAX);
+    }
+
+    #[test]
+    fn parameter_prefix_generation_publishes_only_formals() {
+        let cell = CodeEntryCell::new(0x1234, 7, 9, 2, 12, CODE_ENTRY_PARAMETER_PREFIX, 64);
+        assert_eq!(cell.register_count, 12);
+        assert_eq!(cell.native_frame_header.register_count, 2);
     }
 }

@@ -1312,6 +1312,17 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
         None
     }
 
+    /// Whether stack-owned generated calls may initially publish only the
+    /// initialized formal-parameter prefix of the tagged register window.
+    ///
+    /// A tier may opt in only when no GC, throw, safepoint, or VM transition
+    /// can observe the abbreviated window. Every cold exit must materialize
+    /// the remaining slots and publish the full register count before handing
+    /// the frame back to shared VM machinery.
+    fn generated_entry_uses_parameter_prefix(&self) -> bool {
+        false
+    }
+
     /// Immutable isolate-state dependencies declared by this code object.
     ///
     /// Implementations that record dependencies own the backing slice for the

@@ -45,9 +45,9 @@ use crate::jit::{
     JitCodeGenerationSnapshot, JitDirectCallPlan, JitDirectCallThisMode, JitFunctionCode,
 };
 use crate::native_abi::{
-    CODE_ENTRY_HAS_SAFEPOINTS, CODE_ENTRY_OPTIMIZING_TIER, CodeDependency, CodeDependencyKind,
-    CodeEntryCell, CodeLifetimeState, CodeRegistryView, FunctionEntryCell, NativeFrameKind,
-    SafepointId, SafepointRecord,
+    CODE_ENTRY_HAS_SAFEPOINTS, CODE_ENTRY_OPTIMIZING_TIER, CODE_ENTRY_PARAMETER_PREFIX,
+    CodeDependency, CodeDependencyKind, CodeEntryCell, CodeLifetimeState, CodeRegistryView,
+    FunctionEntryCell, NativeFrameKind, SafepointId, SafepointRecord,
 };
 use std::sync::Arc;
 
@@ -185,6 +185,12 @@ impl JitCodeRegistry {
         }
         if code.native_frame_kind() == NativeFrameKind::Optimizing {
             flags |= CODE_ENTRY_OPTIMIZING_TIER;
+        }
+        if code.generated_entry_uses_parameter_prefix() {
+            if code.safepoint_count() != 0 || param_count > register_count {
+                return false;
+            }
+            flags |= CODE_ENTRY_PARAMETER_PREFIX;
         }
         let entry_cell = Box::new(CodeEntryCell::new(
             entry_addr,
@@ -745,6 +751,7 @@ mod tests {
         function_id: u32,
         tier: NativeFrameKind,
         native_frame_bytes: u32,
+        parameter_prefix_entry: bool,
     }
 
     impl JitFunctionCode for GeneratedFakeCode {
@@ -767,6 +774,10 @@ mod tests {
 
         fn generated_stack_frame_bytes(&self) -> Option<u32> {
             Some(self.native_frame_bytes)
+        }
+
+        fn generated_entry_uses_parameter_prefix(&self) -> bool {
+            self.parameter_prefix_entry
         }
 
         fn code_len(&self) -> usize {
@@ -883,18 +894,21 @@ mod tests {
             function_id: 7,
             tier: NativeFrameKind::Baseline,
             native_frame_bytes: 64,
+            parameter_prefix_entry: false,
         });
         let optimizing: Arc<dyn JitFunctionCode> = Arc::new(GeneratedFakeCode {
             id: 102,
             function_id: 7,
             tier: NativeFrameKind::Optimizing,
             native_frame_bytes: 96,
+            parameter_prefix_entry: true,
         });
         let caller: Arc<dyn JitFunctionCode> = Arc::new(GeneratedFakeCode {
             id: 201,
             function_id: 8,
             tier: NativeFrameKind::Baseline,
             native_frame_bytes: 64,
+            parameter_prefix_entry: false,
         });
 
         assert!(registry.register_generation(101, baseline, 2, 9));
@@ -916,6 +930,11 @@ mod tests {
             registry.entry_cell_addr(102).unwrap(),
             "optimizing tier becomes the published target"
         );
+        // SAFETY: generation cells are stable for the registry lifetime.
+        let optimizing_cell =
+            unsafe { &*(registry.entry_cell_addr(102).unwrap() as *const CodeEntryCell) };
+        assert_eq!(optimizing_cell.register_count, 9);
+        assert_eq!(optimizing_cell.native_frame_header.register_count, 2);
 
         assert_eq!(registry.invalidate_code_object(102), vec![7]);
         assert_eq!(
@@ -934,6 +953,7 @@ mod tests {
             function_id: 7,
             tier: NativeFrameKind::Optimizing,
             native_frame_bytes: 96,
+            parameter_prefix_entry: true,
         });
         assert!(registry.register_generation(103, optimizing_refresh, 2, 9));
         assert_eq!(registry.invalidate_code_object(101), vec![7]);

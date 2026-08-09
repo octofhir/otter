@@ -75,6 +75,9 @@ pub struct OptimizedMetadata {
     pub param_count: u16,
     /// Number of writable interpreter registers reconstructed on bail.
     pub register_count: u16,
+    /// Stack-owned generated calls may publish only initialized parameters
+    /// until this body reaches a cold exit.
+    pub parameter_prefix_entry: bool,
     /// Total number of allocatable GPR and FP registers used by linear scan.
     pub machine_register_count: u8,
     /// GPR and FP spill slots forced by linear scan before deopt legalization.
@@ -218,6 +221,10 @@ impl JitFunctionCode for OptimizedCode {
 
     fn generated_stack_frame_bytes(&self) -> Option<u32> {
         self.generated_stack_frame_bytes
+    }
+
+    fn generated_entry_uses_parameter_prefix(&self) -> bool {
+        self.metadata.parameter_prefix_entry
     }
 
     fn dependencies(&self) -> &[CodeDependency] {

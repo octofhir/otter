@@ -11,9 +11,10 @@
 //!   machine trampoline participates in the hit path.
 //! - Every failure before native entry is effect-free and branches to the
 //!   caller's canonical deopt exit while its original `Call` PC is published.
-//! - Callee registers are initialized tagged slots on the machine stack and
-//!   are published with `NativeFrameFlags::STACK_REGISTERS` before any
-//!   safepoint. Moving GC therefore rewrites them in place.
+//! - Callee registers published by the copied frame header are initialized
+//!   tagged slots on the machine stack. Safepoint-free scalar generations may
+//!   publish only their parameter prefix; every cold exit expands it before
+//!   VM reentry. Moving GC therefore sees exactly the initialized window.
 //! - A callee bailout is not replayed. The live published frame enters the
 //!   cold stack-call deoptimizer, which resumes the already-started callee.
 //! - Callers load the current generation through a stable per-function cell.
@@ -47,16 +48,17 @@ use crate::{
     },
     entry::{
         ACTIVATION_BASE_OFFSET, ACTIVATION_LIMIT_OFFSET, ACTIVATION_TOP_PTR_OFFSET,
-        CODE_ENTRY_CODE_OBJECT_ID_OFFSET, CODE_ENTRY_GENERATED_BAIL_STREAK_OFFSET,
-        CODE_ENTRY_GENERATED_DEOPTS_OFFSET, CODE_ENTRY_GENERATED_ENTRIES_OFFSET,
-        CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET, CODE_ENTRY_GENERATED_THROWS_OFFSET,
-        CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET, FUNCTION_ENTRY_GENERATION_CELL_OFFSET,
-        GENERATED_FEEDBACK_CLEAN_OFFSET, GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_OFFSET,
-        NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE,
-        NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
-        NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NATIVE_STACK_LIMIT_OFFSET, STATUS_BAILED,
-        STATUS_RETURNED, THREAD_OFFSET, Unsupported, VALUE_UNDEFINED,
-        VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_CURRENT_FRAME_OFFSET, reg_offset,
+        CODE_ENTRY_CODE_OBJECT_ID_OFFSET, CODE_ENTRY_FLAGS_OFFSET,
+        CODE_ENTRY_GENERATED_BAIL_STREAK_OFFSET, CODE_ENTRY_GENERATED_DEOPTS_OFFSET,
+        CODE_ENTRY_GENERATED_ENTRIES_OFFSET, CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET,
+        CODE_ENTRY_GENERATED_THROWS_OFFSET, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET,
+        FUNCTION_ENTRY_GENERATION_CELL_OFFSET, GENERATED_FEEDBACK_CLEAN_OFFSET,
+        GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
+        NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE, NATIVE_FRAME_THIS_OFFSET,
+        NATIVE_FRAME_UPVALUE_BASE_OFFSET, NATIVE_FRAME_UPVALUE_COUNT_OFFSET,
+        NATIVE_STACK_LIMIT_OFFSET, STATUS_BAILED, STATUS_RETURNED, THREAD_OFFSET, Unsupported,
+        VALUE_UNDEFINED, VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_CURRENT_FRAME_OFFSET,
+        reg_offset,
     },
 };
 
@@ -64,6 +66,7 @@ use crate::{
 /// The target's exact persistent prologue reservation is accounted separately
 /// in the aggregate generated-call budget.
 pub(crate) const MAX_DIRECT_CALL_FRAME_BYTES: u32 = 4_080;
+const PARAMETER_PREFIX_FLAG_BIT: u32 = abi::CODE_ENTRY_PARAMETER_PREFIX.trailing_zeros();
 
 /// Fully-typed source contract for generated linkage.
 #[derive(Debug, Clone, Copy)]
@@ -163,6 +166,47 @@ fn emit_reset_generated_bail_streak(ops: &mut Assembler) {
         ; .arch aarch64
         ; str wzr, [x25, CODE_ENTRY_GENERATED_BAIL_STREAK_OFFSET]
     );
+}
+
+/// Initialize one compile-time register range in the stack-owned callee frame.
+fn emit_initialize_register_range(ops: &mut Assembler, start: usize, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let start_offset = NATIVE_FRAME_STACK_SIZE + start as u32 * 8;
+    let pair_count = count / 2;
+    emit_load_u64(ops, 15, VALUE_UNDEFINED);
+    dynasm!(ops
+        ; .arch aarch64
+        ; add x14, sp, start_offset
+    );
+    if pair_count != 0 {
+        const MAX_UNROLLED_INIT_PAIRS: usize = 16;
+        if pair_count <= MAX_UNROLLED_INIT_PAIRS {
+            for _ in 0..pair_count {
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; stp x15, x15, [x14], #16
+                );
+            }
+        } else {
+            let init_loop = ops.new_dynamic_label();
+            dynasm!(ops
+                ; .arch aarch64
+                ; movz w13, pair_count as u32
+                ; =>init_loop
+                ; stp x15, x15, [x14], #16
+                ; subs w13, w13, #1
+                ; b.ne =>init_loop
+            );
+        }
+    }
+    if count & 1 != 0 {
+        dynasm!(ops
+            ; .arch aarch64
+            ; str x15, [x14]
+        );
+    }
 }
 
 fn emit_symbol(
@@ -550,46 +594,22 @@ pub(crate) fn emit_direct_call(
         .arguments
         .len()
         .min(usize::from(site.target.plan.param_count));
-    let initialized_register_count =
-        usize::from(site.target.plan.register_count).saturating_sub(copied_argument_count);
-    if initialized_register_count != 0 {
-        let init_pair_count = initialized_register_count / 2;
-        let init_offset = NATIVE_FRAME_STACK_SIZE
-            + u32::try_from(copied_argument_count)
-                .map_err(|_| Unsupported::OperandShape("direct call argument count"))?
-                * 8;
-        emit_load_u64(ops, 15, VALUE_UNDEFINED);
+    let param_count = usize::from(site.target.plan.param_count);
+    emit_initialize_register_range(
+        ops,
+        copied_argument_count,
+        param_count.saturating_sub(copied_argument_count),
+    );
+    let local_count = usize::from(site.target.plan.register_count).saturating_sub(param_count);
+    if local_count != 0 {
+        let locals_ready = ops.new_dynamic_label();
         dynasm!(ops
             ; .arch aarch64
-            ; add x14, sp, init_offset
+            ; ldr w13, [x25, CODE_ENTRY_FLAGS_OFFSET]
+            ; tbnz w13, #PARAMETER_PREFIX_FLAG_BIT, =>locals_ready
         );
-        if init_pair_count != 0 {
-            const MAX_UNROLLED_INIT_PAIRS: usize = 16;
-            if init_pair_count <= MAX_UNROLLED_INIT_PAIRS {
-                for _ in 0..init_pair_count {
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; stp x15, x15, [x14], #16
-                    );
-                }
-            } else {
-                let init_loop = ops.new_dynamic_label();
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; movz w13, init_pair_count as u32
-                    ; =>init_loop
-                    ; stp x15, x15, [x14], #16
-                    ; subs w13, w13, #1
-                    ; b.ne =>init_loop
-                );
-            }
-        }
-        if initialized_register_count & 1 != 0 {
-            dynasm!(ops
-                ; .arch aarch64
-                ; str x15, [x14]
-            );
-        }
+        emit_initialize_register_range(ops, param_count, local_count);
+        dynasm!(ops ; .arch aarch64 ; =>locals_ready);
     }
     for (argument, &source) in site
         .arguments

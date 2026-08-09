@@ -1,7 +1,7 @@
 //! Static value-load transition emission.
 //!
 //! # Contents
-//! - Reentrant calls to the VM-owned value-load helper.
+//! - Reentrant calls carrying decoded operands to the VM-owned typed boundary.
 //! - Uniform success, throw, and exact pre-effect bailout routing.
 //!
 //! # Invariants
@@ -10,7 +10,7 @@
 //! - A missing published activation is the sole bailout case.
 //!
 //! # See also
-//! - `otter_vm::Interpreter::jit_runtime_value_load_op`
+//! - `otter_vm::RuntimeCall::value_load_op`
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::native_abi as abi;

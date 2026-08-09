@@ -66,6 +66,11 @@ It already owns:
 - representation-checked entry and OSR guards with no replay after a started
   operation; method guard misses deopt before lookup effects and tier/frame
   publication changes do not require caller recompilation.
+- one typed `RuntimeCall` boundary for scalar query/coercion, static value-load,
+  class-construction, and built-in Array iterator operations. These families
+  decode machine operand words once into owned descriptors, operate on either
+  materialized or generated stack-owned frames, and never recover an
+  interpreter frame index merely to complete semantics.
 
 The old optimizing compiler and template emitter remain in the active graph
 only for operations and function shapes not yet selected by the replacement
@@ -94,8 +99,10 @@ spread wrappers also keep the compiler-emitted default-Array iterator
 collection native: `GetIterator`, `IteratorNext`, and `ArrayPush` operate over
 the published stack-owned frame through the typed runtime boundary. An own,
 replaced, accessor-backed, or non-Array iterator refuses before effects and
-resumes the exact materialized path. Extend that one boundary to the remaining
-reentrant forms:
+resumes the exact materialized path. Scalar query/coercion, static namespace /
+BigInt/string-index loads, and class heritage / computed naming now use this
+same boundary; their former `jit_runtime_*` materialized-frame entrypoints and
+JIT-prefixed VM modules are deleted. Extend it to the remaining reentrant forms:
 
 - admit nested catch/finally regions and complete multi-frame state through
   `lower_deopt_table`;

@@ -150,7 +150,7 @@ fn template_osr_emits_ordered_compile_events() {
 
 #[test]
 #[cfg(target_arch = "aarch64")]
-fn unary_feedback_keeps_extracted_native_call_loop_optimized() {
+fn unary_feedback_recompiles_extracted_native_call_loop_after_warmup_bail() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
         .jit_osr_threshold(1)
@@ -179,27 +179,42 @@ fn unary_feedback_keeps_extracted_native_call_loop_optimized() {
         .expect("enabled run owns a report");
 
     assert_eq!(result.completion_string(), "128");
+    let optimizing_compiles = report
+        .events()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                JitDebugEvent::CompileFinished {
+                    tier: JitDebugTier::Optimizing,
+                    outcome: JitDebugCompileOutcome::Compiled { .. },
+                    ..
+                }
+            )
+        })
+        .count();
     assert!(
-        report.events().iter().any(|event| matches!(
-            event,
-            JitDebugEvent::CompileFinished {
-                tier: JitDebugTier::Optimizing,
-                outcome: JitDebugCompileOutcome::Compiled { .. },
-                ..
-            }
-        )),
-        "fixture must compile its loop through optimizing OSR: {:?}",
+        optimizing_compiles >= 2,
+        "feedback refresh must republish the optimizing OSR body: {:?}",
         report.events()
     );
-    assert!(
-        !report.events().iter().any(|event| matches!(
-            event,
-            JitDebugEvent::Bail {
-                tier: JitDebugTier::Optimizing,
-                ..
-            }
-        )),
-        "recorded unary feedback must prevent an immediate optimizing bail: {:?}",
+    let optimizing_bails = report
+        .events()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                JitDebugEvent::Bail {
+                    tier: JitDebugTier::Optimizing,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        optimizing_bails,
+        1,
+        "only the pre-refresh body may bail on incomplete Add feedback: {:?}",
         report.events()
     );
 }

@@ -388,7 +388,7 @@ fn optimized_float_function_matches_interpreter_bits() {
 }
 
 #[test]
-fn optimized_long_loop_interrupts_without_materializing_a_frame() {
+fn optimized_long_loop_interrupts_through_leaf_poll_without_reentry() {
     let mut interp = Interpreter::new();
     interp.set_jit_compiler(Some(Arc::new(OtterJitCompiler::production_tiered())));
     let context = interp.link_module(fixture_module());
@@ -423,9 +423,14 @@ fn optimized_long_loop_interrupts_without_materializing_a_frame() {
         stats.leaf_stub_transitions > before.leaf_stub_transitions,
         "interrupt poll must exit through the allocation-free leaf path: {stats:?}"
     );
+    assert!(
+        stats.optimized_deopts > before.optimized_deopts,
+        "the interrupt must leave optimized execution: {stats:?}"
+    );
+    assert_eq!(stats.runtime_calls, before.runtime_calls);
     assert_eq!(
-        stats.optimized_deopts, before.optimized_deopts,
-        "interrupt poll must not materialize an interpreter frame: {stats:?}"
+        stats.reentrant_stub_transitions, before.reentrant_stub_transitions,
+        "the leaf interrupt exit must not enter a materialized-frame runtime path: {stats:?}"
     );
 
     interrupt.reset();

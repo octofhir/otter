@@ -12,10 +12,8 @@ frame=2 fn=outer pc=000000 op=LOAD_GLOBAL_OR_THROW  r0 k[0]
 frame=2 fn=outer pc=000010 op=LOAD_INT32  r1 i32:2
 frame=2 fn=outer pc=000020 op=LOAD_INT32  r2 i32:3
 frame=2 fn=outer pc=000030 op=CALL  r0 r0 k[2] r1 r2
-frame=3 fn=add pc=000000 op=LOAD_LOCAL  r2 i32:0
-frame=3 fn=add pc=000010 op=LOAD_LOCAL  r3 i32:1
-frame=3 fn=add pc=000020 op=ADD  r4 r2 r3
-frame=3 fn=add pc=000031 op=RETURN_VALUE  r4
+frame=3 fn=add pc=000000 op=ADD  r2 r0 r1
+frame=3 fn=add pc=000011 op=RETURN_VALUE  r2
 frame=2 fn=outer pc=000049 op=RETURN_VALUE  r0
 frame=1 fn=<main> pc=000102 op=STORE_LOCAL  r3 i32:2
 frame=1 fn=<main> pc=000112 op=RETURN  r2

@@ -120,6 +120,20 @@ bails into cold interpreter continuation. It records baked `callKind`, exact
 recompilation never merges unrelated edges or bodies. Capture remains
 default-off and bounded; disabled hot calls construct no event.
 
+Scalar query/coercion, static value-load, class-construction, and built-in
+Array iterator opcodes share the VM's typed `RuntimeCall` boundary. Their
+machine ABI still records the original logical opcode in `template-plan.txt`
+and `code-map.json`, but the entry decodes it into a typed descriptor before
+semantics begin. The descriptor reads and writes the published `NativeFrame`
+window directly, regardless of whether an interpreter `Frame` also exists.
+Consequently, a `generatedCallDeopt` at one of these opcodes now indicates a
+real semantic refusal or another unsupported operation in the callee; it is
+not an expected representation conversion. For supported scalar/load/class
+operations, confirm `jit-generated-call-deopts == 0` and correlate the opcode's
+code-map range with `jit-reentrant-stub-transitions`. A high transition count
+with zero deopts means semantics stayed stack-owned but the operation itself
+remains a hot candidate for Machine IR or a narrower leaf/alloc stub.
+
 ## Directory layout
 
 The root contains the current index plus one directory per retained successful

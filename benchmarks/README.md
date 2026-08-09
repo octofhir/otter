@@ -77,6 +77,7 @@ print output, access the filesystem, install packages, or depend on host APIs.
 | `numeric-leaf.js` | Repeated calls into a straight-line eight-operation Number leaf | `-700000` |
 | `derived-constructor.js` | Fixed-arity derived construction, `super()` linkage, initialized `this`, and result property reads | `10000200000` |
 | `spread-call-family.js` | Plain calls, base/derived/`super()` construction, and stack-owned default-Array spread collection | `15000750000` |
+| `typed-runtime-boundary.js` | Stack-owned scalar queries, static value loads, class heritage checks, and computed function naming | `10000400000` |
 | `string-concat.js` | Allocating primitive concat with a tagged result live across the second safepoint | `600000` |
 | `typed-parameter-loop.js` | Int32 parameter guards, loop phis, checked arithmetic, and OSR | `300000` |
 

@@ -438,7 +438,7 @@ fn property_load_misses_complete_in_place_with_exact_throw_order() {
 }
 
 #[test]
-fn boxed_property_loads_recover_exact_values_through_cold_path_after_gc_churn() {
+fn boxed_property_loads_recover_exact_values_through_leaf_ic_after_gc_churn() {
     let (oracle, _) = run_boxed_properties(JitSelection::InterpreterOnly);
     assert_eq!(oracle, "[0.5,true,true,2147483647,true]");
 
@@ -453,13 +453,14 @@ fn boxed_property_loads_recover_exact_values_through_cold_path_after_gc_churn() 
         "boxed property loop must enter compiled optimized code: {stats:?}"
     );
     assert!(
-        stats.jit_runtime_property_stubs > 0,
-        "the property IC must be populated through its runtime transition: {stats:?}"
+        stats.property_load_installs > 0 && stats.jit_leaf_stub_transitions > 0,
+        "the property IC must populate through its leaf transition: {stats:?}"
     );
     assert!(
-        stats.jit_runtime_property_stubs < 64,
+        stats.jit_leaf_stub_transitions < 64,
         "warmed boxed property loads must stay compiled instead of missing per iteration: {stats:?}"
     );
+    assert_eq!(stats.jit_reentrant_stub_transitions, 0);
 }
 
 #[test]

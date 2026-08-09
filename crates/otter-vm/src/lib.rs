@@ -94,6 +94,7 @@ pub mod bootstrap_weak_refs;
 pub mod bound_function;
 pub mod cache_ir;
 pub mod class_constructor;
+mod class_ops;
 pub mod deopt;
 pub mod dynamic_import;
 pub mod error_classes;
@@ -127,7 +128,6 @@ mod iterator_ops;
 pub mod iterator_state;
 pub mod jit;
 pub mod jit_artifact;
-mod jit_class_ops;
 mod jit_class_value_ops;
 mod jit_construct_ops;
 mod jit_control_ops;
@@ -145,12 +145,10 @@ mod jit_object_protocol_ops;
 mod jit_private_ops;
 pub mod jit_registry;
 mod jit_runtime_ops;
-mod jit_scalar_ops;
 mod jit_spread_call_ops;
 mod jit_static_call_ops;
 mod jit_structural_ops;
 mod jit_super_ops;
-mod jit_value_load_ops;
 mod jit_variadic_ops;
 pub mod js_surface;
 pub mod json;
@@ -193,6 +191,7 @@ pub mod runtime_budget;
 pub mod runtime_cx;
 pub mod runtime_state;
 pub mod runtime_stubs;
+mod scalar_ops;
 pub mod snapshot;
 pub mod source_registry;
 mod static_call_ops;
@@ -233,7 +232,9 @@ pub use run_control::{
     DEFAULT_MAX_STACK_DEPTH, DEFAULT_MAX_SYNC_REENTRY_DEPTH, ErrorDetail, InterruptFlag,
     NO_HANDLER_OFFSET, RunError, StackFrameSnapshot, VmError,
 };
-pub use runtime_activation::{IteratorRuntimeOutcome, RuntimeCall};
+pub use runtime_activation::{
+    ClassRuntimeOp, IteratorRuntimeOutcome, RuntimeCall, ScalarRuntimeOp, ValueLoadRuntimeOp,
+};
 
 #[cfg(test)]
 use otter_bytecode::ArgumentsObjectKind;

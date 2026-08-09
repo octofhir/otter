@@ -153,9 +153,15 @@ fn assert_assembly_is_symbolic(bundle: &JitArtifactBundle) {
         }),
         "instructions must carry exact code.bin offsets:\n{assembly}"
     );
+    let map = code_map(bundle);
+    let has_machine_scalar_region = map["regions"].as_array().is_some_and(|regions| {
+        regions
+            .iter()
+            .any(|region| region["kind"] == "machineScalarFunction")
+    });
     assert!(
-        assembly.contains("pc=") && assembly.contains("tier-op="),
-        "assembly must retain bytecode/IR correlation annotations:\n{assembly}"
+        (assembly.contains("pc=") && assembly.contains("tier-op=")) || has_machine_scalar_region,
+        "assembly must retain operation annotations or a Machine IR structural region:\n{assembly}"
     );
     let relocation_lines = assembly
         .lines()
@@ -611,7 +617,7 @@ fn optimizing_osr_returns_ir_deopt_and_safepoint_payloads() {
 }
 
 #[test]
-fn optimizing_math_artifact_types_the_guarded_builtin_address() {
+fn optimizing_math_artifact_uses_symbolic_runtime_identity() {
     let mut runtime = runtime_with_artifacts(JitSelection::ProductionTiered, 4);
     let result = runtime
         .run_script(
@@ -622,11 +628,19 @@ fn optimizing_math_artifact_types_the_guarded_builtin_address() {
     let batch = result.jit_artifacts().expect("enabled artifact batch");
     let bundle = first_tier_bundle(batch, JitDebugTier::Optimizing);
     let kinds = bundle_relocation_target_kinds(bundle);
+    let optimized_ir = std::str::from_utf8(
+        bundle
+            .file(JitArtifactFileName::OptimizedIr)
+            .expect("optimizing Math IR")
+            .contents(),
+    );
 
     assert_eq!(result.completion_string(), "2544");
+    let optimized_ir = optimized_ir.expect("optimizing Math IR is UTF-8");
     assert!(
-        kinds.contains("guardedBuiltinFunction"),
-        "the guarded builtin address must be represented symbolically: {kinds:?}"
+        optimized_ir.starts_with("; otter optimized unit\n"),
+        "optimizing Math must retain the general optimized unit: {}",
+        optimized_ir.lines().next().unwrap_or("<empty>")
     );
     assert!(
         kinds.contains("runtimeStub"),
@@ -635,7 +649,7 @@ fn optimizing_math_artifact_types_the_guarded_builtin_address() {
 }
 
 #[test]
-fn template_artifacts_type_every_non_stub_address_class() {
+fn template_artifacts_type_every_active_non_stub_address_class() {
     let mut runtime = runtime_with_artifacts(JitSelection::Template, 4);
     let result = runtime
         .run_script(
@@ -685,7 +699,6 @@ String(hot(48));
         "propertyIcCell",
         "templateOperandSlice",
         "guardedHeapReference",
-        "guardedBuiltinFunction",
     ] {
         assert!(
             kinds.contains(expected),

@@ -1,16 +1,13 @@
-//! Compiled scalar value-query and coercion transitions.
+//! Interpreter-owned scalar value-query and coercion helpers.
 //!
 //! # Contents
 //! - Extracted single-implementation register helpers for `ToObject`,
 //!   `ToPropertyKey`, `IsArray`, `ArrayLength`, and `LoadLength`, shared by
-//!   interpreter dispatch and compiled slow paths.
-//! - The reentrant scalar transition dispatching those plus `TypeOf`,
-//!   `LoadNewTarget`, and `SameValue`.
+//!   interpreter dispatch.
 //!
 //! # Invariants
-//! - JIT code may commit pure tag/layout-guarded scalar hits; every proxy,
-//!   realm-identity, wrong-type, or otherwise ambiguous case reaches the same
-//!   VM register helper the interpreter dispatches.
+//! - Compiled activations use the typed representation-neutral implementation
+//!   in [`crate::RuntimeCall::scalar_op`], not these materialized-frame helpers.
 //! - `ToPropertyKey` coercion (`@@toPrimitive`/`valueOf`/`toString`) reenters JS
 //!   through the shared path; a committed coercion is never replayed by an exact
 //!   side exit.
@@ -19,10 +16,8 @@
 //! - [`crate::Interpreter::evaluate_to_primitive`]
 //! - [`crate::Interpreter::run_typeof_regs`]
 
-use otter_bytecode::Op;
-
 use crate::{
-    ActiveFrameMut, ExecutionContext, Frame, Interpreter, JsString, Value, VmError, abstract_ops,
+    ExecutionContext, Frame, Interpreter, JsString, Value, VmError, abstract_ops,
     activation_stack::ActivationStack, number::NumberValue, read_register, write_register,
 };
 
@@ -127,65 +122,6 @@ impl Interpreter {
         let len = NumberValue::from_i32(s.len() as i32);
         write_register(frame, dst, Value::number(len))?;
         frame.advance_pc()?;
-        Ok(())
-    }
-
-    /// Complete one scalar value-query/coercion opcode for a published compiled
-    /// frame. `arg0`/`arg1`/`arg2` name the destination and source (or
-    /// left/right) registers per opcode.
-    pub fn jit_runtime_scalar_op(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        frame_index: usize,
-        opcode: u8,
-        arg0: u64,
-        arg1: u64,
-        arg2: u64,
-    ) -> Result<(), VmError> {
-        self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-        if frame_index + 1 != stack.len() {
-            return Err(VmError::InvalidOperand);
-        }
-        let saved_pc = stack[frame_index].pc;
-        let dst = arg0 as u16;
-        let src = arg1 as u16;
-        match opcode {
-            value if value == Op::ToObject as u8 => {
-                self.run_to_object_reg(stack, frame_index, dst, src)?;
-            }
-            value if value == Op::ToPropertyKey as u8 => {
-                self.run_to_property_key_reg(context, stack, frame_index, dst, src)?;
-            }
-            value if value == Op::TypeOf as u8 => {
-                self.run_typeof_regs(&mut stack[frame_index], dst, src)?;
-            }
-            value if value == Op::LoadNewTarget as u8 => {
-                let new_target = self
-                    .frame_cold(&stack[frame_index])
-                    .and_then(|cold| cold.new_target)
-                    .unwrap_or(Value::undefined());
-                let mut frame = ActiveFrameMut::materialized_with_new_target(
-                    &mut stack[frame_index],
-                    new_target,
-                );
-                self.frame_load_new_target(&mut frame, dst)?;
-            }
-            value if value == Op::SameValue as u8 => {
-                self.run_same_value_regs(&mut stack[frame_index], dst, src, arg2 as u16)?;
-            }
-            value if value == Op::IsArray as u8 => {
-                self.run_is_array_reg(&mut stack[frame_index], dst, src)?;
-            }
-            value if value == Op::ArrayLength as u8 => {
-                self.run_array_length_reg(&mut stack[frame_index], dst, src)?;
-            }
-            value if value == Op::LoadLength as u8 => {
-                self.run_load_length_reg(&mut stack[frame_index], dst, src)?;
-            }
-            _ => return Err(VmError::InvalidOperand),
-        }
-        stack[frame_index].pc = saved_pc;
         Ok(())
     }
 }

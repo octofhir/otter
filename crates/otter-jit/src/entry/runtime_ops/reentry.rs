@@ -4,6 +4,7 @@
 //! - Cold stable function-entry repair for generated calls.
 //! - Propagated-throw resumption in live compiled callers.
 //! - Reentrant construction and closure/function creation.
+//! - Generated base-constructor receiver preparation and return substitution.
 //! - Reentrant equality, typed numeric-family, and unary-coercion completion.
 //! - Cooperative backedge polling.
 //!
@@ -1063,6 +1064,63 @@ pub(crate) extern "C" fn jit_construct_stub(
                 1
             }
         },
+    }
+}
+
+/// Perform the observable receiver-preparation half of a generated base
+/// construct. The constructor body remains unstarted; successful return hands
+/// generated linkage one freshly allocated, prototype-linked receiver.
+pub(crate) extern "C" fn jit_prepare_base_construct_stub(
+    ctx: *mut JitCtx,
+    callee_bits: u64,
+    _reserved0: u64,
+    _reserved1: u64,
+    _reserved2: u64,
+) -> JitRet {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let Some(activation) = ctx.checked_activation() else {
+        park_jit_error(ctx, VmError::InvalidOperand);
+        return JitRet {
+            value: 0,
+            status: STATUS_THREW,
+        };
+    };
+    let vm = unsafe { &mut *activation.vm_ptr() };
+    let stack = unsafe { &mut *activation.stack_ptr() };
+    let context = unsafe { &*activation.context_ptr() };
+    match vm.jit_prepare_base_construct_receiver(
+        stack,
+        context,
+        otter_vm::Value::from_bits(callee_bits),
+    ) {
+        Ok(receiver) => JitRet {
+            value: receiver.to_bits(),
+            status: STATUS_RETURNED,
+        },
+        Err(error) => {
+            park_jit_error(ctx, error);
+            JitRet {
+                value: 0,
+                status: STATUS_THREW,
+            }
+        }
+    }
+}
+
+/// Apply base-constructor return substitution without allocation or reentry.
+pub(crate) extern "C" fn jit_base_construct_result_stub(
+    _ctx: *mut JitCtx,
+    result_bits: u64,
+    receiver_bits: u64,
+    _reserved0: u64,
+    _reserved1: u64,
+) -> u64 {
+    let result = otter_vm::Value::from_bits(result_bits);
+    if result.is_object_type() {
+        result_bits
+    } else {
+        receiver_bits
     }
 }
 

@@ -1275,6 +1275,30 @@ pub const STUB_NUMBER_TO_INT32_F64_LEAF: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::ValueWord,
 );
 
+/// Reentrant `OrdinaryCreateFromConstructor` preparation for one generated
+/// base-constructor call. Returns the rooted receiver through a status pair;
+/// the constructor body has not started yet.
+pub const STUB_JIT_PREPARE_BASE_CONSTRUCT: RuntimeStubDescriptor = descriptor(
+    87,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    1,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusPair,
+);
+
+/// Pure base-constructor return substitution over `(result, receiver)`.
+pub const STUB_JIT_BASE_CONSTRUCT_RESULT: RuntimeStubDescriptor = descriptor(
+    88,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::Variadic,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::ValueWord,
+);
+
 /// Leaf `Math.abs`.
 ///
 /// A numeric builtin reached through a declared entry rather than a
@@ -1427,6 +1451,8 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         84 => "number_rem_f64_leaf",
         85 => "number_pow_f64_leaf",
         86 => "number_to_int32_f64_leaf",
+        87 => "jit_prepare_base_construct",
+        88 => "jit_base_construct_result",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1519,6 +1545,8 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_NUMBER_REM_F64_LEAF,
     STUB_NUMBER_POW_F64_LEAF,
     STUB_NUMBER_TO_INT32_F64_LEAF,
+    STUB_JIT_PREPARE_BASE_CONSTRUCT,
+    STUB_JIT_BASE_CONSTRUCT_RESULT,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

@@ -27,9 +27,9 @@
 //! - Successful results use the VM's canonical tagged representation.
 //! - Pure scalar leaves exchange unboxed scalars in fixed ABI operands;
 //!   regalloc2 owns every argument/result move and no frame shuttle exists.
-//! - Plain and guarded-method JavaScript calls reuse the shared generated
-//!   linkage emitter; the allocator supplies only location-aware loads, stores,
-//!   root reloads, and landing-pad result homes.
+//! - Plain, guarded-method, and base-constructor JavaScript calls reuse the
+//!   shared generated linkage emitter; the allocator supplies only
+//!   location-aware loads, stores, root reloads, and landing-pad result homes.
 
 // dynasm's dynamic-register expansion calls `.into()` on the required u8
 // register encoding. Clippy sees the macro expansion as an identity conversion.
@@ -240,6 +240,8 @@ pub(super) fn emit(
     deopt_writeback_entry: u64,
     deopt_stack_call_entry: u64,
     resolve_direct_entry: u64,
+    prepare_construct_entry: u64,
+    construct_result_entry: u64,
     string_concat_entry: u64,
     number_rem_entry: u64,
     number_pow_entry: u64,
@@ -757,6 +759,7 @@ pub(super) fn emit(
                     let method_guard_miss = ops.new_dynamic_label();
                     emit_save_safepoint_roots(&mut ops, frame, site)?;
                     emit_publish_machine_roots(&mut ops, frame, site)?;
+                    let result_index = descriptor.arguments.len();
                     let form = match kind {
                         DirectCallKind::Plain => DirectCallForm::Plain { callable: 0 },
                         DirectCallKind::Method { guard } => {
@@ -785,8 +788,13 @@ pub(super) fn emit(
                                 receiver: 0,
                             }
                         }
+                        DirectCallKind::Construct => DirectCallForm::Construct {
+                            callable: 0,
+                            receiver: u16::try_from(result_index + 1).map_err(|_| {
+                                Unsupported::OperandShape("scalar construct receiver root")
+                            })?,
+                        },
                     };
-                    let result_index = descriptor.arguments.len();
                     let arguments = (1..result_index)
                         .map(|index| {
                             u16::try_from(index).map_err(|_| {
@@ -811,6 +819,8 @@ pub(super) fn emit(
                         },
                         deopt_stack_call_entry,
                         resolve_direct_entry,
+                        prepare_construct_entry,
+                        construct_result_entry,
                         None,
                         direct_bail,
                         direct_threw,
@@ -844,6 +854,43 @@ pub(super) fn emit(
                             emit_reload_safepoint_roots(ops, frame, site)?;
                             dynasm!(ops ; .arch aarch64 ; mov x0, x17);
                             Ok(())
+                        },
+                        |ops, source, sp_bias| {
+                            let receiver = instruction
+                                .operands
+                                .get(result_index + 1)
+                                .ok_or(Unsupported::OperandShape(
+                                    "scalar construct receiver operand",
+                                ))?
+                                .value;
+                            let root = site
+                                .roots
+                                .iter()
+                                .find(|root| root.value == receiver)
+                                .ok_or(Unsupported::OperandShape(
+                                    "scalar construct receiver save home",
+                                ))?;
+                            let offset = root_offset(frame, root.save_slot)?
+                                .checked_add(sp_bias)
+                                .ok_or(Unsupported::OperandShape(
+                                    "scalar construct linkage root offset",
+                                ))?
+                                .checked_add(MACHINE_ROOT_RECORD_SIZE)
+                                .ok_or(Unsupported::OperandShape(
+                                    "scalar construct receiver root offset",
+                                ))?;
+                            dynasm!(ops ; .arch aarch64 ; str X(source), [sp, offset]);
+                            Ok(())
+                        },
+                        |ops, sp_bias| {
+                            emit_reload_safepoint_roots_with_bias(
+                                ops,
+                                frame,
+                                site,
+                                sp_bias.checked_add(MACHINE_ROOT_RECORD_SIZE).ok_or(
+                                    Unsupported::OperandShape("scalar construct root reload bias"),
+                                )?,
+                            )
                         },
                     )?;
                     dynasm!(ops
@@ -1257,14 +1304,27 @@ fn emit_reload_safepoint_roots(
     frame: MachineFrameLayout,
     site: &MachineSafepointSite,
 ) -> Result<(), Unsupported> {
+    emit_reload_safepoint_roots_with_bias(ops, frame, site, 0)
+}
+
+fn emit_reload_safepoint_roots_with_bias(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    frame: MachineFrameLayout,
+    site: &MachineSafepointSite,
+    sp_bias: u32,
+) -> Result<(), Unsupported> {
     for root in &site.roots {
-        let source = root_offset(frame, root.save_slot)?;
+        let source = root_offset(frame, root.save_slot)?
+            .checked_add(sp_bias)
+            .ok_or(Unsupported::OperandShape("scalar root reload stack bias"))?;
         match root.source {
             AllocatedLocation::Register(register) if register.is_integer() => {
                 dynasm!(ops ; .arch aarch64 ; ldr X(register.encoding()), [sp, source]);
             }
             AllocatedLocation::Stack(slot) => {
-                let destination = spill_offset(frame, slot)?;
+                let destination = spill_offset(frame, slot)?
+                    .checked_add(sp_bias)
+                    .ok_or(Unsupported::OperandShape("scalar spill reload stack bias"))?;
                 dynasm!(ops
                     ; .arch aarch64
                     ; ldr x16, [sp, source]

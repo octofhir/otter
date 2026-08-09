@@ -464,7 +464,7 @@ impl TypedFeedbackSlot {
                 Self::Property(Box::new(AtomicPropertyFeedback::new(PropertyIcKind::Has)))
             }
             Op::CallMethodValue => Self::Method,
-            Op::Call => Self::Call(Box::default()),
+            Op::Call | Op::New => Self::Call(Box::default()),
             _ => Self::None,
         }
     }
@@ -844,7 +844,7 @@ impl FeedbackVector {
         matches!(self.typed_slots.get(index), Some(TypedFeedbackSlot::Method))
     }
 
-    /// Ordinary-call payload for one `Call` instruction.
+    /// Ordinary-call payload for one `Call` or `New` instruction.
     #[must_use]
     pub(crate) fn call_slot(&self, index: usize) -> Option<CallFeedbackSlot<'_>> {
         let TypedFeedbackSlot::Call(feedback) = self.typed_slots.get(index)? else {

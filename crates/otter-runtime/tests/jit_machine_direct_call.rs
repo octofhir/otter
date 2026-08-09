@@ -4,6 +4,7 @@
 //! - Native publication proof for a monomorphic plain call.
 //! - Exact return, callee-deopt, and throw semantics against the interpreter.
 //! - Own/prototype guarded methods, exact receiver binding, and guard misses.
+//! - Base constructors with `new.target`, receiver substitution, and accessors.
 //! - Nested generated calls retaining a tagged value across moving GC.
 //!
 //! # Invariants
@@ -276,11 +277,136 @@ JSON.stringify([
 ]);
 "#;
 
+const BASE_CONSTRUCT: &str = r#"
+let prototypeGets = 0;
+const instancePrototype = { marker: "proto" };
+
+function Base(value) {
+  this.value = value;
+  this.targetIsBase = new.target === Base;
+  return 17;
+}
+
+Object.defineProperty(Base, "prototype", {
+  configurable: true,
+  get() {
+    prototypeGets++;
+    return instancePrototype;
+  }
+});
+
+function construct(Ctor, value) {
+  return new Ctor(value);
+}
+
+for (let i = 0; i < 5000; i++) construct(Base, i);
+const result = construct(Base, 42);
+JSON.stringify([
+  result.value,
+  result.targetIsBase,
+  Object.getPrototypeOf(result) === instancePrototype,
+  prototypeGets
+]);
+"#;
+
+const CONSTRUCT_COLD_EXITS: &str = r#"
+let basePrototypeGets = 0;
+let otherPrototypeGets = 0;
+const basePrototype = { kind: "base" };
+const otherPrototype = { kind: "other" };
+
+function Base(value) {
+  if (value.fail) throw "construct-boom";
+  return value;
+}
+
+function Other(value) {
+  this.value = value;
+}
+
+Object.defineProperty(Base, "prototype", {
+  configurable: true,
+  get() {
+    basePrototypeGets++;
+    return basePrototype;
+  }
+});
+Object.defineProperty(Other, "prototype", {
+  configurable: true,
+  get() {
+    otherPrototypeGets++;
+    return otherPrototype;
+  }
+});
+
+function construct(Ctor, value) {
+  return new Ctor(value);
+}
+
+const warmOverride = { override: 1, fail: false };
+for (let i = 0; i < 5000; i++) construct(Base, warmOverride);
+const override = construct(Base, { override: 42, fail: false });
+let caught = "missing";
+try {
+  construct(Base, { fail: true });
+} catch (error) {
+  caught = error;
+}
+const miss = construct(Other, 7);
+const recovered = construct(Base, { override: 10, fail: false });
+JSON.stringify([
+  override.override,
+  caught,
+  miss.value,
+  Object.getPrototypeOf(miss) === otherPrototype,
+  recovered.override,
+  basePrototypeGets,
+  otherPrototypeGets
+]);
+"#;
+
+const CONSTRUCT_GC: &str = r#"
+let constructGcProbe = false;
+const constructGcPrototype = { marker: "prototype" };
+globalThis.__machineConstructGcSink = [];
+
+function GcBase(marker) {
+  this.marker = marker;
+}
+
+Object.defineProperty(GcBase, "prototype", {
+  configurable: true,
+  get() {
+    if (constructGcProbe) {
+      for (let i = 0; i < 200000; i++) {
+        globalThis.__machineConstructGcSink.push({ i, padding: "construct-gc-" + i });
+      }
+    }
+    return constructGcPrototype;
+  }
+});
+
+function constructGc(Ctor, marker) {
+  return new Ctor(marker);
+}
+
+for (let i = 0; i < 5000; i++) constructGc(GcBase, "warm:" + i);
+constructGcProbe = true;
+const marker = "kept:" + 42;
+const result = constructGc(GcBase, marker);
+JSON.stringify([
+  result.marker,
+  Object.getPrototypeOf(result) === constructGcPrototype,
+  globalThis.__machineConstructGcSink.length
+]);
+"#;
+
 struct RunResult {
     completion: String,
     stats: RuntimeExecutionStats,
     used_machine_direct_call: bool,
     used_machine_method_call: bool,
+    used_machine_construct: bool,
 }
 
 fn run(source: &'static str, name: &'static str, selection: JitSelection) -> RunResult {
@@ -296,7 +422,9 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
     .expect("Machine direct-call runtime");
     let result = runtime
         .run_script(SourceInput::from_javascript(source), name)
-        .expect("Machine direct-call fixture");
+        .unwrap_or_else(|error| {
+            panic!("Machine direct-call fixture {name} ({selection:?}): {error:?}")
+        });
     let artifact_has = |needle: &str| {
         result.jit_artifacts().is_some_and(|batch| {
             batch.bundles().iter().any(|bundle| {
@@ -318,12 +446,23 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
     let used_machine_direct_call = artifact_has("directCallEntryCell");
     let used_machine_method_call =
         artifact_has("\"callKind\": \"method\"") || artifact_has("\"callKind\":\"method\"");
+    let used_machine_construct =
+        artifact_has("\"callKind\": \"construct\"") || artifact_has("\"callKind\":\"construct\"");
     RunResult {
         completion: result.completion_string().to_owned(),
         stats: runtime.execution_stats(),
         used_machine_direct_call,
         used_machine_method_call,
+        used_machine_construct,
     }
+}
+
+fn assert_machine_construct(result: &RunResult) {
+    assert_machine_direct_call(result);
+    assert!(
+        result.used_machine_construct,
+        "fixture must publish a typed Machine IR construct target"
+    );
 }
 
 fn assert_machine_method_call(result: &RunResult) {
@@ -361,6 +500,61 @@ fn direct_return_executes_through_machine_ir() {
     assert_eq!(compiled.completion, oracle.completion);
     assert_eq!(compiled.completion, "[32896,42]");
     assert_machine_direct_call(&compiled);
+}
+
+#[test]
+fn base_construct_executes_through_machine_ir() {
+    let oracle = run(
+        BASE_CONSTRUCT,
+        "jit-machine-base-construct.js",
+        JitSelection::InterpreterOnly,
+    );
+    let compiled = run(
+        BASE_CONSTRUCT,
+        "jit-machine-base-construct.js",
+        JitSelection::ProductionTiered,
+    );
+
+    assert_eq!(compiled.completion, oracle.completion);
+    assert_eq!(compiled.completion, "[42,true,true,5001]");
+    assert_machine_construct(&compiled);
+}
+
+#[test]
+fn construct_object_throw_and_guard_miss_are_not_replayed() {
+    let oracle = run(
+        CONSTRUCT_COLD_EXITS,
+        "jit-machine-construct-cold-exits.js",
+        JitSelection::InterpreterOnly,
+    );
+    let compiled = run(
+        CONSTRUCT_COLD_EXITS,
+        "jit-machine-construct-cold-exits.js",
+        JitSelection::ProductionTiered,
+    );
+
+    assert_eq!(compiled.completion, oracle.completion);
+    assert_eq!(
+        compiled.completion,
+        r#"[42,"construct-boom",7,true,10,5003,1]"#
+    );
+    assert_machine_construct(&compiled);
+}
+
+#[test]
+fn construct_receiver_and_arguments_survive_reentrant_moving_gc() {
+    let compiled = run(
+        CONSTRUCT_GC,
+        "jit-machine-construct-gc.js",
+        JitSelection::ProductionTiered,
+    );
+
+    assert_eq!(compiled.completion, r#"["kept:42",true,200000]"#);
+    assert_machine_construct(&compiled);
+    assert!(
+        compiled.stats.gc_minor_cycles > 0,
+        "prototype getter must trigger moving GC while construct roots are published"
+    );
 }
 
 #[test]

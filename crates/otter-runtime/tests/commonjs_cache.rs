@@ -429,9 +429,14 @@ fn run_nested_jit_require(selection: JitSelection) -> JitRequireResult {
 
         const probe = { value: 1 };
         let checksum = 0;
-        for (let i = 0; i < 512; i++) {
+        for (let i = 0; i < 640; i++) {
             checksum += loadFromHotFunction(null, probe);
         }
+
+        // Prove the installed template body actually executes: a different
+        // receiver shape must take exactly one property transition before the
+        // following unsupported require path side-exits.
+        checksum += loadFromHotFunction(null, { padding: 0, value: 1 });
 
         const outer = loadFromHotFunction("./outer.cjs", probe);
         globalThis.__nestedJitRequireResult = JSON.stringify([
@@ -465,7 +470,7 @@ fn nested_require_after_template_jit_side_exit_matches_the_interpreter() {
     let compiled = run_nested_jit_require(JitSelection::Template);
 
     assert_eq!(compiled.completion, oracle.completion);
-    assert_eq!(compiled.completion, "[512,42,true,true]");
+    assert_eq!(compiled.completion, "[641,42,true,true]");
     assert!(
         compiled.stats.jit_compile_attempts > 0,
         "fixture must compile the require caller"
@@ -476,6 +481,7 @@ fn nested_require_after_template_jit_side_exit_matches_the_interpreter() {
     );
     assert!(
         compiled.stats.jit_runtime_property_stubs > 0,
-        "fixture must execute the compiled require caller before the exact side exit"
+        "fixture must execute the compiled require caller before the exact side exit: {:#?}",
+        compiled.stats
     );
 }

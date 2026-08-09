@@ -365,6 +365,9 @@ pub enum DirectCallKind {
         /// Exact VM-baked receiver, prototype, and method-slot identity.
         guard: otter_vm::jit::JitMethodGuard,
     },
+    /// Base construction with receiver creation and `new.target` publication
+    /// owned by the generated call boundary.
+    Construct,
 }
 
 /// Semantic destination selected before target emission.

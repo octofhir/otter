@@ -314,6 +314,7 @@ impl CodeBlock {
             // per-site feedback and can resolve callee bodies); the raw snapshot
             // carries none.
             direct_callees: rustc_hash::FxHashMap::default(),
+            direct_constructs: rustc_hash::FxHashMap::default(),
             direct_methods: rustc_hash::FxHashMap::default(),
             inline_callees: rustc_hash::FxHashMap::default(),
             inline_methods: rustc_hash::FxHashMap::default(),

@@ -116,6 +116,12 @@ impl Interpreter {
         );
         frame.self_value = self_value;
         frame.pc = native.header.pc;
+        if matches!(call_kind, jit::JitDirectCallKind::Construct) {
+            let receiver = this_value.as_object().ok_or(VmError::InvalidOperand)?;
+            let cold = self.frame_ensure_cold(&mut frame);
+            cold.construct_target = Some(receiver);
+            cold.new_target = Some(active.new_target_value());
+        }
 
         self.with_materialized_generated_call_depth(|interp| {
             let floor = stack.floor();

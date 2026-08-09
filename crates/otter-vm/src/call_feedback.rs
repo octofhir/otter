@@ -5,7 +5,7 @@
 //!   the canonical instruction index in the supplied CodeBlock.
 //!
 //! # Invariants
-//! - The typed `Op::Call` payload owns the bounded target population; no
+//! - The typed `Op::Call` / `Op::New` payload owns the bounded target population; no
 //!   interpreter-side `(function_id, pc)` map mirrors it.
 //! - Bytecode and supported static-native identities share one coherent target
 //!   population and one transition epoch.

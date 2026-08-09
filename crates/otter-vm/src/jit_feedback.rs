@@ -464,7 +464,12 @@ impl TypedFeedbackSlot {
                 Self::Property(Box::new(AtomicPropertyFeedback::new(PropertyIcKind::Has)))
             }
             Op::CallMethodValue => Self::Method,
-            Op::Call | Op::New | Op::SuperConstruct => Self::Call(Box::default()),
+            Op::Call
+            | Op::CallSpread
+            | Op::New
+            | Op::NewSpread
+            | Op::SuperConstruct
+            | Op::SuperConstructSpread => Self::Call(Box::default()),
             _ => Self::None,
         }
     }
@@ -1074,6 +1079,25 @@ mod tests {
                 hits: 1,
             }))
         );
+    }
+
+    #[test]
+    fn spread_call_family_owns_typed_call_feedback() {
+        for op in [Op::CallSpread, Op::NewSpread, Op::SuperConstructSpread] {
+            let vector = FeedbackVector::for_instruction_ops([op]);
+            assert_eq!(
+                vector.record_call(0, OrdinaryCallTarget::Bytecode(23)),
+                CallTargetTransition::BecameMonomorphic,
+                "{op:?}"
+            );
+            assert!(matches!(
+                vector.call_slot(0).and_then(|slot| slot.distribution()),
+                Some(CallSiteDistribution::Mono(CallTargetCount {
+                    target: OrdinaryCallTarget::Bytecode(23),
+                    hits: 1,
+                }))
+            ));
+        }
     }
 
     #[test]

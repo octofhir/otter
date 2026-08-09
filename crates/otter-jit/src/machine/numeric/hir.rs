@@ -72,8 +72,7 @@ pub(super) enum NumericNode {
     DirectCall {
         source: NumericValue,
         target: u16,
-        argument_start: u16,
-        argument_count: u8,
+        arguments: NumericDirectCallArguments,
         logical_pc: u32,
         byte_pc: u32,
         exceptional_edge: Option<u16>,
@@ -124,6 +123,12 @@ pub(super) enum NumericNode {
     LessEqual(NumericValue, NumericValue),
     GreaterThan(NumericValue, NumericValue),
     GreaterEqual(NumericValue, NumericValue),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum NumericDirectCallArguments {
+    Fixed { start: u16, count: u8 },
+    Spread(NumericValue),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -682,6 +687,11 @@ fn infer_instruction_parameters(
             let _ = read(register(instruction, code, 1)?)?;
             *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
+        Op::CallSpread | Op::NewSpread | Op::SuperConstructSpread => {
+            let _ = read(register(instruction, code, 1)?)?;
+            let _ = read(register(instruction, code, 2)?)?;
+            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
+        }
         Op::CallMethodValue => {
             let count = usize::try_from(instruction.const_index(code, 3)?).ok()?;
             let _ = instruction.const_index(code, 2)?;
@@ -798,7 +808,13 @@ fn build_raw_blocks(view: &JitCompileSnapshot) -> Option<Vec<RawBlock>> {
         let pc = u32::try_from(pc).ok()?;
         if matches!(
             instruction.op(code),
-            Op::Call | Op::CallMethodValue | Op::New | Op::SuperConstruct
+            Op::Call
+                | Op::CallMethodValue
+                | Op::CallSpread
+                | Op::New
+                | Op::NewSpread
+                | Op::SuperConstruct
+                | Op::SuperConstructSpread
         ) && code
             .control_flow()
             .enclosing_exception_region(pc)
@@ -847,7 +863,13 @@ fn build_raw_blocks(view: &JitCompileSnapshot) -> Option<Vec<RawBlock>> {
         };
         let exceptional = matches!(
             op,
-            Op::Call | Op::CallMethodValue | Op::New | Op::SuperConstruct
+            Op::Call
+                | Op::CallMethodValue
+                | Op::CallSpread
+                | Op::New
+                | Op::NewSpread
+                | Op::SuperConstruct
+                | Op::SuperConstructSpread
         )
         .then(|| code.control_flow().enclosing_exception_region(terminal_pc))
         .flatten()
@@ -1007,6 +1029,13 @@ fn instruction_accesses(
             }
             Some((reads, vec![register(instruction, code, 0)?]))
         }
+        Op::CallSpread | Op::NewSpread | Op::SuperConstructSpread => Some((
+            vec![
+                register(instruction, code, 1)?,
+                register(instruction, code, 2)?,
+            ],
+            vec![register(instruction, code, 0)?],
+        )),
         Op::CallMethodValue => {
             let count = usize::try_from(instruction.const_index(code, 3)?).ok()?;
             let _ = instruction.const_index(code, 2)?;
@@ -1321,8 +1350,10 @@ fn lower_instruction(
                 NumericNode::DirectCall {
                     source,
                     target: u16::try_from(target_index).ok()?,
-                    argument_start,
-                    argument_count: u8::try_from(argument_count).ok()?,
+                    arguments: NumericDirectCallArguments::Fixed {
+                        start: argument_start,
+                        count: u8::try_from(argument_count).ok()?,
+                    },
                     logical_pc,
                     byte_pc: instruction.byte_pc,
                     exceptional_edge: exceptional_edge.map(u16::try_from).transpose().ok()?,
@@ -1377,8 +1408,70 @@ fn lower_instruction(
                 NumericNode::DirectCall {
                     source,
                     target: u16::try_from(target_index).ok()?,
-                    argument_start,
-                    argument_count: u8::try_from(argument_count).ok()?,
+                    arguments: NumericDirectCallArguments::Fixed {
+                        start: argument_start,
+                        count: u8::try_from(argument_count).ok()?,
+                    },
+                    logical_pc,
+                    byte_pc: instruction.byte_pc,
+                    exceptional_edge: exceptional_edge.map(u16::try_from).transpose().ok()?,
+                },
+            );
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
+            write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            )?;
+            return Some(());
+        }
+        Op::CallSpread | Op::NewSpread | Op::SuperConstructSpread => {
+            let callee = match op {
+                Op::CallSpread => *direct_callees.get(&instruction.byte_pc)?,
+                Op::NewSpread | Op::SuperConstructSpread => {
+                    *direct_constructs.get(&instruction.byte_pc)?
+                }
+                _ => return None,
+            };
+            let target = NumericDirectCallTarget {
+                kind: match (op, callee.plan.is_derived_constructor) {
+                    (Op::CallSpread, _) => NumericDirectCallKind::Plain,
+                    (Op::NewSpread, false) => NumericDirectCallKind::Construct,
+                    (Op::NewSpread, true) => NumericDirectCallKind::DerivedConstruct,
+                    (Op::SuperConstructSpread, false) => NumericDirectCallKind::SuperConstruct,
+                    (Op::SuperConstructSpread, true) => {
+                        NumericDirectCallKind::DerivedSuperConstruct
+                    }
+                    _ => return None,
+                },
+                callee,
+            };
+            let source = read_value(registers, register(instruction, code, 1)?)?;
+            let arguments = NumericDirectCallArguments::Spread(read_value(
+                registers,
+                register(instruction, code, 2)?,
+            )?);
+            let target_index = direct_call_targets
+                .iter()
+                .position(|candidate| *candidate == target)
+                .unwrap_or_else(|| {
+                    direct_call_targets.push(target);
+                    direct_call_targets.len() - 1
+                });
+            let value = push(
+                nodes,
+                NumericNode::DirectCall {
+                    source,
+                    target: u16::try_from(target_index).ok()?,
+                    arguments,
                     logical_pc,
                     byte_pc: instruction.byte_pc,
                     exceptional_edge: exceptional_edge.map(u16::try_from).transpose().ok()?,
@@ -1434,8 +1527,10 @@ fn lower_instruction(
                 NumericNode::DirectCall {
                     source,
                     target: u16::try_from(target_index).ok()?,
-                    argument_start,
-                    argument_count: u8::try_from(argument_count).ok()?,
+                    arguments: NumericDirectCallArguments::Fixed {
+                        start: argument_start,
+                        count: u8::try_from(argument_count).ok()?,
+                    },
                     logical_pc,
                     byte_pc: instruction.byte_pc,
                     exceptional_edge: exceptional_edge.map(u16::try_from).transpose().ok()?,

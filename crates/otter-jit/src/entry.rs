@@ -294,6 +294,10 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_class_super_constructor_stub as *const () as usize,
         ),
         binding(
+            abi::STUB_JIT_COPY_SPREAD_ARGUMENTS,
+            jit_copy_spread_arguments_stub as *const () as usize,
+        ),
+        binding(
             abi::STUB_JIT_COERCE_UNARY,
             jit_coerce_unary_stub as *const () as usize,
         ),

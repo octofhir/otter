@@ -1278,10 +1278,15 @@ impl Interpreter {
             })
             .collect();
         for (instruction_pc, call_byte_pc, op, state) in call_sites {
-            let is_construct = matches!(op, Op::New | Op::SuperConstruct);
+            let is_construct = matches!(
+                op,
+                Op::New | Op::NewSpread | Op::SuperConstruct | Op::SuperConstructSpread
+            );
             let unresolved_call_kind = match op {
-                Op::New => jit::JitDirectCallKind::Construct,
-                Op::SuperConstruct => jit::JitDirectCallKind::SuperConstruct,
+                Op::New | Op::NewSpread => jit::JitDirectCallKind::Construct,
+                Op::SuperConstruct | Op::SuperConstructSpread => {
+                    jit::JitDirectCallKind::SuperConstruct
+                }
                 _ => jit::JitDirectCallKind::Plain,
             };
             let feedback::CallSiteDistribution::Mono(target) = state else {
@@ -1428,10 +1433,14 @@ impl Interpreter {
                 }
             };
             let call_kind = match (op, callee.is_derived_constructor) {
-                (Op::New, false) => jit::JitDirectCallKind::Construct,
-                (Op::New, true) => jit::JitDirectCallKind::DerivedConstruct,
-                (Op::SuperConstruct, false) => jit::JitDirectCallKind::SuperConstruct,
-                (Op::SuperConstruct, true) => jit::JitDirectCallKind::DerivedSuperConstruct,
+                (Op::New | Op::NewSpread, false) => jit::JitDirectCallKind::Construct,
+                (Op::New | Op::NewSpread, true) => jit::JitDirectCallKind::DerivedConstruct,
+                (Op::SuperConstruct | Op::SuperConstructSpread, false) => {
+                    jit::JitDirectCallKind::SuperConstruct
+                }
+                (Op::SuperConstruct | Op::SuperConstructSpread, true) => {
+                    jit::JitDirectCallKind::DerivedSuperConstruct
+                }
                 _ => jit::JitDirectCallKind::Plain,
             };
             self.record_jit_direct_call_plan(
@@ -1444,7 +1453,7 @@ impl Interpreter {
                 1,
                 direct_call_outcome,
             );
-            if is_construct {
+            if is_construct || op == Op::CallSpread {
                 continue;
             }
             if !splice_candidates {

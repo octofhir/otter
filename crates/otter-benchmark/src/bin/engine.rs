@@ -3091,6 +3091,32 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
+    fn spread_call_family_kernel_exercises_generated_linkage() {
+        let record = run_kernel(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../benchmarks/scripts/spread-call-family.js"),
+            "engineKernel".into(),
+            15_000_750_000.0,
+            EngineJitTier::ProductionTiered,
+            None,
+            1,
+            1,
+        );
+        assert!(record.failure.is_none(), "{:?}", record.failure);
+        let generated_calls = record
+            .measurements
+            .jit_counters
+            .iter()
+            .find(|(name, _)| *name == "jit-generated-calls")
+            .map_or(0, |(_, value)| *value);
+        assert!(
+            generated_calls > 400_000,
+            "kernel must execute generated linkage for every spread-call form; got {generated_calls}"
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
     fn jit_compile_executes_numeric_leaf_through_production_optimizer() {
         let record = run_jit_compile(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))

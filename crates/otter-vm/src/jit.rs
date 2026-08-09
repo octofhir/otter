@@ -275,16 +275,16 @@ pub struct JitCompileSnapshot {
     /// byte-PC. Each plan names one exact bootstrap function identity and one
     /// machine-code operation; misses side-exit before effects.
     pub static_native_calls: rustc_hash::FxHashMap<u32, JitStaticNativeCall>,
-    /// Compiler-native direct callees keyed by the caller's `Op::Call`
-    /// byte-PC. Each entry names one monomorphic, ordinary synchronous callee
+    /// Compiler-native direct callees keyed by the caller's `Op::Call` or
+    /// `Op::CallSpread` byte-PC. Each entry names one monomorphic synchronous callee
     /// with no callee-owned upvalue cells and a current non-OSR native entry.
     /// The emitter guards the dynamic callable against
     /// [`JitDirectCallPlan::function_id`] and side-exits if the identity or
     /// entry-cell lease no longer matches; no runtime resolver is part of the
     /// compiled hit path.
     pub direct_callees: rustc_hash::FxHashMap<u32, JitDirectCallee>,
-    /// Compiler-native constructors keyed by the caller's `Op::New` or
-    /// `Op::SuperConstruct` byte-PC. The dynamic callee must be the exact
+    /// Compiler-native constructors keyed by fixed or spread `Op::New` /
+    /// `Op::SuperConstruct` byte-PCs. The dynamic callee must be the exact
     /// function or closure identity; receiver creation, derived-`this`, and
     /// `new.target` publication/inheritance are part of the generated boundary.
     pub direct_constructs: rustc_hash::FxHashMap<u32, JitDirectCallee>,

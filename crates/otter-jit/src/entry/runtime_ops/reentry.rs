@@ -1262,6 +1262,34 @@ pub(crate) extern "C" fn jit_class_super_constructor_stub(
         .to_bits()
 }
 
+/// Copy the compiler-created dense spread array into an unpublished generated
+/// callee frame. `0` is success and `1` is an exact pre-entry guard miss.
+pub(crate) extern "C" fn jit_copy_spread_arguments_stub(
+    ctx: *mut JitCtx,
+    arguments_bits: u64,
+    frame: *mut otter_vm::native_abi::NativeFrame,
+    parameter_count: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` entry contract.
+    let ctx = unsafe { &mut *ctx };
+    let Some(activation) = ctx.checked_activation() else {
+        return 1;
+    };
+    let Ok(parameter_count) = u16::try_from(parameter_count) else {
+        return 1;
+    };
+    let vm = unsafe { &*activation.vm_ptr() };
+    // SAFETY: generated linkage owns and keeps the fully initialized but not
+    // yet published stack frame live across this leaf call.
+    u64::from(!unsafe {
+        vm.jit_copy_spread_arguments(
+            otter_vm::Value::from_bits(arguments_bits),
+            frame,
+            parameter_count,
+        )
+    })
+}
+
 /// Complete one full loose-equality opcode in the VM. `0` = destination
 /// written, `1` = threw (coercion raised), `2` = no live activation
 /// (isolate-less probe harness; exact side exit).

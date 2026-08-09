@@ -55,6 +55,41 @@ const derived = constructDerived(Derived, 84);
 const override = { marker: "derived-override" };
 const returned = constructDerivedReturner(DerivedReturner, override);
 
+function spreadAdd(left, right) {
+  return left + right;
+}
+function callSpread(fn, values) {
+  return fn(...values);
+}
+function SpreadBase(left, right) {
+  this.total = left + right;
+  this.targetMatches = new.target === SpreadBase;
+}
+function constructSpread(Ctor, values) {
+  return new Ctor(...values);
+}
+class SpreadDerivedBase {
+  constructor(left, right) {
+    this.total = left + right;
+  }
+}
+class SpreadDerived extends SpreadDerivedBase {
+  constructor(values) {
+    super(...values);
+  }
+}
+function constructSpreadDerived(Ctor, values) {
+  return new Ctor(values);
+}
+for (let i = 0; i < 5000; i++) {
+  callSpread(spreadAdd, [i, 2]);
+  constructSpread(SpreadBase, [i, 3]);
+  constructSpreadDerived(SpreadDerived, [i, 4]);
+}
+const spreadCall = callSpread(spreadAdd, [40, 2]);
+const spreadBase = constructSpread(SpreadBase, [39, 3]);
+const spreadDerived = constructSpreadDerived(SpreadDerived, [38, 4]);
+
 console.log(JSON.stringify([
   result.value,
   result.targetMatches,
@@ -63,5 +98,10 @@ console.log(JSON.stringify([
   derived.value,
   Object.getPrototypeOf(derived) === Derived.prototype,
   returned === override,
-  derivedBaseRuns
+  derivedBaseRuns,
+  spreadCall,
+  spreadBase.total,
+  spreadBase.targetMatches,
+  spreadDerived.total,
+  Object.getPrototypeOf(spreadDerived) === SpreadDerived.prototype
 ]));

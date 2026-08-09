@@ -376,6 +376,15 @@ pub enum DirectCallKind {
     DerivedSuperConstruct,
 }
 
+/// How a generated call obtains the callee's declared parameter prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectCallArgumentMode {
+    /// Each argument is an explicit machine operand.
+    Fixed,
+    /// One machine operand names the compiler-created dense argument array.
+    Spread,
+}
+
 /// Semantic destination selected before target emission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallTarget {
@@ -386,6 +395,8 @@ pub enum CallTarget {
     Direct {
         /// Plain or receiver-bound method entry through the shared linkage.
         kind: DirectCallKind,
+        /// Fixed operands or one compiler-created dense spread array.
+        argument_mode: DirectCallArgumentMode,
         /// Exact callee generation plan and stable function entry cell.
         callee: otter_vm::JitDirectCallee,
         /// Calling function identity used by started-call deoptimization.

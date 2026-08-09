@@ -71,7 +71,7 @@ The old optimizing compiler and template emitter remain in the active graph
 only for operations and function shapes not yet selected by the replacement
 pipeline. They are fallback, not contracts to preserve.
 
-Latest accepted gate: 282 JIT tests, 834 VM tests, all-target/all-feature
+Latest accepted gate: 282 JIT tests, 835 VM tests, all-target/all-feature
 Clippy, compile-fail/rooting checks, and 21/21 differential
 interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.
 
@@ -79,16 +79,19 @@ interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.
 
 ### 1. Complete reentrant operation families
 
-Plain calls, guarded methods, and fixed-arity base, derived, and superclass
+Plain calls, guarded methods, and fixed or spread base, derived, and superclass
 constructs now use the same descriptor, allocator roots, stable entry cells,
 frame publication, cold deopt machinery, and explicit catch landing edges.
 Construction validates the generation before observable receiver work,
 publishes or inherits `new.target`, preserves the derived-`this` TDZ, and
 applies the one base/derived return contract without replaying `New` or
-`SuperConstruct`. Extend that one boundary to the remaining reentrant forms:
+`SuperConstruct`. `CallSpread`, `NewSpread`, and `SuperConstructSpread` own
+ordinary typed call feedback and bake monomorphic targets into this linkage.
+The spread array remains rooted across cold resolution/receiver preparation
+and a leaf runtime stub copies declared arguments directly into the unpublished
+callee frame; no second call, frame, root, or result ABI exists. Extend that
+one boundary to the remaining reentrant forms:
 
-- lower spread construction without a second call, frame, root, or result
-  format;
 - admit nested catch/finally regions and complete multi-frame state through
   `lower_deopt_table`;
 - move reentrant natives onto typed descriptors instead of opcode-specific
@@ -103,7 +106,7 @@ not add a second call format.
 
 Implement in this order:
 
-1. spread constructs, nested/finally exceptional edges, and multi-frame state;
+1. nested/finally exceptional edges and multi-frame state;
 2. settled fields and elements with dependency tokens, guards, and barriers;
 3. inline object allocation, constructors, and virtual objects;
 4. OSR at every reducible loop and incremental-GC handshakes.

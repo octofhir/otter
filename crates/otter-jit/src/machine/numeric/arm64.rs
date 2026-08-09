@@ -49,14 +49,14 @@ use otter_vm::{
 
 use super::super::{
     AllocatedLocation, AllocatedSequence, AllocationEdit, AllocationPoint, CallTarget, DeoptId,
-    DirectCallKind, InstructionSequence, MachineFrameLayout, MachineInstructionId, MachineOpcode,
-    MachineOsrInput, MachineOsrType, MachineRepresentation, MachineSafepointSite,
-    MachineSafepointTable,
+    DirectCallArgumentMode, DirectCallKind, InstructionSequence, MachineFrameLayout,
+    MachineInstructionId, MachineOpcode, MachineOsrInput, MachineOsrType, MachineRepresentation,
+    MachineSafepointSite, MachineSafepointTable,
 };
 use crate::{
     CompiledCode, Unsupported,
     arm64::{
-        DirectCallForm, DirectCallSite, emit_direct_call_with_access,
+        DirectCallArguments, DirectCallForm, DirectCallSite, emit_direct_call_with_access,
         emit_method_guard_from_tagged_register,
     },
     artifact::relocation::{RelocationCapture, RelocationTarget},
@@ -244,6 +244,7 @@ pub(super) fn emit(
     prepare_construct_entry: u64,
     construct_result_entry: u64,
     derived_construct_result_entry: u64,
+    copy_spread_arguments_entry: u64,
     bind_derived_this_entry: u64,
     class_super_constructor_entry: u64,
     load_upvalue_value_entry: u64,
@@ -747,6 +748,7 @@ pub(super) fn emit(
                     .ok_or(Unsupported::OperandShape("scalar call descriptor"))?;
                 if let CallTarget::Direct {
                     kind,
+                    argument_mode,
                     callee,
                     caller_function_id,
                     logical_pc,
@@ -819,6 +821,10 @@ pub(super) fn emit(
                             })
                         })
                         .collect::<Result<Vec<_>, _>>()?;
+                    let arguments = match argument_mode {
+                        DirectCallArgumentMode::Fixed => DirectCallArguments::Fixed(&arguments),
+                        DirectCallArgumentMode::Spread => DirectCallArguments::Spread(1),
+                    };
                     emit_direct_call_with_access(
                         &mut ops,
                         &mut relocations,
@@ -832,13 +838,14 @@ pub(super) fn emit(
                                 Unsupported::OperandShape("scalar direct call result")
                             })?,
                             form,
-                            arguments: &arguments,
+                            arguments,
                         },
                         deopt_stack_call_entry,
                         resolve_direct_entry,
                         prepare_construct_entry,
                         construct_result_entry,
                         derived_construct_result_entry,
+                        copy_spread_arguments_entry,
                         None,
                         direct_bail,
                         direct_threw,

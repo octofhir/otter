@@ -54,7 +54,7 @@ use super::values::{
     emit_slab_base, emit_store_reg,
 };
 use crate::arm64::{
-    DirectCallForm, DirectCallSite, MethodGuardSite, direct_call_artifact,
+    DirectCallArguments, DirectCallForm, DirectCallSite, MethodGuardSite, direct_call_artifact,
     direct_call_target_is_supported, emit_direct_call, emit_method_guard,
 };
 use crate::artifact::relocation::{
@@ -1023,7 +1023,7 @@ pub(super) fn emit_call(
                 byte_pc,
                 dst,
                 form: DirectCallForm::Plain { callable: callee },
-                arguments: argument_registers,
+                arguments: DirectCallArguments::Fixed(argument_registers),
             },
             table.entry(abi::STUB_JIT_DEOPT_STACK_CALL),
             table.entry(abi::STUB_JIT_RESOLVE_DIRECT_ENTRY),
@@ -1074,7 +1074,9 @@ pub(super) fn emit_call(
     Ok(())
 }
 
-fn direct_call_target_tier(target: &otter_vm::JitDirectCallee) -> otter_vm::JitDebugTier {
+pub(super) fn direct_call_target_tier(
+    target: &otter_vm::JitDirectCallee,
+) -> otter_vm::JitDebugTier {
     match target.plan.tier {
         abi::NativeFrameKind::Baseline => otter_vm::JitDebugTier::Template,
         abi::NativeFrameKind::Optimizing => otter_vm::JitDebugTier::Optimizing,
@@ -1084,7 +1086,7 @@ fn direct_call_target_tier(target: &otter_vm::JitDirectCallee) -> otter_vm::JitD
     }
 }
 
-fn direct_call_lowering_event(
+pub(super) fn direct_call_lowering_event(
     call_kind: otter_vm::JitDirectCallKind,
     logical_pc: u32,
     byte_pc: u32,
@@ -1319,7 +1321,7 @@ pub(super) fn emit_method_call(
                 callable: 17,
                 receiver,
             },
-            arguments: argument_registers,
+            arguments: DirectCallArguments::Fixed(argument_registers),
         };
         let direct_call = direct_call_artifact(view, direct_site)?;
         let guard_start = ops.offset().0;
@@ -1386,13 +1388,18 @@ pub(super) fn emit_method_call(
             ops,
             relocations,
             table,
+            view,
+            None,
+            None,
             Op::CallMethodValue as u8,
             packed_meta,
             pack_method_arg_regs(argument_registers),
             u64::from(name),
+            logical_pc,
+            byte_pc,
             bail,
             threw,
-        );
+        )?;
         dynasm!(ops ; .arch aarch64 ; b =>done);
     } else {
         dynasm!(ops ; .arch aarch64 ; b =>bail);

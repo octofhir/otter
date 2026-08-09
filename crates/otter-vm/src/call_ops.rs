@@ -475,6 +475,46 @@ impl Interpreter {
             .map_or_else(Value::hole, |class| class.ctor_proto(&self.gc_heap))
     }
 
+    /// Copy a compiler-collected spread argument array into an unpublished
+    /// native callee frame without allocation or observable JavaScript work.
+    ///
+    /// # Safety
+    ///
+    /// `frame` must name an initialized, exclusively owned [`NativeFrame`]
+    /// whose register window remains live for this call. It is deliberately
+    /// not published until the generated caller completes this copy.
+    pub unsafe fn jit_copy_spread_arguments(
+        &self,
+        arguments: Value,
+        frame: *mut crate::native_abi::NativeFrame,
+        parameter_count: u16,
+    ) -> bool {
+        let Some(array) = arguments.as_array() else {
+            return false;
+        };
+        // SAFETY: upheld by the generated-linkage caller; the view validates
+        // the raw frame and window descriptors before exposing scalar writes.
+        let Ok(mut frame) = (unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }) else {
+            return false;
+        };
+        if usize::from(parameter_count) > frame.register_count() {
+            return false;
+        }
+        crate::array::with_elements(array, &self.gc_heap, |elements| {
+            for (index, value) in elements
+                .iter()
+                .copied()
+                .take(usize::from(parameter_count))
+                .enumerate()
+            {
+                if frame.write(index as u16, value).is_err() {
+                    return false;
+                }
+            }
+            true
+        })
+    }
+
     pub(crate) fn lean_callback_parent_upvalue(
         &self,
         state: &LeanCallbackState,

@@ -1214,13 +1214,18 @@ pub(super) fn compile(
                     &mut ops,
                     &mut relocations,
                     transitions,
+                    view,
+                    direct_call_events.as_mut(),
+                    code_map.as_mut(),
                     opcode,
                     arg0,
                     arg1,
                     arg2,
+                    instr.pc,
+                    instr.byte_pc,
                     bail,
                     threw,
-                );
+                )?;
             }
             TemplateOp::ClassValueOp {
                 opcode,

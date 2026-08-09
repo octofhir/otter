@@ -623,6 +623,7 @@ opcode_schema! {
     (Op::LessThanImm, 0xAE),
     (Op::EqualImm, 0xAF),
     (Op::NotEqualImm, 0xB0),
+    (Op::SuperConstruct, 0xB1),
 }
 
 /// Return the authoritative schema row for `op`.
@@ -823,7 +824,7 @@ const fn operand_shape(op: Op) -> OperandShape {
             count_operand_index: 3,
             tail: R,
         },
-        Op::New => OperandShape::Variadic {
+        Op::New | Op::SuperConstruct => OperandShape::Variadic {
             prefix: CALL_PREFIX,
             count_operand_index: 2,
             tail: R,
@@ -1077,6 +1078,7 @@ const fn control_flow(op: Op) -> ControlFlow {
         | Op::CallSpread
         | Op::New
         | Op::NewSpread
+        | Op::SuperConstruct
         | Op::SuperConstructSpread
         | Op::Eval
         | Op::PromiseCall => ControlFlow::Call,
@@ -1103,7 +1105,12 @@ const fn feedback(op: Op) -> FeedbackKind {
         Op::LoadElement | Op::StoreElement | Op::DeleteElement | Op::ArrayLength => {
             FeedbackKind::Element
         }
-        Op::Call | Op::CallWithThis | Op::CallMethodValue | Op::TailCall => FeedbackKind::Call,
+        Op::Call
+        | Op::CallWithThis
+        | Op::CallMethodValue
+        | Op::TailCall
+        | Op::New
+        | Op::SuperConstruct => FeedbackKind::Call,
         Op::LoadGlobalOrThrow
         | Op::LoadGlobalOrUndefined
         | Op::StoreGlobalBinding

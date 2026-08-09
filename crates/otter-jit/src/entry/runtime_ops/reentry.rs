@@ -671,6 +671,19 @@ pub(crate) extern "C" fn jit_class_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    if opcode as u8 == otter_bytecode::Op::BindThisValue as u8 {
+        match ctx
+            .runtime_call()
+            .and_then(|mut call| call.bind_derived_this(arg0 as u16))
+        {
+            Ok(()) => return 0,
+            Err(VmError::InvalidOperand) => {}
+            Err(err) => {
+                park_jit_error(ctx, err);
+                return STATUS_THREW;
+            }
+        }
+    }
     let frame_index = match ctx.materialized_frame_index() {
         Ok(index) => index,
         Err(_) => return STATUS_BAILED,
@@ -682,7 +695,17 @@ pub(crate) extern "C" fn jit_class_op_stub(
     let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
     match vm.jit_runtime_class_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2) {
-        Ok(()) => 0,
+        Ok(()) => {
+            if opcode as u8 == otter_bytecode::Op::BindThisValue as u8
+                && let Err(err) = ctx
+                    .runtime_call()
+                    .and_then(|mut call| call.refresh_materialized_this_value())
+            {
+                park_jit_error(ctx, err);
+                return STATUS_THREW;
+            }
+            0
+        }
         Err(err) => {
             park_jit_error(ctx, err);
             STATUS_THREW
@@ -1022,7 +1045,9 @@ pub(crate) extern "C" fn jit_bind_function_stub(
     }
 }
 
-/// Complete one full `Op::New` construct in the VM. `0` = destination
+/// Complete one full fixed-arity `Op::New` or `Op::SuperConstruct` in the VM.
+/// `super_construct` selects the entered frame's immutable `new.target`.
+/// `0` = destination
 /// written and the compiled caller continues, `1` = threw, `2` = a
 /// non-constructor callee or no live activation (exact side exit; the
 /// interpreter owns the thrown error).
@@ -1030,7 +1055,7 @@ pub(crate) extern "C" fn jit_construct_stub(
     ctx: *mut JitCtx,
     dst: u64,
     callee: u64,
-    argc: u64,
+    argc_and_mode: u64,
     packed_args: u64,
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
@@ -1042,6 +1067,26 @@ pub(crate) extern "C" fn jit_construct_stub(
             return 1;
         }
     };
+    let (caller_function_id, call_pc) = match ctx.active_frame() {
+        Ok(frame) => (frame.function_id(), frame.pc()),
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
+    let super_construct = argc_and_mode >> 63 != 0;
+    let argc = argc_and_mode & u64::from(u16::MAX);
+    let inherited_new_target = if super_construct {
+        match ctx.active_frame() {
+            Ok(frame) => Some(frame.new_target_value()),
+            Err(err) => {
+                park_jit_error(ctx, err);
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
     let Some(activation) = ctx.checked_activation() else {
         return 2;
     };
@@ -1050,7 +1095,17 @@ pub(crate) extern "C" fn jit_construct_stub(
     let context = unsafe { &*activation.context_ptr() };
     let mut inline_args = [0u16; crate::entry::MAX_METHOD_ARGS];
     let args = crate::entry::decode_packed_arg_regs(argc as usize, packed_args, &mut inline_args);
-    match vm.jit_runtime_construct_in_place(context, stack, dst as u16, callee as u16, args, regs) {
+    match vm.jit_runtime_construct_in_place(
+        context,
+        stack,
+        dst as u16,
+        callee as u16,
+        args,
+        regs,
+        inherited_new_target,
+        caller_function_id,
+        call_pc,
+    ) {
         Ok(true) => 0,
         Ok(false) => 2,
         Err(err) => match try_resume_caller_throw(ctx, matches!(err, VmError::Uncaught)) {
@@ -1073,7 +1128,7 @@ pub(crate) extern "C" fn jit_construct_stub(
 pub(crate) extern "C" fn jit_prepare_base_construct_stub(
     ctx: *mut JitCtx,
     callee_bits: u64,
-    _reserved0: u64,
+    new_target_bits: u64,
     _reserved1: u64,
     _reserved2: u64,
 ) -> JitRet {
@@ -1093,6 +1148,7 @@ pub(crate) extern "C" fn jit_prepare_base_construct_stub(
         stack,
         context,
         otter_vm::Value::from_bits(callee_bits),
+        otter_vm::Value::from_bits(new_target_bits),
     ) {
         Ok(receiver) => JitRet {
             value: receiver.to_bits(),
@@ -1122,6 +1178,88 @@ pub(crate) extern "C" fn jit_base_construct_result_stub(
     } else {
         receiver_bits
     }
+}
+
+/// Apply derived-constructor return validation and park any abrupt completion.
+pub(crate) extern "C" fn jit_derived_construct_result_stub(
+    ctx: *mut JitCtx,
+    result_bits: u64,
+    this_bits: u64,
+    _reserved0: u64,
+    _reserved1: u64,
+) -> JitRet {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let Some(activation) = ctx.checked_activation() else {
+        park_jit_error(ctx, VmError::InvalidOperand);
+        return JitRet {
+            value: 0,
+            status: STATUS_THREW,
+        };
+    };
+    let vm = unsafe { &mut *activation.vm_ptr() };
+    match vm.jit_derived_construct_result(
+        otter_vm::Value::from_bits(result_bits),
+        otter_vm::Value::from_bits(this_bits),
+    ) {
+        Ok(value) => JitRet {
+            value: value.to_bits(),
+            status: STATUS_RETURNED,
+        },
+        Err(error) => {
+            park_jit_error(ctx, error);
+            JitRet {
+                value: 0,
+                status: STATUS_THREW,
+            }
+        }
+    }
+}
+
+/// Bind a Machine IR `super` result into the current stack-owned frame.
+pub(crate) extern "C" fn jit_bind_derived_this_stub(
+    ctx: *mut JitCtx,
+    value_bits: u64,
+    _reserved0: u64,
+    _reserved1: u64,
+    _reserved2: u64,
+) -> JitRet {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    match ctx
+        .runtime_call()
+        .and_then(|mut call| call.bind_derived_this_value(otter_vm::Value::from_bits(value_bits)))
+    {
+        Ok(()) => JitRet {
+            value: value_bits,
+            status: STATUS_RETURNED,
+        },
+        Err(error) => {
+            park_jit_error(ctx, error);
+            JitRet {
+                value: 0,
+                status: STATUS_THREW,
+            }
+        }
+    }
+}
+
+/// Read the live superclass from an exact class wrapper; hole means guard miss.
+pub(crate) extern "C" fn jit_class_super_constructor_stub(
+    ctx: *mut JitCtx,
+    value_bits: u64,
+    _reserved0: u64,
+    _reserved1: u64,
+    _reserved2: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` entry contract.
+    let ctx = unsafe { &mut *ctx };
+    let Some(activation) = ctx.checked_activation() else {
+        return otter_vm::Value::hole().to_bits();
+    };
+    let vm = unsafe { &*activation.vm_ptr() };
+    vm.jit_class_super_constructor(otter_vm::Value::from_bits(value_bits))
+        .to_bits()
 }
 
 /// Complete one full loose-equality opcode in the VM. `0` = destination

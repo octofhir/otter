@@ -12,7 +12,7 @@
 //! # See also
 //! - `otter_vm::jit_runtime_ops` — safe VM-side implementations.
 
-use super::super::JitCtx;
+use super::super::{JitCtx, JitRet, STATUS_RETURNED, STATUS_THREW};
 use super::park_jit_error;
 
 /// Number of shapes a WhiskerIC site caches inline before it is megamorphic and
@@ -281,6 +281,34 @@ pub(crate) extern "C" fn jit_load_upvalue_stub(ctx: *mut JitCtx, dst: u64, idx: 
         Err(err) => {
             park_jit_error(ctx, err);
             1
+        }
+    }
+}
+
+/// SSA value form of a captured-binding read.
+pub(crate) extern "C" fn jit_load_upvalue_value_stub(
+    ctx: *mut JitCtx,
+    idx: u64,
+    _reserved0: u64,
+    _reserved1: u64,
+    _reserved2: u64,
+) -> JitRet {
+    // SAFETY: the live `JitCtx` entry contract.
+    let ctx = unsafe { &mut *ctx };
+    match ctx
+        .runtime_call()
+        .and_then(|call| call.load_upvalue_value(idx as u32 as i32))
+    {
+        Ok(value) => JitRet {
+            value: value.to_bits(),
+            status: STATUS_RETURNED,
+        },
+        Err(error) => {
+            park_jit_error(ctx, error);
+            JitRet {
+                value: 0,
+                status: STATUS_THREW,
+            }
         }
     }
 }

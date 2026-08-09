@@ -415,11 +415,12 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         callee: Value,
+        new_target: Value,
     ) -> Result<Value, VmError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         self.jit_runtime_stats.runtime_constructs =
             self.jit_runtime_stats.runtime_constructs.saturating_add(1);
-        let roots = SyncJsCallRoots::construct(callee, callee, SmallVec::new());
+        let roots = SyncJsCallRoots::construct(callee, new_target, SmallVec::new());
         let _roots_guard = self
             .gc_heap
             .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
@@ -436,6 +437,42 @@ impl Interpreter {
             Some(roots.scratch_0.get()),
         );
         Ok(roots.receiver.get())
+    }
+
+    /// Apply the derived-constructor return rules to one generated callee.
+    pub fn jit_derived_construct_result(
+        &mut self,
+        result: Value,
+        bound_this: Value,
+    ) -> Result<Value, VmError> {
+        if result.is_object_type() {
+            Ok(result)
+        } else if result.is_undefined() {
+            if bound_this.is_hole() {
+                Err(self.err_this_uninit(
+                    "must call super constructor in derived class before accessing 'this' or returning from derived constructor"
+                        .to_string()
+                        .into(),
+                ))
+            } else {
+                Ok(bound_this)
+            }
+        } else {
+            Err(self.err_type(
+                "derived constructors may only return an object or undefined"
+                    .to_string()
+                    .into(),
+            ))
+        }
+    }
+
+    /// Read the live superclass identity from an exact class-constructor
+    /// wrapper. Non-class inputs return the hole sentinel so generated code can
+    /// side-exit before any construct effect.
+    pub fn jit_class_super_constructor(&self, value: Value) -> Value {
+        value
+            .as_class_constructor()
+            .map_or_else(Value::hole, |class| class.ctor_proto(&self.gc_heap))
     }
 
     pub(crate) fn lean_callback_parent_upvalue(
@@ -1726,6 +1763,35 @@ impl Interpreter {
             context,
             ArgumentOperands::execution(function, instruction),
         )
+    }
+
+    /// Handle fixed-arity `Op::SuperConstruct`: forward the current derived
+    /// frame's `new.target` while keeping arguments in their canonical caller
+    /// window until the construct dispatch takes ownership.
+    pub(crate) fn do_super_construct_exec(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        function: &CodeBlock,
+        instruction: &crate::CodeBlockInstruction,
+    ) -> Result<(), VmError> {
+        let operands = ArgumentOperands::execution(function, instruction);
+        let dst = operands.register(0)?;
+        let callee_reg = operands.register(1)?;
+        let argc = operands.const_index(2)? as usize;
+        let top_idx = stack.len() - 1;
+        let callee = *read_register(&stack[top_idx], callee_reg)?;
+        if !is_constructor_runtime(&callee, context, &self.gc_heap) {
+            return Err(VmError::NotCallable);
+        }
+        let new_target = self
+            .frame_cold(&stack[top_idx])
+            .and_then(|cold| cold.new_target)
+            .unwrap_or(callee);
+        let args = BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 3, argc)
+            .to_smallvec8()?;
+        stack[top_idx].advance_pc()?;
+        self.dispatch_construct_with_new_target(stack, context, callee, new_target, args, dst)
     }
 
     fn do_construct_inner(

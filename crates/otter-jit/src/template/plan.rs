@@ -213,6 +213,8 @@ pub(crate) enum TemplateOp {
     /// `r<dst>` = the running function's SELF closure bits from the entry
     /// context (named-function self binding).
     LoadSelfClosure { dst: u16 },
+    /// Exact derived-constructor superclass lookup from its class wrapper.
+    ClassSuperConstructor { dst: u16, class: u16 },
     /// `r<dst>` = materialized function object for `constants[constant]`.
     MakeFunction { dst: u16, constant: u32 },
     /// `r<dst>` = closure over `function` capturing `parents` upvalues.
@@ -287,15 +289,17 @@ pub(crate) enum TemplateOp {
         /// Serialized byte PC used to resolve the immutable call-site link.
         byte_pc: u32,
     },
-    /// `r<dst> = new r<callee>(args…)` (`Op::New`) through the generic
-    /// in-place construct transition; a non-constructor callee takes an exact
-    /// side exit so the interpreter owns the thrown error. Argument register
-    /// indices are packed one per 16-bit lane.
+    /// Fixed-arity `new` / `super()` through the generic in-place construct
+    /// transition. `super_construct` selects the current frame's immutable
+    /// `new.target`; ordinary `new` uses the callee. A non-constructor takes
+    /// an exact side exit before effects. Argument register indices are packed
+    /// one per 16-bit lane.
     Construct {
         dst: u16,
         callee: u16,
         argc: u16,
         packed_args: u64,
+        super_construct: bool,
     },
     /// `r<dst> = r<receiver>.name(args…)` through the guarded collection
     /// fast paths, the collection-method IC, and the direct-method prepare
@@ -1111,6 +1115,18 @@ impl TemplatePlan {
                         callee: operands.callee,
                         argc: arguments.len() as u16,
                         packed_args: pack_or_spill_arg_regs(arguments, &mut register_operands),
+                        super_construct: false,
+                    }
+                }
+                Op::SuperConstruct => {
+                    let operands = lowered.call_operands()?;
+                    let arguments = lowering.register_tail(operands.arguments)?;
+                    TemplateOp::Construct {
+                        dst: operands.dst,
+                        callee: operands.callee,
+                        argc: arguments.len() as u16,
+                        packed_args: pack_or_spill_arg_regs(arguments, &mut register_operands),
+                        super_construct: true,
                     }
                 }
                 Op::CallMethodValue => {
@@ -1516,6 +1532,13 @@ impl TemplatePlan {
                         arg0: u64::from(operands.first),
                         arg1: u64::from(operands.second),
                         arg2: u64::from(operands.third),
+                    }
+                }
+                Op::GetPrototype if view.derived_constructor => {
+                    let operands = lowered.unary_operands()?;
+                    TemplateOp::ClassSuperConstructor {
+                        dst: operands.dst,
+                        class: operands.src,
                     }
                 }
                 Op::GetPrototype | Op::SetPrototype => {

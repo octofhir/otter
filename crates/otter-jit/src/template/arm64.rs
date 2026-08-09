@@ -461,6 +461,21 @@ pub(super) fn compile(
                 dynasm!(ops ; .arch aarch64 ; ldr x9, [x21, NATIVE_FRAME_SELF_OFFSET]);
                 emit_store_reg(&mut ops, 9, dst)?;
             }
+            TemplateOp::ClassSuperConstructor { dst, class } => {
+                emit_load_reg(&mut ops, 1, class)?;
+                dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+                emit_load_runtime_stub(
+                    &mut ops,
+                    &mut relocations,
+                    16,
+                    transitions.variadic_entry(abi::STUB_JIT_CLASS_SUPER_CONSTRUCTOR),
+                    abi::STUB_JIT_CLASS_SUPER_CONSTRUCTOR,
+                );
+                dynasm!(ops ; .arch aarch64 ; blr x16);
+                emit_load_u64(&mut ops, 16, VALUE_HOLE);
+                dynasm!(ops ; .arch aarch64 ; cmp x0, x16 ; b.eq =>bail);
+                emit_store_reg(&mut ops, 0, dst)?;
+            }
             TemplateOp::MakeFunction { dst, constant } => {
                 transitions::emit_make_function(
                     &mut ops,
@@ -732,6 +747,7 @@ pub(super) fn compile(
                 callee,
                 argc,
                 packed_args,
+                super_construct,
             } => {
                 let (packed_args, packed_args_tail) = plan.resolve_packed_args(argc, packed_args);
                 calls::emit_construct(
@@ -743,6 +759,7 @@ pub(super) fn compile(
                     argc,
                     packed_args,
                     packed_args_tail,
+                    super_construct,
                     bail,
                     threw,
                 );

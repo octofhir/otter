@@ -1041,6 +1041,9 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
                 DirectCallKindArtifact::Plain => 0,
                 DirectCallKindArtifact::Method => 1,
                 DirectCallKindArtifact::Construct => 2,
+                DirectCallKindArtifact::DerivedConstruct => 3,
+                DirectCallKindArtifact::SuperConstruct => 4,
+                DirectCallKindArtifact::DerivedSuperConstruct => 5,
             });
             output.push(match direct_call.target_tier {
                 DirectCallTierArtifact::Template => 0,
@@ -1051,6 +1054,7 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
                 DirectCallThisModeArtifact::SloppyGlobal => 1,
                 DirectCallThisModeArtifact::MethodReceiver => 2,
                 DirectCallThisModeArtifact::ConstructReceiver => 3,
+                DirectCallThisModeArtifact::DerivedConstructor => 4,
             });
             put_u32(output, direct_call.callee_native_frame_bytes);
             put_u32(output, direct_call.linkage_bytes);

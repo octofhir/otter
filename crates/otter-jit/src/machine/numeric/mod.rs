@@ -16,10 +16,10 @@
 //! - Allocating calls save every live tagged value from its exact late-use
 //!   location into the frame's collector-visible root area and reload it after
 //!   moving GC; no interpreter-window shuttle or emitter-local map exists.
-//! - Guarded methods, plain calls, and base constructs share one typed
-//!   descriptor and generated linkage emitter. Calls inside supported catch
-//!   regions own explicit exceptional CFG successors rather than leaving
-//!   compiled code.
+//! - Guarded methods, plain calls, and fixed-arity base/derived/super
+//!   construction share one typed descriptor and generated linkage emitter.
+//!   Calls inside supported catch regions own explicit exceptional CFG
+//!   successors rather than leaving compiled code.
 
 mod arm64;
 mod hir;
@@ -28,8 +28,10 @@ use otter_vm::{
     JitArtifactFileName, JitCompileSnapshot,
     deopt::{DeoptExitDescriptor, DeoptExitId, DeoptRuntime},
     native_abi::{
-        STUB_JIT_BACKEDGE_POLL, STUB_JIT_BASE_CONSTRUCT_RESULT, STUB_JIT_DEOPT_STACK_CALL,
-        STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_PREPARE_BASE_CONSTRUCT, STUB_JIT_RESOLVE_DIRECT_ENTRY,
+        STUB_JIT_BACKEDGE_POLL, STUB_JIT_BASE_CONSTRUCT_RESULT, STUB_JIT_BIND_DERIVED_THIS,
+        STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK,
+        STUB_JIT_DERIVED_CONSTRUCT_RESULT, STUB_JIT_LOAD_UPVALUE_VALUE,
+        STUB_JIT_PREPARE_BASE_CONSTRUCT, STUB_JIT_RESOLVE_DIRECT_ENTRY,
     },
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -114,6 +116,10 @@ pub(crate) fn try_compile(
         transitions.entry(STUB_JIT_RESOLVE_DIRECT_ENTRY),
         transitions.entry(STUB_JIT_PREPARE_BASE_CONSTRUCT),
         transitions.entry(STUB_JIT_BASE_CONSTRUCT_RESULT),
+        transitions.entry(STUB_JIT_DERIVED_CONSTRUCT_RESULT),
+        transitions.entry(STUB_JIT_BIND_DERIVED_THIS),
+        transitions.entry(STUB_JIT_CLASS_SUPER_CONSTRUCTOR),
+        transitions.entry(STUB_JIT_LOAD_UPVALUE_VALUE),
         otter_vm::runtime_stubs::STRING_CONCAT_ALLOC
             .entry_addr()
             .ok_or(Unsupported::OperandShape(
@@ -415,6 +421,97 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                     MachineOpcode::EntryThis,
                     vec![MachineOperand::register_output(result)],
                 ),
+                NumericNode::ClassSuperConstructor(source) => {
+                    let source = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        source,
+                    );
+                    let descriptor_index = intern_call_descriptor(
+                        &mut call_descriptors,
+                        class_super_constructor_descriptor(),
+                    );
+                    let mut call = MachineInstruction::plain(
+                        MachineOpcode::Call(descriptor_index as u32),
+                        vec![
+                            MachineOperand::register_input(source),
+                            MachineOperand::register_output(result),
+                        ],
+                    );
+                    call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
+                    call
+                }
+                NumericNode::Upvalue {
+                    index,
+                    exceptional_edge,
+                } => {
+                    let index_value =
+                        push_value(&mut representations, MachineRepresentation::Int64);
+                    instructions.push(MachineInstruction::plain(
+                        MachineOpcode::IntegerConstant(i64::from(index)),
+                        vec![MachineOperand::register_output(index_value)],
+                    ));
+                    let descriptor_index = intern_call_descriptor(
+                        &mut call_descriptors,
+                        load_upvalue_value_descriptor(exceptional_edge.map(|edge| {
+                            let edge = usize::from(edge);
+                            selection_cfg
+                                .split_edges
+                                .get(&(block_index, edge))
+                                .copied()
+                                .unwrap_or_else(|| selection_cfg.originals[block.successors[edge]])
+                        })),
+                    );
+                    let mut call = MachineInstruction::plain(
+                        MachineOpcode::Call(descriptor_index as u32),
+                        vec![
+                            MachineOperand::register_input(index_value),
+                            MachineOperand::register_output(result),
+                        ],
+                    );
+                    call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
+                    call
+                }
+                NumericNode::BindThis {
+                    source,
+                    logical_pc: _,
+                    byte_pc: _,
+                    exceptional_edge,
+                } => {
+                    let source = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        source,
+                    );
+                    let descriptor_index = intern_call_descriptor(
+                        &mut call_descriptors,
+                        bind_derived_this_descriptor(exceptional_edge.map(|edge| {
+                            let edge = usize::from(edge);
+                            selection_cfg
+                                .split_edges
+                                .get(&(block_index, edge))
+                                .copied()
+                                .unwrap_or_else(|| selection_cfg.originals[block.successors[edge]])
+                        })),
+                    );
+                    let mut call = MachineInstruction::plain(
+                        MachineOpcode::Call(descriptor_index as u32),
+                        vec![
+                            MachineOperand::register_input(source),
+                            MachineOperand::register_output(result),
+                        ],
+                    );
+                    call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
+                    call.safepoint = Some(super::SafepointId(next_safepoint));
+                    next_safepoint = next_safepoint
+                        .checked_add(1)
+                        .expect("bounded scalar function safepoint count");
+                    call
+                }
                 NumericNode::IntegerConstant(value) => MachineInstruction::plain(
                     MachineOpcode::IntegerConstant(i64::from(value)),
                     vec![MachineOperand::register_output(result)],
@@ -775,18 +872,19 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         .direct_call_targets
                         .get(usize::from(target))
                         .ok_or(super::VerificationError::InvalidValue(result))?;
-                    let construct_receiver =
-                        matches!(&target.kind, NumericDirectCallKind::Construct).then(|| {
-                            let receiver =
-                                push_value(&mut representations, MachineRepresentation::Tagged);
-                            instructions.push(MachineInstruction::plain(
-                                MachineOpcode::TaggedConstant(
-                                    otter_vm::Value::undefined().to_bits(),
-                                ),
-                                vec![MachineOperand::register_output(receiver)],
-                            ));
-                            receiver
-                        });
+                    let construct_receiver = matches!(
+                        &target.kind,
+                        NumericDirectCallKind::Construct | NumericDirectCallKind::SuperConstruct
+                    )
+                    .then(|| {
+                        let receiver =
+                            push_value(&mut representations, MachineRepresentation::Tagged);
+                        instructions.push(MachineInstruction::plain(
+                            MachineOpcode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
+                            vec![MachineOperand::register_output(receiver)],
+                        ));
+                        receiver
+                    });
                     let descriptor_index = intern_call_descriptor(
                         &mut call_descriptors,
                         direct_call_descriptor(
@@ -1016,6 +1114,11 @@ fn direct_call_descriptor(
                     guard: guard.clone(),
                 },
                 NumericDirectCallKind::Construct => DirectCallKind::Construct,
+                NumericDirectCallKind::DerivedConstruct => DirectCallKind::DerivedConstruct,
+                NumericDirectCallKind::SuperConstruct => DirectCallKind::SuperConstruct,
+                NumericDirectCallKind::DerivedSuperConstruct => {
+                    DirectCallKind::DerivedSuperConstruct
+                }
             },
             callee: target.callee,
             caller_function_id: hir.function_id,
@@ -1033,6 +1136,46 @@ fn direct_call_descriptor(
             .map(ExceptionalEdge::LandingPad)
             .unwrap_or(ExceptionalEdge::Propagate),
         safepoint: SafepointKind::Gc,
+    }
+}
+
+fn bind_derived_this_descriptor(landing_pad: Option<MachineBlock>) -> CallDescriptor {
+    CallDescriptor {
+        target: CallTarget::RuntimeStub(otter_vm::native_abi::STUB_JIT_BIND_DERIVED_THIS),
+        arguments: vec![MachineRepresentation::Tagged],
+        result: Some(MachineRepresentation::Tagged),
+        effects: CallEffects::WRITES_HEAP.union(CallEffects::REENTRANT),
+        clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+        exceptional: landing_pad
+            .map(ExceptionalEdge::LandingPad)
+            .unwrap_or(ExceptionalEdge::Propagate),
+        safepoint: SafepointKind::Gc,
+    }
+}
+
+fn class_super_constructor_descriptor() -> CallDescriptor {
+    CallDescriptor {
+        target: CallTarget::RuntimeStub(otter_vm::native_abi::STUB_JIT_CLASS_SUPER_CONSTRUCTOR),
+        arguments: vec![MachineRepresentation::Tagged],
+        result: Some(MachineRepresentation::Tagged),
+        effects: CallEffects::READS_HEAP,
+        clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+        exceptional: ExceptionalEdge::None,
+        safepoint: SafepointKind::None,
+    }
+}
+
+fn load_upvalue_value_descriptor(landing_pad: Option<MachineBlock>) -> CallDescriptor {
+    CallDescriptor {
+        target: CallTarget::RuntimeStub(otter_vm::native_abi::STUB_JIT_LOAD_UPVALUE_VALUE),
+        arguments: vec![MachineRepresentation::Int64],
+        result: Some(MachineRepresentation::Tagged),
+        effects: CallEffects::READS_HEAP,
+        clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+        exceptional: landing_pad
+            .map(ExceptionalEdge::LandingPad)
+            .unwrap_or(ExceptionalEdge::Propagate),
+        safepoint: SafepointKind::None,
     }
 }
 

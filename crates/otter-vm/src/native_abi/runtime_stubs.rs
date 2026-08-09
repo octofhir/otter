@@ -819,7 +819,7 @@ pub const STUB_STRING_ENDS_WITH_LEAF: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusPair,
 );
 
-/// Completes one full `Op::New` construct in the VM for a New site outside
+/// Completes one full fixed-arity `Op::New` or `Op::SuperConstruct` outside
 /// the compiled subset; the constructor body may run arbitrary JS.
 pub const STUB_JIT_CONSTRUCT: RuntimeStubDescriptor = descriptor(
     42,
@@ -1282,7 +1282,7 @@ pub const STUB_JIT_PREPARE_BASE_CONSTRUCT: RuntimeStubDescriptor = descriptor(
     87,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
-    1,
+    2,
     RuntimeStubEffects::reentrant(true),
     RuntimeStubException::Status,
     RuntimeStubResultAbi::StatusPair,
@@ -1297,6 +1297,50 @@ pub const STUB_JIT_BASE_CONSTRUCT_RESULT: RuntimeStubDescriptor = descriptor(
     RuntimeStubEffects::none(),
     RuntimeStubException::Never,
     RuntimeStubResultAbi::ValueWord,
+);
+
+/// Derived-constructor return validation over `(result, bound_this)`.
+pub const STUB_JIT_DERIVED_CONSTRUCT_RESULT: RuntimeStubDescriptor = descriptor(
+    89,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    2,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusPair,
+);
+
+/// Bind one Machine IR value as the current derived constructor's `this`.
+pub const STUB_JIT_BIND_DERIVED_THIS: RuntimeStubDescriptor = descriptor(
+    90,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    1,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusPair,
+);
+
+/// Read the live superclass constructor from an exact class wrapper.
+pub const STUB_JIT_CLASS_SUPER_CONSTRUCTOR: RuntimeStubDescriptor = descriptor(
+    91,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::Variadic,
+    1,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::ValueWord,
+);
+
+/// Read one captured binding directly into an SSA result.
+pub const STUB_JIT_LOAD_UPVALUE_VALUE: RuntimeStubDescriptor = descriptor(
+    92,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::Variadic,
+    1,
+    RuntimeStubEffects::leaf(true, false),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusPair,
 );
 
 /// Leaf `Math.abs`.
@@ -1453,6 +1497,10 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         86 => "number_to_int32_f64_leaf",
         87 => "jit_prepare_base_construct",
         88 => "jit_base_construct_result",
+        89 => "jit_derived_construct_result",
+        90 => "jit_bind_derived_this",
+        91 => "jit_class_super_constructor",
+        92 => "jit_load_upvalue_value",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1547,6 +1595,10 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_NUMBER_TO_INT32_F64_LEAF,
     STUB_JIT_PREPARE_BASE_CONSTRUCT,
     STUB_JIT_BASE_CONSTRUCT_RESULT,
+    STUB_JIT_DERIVED_CONSTRUCT_RESULT,
+    STUB_JIT_BIND_DERIVED_THIS,
+    STUB_JIT_CLASS_SUPER_CONSTRUCTOR,
+    STUB_JIT_LOAD_UPVALUE_VALUE,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

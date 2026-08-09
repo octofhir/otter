@@ -242,6 +242,10 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_load_upvalue_stub as *const () as usize,
         ),
         binding(
+            abi::STUB_JIT_LOAD_UPVALUE_VALUE,
+            jit_load_upvalue_value_stub as *const () as usize,
+        ),
+        binding(
             abi::STUB_JIT_STORE_UPVALUE,
             jit_store_upvalue_stub as *const () as usize,
         ),
@@ -276,6 +280,18 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
         binding(
             abi::STUB_JIT_BASE_CONSTRUCT_RESULT,
             jit_base_construct_result_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT,
+            jit_derived_construct_result_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_BIND_DERIVED_THIS,
+            jit_bind_derived_this_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_CLASS_SUPER_CONSTRUCTOR,
+            jit_class_super_constructor_stub as *const () as usize,
         ),
         binding(
             abi::STUB_JIT_COERCE_UNARY,

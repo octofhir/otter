@@ -464,7 +464,7 @@ impl TypedFeedbackSlot {
                 Self::Property(Box::new(AtomicPropertyFeedback::new(PropertyIcKind::Has)))
             }
             Op::CallMethodValue => Self::Method,
-            Op::Call | Op::New => Self::Call(Box::default()),
+            Op::Call | Op::New | Op::SuperConstruct => Self::Call(Box::default()),
             _ => Self::None,
         }
     }
@@ -844,7 +844,8 @@ impl FeedbackVector {
         matches!(self.typed_slots.get(index), Some(TypedFeedbackSlot::Method))
     }
 
-    /// Ordinary-call payload for one `Call` or `New` instruction.
+    /// Ordinary-call payload for one `Call`, `New`, or `SuperConstruct`
+    /// instruction.
     #[must_use]
     pub(crate) fn call_slot(&self, index: usize) -> Option<CallFeedbackSlot<'_>> {
         let TypedFeedbackSlot::Call(feedback) = self.typed_slots.get(index)? else {
@@ -1056,6 +1057,23 @@ mod tests {
         assert!(!feedback.widen_arith_to_float());
         assert_eq!(vector.epoch(), 7);
         assert_eq!(std::mem::size_of::<InstructionFeedback>(), 4);
+    }
+
+    #[test]
+    fn fixed_super_construct_owns_call_feedback() {
+        let vector = FeedbackVector::for_instruction_ops([Op::SuperConstruct]);
+
+        assert_eq!(
+            vector.record_call(0, OrdinaryCallTarget::Bytecode(17)),
+            CallTargetTransition::BecameMonomorphic
+        );
+        assert_eq!(
+            vector.call_slot(0).unwrap().distribution(),
+            Some(CallSiteDistribution::Mono(CallTargetCount {
+                target: OrdinaryCallTarget::Bytecode(17),
+                hits: 1,
+            }))
+        );
     }
 
     #[test]

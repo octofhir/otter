@@ -832,7 +832,7 @@ impl BaselinePlan {
                     index: reg(operands, 1)?,
                     value: reg(operands, 2)?,
                 }),
-                Op::Call | Op::New => {
+                Op::Call | Op::New | Op::SuperConstruct => {
                     let count = const_index(operands, 2)? as usize;
                     let arguments = append_register_tail(
                         &mut register_operands,

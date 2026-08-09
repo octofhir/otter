@@ -886,6 +886,7 @@ mod tests {
         Op::CallSpread,
         Op::New,
         Op::NewSpread,
+        Op::SuperConstruct,
         Op::SuperConstructSpread,
         Op::BindThisValue,
         Op::LoadSuperProperty,

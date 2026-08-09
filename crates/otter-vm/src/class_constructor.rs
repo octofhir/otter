@@ -33,6 +33,7 @@ pub const CLASS_CONSTRUCTOR_BODY_TYPE_TAG: u8 = 0x1f;
 /// object the class exposes.
 #[derive(Debug, Pelt)]
 #[pelt(tag = CLASS_CONSTRUCTOR_BODY_TYPE_TAG)]
+#[repr(C)]
 pub struct ClassConstructorBody {
     /// The actual callable (`Value::Function` / `Value::Closure` /
     /// `Value::NativeFunction`) the runtime invokes for `new C(...)`
@@ -55,6 +56,10 @@ pub struct ClassConstructorBody {
     /// preserves identity for getPrototypeOf / super-base checks.
     pub ctor_proto: Value,
 }
+
+/// Byte offset of the underlying callable in [`ClassConstructorBody`].
+pub const CLASS_CONSTRUCTOR_BODY_CTOR_OFFSET: usize =
+    std::mem::offset_of!(ClassConstructorBody, ctor);
 
 /// Cheap-to-clone class-constructor handle. Wraps a
 /// `Gc<ClassConstructorBody>` so `Value::ClassConstructor` stays a

@@ -419,6 +419,11 @@ pub enum Op {
     /// matching the spec's `OrdinaryCreateFromConstructor` behavior
     /// stripped down for the foundation slice.
     New,
+    /// Fixed-arity derived-class `super(arg0, …)` construction. Operands:
+    /// `Register(dst), Register(callee), ConstIndex(argc), Register(arg0), …`.
+    /// Unlike [`Self::New`], the current frame's `new.target` is forwarded to
+    /// the superclass constructor.
+    SuperConstruct,
     /// Construct call with spread arguments. Operands:
     /// `Register(dst), Register(callee), Register(args)`. The args
     /// register holds a `Value::Array` whose elements become the
@@ -1359,6 +1364,7 @@ impl Op {
             Op::ArrayPush => "ARRAY_PUSH",
             Op::CallSpread => "CALL_SPREAD",
             Op::New => "NEW",
+            Op::SuperConstruct => "SUPER_CONSTRUCT",
             Op::NewSpread => "NEW_SPREAD",
             Op::SuperConstructSpread => "SUPER_CONSTRUCT_SPREAD",
             Op::BindThisValue => "BIND_THIS_VALUE",
@@ -1677,8 +1683,8 @@ impl Op {
             Op::QueueMicrotask => 2,  // callee, argc — args follow
             Op::PromiseNew => 3,      // dst, executor_reg, scratch_dst
             Op::PromiseCall => 3,     // dst, name_const, argc — args follow
-            Op::Call | Op::TailCall | Op::New => 3, // dst, callee, argc — args follow
-            Op::MakeClass => 5,       // dst, ctor, prototype, statics, parent
+            Op::Call | Op::TailCall | Op::New | Op::SuperConstruct => 3, // dst, callee, argc — args follow
+            Op::MakeClass => 5, // dst, ctor, prototype, statics, parent
             // dst, callee, this, argc — args follow.
             Op::CallWithThis | Op::BindFunction => 4,
             // catch_offset, finally_offset, exc_dst.

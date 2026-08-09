@@ -1273,19 +1273,16 @@ impl Interpreter {
                 let state = view
                     .code_block
                     .call_distribution_at(instruction_pc as usize)?;
-                Some((
-                    instruction_pc,
-                    instr.byte_pc,
-                    instr.op(&view.code_block) == Op::New,
-                    state,
-                ))
+                let op = instr.op(&view.code_block);
+                Some((instruction_pc, instr.byte_pc, op, state))
             })
             .collect();
-        for (instruction_pc, call_byte_pc, is_construct, state) in call_sites {
-            let call_kind = if is_construct {
-                jit::JitDirectCallKind::Construct
-            } else {
-                jit::JitDirectCallKind::Plain
+        for (instruction_pc, call_byte_pc, op, state) in call_sites {
+            let is_construct = matches!(op, Op::New | Op::SuperConstruct);
+            let unresolved_call_kind = match op {
+                Op::New => jit::JitDirectCallKind::Construct,
+                Op::SuperConstruct => jit::JitDirectCallKind::SuperConstruct,
+                _ => jit::JitDirectCallKind::Plain,
             };
             let feedback::CallSiteDistribution::Mono(target) = state else {
                 self.record_jit_inline_candidate(
@@ -1337,7 +1334,7 @@ impl Interpreter {
                     Some(jit_debug::JitInlineRejectionReason::MissingCallee),
                 );
                 self.record_jit_direct_call_plan(
-                    call_kind,
+                    unresolved_call_kind,
                     fid,
                     instruction_pc,
                     tier,
@@ -1356,7 +1353,7 @@ impl Interpreter {
                 || callee.needs_arguments
                 || callee.has_rest
                 || callee.contains_direct_eval
-                || callee.is_derived_constructor
+                || (callee.is_derived_constructor && (!is_construct || callee.makes_function))
                 || (is_construct && callee.is_method)
             {
                 self.record_jit_inline_candidate(
@@ -1376,7 +1373,7 @@ impl Interpreter {
                     }),
                 );
                 self.record_jit_direct_call_plan(
-                    call_kind,
+                    unresolved_call_kind,
                     fid,
                     instruction_pc,
                     tier,
@@ -1416,7 +1413,9 @@ impl Interpreter {
                             unreachable!("interpreter has no entry-capable code generation")
                         }
                     },
-                    this_mode: if is_construct {
+                    this_mode: if is_construct && callee.plan.is_derived_constructor {
+                        jit::JitDirectCallThisMode::DerivedConstructor
+                    } else if is_construct {
                         jit::JitDirectCallThisMode::ConstructReceiver
                     } else {
                         plan.this_mode
@@ -1427,6 +1426,13 @@ impl Interpreter {
                 jit_debug::JitDirectCallPlanOutcome::Rejected {
                     reason: jit_debug::JitDirectCallRejectionReason::NoEntryGeneration,
                 }
+            };
+            let call_kind = match (op, callee.is_derived_constructor) {
+                (Op::New, false) => jit::JitDirectCallKind::Construct,
+                (Op::New, true) => jit::JitDirectCallKind::DerivedConstruct,
+                (Op::SuperConstruct, false) => jit::JitDirectCallKind::SuperConstruct,
+                (Op::SuperConstruct, true) => jit::JitDirectCallKind::DerivedSuperConstruct,
+                _ => jit::JitDirectCallKind::Plain,
             };
             self.record_jit_direct_call_plan(
                 call_kind,

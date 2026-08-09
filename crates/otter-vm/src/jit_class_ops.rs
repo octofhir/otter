@@ -1,13 +1,13 @@
 //! Compiled class-construction transitions.
 //!
 //! # Contents
-//! - Single-implementation register helpers for `BindThisValue`, `ClassCheck`,
-//!   and `SetFunctionName`, shared by the interpreter dispatch and the compiled
-//!   transition.
+//! - Single-implementation value/register helpers for `BindThisValue`,
+//!   `ClassCheck`, and `SetFunctionName`, shared by interpreter and compiled
+//!   transitions.
 //!
 //! # Invariants
-//! - No class-construction semantics are duplicated in JIT code; each opcode
-//!   calls the same VM register helper the interpreter dispatches.
+//! - No class-construction semantics are duplicated in JIT code; interpreter
+//!   and JIT entries call the same VM value operation.
 //! - A committed binding/name effect is never replayed by an exact side exit.
 //!
 //! # See also
@@ -30,6 +30,17 @@ impl Interpreter {
         src: u16,
     ) -> Result<(), VmError> {
         let value = *read_register(&stack[top_idx], src)?;
+        self.run_bind_this_value(stack, top_idx, value)
+    }
+
+    /// Value-form of [`Self::run_bind_this_value_reg`] for Machine IR, where
+    /// `super()` has already produced an SSA value.
+    pub(crate) fn run_bind_this_value(
+        &mut self,
+        stack: &mut ActivationStack,
+        top_idx: usize,
+        value: crate::Value,
+    ) -> Result<(), VmError> {
         let target = (0..=top_idx).rev().find(|&i| {
             self.frame_cold(&stack[i])
                 .is_some_and(|c| c.is_derived_constructor)

@@ -58,11 +58,11 @@ use crate::{
         CODE_ENTRY_GENERATED_ENTRIES_OFFSET, CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET,
         CODE_ENTRY_GENERATED_THROWS_OFFSET, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET,
         FUNCTION_ENTRY_GENERATION_CELL_OFFSET, GENERATED_FEEDBACK_CLEAN_OFFSET,
-        GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_OFFSET,
-        NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE,
-        NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
+        GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_FLAGS_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET,
+        NATIVE_FRAME_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET,
+        NATIVE_FRAME_STACK_SIZE, NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
         NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NATIVE_STACK_LIMIT_OFFSET, STATUS_BAILED,
-        STATUS_RETURNED, THREAD_OFFSET, Unsupported, VALUE_UNDEFINED,
+        STATUS_RETURNED, THREAD_OFFSET, Unsupported, VALUE_HOLE, VALUE_UNDEFINED,
         VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_CURRENT_FRAME_OFFSET, reg_offset,
     },
 };
@@ -83,6 +83,56 @@ pub(crate) enum DirectCallForm {
     /// Reload an exact base-constructor callable and use one dedicated Machine
     /// root home for its prepared receiver.
     Construct { callable: u16, receiver: u16 },
+    /// Enter a derived constructor with an uninitialized receiver and the
+    /// callable itself as `new.target`.
+    DerivedConstruct { callable: u16 },
+    /// Enter a base superclass with a prepared receiver and the caller's
+    /// `new.target`.
+    SuperConstruct { callable: u16, receiver: u16 },
+    /// Enter a derived superclass with the caller's `new.target`.
+    DerivedSuperConstruct { callable: u16 },
+}
+
+impl DirectCallForm {
+    const fn is_construct(self) -> bool {
+        !matches!(self, Self::Plain { .. } | Self::Method { .. })
+    }
+
+    const fn is_derived(self) -> bool {
+        matches!(
+            self,
+            Self::DerivedConstruct { .. } | Self::DerivedSuperConstruct { .. }
+        )
+    }
+
+    const fn inherits_new_target(self) -> bool {
+        matches!(
+            self,
+            Self::SuperConstruct { .. } | Self::DerivedSuperConstruct { .. }
+        )
+    }
+
+    const fn construct_callable(self) -> Option<u16> {
+        match self {
+            Self::Construct { callable, .. }
+            | Self::DerivedConstruct { callable }
+            | Self::SuperConstruct { callable, .. }
+            | Self::DerivedSuperConstruct { callable } => Some(callable),
+            Self::Plain { .. } | Self::Method { .. } => None,
+        }
+    }
+
+    const fn prepared_receiver(self) -> Option<u16> {
+        match self {
+            Self::Construct { receiver, .. } | Self::SuperConstruct { receiver, .. } => {
+                Some(receiver)
+            }
+            Self::Plain { .. }
+            | Self::Method { .. }
+            | Self::DerivedConstruct { .. }
+            | Self::DerivedSuperConstruct { .. } => None,
+        }
+    }
 }
 
 /// One compiler-native call site.
@@ -324,6 +374,11 @@ fn layout_and_artifact(
             DirectCallForm::Plain { .. } => DirectCallKindArtifact::Plain,
             DirectCallForm::Method { .. } => DirectCallKindArtifact::Method,
             DirectCallForm::Construct { .. } => DirectCallKindArtifact::Construct,
+            DirectCallForm::DerivedConstruct { .. } => DirectCallKindArtifact::DerivedConstruct,
+            DirectCallForm::SuperConstruct { .. } => DirectCallKindArtifact::SuperConstruct,
+            DirectCallForm::DerivedSuperConstruct { .. } => {
+                DirectCallKindArtifact::DerivedSuperConstruct
+            }
         },
         target_function_id: site.target.plan.function_id,
         target_code_object_id: site.target.plan.code_object_id,
@@ -337,6 +392,11 @@ fn layout_and_artifact(
         this_mode: match site.form {
             DirectCallForm::Method { .. } => DirectCallThisModeArtifact::MethodReceiver,
             DirectCallForm::Construct { .. } => DirectCallThisModeArtifact::ConstructReceiver,
+            DirectCallForm::SuperConstruct { .. } => DirectCallThisModeArtifact::ConstructReceiver,
+            DirectCallForm::DerivedConstruct { .. }
+            | DirectCallForm::DerivedSuperConstruct { .. } => {
+                DirectCallThisModeArtifact::DerivedConstructor
+            }
             DirectCallForm::Plain { .. } => match site.target.plan.this_mode {
                 JitDirectCallThisMode::StrictOrLexical => {
                     DirectCallThisModeArtifact::StrictOrLexical
@@ -348,6 +408,11 @@ fn layout_and_artifact(
                 JitDirectCallThisMode::ConstructReceiver => {
                     return Err(Unsupported::OperandShape(
                         "plain call constructor receiver binding",
+                    ));
+                }
+                JitDirectCallThisMode::DerivedConstructor => {
+                    return Err(Unsupported::OperandShape(
+                        "plain call derived-constructor binding",
                     ));
                 }
             },
@@ -394,6 +459,7 @@ pub(crate) fn emit_direct_call(
         resolve_direct_entry,
         0,
         0,
+        0,
         code_map,
         bail,
         threw,
@@ -435,6 +501,7 @@ pub(crate) fn emit_direct_call_with_access<Load, Store, Restore, RootReceiver, R
     resolve_direct_entry: u64,
     prepare_construct_entry: u64,
     construct_result_entry: u64,
+    derived_construct_result_entry: u64,
     mut code_map: Option<&mut CodeMapCapture>,
     bail: DynamicLabel,
     threw: DynamicLabel,
@@ -585,8 +652,18 @@ where
                 emit_load_sloppy_global_this(ops, relocations, view, context_register);
             }
         }
-        DirectCallForm::Construct { callable, .. } => {
+        DirectCallForm::Construct { callable, .. }
+        | DirectCallForm::DerivedConstruct { callable }
+        | DirectCallForm::SuperConstruct { callable, .. }
+        | DirectCallForm::DerivedSuperConstruct { callable } => {
             load(ops, callable, 9, 0)?;
+            let construct_callable = ops.new_dynamic_label();
+            let class_wrapper = ops.new_dynamic_label();
+            dynasm!(ops
+                ; .arch aarch64
+                ; mov x14, x9
+                ; =>construct_callable
+            );
             emit_load_u64(
                 ops,
                 10,
@@ -602,6 +679,8 @@ where
             dynasm!(ops
                 ; .arch aarch64
                 ; ldrb w10, [x9]
+                ; cmp w10, view.class_constructor_layout.type_tag as u32
+                ; b.eq =>class_wrapper
                 ; cmp w10, JS_CLOSURE_BODY_TYPE_TAG as u32
                 ; b.ne =>caller_bail
                 ; ldr w13, [x9, view.closure_call_layout.flags_byte]
@@ -628,6 +707,10 @@ where
                 ; =>direct_function
                 ; mov x10, xzr
                 ; mov w11, wzr
+                ; b =>callable_ready
+                ; =>class_wrapper
+                ; ldr x9, [x9, view.class_constructor_layout.callable_byte]
+                ; b =>construct_callable
             );
         }
     }
@@ -654,13 +737,14 @@ where
         ; str x10, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
     );
     match site.form {
-        DirectCallForm::Construct { .. } => {
+        form if form.is_construct() => {
             emit_load_u64(ops, 13, VALUE_UNDEFINED);
+            let initial_new_target: u8 = if form.inherits_new_target() { 13 } else { 14 };
             dynasm!(ops
                 ; .arch aarch64
                 ; str x13, [sp, NATIVE_FRAME_SELF_OFFSET]
                 ; str x13, [sp, NATIVE_FRAME_THIS_OFFSET]
-                ; str x13, [sp, NATIVE_FRAME_NEW_TARGET_OFFSET]
+                ; str X(initial_new_target), [sp, NATIVE_FRAME_NEW_TARGET_OFFSET]
                 ; str xzr, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
                 ; str wzr, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
             );
@@ -673,6 +757,7 @@ where
                 ; str x11, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
             );
         }
+        _ => unreachable!("construct forms handled above"),
     }
 
     // Copy arguments before the cold generation resolver can clobber
@@ -776,9 +861,21 @@ where
         dynasm!(ops ; .arch aarch64 ; =>locals_ready);
     }
 
-    if let DirectCallForm::Construct { callable, receiver } = site.form {
+    if let (Some(callable), Some(receiver)) = (
+        site.form.construct_callable(),
+        site.form.prepared_receiver(),
+    ) {
         let prepare_start = ops.offset().0;
         load(ops, callable, 9, layout.frame_bytes)?;
+        if site.form.inherits_new_target() {
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x13, [X(context_register), NATIVE_FRAME_OFFSET]
+                ; ldr x2, [x13, NATIVE_FRAME_NEW_TARGET_OFFSET]
+            );
+        } else {
+            dynasm!(ops ; .arch aarch64 ; mov x2, x9);
+        }
         dynasm!(ops
             ; .arch aarch64
             ; mov x0, X(context_register)
@@ -801,7 +898,17 @@ where
         refresh_roots(ops, layout.frame_bytes)?;
         load(ops, callable, 9, layout.frame_bytes)?;
         load(ops, receiver, 12, layout.frame_bytes)?;
+        if site.form.inherits_new_target() {
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x13, [X(context_register), NATIVE_FRAME_OFFSET]
+                ; ldr x14, [x13, NATIVE_FRAME_NEW_TARGET_OFFSET]
+            );
+        } else {
+            dynasm!(ops ; .arch aarch64 ; mov x14, x9);
+        }
         let direct_constructor = ops.new_dynamic_label();
+        let closure_constructor = ops.new_dynamic_label();
         let constructor_state_ready = ops.new_dynamic_label();
         emit_load_u64(
             ops,
@@ -812,6 +919,13 @@ where
             ; .arch aarch64
             ; cmp x9, x10
             ; b.eq =>direct_constructor
+            ; ldrb w13, [x9]
+            ; cmp w13, view.class_constructor_layout.type_tag as u32
+            ; b.ne =>closure_constructor
+            ; ldr x9, [x9, view.class_constructor_layout.callable_byte]
+            ; cmp x9, x10
+            ; b.eq =>direct_constructor
+            ; =>closure_constructor
             ; ldr x10, [x9, view.closure_call_layout.upvalue_base_byte]
             ; ldr w11, [x9, view.closure_call_layout.upvalue_count_byte]
             ; b =>constructor_state_ready
@@ -821,7 +935,7 @@ where
             ; =>constructor_state_ready
             ; str x9, [sp, NATIVE_FRAME_SELF_OFFSET]
             ; str x12, [sp, NATIVE_FRAME_THIS_OFFSET]
-            ; str x9, [sp, NATIVE_FRAME_NEW_TARGET_OFFSET]
+            ; str x14, [sp, NATIVE_FRAME_NEW_TARGET_OFFSET]
             ; str x10, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
             ; str w11, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
         );
@@ -845,6 +959,60 @@ where
             ops.offset().0,
             site,
             direct_call,
+        );
+    }
+    if site.form.is_derived() {
+        let callable = site
+            .form
+            .construct_callable()
+            .expect("derived construct carries callable");
+        load(ops, callable, 9, layout.frame_bytes)?;
+        let direct_constructor = ops.new_dynamic_label();
+        let closure_constructor = ops.new_dynamic_label();
+        let constructor_state_ready = ops.new_dynamic_label();
+        emit_load_u64(
+            ops,
+            13,
+            value_tag::box_function_id(site.target.plan.function_id),
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov x14, x9
+            ; cmp x9, x13
+            ; b.eq =>direct_constructor
+            ; ldrb w15, [x9]
+            ; cmp w15, view.class_constructor_layout.type_tag as u32
+            ; b.ne =>closure_constructor
+            ; ldr x9, [x9, view.class_constructor_layout.callable_byte]
+            ; cmp x9, x13
+            ; b.eq =>direct_constructor
+            ; =>closure_constructor
+            ; ldr x10, [x9, view.closure_call_layout.upvalue_base_byte]
+            ; ldr w11, [x9, view.closure_call_layout.upvalue_count_byte]
+            ; b =>constructor_state_ready
+            ; =>direct_constructor
+            ; mov x10, xzr
+            ; mov w11, wzr
+            ; =>constructor_state_ready
+        );
+        if site.form.inherits_new_target() {
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x13, [X(context_register), NATIVE_FRAME_OFFSET]
+                ; ldr x14, [x13, NATIVE_FRAME_NEW_TARGET_OFFSET]
+            );
+        }
+        emit_load_u64(ops, 12, VALUE_HOLE);
+        dynasm!(ops
+            ; .arch aarch64
+            ; str x9, [sp, NATIVE_FRAME_SELF_OFFSET]
+            ; str x12, [sp, NATIVE_FRAME_THIS_OFFSET]
+            ; str x14, [sp, NATIVE_FRAME_NEW_TARGET_OFFSET]
+            ; str x10, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
+            ; str w11, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
+            ; ldrb w15, [sp, NATIVE_FRAME_FLAGS_OFFSET]
+            ; orr w15, w15, abi::NativeFrameFlags::DERIVED_CONSTRUCTOR as u32
+            ; strb w15, [sp, NATIVE_FRAME_FLAGS_OFFSET]
         );
     }
     dynasm!(ops
@@ -904,7 +1072,7 @@ where
     emit_increment_feedback_u64(ops, CODE_ENTRY_GENERATED_THROWS_OFFSET);
     emit_reset_generated_bail_streak(ops);
     dynasm!(ops ; .arch aarch64 ; b =>result_ready ; =>callee_returned);
-    if matches!(site.form, DirectCallForm::Construct { .. }) {
+    if site.form.prepared_receiver().is_some() {
         dynasm!(ops
             ; .arch aarch64
             ; mov x1, x0
@@ -923,6 +1091,22 @@ where
             ; blr x16
             ; mov x1, xzr
         );
+    }
+    if site.form.is_derived() {
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov x1, x0
+            ; ldr x2, [sp, NATIVE_FRAME_THIS_OFFSET]
+            ; mov x0, X(context_register)
+        );
+        emit_runtime_stub(
+            ops,
+            relocations,
+            16,
+            derived_construct_result_entry,
+            abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT,
+        );
+        dynasm!(ops ; .arch aarch64 ; blr x16);
     }
     emit_reset_generated_bail_streak(ops);
     dynasm!(ops
@@ -951,6 +1135,9 @@ where
             DirectCallForm::Plain { .. } => 0,
             DirectCallForm::Method { .. } => 1,
             DirectCallForm::Construct { .. } => 2,
+            DirectCallForm::DerivedConstruct { .. } => 3,
+            DirectCallForm::SuperConstruct { .. } => 4,
+            DirectCallForm::DerivedSuperConstruct { .. } => 5,
         },
     );
     emit_runtime_stub(

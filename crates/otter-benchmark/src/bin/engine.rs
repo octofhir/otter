@@ -1791,7 +1791,7 @@ fn run_jit_compile(
         };
         if !optimized_ir
             .contents()
-            .starts_with(b"; backend=otter-machine-ir numeric-function\n")
+            .starts_with(b"; backend=otter-machine-ir scalar-function\n")
         {
             let feedback = view
                 .instructions

@@ -1377,11 +1377,7 @@ impl Interpreter {
                 );
                 continue;
             }
-            let direct_call_outcome = if callee_fid == fid {
-                jit_debug::JitDirectCallPlanOutcome::Rejected {
-                    reason: jit_debug::JitDirectCallRejectionReason::SelfRecursive,
-                }
-            } else if callee.own_upvalue_count != 0 {
+            let direct_call_outcome = if callee.own_upvalue_count != 0 {
                 jit_debug::JitDirectCallPlanOutcome::Rejected {
                     reason: jit_debug::JitDirectCallRejectionReason::OwnUpvalues {
                         count: callee.own_upvalue_count,
@@ -1504,7 +1500,6 @@ impl Interpreter {
             for (target_index, target) in snap.targets.iter().enumerate() {
                 let (callee_function_id, outcome) = match self.bake_one_direct_method(
                     context,
-                    fid,
                     target,
                     u32::try_from(target_index).unwrap_or(u32::MAX),
                     target_count,
@@ -1626,13 +1621,14 @@ impl Interpreter {
     /// Bake one compiler-generated method call independently of leaf inlining.
     ///
     /// Only a monomorphic feedback target reaches this helper. The target must
-    /// be an ordinary synchronous function, differ from the caller, require no
-    /// fresh capture-cell allocation, and already have one entry-capable native
-    /// generation. Inherited closure captures are consumed directly.
+    /// be an ordinary synchronous function, require no fresh capture-cell
+    /// allocation, and already have one entry-capable native generation.
+    /// Recursive entry resolves through the same stable generation cell as
+    /// every other generated call. Inherited closure captures are consumed
+    /// directly.
     fn bake_one_direct_method(
         &mut self,
         context: &ExecutionContext,
-        caller_fid: u32,
         target: &PolyMethodTarget,
         target_index: u32,
         target_count: u32,
@@ -1650,9 +1646,6 @@ impl Interpreter {
             || method.is_derived_constructor
         {
             return Err(jit_debug::JitDirectCallRejectionReason::IneligibleFunction);
-        }
-        if target.method_fid == caller_fid {
-            return Err(jit_debug::JitDirectCallRejectionReason::SelfRecursive);
         }
         if method.own_upvalue_count != 0 {
             return Err(jit_debug::JitDirectCallRejectionReason::OwnUpvalues {

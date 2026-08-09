@@ -5,7 +5,7 @@
 //! - [`NumericBlock`] and [`NumericTerminator`] — predecessor/successor edges,
 //!   block parameters, edge arguments, branches, and returns.
 //! - [`NumericNode`] — tagged/scalar parameters, constants, moves, coercions,
-//!   arithmetic, comparison, and planned direct calls.
+//!   arithmetic, comparison, and typed plain/method calls.
 //!
 //! # Invariants
 //! - Parameters remain tagged unless their uses prove a numeric representation;
@@ -13,8 +13,11 @@
 //! - Parameters outside the exact entry live-in set have no HIR value, load,
 //!   guard, or allocator interval.
 //! - Reentrant calls require one VM-planned direct target and carry an exact
-//!   pre-call FrameState. All other tagged coercions/equality use declared leaf
-//!   stubs; primitive string concatenation uses the allocating stub family.
+//!   pre-call FrameState. Guarded methods additionally retain the VM-baked
+//!   receiver/prototype/slot identity. Supported catch regions become explicit
+//!   exceptional CFG edges whose landing state receives the thrown value.
+//! - All other tagged coercions/equality use declared leaf stubs; primitive
+//!   string concatenation uses the allocating stub family.
 //! - Register merges become typed block parameters. Only loop-header OSR
 //!   metadata retains the aligned VM-register sources needed at the entry ABI.
 //! - Loop headers receive explicit parameters for every numeric value live from
@@ -56,12 +59,13 @@ pub(super) enum NumericNode {
     TaggedStrictEqual(NumericValue, NumericValue),
     TaggedStringConcat(NumericValue, NumericValue),
     DirectCall {
-        callee: NumericValue,
+        source: NumericValue,
         target: u16,
         argument_start: u16,
         argument_count: u8,
         logical_pc: u32,
         byte_pc: u32,
+        exceptional_edge: Option<u16>,
     },
     IntegerConstant(i32),
     BooleanConstant(bool),
@@ -109,6 +113,18 @@ pub(super) enum NumericNode {
     LessEqual(NumericValue, NumericValue),
     GreaterThan(NumericValue, NumericValue),
     GreaterEqual(NumericValue, NumericValue),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum NumericDirectCallKind {
+    Plain,
+    Method(otter_vm::jit::JitMethodGuard),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NumericDirectCallTarget {
+    pub(super) kind: NumericDirectCallKind,
+    pub(super) callee: otter_vm::JitDirectCallee,
 }
 
 impl NumericNode {
@@ -211,7 +227,7 @@ pub(super) struct NumericFunction {
     pub(super) nodes: Vec<NumericNode>,
     pub(super) blocks: Vec<NumericBlock>,
     pub(super) frame_states: Vec<NumericFrameState>,
-    pub(super) direct_call_targets: Vec<otter_vm::JitDirectCallee>,
+    pub(super) direct_call_targets: Vec<NumericDirectCallTarget>,
     pub(super) direct_call_arguments: Vec<NumericValue>,
     pub(super) parameter_count: u16,
     pub(super) register_count: u16,
@@ -252,6 +268,8 @@ struct RawBlock {
     end: usize,
     predecessors: Vec<usize>,
     successors: Vec<usize>,
+    exceptional_edge: Option<usize>,
+    exception_register: Option<u16>,
     terminator: RawTerminator,
 }
 
@@ -267,7 +285,14 @@ impl NumericFunction {
             || parameter_count > MAX_FUNCTION_PARAMETERS
             || view.instructions.is_empty()
             || view.instructions.len() > MAX_FUNCTION_INSTRUCTIONS
-            || !code.control_flow().exception_regions().is_empty()
+        {
+            return None;
+        }
+        if code
+            .control_flow()
+            .exception_regions()
+            .iter()
+            .any(|region| region.catch_pc.is_none() || region.finally_pc.is_some())
         {
             return None;
         }
@@ -298,6 +323,8 @@ impl NumericFunction {
 
         let mut blocks = Vec::with_capacity(raw_blocks.len());
         let mut out_states = Vec::<Vec<RegisterState>>::with_capacity(raw_blocks.len());
+        let mut exceptional_out_states =
+            Vec::<Option<Vec<RegisterState>>>::with_capacity(raw_blocks.len());
         let mut arithmetic_op_count = 0usize;
         let mut frame_states = Vec::new();
         let mut direct_call_targets = Vec::new();
@@ -319,15 +346,21 @@ impl NumericFunction {
                     .collect::<Vec<_>>();
                 merge_predecessors(
                     &forward_predecessors,
+                    block_index,
+                    &raw_blocks,
                     &live_in[block_index],
                     &out_states,
+                    &exceptional_out_states,
                     &mut nodes,
                 )?
             } else {
                 merge_predecessors(
                     &raw.predecessors,
+                    block_index,
+                    &raw_blocks,
                     &live_in[block_index],
                     &out_states,
+                    &exceptional_out_states,
                     &mut nodes,
                 )?
             };
@@ -351,6 +384,7 @@ impl NumericFunction {
             };
             block_nodes.extend(parameters.iter().copied());
             let terminal_pc = raw.end.checked_sub(1)?;
+            let mut exceptional_pre_state = None;
             for (pc, instruction_live) in instruction_live_in
                 .iter()
                 .enumerate()
@@ -372,6 +406,9 @@ impl NumericFunction {
                 {
                     break;
                 }
+                if pc == terminal_pc && raw.exceptional_edge.is_some() {
+                    exceptional_pre_state = Some(registers.clone());
+                }
                 lower_instruction(
                     instruction,
                     code,
@@ -384,8 +421,12 @@ impl NumericFunction {
                     code.id,
                     u32::try_from(pc).ok()?,
                     &view.direct_callees,
+                    &view.direct_methods,
                     &mut direct_call_targets,
                     &mut direct_call_arguments,
+                    (pc == terminal_pc)
+                        .then_some(raw.exceptional_edge)
+                        .flatten(),
                 )?;
             }
 
@@ -423,7 +464,19 @@ impl NumericFunction {
                 }
             };
 
+            let exceptional_state = if let (Some(mut state), Some(exception_register)) =
+                (exceptional_pre_state, raw.exception_register)
+            {
+                let destination = register(terminal, code, 0)?;
+                let result = read_state(&registers, destination)?;
+                state[usize::from(destination)] = RegisterState::Unset;
+                state[usize::from(exception_register)] = result;
+                Some(state)
+            } else {
+                None
+            };
             out_states.push(registers);
+            exceptional_out_states.push(exceptional_state);
             blocks.push(NumericBlock {
                 logical_pc: u32::try_from(raw.start).ok()?,
                 predecessors: raw.predecessors.clone(),
@@ -440,14 +493,19 @@ impl NumericFunction {
             for edge in 0..blocks[predecessor].successors.len() {
                 let successor = blocks[predecessor].successors[edge];
                 let successor_registers = blocks[successor].parameter_registers.clone();
+                let edge_state = edge_state(
+                    predecessor,
+                    edge,
+                    &raw_blocks,
+                    &out_states,
+                    &exceptional_out_states,
+                )?;
                 let arguments = successor_registers
                     .iter()
-                    .map(
-                        |&register| match out_states[predecessor][usize::from(register)] {
-                            RegisterState::Value(value) => Some(value),
-                            RegisterState::Unset => None,
-                        },
-                    )
+                    .map(|&register| match edge_state[usize::from(register)] {
+                        RegisterState::Value(value) => Some(value),
+                        RegisterState::Unset => None,
+                    })
                     .collect::<Option<Vec<_>>>()?;
                 if arguments.iter().zip(&blocks[successor].parameters).any(
                     |(&argument, &parameter)| {
@@ -596,6 +654,15 @@ fn infer_instruction_parameters(
             let _ = read(register(instruction, code, 1)?)?;
             *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
+        Op::CallMethodValue => {
+            let count = usize::try_from(instruction.const_index(code, 3)?).ok()?;
+            let _ = instruction.const_index(code, 2)?;
+            let _ = read(register(instruction, code, 1)?)?;
+            for index in 0..count {
+                let _ = read(register(instruction, code, 4 + index)?)?;
+            }
+            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
+        }
         Op::ToPrimitive | Op::ToNumeric | Op::ToNumber => {
             let source = read(register(instruction, code, 1)?)?;
             *number_parameters |= source;
@@ -680,6 +747,8 @@ fn infer_instruction_parameters(
         }
         Op::JumpIfTrue
         | Op::JumpIfFalse
+        | Op::EnterTry
+        | Op::LeaveTry
         | Op::Return
         | Op::ReturnValue
         | Op::ReturnUndefined
@@ -692,7 +761,25 @@ fn infer_instruction_parameters(
 
 fn build_raw_blocks(view: &JitCompileSnapshot) -> Option<Vec<RawBlock>> {
     let code = view.code_block.as_ref();
-    let starts = code.block_starts();
+    let mut starts = code
+        .block_starts()
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    for (pc, instruction) in view.instructions.iter().enumerate() {
+        let pc = u32::try_from(pc).ok()?;
+        if matches!(instruction.op(code), Op::Call | Op::CallMethodValue)
+            && code
+                .control_flow()
+                .enclosing_exception_region(pc)
+                .and_then(|region| region.catch_pc)
+                .is_some()
+            && usize::try_from(pc + 1).ok()? < view.instructions.len()
+        {
+            starts.insert(pc + 1);
+        }
+    }
+    let starts = starts.into_iter().collect::<Vec<_>>();
     if starts.first().copied() != Some(0) {
         return None;
     }
@@ -710,7 +797,7 @@ fn build_raw_blocks(view: &JitCompileSnapshot) -> Option<Vec<RawBlock>> {
         let terminal_pc = end.checked_sub(1)?;
         let instruction = view.instructions.get(terminal_pc as usize)?;
         let op = instruction.op(code);
-        let (successors, terminator) = match op {
+        let (mut successors, terminator) = match op {
             Op::Jump => (
                 vec![target_block(instruction, code, terminal_pc, &by_pc)?],
                 RawTerminator::Jump,
@@ -728,11 +815,25 @@ fn build_raw_blocks(view: &JitCompileSnapshot) -> Option<Vec<RawBlock>> {
             Op::ReturnUndefined => (Vec::new(), RawTerminator::ReturnUndefined),
             _ => (vec![*by_pc.get(&end)?], RawTerminator::Jump),
         };
+        let exceptional = matches!(op, Op::Call | Op::CallMethodValue)
+            .then(|| code.control_flow().enclosing_exception_region(terminal_pc))
+            .flatten()
+            .and_then(|region| Some((*by_pc.get(&region.catch_pc?)?, region.exception_register)));
+        let (exceptional_edge, exception_register) = if let Some((handler, register)) = exceptional
+        {
+            let edge = successors.len();
+            successors.push(handler);
+            (Some(edge), Some(register))
+        } else {
+            (None, None)
+        };
         blocks.push(RawBlock {
             start: start as usize,
             end: end as usize,
             predecessors: Vec::new(),
             successors,
+            exceptional_edge,
+            exception_register,
             terminator,
         });
     }
@@ -773,6 +874,9 @@ fn build_liveness(
             for write in writes {
                 definitions[block_index][usize::from(write)] = true;
             }
+        }
+        if let Some(exception_register) = block.exception_register {
+            definitions[block_index][usize::from(exception_register)] = true;
         }
     }
 
@@ -818,6 +922,11 @@ fn build_instruction_liveness(
         for pc in (block.start..block.end).rev() {
             let instruction = view.instructions.get(pc)?;
             let (reads, writes) = instruction_accesses(instruction, code)?;
+            if pc + 1 == block.end
+                && let Some(exception_register) = block.exception_register
+            {
+                live[usize::from(exception_register)] = false;
+            }
             for write in writes {
                 live[usize::from(write)] = false;
             }
@@ -856,6 +965,16 @@ fn instruction_accesses(
             reads.push(register(instruction, code, 1)?);
             for index in 0..count {
                 reads.push(register(instruction, code, 3 + index)?);
+            }
+            Some((reads, vec![register(instruction, code, 0)?]))
+        }
+        Op::CallMethodValue => {
+            let count = usize::try_from(instruction.const_index(code, 3)?).ok()?;
+            let _ = instruction.const_index(code, 2)?;
+            let mut reads = Vec::with_capacity(count + 1);
+            reads.push(register(instruction, code, 1)?);
+            for index in 0..count {
+                reads.push(register(instruction, code, 4 + index)?);
             }
             Some((reads, vec![register(instruction, code, 0)?]))
         }
@@ -907,7 +1026,9 @@ fn instruction_accesses(
             Some((vec![register(instruction, code, 1)?], Vec::new()))
         }
         Op::Return | Op::ReturnValue => Some((vec![register(instruction, code, 0)?], Vec::new())),
-        Op::ReturnUndefined | Op::Nop | Op::Jump => Some((Vec::new(), Vec::new())),
+        Op::ReturnUndefined | Op::Nop | Op::Jump | Op::EnterTry | Op::LeaveTry => {
+            Some((Vec::new(), Vec::new()))
+        }
         _ => None,
     }
 }
@@ -926,11 +1047,28 @@ fn target_block(
 
 fn merge_predecessors(
     predecessors: &[usize],
+    successor: usize,
+    blocks: &[RawBlock],
     live_in: &[bool],
     out_states: &[Vec<RegisterState>],
+    exceptional_out_states: &[Option<Vec<RegisterState>>],
     nodes: &mut Vec<NumericNode>,
 ) -> Option<(Vec<RegisterState>, Vec<NumericValue>, Vec<u16>)> {
-    let first = out_states.get(*predecessors.first()?)?.clone();
+    let state = |predecessor: usize| {
+        let edge = blocks
+            .get(predecessor)?
+            .successors
+            .iter()
+            .position(|&target| target == successor)?;
+        edge_state(
+            predecessor,
+            edge,
+            blocks,
+            out_states,
+            exceptional_out_states,
+        )
+    };
+    let first = state(*predecessors.first()?)?.to_vec();
     let mut merged = first.clone();
     let mut parameters = Vec::new();
     let mut parameter_registers = Vec::new();
@@ -941,7 +1079,7 @@ fn merge_predecessors(
         }
         let states = predecessors
             .iter()
-            .map(|&predecessor| out_states.get(predecessor)?.get(register).copied())
+            .map(|&predecessor| state(predecessor)?.get(register).copied())
             .collect::<Option<Vec<_>>>()?;
         if states.iter().all(|&state| state == states[0]) {
             continue;
@@ -963,6 +1101,20 @@ fn merge_predecessors(
         parameter_registers.push(u16::try_from(register).ok()?);
     }
     Some((merged, parameters, parameter_registers))
+}
+
+fn edge_state<'a>(
+    predecessor: usize,
+    edge: usize,
+    blocks: &[RawBlock],
+    out_states: &'a [Vec<RegisterState>],
+    exceptional_out_states: &'a [Option<Vec<RegisterState>>],
+) -> Option<&'a [RegisterState]> {
+    if blocks.get(predecessor)?.exceptional_edge == Some(edge) {
+        exceptional_out_states.get(predecessor)?.as_deref()
+    } else {
+        out_states.get(predecessor).map(Vec::as_slice)
+    }
 }
 
 fn force_loop_parameters(
@@ -1004,12 +1156,14 @@ fn lower_instruction(
     function_id: u32,
     logical_pc: u32,
     direct_callees: &rustc_hash::FxHashMap<u32, otter_vm::JitDirectCallee>,
-    direct_call_targets: &mut Vec<otter_vm::JitDirectCallee>,
+    direct_methods: &rustc_hash::FxHashMap<u32, Vec<otter_vm::jit::JitDirectMethod>>,
+    direct_call_targets: &mut Vec<NumericDirectCallTarget>,
     direct_call_arguments: &mut Vec<NumericValue>,
+    exceptional_edge: Option<usize>,
 ) -> Option<()> {
     let op = instruction.op(code);
     let node = match op {
-        Op::Nop => return Some(()),
+        Op::Nop | Op::EnterTry | Op::LeaveTry => return Some(()),
         Op::StoreLocal => {
             let value = read_state(registers, register(instruction, code, 0)?)?;
             write(registers, local_index(instruction, code, 1)?, value)?;
@@ -1031,8 +1185,11 @@ fn lower_instruction(
             NumericNode::Constant(instruction.load_number?)
         }
         Op::Call => {
-            let target = *direct_callees.get(&instruction.byte_pc)?;
-            let callee = read_value(registers, register(instruction, code, 1)?)?;
+            let target = NumericDirectCallTarget {
+                kind: NumericDirectCallKind::Plain,
+                callee: *direct_callees.get(&instruction.byte_pc)?,
+            };
+            let source = read_value(registers, register(instruction, code, 1)?)?;
             let argument_count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
             let argument_start = u16::try_from(direct_call_arguments.len()).ok()?;
             for index in 0..argument_count {
@@ -1051,12 +1208,70 @@ fn lower_instruction(
             let value = push(
                 nodes,
                 NumericNode::DirectCall {
-                    callee,
+                    source,
                     target: u16::try_from(target_index).ok()?,
                     argument_start,
                     argument_count: u8::try_from(argument_count).ok()?,
                     logical_pc,
                     byte_pc: instruction.byte_pc,
+                    exceptional_edge: exceptional_edge.map(u16::try_from).transpose().ok()?,
+                },
+            );
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
+            write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            )?;
+            return Some(());
+        }
+        Op::CallMethodValue => {
+            let methods = direct_methods.get(&instruction.byte_pc)?;
+            let [method] = methods.as_slice() else {
+                return None;
+            };
+            if method.target_count != 1 || method.target_index != 0 {
+                return None;
+            }
+            let _name = instruction.const_index(code, 2)?;
+            let target = NumericDirectCallTarget {
+                kind: NumericDirectCallKind::Method(method.guard.clone()),
+                callee: method.callee,
+            };
+            let source = read_value(registers, register(instruction, code, 1)?)?;
+            let argument_count = usize::try_from(instruction.const_index(code, 3)?).ok()?;
+            let argument_start = u16::try_from(direct_call_arguments.len()).ok()?;
+            for index in 0..argument_count {
+                direct_call_arguments.push(read_value(
+                    registers,
+                    register(instruction, code, 4 + index)?,
+                )?);
+            }
+            let target_index = direct_call_targets
+                .iter()
+                .position(|candidate| *candidate == target)
+                .unwrap_or_else(|| {
+                    direct_call_targets.push(target);
+                    direct_call_targets.len() - 1
+                });
+            let value = push(
+                nodes,
+                NumericNode::DirectCall {
+                    source,
+                    target: u16::try_from(target_index).ok()?,
+                    argument_start,
+                    argument_count: u8::try_from(argument_count).ok()?,
+                    logical_pc,
+                    byte_pc: instruction.byte_pc,
+                    exceptional_edge: exceptional_edge.map(u16::try_from).transpose().ok()?,
                 },
             );
             block_nodes.push(value);

@@ -121,8 +121,7 @@ use super::{
 use crate::{
     CompiledCode,
     arm64::{
-        DirectCallForm, DirectCallSite, MethodGuardSite, direct_call_artifact,
-        direct_call_target_is_supported, emit_direct_call, emit_method_guard,
+        DirectCallForm, DirectCallSite, direct_call_target_is_supported, emit_direct_call,
         emit_method_guard_from_tagged_register,
     },
     artifact::{
@@ -2810,109 +2809,6 @@ fn emit(
                                 ; b =>succeeded
                                 ; =>leaf_miss
                             );
-                        }
-                        let planned_methods = native_leaf
-                            .is_none()
-                            .then(|| {
-                                (instruction.inline == InlineId::ROOT)
-                                    .then(|| frame.body.direct_methods.get(&byte_pc))
-                                    .flatten()
-                            })
-                            .flatten();
-                        for method in planned_methods.into_iter().flatten() {
-                            if !direct_call_target_is_supported(&method.callee) {
-                                if let Some(events) = direct_call_events.as_mut() {
-                                    events.insert(
-                                        (byte_pc, method.target_index),
-                                        optimizing_direct_call_event(
-                                            otter_vm::JitDirectCallKind::Method,
-                                            instruction.pc,
-                                            byte_pc,
-                                            &method.callee,
-                                            method.target_index,
-                                            method.target_count,
-                                            otter_vm::JitDirectCallLoweringOutcome::Rejected {
-                                                reason: otter_vm::JitDirectCallLoweringRejectionReason::LayoutUnsupported,
-                                            },
-                                        ),
-                                    );
-                                }
-                                continue;
-                            }
-                            let next_target = ops.new_dynamic_label();
-                            let direct_site = DirectCallSite {
-                                target: &method.callee,
-                                caller_function_id: frame.function_id(),
-                                logical_pc: instruction.pc,
-                                byte_pc,
-                                dst,
-                                form: DirectCallForm::Method {
-                                    callable: 17,
-                                    receiver,
-                                },
-                                arguments: arg_regs,
-                            };
-                            let direct_call = direct_call_artifact(view, direct_site)?;
-                            let guard_start = ops.offset().0;
-                            emit_method_guard(
-                                &mut ops,
-                                &mut relocations,
-                                view,
-                                MethodGuardSite {
-                                    guard: &method.guard,
-                                    receiver,
-                                },
-                                17,
-                                None,
-                                next_target,
-                            )?;
-                            if let Some(code_map) = code_map.as_mut() {
-                                code_map.record(CodeRegion::method_call_structural(
-                                    "directMethodGuard",
-                                    guard_start,
-                                    ops.offset().0,
-                                    direct_site.caller_function_id,
-                                    direct_site.logical_pc,
-                                    direct_site.byte_pc,
-                                    direct_call,
-                                    receiver,
-                                    &method.guard,
-                                ));
-                            }
-                            emit_direct_call(
-                                &mut ops,
-                                &mut relocations,
-                                view,
-                                direct_site,
-                                deopt_stack_call_entry.address,
-                                resolve_direct_entry.address,
-                                code_map.as_mut(),
-                                bail,
-                                threw,
-                                succeeded,
-                            )?;
-                            if let Some(events) = direct_call_events.as_mut() {
-                                events.insert(
-                                    (byte_pc, method.target_index),
-                                    optimizing_direct_call_event(
-                                        otter_vm::JitDirectCallKind::Method,
-                                        instruction.pc,
-                                        byte_pc,
-                                        &method.callee,
-                                        method.target_index,
-                                        method.target_count,
-                                        otter_vm::JitDirectCallLoweringOutcome::Generated {
-                                            code_object_id: method.callee.plan.code_object_id,
-                                            target_tier: optimizing_direct_call_target_tier(
-                                                &method.callee,
-                                            ),
-                                            this_mode:
-                                                otter_vm::JitDirectCallThisMode::MethodReceiver,
-                                        },
-                                    ),
-                                );
-                            }
-                            dynasm!(ops ; .arch aarch64 ; =>next_target);
                         }
                         let packed_meta = u64::from(dst)
                             | (u64::from(receiver) << 16)

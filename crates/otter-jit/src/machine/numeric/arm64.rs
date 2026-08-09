@@ -27,8 +27,9 @@
 //! - Successful results use the VM's canonical tagged representation.
 //! - Pure scalar leaves exchange unboxed scalars in fixed ABI operands;
 //!   regalloc2 owns every argument/result move and no frame shuttle exists.
-//! - Direct JavaScript calls reuse the shared generated linkage emitter; the
-//!   allocator supplies only location-aware loads, stores, and root reloads.
+//! - Plain and guarded-method JavaScript calls reuse the shared generated
+//!   linkage emitter; the allocator supplies only location-aware loads, stores,
+//!   root reloads, and landing-pad result homes.
 
 // dynasm's dynamic-register expansion calls `.into()` on the required u8
 // register encoding. Clippy sees the macro expansion as an identity conversion.
@@ -47,12 +48,16 @@ use otter_vm::{
 
 use super::super::{
     AllocatedLocation, AllocatedSequence, AllocationEdit, AllocationPoint, CallTarget, DeoptId,
-    InstructionSequence, MachineFrameLayout, MachineInstructionId, MachineOpcode, MachineOsrInput,
-    MachineOsrType, MachineRepresentation, MachineSafepointSite, MachineSafepointTable,
+    DirectCallKind, InstructionSequence, MachineFrameLayout, MachineInstructionId, MachineOpcode,
+    MachineOsrInput, MachineOsrType, MachineRepresentation, MachineSafepointSite,
+    MachineSafepointTable,
 };
 use crate::{
     CompiledCode, Unsupported,
-    arm64::{DirectCallForm, DirectCallSite, emit_direct_call_with_access},
+    arm64::{
+        DirectCallForm, DirectCallSite, emit_direct_call_with_access,
+        emit_method_guard_from_tagged_register,
+    },
     artifact::relocation::{RelocationCapture, RelocationTarget},
     entry::{
         ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET,
@@ -704,9 +709,12 @@ pub(super) fn emit(
             }
             MachineOpcode::Jump => {
                 let block = &sequence.blocks()[block_index];
-                let [successor] = block.successors.as_slice() else {
-                    return Err(Unsupported::OperandShape("numeric jump successors"));
-                };
+                let successor = block
+                    .successors
+                    .iter()
+                    .copied()
+                    .find(|&successor| !is_exceptional_successor(sequence, block_index, successor))
+                    .ok_or(Unsupported::OperandShape("numeric jump successors"))?;
                 let target = block_labels[successor.0 as usize];
                 dynasm!(ops ; .arch aarch64 ; b =>target);
             }
@@ -731,11 +739,12 @@ pub(super) fn emit(
                     .get(descriptor_index as usize)
                     .ok_or(Unsupported::OperandShape("scalar call descriptor"))?;
                 if let CallTarget::Direct {
+                    kind,
                     callee,
                     caller_function_id,
                     logical_pc,
                     byte_pc,
-                } = descriptor.target
+                } = &descriptor.target
                 {
                     let site = safepoints
                         .site(id)
@@ -745,8 +754,38 @@ pub(super) fn emit(
                     let direct_done = ops.new_dynamic_label();
                     let direct_threw = ops.new_dynamic_label();
                     let direct_bail = ops.new_dynamic_label();
+                    let method_guard_miss = ops.new_dynamic_label();
                     emit_save_safepoint_roots(&mut ops, frame, site)?;
                     emit_publish_machine_roots(&mut ops, frame, site)?;
+                    let form = match kind {
+                        DirectCallKind::Plain => DirectCallForm::Plain { callable: 0 },
+                        DirectCallKind::Method { guard } => {
+                            let receiver = *locations
+                                .first()
+                                .ok_or(Unsupported::OperandShape("scalar method receiver"))?;
+                            emit_load_allocated_tagged(
+                                &mut ops,
+                                frame,
+                                receiver,
+                                9,
+                                MACHINE_ROOT_RECORD_SIZE,
+                            )?;
+                            emit_method_guard_from_tagged_register(
+                                &mut ops,
+                                &mut relocations,
+                                view,
+                                guard,
+                                9,
+                                17,
+                                None,
+                                method_guard_miss,
+                            )?;
+                            DirectCallForm::Method {
+                                callable: 17,
+                                receiver: 0,
+                            }
+                        }
+                    };
                     let result_index = descriptor.arguments.len();
                     let arguments = (1..result_index)
                         .map(|index| {
@@ -760,14 +799,14 @@ pub(super) fn emit(
                         &mut relocations,
                         view,
                         DirectCallSite {
-                            target: &callee,
-                            caller_function_id,
-                            logical_pc,
-                            byte_pc,
+                            target: callee,
+                            caller_function_id: *caller_function_id,
+                            logical_pc: *logical_pc,
+                            byte_pc: *byte_pc,
                             dst: u16::try_from(result_index).map_err(|_| {
                                 Unsupported::OperandShape("scalar direct call result")
                             })?,
-                            form: DirectCallForm::Plain { callable: 0 },
+                            form,
                             arguments: &arguments,
                         },
                         deopt_stack_call_entry,
@@ -809,24 +848,51 @@ pub(super) fn emit(
                     )?;
                     dynasm!(ops
                         ; .arch aarch64
+                        ; =>method_guard_miss
+                    );
+                    emit_clear_machine_roots(&mut ops);
+                    emit_reload_safepoint_roots(&mut ops, frame, site)?;
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; b =>deopt
                         ; =>direct_bail
                         ; b =>deopt
                         ; =>direct_threw
-                        ; b =>threw
-                        ; =>direct_done
                     );
+                    match descriptor.exceptional {
+                        super::super::ExceptionalEdge::LandingPad(target) => {
+                            emit_store_allocated_tagged(
+                                &mut ops,
+                                frame,
+                                locations[result_index],
+                                0,
+                                0,
+                            )?;
+                            let target = block_labels[target.0 as usize];
+                            dynasm!(ops ; .arch aarch64 ; b =>target);
+                        }
+                        super::super::ExceptionalEdge::Propagate => {
+                            dynasm!(ops ; .arch aarch64 ; b =>threw);
+                        }
+                        super::super::ExceptionalEdge::None => {
+                            return Err(Unsupported::OperandShape(
+                                "scalar direct call exceptional edge",
+                            ));
+                        }
+                    }
+                    dynasm!(ops ; .arch aarch64 ; =>direct_done);
                 } else {
-                    let (target, entry, result_index, allocating) = match descriptor.target {
-                        CallTarget::RuntimeStub(target) if target == STUB_TO_BOOLEAN_LEAF => {
+                    let (target, entry, result_index, allocating) = match &descriptor.target {
+                        CallTarget::RuntimeStub(target) if *target == STUB_TO_BOOLEAN_LEAF => {
                             if locations.len() < 3
                                 || integer_register(locations[0])? != 1
                                 || integer_register(locations[1])? != 2
                             {
                                 return Err(Unsupported::OperandShape("scalar ToBoolean call"));
                             }
-                            (target, to_boolean_entry, 2, false)
+                            (*target, to_boolean_entry, 2, false)
                         }
-                        CallTarget::RuntimeStub(target) if target == STUB_STRICT_EQ_LEAF => {
+                        CallTarget::RuntimeStub(target) if *target == STUB_STRICT_EQ_LEAF => {
                             if locations.len() < 3
                                 || integer_register(locations[0])? != 1
                                 || integer_register(locations[1])? != 2
@@ -835,9 +901,9 @@ pub(super) fn emit(
                                     "scalar strict equality call",
                                 ));
                             }
-                            (target, strict_eq_entry, 2, false)
+                            (*target, strict_eq_entry, 2, false)
                         }
-                        CallTarget::RuntimeStub(target) if target == STUB_STRING_CONCAT_ALLOC => {
+                        CallTarget::RuntimeStub(target) if *target == STUB_STRING_CONCAT_ALLOC => {
                             if locations.len() < 4
                                 || integer_register(locations[0])? != 2
                                 || integer_register(locations[1])? != 3
@@ -845,7 +911,7 @@ pub(super) fn emit(
                             {
                                 return Err(Unsupported::OperandShape("scalar string concat call"));
                             }
-                            (target, string_concat_entry, 3, true)
+                            (*target, string_concat_entry, 3, true)
                         }
                         CallTarget::RuntimeStub(_) => {
                             return Err(Unsupported::OperandShape("scalar runtime call target"));
@@ -1072,6 +1138,26 @@ pub(super) fn emit(
         relocations,
         osr_entries,
         osr_regions,
+    })
+}
+
+fn is_exceptional_successor(
+    sequence: &InstructionSequence,
+    block_index: usize,
+    successor: super::super::MachineBlock,
+) -> bool {
+    let block = &sequence.blocks()[block_index];
+    (block.first.0..block.end.0).any(|instruction_index| {
+        let instruction = &sequence.instructions()[instruction_index as usize];
+        let MachineOpcode::Call(descriptor_index) = instruction.opcode else {
+            return false;
+        };
+        sequence
+            .call_descriptors()
+            .get(descriptor_index as usize)
+            .is_some_and(|descriptor| {
+                descriptor.exceptional == super::super::ExceptionalEdge::LandingPad(successor)
+            })
     })
 }
 

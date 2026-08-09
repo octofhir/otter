@@ -3,6 +3,7 @@
 //! # Contents
 //! - Native publication proof for a monomorphic plain call.
 //! - Exact return, callee-deopt, and throw semantics against the interpreter.
+//! - Own/prototype guarded methods, exact receiver binding, and guard misses.
 //! - Nested generated calls retaining a tagged value across moving GC.
 //!
 //! # Invariants
@@ -120,10 +121,166 @@ const marker = "kept:" + 17;
 outer(middle, allocator, marker, 200000);
 "#;
 
+const OWN_METHOD: &str = r#"
+function ownMethod(delta) {
+  return this.base + delta;
+}
+
+const ownReceiver = { base: 40, method: ownMethod };
+function ownCaller(receiver, delta) {
+  return receiver.method(delta);
+}
+
+for (let i = 0; i < 5000; i++) ownCaller(ownReceiver, i);
+JSON.stringify([ownCaller(ownReceiver, 2), ownReceiver.base]);
+"#;
+
+const PROTOTYPE_METHOD: &str = r#"
+function prototypeMethod(delta) {
+  return this.base + delta;
+}
+
+const methodPrototype = { method: prototypeMethod };
+const prototypeReceiver = Object.create(methodPrototype);
+prototypeReceiver.base = 40;
+function prototypeCaller(receiver, delta) {
+  return receiver.method(delta);
+}
+
+for (let i = 0; i < 5000; i++) prototypeCaller(prototypeReceiver, i);
+JSON.stringify([prototypeCaller(prototypeReceiver, 2), prototypeReceiver.base]);
+"#;
+
+const METHOD_COLD_EXITS: &str = r#"
+let accessorEffects = 0;
+function guardedMethod(value) {
+  if (value < 0) throw "method-boom";
+  return value + 1;
+}
+
+const stableReceiver = { method: guardedMethod };
+const unstableReceiver = {
+  get method() {
+    accessorEffects++;
+    return guardedMethod;
+  }
+};
+function guardedCaller(receiver, value) {
+  return receiver.method(value);
+}
+
+for (let i = 0; i < 5000; i++) guardedCaller(stableReceiver, i);
+const overflow = guardedCaller(stableReceiver, 2147483647);
+let caught = "missing";
+try {
+  guardedCaller(stableReceiver, -1);
+} catch (error) {
+  caught = error;
+}
+const miss = guardedCaller(unstableReceiver, 4);
+const reused = guardedCaller(stableReceiver, 41);
+JSON.stringify([overflow, caught, miss, accessorEffects, reused]);
+"#;
+
+const METHOD_SPILLS: &str = r#"
+function manyArgumentMethod(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) {
+  return this.marker + a + o;
+}
+
+const spillReceiver = { marker: "spill:", method: manyArgumentMethod };
+function spillCaller(receiver, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) {
+  return receiver.method(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o);
+}
+
+for (let i = 0; i < 5000; i++) {
+  spillCaller(spillReceiver, i, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+}
+spillCaller(spillReceiver, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+"#;
+
+const METHOD_LANDING_PAD: &str = r#"
+function landingMethod(value) {
+  if (value < 0) throw "landing-boom";
+  return value + 1;
+}
+
+const landingReceiver = { method: landingMethod };
+function landingCaller(receiver, value) {
+  let result = undefined;
+  try {
+    result = receiver.method(value);
+  } catch {
+    result = undefined;
+  }
+  return result;
+}
+
+for (let i = 0; i < 5000; i++) landingCaller(landingReceiver, i);
+JSON.stringify([
+  landingCaller(landingReceiver, 7),
+  landingCaller(landingReceiver, -5),
+  landingCaller(landingReceiver, 41)
+]);
+"#;
+
+const METHOD_GC_SETUP: &str = r#"
+function allocatingMethod(count) {
+  let checksum = 0;
+  for (let i = 0; i < count; i++) {
+    const item = { value: i, padding: "method-allocation-padding-" + i };
+    globalThis.__machineMethodGcSink.push(item);
+    checksum += item.value & 1;
+  }
+  return this.marker + checksum;
+}
+
+const methodGcReceiver = { marker: "method-root:", method: allocatingMethod };
+function methodGcCaller(receiver, count) {
+  return receiver.method(count);
+}
+
+globalThis.__machineMethodGcSink = [];
+for (let i = 0; i < 5000; i++) methodGcCaller(methodGcReceiver, 0);
+"#;
+
+const METHOD_GC_PROBE: &str = r#"
+methodGcCaller(methodGcReceiver, 200000);
+"#;
+
+const RECURSIVE_CALLS: &str = r#"
+function recursive(self, value) {
+  if (value <= 0) return value;
+  return self(self, value - 1);
+}
+
+function mutualLeft(other, self, value) {
+  if (value <= 0) return 1;
+  return other(self, other, value - 1);
+}
+
+function mutualRight(other, self, value) {
+  if (value <= 0) return 2;
+  return other(self, other, value - 1);
+}
+
+for (let i = 0; i < 5000; i++) {
+  recursive(recursive, 4);
+  mutualLeft(mutualRight, mutualLeft, 4);
+  mutualRight(mutualLeft, mutualRight, 4);
+}
+
+JSON.stringify([
+  recursive(recursive, 64),
+  mutualLeft(mutualRight, mutualLeft, 64),
+  mutualLeft(mutualRight, mutualLeft, 63)
+]);
+"#;
+
 struct RunResult {
     completion: String,
     stats: RuntimeExecutionStats,
     used_machine_direct_call: bool,
+    used_machine_method_call: bool,
 }
 
 fn run(source: &'static str, name: &'static str, selection: JitSelection) -> RunResult {
@@ -140,27 +297,41 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
     let result = runtime
         .run_script(SourceInput::from_javascript(source), name)
         .expect("Machine direct-call fixture");
-    let used_machine_direct_call = result.jit_artifacts().is_some_and(|batch| {
-        batch.bundles().iter().any(|bundle| {
-            bundle
-                .file(JitArtifactFileName::OptimizedIr)
-                .is_some_and(|file| {
-                    file.contents()
-                        .starts_with(b"; backend=otter-machine-ir scalar-function\n")
-                })
-                && bundle
-                    .file(JitArtifactFileName::Relocations)
+    let artifact_has = |needle: &str| {
+        result.jit_artifacts().is_some_and(|batch| {
+            batch.bundles().iter().any(|bundle| {
+                bundle
+                    .file(JitArtifactFileName::OptimizedIr)
                     .is_some_and(|file| {
-                        std::str::from_utf8(file.contents())
-                            .is_ok_and(|text| text.contains("directCallEntryCell"))
+                        file.contents()
+                            .starts_with(b"; backend=otter-machine-ir scalar-function\n")
                     })
+                    && bundle
+                        .file(JitArtifactFileName::Relocations)
+                        .is_some_and(|file| {
+                            std::str::from_utf8(file.contents())
+                                .is_ok_and(|text| text.contains(needle))
+                        })
+            })
         })
-    });
+    };
+    let used_machine_direct_call = artifact_has("directCallEntryCell");
+    let used_machine_method_call =
+        artifact_has("\"callKind\": \"method\"") || artifact_has("\"callKind\":\"method\"");
     RunResult {
         completion: result.completion_string().to_owned(),
         stats: runtime.execution_stats(),
         used_machine_direct_call,
+        used_machine_method_call,
     }
+}
+
+fn assert_machine_method_call(result: &RunResult) {
+    assert_machine_direct_call(result);
+    assert!(
+        result.used_machine_method_call,
+        "fixture must publish a typed Machine IR method-call target"
+    );
 }
 
 fn assert_machine_direct_call(result: &RunResult) {
@@ -303,4 +474,173 @@ fn nested_machine_calls_rewrite_live_roots_during_gc() {
         .completion_string()
         .to_owned();
     assert_eq!(reused, "again:0");
+}
+
+#[test]
+fn own_method_binds_exact_receiver_through_machine_ir() {
+    let oracle = run(
+        OWN_METHOD,
+        "jit-machine-own-method.js",
+        JitSelection::InterpreterOnly,
+    );
+    let compiled = run(
+        OWN_METHOD,
+        "jit-machine-own-method.js",
+        JitSelection::ProductionTiered,
+    );
+
+    assert_eq!(compiled.completion, oracle.completion);
+    assert_eq!(compiled.completion, "[42,40]");
+    assert_machine_method_call(&compiled);
+}
+
+#[test]
+fn prototype_method_guard_binds_exact_receiver() {
+    let oracle = run(
+        PROTOTYPE_METHOD,
+        "jit-machine-prototype-method.js",
+        JitSelection::InterpreterOnly,
+    );
+    let compiled = run(
+        PROTOTYPE_METHOD,
+        "jit-machine-prototype-method.js",
+        JitSelection::ProductionTiered,
+    );
+
+    assert_eq!(compiled.completion, oracle.completion);
+    assert_eq!(compiled.completion, "[42,40]");
+    assert_machine_method_call(&compiled);
+}
+
+#[test]
+fn method_cold_exits_do_not_replay_and_caller_is_reusable() {
+    let oracle = run(
+        METHOD_COLD_EXITS,
+        "jit-machine-method-cold-exits.js",
+        JitSelection::InterpreterOnly,
+    );
+    let compiled = run(
+        METHOD_COLD_EXITS,
+        "jit-machine-method-cold-exits.js",
+        JitSelection::ProductionTiered,
+    );
+
+    assert_eq!(compiled.completion, oracle.completion);
+    assert_eq!(compiled.completion, r#"[2147483648,"method-boom",5,1,42]"#);
+    assert_machine_method_call(&compiled);
+    assert!(compiled.stats.jit_generated_call_deopts > 0);
+}
+
+#[test]
+fn method_receiver_arguments_and_deopt_state_can_spill() {
+    let oracle = run(
+        METHOD_SPILLS,
+        "jit-machine-method-spills.js",
+        JitSelection::InterpreterOnly,
+    );
+    let compiled = run(
+        METHOD_SPILLS,
+        "jit-machine-method-spills.js",
+        JitSelection::ProductionTiered,
+    );
+
+    assert_eq!(compiled.completion, oracle.completion);
+    assert_eq!(compiled.completion, "spill:115");
+    assert_machine_method_call(&compiled);
+}
+
+#[test]
+fn method_throw_enters_explicit_machine_landing_pad() {
+    let oracle = run(
+        METHOD_LANDING_PAD,
+        "jit-machine-method-landing-pad.js",
+        JitSelection::InterpreterOnly,
+    );
+    let compiled = run(
+        METHOD_LANDING_PAD,
+        "jit-machine-method-landing-pad.js",
+        JitSelection::ProductionTiered,
+    );
+
+    assert_eq!(compiled.completion, oracle.completion);
+    assert_eq!(compiled.completion, "[8,null,42]");
+    assert_machine_method_call(&compiled);
+}
+
+#[test]
+fn method_receiver_remains_rooted_during_moving_gc() {
+    let mut runtime = Runtime::builder()
+        .jit_selection(JitSelection::ProductionTiered)
+        .jit_osr_threshold(u32::MAX)
+        .jit_debug(JitDebugRequest::artifacts())
+        .build()
+        .expect("Machine method-GC runtime");
+    let setup = runtime
+        .run_script(
+            SourceInput::from_javascript(METHOD_GC_SETUP),
+            "jit-machine-method-gc-setup.js",
+        )
+        .expect("Machine method-GC setup");
+    let used_machine_method_call = setup.jit_artifacts().is_some_and(|batch| {
+        batch.bundles().iter().any(|bundle| {
+            bundle
+                .file(JitArtifactFileName::OptimizedIr)
+                .is_some_and(|file| {
+                    file.contents()
+                        .starts_with(b"; backend=otter-machine-ir scalar-function\n")
+                })
+                && bundle
+                    .file(JitArtifactFileName::Relocations)
+                    .is_some_and(|file| {
+                        std::str::from_utf8(file.contents())
+                            .is_ok_and(|text| text.contains("\"callKind\": \"method\""))
+                    })
+        })
+    });
+    let stats_before = runtime.execution_stats();
+    let gc_before = runtime.heap_stats().minor_gc_cycles;
+    let completion = runtime
+        .run_script(
+            SourceInput::from_javascript(METHOD_GC_PROBE),
+            "jit-machine-method-gc-probe.js",
+        )
+        .expect("Machine method-GC probe")
+        .completion_string()
+        .to_owned();
+    let stats_after = runtime.execution_stats();
+
+    assert_eq!(completion, "method-root:100000");
+    assert!(used_machine_method_call);
+    assert!(stats_after.jit_generated_calls > stats_before.jit_generated_calls);
+    assert!(runtime.heap_stats().minor_gc_cycles > gc_before);
+    runtime
+        .force_gc()
+        .expect("completed method call must unlink its Machine root record");
+    let reused = runtime
+        .run_script(
+            SourceInput::from_javascript("methodGcCaller(methodGcReceiver, 0);"),
+            "jit-machine-method-gc-reuse.js",
+        )
+        .expect("Machine method caller must remain reusable after full GC")
+        .completion_string()
+        .to_owned();
+    assert_eq!(reused, "method-root:0");
+}
+
+#[test]
+fn recursive_and_mutually_recursive_machine_calls_use_stable_cells() {
+    let oracle = run(
+        RECURSIVE_CALLS,
+        "jit-machine-recursive-calls.js",
+        JitSelection::InterpreterOnly,
+    );
+    let compiled = run(
+        RECURSIVE_CALLS,
+        "jit-machine-recursive-calls.js",
+        JitSelection::ProductionTiered,
+    );
+
+    assert_eq!(compiled.completion, oracle.completion);
+    assert_eq!(compiled.completion, "[0,1,2]");
+    assert_machine_direct_call(&compiled);
 }

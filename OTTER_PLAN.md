@@ -43,9 +43,10 @@ It already owns:
 - descriptor-driven allocating primitive string concatenation with exact
   pre-operation deopt, allocator late-use roots, a reusable native root-save
   area, VM `SafepointRecord` spill locations, and post-GC reloads;
-- descriptor-driven monomorphic plain JavaScript calls from Machine IR through
-  the shared generated-linkage emitter, with exact pre-call FrameState,
-  allocator-owned arguments/results, and no interpreter-window shuttle;
+- descriptor-driven monomorphic plain and guarded-method JavaScript calls from
+  Machine IR through the shared generated-linkage emitter, with exact pre-call
+  FrameState, allocator-owned receiver/arguments/results, own/prototype guards,
+  and no interpreter-window shuttle;
 - allocator-driven spills, AAPCS64 callee-saved allocation, exact frame sizing,
   fixed leaf ABI operands, and deterministic normalized allocation artifacts;
 - `MachineFrameState -> lower_deopt_table -> VM DeoptTable`, shared cold exits,
@@ -55,33 +56,40 @@ It already owns:
   scalar generations initially publish only their initialized parameter
   prefix, while every cold exit expands the canonical VM window before reentry;
 - a VM-owned linked root chain for Machine values live across reentrant calls;
-  return, callee overflow/deopt, propagated throw, nested generated calls, and
-  moving minor GC all execute without replay or conservative stack scanning;
+  return, callee overflow/deopt, propagated throw, nested/recursive generated
+  calls, and moving minor GC all execute without replay or conservative stack
+  scanning;
+- catch-only exception-region CFGs with explicit landing-pad successors; the
+  shared linkage fully unwinds publication, commits the thrown value to its
+  allocator home, and transfers at the exact call PC without replay;
 - representation-checked entry and OSR guards with no replay after a started
-  operation.
+  operation; method guard misses deopt before lookup effects and tier/frame
+  publication changes do not require caller recompilation.
 
 The old optimizing compiler and template emitter remain in the active graph
 only for operations and function shapes not yet selected by the replacement
 pipeline. They are fallback, not contracts to preserve.
 
 Latest accepted gate: 282 JIT tests, 833 VM tests, all-target/all-feature
-Clippy, compile-fail/rooting checks, and 19/19 differential
+Clippy, compile-fail/rooting checks, and 20/20 differential
 interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.
 
 ## Active work
 
 ### 1. Complete reentrant operation families
 
-Plain calls now use the same descriptor, allocator roots, stable entry cells,
-stack-owned frame publication, and cold deopt machinery as the rest of Machine
-IR. Extend that one boundary to the remaining reentrant forms:
+Plain and guarded-method calls now use the same descriptor, allocator roots,
+stable entry cells, stack-owned frame publication, cold deopt machinery, and
+explicit catch landing edges. Extend that one boundary to the remaining
+reentrant forms:
 
-- lower guarded method calls and constructs without a second call format;
-- admit exception-region CFGs with explicit landing pads and multi-frame state;
+- lower constructs without a second call, frame, root, or result format;
+- admit nested catch/finally regions and complete multi-frame state through
+  `lower_deopt_table`;
 - move reentrant natives onto typed descriptors instead of opcode-specific
   materialization stubs;
-- prove recursion, interrupt/budget exits, and constructor abrupt completion
-  without conservative scanning, replay, or an interpreter-window ABI.
+- prove constructor abrupt completion and interrupt/budget exits without
+  conservative scanning, replay, or an interpreter-window ABI.
 
 Leaf calls remain the no-safepoint case of this same descriptor boundary; do
 not add a second call format.
@@ -90,7 +98,7 @@ not add a second call format.
 
 Implement in this order:
 
-1. method calls and constructs with exceptional edges and multi-frame state;
+1. constructs, nested/finally exceptional edges, and multi-frame state;
 2. settled fields and elements with dependency tokens, guards, and barriers;
 3. inline object allocation, constructors, and virtual objects;
 4. OSR at every reducible loop and incremental-GC handshakes.

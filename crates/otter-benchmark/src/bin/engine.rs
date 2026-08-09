@@ -15,8 +15,10 @@
 //! - Kernel fixture setup runs once before warmup; samples run a precompiled call stub.
 //! - One interpreter owns all warmup and measured kernel executions.
 //! - Kernel VM/JIT counter snapshots bracket warmup plus measurement and never
-//!   execute inside a timed sample; compile/layout diagnostics describe the
-//!   prepared module once.
+//!   execute inside a timed sample; compiler-hook timing spans fixture setup
+//!   through measurement but covers only actual tier-up invocations, while
+//!   layout diagnostics describe the prepared module and final native-code
+//!   residency once.
 //! - Feedback seeding, JIT snapshot construction, and compiler-hook
 //!   construction are outside native-emitter samples.
 //! - Feedback seed calls stay interpreted so hot loops cannot OSR before every
@@ -36,7 +38,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -279,6 +281,65 @@ struct Measurements {
     release_binary_bytes: Vec<u64>,
     jit_counters: Vec<(&'static str, u64)>,
     diagnostics: Vec<(&'static str, MetricUnit, u64)>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct JitCompilerProbeStats {
+    invocations: u64,
+    wall_time_ns: u64,
+    max_wall_time_ns: u64,
+    emitted_code_objects: u64,
+    emitted_code_bytes: u64,
+}
+
+struct MeasuredJitCompiler {
+    inner: Arc<dyn JitCompilerHook>,
+    stats: Arc<Mutex<JitCompilerProbeStats>>,
+}
+
+impl MeasuredJitCompiler {
+    fn record(&self, elapsed_ns: u64, result: &Result<JitCompileStatus, JitCompileError>) {
+        let mut stats = self.stats.lock().expect("JIT compiler probe lock poisoned");
+        stats.invocations = stats.invocations.saturating_add(1);
+        stats.wall_time_ns = stats.wall_time_ns.saturating_add(elapsed_ns);
+        stats.max_wall_time_ns = stats.max_wall_time_ns.max(elapsed_ns);
+        if let Ok(JitCompileStatus::Compiled { code, .. }) = result {
+            stats.emitted_code_objects = stats.emitted_code_objects.saturating_add(1);
+            stats.emitted_code_bytes = stats
+                .emitted_code_bytes
+                .saturating_add(u64::try_from(code.code_len()).unwrap_or(u64::MAX));
+        }
+    }
+}
+
+impl JitCompilerHook for MeasuredJitCompiler {
+    fn optimizing_tier_enabled(&self) -> bool {
+        self.inner.optimizing_tier_enabled()
+    }
+
+    fn runtime_stub_bindings(&self) -> Vec<JitRuntimeStubBinding> {
+        self.inner.runtime_stub_bindings()
+    }
+
+    fn compile_function(
+        &self,
+        request: JitCompileRequest,
+    ) -> Result<JitCompileStatus, JitCompileError> {
+        let started = Instant::now();
+        let result = self.inner.compile_function(request);
+        self.record(elapsed_ns(started), &result);
+        result
+    }
+
+    fn compile_optimized_function(
+        &self,
+        request: JitCompileRequest,
+    ) -> Result<JitCompileStatus, JitCompileError> {
+        let started = Instant::now();
+        let result = self.inner.compile_optimized_function(request);
+        self.record(elapsed_ns(started), &result);
+        result
+    }
 }
 
 #[derive(Debug)]
@@ -1080,7 +1141,17 @@ fn run_kernel(
         opcode_count,
     } = prepared;
     let mut interpreter = Interpreter::new();
-    configure_interpreter(&mut interpreter, jit_tier, jit_osr_threshold);
+    if let Some(threshold) = jit_osr_threshold {
+        interpreter.set_jit_osr_threshold(threshold);
+    }
+    let compiler_probe = Arc::new(Mutex::new(JitCompilerProbeStats::default()));
+    let compiler = jit_tier.compiler().map(|inner| {
+        Arc::new(MeasuredJitCompiler {
+            inner,
+            stats: Arc::clone(&compiler_probe),
+        }) as Arc<dyn JitCompilerHook>
+    });
+    interpreter.set_jit_compiler(compiler);
     if let Err(error) = interpreter.run(&context) {
         return fail(
             RunFailureKind::Runtime,
@@ -1151,6 +1222,10 @@ fn run_kernel(
         measurements.execution_time_ns.push(elapsed);
     }
     measurements.jit_counters = jit_counter_deltas(jit_before, interpreter.jit_runtime_stats());
+    let compiler_stats = *compiler_probe
+        .lock()
+        .expect("JIT compiler probe lock poisoned");
+    let residency = interpreter.jit_code_residency();
     let budget_after = interpreter.runtime_budget_stats();
     let property_after = interpreter.property_ic_stats();
     let call_after = context.call_feedback_stats();
@@ -1162,6 +1237,56 @@ fn run_kernel(
         ),
         ("bytecode-size", MetricUnit::Bytes, bytecode_bytes),
         ("static-opcode-count", MetricUnit::Count, opcode_count),
+        (
+            "jit-compiler-invocations",
+            MetricUnit::Count,
+            compiler_stats.invocations,
+        ),
+        (
+            "jit-compiler-wall-time-total",
+            MetricUnit::Nanoseconds,
+            compiler_stats.wall_time_ns,
+        ),
+        (
+            "jit-compiler-wall-time-max",
+            MetricUnit::Nanoseconds,
+            compiler_stats.max_wall_time_ns,
+        ),
+        (
+            "jit-emitted-code-objects",
+            MetricUnit::Count,
+            compiler_stats.emitted_code_objects,
+        ),
+        (
+            "jit-emitted-code-bytes",
+            MetricUnit::Bytes,
+            compiler_stats.emitted_code_bytes,
+        ),
+        (
+            "jit-resident-code-objects",
+            MetricUnit::Count,
+            residency.unique_code_objects,
+        ),
+        (
+            "jit-resident-code-bytes",
+            MetricUnit::Bytes,
+            residency.code_bytes,
+        ),
+        (
+            "jit-installed-entry-bodies",
+            MetricUnit::Count,
+            residency.installed_entry_bodies,
+        ),
+        (
+            "jit-installed-optimizing-bodies",
+            MetricUnit::Count,
+            residency.installed_optimized_bodies,
+        ),
+        (
+            "jit-installed-osr-bodies",
+            MetricUnit::Count,
+            residency.installed_osr_bodies,
+        ),
         (
             "vm-reductions",
             MetricUnit::Count,
@@ -2870,6 +2995,23 @@ mod tests {
         assert_eq!(passed.measurements.wall_time_ns.len(), 2);
         assert_eq!(passed.measurements.execution_time_ns.len(), 2);
         assert_eq!(passed.iterations_per_sample, Some(1));
+        for metric in [
+            "jit-compiler-invocations",
+            "jit-compiler-wall-time-total",
+            "jit-emitted-code-bytes",
+            "jit-resident-code-bytes",
+        ] {
+            assert_eq!(
+                passed
+                    .measurements
+                    .diagnostics
+                    .iter()
+                    .find(|(name, _, _)| *name == metric)
+                    .map(|(_, _, value)| *value),
+                Some(0),
+                "interpreter kernel diagnostic {metric}"
+            );
+        }
 
         let failed = benchmark_result(run_kernel(
             source_path.clone(),
@@ -2905,6 +3047,46 @@ mod tests {
         let value = run_kernel_invocation(&mut interpreter, &context, invocation_id)
             .expect("invoke after full GC");
         assert_eq!(value.as_f64(), Some(42.0));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn derived_constructor_kernel_exercises_generated_linkage() {
+        let record = run_kernel(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../benchmarks/scripts/derived-constructor.js"),
+            "engineKernel".into(),
+            10_000_200_000.0,
+            EngineJitTier::ProductionTiered,
+            None,
+            1,
+            1,
+        );
+        assert!(record.failure.is_none(), "{:?}", record.failure);
+        assert!(
+            record
+                .measurements
+                .jit_counters
+                .iter()
+                .find(|(name, _)| *name == "jit-generated-calls")
+                .is_some_and(|(_, value)| *value > 300_000),
+            "kernel must execute generated constructor linkage"
+        );
+        for metric in [
+            "jit-compiler-wall-time-total",
+            "jit-emitted-code-bytes",
+            "jit-resident-code-bytes",
+        ] {
+            assert!(
+                record
+                    .measurements
+                    .diagnostics
+                    .iter()
+                    .find(|(name, _, _)| *name == metric)
+                    .is_some_and(|(_, _, value)| *value > 0),
+                "kernel diagnostic {metric} must be non-zero"
+            );
+        }
     }
 
     #[cfg(target_arch = "aarch64")]

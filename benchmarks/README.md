@@ -75,6 +75,7 @@ print output, access the filesystem, install packages, or depend on host APIs.
 | `boxed-double-property.js` | Repeated double-valued object property loads | `4000000` |
 | `dense-array.js` | Repeated dense indexed array loads | `5234688` |
 | `numeric-leaf.js` | Repeated calls into a straight-line eight-operation Number leaf | `-700000` |
+| `derived-constructor.js` | Fixed-arity derived construction, `super()` linkage, initialized `this`, and result property reads | `10000200000` |
 | `string-concat.js` | Allocating primitive concat with a tagged result live across the second safepoint | `600000` |
 | `typed-parameter-loop.js` | Int32 parameter guards, loop phis, checked arithmetic, and OSR | `300000` |
 
@@ -98,9 +99,15 @@ The same snapshot window reports `vm-reductions`, `vm-bytecode-calls`,
 named-property load-IC hits, misses, and installs, plus retained ordinary-call
 observations. Final mono/poly/megamorphic call-site counts describe the bounded
 feedback state. One-time module diagnostics report bytecode compile time, exact
-serialized bytecode size, and static opcode count. These values are diagnostic
-rather than ranking inputs: counter totals cover all warmup and measured
-invocations, while compile and layout values describe the prepared module once.
+serialized bytecode size, and static opcode count. Kernel records also measure
+each actual tier-up compiler-hook invocation from fixture setup through the
+last measured sample:
+`jit-compiler-wall-time-total` and `jit-compiler-wall-time-max` report cold
+compiler latency, `jit-emitted-code-*` reports every successful generation,
+and `jit-resident-code-*` reports unique executable objects still owned after
+the last sample. These values are diagnostic rather than ranking inputs:
+counter totals cover all warmup and measured invocations, while compile and
+layout values describe the prepared module or tiering lifetime once.
 
 ```bash
 cargo run --release -p otter-benchmark --features engine \

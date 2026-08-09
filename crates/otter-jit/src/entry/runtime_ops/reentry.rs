@@ -5,6 +5,7 @@
 //! - Propagated-throw resumption in live compiled callers.
 //! - Reentrant construction and closure/function creation.
 //! - Generated base-constructor receiver preparation and return substitution.
+//! - Stack-owned built-in Array iterator collection and spread-result append.
 //! - Reentrant equality, typed numeric-family, and unary-coercion completion.
 //! - Cooperative backedge polling.
 //!
@@ -14,7 +15,9 @@
 //! roots for the entire call. Raw numeric opcodes and unary-coercion modes are
 //! decoded exactly once at this ABI edge; coercion hint constants are resolved
 //! through the canonical frame owner before VM semantics receive typed
-//! requests. Errors are parked in the shared context slot.
+//! requests. Built-in Array spread collection accepts both materialized and
+//! stack-owned frames; observable iterator overrides bail before effects.
+//! Errors are parked in the shared context slot.
 //!
 //! # See also
 //! - `super::super::abi` — machine-visible entry context.
@@ -359,8 +362,8 @@ pub(crate) extern "C" fn jit_exception_op_stub(
 }
 
 /// Complete one iterator-lifecycle opcode. `0` means the VM committed the
-/// opcode and the template may fall through; `1` reports a parked throw; `2`
-/// is reserved for an absent activation and therefore remains an exact
+/// opcode and the template may fall through; `1` is an exact pre-effect side
+/// exit; `2` reports a parked throw. An absent activation therefore remains a
 /// pre-effect side exit.
 pub(crate) extern "C" fn jit_iterator_op_stub(
     ctx: *mut JitCtx,
@@ -373,7 +376,23 @@ pub(crate) extern "C" fn jit_iterator_op_stub(
     let ctx = unsafe { &mut *ctx };
     let frame_index = match ctx.materialized_frame_index() {
         Ok(index) => index,
-        Err(_) => return STATUS_BAILED,
+        Err(_) => {
+            let result = match ctx.try_runtime_call() {
+                Ok(Some(mut runtime)) => {
+                    runtime.iterator_op(opcode as u8, arg0 as u16, arg1 as u16, arg2 as u16)
+                }
+                Ok(None) => return STATUS_BAILED,
+                Err(err) => Err(err),
+            };
+            return match result {
+                Ok(otter_vm::IteratorRuntimeOutcome::Completed) => 0,
+                Ok(otter_vm::IteratorRuntimeOutcome::Bail) => STATUS_BAILED,
+                Err(err) => {
+                    park_jit_error(ctx, err);
+                    STATUS_THREW
+                }
+            };
+        }
     };
     let Some(activation) = ctx.checked_activation() else {
         return STATUS_BAILED;
@@ -620,8 +639,8 @@ pub(crate) extern "C" fn jit_module_op_stub(
 
 /// Complete one variadic construction opcode (`ArrayConstruct`, `ArrayFrom`,
 /// `ArrayOf`, `QueueMicrotask`). `0` means the VM committed the opcode and the
-/// template may fall through; `1` reports a parked throw; `2` remains an exact
-/// pre-effect side exit for an absent activation.
+/// template may fall through; `1` is an exact pre-effect side exit; `2` reports
+/// a parked throw. An absent activation therefore remains an exact side exit.
 pub(crate) extern "C" fn jit_variadic_op_stub(
     ctx: *mut JitCtx,
     opcode: u64,
@@ -747,8 +766,8 @@ pub(crate) extern "C" fn jit_structural_op_stub(
 
 /// Complete one allocating-construction opcode (`CollectRest`, `NewError`,
 /// `NewBuiltinError`, `ArrayPush`). `0` means the VM committed the opcode and the
-/// template may fall through; `1` reports a parked throw; `2` remains an exact
-/// pre-effect side exit for an absent activation.
+/// template may fall through; `1` is an exact pre-effect side exit; `2` reports
+/// a parked throw. An absent activation therefore remains an exact side exit.
 pub(crate) extern "C" fn jit_construct_op_stub(
     ctx: *mut JitCtx,
     opcode: u64,
@@ -758,7 +777,22 @@ pub(crate) extern "C" fn jit_construct_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let frame_index = match ctx.materialized_frame_index() {
+    let materialized_frame = ctx.materialized_frame_index();
+    if materialized_frame.is_err() && opcode as u8 == otter_bytecode::Op::ArrayPush as u8 {
+        let result = match ctx.try_runtime_call() {
+            Ok(Some(mut runtime)) => runtime.spread_array_push(arg0 as u16, arg1 as u16),
+            Ok(None) => return STATUS_BAILED,
+            Err(err) => Err(err),
+        };
+        return match result {
+            Ok(()) => 0,
+            Err(err) => {
+                park_jit_error(ctx, err);
+                STATUS_THREW
+            }
+        };
+    }
+    let frame_index = match materialized_frame {
         Ok(index) => index,
         Err(_) => return STATUS_BAILED,
     };

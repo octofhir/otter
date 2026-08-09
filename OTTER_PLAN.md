@@ -89,13 +89,18 @@ applies the one base/derived return contract without replaying `New` or
 ordinary typed call feedback and bake monomorphic targets into this linkage.
 The spread array remains rooted across cold resolution/receiver preparation
 and a leaf runtime stub copies declared arguments directly into the unpublished
-callee frame; no second call, frame, root, or result ABI exists. Extend that
-one boundary to the remaining reentrant forms:
+callee frame; no second call, frame, root, or result ABI exists. Generated
+spread wrappers also keep the compiler-emitted default-Array iterator
+collection native: `GetIterator`, `IteratorNext`, and `ArrayPush` operate over
+the published stack-owned frame through the typed runtime boundary. An own,
+replaced, accessor-backed, or non-Array iterator refuses before effects and
+resumes the exact materialized path. Extend that one boundary to the remaining
+reentrant forms:
 
 - admit nested catch/finally regions and complete multi-frame state through
   `lower_deopt_table`;
-- move reentrant natives onto typed descriptors instead of opcode-specific
-  materialization stubs;
+- move the remaining reentrant natives onto typed descriptors instead of
+  opcode-specific materialization stubs;
 - prove constructor abrupt completion and interrupt/budget exits without
   conservative scanning, replay, or an interpreter-window ABI.
 

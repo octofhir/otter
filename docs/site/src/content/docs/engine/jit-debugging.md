@@ -311,6 +311,16 @@ keeps its source array rooted across cold resolution and receiver preparation,
 then copies the declared-parameter prefix directly into the same unpublished
 callee frame with a leaf/no-allocation runtime stub. It does not introduce a
 second frame, call ABI, result transition, or replay path.
+
+Compiler-generated spread wrappers normally contain the frontend's canonical
+`GetIterator` / `IteratorNext` / `ArrayPush` collection loop before the call.
+When its source is an ordinary Array whose `@@iterator` is still the original
+`Array.prototype.values`, those operations run through the same published
+stack-owned activation and the generated wrapper can return without an entry
+deopt. An own iterator, prototype replacement, accessor, or non-Array source
+misses before observable work and resumes the materialized opcode path. A
+generated-call deopt at that guard is therefore a semantic fallback, while
+repeated deopts at the default Array collection PCs indicate a regression.
 `linkageBytes` is the exact caller-owned `NativeFrame`, tagged register window,
 bookkeeping, and alignment. `reservedStackBytes` is the planning-time sum with
 the captured target prologue. At runtime the permanent function cell selects

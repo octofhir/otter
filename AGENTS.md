@@ -444,6 +444,9 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     reservation, and register count. `argumentMode` is `fixed` or `spread`;
     spread arguments are copied from the rooted dense array into the same
     unpublished callee frame through the leaf/no-allocation runtime stub.
+    Compiler-generated default-Array iterator collection inside a generated
+    spread wrapper remains on the published stack-owned activation; observable
+    iterator overrides side-exit before effects to the materialized path.
     Generated code links through the permanent function cell and reads the
     selected generation's actual code-object id, tier, and frame reservation
     before entry; tier publication does not recompile callers. `methodGuard`

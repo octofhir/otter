@@ -233,7 +233,7 @@ pub use run_control::{
     DEFAULT_MAX_STACK_DEPTH, DEFAULT_MAX_SYNC_REENTRY_DEPTH, ErrorDetail, InterruptFlag,
     NO_HANDLER_OFFSET, RunError, StackFrameSnapshot, VmError,
 };
-pub use runtime_activation::RuntimeCall;
+pub use runtime_activation::{IteratorRuntimeOutcome, RuntimeCall};
 
 #[cfg(test)]
 use otter_bytecode::ArgumentsObjectKind;

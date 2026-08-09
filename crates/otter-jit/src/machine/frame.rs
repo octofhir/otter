@@ -7,6 +7,7 @@
 //!
 //! # Invariants
 //! - Every spill slot is one eight-byte machine word.
+//! - Allocator spills precede the reusable tagged-root save area.
 //! - The total native reservation includes target-owned fixed bytes and is
 //!   aligned to the target ABI requirement.
 //! - Spill offsets are relative to the post-prologue stack pointer and never
@@ -40,6 +41,8 @@ impl std::error::Error for FrameLayoutError {}
 pub struct MachineFrameLayout {
     fixed_bytes: u32,
     spill_slots: u32,
+    root_slots: u16,
+    root_area_offset: u32,
     spill_area_bytes: u32,
     frame_bytes: u32,
 }
@@ -48,15 +51,23 @@ impl MachineFrameLayout {
     /// Build an aligned frame around one allocator result.
     pub fn new(
         allocation: &AllocatedSequence,
+        root_slots: u16,
         fixed_bytes: u32,
         stack_alignment: u32,
     ) -> Result<Self, FrameLayoutError> {
         if !stack_alignment.is_power_of_two() {
             return Err(FrameLayoutError::InvalidAlignment);
         }
-        let raw_spill_bytes = allocation
+        let allocator_spill_bytes = allocation
             .spill_slots()
             .checked_mul(SPILL_SLOT_BYTES)
+            .ok_or(FrameLayoutError::FrameSizeOverflow)?;
+        let root_area_offset = allocator_spill_bytes;
+        let root_bytes = u32::from(root_slots)
+            .checked_mul(SPILL_SLOT_BYTES)
+            .ok_or(FrameLayoutError::FrameSizeOverflow)?;
+        let raw_spill_bytes = allocator_spill_bytes
+            .checked_add(root_bytes)
             .ok_or(FrameLayoutError::FrameSizeOverflow)?;
         let unaligned_total = fixed_bytes
             .checked_add(raw_spill_bytes)
@@ -68,6 +79,8 @@ impl MachineFrameLayout {
         Ok(Self {
             fixed_bytes,
             spill_slots: allocation.spill_slots(),
+            root_slots,
+            root_area_offset,
             spill_area_bytes,
             frame_bytes,
         })
@@ -91,12 +104,29 @@ impl MachineFrameLayout {
         self.frame_bytes
     }
 
+    /// Number of reusable tagged-root save slots.
+    #[must_use]
+    pub const fn root_slots(self) -> u16 {
+        self.root_slots
+    }
+
     /// Byte offset of one spill slot from the post-prologue stack pointer.
     pub fn spill_offset(self, slot: u32) -> Result<u32, FrameLayoutError> {
         if slot >= self.spill_slots {
             return Err(FrameLayoutError::InvalidSpillSlot(slot));
         }
         slot.checked_mul(SPILL_SLOT_BYTES)
+            .ok_or(FrameLayoutError::FrameSizeOverflow)
+    }
+
+    /// Byte offset of one tagged-root save home from the post-prologue SP.
+    pub fn root_offset(self, slot: u16) -> Result<u32, FrameLayoutError> {
+        if slot >= self.root_slots {
+            return Err(FrameLayoutError::InvalidSpillSlot(u32::from(slot)));
+        }
+        u32::from(slot)
+            .checked_mul(SPILL_SLOT_BYTES)
+            .and_then(|offset| self.root_area_offset.checked_add(offset))
             .ok_or(FrameLayoutError::FrameSizeOverflow)
     }
 }
@@ -172,10 +202,15 @@ mod tests {
             .expect("pressure sequence allocates");
         assert!(allocation.spill_slots() > 0);
 
-        let layout = MachineFrameLayout::new(&allocation, 16, 16).expect("valid frame");
+        let layout = MachineFrameLayout::new(&allocation, 3, 16, 16).expect("valid frame");
         assert_eq!(layout.frame_bytes() % 16, 0);
         assert!(layout.spill_area_bytes() >= allocation.spill_slots() * 8);
         assert_eq!(layout.spill_offset(0), Ok(0));
+        assert_eq!(layout.root_slots(), 3);
+        assert_eq!(
+            layout.root_offset(0),
+            Ok(allocation.spill_slots() * SPILL_SLOT_BYTES)
+        );
         assert_eq!(
             layout.spill_offset(allocation.spill_slots() - 1),
             Ok((allocation.spill_slots() - 1) * 8)

@@ -12,8 +12,9 @@
 //! - Machine locations, edits, and frame size come only from regalloc2 output.
 //! - Reducible loop headers publish one representation-checked OSR trampoline
 //!   that fills only live block parameters and never mutates the VM window.
-//! - Runtime calls are leaf polls or cold deopt writeback; neither keeps a
-//!   tagged value solely in Machine IR storage across a GC safepoint.
+//! - Allocating calls save every live tagged value from its exact late-use
+//!   location into the frame's collector-visible root area and reload it after
+//!   moving GC; no interpreter-window shuttle or emitter-local map exists.
 
 mod arm64;
 mod hir;
@@ -31,6 +32,7 @@ use super::{
     InstructionSequence, MachineBlock, MachineBlockData, MachineInstruction, MachineInstructionId,
     MachineOpcode, MachineOperand, MachineOsrInput, MachineOsrType, MachineRepresentation,
     MachineValue, PhysicalRegister, SafepointKind, TargetRegisterFile, lower_deopt_table,
+    lower_safepoints,
 };
 use crate::{
     Unsupported,
@@ -48,16 +50,19 @@ pub(crate) fn try_compile(
     let Some(hir) = NumericFunction::build(view) else {
         return Ok(None);
     };
-    let parameter_prefix_entry = !hir
-        .frame_states
-        .iter()
-        .any(|state| matches!(state.point, NumericFramePoint::Backedge { .. }));
     let sequence = select(&hir)
         .map_err(|_| Unsupported::OperandShape("scalar HIR to Machine IR selection"))?;
     let allocation = sequence
         .allocate(&TargetRegisterFile::aarch64_scalar_function())
         .map_err(|_| Unsupported::OperandShape("scalar Machine IR allocation"))?;
-    let frame = arm64::frame_layout(&allocation)?;
+    let machine_safepoints = lower_safepoints(&sequence, &allocation)
+        .map_err(|_| Unsupported::OperandShape("scalar Machine IR safepoint lowering"))?;
+    let parameter_prefix_entry = machine_safepoints.is_empty()
+        && !hir
+            .frame_states
+            .iter()
+            .any(|state| matches!(state.point, NumericFramePoint::Backedge { .. }));
+    let frame = arm64::frame_layout(&allocation, machine_safepoints.root_slot_count())?;
     let deopt_table = lower_deopt_table(
         &sequence,
         &allocation,
@@ -90,8 +95,14 @@ pub(crate) fn try_compile(
         &allocation,
         frame,
         &deopt_runtime,
+        &machine_safepoints,
         transitions.entry(STUB_JIT_BACKEDGE_POLL),
         transitions.variadic_entry(STUB_JIT_DEOPT_WRITEBACK),
+        otter_vm::runtime_stubs::STRING_CONCAT_ALLOC
+            .entry_addr()
+            .ok_or(Unsupported::OperandShape(
+                "scalar string concat runtime entry",
+            ))? as u64,
         otter_vm::runtime_stubs::NUMBER_REM_F64_LEAF.entry_addr() as u64,
         otter_vm::runtime_stubs::NUMBER_POW_F64_LEAF.entry_addr() as u64,
         otter_vm::runtime_stubs::NUMBER_TO_INT32_F64_LEAF.entry_addr() as u64,
@@ -102,7 +113,7 @@ pub(crate) fn try_compile(
     )?;
     let machine_register_count = u8::try_from(allocation.used_register_count())
         .map_err(|_| Unsupported::OperandShape("scalar machine register count"))?;
-    let safepoints = Box::default();
+    let safepoints = machine_safepoints.records().to_vec().into_boxed_slice();
     let frame_maps = Box::default();
     let frame_map_bitmap_words = Box::default();
 
@@ -124,6 +135,7 @@ pub(crate) fn try_compile(
         );
         tier_input.push_str(&sequence.normalized());
         tier_input.push_str(&allocation.normalized());
+        tier_input.push_str(&machine_safepoints.normalized());
         let mut code_map = CodeMapCapture::default();
         code_map.record(CodeRegion::structural(
             "machineScalarFunction",
@@ -166,7 +178,9 @@ pub(crate) fn try_compile(
             parameter_prefix_entry,
             machine_register_count,
             linear_scan_spill_slot_count: allocation.spill_slots(),
-            spill_slot_count: allocation.spill_slots(),
+            spill_slot_count: allocation
+                .spill_slots()
+                .saturating_add(u32::from(machine_safepoints.root_slot_count())),
         },
     );
     Ok(Some(NativeCompileOutput {
@@ -210,6 +224,7 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
     let selection_cfg = SelectionCfg::build(hir);
     let mut instructions = Vec::with_capacity(hir.nodes.len() + hir.parameter_count as usize + 4);
     let mut call_descriptors = Vec::<CallDescriptor>::new();
+    let mut next_safepoint = 0_u32;
     let mut blocks = Vec::with_capacity(selection_cfg.order.len());
     let frame_state_ids = hir
         .frame_states
@@ -652,6 +667,58 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                     call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
                     call
                 }
+                NumericNode::TaggedStringConcat(left, right) => {
+                    let left = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        left,
+                    );
+                    let right = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        right,
+                    );
+                    let padding = push_value(&mut representations, MachineRepresentation::Tagged);
+                    instructions.push(MachineInstruction::plain(
+                        MachineOpcode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
+                        vec![MachineOperand::register_output(padding)],
+                    ));
+                    let descriptor_index = intern_call_descriptor(
+                        &mut call_descriptors,
+                        string_concat_call_descriptor(),
+                    );
+                    let mut call = MachineInstruction::plain(
+                        MachineOpcode::Call(descriptor_index as u32),
+                        vec![
+                            MachineOperand::fixed_register_input(
+                                left,
+                                PhysicalRegister::integer(2),
+                            ),
+                            MachineOperand::fixed_register_input(
+                                right,
+                                PhysicalRegister::integer(3),
+                            ),
+                            MachineOperand::fixed_register_input(
+                                padding,
+                                PhysicalRegister::integer(4),
+                            ),
+                            MachineOperand::fixed_register_output(
+                                result,
+                                PhysicalRegister::integer(0),
+                            ),
+                        ],
+                    );
+                    call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
+                    call.safepoint = Some(super::SafepointId(next_safepoint));
+                    next_safepoint = next_safepoint
+                        .checked_add(1)
+                        .expect("bounded scalar function safepoint count");
+                    call
+                }
                 NumericNode::FloatToBoolean(source) => MachineInstruction::plain(
                     MachineOpcode::FloatToBoolean,
                     vec![
@@ -697,6 +764,7 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
             if let Some(&deopt) = frame_state_ids.get(&NumericFramePoint::Node(node_value)) {
                 attach_frame_state(hir, &values, deopt, &mut instruction);
             }
+            attach_safepoint_roots(&representations, &mut instruction);
             instructions.push(instruction);
         }
 
@@ -792,14 +860,59 @@ fn intern_leaf_boolean_call_descriptor(
     target: otter_vm::native_abi::RuntimeStubDescriptor,
     argument_count: usize,
 ) -> usize {
+    intern_call_descriptor(
+        descriptors,
+        leaf_boolean_call_descriptor(target, argument_count),
+    )
+}
+
+fn intern_call_descriptor(
+    descriptors: &mut Vec<CallDescriptor>,
+    descriptor: CallDescriptor,
+) -> usize {
     if let Some(index) = descriptors
         .iter()
-        .position(|descriptor| descriptor.target == CallTarget::RuntimeStub(target))
+        .position(|candidate| candidate.target == descriptor.target)
     {
         return index;
     }
-    descriptors.push(leaf_boolean_call_descriptor(target, argument_count));
+    descriptors.push(descriptor);
     descriptors.len() - 1
+}
+
+fn string_concat_call_descriptor() -> CallDescriptor {
+    let mut clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
+    clobbers.retain(|register| *register != PhysicalRegister::integer(0));
+    CallDescriptor {
+        target: CallTarget::RuntimeStub(otter_vm::native_abi::STUB_STRING_CONCAT_ALLOC),
+        arguments: vec![MachineRepresentation::Tagged; 3],
+        result: Some(MachineRepresentation::Tagged),
+        effects: CallEffects::READS_HEAP,
+        clobbers,
+        exceptional: ExceptionalEdge::None,
+        safepoint: SafepointKind::Gc,
+    }
+}
+
+fn attach_safepoint_roots(
+    representations: &[MachineRepresentation],
+    instruction: &mut MachineInstruction,
+) {
+    if instruction.safepoint.is_none() {
+        return;
+    }
+    let roots = instruction
+        .operands
+        .iter()
+        .filter(|operand| operand.purpose == super::OperandPurpose::Deopt)
+        .filter(|operand| {
+            representations[operand.value.0 as usize] == MachineRepresentation::Tagged
+        })
+        .map(|operand| operand.value)
+        .collect::<BTreeSet<_>>();
+    instruction
+        .operands
+        .extend(roots.into_iter().map(MachineOperand::tagged_root));
 }
 
 fn leaf_boolean_call_descriptor(
@@ -1033,7 +1146,7 @@ mod tests {
         JitArtifactFileName, JitArtifactIdentity, JitCompileSnapshot, JitDebugTarget, JitDebugTier,
         JitFunctionCode, Value,
         jit::JitTestInstruction,
-        jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ArithFeedback},
+        jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ARITH_STRING, ArithFeedback},
         native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader, VmThread},
         value::tag,
     };
@@ -1041,7 +1154,8 @@ mod tests {
     use super::*;
     use crate::entry::{JitCtx, JitEntry, JitRet, STATUS_BAILED, STATUS_RETURNED};
     use crate::machine::{
-        AllocatedLocation, OperandConstraint, OperandPurpose, OperandTiming, lower_deopt_table,
+        AllocatedLocation, OperandConstraint, OperandPurpose, OperandTiming, SafepointId,
+        lower_deopt_table,
     };
 
     fn numeric_view(
@@ -1516,6 +1630,47 @@ mod tests {
                 JitTestInstruction::new(Op::ReturnValue, 2, 16, vec![Operand::Register(2)]),
             ],
         )
+    }
+
+    fn tagged_string_concat_view(parameter_count: u16) -> JitCompileSnapshot {
+        assert!(parameter_count >= 2);
+        let accumulator = parameter_count;
+        let mut instructions = Vec::with_capacity(usize::from(parameter_count));
+        instructions.push((
+            Op::Add,
+            vec![
+                Operand::Register(accumulator),
+                Operand::Register(0),
+                Operand::Register(1),
+            ],
+        ));
+        for parameter in 2..parameter_count {
+            instructions.push((
+                Op::Add,
+                vec![
+                    Operand::Register(accumulator),
+                    Operand::Register(accumulator),
+                    Operand::Register(parameter),
+                ],
+            ));
+        }
+        instructions.push((Op::ReturnValue, vec![Operand::Register(accumulator)]));
+        let mut view = JitCompileSnapshot::without_feedback(
+            74,
+            parameter_count,
+            parameter_count + 1,
+            instructions
+                .into_iter()
+                .enumerate()
+                .map(|(pc, (op, operands))| {
+                    JitTestInstruction::new(op, pc as u32, pc as u32 * 8, operands)
+                })
+                .collect(),
+        );
+        for pc in 0..u32::from(parameter_count - 1) {
+            view.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(ARITH_STRING));
+        }
+        view
     }
 
     fn unused_parameter_view() -> JitCompileSnapshot {
@@ -3450,6 +3605,104 @@ mod tests {
     }
 
     #[test]
+    fn tagged_string_concat_uses_allocator_driven_vm_safepoints() {
+        let view = tagged_string_concat_view(3);
+        let hir = NumericFunction::build(&view).expect("tagged string-concat HIR");
+        assert_eq!(
+            hir.nodes
+                .iter()
+                .filter(|node| matches!(node, NumericNode::TaggedStringConcat(..)))
+                .count(),
+            2
+        );
+        assert_eq!(hir.frame_states.len(), 2);
+
+        let sequence = select(&hir).expect("tagged string-concat Machine IR");
+        assert_eq!(sequence.call_descriptors().len(), 1);
+        let descriptor = &sequence.call_descriptors()[0];
+        assert_eq!(
+            descriptor.target,
+            CallTarget::RuntimeStub(otter_vm::native_abi::STUB_STRING_CONCAT_ALLOC)
+        );
+        assert_eq!(descriptor.arguments, [MachineRepresentation::Tagged; 3]);
+        assert_eq!(descriptor.result, Some(MachineRepresentation::Tagged));
+        assert_eq!(descriptor.safepoint, SafepointKind::Gc);
+
+        let calls = sequence
+            .instructions()
+            .iter()
+            .enumerate()
+            .filter(|(_, instruction)| matches!(instruction.opcode, MachineOpcode::Call(0)))
+            .map(|(index, instruction)| (MachineInstructionId(index as u32), instruction))
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].1.safepoint, Some(SafepointId(0)));
+        assert_eq!(calls[1].1.safepoint, Some(SafepointId(1)));
+        assert!(calls.iter().all(|(_, call)| call.deopt.is_some()));
+        assert!(calls.iter().all(|(_, call)| {
+            call.operands
+                .iter()
+                .any(|operand| operand.purpose == OperandPurpose::TaggedRoot)
+        }));
+
+        let allocation = sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("tagged string-concat allocation");
+        let safepoints =
+            lower_safepoints(&sequence, &allocation).expect("allocator-driven tagged safepoints");
+        assert_eq!(safepoints.records().len(), 2);
+        assert_eq!(safepoints.records()[0].id, 0);
+        assert_eq!(safepoints.records()[0].frame_state, 0);
+        assert_eq!(safepoints.records()[1].id, 1);
+        assert_eq!(safepoints.records()[1].frame_state, 1);
+        assert!(safepoints.records().iter().all(|record| {
+            !record.tagged_locations.is_empty()
+                && record.tagged_locations.iter().all(|location| {
+                    location.kind == otter_vm::native_abi::TaggedLocationKind::SpillSlot
+                })
+        }));
+
+        let code = compile_output(&view, None).code;
+        assert!(!code.metadata().parameter_prefix_entry);
+        assert_eq!(JitFunctionCode::safepoint_count(&code), 2);
+        assert_eq!(code.deopt_table().entries()[0].outermost().byte_pc, 0);
+        assert_eq!(code.deopt_table().entries()[1].outermost().byte_pc, 8);
+    }
+
+    #[test]
+    fn tagged_string_concat_forces_roots_into_allocator_spills() {
+        let hir = NumericFunction::build(&tagged_string_concat_view(16))
+            .expect("pressure string-concat HIR");
+        let sequence = select(&hir).expect("pressure string-concat Machine IR");
+        let allocation = sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("pressure string-concat allocation");
+        let safepoints =
+            lower_safepoints(&sequence, &allocation).expect("pressure allocator-driven safepoints");
+        let first_call = sequence
+            .instructions()
+            .iter()
+            .position(|instruction| matches!(instruction.opcode, MachineOpcode::Call(0)))
+            .map(|index| MachineInstructionId(index as u32))
+            .expect("first pressure concat call");
+        let first_site = safepoints
+            .site(first_call)
+            .expect("first pressure safepoint");
+        assert!(first_site.roots.len() > 9);
+        assert!(
+            first_site
+                .roots
+                .iter()
+                .any(|root| matches!(root.source, AllocatedLocation::Stack(_))),
+            "callee-saved GPR pressure must force at least one GC root to a spill"
+        );
+        let frame = arm64::frame_layout(&allocation, safepoints.root_slot_count())
+            .expect("pressure root-save frame");
+        assert_eq!(frame.root_slots(), safepoints.root_slot_count());
+        assert!(frame.root_offset(0).expect("first root offset") >= allocation.spill_slots() * 8);
+    }
+
+    #[test]
     fn feedback_specializes_numeric_parameters_until_a_float64_boundary() {
         let view = typed_parameter_leaf_view();
         let hir = NumericFunction::build(&view).expect("typed parameter numeric HIR");
@@ -3944,7 +4197,7 @@ mod tests {
                 && matches!(metadata.location, AllocatedLocation::Register(register)
                     if register.is_integer() && (20..=28).contains(&register.encoding()))
         }));
-        let layout = arm64::frame_layout(&allocation).expect("branch-phi frame layout");
+        let layout = arm64::frame_layout(&allocation, 0).expect("branch-phi frame layout");
         let deopt_table = lower_deopt_table(
             &sequence,
             &allocation,
@@ -4459,7 +4712,7 @@ mod tests {
         let allocation = sequence
             .allocate(&TargetRegisterFile::aarch64_scalar_function())
             .expect("integer-scalar allocation");
-        let frame = arm64::frame_layout(&allocation).expect("integer-scalar frame");
+        let frame = arm64::frame_layout(&allocation, 0).expect("integer-scalar frame");
         lower_deopt_table(
             &sequence,
             &allocation,

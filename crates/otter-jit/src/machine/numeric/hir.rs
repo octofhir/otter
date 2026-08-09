@@ -12,8 +12,9 @@
 //!   inferred Number/Int32 parameters are guarded before effects.
 //! - Parameters outside the exact entry live-in set have no HIR value, load,
 //!   guard, or allocator interval.
-//! - Accepted nodes cannot allocate, throw, or reenter JS; tagged coercions
-//!   and equality may read the heap only through declared leaf stubs.
+//! - Accepted nodes cannot reenter JS. Tagged coercions/equality use declared
+//!   leaf stubs; primitive string concatenation is the sole allocating node
+//!   and carries an exact pre-operation FrameState for miss/OOM deopt.
 //! - Register merges become typed block parameters. Only loop-header OSR
 //!   metadata retains the aligned VM-register sources needed at the entry ABI.
 //! - Loop headers receive explicit parameters for every numeric value live from
@@ -53,6 +54,7 @@ pub(super) enum NumericNode {
     This,
     TaggedToBoolean(NumericValue),
     TaggedStrictEqual(NumericValue, NumericValue),
+    TaggedStringConcat(NumericValue, NumericValue),
     IntegerConstant(i32),
     BooleanConstant(bool),
     Constant(f64),
@@ -104,9 +106,10 @@ pub(super) enum NumericNode {
 impl NumericNode {
     pub(super) const fn value_type(self) -> NumericType {
         match self {
-            Self::TaggedConstant(..) | Self::This | Self::BlockParameter(NumericType::Tagged) => {
-                NumericType::Tagged
-            }
+            Self::TaggedConstant(..)
+            | Self::This
+            | Self::TaggedStringConcat(..)
+            | Self::BlockParameter(NumericType::Tagged) => NumericType::Tagged,
             Self::IntegerConstant(..)
             | Self::FloatToInt32(..)
             | Self::BooleanToInt32(..)
@@ -579,6 +582,13 @@ fn infer_instruction_parameters(
                 *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
             }
         }
+        Op::Add
+            if instruction
+                .arith_feedback()
+                .is_primitive_string_concat_only() =>
+        {
+            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
+        }
         Op::Add | Op::Sub | Op::Mul => {
             let left = read(register(instruction, code, 1)?)?;
             let right = read(register(instruction, code, 2)?)?;
@@ -1017,6 +1027,31 @@ fn lower_instruction(
             } else {
                 boolean
             };
+            write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            )?;
+            return Some(());
+        }
+        Op::Add
+            if instruction
+                .arith_feedback()
+                .is_primitive_string_concat_only() =>
+        {
+            let left = read_value(registers, register(instruction, code, 1)?)?;
+            let right = read_value(registers, register(instruction, code, 2)?)?;
+            *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
+            let value = push(nodes, NumericNode::TaggedStringConcat(left, right));
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
             write(
                 registers,
                 register(instruction, code, 0)?,

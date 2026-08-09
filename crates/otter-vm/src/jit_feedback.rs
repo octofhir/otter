@@ -604,6 +604,15 @@ impl ArithFeedback {
         self.0 == ARITH_INT32
     }
 
+    /// `true` when `+` has observed at least one primitive String operand and
+    /// no BigInt, object, Symbol, nullish, or Boolean operand. Number bits may
+    /// coexist because primitive string concatenation accepts Number on the
+    /// other side without observable coercion.
+    #[must_use]
+    pub const fn is_primitive_string_concat_only(self) -> bool {
+        self.0 & ARITH_STRING != 0 && self.0 & (ARITH_BIGINT | ARITH_OTHER) == 0
+    }
+
     /// `true` when this site has never executed. Optimized code may treat it
     /// as unreachable-by-feedback and deoptimize unconditionally if it is ever
     /// reached: the interpreter then records real feedback and the next
@@ -960,6 +969,25 @@ mod tests {
         assert!(!fb.is_numeric_only());
         assert!(!fb.is_int32_only());
         assert_eq!(fb.bits() & ARITH_OTHER, ARITH_OTHER);
+    }
+
+    #[test]
+    fn primitive_string_concat_feedback_excludes_observable_coercion() {
+        for bits in [
+            ARITH_STRING,
+            ARITH_STRING | ARITH_INT32,
+            ARITH_STRING | ARITH_FLOAT64,
+        ] {
+            assert!(ArithFeedback::from_bits(bits).is_primitive_string_concat_only());
+        }
+        for bits in [
+            0,
+            ARITH_INT32,
+            ARITH_STRING | ARITH_BIGINT,
+            ARITH_STRING | ARITH_OTHER,
+        ] {
+            assert!(!ArithFeedback::from_bits(bits).is_primitive_string_concat_only());
+        }
     }
 
     #[test]

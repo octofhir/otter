@@ -12,6 +12,9 @@
 //! - `x15..x18`, `d16..d31` are emitter/platform scratch excluded from
 //!   allocation; cold deopt dumps use the target's complete register-id map.
 //! - Spill storage and offsets come only from [`MachineFrameLayout`].
+//! - Allocating calls copy late-use tagged roots into the layout's native save
+//!   area before constructing the VM allocation packet, then reload every
+//!   collector-rewritten value before success or exact deoptimization.
 //! - A failed Number guard writes logical PC zero and returns `BAILED` before
 //!   any externally visible effect.
 //! - Checked integer overflow uses the allocator-driven VM [`DeoptRuntime`];
@@ -35,19 +38,21 @@ use otter_vm::{
     native_abi::{
         RuntimeStubDescriptor, STUB_JIT_BACKEDGE_POLL, STUB_JIT_DEOPT_WRITEBACK,
         STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF,
-        STUB_STRICT_EQ_LEAF, STUB_TO_BOOLEAN_LEAF,
+        STUB_STRICT_EQ_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF,
     },
 };
 
 use super::super::{
     AllocatedLocation, AllocatedSequence, AllocationEdit, AllocationPoint, CallTarget, DeoptId,
     InstructionSequence, MachineFrameLayout, MachineInstructionId, MachineOpcode, MachineOsrInput,
-    MachineOsrType, MachineRepresentation,
+    MachineOsrType, MachineRepresentation, MachineSafepointSite, MachineSafepointTable,
 };
 use crate::{
     CompiledCode, Unsupported,
     artifact::relocation::{RelocationCapture, RelocationTarget},
     entry::{
+        ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET,
+        ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET,
         CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
         NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_REGISTER_COUNT_OFFSET,
         NATIVE_FRAME_THIS_OFFSET, NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
@@ -200,9 +205,11 @@ fn emit_float_to_int32_leaf(
 
 pub(super) fn frame_layout(
     allocation: &AllocatedSequence,
+    root_slots: u16,
 ) -> Result<MachineFrameLayout, Unsupported> {
     MachineFrameLayout::new(
         allocation,
+        root_slots,
         SavedFrame::from_allocation(allocation).fixed_bytes(),
         16,
     )
@@ -214,8 +221,10 @@ pub(super) fn emit(
     allocation: &AllocatedSequence,
     frame: MachineFrameLayout,
     deopt_runtime: &DeoptRuntime,
+    safepoints: &MachineSafepointTable,
     poll_entry: u64,
     deopt_writeback_entry: u64,
+    string_concat_entry: u64,
     number_rem_entry: u64,
     number_pow_entry: u64,
     number_to_int32_entry: u64,
@@ -710,7 +719,7 @@ pub(super) fn emit(
                     .call_descriptors()
                     .get(descriptor_index as usize)
                     .ok_or(Unsupported::OperandShape("scalar call descriptor"))?;
-                let (target, entry, result_index) = match descriptor.target {
+                let (target, entry, result_index, allocating) = match descriptor.target {
                     CallTarget::RuntimeStub(target) if target == STUB_TO_BOOLEAN_LEAF => {
                         if locations.len() < 3
                             || integer_register(locations[0])? != 1
@@ -718,7 +727,7 @@ pub(super) fn emit(
                         {
                             return Err(Unsupported::OperandShape("scalar ToBoolean call"));
                         }
-                        (target, to_boolean_entry, 2)
+                        (target, to_boolean_entry, 2, false)
                     }
                     CallTarget::RuntimeStub(target) if target == STUB_STRICT_EQ_LEAF => {
                         if locations.len() < 3
@@ -727,7 +736,17 @@ pub(super) fn emit(
                         {
                             return Err(Unsupported::OperandShape("scalar strict equality call"));
                         }
-                        (target, strict_eq_entry, 2)
+                        (target, strict_eq_entry, 2, false)
+                    }
+                    CallTarget::RuntimeStub(target) if target == STUB_STRING_CONCAT_ALLOC => {
+                        if locations.len() < 4
+                            || integer_register(locations[0])? != 2
+                            || integer_register(locations[1])? != 3
+                            || integer_register(locations[2])? != 4
+                        {
+                            return Err(Unsupported::OperandShape("scalar string concat call"));
+                        }
+                        (target, string_concat_entry, 3, true)
                     }
                     CallTarget::RuntimeStub(_) => {
                         return Err(Unsupported::OperandShape("scalar runtime call target"));
@@ -737,30 +756,48 @@ pub(super) fn emit(
                     return Err(Unsupported::OperandShape("scalar runtime call result"));
                 }
                 let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; ldr x0, [x19, THREAD_OFFSET]
-                    ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
-                );
-                emit_load_symbolic_u64(
-                    &mut ops,
-                    &mut relocations,
-                    16,
-                    entry,
-                    RelocationTarget::runtime_stub(target),
-                );
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; blr x16
-                    ; and x1, x1, #0xff
-                    ; cbnz x1, =>deopt
-                );
-                emit_load_u64(&mut ops, 16, Value::boolean(true).to_bits());
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; cmp x0, x16
-                    ; cset w0, eq
-                );
+                if allocating {
+                    let site = safepoints
+                        .site(id)
+                        .filter(|site| instruction.safepoint == Some(site.id))
+                        .ok_or(Unsupported::OperandShape(
+                            "scalar allocating call safepoint",
+                        ))?;
+                    emit_allocating_call(
+                        &mut ops,
+                        &mut relocations,
+                        frame,
+                        site,
+                        entry,
+                        target,
+                        deopt,
+                    )?;
+                } else {
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr x0, [x19, THREAD_OFFSET]
+                        ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+                    );
+                    emit_load_symbolic_u64(
+                        &mut ops,
+                        &mut relocations,
+                        16,
+                        entry,
+                        RelocationTarget::runtime_stub(target),
+                    );
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; and x1, x1, #0xff
+                        ; cbnz x1, =>deopt
+                    );
+                    emit_load_u64(&mut ops, 16, Value::boolean(true).to_bits());
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; cmp x0, x16
+                        ; cset w0, eq
+                    );
+                }
             }
         }
         if !is_terminator {
@@ -935,6 +972,124 @@ pub(super) fn emit(
         osr_entries,
         osr_regions,
     })
+}
+
+fn emit_allocating_call(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    relocations: &mut RelocationCapture,
+    frame: MachineFrameLayout,
+    site: &MachineSafepointSite,
+    entry: u64,
+    target: RuntimeStubDescriptor,
+    deopt: DynamicLabel,
+) -> Result<(), Unsupported> {
+    emit_save_safepoint_roots(ops, frame, site)?;
+    dynasm!(ops
+        ; .arch aarch64
+        ; sub sp, sp, ALLOC_CTX_STACK_SIZE
+        ; ldr x9, [x19, THREAD_OFFSET]
+        ; str x9, [sp, ALLOC_CTX_THREAD_OFFSET]
+        ; movz w9, site.id.0
+        ; str w9, [sp, ALLOC_CTX_SAFEPOINT_ID_OFFSET]
+    );
+    if frame.root_slots() == 0 {
+        dynasm!(ops
+            ; .arch aarch64
+            ; str xzr, [sp, ALLOC_CTX_SPILL_SLOTS_OFFSET]
+            ; strh wzr, [sp, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET]
+        );
+    } else {
+        let root_base = ALLOC_CTX_STACK_SIZE
+            .checked_add(root_offset(frame, 0)?)
+            .ok_or(Unsupported::OperandShape("scalar root-save base"))?;
+        emit_sp_address_x9(ops, root_base);
+        dynasm!(ops
+            ; .arch aarch64
+            ; str x9, [sp, ALLOC_CTX_SPILL_SLOTS_OFFSET]
+            ; movz w9, frame.root_slots() as u32
+            ; strh w9, [sp, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET]
+        );
+    }
+    dynasm!(ops
+        ; .arch aarch64
+        ; mov x0, sp
+        ; movz w1, site.id.0
+    );
+    emit_load_symbolic_u64(
+        ops,
+        relocations,
+        16,
+        entry,
+        RelocationTarget::runtime_stub(target),
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; mov x6, x0
+        ; and x5, x1, #0xff
+        ; add sp, sp, ALLOC_CTX_STACK_SIZE
+    );
+    emit_reload_safepoint_roots(ops, frame, site)?;
+    dynasm!(ops
+        ; .arch aarch64
+        ; mov x0, x6
+        ; cbnz x5, =>deopt
+    );
+    Ok(())
+}
+
+fn emit_save_safepoint_roots(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    frame: MachineFrameLayout,
+    site: &MachineSafepointSite,
+) -> Result<(), Unsupported> {
+    for root in &site.roots {
+        let destination = root_offset(frame, root.save_slot)?;
+        match root.source {
+            AllocatedLocation::Register(register) if register.is_integer() => {
+                dynasm!(ops ; .arch aarch64 ; str X(register.encoding()), [sp, destination]);
+            }
+            AllocatedLocation::Stack(slot) => {
+                let source = spill_offset(frame, slot)?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr x16, [sp, source]
+                    ; str x16, [sp, destination]
+                );
+            }
+            AllocatedLocation::Register(_) => {
+                return Err(Unsupported::OperandShape("scalar tagged root source"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn emit_reload_safepoint_roots(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    frame: MachineFrameLayout,
+    site: &MachineSafepointSite,
+) -> Result<(), Unsupported> {
+    for root in &site.roots {
+        let source = root_offset(frame, root.save_slot)?;
+        match root.source {
+            AllocatedLocation::Register(register) if register.is_integer() => {
+                dynasm!(ops ; .arch aarch64 ; ldr X(register.encoding()), [sp, source]);
+            }
+            AllocatedLocation::Stack(slot) => {
+                let destination = spill_offset(frame, slot)?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr x16, [sp, source]
+                    ; str x16, [sp, destination]
+                );
+            }
+            AllocatedLocation::Register(_) => {
+                return Err(Unsupported::OperandShape("scalar tagged root reload"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Expand a parameter-prefix frame before shared VM machinery can observe it.
@@ -1439,6 +1594,21 @@ fn spill_offset(frame: MachineFrameLayout, slot: u32) -> Result<u32, Unsupported
     frame
         .spill_offset(slot)
         .map_err(|_| Unsupported::OperandShape("scalar Machine IR spill offset"))
+}
+
+fn root_offset(frame: MachineFrameLayout, slot: u16) -> Result<u32, Unsupported> {
+    frame
+        .root_offset(slot)
+        .map_err(|_| Unsupported::OperandShape("scalar Machine IR root-save offset"))
+}
+
+fn emit_sp_address_x9(ops: &mut dynasmrt::aarch64::Assembler, offset: u32) {
+    if offset <= 4095 {
+        dynasm!(ops ; .arch aarch64 ; add x9, sp, offset);
+    } else {
+        emit_load_u64(ops, 9, u64::from(offset));
+        dynasm!(ops ; .arch aarch64 ; add x9, sp, x9);
+    }
 }
 
 fn emit_load_u64(ops: &mut dynasmrt::aarch64::Assembler, register: u8, value: u64) {

@@ -28,6 +28,7 @@ KERNELS=(
   "numeric-leaf           -700000"
   "typed-parameter-loop    300000"
   "branch-phi             -6000000"
+  "string-concat             600000"
   "dense-array            5234688"
   "boxed-double-property  4000000"
   "property-polymorphic   80011800000"
@@ -91,6 +92,8 @@ axes = {
         "jit-runtime-calls",
         "jit-runtime-constructs",
     ),
+    "alloc_ok": total("jit-alloc-value-stub-ok"),
+    "alloc_miss": total("jit-alloc-value-stub-miss"),
     # Broken out because it is the metric Slice 1 must drive to zero: a
     # property access that leaves generated code to ask the runtime.
     "prop_stub": total("jit-runtime-property-stubs"),
@@ -109,8 +112,8 @@ PY
 
 for tier in $TIERS; do
   printf '\n=== tier: %s  samples=%s warmup=%s ===\n' "$tier" "$SAMPLES" "$WARMUP"
-  printf '%-24s %14s %9s %11s %9s %7s %7s %7s %9s %11s %6s\n' \
-    kernel retired wall_ms reductions instr/red ic_miss ic_inst ic_disa native prop_stub deopt
+  printf '%-24s %14s %9s %11s %9s %7s %7s %7s %9s %10s %10s %11s %6s\n' \
+    kernel retired wall_ms reductions instr/red ic_miss ic_inst ic_disa native alloc_ok alloc_miss prop_stub deopt
   for entry in "${KERNELS[@]}"; do
     read -r name expected <<<"$entry"
     if [[ -n "$filter" && "$name" != *"$filter"* ]]; then continue; fi
@@ -140,14 +143,15 @@ for tier in $TIERS; do
       rm -f "$record" "$timing"
       continue
     fi
-    read -r wall reductions ic_miss ic_install ic_disable native prop_stub deopt gc <<<"$axes"
+    read -r wall reductions ic_miss ic_install ic_disable native alloc_ok alloc_miss prop_stub deopt gc <<<"$axes"
 
     per_reduction=$(python3 -c \
       "r=${retired:-0}; d=${reductions:-0}; print(f'{r/d:.1f}' if d else '-')")
 
-    printf '%-24s %14s %9s %11s %9s %7s %7s %7s %9s %11s %6s\n' \
+    printf '%-24s %14s %9s %11s %9s %7s %7s %7s %9s %10s %10s %11s %6s\n' \
       "$name" "${retired:-?}" "$wall" "$reductions" "$per_reduction" \
-      "$ic_miss" "$ic_install" "$ic_disable" "$native" "$prop_stub" "$deopt"
+      "$ic_miss" "$ic_install" "$ic_disable" "$native" "$alloc_ok" "$alloc_miss" \
+      "$prop_stub" "$deopt"
 
     if [[ "${gc:-0}" != "0" ]]; then
       printf '%-24s %14s gc-cycles=%s\n' "" "" "$gc"

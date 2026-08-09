@@ -40,6 +40,9 @@ It already owns:
 - descriptor-driven leaf calls for exact tagged truthiness and strict equality,
   including heap-cell semantics, scalar argument boxing, allocator clobbers,
   and exact miss deopt without a VM-window shuttle;
+- descriptor-driven allocating primitive string concatenation with exact
+  pre-operation deopt, allocator late-use roots, a reusable native root-save
+  area, VM `SafepointRecord` spill locations, and post-GC reloads;
 - allocator-driven spills, AAPCS64 callee-saved allocation, exact frame sizing,
   fixed leaf ABI operands, and deterministic normalized allocation artifacts;
 - `MachineFrameState -> lower_deopt_table -> VM DeoptTable`, shared cold exits,
@@ -55,22 +58,23 @@ The old optimizing compiler and template emitter remain in the active graph
 only for operations and function shapes not yet selected by the replacement
 pipeline. They are fallback, not contracts to preserve.
 
-Latest accepted gate: 280 JIT tests, 832 VM tests, all-target/all-feature
+Latest accepted gate: 282 JIT tests, 833 VM tests, all-target/all-feature
 Clippy, compile-fail/rooting checks, and 19/19 differential
 interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.
 
 ## Active work
 
-### 1. Publish exact roots for allocating and reentrant calls
+### 1. Extend exact roots through reentrant calls
 
-Make the existing universal call descriptor safe for moving-GC calls:
+The fixed allocating-call boundary is now moving-GC safe without an
+interpreter-window shuttle. Extend that same descriptor/frame boundary to
+ordinary reentrant operations:
 
-- derive live Tagged roots at each safepoint from Machine IR liveness;
-- assign save homes after regalloc2 and encode them in the one stack-map format;
-- publish the active code object, safepoint, and spill base in `NativeFrame`;
-- let moving GC rewrite those homes, then reload live values before continuing;
-- prove normal return, throw, bail, and nested collection without conservative
-  scanning or an interpreter-register-window ABI.
+- publish complete nested `NativeFrame` state before a call can invoke JS;
+- add exceptional Machine IR edges and exact started-operation continuation;
+- reuse allocator root homes for nested collection and multi-frame deopt;
+- prove return, throw, bail, recursion, and interrupt completion without
+  conservative scanning, replay, or an interpreter-register-window ABI.
 
 Leaf calls remain the no-safepoint case of this same descriptor boundary; do
 not add a second call format.

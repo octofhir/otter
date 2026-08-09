@@ -110,11 +110,11 @@ impl TargetRegisterFile {
         }
     }
 
-    pub(super) fn aarch64_numeric_function() -> Self {
+    pub(super) fn aarch64_scalar_function() -> Self {
         let mut registers = Self::aarch64();
         // x19 retains the context, x15..x18 are emitter/platform scratch, and
-        // v16..v31 stay outside the numeric contract. Values live across leaf
-        // calls may use the remaining AAPCS64 callee-saved file; the numeric
+        // v16..v31 stay outside the scalar contract. Values live across leaf
+        // calls may use the remaining AAPCS64 callee-saved file; the scalar
         // emitter derives its exact save set and deopt dump from this one
         // inventory.
         registers.preferred[RegClass::Int as usize].retain(|register| register.encoding != 15);
@@ -126,8 +126,8 @@ impl TargetRegisterFile {
         registers
     }
 
-    /// Caller-saved registers exposed to numeric-function allocation.
-    pub(super) fn aarch64_numeric_call_clobbers() -> Vec<PhysicalRegister> {
+    /// Caller-saved registers exposed to scalar-function allocation.
+    pub(super) fn aarch64_scalar_call_clobbers() -> Vec<PhysicalRegister> {
         (0..=14)
             .map(PhysicalRegister::integer)
             .chain((0..=7).map(PhysicalRegister::float))

@@ -281,6 +281,8 @@ impl MachineOperand {
 /// Scalar contract for one interpreter-frame value entering Machine IR via OSR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MachineOsrType {
+    /// Any ordinary tagged JavaScript value copied without interpretation.
+    Tagged,
     /// Tagged Number proven to fit a signed 32-bit integer.
     Int32,
     /// Tagged Number proven to fit an unsigned 32-bit integer.
@@ -363,6 +365,10 @@ pub struct CallDescriptor {
 pub enum MachineOpcode {
     /// Materialize an incoming ABI value.
     EntryValue(u16),
+    /// Materialize the current frame's tagged `this` binding.
+    EntryThis,
+    /// Materialize one exact immediate tagged JavaScript value.
+    TaggedConstant(u64),
     /// Guard and decode one tagged JavaScript Number.
     DecodeNumber,
     /// Guard and decode one tagged JavaScript Int32.

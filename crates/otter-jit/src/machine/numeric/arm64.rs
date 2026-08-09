@@ -1,7 +1,7 @@
-//! AArch64 emission for allocated numeric Machine IR.
+//! AArch64 emission for allocated scalar Machine IR.
 //!
 //! # Contents
-//! - [`emit`] — emits one numeric function from allocator locations.
+//! - [`emit`] — emits one scalar function from allocator locations.
 //! - Exact JavaScript Number decode, scalar coercion leaves, canonical boxing,
 //!   and shared cold exits.
 //! - regalloc2 edit emission between selected instructions.
@@ -20,8 +20,8 @@
 //!   live into the loop header across the leaf runtime call.
 //! - OSR trampolines decode only live loop-header inputs into the exact
 //!   late-use locations selected by regalloc2; rejection never mutates VM slots.
-//! - Successful results use the VM's canonical Number or Boolean representation.
-//! - Pure numeric leaves exchange unboxed scalars in fixed ABI operands;
+//! - Successful results use the VM's canonical tagged representation.
+//! - Pure scalar leaves exchange unboxed scalars in fixed ABI operands;
 //!   regalloc2 owns every argument/result move and no frame shuttle exists.
 
 // dynasm's dynamic-register expansion calls `.into()` on the required u8
@@ -48,9 +48,10 @@ use crate::{
     artifact::relocation::{RelocationCapture, RelocationTarget},
     entry::{
         CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
-        NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_REGISTER_COUNT_OFFSET, NUMBER_TAG_HI16,
-        STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THREAD_OFFSET, VALUE_UNDEFINED,
-        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
+        NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_REGISTER_COUNT_OFFSET,
+        NATIVE_FRAME_THIS_OFFSET, NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
+        THREAD_OFFSET, VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
+        VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
 };
 use std::collections::BTreeMap;
@@ -204,7 +205,7 @@ pub(super) fn frame_layout(
         SavedFrame::from_allocation(allocation).fixed_bytes(),
         16,
     )
-    .map_err(|_| Unsupported::OperandShape("numeric Machine IR frame layout"))
+    .map_err(|_| Unsupported::OperandShape("scalar Machine IR frame layout"))
 }
 
 pub(super) fn emit(
@@ -224,7 +225,7 @@ pub(super) fn emit(
     let saved = SavedFrame::from_allocation(allocation);
     if frame.fixed_bytes() != saved.fixed_bytes() {
         return Err(Unsupported::OperandShape(
-            "numeric Machine IR saved frame layout",
+            "scalar Machine IR saved frame layout",
         ));
     }
     let mut ops = dynasmrt::aarch64::Assembler::new()
@@ -253,7 +254,7 @@ pub(super) fn emit(
             continue;
         };
         if inputs.len() != instruction.operands.len() {
-            return Err(Unsupported::OperandShape("numeric OSR input arity"));
+            return Err(Unsupported::OperandShape("scalar OSR input arity"));
         }
         osr_sites.push(OsrSite {
             instruction: MachineInstructionId(index as u32),
@@ -289,13 +290,13 @@ pub(super) fn emit(
         }
         let locations = allocation
             .instruction_locations(id)
-            .ok_or(Unsupported::OperandShape("numeric Machine IR locations"))?;
+            .ok_or(Unsupported::OperandShape("scalar Machine IR locations"))?;
         match instruction.opcode {
             MachineOpcode::OsrEntry { .. } => {
                 let site = osr_sites
                     .iter()
                     .find(|site| site.instruction == id)
-                    .ok_or(Unsupported::OperandShape("numeric OSR continuation"))?;
+                    .ok_or(Unsupported::OperandShape("scalar OSR continuation"))?;
                 let continuation = site.continuation;
                 dynasm!(ops ; .arch aarch64 ; =>continuation);
             }
@@ -305,6 +306,17 @@ pub(super) fn emit(
                     .checked_mul(8)
                     .ok_or(Unsupported::OperandShape("numeric parameter offset"))?;
                 dynasm!(ops ; .arch aarch64 ; ldr X(destination), [x17, offset]);
+            }
+            MachineOpcode::EntryThis => {
+                let destination = integer_register(locations[0])?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr x16, [x19, NATIVE_FRAME_OFFSET]
+                    ; ldr X(destination), [x16, NATIVE_FRAME_THIS_OFFSET]
+                );
+            }
+            MachineOpcode::TaggedConstant(bits) => {
+                emit_load_u64(&mut ops, integer_register(locations[0])?, bits);
             }
             MachineOpcode::DecodeNumber => {
                 emit_decode_number(
@@ -730,7 +742,7 @@ pub(super) fn emit(
             let index = u32::try_from(index)
                 .ok()
                 .filter(|&index| index <= u32::from(u16::MAX))
-                .ok_or(Unsupported::OperandShape("numeric deopt exit count"))?;
+                .ok_or(Unsupported::OperandShape("scalar deopt exit count"))?;
             dynasm!(ops
                 ; .arch aarch64
                 ; =>label
@@ -808,7 +820,7 @@ pub(super) fn emit(
         emit_prologue(&mut ops, frame, saved);
         let locations = allocation
             .instruction_locations(site.instruction)
-            .ok_or(Unsupported::OperandShape("numeric OSR allocation coverage"))?;
+            .ok_or(Unsupported::OperandShape("scalar OSR allocation coverage"))?;
         for ((input, &location), operand) in site
             .inputs
             .iter()
@@ -841,9 +853,7 @@ pub(super) fn emit(
         emit_epilogue(&mut ops, frame, saved);
         let end = ops.offset().0;
         if osr_entries.insert(site.logical_pc, offset).is_some() {
-            return Err(Unsupported::OperandShape(
-                "duplicate numeric OSR logical PC",
-            ));
+            return Err(Unsupported::OperandShape("duplicate scalar OSR logical PC"));
         }
         osr_regions.push((site.logical_pc, offset, end));
     }
@@ -929,12 +939,12 @@ fn reject_unimplemented_locations(
                         && !((register.encoding() <= 14)
                             || (20..=28).contains(&register.encoding())) =>
                 {
-                    return Err(Unsupported::OperandShape("numeric Machine IR GPR"));
+                    return Err(Unsupported::OperandShape("scalar Machine IR GPR"));
                 }
                 AllocatedLocation::Register(register)
                     if register.is_float() && register.encoding() > 15 =>
                 {
-                    return Err(Unsupported::OperandShape("numeric Machine IR FP register"));
+                    return Err(Unsupported::OperandShape("scalar Machine IR FP register"));
                 }
                 AllocatedLocation::Register(_) | AllocatedLocation::Stack(_) => {}
             }
@@ -1191,7 +1201,28 @@ fn emit_store_osr_integer(
             dynasm!(ops ; .arch aarch64 ; str x16, [sp, offset]);
         }
         AllocatedLocation::Register(_) => {
-            return Err(Unsupported::OperandShape("numeric OSR integer location"));
+            return Err(Unsupported::OperandShape("scalar OSR integer location"));
+        }
+    }
+    Ok(())
+}
+
+fn emit_store_osr_tagged(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    frame: MachineFrameLayout,
+    location: AllocatedLocation,
+) -> Result<(), Unsupported> {
+    match location {
+        AllocatedLocation::Register(register) if register.is_integer() => {
+            let destination = register.encoding();
+            dynasm!(ops ; .arch aarch64 ; mov X(destination), x16);
+        }
+        AllocatedLocation::Stack(slot) => {
+            let offset = spill_offset(frame, slot)?;
+            dynasm!(ops ; .arch aarch64 ; str x16, [sp, offset]);
+        }
+        AllocatedLocation::Register(_) => {
+            return Err(Unsupported::OperandShape("scalar OSR tagged location"));
         }
     }
     Ok(())
@@ -1212,7 +1243,7 @@ fn emit_store_osr_float(
             dynasm!(ops ; .arch aarch64 ; str d31, [sp, offset]);
         }
         AllocatedLocation::Register(_) => {
-            return Err(Unsupported::OperandShape("numeric OSR float location"));
+            return Err(Unsupported::OperandShape("scalar OSR float location"));
         }
     }
     Ok(())
@@ -1227,16 +1258,18 @@ fn emit_osr_materialization(
     bail: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let expected = match input.value_type {
+        MachineOsrType::Tagged => MachineRepresentation::Tagged,
         MachineOsrType::Int32 | MachineOsrType::Boolean => MachineRepresentation::Int32,
         MachineOsrType::Uint32 => MachineRepresentation::Uint32,
         MachineOsrType::Float64 => MachineRepresentation::Float64,
     };
     if representation != expected {
-        return Err(Unsupported::OperandShape("numeric OSR representation"));
+        return Err(Unsupported::OperandShape("scalar OSR representation"));
     }
 
     emit_load_osr_source(ops, input.frame_register);
     match input.value_type {
+        MachineOsrType::Tagged => emit_store_osr_tagged(ops, frame, location),
         MachineOsrType::Int32 => {
             dynasm!(ops
                 ; .arch aarch64
@@ -1350,7 +1383,7 @@ fn emit_release_spill_area(ops: &mut dynasmrt::aarch64::Assembler, bytes: u32) {
 fn spill_offset(frame: MachineFrameLayout, slot: u32) -> Result<u32, Unsupported> {
     frame
         .spill_offset(slot)
-        .map_err(|_| Unsupported::OperandShape("numeric Machine IR spill offset"))
+        .map_err(|_| Unsupported::OperandShape("scalar Machine IR spill offset"))
 }
 
 fn emit_load_u64(ops: &mut dynasmrt::aarch64::Assembler, register: u8, value: u64) {

@@ -1,7 +1,7 @@
-//! Production numeric-function lowering through the shared Machine IR pipeline.
+//! Production scalar-function lowering through the shared Machine IR pipeline.
 //!
 //! # Contents
-//! - `hir` — typed, side-effect-free numeric semantic graph.
+//! - `hir` — typed, side-effect-free scalar semantic graph.
 //! - `arm64` — allocation-driven AArch64 emission.
 //! - [`try_compile`] — production optimizing-tier entry for this vertical slice.
 //!
@@ -52,10 +52,10 @@ pub(crate) fn try_compile(
         .iter()
         .any(|state| matches!(state.point, NumericFramePoint::Backedge { .. }));
     let sequence = select(&hir)
-        .map_err(|_| Unsupported::OperandShape("numeric HIR to Machine IR selection"))?;
+        .map_err(|_| Unsupported::OperandShape("scalar HIR to Machine IR selection"))?;
     let allocation = sequence
-        .allocate(&TargetRegisterFile::aarch64_numeric_function())
-        .map_err(|_| Unsupported::OperandShape("numeric Machine IR allocation"))?;
+        .allocate(&TargetRegisterFile::aarch64_scalar_function())
+        .map_err(|_| Unsupported::OperandShape("scalar Machine IR allocation"))?;
     let frame = arm64::frame_layout(&allocation)?;
     let deopt_table = lower_deopt_table(
         &sequence,
@@ -65,7 +65,7 @@ pub(crate) fn try_compile(
         arm64::FP_BUDGET,
         &machine_frame_states(&hir),
     )
-    .map_err(|_| Unsupported::OperandShape("numeric Machine IR deopt lowering"))?;
+    .map_err(|_| Unsupported::OperandShape("scalar Machine IR deopt lowering"))?;
     let mut exits = Vec::with_capacity(hir.frame_states.len());
     for (index, state) in hir.frame_states.iter().enumerate() {
         let logical_pc = view
@@ -73,7 +73,7 @@ pub(crate) fn try_compile(
             .iter()
             .position(|instruction| instruction.byte_pc == state.byte_pc)
             .and_then(|pc| u32::try_from(pc).ok())
-            .ok_or(Unsupported::OperandShape("numeric deopt resume PC"))?;
+            .ok_or(Unsupported::OperandShape("scalar deopt resume PC"))?;
         exits.push(DeoptExitDescriptor {
             state: DeoptExitId(index as u32),
             resume_pcs: vec![logical_pc].into_boxed_slice(),
@@ -98,7 +98,7 @@ pub(crate) fn try_compile(
         artifact_request.is_some(),
     )?;
     let machine_register_count = u8::try_from(allocation.used_register_count())
-        .map_err(|_| Unsupported::OperandShape("numeric machine register count"))?;
+        .map_err(|_| Unsupported::OperandShape("scalar machine register count"))?;
     let safepoints = Box::default();
     let frame_maps = Box::default();
     let frame_map_bitmap_words = Box::default();
@@ -113,7 +113,7 @@ pub(crate) fn try_compile(
 
     let artifact = artifact_request.map(|request| {
         let mut tier_input = format!(
-            "; backend=otter-machine-ir numeric-function\n; parameters={} registers={} blocks={} arithmetic-ops={}\n",
+            "; backend=otter-machine-ir scalar-function\n; parameters={} registers={} blocks={} arithmetic-ops={}\n",
             hir.parameter_count,
             hir.register_count,
             hir.blocks.len(),
@@ -123,7 +123,7 @@ pub(crate) fn try_compile(
         tier_input.push_str(&allocation.normalized());
         let mut code_map = CodeMapCapture::default();
         code_map.record(CodeRegion::structural(
-            "machineNumericFunction",
+            "machineScalarFunction",
             0,
             emitted_code.len(),
         ));
@@ -178,6 +178,7 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
         .nodes
         .iter()
         .map(|node| match node.value_type() {
+            NumericType::Tagged => MachineRepresentation::Tagged,
             NumericType::Int32 => MachineRepresentation::Int32,
             NumericType::Uint32 => MachineRepresentation::Uint32,
             NumericType::Number => MachineRepresentation::Float64,
@@ -188,14 +189,19 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
         .map(|index| MachineValue(index as u32))
         .collect::<Vec<_>>();
     let mut tagged_parameters = vec![None; hir.parameter_count as usize];
-    for node in &hir.nodes {
-        let NumericNode::Parameter { register, .. } = node else {
+    for (index, node) in hir.nodes.iter().enumerate() {
+        let NumericNode::Parameter {
+            register,
+            value_type,
+        } = node
+        else {
             continue;
         };
-        tagged_parameters[usize::from(*register)] = Some(push_value(
-            &mut representations,
-            MachineRepresentation::Tagged,
-        ));
+        tagged_parameters[usize::from(*register)] = Some(if *value_type == NumericType::Tagged {
+            values[index]
+        } else {
+            push_value(&mut representations, MachineRepresentation::Tagged)
+        });
     }
 
     let selection_cfg = SelectionCfg::build(hir);
@@ -223,7 +229,7 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                 let deopt = frame_state_ids[&point];
                 let mut poll = MachineInstruction::plain(MachineOpcode::BackedgePoll, Vec::new());
                 attach_frame_state(hir, &values, deopt, &mut poll);
-                poll.clobbers = TargetRegisterFile::aarch64_numeric_call_clobbers();
+                poll.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
                 instructions.push(poll);
             }
             let mut jump = MachineInstruction::plain(MachineOpcode::Jump, Vec::new());
@@ -270,6 +276,7 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                 .map(|(&parameter, &frame_register)| MachineOsrInput {
                     frame_register,
                     value_type: match hir.nodes[parameter.0].value_type() {
+                        NumericType::Tagged => MachineOsrType::Tagged,
                         NumericType::Int32 => MachineOsrType::Int32,
                         NumericType::Uint32 => MachineOsrType::Uint32,
                         NumericType::Number => MachineOsrType::Float64,
@@ -305,7 +312,7 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         MachineOperand::fixed_register_output(result, PhysicalRegister::integer(0)),
                     ],
                 );
-                call.clobbers = TargetRegisterFile::aarch64_numeric_call_clobbers();
+                call.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
                 call.clobbers
                     .retain(|register| *register != PhysicalRegister::integer(0));
                 instructions.push(call);
@@ -331,7 +338,7 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         MachineOperand::fixed_register_output(result, PhysicalRegister::float(0)),
                     ],
                 );
-                call.clobbers = TargetRegisterFile::aarch64_numeric_call_clobbers();
+                call.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
                 call.clobbers
                     .retain(|register| *register != PhysicalRegister::float(0));
                 instructions.push(call);
@@ -342,12 +349,15 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                     register,
                     value_type,
                 } => {
+                    if value_type == NumericType::Tagged {
+                        continue;
+                    }
                     let tagged = tagged_parameters[usize::from(register)]
                         .expect("live HIR parameter has an entry value");
                     let opcode = match value_type {
                         NumericType::Int32 => MachineOpcode::DecodeInt32,
                         NumericType::Number => MachineOpcode::DecodeNumber,
-                        NumericType::Uint32 | NumericType::Boolean => {
+                        NumericType::Tagged | NumericType::Uint32 | NumericType::Boolean => {
                             unreachable!("parameter inference emits only Int32 or Number")
                         }
                     };
@@ -362,6 +372,14 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                     )
                 }
                 NumericNode::BlockParameter(_) => continue,
+                NumericNode::TaggedConstant(bits) => MachineInstruction::plain(
+                    MachineOpcode::TaggedConstant(bits),
+                    vec![MachineOperand::register_output(result)],
+                ),
+                NumericNode::This => MachineInstruction::plain(
+                    MachineOpcode::EntryThis,
+                    vec![MachineOperand::register_output(result)],
+                ),
                 NumericNode::IntegerConstant(value) => MachineInstruction::plain(
                     MachineOpcode::IntegerConstant(i64::from(value)),
                     vec![MachineOperand::register_output(result)],
@@ -619,8 +637,29 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                 ))],
             ),
             NumericTerminator::Return(value) => {
+                if hir.nodes[value.0].value_type() == NumericType::Tagged {
+                    let mut ret = MachineInstruction::plain(
+                        MachineOpcode::Return,
+                        vec![MachineOperand::register_input(machine_value(
+                            &values, value,
+                        ))],
+                    );
+                    ret.control = ControlFlow::Return;
+                    instructions.push(ret);
+                    let end = MachineInstructionId(instructions.len() as u32);
+                    blocks.push(machine_block(
+                        hir,
+                        &selection_cfg,
+                        block_index,
+                        &values,
+                        first,
+                        end,
+                    ));
+                    continue;
+                }
                 let boxed = push_value(&mut representations, MachineRepresentation::Tagged);
                 let box_opcode = match hir.nodes[value.0].value_type() {
+                    NumericType::Tagged => unreachable!("tagged returns bypass boxing"),
                     NumericType::Int32 => MachineOpcode::BoxInt32,
                     NumericType::Uint32 => MachineOpcode::BoxUint32,
                     NumericType::Number => MachineOpcode::BoxNumber,
@@ -1168,6 +1207,101 @@ mod tests {
                 (Op::ReturnValue, vec![Operand::Register(1)]),
             ],
         )
+    }
+
+    fn tagged_identity_view() -> JitCompileSnapshot {
+        numeric_view(1, 1, vec![(Op::ReturnValue, vec![Operand::Register(0)])])
+    }
+
+    fn tagged_immediate_view(op: Op) -> JitCompileSnapshot {
+        assert!(matches!(op, Op::LoadUndefined | Op::LoadNull));
+        numeric_view(
+            0,
+            1,
+            vec![
+                (op, vec![Operand::Register(0)]),
+                (Op::ReturnValue, vec![Operand::Register(0)]),
+            ],
+        )
+    }
+
+    fn tagged_this_view() -> JitCompileSnapshot {
+        numeric_view(
+            0,
+            1,
+            vec![
+                (Op::LoadThis, vec![Operand::Register(0)]),
+                (Op::Return, vec![Operand::Register(0)]),
+            ],
+        )
+    }
+
+    fn tagged_phi_view() -> JitCompileSnapshot {
+        numeric_view(
+            4,
+            6,
+            vec![
+                (
+                    Op::LessThan,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(2),
+                        Operand::Register(3),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(2), Operand::Register(4)],
+                ),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(0), Operand::Imm32(5)],
+                ),
+                (Op::Jump, vec![Operand::Imm32(1)]),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(1), Operand::Imm32(5)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(5)]),
+            ],
+        )
+    }
+
+    fn tagged_loop_view() -> JitCompileSnapshot {
+        let mut view = numeric_view(
+            2,
+            5,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(0)]),
+                (Op::LoadInt32, vec![Operand::Register(3), Operand::Imm32(1)]),
+                (
+                    Op::LessThan,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(2),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(2), Operand::Register(4)],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(2),
+                        Operand::Register(3),
+                    ],
+                ),
+                (Op::Jump, vec![Operand::Imm32(-4)]),
+                (Op::ReturnValue, vec![Operand::Register(0)]),
+            ],
+        );
+        for pc in [2_u32, 4] {
+            view.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(ARITH_INT32));
+        }
+        view
     }
 
     fn unused_parameter_view() -> JitCompileSnapshot {
@@ -2555,6 +2689,7 @@ mod tests {
             frame,
             initial_pc,
             register_count,
+            Value::undefined(),
             interrupt,
             fuel,
         );
@@ -2567,6 +2702,7 @@ mod tests {
         mut frame: Vec<u64>,
         initial_pc: u32,
         initialized_register_count: u16,
+        this_value: Value,
         interrupt: *const u8,
         fuel: &mut u64,
     ) -> (JitRet, Vec<u64>, u32, u16) {
@@ -2583,7 +2719,7 @@ mod tests {
             },
             frame.as_mut_ptr() as u64,
             Value::undefined(),
-            Value::undefined(),
+            this_value,
         );
         native_frame.set_materialized_activation(0);
         let mut thread = VmThread::empty();
@@ -2654,6 +2790,174 @@ mod tests {
 
         assert_eq!(ret.status, STATUS_RETURNED);
         assert_eq!(ret.value, tag::box_int32(-9));
+    }
+
+    #[test]
+    fn tagged_parameters_return_without_numeric_guards_or_boxing() {
+        let view = tagged_identity_view();
+        let hir = NumericFunction::build(&view).expect("tagged identity HIR");
+        assert!(matches!(
+            hir.nodes[0],
+            NumericNode::Parameter {
+                register: 0,
+                value_type: NumericType::Tagged,
+            }
+        ));
+
+        let sequence = select(&hir).expect("tagged identity Machine IR");
+        assert_eq!(
+            sequence
+                .instructions()
+                .iter()
+                .map(|instruction| &instruction.opcode)
+                .collect::<Vec<_>>(),
+            [&MachineOpcode::EntryValue(0), &MachineOpcode::Return]
+        );
+        assert_eq!(sequence.representations(), &[MachineRepresentation::Tagged]);
+
+        let code = compile_output(&view, None).code;
+        for value in [Value::undefined(), Value::null(), Value::boolean(true)] {
+            let (result, _, _) = execute(&code, &[value.to_bits()], 0);
+            assert_eq!(result.status, STATUS_RETURNED);
+            assert_eq!(result.value, value.to_bits());
+        }
+    }
+
+    #[test]
+    fn tagged_constants_this_and_bare_return_preserve_exact_value_bits() {
+        for (op, expected) in [
+            (Op::LoadUndefined, Value::undefined()),
+            (Op::LoadNull, Value::null()),
+        ] {
+            let code = compile_output(&tagged_immediate_view(op), None).code;
+            let (result, _, _) = execute(&code, &[], 0);
+            assert_eq!(result.status, STATUS_RETURNED);
+            assert_eq!(result.value, expected.to_bits());
+        }
+
+        let bare_return = numeric_view(0, 0, vec![(Op::ReturnUndefined, vec![])]);
+        let code = compile_output(&bare_return, None).code;
+        let (result, _, _) = execute(&code, &[], 0);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, Value::undefined().to_bits());
+
+        let code = compile_output(&tagged_this_view(), None).code;
+        let entry: JitEntry = unsafe { std::mem::transmute(code.compiled_code().entry_ptr()) };
+        let interrupt = 0_u8;
+        let mut fuel = i64::MAX as u64;
+        let (result, _, _, _) = execute_at_with_register_count(
+            &code,
+            entry,
+            vec![Value::undefined().to_bits()],
+            0,
+            code.metadata().register_count,
+            Value::null(),
+            std::ptr::addr_of!(interrupt),
+            &mut fuel,
+        );
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, Value::null().to_bits());
+    }
+
+    #[test]
+    fn tagged_branch_phi_executes_both_edges_without_reencoding_values() {
+        let view = tagged_phi_view();
+        let hir = NumericFunction::build(&view).expect("tagged branch-phi HIR");
+        assert!(hir.blocks.iter().any(|block| {
+            block.predecessors.len() == 2
+                && block
+                    .parameters
+                    .iter()
+                    .any(|parameter| hir.nodes[parameter.0].value_type() == NumericType::Tagged)
+        }));
+        let sequence = select(&hir).expect("tagged branch-phi Machine IR");
+        assert!(sequence.blocks().iter().any(|block| {
+            block.predecessors.len() == 2
+                && block.parameters.iter().any(|parameter| {
+                    sequence.representations()[parameter.0 as usize]
+                        == MachineRepresentation::Tagged
+                })
+        }));
+
+        let code = compile_output(&view, None).code;
+        let (left, _, _) = execute(
+            &code,
+            &[
+                Value::null().to_bits(),
+                Value::undefined().to_bits(),
+                tag::box_int32(1),
+                tag::box_int32(3),
+            ],
+            0,
+        );
+        assert_eq!(left.status, STATUS_RETURNED);
+        assert_eq!(left.value, Value::null().to_bits());
+
+        let (right, _, _) = execute(
+            &code,
+            &[
+                Value::null().to_bits(),
+                Value::undefined().to_bits(),
+                tag::box_int32(3),
+                tag::box_int32(1),
+            ],
+            0,
+        );
+        assert_eq!(right.status, STATUS_RETURNED);
+        assert_eq!(right.value, Value::undefined().to_bits());
+    }
+
+    #[test]
+    fn tagged_values_survive_loop_phis_osr_and_backedge_deopt() {
+        let view = tagged_loop_view();
+        let hir = NumericFunction::build(&view).expect("tagged loop HIR");
+        let sequence = select(&hir).expect("tagged loop Machine IR");
+        let osr_inputs = sequence
+            .instructions()
+            .iter()
+            .find_map(|instruction| match &instruction.opcode {
+                MachineOpcode::OsrEntry {
+                    logical_pc: 2,
+                    inputs,
+                } => Some(inputs.as_slice()),
+                _ => None,
+            })
+            .expect("tagged loop OSR marker");
+        assert!(osr_inputs.contains(&MachineOsrInput {
+            frame_register: 0,
+            value_type: MachineOsrType::Tagged,
+        }));
+
+        let code = compile_output(&view, None).code;
+        let (normal, _, _) = execute(&code, &[Value::null().to_bits(), tag::box_int32(4)], 0);
+        assert_eq!(normal.status, STATUS_RETURNED);
+        assert_eq!(normal.value, Value::null().to_bits());
+
+        let mut frame = vec![Value::undefined().to_bits(); 5];
+        frame[0] = Value::boolean(true).to_bits();
+        frame[1] = tag::box_int32(4);
+        frame[2] = tag::box_int32(0);
+        frame[3] = tag::box_int32(1);
+        let interrupt = 0_u8;
+        let mut fuel = i64::MAX as u64;
+        let (osr, after, _) = execute_osr_with_poll_cells(
+            &code,
+            2,
+            frame.clone(),
+            std::ptr::addr_of!(interrupt),
+            &mut fuel,
+        );
+        assert_eq!(osr.status, STATUS_RETURNED);
+        assert_eq!(osr.value, Value::boolean(true).to_bits());
+        assert_eq!(after, frame);
+
+        let interrupt = 1_u8;
+        let mut fuel = i64::MAX as u64;
+        let (bail, after, pc) =
+            execute_osr_with_poll_cells(&code, 2, frame, std::ptr::addr_of!(interrupt), &mut fuel);
+        assert_eq!(bail.status, STATUS_BAILED);
+        assert_eq!(pc, 2);
+        assert_eq!(after[0], Value::boolean(true).to_bits());
     }
 
     #[test]
@@ -2791,6 +3095,7 @@ mod tests {
             vec![tag::box_int32(9), 0xdead_beef_dead_beef],
             91,
             guard.metadata().param_count,
+            Value::undefined(),
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
@@ -2805,6 +3110,7 @@ mod tests {
             vec![Value::undefined().to_bits(), 0xdead_beef_dead_beef],
             91,
             guard.metadata().param_count,
+            Value::undefined(),
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
@@ -2826,6 +3132,7 @@ mod tests {
             ],
             91,
             overflow.metadata().param_count,
+            Value::undefined(),
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
@@ -2888,7 +3195,7 @@ mod tests {
         )));
         let sequence = select(&hir).expect("typed parameter loop Machine IR");
         sequence
-            .allocate(&TargetRegisterFile::aarch64_numeric_function())
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
             .expect("typed parameter loop allocation");
 
         let code = compile_output(&view, None).code;
@@ -3034,7 +3341,7 @@ mod tests {
             assert_eq!(predecessor.successor_arguments[edge].len(), 2);
         }
         sequence
-            .allocate(&TargetRegisterFile::aarch64_numeric_function())
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
             .expect("loop Machine IR allocation");
 
         let code = compile_output(&view, None).code;
@@ -3128,7 +3435,7 @@ mod tests {
                 })
         }));
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_numeric_function())
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
             .expect("branch-phi Machine IR allocation");
         assert!(
             allocation
@@ -3209,7 +3516,7 @@ mod tests {
                 .contents(),
         )
         .expect("UTF-8 optimized IR");
-        assert!(optimized_ir.starts_with("; backend=otter-machine-ir numeric-function\n"));
+        assert!(optimized_ir.starts_with("; backend=otter-machine-ir scalar-function\n"));
         assert!(optimized_ir.contains("OsrEntry { logical_pc: 3"));
         let code_map = std::str::from_utf8(
             artifact
@@ -3275,7 +3582,7 @@ mod tests {
                 .contents(),
         )
         .expect("UTF-8 optimized IR");
-        assert!(optimized_ir.starts_with("; backend=otter-machine-ir numeric-function\n"));
+        assert!(optimized_ir.starts_with("; backend=otter-machine-ir scalar-function\n"));
 
         let (result, _, _) = execute(&output.code, &[], 0);
         assert_eq!(result.status, STATUS_RETURNED);
@@ -3319,7 +3626,7 @@ mod tests {
 
         let sequence = select(&hir).expect("bitwise-loop Machine IR");
         sequence
-            .allocate(&TargetRegisterFile::aarch64_numeric_function())
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
             .expect("bitwise-loop Machine IR allocation");
 
         let output = crate::optimizing::compile_optimized_with_artifacts(
@@ -3347,7 +3654,7 @@ mod tests {
                 .contents(),
         )
         .expect("UTF-8 optimized IR");
-        assert!(optimized_ir.starts_with("; backend=otter-machine-ir numeric-function\n"));
+        assert!(optimized_ir.starts_with("; backend=otter-machine-ir scalar-function\n"));
 
         let (result, _, _) = execute(&output.code, &[], 0);
         let mut expected = 0x1234_5678_i32;
@@ -3499,7 +3806,7 @@ mod tests {
         let rem_hir = NumericFunction::build(&rem_view).expect("remainder numeric HIR");
         let rem_sequence = select(&rem_hir).expect("remainder Machine IR");
         rem_sequence
-            .allocate(&TargetRegisterFile::aarch64_numeric_function())
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
             .expect("remainder allocation");
 
         for (op, left, right, expected) in [
@@ -3584,7 +3891,7 @@ mod tests {
         let hir = NumericFunction::build(&view).expect("typed leaf overflow numeric HIR");
         let sequence = select(&hir).expect("typed leaf overflow Machine IR");
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_numeric_function())
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
             .expect("typed leaf overflow allocation");
         assert!(allocation.metadata().iter().any(|metadata| {
             metadata.deopt.is_some()
@@ -3661,7 +3968,7 @@ mod tests {
         );
         let sequence = select(&hir).expect("integer-scalar Machine IR");
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_numeric_function())
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
             .expect("integer-scalar allocation");
         let frame = arm64::frame_layout(&allocation).expect("integer-scalar frame");
         lower_deopt_table(
@@ -3699,7 +4006,7 @@ mod tests {
                 .contents(),
         )
         .expect("UTF-8 optimized IR");
-        assert!(optimized_ir.starts_with("; backend=otter-machine-ir numeric-function\n"));
+        assert!(optimized_ir.starts_with("; backend=otter-machine-ir scalar-function\n"));
 
         let (result, _, _) = execute(&output.code, &[], 0);
         assert_eq!(result.status, STATUS_RETURNED);
@@ -3754,7 +4061,7 @@ mod tests {
             ]
         );
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_numeric_function())
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
             .expect("float-leaf-loop allocation");
         assert!(
             allocation.used_registers().any(|register| {
@@ -3788,7 +4095,7 @@ mod tests {
                 .contents(),
         )
         .expect("UTF-8 optimized IR");
-        assert!(optimized_ir.starts_with("; backend=otter-machine-ir numeric-function\n"));
+        assert!(optimized_ir.starts_with("; backend=otter-machine-ir scalar-function\n"));
         assert!(optimized_ir.contains("FloatRem"));
         assert!(optimized_ir.contains("FloatPow"));
         assert!(!optimized_ir.contains("FloatLeafResult"));
@@ -3841,7 +4148,7 @@ mod tests {
             ]
         );
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_numeric_function())
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
             .expect("float-bitwise-loop allocation");
         assert!(
             allocation.used_registers().any(|register| {
@@ -3876,7 +4183,7 @@ mod tests {
                 .contents(),
         )
         .expect("UTF-8 optimized IR");
-        assert!(optimized_ir.starts_with("; backend=otter-machine-ir numeric-function\n"));
+        assert!(optimized_ir.starts_with("; backend=otter-machine-ir scalar-function\n"));
         assert!(optimized_ir.contains("Float64ToInt32"));
         assert!(!optimized_ir.contains("IntegerLeafResult"));
 
@@ -4120,7 +4427,7 @@ mod tests {
             .map(|index| MachineInstructionId(index as u32))
             .expect("OSR spill-pressure marker");
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_numeric_function())
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
             .expect("OSR spill-pressure allocation");
         assert!(
             allocation
@@ -4224,11 +4531,9 @@ mod tests {
 
         assert!(
             text(JitArtifactFileName::OptimizedIr)
-                .starts_with("; backend=otter-machine-ir numeric-function\n")
+                .starts_with("; backend=otter-machine-ir scalar-function\n")
         );
-        assert!(
-            text(JitArtifactFileName::CodeMap).contains("\"kind\": \"machineNumericFunction\"")
-        );
+        assert!(text(JitArtifactFileName::CodeMap).contains("\"kind\": \"machineScalarFunction\""));
         assert_eq!(
             artifact
                 .file(JitArtifactFileName::Code)

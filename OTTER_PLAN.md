@@ -27,15 +27,16 @@ and artifact schemas. They differ only in optimization budget and tier policy.
 The active replacement path is:
 
 ```text
-typed numeric HIR -> Machine IR -> regalloc2 -> AArch64 emitter
+typed scalar HIR -> Machine IR -> regalloc2 -> AArch64 emitter
 ```
 
 It already owns:
 
-- straight-line and reducible cyclic numeric CFGs, critical-edge splitting,
+- straight-line and reducible cyclic scalar CFGs, critical-edge splitting,
   block parameters, edge moves, instruction-exact liveness, and loop OSR;
-- Int32, Uint32, Float64, and Boolean numeric operations currently selected by
-  the numeric HIR, including checked arithmetic and scalar VM leaves;
+- Tagged, Int32, Uint32, Float64, and Boolean values, including arbitrary
+  tagged parameters, constants, locals, `this`, ordinary returns, tagged
+  block parameters, tagged OSR inputs, checked arithmetic, and scalar VM leaves;
 - allocator-driven spills, AAPCS64 callee-saved allocation, exact frame sizing,
   fixed leaf ABI operands, and deterministic normalized allocation artifacts;
 - `MachineFrameState -> lower_deopt_table -> VM DeoptTable`, shared cold exits,
@@ -51,8 +52,8 @@ The old optimizing compiler and template emitter remain in the active graph
 only for operations and function shapes not yet selected by the replacement
 pipeline. They are fallback, not contracts to preserve.
 
-Latest accepted gate: 272 JIT tests, 832 VM tests, all-target/all-feature
-Clippy, compile-fail/rooting checks, and 18/18 differential
+Latest accepted gate: 276 JIT tests, 832 VM tests, all-target/all-feature
+Clippy, compile-fail/rooting checks, and 19/19 differential
 interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.
 
 ## Active work
@@ -61,7 +62,6 @@ interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.
 
 Move complete function bodies rather than adding emitter detours:
 
-- tagged constants, moves, arguments, locals, `this`, and ordinary returns;
 - calls and constructs through the universal call descriptor and exceptional
   edge model;
 - settled property/element loads and stores with explicit dependency tokens,

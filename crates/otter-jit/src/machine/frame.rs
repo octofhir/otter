@@ -168,7 +168,7 @@ mod tests {
         )
         .expect("valid pressure sequence");
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_numeric_function())
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
             .expect("pressure sequence allocates");
         assert!(allocation.spill_slots() > 0);
 

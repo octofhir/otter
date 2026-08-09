@@ -1,15 +1,15 @@
-//! Typed numeric HIR and control-flow construction.
+//! Typed scalar HIR and control-flow construction.
 //!
 //! # Contents
 //! - [`NumericFunction`] — bounded numeric SSA graph with explicit blocks.
 //! - [`NumericBlock`] and [`NumericTerminator`] — predecessor/successor edges,
 //!   block parameters, edge arguments, branches, and returns.
-//! - [`NumericNode`] — typed parameters, constants, coercions, arithmetic, and
-//!   comparison.
+//! - [`NumericNode`] — tagged/scalar parameters, constants, moves, coercions,
+//!   arithmetic, and comparison.
 //!
 //! # Invariants
-//! - Every accepted parameter is guarded as the inferred numeric representation
-//!   before effects; inference specializes only feedback-proven Int32 inputs.
+//! - Parameters remain tagged unless their uses prove a numeric representation;
+//!   inferred Number/Int32 parameters are guarded before effects.
 //! - Parameters outside the exact entry live-in set have no HIR value, load,
 //!   guard, or allocator interval.
 //! - Accepted nodes cannot allocate, touch the heap, throw, or reenter JS;
@@ -35,6 +35,7 @@ pub(super) struct NumericValue(pub(super) usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NumericType {
+    Tagged,
     Int32,
     Uint32,
     Number,
@@ -48,6 +49,8 @@ pub(super) enum NumericNode {
         value_type: NumericType,
     },
     BlockParameter(NumericType),
+    TaggedConstant(u64),
+    This,
     IntegerConstant(i32),
     BooleanConstant(bool),
     Constant(f64),
@@ -99,6 +102,9 @@ pub(super) enum NumericNode {
 impl NumericNode {
     pub(super) const fn value_type(self) -> NumericType {
         match self {
+            Self::TaggedConstant(..) | Self::This | Self::BlockParameter(NumericType::Tagged) => {
+                NumericType::Tagged
+            }
             Self::IntegerConstant(..)
             | Self::FloatToInt32(..)
             | Self::BooleanToInt32(..)
@@ -158,7 +164,6 @@ impl NumericNode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegisterState {
     Unset,
-    Undefined,
     Value(NumericValue),
 }
 
@@ -218,7 +223,8 @@ pub(super) enum NumericFramePoint {
 enum RawTerminator {
     Jump,
     Branch { when_true: bool },
-    Return,
+    ReturnValue,
+    ReturnUndefined,
 }
 
 #[derive(Debug, Clone)]
@@ -335,7 +341,12 @@ impl NumericFunction {
                 if pc == terminal_pc
                     && matches!(
                         op,
-                        Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse | Op::ReturnValue
+                        Op::Jump
+                            | Op::JumpIfTrue
+                            | Op::JumpIfFalse
+                            | Op::Return
+                            | Op::ReturnValue
+                            | Op::ReturnUndefined
                     )
                 {
                     break;
@@ -363,8 +374,16 @@ impl NumericFunction {
                         when_true,
                     }
                 }
-                RawTerminator::Return => {
+                RawTerminator::ReturnValue => {
                     NumericTerminator::Return(read_value(&registers, register(terminal, code, 0)?)?)
+                }
+                RawTerminator::ReturnUndefined => {
+                    let value = push(
+                        &mut nodes,
+                        NumericNode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
+                    );
+                    block_nodes.push(value);
+                    NumericTerminator::Return(value)
                 }
             };
 
@@ -390,7 +409,7 @@ impl NumericFunction {
                     .map(
                         |&register| match out_states[predecessor][usize::from(register)] {
                             RegisterState::Value(value) => Some(value),
-                            RegisterState::Unset | RegisterState::Undefined => None,
+                            RegisterState::Unset => None,
                         },
                     )
                     .collect::<Option<Vec<_>>>()?;
@@ -420,8 +439,9 @@ impl NumericFunction {
                         .zip(live_in[successor].iter().copied())
                         .map(|(state, live)| match (state, live) {
                             (RegisterState::Value(value), true) => NumericFrameSlot::Value(value),
-                            (RegisterState::Unset | RegisterState::Undefined, _)
-                            | (RegisterState::Value(_), false) => NumericFrameSlot::Undefined,
+                            (RegisterState::Unset, _) | (RegisterState::Value(_), false) => {
+                                NumericFrameSlot::Undefined
+                            }
                         })
                         .collect(),
                 });
@@ -453,6 +473,7 @@ fn infer_parameter_types(
     }
     let mut out_origins = vec![vec![0_u16; width]; blocks.len()];
     let mut int32_parameters = 0_u16;
+    let mut number_parameters = 0_u16;
 
     loop {
         let mut changed = false;
@@ -474,6 +495,7 @@ fn infer_parameter_types(
                     code,
                     &mut origins,
                     &mut int32_parameters,
+                    &mut number_parameters,
                 )?;
             }
             if origins != out_origins[block_index] {
@@ -488,8 +510,10 @@ fn infer_parameter_types(
                         let bit = 1_u16 << parameter;
                         if int32_parameters & bit != 0 {
                             NumericType::Int32
-                        } else {
+                        } else if number_parameters & bit != 0 {
                             NumericType::Number
+                        } else {
+                            NumericType::Tagged
                         }
                     })
                     .collect(),
@@ -503,6 +527,7 @@ fn infer_instruction_parameters(
     code: &otter_vm::CodeBlock,
     origins: &mut [u16],
     int32_parameters: &mut u16,
+    number_parameters: &mut u16,
 ) -> Option<()> {
     let read = |register: u16| origins.get(usize::from(register)).copied();
     let op = instruction.op(code);
@@ -515,15 +540,23 @@ fn infer_instruction_parameters(
             let source = read(local_index(instruction, code, 1)?)?;
             *origins.get_mut(usize::from(register(instruction, code, 0)?))? = source;
         }
-        Op::LoadUndefined | Op::LoadTrue | Op::LoadFalse | Op::LoadInt32 | Op::LoadNumber => {
+        Op::LoadUndefined
+        | Op::LoadNull
+        | Op::LoadTrue
+        | Op::LoadFalse
+        | Op::LoadInt32
+        | Op::LoadNumber
+        | Op::LoadThis => {
             *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
         Op::ToPrimitive | Op::ToNumeric | Op::ToNumber => {
             let source = read(register(instruction, code, 1)?)?;
+            *number_parameters |= source;
             *origins.get_mut(usize::from(register(instruction, code, 0)?))? = source;
         }
         Op::Neg | Op::Increment | Op::AddImm | Op::SubImm => {
             let source = read(register(instruction, code, 1)?)?;
+            *number_parameters |= source;
             if instruction.arith_feedback().is_int32_only() {
                 *int32_parameters |= source;
                 *origins.get_mut(usize::from(register(instruction, code, 0)?))? = source;
@@ -534,6 +567,7 @@ fn infer_instruction_parameters(
         Op::Add | Op::Sub | Op::Mul => {
             let left = read(register(instruction, code, 1)?)?;
             let right = read(register(instruction, code, 2)?)?;
+            *number_parameters |= left | right;
             let destination = usize::from(register(instruction, code, 0)?);
             if instruction.arith_feedback().is_int32_only() {
                 *int32_parameters |= left | right;
@@ -543,34 +577,46 @@ fn infer_instruction_parameters(
             }
         }
         Op::Equal | Op::NotEqual | Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
+            let inputs =
+                read(register(instruction, code, 1)?)? | read(register(instruction, code, 2)?)?;
+            *number_parameters |= inputs;
             if instruction.arith_feedback().is_int32_only() {
-                *int32_parameters |=
-                    read(register(instruction, code, 1)?)? | read(register(instruction, code, 2)?)?;
+                *int32_parameters |= inputs;
             }
             *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
         Op::LessThanImm | Op::EqualImm | Op::NotEqualImm => {
+            let source = read(register(instruction, code, 1)?)?;
+            *number_parameters |= source;
             if instruction.arith_feedback().is_int32_only() {
-                *int32_parameters |= read(register(instruction, code, 1)?)?;
+                *int32_parameters |= source;
             }
             *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
         Op::Div
         | Op::Rem
         | Op::Pow
-        | Op::ToBoolean
-        | Op::LogicalNot
-        | Op::BitwiseNot
-        | Op::BitwiseAndImm
         | Op::BitwiseAnd
         | Op::BitwiseOr
         | Op::BitwiseXor
         | Op::Shl
         | Op::Shr
         | Op::Ushr => {
+            *number_parameters |=
+                read(register(instruction, code, 1)?)? | read(register(instruction, code, 2)?)?;
             *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
-        Op::JumpIfTrue | Op::JumpIfFalse | Op::ReturnValue | Op::Nop | Op::Jump => {}
+        Op::ToBoolean | Op::LogicalNot | Op::BitwiseNot | Op::BitwiseAndImm => {
+            *number_parameters |= read(register(instruction, code, 1)?)?;
+            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
+        }
+        Op::JumpIfTrue
+        | Op::JumpIfFalse
+        | Op::Return
+        | Op::ReturnValue
+        | Op::ReturnUndefined
+        | Op::Nop
+        | Op::Jump => {}
         _ => return None,
     }
     Some(())
@@ -610,7 +656,8 @@ fn build_raw_blocks(view: &JitCompileSnapshot) -> Option<Vec<RawBlock>> {
                     when_true: op == Op::JumpIfTrue,
                 },
             ),
-            Op::ReturnValue => (Vec::new(), RawTerminator::Return),
+            Op::Return | Op::ReturnValue => (Vec::new(), RawTerminator::ReturnValue),
+            Op::ReturnUndefined => (Vec::new(), RawTerminator::ReturnUndefined),
             _ => (vec![*by_pc.get(&end)?], RawTerminator::Jump),
         };
         blocks.push(RawBlock {
@@ -728,9 +775,13 @@ fn instruction_accesses(
             vec![local_index(instruction, code, 1)?],
             vec![register(instruction, code, 0)?],
         )),
-        Op::LoadUndefined | Op::LoadTrue | Op::LoadFalse | Op::LoadInt32 | Op::LoadNumber => {
-            Some((Vec::new(), vec![register(instruction, code, 0)?]))
-        }
+        Op::LoadUndefined
+        | Op::LoadNull
+        | Op::LoadTrue
+        | Op::LoadFalse
+        | Op::LoadInt32
+        | Op::LoadNumber
+        | Op::LoadThis => Some((Vec::new(), vec![register(instruction, code, 0)?])),
         Op::ToPrimitive
         | Op::ToNumeric
         | Op::ToNumber
@@ -778,8 +829,8 @@ fn instruction_accesses(
         Op::JumpIfTrue | Op::JumpIfFalse => {
             Some((vec![register(instruction, code, 1)?], Vec::new()))
         }
-        Op::ReturnValue => Some((vec![register(instruction, code, 0)?], Vec::new())),
-        Op::Nop | Op::Jump => Some((Vec::new(), Vec::new())),
+        Op::Return | Op::ReturnValue => Some((vec![register(instruction, code, 0)?], Vec::new())),
+        Op::ReturnUndefined | Op::Nop | Op::Jump => Some((Vec::new(), Vec::new())),
         _ => None,
     }
 }
@@ -888,14 +939,9 @@ fn lower_instruction(
             write(registers, register(instruction, code, 0)?, value)?;
             return Some(());
         }
-        Op::LoadUndefined => {
-            write(
-                registers,
-                register(instruction, code, 0)?,
-                RegisterState::Undefined,
-            )?;
-            return Some(());
-        }
+        Op::LoadUndefined => NumericNode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
+        Op::LoadNull => NumericNode::TaggedConstant(otter_vm::Value::null().to_bits()),
+        Op::LoadThis => NumericNode::This,
         Op::LoadInt32 => NumericNode::IntegerConstant(instruction.imm32(code, 1)?),
         Op::LoadTrue => NumericNode::BooleanConstant(true),
         Op::LoadFalse => NumericNode::BooleanConstant(false),
@@ -1113,8 +1159,9 @@ fn lower_instruction(
                 .zip(live_in.iter().copied())
                 .map(|(state, live)| match (state, live) {
                     (RegisterState::Value(value), true) => NumericFrameSlot::Value(value),
-                    (RegisterState::Unset | RegisterState::Undefined, _)
-                    | (RegisterState::Value(_), false) => NumericFrameSlot::Undefined,
+                    (RegisterState::Unset, _) | (RegisterState::Value(_), false) => {
+                        NumericFrameSlot::Undefined
+                    }
                 })
                 .collect(),
         });
@@ -1150,7 +1197,7 @@ fn local_index(
 fn read_state(registers: &[RegisterState], register: u16) -> Option<RegisterState> {
     match registers.get(usize::from(register)).copied()? {
         RegisterState::Unset => None,
-        value => Some(value),
+        RegisterState::Value(value) => Some(RegisterState::Value(value)),
     }
 }
 
@@ -1200,6 +1247,7 @@ fn read_int32_bits(
         NumericType::Int32 | NumericType::Uint32 => return Some(value),
         NumericType::Number => NumericNode::FloatToInt32(value),
         NumericType::Boolean => NumericNode::BooleanToInt32(value),
+        NumericType::Tagged => return None,
     };
     let coerced = push(nodes, node);
     block_nodes.push(coerced);
@@ -1219,6 +1267,7 @@ fn to_boolean(
         NumericType::Boolean => return Some(value),
         NumericType::Int32 | NumericType::Uint32 => NumericNode::IntegerToBoolean(value),
         NumericType::Number => NumericNode::FloatToBoolean(value),
+        NumericType::Tagged => return None,
     };
     let boolean = push(nodes, node);
     block_nodes.push(boolean);
@@ -1243,6 +1292,7 @@ fn widen_to_number(
             Some(widened)
         }
         NumericType::Boolean => None,
+        NumericType::Tagged => None,
     }
 }
 

@@ -151,9 +151,9 @@ cargo run --release -p otter-benchmark --features engine \
   --samples 100 --warmup 10
 ```
 
-The optimizing numeric-leaf row exercises the same optimizing pipeline as
+The optimizing scalar-leaf row exercises the same optimizing pipeline as
 every other function. Before accepting optimizing samples, an untimed compile
-of the same snapshot must identify `otter-machine-ir numeric-function`; the
+of the same snapshot must identify `otter-machine-ir scalar-function`; the
 validation hook then executes the exact measured code object. The validation
 marker records `backend=otter-machine-ir`. There is no backend-selection
 benchmark parameter or legacy fallback result.

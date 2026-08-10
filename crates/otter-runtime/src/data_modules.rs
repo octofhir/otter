@@ -104,12 +104,57 @@ pub struct DataModuleError {
 /// # Errors
 /// Returns the parser's complaint, or the nesting bound's, as a message.
 pub fn data_module_source(format: DataFormat, bytes: &[u8]) -> Result<String, DataModuleError> {
+    let parsed = data_literal(format, bytes)?;
+    let literal = parsed.literal;
+    let mut source = format!("const document = {literal};\nexport default document;\n");
+    // An XML document's root element is worth naming, so
+    // `import { feed } from "./x.xml"` works — but only where its name is one
+    // JavaScript can bind.
+    if let Some(name) = parsed.root.filter(|name| is_identifier(name)) {
+        source.push_str(&format!("export const {name} = document[{name:?}];\n"));
+    }
+    Ok(source)
+}
+
+/// Turn a data file's bytes into CommonJS module source publishing its parsed
+/// value as `module.exports`.
+///
+/// # Errors
+/// As [`data_module_source`].
+pub fn data_module_commonjs_source(
+    format: DataFormat,
+    bytes: &[u8],
+) -> Result<String, DataModuleError> {
+    let literal = data_literal(format, bytes)?.literal;
+    Ok(format!("module.exports = ({literal});\n"))
+}
+
+/// A data file's value as a JavaScript literal, and the root element's name
+/// where the format has one.
+struct ParsedData {
+    literal: String,
+    root: Option<String>,
+}
+
+/// Parse a data file and write its value as one JavaScript literal, which is
+/// what both module forms publish — so the two cannot disagree about it.
+fn data_literal(format: DataFormat, bytes: &[u8]) -> Result<ParsedData, DataModuleError> {
     if format == DataFormat::Xml {
-        return xml_module_source(bytes);
+        let root = otter_xml::parse_bytes(bytes).map_err(parse_error)?;
+        let document = otter_xml::compact(&root);
+        let mut literal = String::new();
+        write_json(&document, &mut literal);
+        return Ok(ParsedData {
+            literal,
+            root: Some(root.name),
+        });
     }
     let text = std::str::from_utf8(bytes).map_err(parse_error)?;
     if format == DataFormat::Text {
-        return Ok(export_default(&text));
+        return Ok(ParsedData {
+            literal: json_literal(&text),
+            root: None,
+        });
     }
     if let Some(depth) = nesting_depth_over(text, MAX_DATA_NESTING) {
         return Err(DataModuleError {
@@ -130,24 +175,10 @@ pub fn data_module_source(format: DataFormat, bytes: &[u8]) -> Result<String, Da
             unreachable!("text and XML are handled before parsing")
         }
     };
-    Ok(export_default(&value))
-}
-
-/// An XML document as a module: the compact shape by default, and the root
-/// element under its own name as well when that name is an identifier.
-fn xml_module_source(bytes: &[u8]) -> Result<String, DataModuleError> {
-    let root = otter_xml::parse_bytes(bytes).map_err(parse_error)?;
-    let document = otter_xml::compact(&root);
-    let mut literal = String::new();
-    write_json(&document, &mut literal);
-    let mut source = format!("const document = {literal};\nexport default document;\n");
-    // The root element is worth naming, so `import { feed } from "./x.xml"`
-    // works — but only where its name is one JavaScript can bind.
-    if is_identifier(&root.name) {
-        let name = &root.name;
-        source.push_str(&format!("export const {name} = document[{:?}];\n", name));
-    }
-    Ok(source)
+    Ok(ParsedData {
+        literal: json_literal(&value),
+        root: None,
+    })
 }
 
 /// Write a compact-shape value as JSON.
@@ -274,11 +305,10 @@ fn parse_error(error: impl std::fmt::Display) -> DataModuleError {
     }
 }
 
-fn export_default(value: &impl Serialize) -> String {
-    // A JSON literal is a JS expression, so the parsed document crosses into
-    // the module graph as source rather than as a host value.
-    let literal = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
-    format!("export default ({literal});\n")
+/// A JSON literal is a JavaScript expression, so a parsed document crosses
+/// into the module graph as source rather than as a host value.
+fn json_literal(value: &impl Serialize) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
 }
 
 /// Depth of the deepest `{`/`[` nesting, when it exceeds `limit`.
@@ -369,7 +399,7 @@ mod tests {
                 "port: 8080\nhosts:\n  - a\n  - b\n".as_bytes()
             )
             .unwrap(),
-            "export default ({\"port\":8080,\"hosts\":[\"a\",\"b\"]});\n"
+            "const document = {\"port\":8080,\"hosts\":[\"a\",\"b\"]};\nexport default document;\n"
         );
         assert_eq!(
             data_module_source(
@@ -377,7 +407,7 @@ mod tests {
                 "port = 8080\nhosts = [\"a\"]\n".as_bytes()
             )
             .unwrap(),
-            "export default ({\"hosts\":[\"a\"],\"port\":8080});\n"
+            "const document = {\"hosts\":[\"a\"],\"port\":8080};\nexport default document;\n"
         );
     }
 
@@ -389,11 +419,11 @@ mod tests {
                 "{\n // a comment\n \"a\": 1,\n}".as_bytes()
             )
             .unwrap(),
-            "export default ({\"a\":1});\n"
+            "const document = {\"a\":1};\nexport default document;\n"
         );
         assert_eq!(
             data_module_source(DataFormat::Json5, "{ a: 1, b: 'two' }".as_bytes()).unwrap(),
-            "export default ({\"a\":1,\"b\":\"two\"});\n"
+            "const document = {\"a\":1,\"b\":\"two\"};\nexport default document;\n"
         );
     }
 
@@ -401,7 +431,7 @@ mod tests {
     fn text_loads_as_a_string() {
         assert_eq!(
             data_module_source(DataFormat::Text, "line one\nline two\n".as_bytes()).unwrap(),
-            "export default (\"line one\\nline two\\n\");\n"
+            "const document = \"line one\\nline two\\n\";\nexport default document;\n"
         );
     }
 
@@ -420,6 +450,22 @@ mod tests {
                 "export default document;\n",
                 "export const feed = document[\"feed\"];\n",
             )
+        );
+    }
+
+    #[test]
+    fn require_publishes_the_same_value_as_import() {
+        assert_eq!(
+            data_module_commonjs_source(DataFormat::Json, b"{\"a\": [1, 2]}").unwrap(),
+            "module.exports = ({\"a\":[1,2]});\n"
+        );
+        assert_eq!(
+            data_module_commonjs_source(DataFormat::Xml, b"<a k='v'>t</a>").unwrap(),
+            "module.exports = ({\"a\":{\"@k\":\"v\",\"#text\":\"t\"}});\n"
+        );
+        assert_eq!(
+            data_module_commonjs_source(DataFormat::Text, b"raw\n").unwrap(),
+            "module.exports = (\"raw\\n\");\n"
         );
     }
 

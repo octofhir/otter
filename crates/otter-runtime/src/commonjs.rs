@@ -393,6 +393,40 @@ fn load_resolved_scoped<'scope>(
                     )?;
                     return finish_module(scope, record.module, exports);
                 }
+                // A data file is not code: `require` parses it and publishes
+                // the value, the way an `import` of the same file does.
+                if entry_source.is_none()
+                    && let Some(format) = path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .and_then(crate::data_modules::DataFormat::from_extension)
+                {
+                    if !cfg.capabilities.read.matches_path(path) {
+                        return Err(denied());
+                    }
+                    let bytes = std::fs::read(path).map_err(|err| {
+                        runtime_type_error(
+                            "require",
+                            format!("io error for '{}': {err}", resolution.filename),
+                        )
+                    })?;
+                    let source = crate::data_modules::data_module_commonjs_source(format, &bytes)
+                        .map_err(|err| {
+                        runtime_type_error(
+                            "require",
+                            format!("{}: {}", resolution.filename, err.message),
+                        )
+                    })?;
+                    let dirname = scope.string(&resolution.dir.to_string_lossy())?;
+                    let wrapper = scope.commonjs_wrapper(&resolution.filename, &source)?;
+                    scope.call(
+                        wrapper,
+                        record.exports,
+                        &[record.exports, require, record.module, record.id, dirname],
+                    )?;
+                    let exports = scope.get(record.module, "exports")?;
+                    return finish_module(scope, record.module, exports);
+                }
                 let owned_source;
                 let source = if let Some(source) = entry_source {
                     source

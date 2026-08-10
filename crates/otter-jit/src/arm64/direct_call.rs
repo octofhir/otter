@@ -172,6 +172,7 @@ pub(crate) enum DirectCallArguments<'a> {
 
 #[derive(Debug, Clone, Copy)]
 struct StackLayout {
+    upvalue_base: u32,
     saved_x25: u32,
     entry_addr: u32,
     caller_frame: u32,
@@ -183,13 +184,18 @@ struct StackLayout {
 impl StackLayout {
     fn for_target(target: &JitDirectCallee) -> Option<Self> {
         let register_bytes = u32::from(target.plan.register_count).checked_mul(8)?;
-        let spill = NATIVE_FRAME_STACK_SIZE.checked_add(register_bytes)?;
+        let upvalue_base = NATIVE_FRAME_STACK_SIZE.checked_add(register_bytes)?;
+        let upvalue_count = u32::from(target.plan.own_upvalue_count)
+            .checked_add(u32::from(target.plan.inherited_upvalue_count))?;
+        let upvalue_bytes = upvalue_count.checked_mul(4)?;
+        let spill = upvalue_base.checked_add(upvalue_bytes)?.checked_add(7)? & !7;
         target
             .plan
             .generated_stack_frame_bytes
             .filter(|bytes| *bytes != 0)?;
         let frame_bytes = spill.checked_add(40)?.checked_add(15)? & !15;
         (frame_bytes <= MAX_DIRECT_CALL_FRAME_BYTES).then_some(Self {
+            upvalue_base,
             saved_x25: spill,
             entry_addr: spill + 8,
             caller_frame: spill + 16,
@@ -456,6 +462,8 @@ fn layout_and_artifact(
         linkage_bytes: layout.frame_bytes,
         reserved_stack_bytes,
         callee_register_count: site.target.plan.register_count,
+        own_upvalue_count: site.target.plan.own_upvalue_count,
+        inherited_upvalue_count: site.target.plan.inherited_upvalue_count,
     };
     Ok((layout, direct_call))
 }
@@ -480,6 +488,7 @@ pub(crate) fn emit_direct_call(
     site: DirectCallSite<'_>,
     deopt_entry: u64,
     resolve_direct_entry: u64,
+    initialize_upvalues_entry: u64,
     code_map: Option<&mut CodeMapCapture>,
     bail: DynamicLabel,
     threw: DynamicLabel,
@@ -496,6 +505,7 @@ pub(crate) fn emit_direct_call(
         0,
         0,
         0,
+        initialize_upvalues_entry,
         code_map,
         bail,
         threw,
@@ -539,6 +549,7 @@ pub(crate) fn emit_direct_call_with_access<Load, Store, Restore, RootReceiver, R
     construct_result_entry: u64,
     derived_construct_result_entry: u64,
     copy_spread_arguments_entry: u64,
+    initialize_upvalues_entry: u64,
     mut code_map: Option<&mut CodeMapCapture>,
     bail: DynamicLabel,
     threw: DynamicLabel,
@@ -773,6 +784,12 @@ where
         }
     }
     dynasm!(ops ; .arch aarch64 ; =>callable_ready);
+    emit_load_u64(ops, 13, u64::from(site.target.plan.inherited_upvalue_count));
+    dynasm!(ops
+        ; .arch aarch64
+        ; cmp w11, w13
+        ; b.ne =>caller_bail
+    );
     record_region(
         &mut code_map,
         "directCallGuard",
@@ -818,6 +835,14 @@ where
             );
         }
         _ => unreachable!("construct forms handled above"),
+    }
+    if site.target.plan.own_upvalue_count != 0 {
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, sp, layout.upvalue_base
+            ; str x13, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
+            ; str wzr, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
+        );
     }
 
     // Copy arguments before the cold generation resolver can clobber
@@ -1075,6 +1100,40 @@ where
             ; ldrb w15, [sp, NATIVE_FRAME_FLAGS_OFFSET]
             ; orr w15, w15, abi::NativeFrameFlags::DERIVED_CONSTRUCTOR as u32
             ; strb w15, [sp, NATIVE_FRAME_FLAGS_OFFSET]
+        );
+    }
+    if site.target.plan.own_upvalue_count != 0 {
+        if initialize_upvalues_entry == 0 {
+            return Err(Unsupported::OperandShape(
+                "direct call upvalue initialization transition",
+            ));
+        }
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, sp, layout.upvalue_base
+            ; str x13, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
+            ; str wzr, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov x0, X(context_register)
+            ; mov x1, sp
+        );
+        emit_load_u64(ops, 2, u64::from(site.target.plan.own_upvalue_count));
+        emit_load_u64(ops, 3, u64::from(site.target.plan.inherited_upvalue_count));
+        emit_runtime_stub(
+            ops,
+            relocations,
+            16,
+            initialize_upvalues_entry,
+            abi::STUB_JIT_INITIALIZE_UPVALUES,
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; cmp x0, #2
+            ; b.eq =>construct_prepare_threw
+            ; cbnz x0, =>uncommitted_rejected
         );
     }
     if let DirectCallArguments::Spread(arguments) = site.arguments {

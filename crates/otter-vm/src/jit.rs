@@ -277,7 +277,7 @@ pub struct JitCompileSnapshot {
     pub static_native_calls: rustc_hash::FxHashMap<u32, JitStaticNativeCall>,
     /// Compiler-native direct callees keyed by the caller's `Op::Call` or
     /// `Op::CallSpread` byte-PC. Each entry names one monomorphic synchronous callee
-    /// with no callee-owned upvalue cells and a current non-OSR native entry.
+    /// with an exact fresh/inherited upvalue spine and a current non-OSR native entry.
     /// The emitter guards the dynamic callable against
     /// [`JitDirectCallPlan::function_id`] and side-exits if the identity or
     /// entry-cell lease no longer matches; no runtime resolver is part of the
@@ -692,13 +692,17 @@ pub struct JitDirectCallPlan {
     pub param_count: u16,
     /// Total callee register-window length.
     pub register_count: u16,
+    /// Fresh capture cells allocated by each invocation.
+    pub own_upvalue_count: u16,
+    /// Closure-owned capture cells copied after the fresh prefix.
+    pub inherited_upvalue_count: u16,
 }
 
 /// One baked compiler-native target for a monomorphic plain-call site.
 ///
 /// Presence in [`JitCompileSnapshot::direct_callees`] proves the callee is an
-/// ordinary synchronous body, owns no fresh upvalue cells, and has a stable
-/// entry cell with one current entry-capable generation. Dynamic callable
+/// ordinary synchronous body and has a stable entry cell with one current
+/// entry-capable generation. Dynamic callable
 /// identity, supported `this` binding, and target liveness remain machine-code
 /// guards; tier promotion patches the cell without invalidating this caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

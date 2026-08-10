@@ -298,6 +298,10 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_copy_spread_arguments_stub as *const () as usize,
         ),
         binding(
+            abi::STUB_JIT_INITIALIZE_UPVALUES,
+            jit_initialize_upvalues_stub as *const () as usize,
+        ),
+        binding(
             abi::STUB_JIT_COERCE_UNARY,
             jit_coerce_unary_stub as *const () as usize,
         ),

@@ -1359,6 +1359,17 @@ pub const STUB_JIT_COPY_SPREAD_ARGUMENTS: RuntimeStubDescriptor = descriptor(
     RuntimeStubException::Never,
     RuntimeStubResultAbi::ValueWord,
 );
+/// Allocate fresh capture cells and complete an unpublished generated frame's
+/// stack-owned upvalue spine.
+pub const STUB_JIT_INITIALIZE_UPVALUES: RuntimeStubDescriptor = descriptor(
+    94,
+    RuntimeStubClass::Alloc,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::allocating(true, true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+);
 
 /// Leaf `Math.abs`.
 ///
@@ -1519,6 +1530,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         91 => "jit_class_super_constructor",
         92 => "jit_load_upvalue_value",
         93 => "jit_copy_spread_arguments",
+        94 => "jit_initialize_upvalues",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1618,6 +1630,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_CLASS_SUPER_CONSTRUCTOR,
     STUB_JIT_LOAD_UPVALUE_VALUE,
     STUB_JIT_COPY_SPREAD_ARGUMENTS,
+    STUB_JIT_INITIALIZE_UPVALUES,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

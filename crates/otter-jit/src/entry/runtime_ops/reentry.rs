@@ -26,6 +26,7 @@
 //! - `super::super::abi` — machine-visible entry context.
 //! - `super::calls` — native activation and generated-call deoptimization.
 
+use otter_bytecode::Op;
 use otter_vm::{
     ClassRuntimeOp, JitExceptionOutcome, NumericRuntimeOp, ScalarRuntimeOp, UnaryCoercionOp,
     ValueLoadRuntimeOp, VmError,
@@ -565,6 +566,26 @@ pub(crate) extern "C" fn jit_class_value_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    if opcode == Op::MakeClass as u64 {
+        let lane = |packed: u64, index: usize| ((packed >> (index * 16)) & 0xffff) as u16;
+        let operation = ClassRuntimeOp::MakeClass {
+            destination: lane(arg0, 0),
+            constructor: lane(arg0, 1),
+            prototype: lane(arg0, 2),
+            statics: lane(arg0, 3),
+            parent: Some(arg1 as u16),
+        };
+        match ctx
+            .runtime_call()
+            .and_then(|mut call| call.class_op(operation))
+        {
+            Ok(()) => return 0,
+            Err(err) => {
+                park_jit_error(ctx, err);
+                return STATUS_THREW;
+            }
+        }
+    }
     let frame_index = match ctx.materialized_frame_index() {
         Ok(index) => index,
         Err(_) => return STATUS_BAILED,
@@ -1043,6 +1064,23 @@ pub(crate) extern "C" fn jit_object_protocol_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    if opcode == Op::SetPrototype as u64 {
+        let operation = otter_vm::ObjectProtocolRuntimeOp::SetPrototype {
+            object: arg0 as u16,
+            prototype: arg1 as u16,
+        };
+        match ctx
+            .runtime_call()
+            .and_then(|mut call| call.object_protocol_op(operation))
+        {
+            Ok(true) => return 0,
+            Ok(false) => {}
+            Err(err) => {
+                park_jit_error(ctx, err);
+                return STATUS_THREW;
+            }
+        }
+    }
     let frame_index = match ctx.materialized_frame_index() {
         Ok(index) => index,
         Err(_) => return STATUS_BAILED,
@@ -1379,6 +1417,34 @@ pub(crate) extern "C" fn jit_copy_spread_arguments_stub(
             parameter_count,
         )
     })
+}
+
+/// Build a generated callee's stack-owned upvalue spine before publication.
+/// `0` is success, `1` is a guard miss, and `2` parks an abrupt completion.
+pub(crate) extern "C" fn jit_initialize_upvalues_stub(
+    ctx: *mut JitCtx,
+    frame: *mut otter_vm::native_abi::NativeFrame,
+    own: u64,
+    inherited: u64,
+) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some(activation) = ctx.checked_activation() else {
+        return 1;
+    };
+    let (Ok(own), Ok(inherited)) = (u16::try_from(own), u16::try_from(inherited)) else {
+        return 1;
+    };
+    let vm = unsafe { &mut *activation.vm_ptr() };
+    let stack = unsafe { &*activation.stack_ptr() };
+    let context = unsafe { &*activation.context_ptr() };
+    match unsafe { vm.jit_initialize_generated_upvalues(stack, context, frame, own, inherited) } {
+        Ok(true) => 0,
+        Ok(false) => 1,
+        Err(error) => {
+            park_jit_error(ctx, error);
+            2
+        }
+    }
 }
 
 /// Complete one full loose-equality opcode in the VM. `0` = destination

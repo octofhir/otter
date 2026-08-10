@@ -143,7 +143,8 @@ pub use otter_vm::{
     JIT_ARTIFACT_BUNDLE_LIMIT, JIT_ARTIFACT_BYTE_LIMIT, JIT_DEBUG_EVENT_LIMIT, JitArtifactBatch,
     JitArtifactBundle, JitArtifactFile, JitArtifactFileName, JitArtifactManifest,
     JitDebugCompileOutcome, JitDebugEvent, JitDebugReport, JitDebugRequest, JitDebugTarget,
-    JitDebugTier, JitDirectCallKind, JitInlineRejectionReason, array, object,
+    JitDebugTier, JitDirectCallKind, JitDirectCallLoweringOutcome, JitInlineRejectionReason, array,
+    object,
 };
 pub use otter_vm::{
     JitRuntimeStats, RuntimeBudget, RuntimeBudgetExceededAction, RuntimeBudgetStats,

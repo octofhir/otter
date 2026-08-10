@@ -60,8 +60,10 @@ separately from `inlineCallees` /
 `thisMode` (`constructReceiver` or `derivedConstructor` for construct
 planning), or
 `rejected` with one of `missingCallee`, `ineligibleFunction`,
-`ownUpvalues`, `methodGuardUnavailable`, or
-`noEntryGeneration`.
+`methodGuardUnavailable`, or `noEntryGeneration`. Fresh callee-owned capture
+cells no longer reject direct linkage: generated entry allocates them into a
+caller-reserved upvalue spine and appends the closure's inherited cells before
+publishing the callee frame.
 
 For every available plan in a successful compile, `directCallLowered` records
 the backend's actual choice: `generated`, `inlined`, or `rejected` because the
@@ -73,6 +75,16 @@ publication switches the selected generation without recompiling the caller.
 `callerCodeObjectId` identifies the exact successful caller generation.
 Planning and lowering are separate events so diagnostics never claim a native
 call edge that the backend did not emit.
+
+Every direct-call region and entry-cell relocation reports
+`ownUpvalueCount` and `inheritedUpvalueCount` alongside the register and stack
+reservation fields. The counts describe the exact stack-owned spine contract
+used by that edge. Portable normalized code retains both counts because they
+change frame semantics; only the generation-local `targetCodeObjectId` is
+excluded. Hot observed targets may be prepared to a bounded depth of two
+edges, allowing a closure-backed callee's already-observed nested call to join
+the same sealed generation without recursively compiling an unbounded call
+graph.
 
 Base-construct artifacts add `directConstructPrepare` between the shared guard
 and frame publication. Generation and stack-entry validation happen first;

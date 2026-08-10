@@ -186,6 +186,7 @@ mod tests {
                 param_count: 2,
                 length: 2,
                 own_upvalue_count: 0,
+                inherited_upvalue_count: 0,
                 is_strict: true,
                 is_arrow: false,
                 is_method: false,

@@ -56,6 +56,11 @@ It already owns:
   generated calls into template or optimizing callees; safepoint-free acyclic
   scalar generations initially publish only their initialized parameter
   prefix, while every cold exit expands the canonical VM window before reentry;
+- caller-reserved upvalue spines for generated plain, guarded-method, fixed
+  base-constructor, and spread linkage. Fresh callee cells are allocated into
+  the spine before publication, inherited closure cells are appended exactly,
+  and bounded two-edge target preparation closes an already-observed nested
+  closure call without unbounded call-graph compilation;
 - a VM-owned linked root chain for Machine values live across reentrant calls;
   return, constructor receiver preparation, callee overflow/deopt, propagated
   throw, nested/recursive generated calls, and moving minor GC all execute
@@ -67,7 +72,8 @@ It already owns:
   operation; method guard misses deopt before lookup effects and tier/frame
   publication changes do not require caller recompilation.
 - one typed `RuntimeCall` boundary for scalar query/coercion, static value-load,
-  class-construction, and built-in Array iterator operations. These families
+  class-construction, ordinary prototype mutation, and built-in Array iterator
+  operations. These families
   decode machine operand words once into owned descriptors, operate on either
   materialized or generated stack-owned frames, and never recover an
   interpreter frame index merely to complete semantics.
@@ -76,8 +82,9 @@ The old optimizing compiler and template emitter remain in the active graph
 only for operations and function shapes not yet selected by the replacement
 pipeline. They are fallback, not contracts to preserve.
 
-Latest accepted gate: 282 JIT tests, 835 VM tests, all-target/all-feature
-Clippy, compile-fail/rooting checks, and 21/21 differential
+Latest accepted gate: 53 bytecode, 86 compiler, 282 JIT, and 835 VM tests;
+the complete runtime suite; all-target/all-feature Clippy;
+compile-fail/rooting checks; and 21/21 differential
 interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.
 
 ## Active work
@@ -102,7 +109,9 @@ replaced, accessor-backed, or non-Array iterator refuses before effects and
 resumes the exact materialized path. Scalar query/coercion, static namespace /
 BigInt/string-index loads, and class heritage / computed naming now use this
 same boundary; their former `jit_runtime_*` materialized-frame entrypoints and
-JIT-prefixed VM modules are deleted. Extend it to the remaining reentrant forms:
+JIT-prefixed VM modules are deleted. Fixed base `new` consumes the same
+generated linkage as plain and method calls, while fresh/inherited upvalues
+remain stack-owned. Extend it to the remaining reentrant forms:
 
 - admit nested catch/finally regions and complete multi-frame state through
   `lower_deopt_table`;

@@ -8,6 +8,7 @@
 //! - Ordinary call entry and shared callable invocation.
 //! - Constructor call entry and receiver/prototype setup.
 //! - Spread and explicit-`this` call forms.
+//! - Stack-owned generated-call upvalue-spine initialization.
 //! - Same-stack synchronous re-entry and reusable lean callback frames.
 //!
 //! # Invariants
@@ -513,6 +514,97 @@ impl Interpreter {
             }
             true
         })
+    }
+
+    /// Initialize the exact upvalue spine of an unpublished stack-owned
+    /// generated callee. Fresh cells occupy the prefix and closure captures
+    /// follow without allocating a Rust-owned frame container.
+    ///
+    /// # Safety
+    ///
+    /// `frame` must name an exclusively owned native frame whose initialized
+    /// register window and `upvalue_base` storage stay live for the call. The
+    /// storage must contain at least `own + inherited` handles.
+    pub unsafe fn jit_initialize_generated_upvalues(
+        &mut self,
+        stack: &ActivationStack,
+        context: &ExecutionContext,
+        frame: *mut crate::native_abi::NativeFrame,
+        own: u16,
+        inherited: u16,
+    ) -> Result<bool, VmError> {
+        let function_id = unsafe { (*frame).header.function_id };
+        let Some(function) = context.exec_function(function_id) else {
+            return Ok(false);
+        };
+        if function.own_upvalue_count != own || function.inherited_upvalue_count != inherited {
+            return Ok(false);
+        }
+        let total = usize::from(own)
+            .checked_add(usize::from(inherited))
+            .ok_or(VmError::InvalidOperand)?;
+        let base = unsafe { (*frame).upvalue_base as *mut crate::UpvalueCell };
+        if total != 0 && base.is_null() {
+            return Ok(false);
+        }
+        unsafe { (*frame).upvalue_count = 0 };
+        let roots = self.collect_allocation_roots(stack);
+        for index in 0..usize::from(own) {
+            let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                for &slot in &roots {
+                    visitor(slot);
+                }
+                // SAFETY: the generated caller keeps the frame, register
+                // window, and initialized upvalue prefix live. The current
+                // prefix length is published in the frame before each later
+                // allocation.
+                if let Ok(active) = unsafe { crate::ActiveFrameRef::from_native_ptr(frame) } {
+                    active.trace_stack_register_slots(visitor);
+                    active.trace_non_register_slots(visitor);
+                }
+            };
+            let cell = crate::alloc_upvalue_with_roots(
+                &mut self.gc_heap,
+                Value::undefined(),
+                &mut external_visit,
+            )
+            .map_err(crate::oom_to_vm)?;
+            unsafe {
+                base.add(index).write(cell);
+                (*frame).upvalue_count =
+                    u32::try_from(index + 1).map_err(|_| VmError::InvalidOperand)?;
+            }
+        }
+
+        // Allocations may move the exact closure body and rewrite SELF in the
+        // unpublished frame. Re-read it only after the final collection, then
+        // copy its stable old-space spine handles into the stack suffix.
+        let self_value = Value::from_abi_bits(unsafe { (*frame).self_value_bits });
+        if inherited != 0 {
+            let Some(closure) = self_value.as_closure(&self.gc_heap) else {
+                return Ok(false);
+            };
+            if closure.function_id() != function_id {
+                return Ok(false);
+            }
+            let source = closure.call_state(&self.gc_heap).upvalues;
+            if source.len() != usize::from(inherited) {
+                return Ok(false);
+            }
+            for index in 0..usize::from(inherited) {
+                let cell = source.read(index).ok_or(VmError::InvalidOperand)?;
+                unsafe { base.add(usize::from(own) + index).write(cell) };
+            }
+        } else if let Some(closure) = self_value.as_closure(&self.gc_heap)
+            && closure.function_id() == function_id
+            && !closure.call_state(&self.gc_heap).upvalues.is_empty()
+        {
+            return Ok(false);
+        }
+        unsafe {
+            (*frame).upvalue_count = u32::try_from(total).map_err(|_| VmError::InvalidOperand)?;
+        }
+        Ok(true)
     }
 
     pub(crate) fn lean_callback_parent_upvalue(

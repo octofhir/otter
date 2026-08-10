@@ -214,11 +214,6 @@ pub enum JitDirectCallRejectionReason {
     /// The bytecode function requires call semantics outside the synchronous
     /// direct-entry subset.
     IneligibleFunction,
-    /// Entry must allocate fresh callee-owned capture cells before execution.
-    OwnUpvalues {
-        /// Number of fresh cells required by every invocation.
-        count: u16,
-    },
     /// Method feedback could not be converted into immutable
     /// receiver/prototype/slot guard metadata.
     MethodGuardUnavailable,

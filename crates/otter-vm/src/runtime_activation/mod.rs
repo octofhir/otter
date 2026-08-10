@@ -32,12 +32,14 @@
 mod class_ops;
 mod control;
 mod iterators;
+mod object_protocol;
 mod scalar_ops;
 mod value_loads;
 mod value_ops;
 
 pub use class_ops::ClassRuntimeOp;
 pub use iterators::IteratorRuntimeOutcome;
+pub use object_protocol::ObjectProtocolRuntimeOp;
 pub use scalar_ops::ScalarRuntimeOp;
 pub use value_loads::ValueLoadRuntimeOp;
 

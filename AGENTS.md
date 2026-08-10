@@ -441,7 +441,10 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     caller. Typed `directCall` metadata names call kind, target function,
     planning-time `targetCodeObjectId`, tier, `thisMode`, `argumentMode`,
     captured callee-native-frame bytes, caller linkage bytes, captured total
-    reservation, and register count. `argumentMode` is `fixed` or `spread`;
+    reservation, register count, `ownUpvalueCount`, and
+    `inheritedUpvalueCount`. Fresh capture cells occupy a caller-reserved
+    stack spine; inherited closure cells follow in the same spine before the
+    callee frame is published. `argumentMode` is `fixed` or `spread`;
     spread arguments are copied from the rooted dense array into the same
     unpublished callee frame through the leaf/no-allocation runtime stub.
     Compiler-generated default-Array iterator collection inside a generated
@@ -449,7 +452,10 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     iterator overrides side-exit before effects to the materialized path.
     Generated code links through the permanent function cell and reads the
     selected generation's actual code-object id, tier, and frame reservation
-    before entry; tier publication does not recompile callers. `methodGuard`
+    before entry; tier publication does not recompile callers. Eager target
+    preparation is bounded to two observed call-graph edges so one nested hot
+    closure target can be sealed without unbounded recursive compilation.
+    `methodGuard`
     names the receiver register, receiver/prototype shapes, method function,
     and slot byte. Portable normalized code excludes generation-local
     `targetCodeObjectId`; call kind, argument mode, captured target tier,

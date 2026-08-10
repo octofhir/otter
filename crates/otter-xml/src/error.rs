@@ -65,6 +65,10 @@ pub enum ErrorKind {
     ExternalEntityInAttribute(String),
     /// A document type declaration whose internal subset is malformed.
     BadDoctype(&'static str),
+    /// A name that XML cannot spell, found while writing a document.
+    IllegalName(String),
+    /// A value whose shape is not a document, found while writing one.
+    Unserializable(&'static str),
     /// A character reference that names no legal character.
     BadCharacterReference,
     /// A `<?xml …?>` declaration that is malformed or misplaced.
@@ -111,6 +115,8 @@ impl fmt::Display for ErrorKind {
                 )
             }
             Self::BadDoctype(what) => write!(f, "malformed document type declaration: {what}"),
+            Self::IllegalName(name) => write!(f, "{name:?} is not a legal XML name"),
+            Self::Unserializable(what) => write!(f, "cannot be written as XML: {what}"),
             Self::BadCharacterReference => f.write_str("character reference is out of range"),
             Self::BadDeclaration(what) => write!(f, "malformed XML declaration: {what}"),
             Self::DepthLimit => f.write_str("element nesting is too deep"),

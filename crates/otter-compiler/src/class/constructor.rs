@@ -176,6 +176,7 @@ pub(crate) fn compile_synthetic_constructor(
     slot.has_rest = is_derived;
     slot.is_derived_constructor = is_derived;
     slot.own_upvalue_count = child.own_upvalue_count;
+    slot.inherited_upvalue_count = captures.len() as u16;
     slot.direct_eval_bindings = direct_eval_meta;
     slot.contains_direct_eval = contains_direct_eval;
     slot.code = child.code.finish();
@@ -370,6 +371,7 @@ pub(crate) fn compile_class_constructor(
     slot.is_async = is_async;
     slot.is_derived_constructor = is_derived;
     slot.own_upvalue_count = child.own_upvalue_count;
+    slot.inherited_upvalue_count = captures.len() as u16;
     slot.direct_eval_bindings = direct_eval_meta;
     slot.contains_direct_eval = contains_direct_eval;
     slot.code = child.code.finish();

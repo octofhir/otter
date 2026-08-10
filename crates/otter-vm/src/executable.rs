@@ -377,6 +377,7 @@ impl CodeBlock {
             param_count,
             register_count,
             own_upvalue_count: 0,
+            inherited_upvalue_count: 0,
             is_strict: false,
             is_arrow: false,
             is_method: false,
@@ -817,6 +818,8 @@ pub struct CodeBlock {
     pub register_count: u16,
     /// Number of fresh upvalue cells owned by each frame.
     pub(crate) own_upvalue_count: u16,
+    /// Exact number of closure-owned cells appended after fresh frame cells.
+    pub(crate) inherited_upvalue_count: u16,
     /// `true` when this function uses strict-mode call semantics.
     pub is_strict: bool,
     /// `true` when this function is an arrow function.
@@ -906,6 +909,7 @@ impl Clone for CodeBlock {
             param_count: self.param_count,
             register_count: self.register_count,
             own_upvalue_count: self.own_upvalue_count,
+            inherited_upvalue_count: self.inherited_upvalue_count,
             is_strict: self.is_strict,
             is_arrow: self.is_arrow,
             is_method: self.is_method,
@@ -1086,6 +1090,7 @@ impl CodeBlock {
             param_count: function.param_count,
             register_count,
             own_upvalue_count: function.own_upvalue_count,
+            inherited_upvalue_count: function.inherited_upvalue_count,
             is_strict: function.is_strict,
             is_arrow: function.is_arrow,
             is_method: function.is_method,

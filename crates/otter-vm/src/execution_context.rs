@@ -643,6 +643,7 @@ mod tests {
                 param_count: 0,
                 length: 0,
                 own_upvalue_count: 0,
+                inherited_upvalue_count: 0,
                 is_strict: false,
                 is_arrow: false,
                 is_method: false,

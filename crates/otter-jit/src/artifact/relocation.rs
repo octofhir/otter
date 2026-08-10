@@ -1065,6 +1065,8 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             put_u32(output, direct_call.linkage_bytes);
             put_u32(output, direct_call.reserved_stack_bytes);
             put_u16(output, direct_call.callee_register_count);
+            put_u16(output, direct_call.own_upvalue_count);
+            put_u16(output, direct_call.inherited_upvalue_count);
         }
     }
     Ok(())
@@ -1134,6 +1136,8 @@ mod tests {
                 linkage_bytes: 112,
                 reserved_stack_bytes: 272,
                 callee_register_count: 6,
+                own_upvalue_count: 2,
+                inherited_upvalue_count: 1,
             },
         }
     }

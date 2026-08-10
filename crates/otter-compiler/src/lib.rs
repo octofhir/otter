@@ -853,6 +853,8 @@ mod tests {
         // The inner function captures `n` from `makeCounter`, so the
         // outer body emits `MakeClosure` instead of `MakeFunction`.
         let outer = &module.functions[1];
+        assert_eq!(outer.own_upvalue_count, 1);
+        assert_eq!(outer.inherited_upvalue_count, 0);
         let has_make_closure = outer.code.iter().any(|i| i.op == Op::MakeClosure);
         assert!(
             has_make_closure,
@@ -861,6 +863,8 @@ mod tests {
         );
         // The inner function reads / writes `n` through upvalue ops.
         let inner = &module.functions[2];
+        assert_eq!(inner.own_upvalue_count, 0);
+        assert_eq!(inner.inherited_upvalue_count, 1);
         assert!(
             inner.code.iter().any(|i| i.op == Op::LoadUpvalue),
             "inner should LoadUpvalue: {:?}",

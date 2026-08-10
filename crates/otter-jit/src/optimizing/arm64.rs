@@ -417,6 +417,8 @@ struct EmissionPlan<'a> {
     deopt_stack_call_entry: ResolvedRuntimeEntry,
     /// Repairs an empty stable function-entry cell from installed generations.
     resolve_direct_entry: ResolvedRuntimeEntry,
+    /// Builds fresh capture cells in an unpublished stack-owned callee frame.
+    initialize_upvalues_entry: ResolvedRuntimeEntry,
     /// Reads one captured binding into a window slot; TDZ reads throw.
     load_upvalue_entry: ResolvedRuntimeEntry,
     /// Writes one captured binding with the generational barrier.
@@ -643,6 +645,10 @@ pub(super) fn compile_with_artifacts(
             resolve_direct_entry: ResolvedRuntimeEntry::new(
                 otter_vm::native_abi::STUB_JIT_RESOLVE_DIRECT_ENTRY,
                 transitions.entry(otter_vm::native_abi::STUB_JIT_RESOLVE_DIRECT_ENTRY),
+            ),
+            initialize_upvalues_entry: ResolvedRuntimeEntry::new(
+                otter_vm::native_abi::STUB_JIT_INITIALIZE_UPVALUES,
+                transitions.entry(otter_vm::native_abi::STUB_JIT_INITIALIZE_UPVALUES),
             ),
             load_upvalue_entry: ResolvedRuntimeEntry::new(
                 STUB_JIT_LOAD_UPVALUE,
@@ -993,6 +999,7 @@ fn emit(
         poll_entry,
         deopt_stack_call_entry,
         resolve_direct_entry,
+        initialize_upvalues_entry,
         load_upvalue_entry,
         store_upvalue_entry,
         store_upvalue_checked_entry,
@@ -3766,6 +3773,7 @@ fn emit(
                                     },
                                     deopt_stack_call_entry.address,
                                     resolve_direct_entry.address,
+                                    initialize_upvalues_entry.address,
                                     code_map.as_mut(),
                                     bail,
                                     threw,

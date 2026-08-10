@@ -331,6 +331,8 @@ impl JitCodeRegistry {
             generated_stack_frame_bytes: Some(generation.generated_stack_frame_bytes),
             param_count: function.param_count,
             register_count: function.register_count,
+            own_upvalue_count: function.own_upvalue_count,
+            inherited_upvalue_count: function.inherited_upvalue_count,
         })
     }
 

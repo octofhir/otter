@@ -323,6 +323,7 @@ pub(crate) fn compile_function_full(
     };
     slot.mapped_argument_bindings = mapped_argument_bindings;
     slot.own_upvalue_count = child.own_upvalue_count;
+    slot.inherited_upvalue_count = captures.len() as u16;
     slot.direct_eval_bindings = direct_eval_meta;
     slot.contains_direct_eval = contains_direct_eval;
     slot.number_hint_sites = child.number_hint_sites;
@@ -605,6 +606,7 @@ pub(crate) fn compile_arrow_function(
     slot.has_rest = has_rest;
     slot.is_async = arrow.r#async;
     slot.own_upvalue_count = child.own_upvalue_count;
+    slot.inherited_upvalue_count = captures.len() as u16;
     slot.is_arrow = true;
     slot.direct_eval_bindings = direct_eval_meta;
     slot.contains_direct_eval = contains_direct_eval;

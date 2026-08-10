@@ -280,6 +280,7 @@ impl Writer {
         self.u16(function.param_count);
         self.u16(function.length);
         self.u16(function.own_upvalue_count);
+        self.u16(function.inherited_upvalue_count);
         for flag in [
             function.is_strict,
             function.is_arrow,
@@ -546,6 +547,7 @@ impl<'a> Reader<'a> {
         let param_count = self.u16()?;
         let length = self.u16()?;
         let own_upvalue_count = self.u16()?;
+        let inherited_upvalue_count = self.u16()?;
         let is_strict = self.bool()?;
         let is_arrow = self.bool()?;
         let is_method = self.bool()?;
@@ -585,6 +587,7 @@ impl<'a> Reader<'a> {
             param_count,
             length,
             own_upvalue_count,
+            inherited_upvalue_count,
             is_strict,
             is_arrow,
             is_method,
@@ -651,6 +654,7 @@ mod tests {
                 param_count: 1,
                 length: 1,
                 own_upvalue_count: 1,
+                inherited_upvalue_count: 2,
                 is_strict: true,
                 is_arrow: false,
                 is_method: true,

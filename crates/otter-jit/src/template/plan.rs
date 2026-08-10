@@ -289,8 +289,9 @@ pub(crate) enum TemplateOp {
         /// Serialized byte PC used to resolve the immutable call-site link.
         byte_pc: u32,
     },
-    /// Fixed-arity `new` / `super()` through the generic in-place construct
-    /// transition. `super_construct` selects the current frame's immutable
+    /// Fixed-arity `new` through baked generated linkage when the target is
+    /// available; `super()` and unplanned `new` use the generic in-place
+    /// construct transition. `super_construct` selects the current frame's immutable
     /// `new.target`; ordinary `new` uses the callee. A non-constructor takes
     /// an exact side exit before effects. Argument register indices are packed
     /// one per 16-bit lane.
@@ -300,6 +301,8 @@ pub(crate) enum TemplateOp {
         argc: u16,
         packed_args: u64,
         super_construct: bool,
+        /// Serialized byte PC used to resolve the immutable construct link.
+        byte_pc: u32,
     },
     /// `r<dst> = r<receiver>.name(args…)` through the guarded collection
     /// fast paths, the collection-method IC, and the direct-method prepare
@@ -1116,6 +1119,7 @@ impl TemplatePlan {
                         argc: arguments.len() as u16,
                         packed_args: pack_or_spill_arg_regs(arguments, &mut register_operands),
                         super_construct: false,
+                        byte_pc: lowered.byte_pc,
                     }
                 }
                 Op::SuperConstruct => {
@@ -1127,6 +1131,7 @@ impl TemplatePlan {
                         argc: arguments.len() as u16,
                         packed_args: pack_or_spill_arg_regs(arguments, &mut register_operands),
                         super_construct: true,
+                        byte_pc: lowered.byte_pc,
                     }
                 }
                 Op::CallMethodValue => {

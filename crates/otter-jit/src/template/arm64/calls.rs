@@ -3,7 +3,8 @@
 //! # Contents
 //! - Compiler-generated monomorphic plain calls and bounded polymorphic method
 //!   chains with a canonical generic-call continuation.
-//! - Construct lowering through the current runtime transition.
+//! - Fixed base construction through shared generated linkage with the current
+//!   runtime transition as the unplanned/`super()` fallback.
 //! - Guarded read-only numeric call/method splicing from VM-baked metadata.
 //! - Guarded collection-method leaves before generated method linkage.
 //!
@@ -1027,6 +1028,7 @@ pub(super) fn emit_call(
             },
             table.entry(abi::STUB_JIT_DEOPT_STACK_CALL),
             table.entry(abi::STUB_JIT_RESOLVE_DIRECT_ENTRY),
+            table.entry(abi::STUB_JIT_INITIALIZE_UPVALUES),
             code_map,
             bail,
             threw,
@@ -1108,25 +1110,138 @@ pub(super) fn direct_call_lowering_event(
 
 /// Emit fixed-arity `new callee(args…)` or `super(args…)`.
 ///
-/// The construct opcode has no direct-call fast path: it completes through
-/// the single generic in-place construct transition, which runs the
-/// interpreter's own `Construct` synchronously and writes `dst`. Status `0`
-/// continues the compiled caller, `1` throws, and `2` (a non-constructor
-/// callee) takes the exact side exit so the interpreter owns the `TypeError`.
+/// A baked target uses the shared stack-owned generated linkage. An unplanned
+/// site completes through the single generic in-place construct transition,
+/// which runs the interpreter's own `Construct` synchronously and writes
+/// `dst`. Status `0` continues the compiled caller, `1` throws, and `2` (a
+/// non-constructor callee) takes the exact side exit so the interpreter owns
+/// the `TypeError`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_construct(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
+    view: &JitCompileSnapshot,
+    direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
+    code_map: Option<&mut CodeMapCapture>,
     dst: u16,
     callee: u16,
     argc: u16,
     packed_args: u64,
     packed_args_tail: Option<TemplateTail>,
+    argument_registers: &[u16],
     super_construct: bool,
+    logical_pc: u32,
+    byte_pc: u32,
     bail: DynamicLabel,
     threw: DynamicLabel,
-) {
+) -> Result<(), Unsupported> {
+    // Keep fixed `super()` on the in-place transition until template entry
+    // tiering accounts for a generated superclass edge. Entering it directly
+    // here starves the derived body of the feedback/hotness that currently
+    // publishes its Machine IR super linkage. Ordinary fixed `new` has no such
+    // tier-policy dependency and uses the shared generated path below.
+    let direct_target = (!super_construct)
+        .then(|| view.direct_constructs.get(&byte_pc))
+        .flatten();
+    if let Some(target) = direct_target.filter(|target| direct_call_target_is_supported(target)) {
+        let done = ops.new_dynamic_label();
+        let kind = match (super_construct, target.plan.is_derived_constructor) {
+            (false, false) => otter_vm::JitDirectCallKind::Construct,
+            (false, true) => otter_vm::JitDirectCallKind::DerivedConstruct,
+            (true, false) => otter_vm::JitDirectCallKind::SuperConstruct,
+            (true, true) => otter_vm::JitDirectCallKind::DerivedSuperConstruct,
+        };
+        let form = match kind {
+            otter_vm::JitDirectCallKind::Construct => DirectCallForm::Construct {
+                callable: callee,
+                receiver: dst,
+            },
+            otter_vm::JitDirectCallKind::DerivedConstruct => {
+                DirectCallForm::DerivedConstruct { callable: callee }
+            }
+            otter_vm::JitDirectCallKind::SuperConstruct => DirectCallForm::SuperConstruct {
+                callable: callee,
+                receiver: dst,
+            },
+            otter_vm::JitDirectCallKind::DerivedSuperConstruct => {
+                DirectCallForm::DerivedSuperConstruct { callable: callee }
+            }
+            _ => unreachable!("fixed construct kind"),
+        };
+        crate::arm64::emit_direct_call_with_access(
+            ops,
+            relocations,
+            view,
+            DirectCallSite {
+                target,
+                caller_function_id: view.code_block.id,
+                logical_pc,
+                byte_pc,
+                dst,
+                form,
+                arguments: DirectCallArguments::Fixed(argument_registers),
+            },
+            table.entry(abi::STUB_JIT_DEOPT_STACK_CALL),
+            table.entry(abi::STUB_JIT_RESOLVE_DIRECT_ENTRY),
+            table.entry(abi::STUB_JIT_PREPARE_BASE_CONSTRUCT),
+            table.entry(abi::STUB_JIT_BASE_CONSTRUCT_RESULT),
+            table.entry(abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT),
+            0,
+            table.entry(abi::STUB_JIT_INITIALIZE_UPVALUES),
+            code_map,
+            bail,
+            threw,
+            done,
+            20,
+            |ops, source, target, _| emit_load_reg(ops, target, source),
+            |ops, destination, source, _| emit_store_reg(ops, source, destination),
+            |_| Ok(()),
+            |ops, source, _| emit_store_reg(ops, source, dst),
+            |_, _| Ok(()),
+        )?;
+        if let Some(events) = direct_call_events {
+            events.insert(
+                (byte_pc, 0),
+                direct_call_lowering_event(
+                    kind,
+                    logical_pc,
+                    byte_pc,
+                    target,
+                    0,
+                    1,
+                    otter_vm::JitDirectCallLoweringOutcome::Generated {
+                        code_object_id: target.plan.code_object_id,
+                        target_tier: direct_call_target_tier(target),
+                        this_mode: target.plan.this_mode,
+                    },
+                ),
+            );
+        }
+        dynasm!(ops ; .arch aarch64 ; =>done);
+        return Ok(());
+    }
+
+    if let (Some(events), Some(target)) = (direct_call_events, direct_target) {
+        events.insert(
+            (byte_pc, 0),
+            direct_call_lowering_event(
+                if super_construct {
+                    otter_vm::JitDirectCallKind::SuperConstruct
+                } else {
+                    otter_vm::JitDirectCallKind::Construct
+                },
+                logical_pc,
+                byte_pc,
+                target,
+                0,
+                1,
+                otter_vm::JitDirectCallLoweringOutcome::Rejected {
+                    reason: otter_vm::JitDirectCallLoweringRejectionReason::LayoutUnsupported,
+                },
+            ),
+        );
+    }
     dynasm!(ops
         ; .arch aarch64
         ; mov x0, x20
@@ -1157,6 +1272,7 @@ pub(super) fn emit_construct(
         ; cmp x0, #2
         ; b.eq =>bail
     );
+    Ok(())
 }
 
 /// Emit `dst = recv.name(args…)` (`Op::CallMethodValue`).
@@ -1357,6 +1473,7 @@ pub(super) fn emit_method_call(
             direct_site,
             table.entry(abi::STUB_JIT_DEOPT_STACK_CALL),
             table.entry(abi::STUB_JIT_RESOLVE_DIRECT_ENTRY),
+            table.entry(abi::STUB_JIT_INITIALIZE_UPVALUES),
             code_map.as_deref_mut(),
             bail,
             threw,

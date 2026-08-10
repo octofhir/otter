@@ -15,13 +15,27 @@
 //! # See also
 //! - [`crate::class_ops`]
 
-use crate::{VmError, abstract_ops, object};
+use crate::{ClassConstructor, Value, VmError, abstract_ops, object};
 
 use super::RuntimeCall;
 
 /// Decoded class-construction operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClassRuntimeOp {
+    /// Assemble one class wrapper from compiler-built constructor, prototype,
+    /// statics, and optional parent values.
+    MakeClass {
+        /// Result register.
+        destination: u16,
+        /// Constructor callable register.
+        constructor: u16,
+        /// Instance prototype object register.
+        prototype: u16,
+        /// Static-side object register.
+        statics: u16,
+        /// Optional heritage value register.
+        parent: Option<u16>,
+    },
     /// Bind the value in `source` as a derived constructor's `this`.
     BindThis {
         /// Source register containing the completed `super()` result.
@@ -52,6 +66,96 @@ impl RuntimeCall<'_> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         match operation {
+            ClassRuntimeOp::MakeClass {
+                destination,
+                constructor,
+                prototype,
+                statics,
+                parent,
+            } => {
+                let ctor = self.read(constructor)?;
+                if !vm.is_callable_runtime(&ctor) {
+                    return Err(VmError::NotCallable);
+                }
+                let prototype_object = self
+                    .read(prototype)?
+                    .as_object()
+                    .ok_or(VmError::TypeMismatch)?;
+                let statics_object = self
+                    .read(statics)?
+                    .as_object()
+                    .ok_or(VmError::TypeMismatch)?;
+                let roots = vm.collect_allocation_roots(unsafe { self.stack.as_ref() });
+                let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                    for &slot in &roots {
+                        visitor(slot);
+                    }
+                };
+                let class = ClassConstructor::new_with_roots(
+                    &mut vm.gc_heap,
+                    ctor,
+                    prototype_object,
+                    statics_object,
+                    &mut external_visit,
+                )?;
+                let ctor = self.read(constructor)?;
+                let statics_object = self
+                    .read(statics)?
+                    .as_object()
+                    .ok_or(VmError::TypeMismatch)?;
+                if let Some(function_id) = ctor.as_function().or_else(|| {
+                    ctor.as_closure(&vm.gc_heap)
+                        .map(|closure| closure.cached_function_id)
+                }) {
+                    for key in ["name", "length"] {
+                        if object::get_own_descriptor(statics_object, &vm.gc_heap, key).is_some() {
+                            vm.function_deleted_metadata.insert((function_id, key));
+                        }
+                    }
+                }
+                if let Some(parent) = parent {
+                    let parent = self.read(parent)?;
+                    if !parent.is_undefined() && !parent.is_null() {
+                        class.set_ctor_proto(&mut vm.gc_heap, parent);
+                    }
+                }
+                if class.ctor_proto(&vm.gc_heap).is_undefined()
+                    && let Some(function_prototype) = vm.realm_intrinsics.function_prototype()
+                {
+                    let statics_object = self
+                        .read(statics)?
+                        .as_object()
+                        .ok_or(VmError::TypeMismatch)?;
+                    object::set_prototype(
+                        statics_object,
+                        &mut vm.gc_heap,
+                        Some(function_prototype),
+                    );
+                }
+                self.write(destination, Value::class_constructor(class))?;
+                let constructor_descriptor = object::PartialPropertyDescriptor {
+                    value: Some(Value::class_constructor(class)),
+                    writable: Some(true),
+                    enumerable: Some(false),
+                    configurable: Some(true),
+                    ..Default::default()
+                };
+                let prototype_object = self
+                    .read(prototype)?
+                    .as_object()
+                    .ok_or(VmError::TypeMismatch)?;
+                let placeholder_pending =
+                    object::get_own(prototype_object, &vm.gc_heap, "constructor")
+                        .is_none_or(Value::is_undefined);
+                if placeholder_pending {
+                    let _ = vm.define_own_property_partial(
+                        prototype_object,
+                        "constructor",
+                        constructor_descriptor,
+                    )?;
+                }
+                Ok(())
+            }
             ClassRuntimeOp::BindThis { source } => self.bind_derived_this_value(self.read(source)?),
             ClassRuntimeOp::Check { register, kind } => {
                 let value = self.read(register)?;

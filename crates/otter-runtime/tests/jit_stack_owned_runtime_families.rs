@@ -4,6 +4,8 @@
 //! - Direct generated calls combining scalar queries and allocating value loads.
 //! - Dynamic class heritage and computed function naming in a generated callee.
 //! - Observable `ToPropertyKey` success and throw paths with exact effect counts.
+//! - Plain, method, and construct linkage with fresh plus inherited upvalues.
+//! - Exact direct-call artifact spine counts and abrupt side-exit behavior.
 //!
 //! # Invariants
 //! - Supported operations complete against the published native frame without
@@ -11,7 +13,10 @@
 //! - Interpreter and production-tiered results are byte-identical.
 //! - A coercion hook runs once per specification operation, including abrupt completion.
 
-use otter_runtime::{JitSelection, Runtime, RuntimeExecutionStats, SourceInput};
+use otter_runtime::{
+    JitArtifactFileName, JitDebugEvent, JitDebugRequest, JitDirectCallKind,
+    JitDirectCallLoweringOutcome, JitSelection, Runtime, RuntimeExecutionStats, SourceInput,
+};
 
 const DIRECT_FAMILIES: &str = r#"
 function BoundaryBase(value) { this.total = value + 1; }
@@ -55,10 +60,30 @@ fn run(source: &str, selection: JitSelection) -> (String, RuntimeExecutionStats)
             SourceInput::from_javascript(source.to_string()),
             "jit-stack-owned-runtime-families.js",
         )
-        .expect("runtime-family completion")
-        .completion_string()
-        .to_owned();
+        .expect("runtime-family completion");
+    let completion = completion.completion_string().to_owned();
     (completion, runtime.execution_stats())
+}
+
+fn run_with_events(source: &str, selection: JitSelection) -> (String, Vec<JitDebugEvent>) {
+    let mut runtime = Runtime::builder()
+        .jit_selection(selection)
+        .jit_osr_threshold(8)
+        .jit_debug(JitDebugRequest::events())
+        .build()
+        .expect("runtime");
+    let completion = runtime
+        .run_script(
+            SourceInput::from_javascript(source.to_string()),
+            "jit-stack-owned-runtime-families-events.js",
+        )
+        .expect("runtime-family completion");
+    let events = completion
+        .jit_debug_report()
+        .expect("event report")
+        .events()
+        .to_vec();
+    (completion.completion_string().to_owned(), events)
 }
 
 #[test]
@@ -120,6 +145,205 @@ fn observable_coercion_commits_or_throws_without_replay() {
         assert_eq!(
             stats.jit_generated_call_deopts, 0,
             "started coercions must complete or throw, never replay through deopt"
+        );
+    }
+}
+
+const UPVALUE_CALL_FAMILIES: &str = r#"
+function makePlain(offset) {
+  return function plain(value) {
+    let captured = value;
+    function read() { return captured + offset; }
+    return read();
+  };
+}
+function makeHolder(offset) {
+  return {
+    method(value) {
+      let captured = value;
+      function read() { return captured + offset; }
+      return read();
+    }
+  };
+}
+function makeBox(offset) {
+  return function Box(value) {
+    let captured = value;
+    function read() { return captured + offset; }
+    this.value = read();
+  };
+}
+const plain = makePlain(1);
+const holder = makeHolder(2);
+const Box = makeBox(3);
+for (let i = 0; i < 1000; i++) {
+  plain(i);
+  holder.method(i);
+  new Box(i);
+}
+function run(rounds) {
+  let checksum = 0;
+  for (let i = 0; i < rounds; i++) {
+    checksum += plain(i);
+    checksum += holder.method(i);
+    checksum += new Box(i).value;
+  }
+  return String(checksum);
+}
+run(1000);
+"#;
+
+#[test]
+fn generated_plain_method_and_construct_calls_own_stack_upvalue_spines() {
+    let (oracle, _) = run(UPVALUE_CALL_FAMILIES, JitSelection::InterpreterOnly);
+    assert_eq!(oracle, "1504500");
+    for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
+        let (compiled, stats) = run(UPVALUE_CALL_FAMILIES, selection);
+        assert_eq!(compiled, oracle);
+        assert!(
+            stats.jit_generated_calls > 1000,
+            "plain/method/construct families must enter generated linkage: {stats:?}"
+        );
+        assert_eq!(
+            stats.jit_generated_call_deopts, 0,
+            "{selection:?}: {stats:?}"
+        );
+        assert_eq!(
+            stats.jit_generated_template_deopts, 0,
+            "{selection:?}: {stats:?}"
+        );
+        if selection == JitSelection::Template {
+            assert_eq!(
+                stats.jit_to_rust_call_transitions, 0,
+                "the template caller must keep every hot call family native: {stats:?}"
+            );
+        }
+
+        let (event_completion, events) = run_with_events(UPVALUE_CALL_FAMILIES, selection);
+        assert_eq!(event_completion, oracle);
+        for expected in [
+            JitDirectCallKind::Plain,
+            JitDirectCallKind::Method,
+            JitDirectCallKind::Construct,
+        ] {
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    JitDebugEvent::DirectCallLowered {
+                        call_kind,
+                        outcome: JitDirectCallLoweringOutcome::Generated { .. },
+                        ..
+                    } if *call_kind == expected
+                )),
+                "{selection:?} did not generate {expected:?} linkage"
+            );
+        }
+    }
+}
+
+#[test]
+fn direct_call_artifacts_publish_exact_upvalue_spine_contracts() {
+    let mut runtime = Runtime::builder()
+        .jit_selection(JitSelection::Template)
+        .jit_osr_threshold(8)
+        .jit_debug(JitDebugRequest::artifacts())
+        .build()
+        .expect("artifact runtime");
+    let completion = runtime
+        .run_script(
+            SourceInput::from_javascript(UPVALUE_CALL_FAMILIES),
+            "jit-upvalue-call-family-artifacts.js",
+        )
+        .expect("artifact completion");
+    assert_eq!(completion.completion_string(), "1504500");
+    let artifacts = completion.jit_artifacts().expect("artifact batch");
+    let mut generated_kinds = std::collections::BTreeSet::new();
+    for bundle in artifacts.bundles() {
+        let Some(file) = bundle.file(JitArtifactFileName::CodeMap) else {
+            continue;
+        };
+        let map: serde_json::Value =
+            serde_json::from_slice(file.contents()).expect("valid code-map JSON");
+        let Some(regions) = map["regions"].as_array() else {
+            continue;
+        };
+        for direct in regions
+            .iter()
+            .filter_map(|region| region.get("directCall"))
+            .filter(|direct| direct["ownUpvalueCount"] == 1 && direct["inheritedUpvalueCount"] == 1)
+        {
+            if let Some(kind) = direct["callKind"].as_str() {
+                generated_kinds.insert(kind.to_owned());
+            }
+        }
+    }
+    assert_eq!(
+        generated_kinds,
+        ["construct", "method", "plain"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        "every generated outer edge must expose its exact fresh/inherited spine"
+    );
+}
+
+const UPVALUE_THROW_FAMILIES: &str = r#"
+let effects = 0;
+function makePlain(offset) {
+  return function plain(value) {
+    let captured = value;
+    function read() { return captured + offset; }
+    const result = read();
+    if (result < 0) { effects++; throw new Error("plain"); }
+    return result;
+  };
+}
+function makeHolder(offset) {
+  return { method(value) {
+    let captured = value;
+    function read() { return captured + offset; }
+    const result = read();
+    if (result < 0) { effects++; throw new Error("method"); }
+    return result;
+  } };
+}
+function makeBox(offset) {
+  return function Box(value) {
+    let captured = value;
+    function read() { return captured + offset; }
+    const result = read();
+    if (result < 0) { effects++; throw new Error("construct"); }
+    this.value = result;
+  };
+}
+const plain = makePlain(1);
+const holder = makeHolder(2);
+const Box = makeBox(3);
+let caught = 0;
+for (let i = 0; i <= 1000; i++) {
+  const value = i === 1000 ? -10 : i;
+  try { plain(value); } catch (error) { if (error.message === "plain") caught++; }
+  try { holder.method(value); } catch (error) { if (error.message === "method") caught++; }
+  try { new Box(value); } catch (error) { if (error.message === "construct") caught++; }
+}
+JSON.stringify([effects, caught]);
+"#;
+
+#[test]
+fn upvalue_spine_abrupt_paths_commit_once_across_generated_side_exits() {
+    let (oracle, _) = run(UPVALUE_THROW_FAMILIES, JitSelection::InterpreterOnly);
+    assert_eq!(oracle, "[3,3]");
+    for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
+        let (compiled, stats) = run(UPVALUE_THROW_FAMILIES, selection);
+        assert_eq!(compiled, oracle);
+        assert!(stats.jit_generated_calls > 1000, "{selection:?}: {stats:?}");
+        assert!(
+            stats.jit_generated_call_deopts <= 3,
+            "each first abrupt family may side-exit once, never replay: {stats:?}"
+        );
+        assert!(
+            stats.jit_generated_call_deopts + stats.jit_generated_template_throws > 0,
+            "the abrupt inputs must exercise generated unwind/side-exit routing: {stats:?}"
         );
     }
 }

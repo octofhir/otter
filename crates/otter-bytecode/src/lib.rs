@@ -1873,6 +1873,11 @@ pub struct Function {
     /// and parent-passed captures follow.
     #[serde(default)]
     pub own_upvalue_count: u16,
+    /// Number of captured cells inherited from the closure that invokes this
+    /// function. Together with [`Self::own_upvalue_count`] this fixes the exact
+    /// frame spine width before call entry.
+    #[serde(default)]
+    pub inherited_upvalue_count: u16,
     /// `true` when this compiled function body executes as strict
     /// ECMAScript code. The compiler sets this from the source type
     /// and directive prologue; runtime call setup reads it for

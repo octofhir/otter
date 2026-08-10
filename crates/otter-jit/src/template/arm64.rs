@@ -748,21 +748,29 @@ pub(super) fn compile(
                 argc,
                 packed_args,
                 super_construct,
+                byte_pc,
             } => {
+                let argument_registers = plan.call_argument_registers(argc, packed_args);
                 let (packed_args, packed_args_tail) = plan.resolve_packed_args(argc, packed_args);
                 calls::emit_construct(
                     &mut ops,
                     &mut relocations,
                     transitions,
+                    view,
+                    direct_call_events.as_mut(),
+                    code_map.as_mut(),
                     dst,
                     callee,
                     argc,
                     packed_args,
                     packed_args_tail,
+                    &argument_registers,
                     super_construct,
+                    instr.pc,
+                    byte_pc,
                     bail,
                     threw,
-                );
+                )?;
             }
             TemplateOp::MethodCall {
                 dst,

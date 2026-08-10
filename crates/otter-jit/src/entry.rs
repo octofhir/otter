@@ -278,6 +278,10 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_prepare_base_construct_stub as *const () as usize,
         ),
         binding(
+            abi::STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
+            jit_try_prepare_base_construct_stub as *const () as usize,
+        ),
+        binding(
             abi::STUB_JIT_BASE_CONSTRUCT_RESULT,
             jit_base_construct_result_stub as *const () as usize,
         ),

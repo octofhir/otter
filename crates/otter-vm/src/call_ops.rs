@@ -403,6 +403,62 @@ pub(crate) struct LeanCallbackState {
 }
 
 impl Interpreter {
+    /// Try the non-observable half of generated base-constructor receiver
+    /// preparation.
+    ///
+    /// A hit requires an already materialized own data `prototype` on an
+    /// ordinary function/closure, or the intrinsic prototype held by a class
+    /// constructor. Accessors, proxies, bound functions, missing lazy
+    /// prototypes, and every other uncertain shape miss before effects so the
+    /// caller can enter [`Self::jit_prepare_base_construct_receiver`].
+    pub fn jit_try_prepare_base_construct_receiver(
+        &mut self,
+        callee: Value,
+        new_target: Value,
+    ) -> Result<Option<Value>, VmError> {
+        self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Alloc);
+
+        let prototype = if let Some(function_id) = new_target.as_function().or_else(|| {
+            new_target
+                .as_closure(&self.gc_heap)
+                .map(|closure| closure.cached_function_id)
+        }) {
+            let owner = new_target.as_closure(&self.gc_heap);
+            let Some(bag) = self.callable_bag_read(owner, function_id) else {
+                return Ok(None);
+            };
+            match crate::object::lookup_own(bag, &self.gc_heap, "prototype") {
+                crate::object::PropertyLookup::Data { value, .. } => value,
+                crate::object::PropertyLookup::Accessor { .. }
+                | crate::object::PropertyLookup::Absent => return Ok(None),
+            }
+        } else if let Some(class) = new_target.as_class_constructor() {
+            Value::object(class.prototype(&self.gc_heap))
+        } else {
+            return Ok(None);
+        };
+
+        self.jit_runtime_stats.runtime_constructs =
+            self.jit_runtime_stats.runtime_constructs.saturating_add(1);
+        let roots = SyncJsCallRoots::construct(callee, new_target, SmallVec::new());
+        let _roots_guard = self
+            .gc_heap
+            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+        roots.scratch_0.set(if prototype.is_object_type() {
+            prototype
+        } else {
+            self.constructor_prototype_value("Object")?
+        });
+        let receiver = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
+        roots.receiver.set(Value::object(receiver));
+        crate::object::set_prototype_value(
+            receiver,
+            &mut self.gc_heap,
+            Some(roots.scratch_0.get()),
+        );
+        Ok(Some(roots.receiver.get()))
+    }
+
     /// Prepare the receiver for one compiler-generated base constructor.
     ///
     /// The dynamic callable has already passed the generated identity guard.

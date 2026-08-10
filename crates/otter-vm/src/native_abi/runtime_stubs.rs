@@ -1371,6 +1371,19 @@ pub const STUB_JIT_INITIALIZE_UPVALUES: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
 );
 
+/// Allocating, non-reentrant `OrdinaryCreateFromConstructor` fast path for a
+/// generated base constructor. An uncertain or observable `prototype` lookup
+/// reports a pre-effect miss through the status pair.
+pub const STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT: RuntimeStubDescriptor = descriptor(
+    95,
+    RuntimeStubClass::Alloc,
+    RuntimeStubSignature::Variadic,
+    2,
+    RuntimeStubEffects::allocating(true, true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusPair,
+);
+
 /// Leaf `Math.abs`.
 ///
 /// A numeric builtin reached through a declared entry rather than a
@@ -1531,6 +1544,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         92 => "jit_load_upvalue_value",
         93 => "jit_copy_spread_arguments",
         94 => "jit_initialize_upvalues",
+        95 => "jit_try_prepare_base_construct",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1631,6 +1645,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_LOAD_UPVALUE_VALUE,
     STUB_JIT_COPY_SPREAD_ARGUMENTS,
     STUB_JIT_INITIALIZE_UPVALUES,
+    STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

@@ -118,6 +118,7 @@ pub(super) fn emit_spread_call_op(
             },
             transitions.entry(abi::STUB_JIT_DEOPT_STACK_CALL),
             transitions.entry(abi::STUB_JIT_RESOLVE_DIRECT_ENTRY),
+            transitions.entry(abi::STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT),
             transitions.entry(abi::STUB_JIT_PREPARE_BASE_CONSTRUCT),
             transitions.entry(abi::STUB_JIT_BASE_CONSTRUCT_RESULT),
             transitions.entry(abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT),

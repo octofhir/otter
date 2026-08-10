@@ -3,8 +3,8 @@
 //! # Contents
 //! - Compiler-generated monomorphic plain calls and bounded polymorphic method
 //!   chains with a canonical generic-call continuation.
-//! - Fixed base construction through shared generated linkage with the current
-//!   runtime transition as the unplanned/`super()` fallback.
+//! - Fixed base construction through shared generated linkage, with exact
+//!   non-reentrant receiver preparation and observable fallback.
 //! - Guarded read-only numeric call/method splicing from VM-baked metadata.
 //! - Guarded collection-method leaves before generated method linkage.
 //!
@@ -1184,6 +1184,7 @@ pub(super) fn emit_construct(
             },
             table.entry(abi::STUB_JIT_DEOPT_STACK_CALL),
             table.entry(abi::STUB_JIT_RESOLVE_DIRECT_ENTRY),
+            table.entry(abi::STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT),
             table.entry(abi::STUB_JIT_PREPARE_BASE_CONSTRUCT),
             table.entry(abi::STUB_JIT_BASE_CONSTRUCT_RESULT),
             table.entry(abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT),

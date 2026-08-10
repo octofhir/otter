@@ -9,13 +9,15 @@
 //!
 //! # Invariants
 //! - Plain, method, and spread call entry/return execute entirely in generated code.
-//!   Base construction adds one typed receiver-preparation transition; body
+//!   Base construction first probes one allocating/non-reentrant receiver
+//!   path and enters the observable sibling only on a pre-effect miss; body
 //!   entry, frame linkage, return substitution, and cleanup remain generated.
 //! - Every failure before native entry is effect-free and branches to the
 //!   caller's canonical deopt exit while its original call PC is published.
-//!   Base constructs finish generation/stack validation before their
-//!   observable prototype lookup, so no post-effect rejection can replay
-//!   `New`.
+//!   Base constructs finish generation/stack validation before receiver
+//!   preparation. An own data prototype allocates without reentry; uncertain
+//!   shapes reach the observable lookup, and no post-effect rejection can
+//!   replay `New`.
 //! - Callee registers published by the copied frame header are initialized
 //!   tagged slots on the machine stack. Safepoint-free scalar generations may
 //!   publish only their parameter prefix; every cold exit expands it before
@@ -505,6 +507,7 @@ pub(crate) fn emit_direct_call(
         0,
         0,
         0,
+        0,
         initialize_upvalues_entry,
         code_map,
         bail,
@@ -545,6 +548,7 @@ pub(crate) fn emit_direct_call_with_access<Load, Store, Restore, RootReceiver, R
     site: DirectCallSite<'_>,
     deopt_entry: u64,
     resolve_direct_entry: u64,
+    try_prepare_construct_entry: u64,
     prepare_construct_entry: u64,
     construct_result_entry: u64,
     derived_construct_result_entry: u64,
@@ -583,6 +587,7 @@ where
     let cleanup_threw = ops.new_dynamic_label();
     let caller_bail = ops.new_dynamic_label();
     let construct_prepare_threw = ops.new_dynamic_label();
+    let construct_prepare_ready = ops.new_dynamic_label();
 
     let guard_start = ops.offset().0;
     // The effective activation limit combines physical publication capacity
@@ -965,6 +970,48 @@ where
             ; mov x0, X(context_register)
             ; mov x1, x9
         );
+        let fast_start = ops.offset().0;
+        emit_runtime_stub(
+            ops,
+            relocations,
+            16,
+            try_prepare_construct_entry,
+            abi::STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; cmp x1, STATUS_RETURNED as u32
+            ; b.eq =>construct_prepare_ready
+            ; cmp x1, STATUS_BAILED as u32
+            ; b.ne =>construct_prepare_threw
+        );
+        record_region(
+            &mut code_map,
+            "directConstructPrepareFast",
+            fast_start,
+            ops.offset().0,
+            site,
+            direct_call,
+        );
+        // The fast probe misses before effects. Rebuild its caller-clobbered
+        // operands and enter the exact observable prototype path once.
+        load(ops, callable, 9, layout.frame_bytes)?;
+        if site.form.inherits_new_target() {
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x13, [X(context_register), NATIVE_FRAME_OFFSET]
+                ; ldr x2, [x13, NATIVE_FRAME_NEW_TARGET_OFFSET]
+            );
+        } else {
+            dynasm!(ops ; .arch aarch64 ; mov x2, x9);
+        }
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov x0, X(context_register)
+            ; mov x1, x9
+        );
+        let observable_start = ops.offset().0;
         emit_runtime_stub(
             ops,
             relocations,
@@ -977,6 +1024,15 @@ where
             ; blr x16
             ; cmp x1, STATUS_RETURNED as u32
             ; b.ne =>construct_prepare_threw
+            ; =>construct_prepare_ready
+        );
+        record_region(
+            &mut code_map,
+            "directConstructPrepareObservable",
+            observable_start,
+            ops.offset().0,
+            site,
+            direct_call,
         );
         // The bytecode destination may recycle the callable register (the
         // canonical `NewSpread r2 r2 r3` shape). Preserve the returned

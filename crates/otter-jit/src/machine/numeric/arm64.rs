@@ -13,9 +13,11 @@
 //!   allocation; cold deopt dumps use the target's complete register-id map.
 //! - Spill storage and offsets come only from [`MachineFrameLayout`].
 //! - Allocating calls copy late-use tagged roots into the layout's native save
-//!   area before constructing the VM allocation packet. Reentrant direct calls
-//!   link those same homes through the VM-owned root chain. Both reload every
-//!   collector-rewritten value before success, throw, or exact deoptimization.
+//!   area before constructing the VM allocation packet. Direct base constructs
+//!   probe non-reentrant receiver allocation before an observable fallback;
+//!   reentrant direct calls link the same homes through the VM-owned root chain.
+//!   Both reload every collector-rewritten value before success, throw, or
+//!   exact deoptimization.
 //! - A failed Number guard writes logical PC zero and returns `BAILED` before
 //!   any externally visible effect.
 //! - Checked integer overflow uses the allocator-driven VM [`DeoptRuntime`];
@@ -241,6 +243,7 @@ pub(super) fn emit(
     deopt_writeback_entry: u64,
     deopt_stack_call_entry: u64,
     resolve_direct_entry: u64,
+    try_prepare_construct_entry: u64,
     prepare_construct_entry: u64,
     construct_result_entry: u64,
     derived_construct_result_entry: u64,
@@ -843,6 +846,7 @@ pub(super) fn emit(
                         },
                         deopt_stack_call_entry,
                         resolve_direct_entry,
+                        try_prepare_construct_entry,
                         prepare_construct_entry,
                         construct_result_entry,
                         derived_construct_result_entry,

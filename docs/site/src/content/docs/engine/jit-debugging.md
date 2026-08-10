@@ -87,9 +87,12 @@ the same sealed generation without recursively compiling an unbounded call
 graph.
 
 Base-construct artifacts add `directConstructPrepare` between the shared guard
-and frame publication. Generation and stack-entry validation happen first;
-the region then performs the observable `new.target.prototype` lookup, roots
-the receiver in the Machine safepoint area, and initializes the same
+and frame publication. Its nested `directConstructPrepareFast` region probes an
+already materialized own data `new.target.prototype` and allocates through an
+allocating/non-reentrant stub. `directConstructPrepareObservable` is the cold
+pre-effect-miss sibling for accessors, proxies, bound functions, and lazy or
+otherwise uncertain prototypes; it owns the exact observable lookup. Both
+paths root the receiver in the Machine safepoint area and initialize the same
 stack-owned `NativeFrame` used by plain and method calls. Derived construction
 publishes a hole `this`, while `superConstruct` inherits the caller's live
 `new.target`; `BindThisValue` commits the returned superclass receiver in both

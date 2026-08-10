@@ -437,8 +437,12 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     call-family operations expose `directCallGuard`, `directCallFrameSetup`,
     `directCallNativeEntry`, `directCallReturn`, `directCallCleanup`, and
     `directCallEntryReject`; methods additionally expose `directMethodGuard`,
-    while constructors expose `directConstructPrepare`. `functionId` is the
-    caller. Typed `directCall` metadata names call kind, target function,
+    while constructors expose `directConstructPrepare` with nested
+    `directConstructPrepareFast` and `directConstructPrepareObservable`
+    regions. The fast region accepts an exact own data prototype and allocates
+    without reentry; the observable region is its pre-effect miss fallback.
+    `functionId` is the caller. Typed `directCall` metadata names call kind,
+    target function,
     planning-time `targetCodeObjectId`, tier, `thisMode`, `argumentMode`,
     captured callee-native-frame bytes, caller linkage bytes, captured total
     reservation, register count, `ownUpvalueCount`, and

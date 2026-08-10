@@ -10,6 +10,7 @@
 //! - [`sql`] - permission-gated SQLite access.
 //! - [`ffi`] - permission-gated native library loading metadata.
 //! - [`serve`] - Otter-specific HTTP server entry points.
+//! - [`xml`] - `Otter.XML` document parsing.
 //! - [`HOSTED_MODULES`] - static hosted-module specs.
 //!
 //! # Invariants
@@ -25,6 +26,7 @@ pub mod ffi;
 pub mod kv;
 pub mod serve;
 pub mod sql;
+pub mod xml;
 
 use otter_runtime::{
     HostedModule, OtterBuilder, RuntimeBuilder, RuntimeNativeCtx as NativeCtx,
@@ -58,6 +60,7 @@ impl OtterModulesBuilderExt for RuntimeBuilder {
     fn with_otter_modules(self) -> Self {
         self.hosted_modules(HOSTED_MODULES.iter().copied())
             .extension_installer(serve::otter_global_installer())
+            .extension_installer(xml::otter_xml_global_installer())
             .dynamic_native_factory(
                 "__otterServe",
                 std::sync::Arc::new(|ctx| {
@@ -77,6 +80,7 @@ impl OtterModulesBuilderExt for OtterBuilder {
     fn with_otter_modules(self) -> Self {
         self.hosted_modules(HOSTED_MODULES.iter().copied())
             .extension_installer(serve::otter_global_installer())
+            .extension_installer(xml::otter_xml_global_installer())
             .dynamic_native_factory(
                 "__otterServe",
                 std::sync::Arc::new(|ctx| {

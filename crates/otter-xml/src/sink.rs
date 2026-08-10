@@ -41,13 +41,28 @@ pub enum Piece<'a, U: Unit> {
     Widened(&'a [u16]),
 }
 
-impl<U: Unit> Piece<'_, U> {
+impl<'a, U: Unit> Piece<'a, U> {
     /// Whether the run has no units.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         match self {
             Self::Source { units, .. } | Self::Rewritten(units) => units.is_empty(),
             Self::Widened(units) => units.is_empty(),
+        }
+    }
+
+    /// The run as text, without copying, when the encoding spells it the way
+    /// Rust spells `str` — the common case for a run of an ASCII document.
+    ///
+    /// `None` means the run must be walked scalar by scalar; see [`Self::chars`].
+    #[must_use]
+    pub fn as_str<E>(&self) -> Option<&'a str>
+    where
+        E: crate::encoding::Encoding<Unit = U>,
+    {
+        match *self {
+            Self::Source { units, .. } | Self::Rewritten(units) => E::as_str(units),
+            Self::Widened(_) => None,
         }
     }
 

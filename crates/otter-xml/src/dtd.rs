@@ -31,7 +31,7 @@
 
 use std::collections::HashMap;
 
-use crate::chars::is_whitespace;
+use crate::chars::{is_name_char, is_pubid_char, is_whitespace};
 use crate::encoding::{Encoding, Unit, push_utf16};
 use crate::error::{Error, ErrorKind, Result};
 use crate::scan::Scanner;
@@ -41,6 +41,9 @@ pub(crate) const MAX_ENTITY_DEPTH: usize = 40;
 
 /// How many code units all of one document's expansions may produce together.
 pub(crate) const EXPANSION_BUDGET: usize = 8 << 20;
+
+/// How deeply the groups of one content model may nest.
+const MAX_CONTENT_MODEL_DEPTH: usize = 256;
 
 /// A general entity, as its declaration described it.
 pub(crate) enum Entity {
@@ -516,15 +519,47 @@ impl<E: Encoding> Scanner<'_, E> {
 
     /// `SYSTEM S SystemLiteral | PUBLIC S PubidLiteral S SystemLiteral`
     fn scan_external_id(&mut self) -> Result<()> {
-        let public = self.at(self.pos, b'P');
+        let public = self.starts_with(self.pos, b"PUBLIC");
+        if !public && !self.starts_with(self.pos, b"SYSTEM") {
+            return self.err(ErrorKind::BadDoctype("expected SYSTEM or PUBLIC"));
+        }
         self.pos += 6;
         self.require_whitespace()?;
         if public {
-            self.scan_quoted_literal()?;
+            self.scan_pubid_literal()?;
             self.require_whitespace()?;
         }
         self.scan_quoted_literal()?;
         Ok(())
+    }
+
+    /// A public identifier, whose characters the grammar restricts to a set
+    /// narrower than the rest of a document's.
+    fn scan_pubid_literal(&mut self) -> Result<()> {
+        let quote = match self.unit(self.pos) {
+            Some(unit) if unit.is(b'"') => b'"',
+            Some(unit) if unit.is(b'\'') => b'\'',
+            _ => return self.err(ErrorKind::Expected("a quoted public identifier")),
+        };
+        self.pos += 1;
+        loop {
+            let Some(unit) = self.unit(self.pos) else {
+                return self.err(ErrorKind::UnexpectedEof);
+            };
+            if unit.is(quote) {
+                self.pos += 1;
+                return Ok(());
+            }
+            let value = unit.value();
+            // An apostrophe is a public identifier character, but not inside
+            // an apostrophe-quoted one, where it would end the literal.
+            if !is_pubid_char(value) || (quote == b'\'' && value == 0x27) {
+                return self.err(ErrorKind::BadDoctype(
+                    "a public identifier holds a character the grammar excludes",
+                ));
+            }
+            self.pos += 1;
+        }
     }
 
     /// A quoted literal of a declaration, whose text this parser does not use.
@@ -567,13 +602,14 @@ impl<E: Encoding> Scanner<'_, E> {
                 self.scan_entity_declaration(ctx)?;
             } else if self.starts_with(self.pos, b"<!ATTLIST") {
                 self.scan_attlist_declaration(ctx)?;
-            } else if self.starts_with(self.pos, b"<!ELEMENT")
-                || self.starts_with(self.pos, b"<!NOTATION")
-            {
-                // Element and notation declarations constrain validity only,
-                // and this processor does not validate; they are read for
-                // their extent and then dropped.
-                self.skip_declaration()?;
+            } else if self.starts_with(self.pos, b"<!ELEMENT") {
+                // What an element declaration says constrains validity only,
+                // and this processor does not validate; how it is written is
+                // still a matter of well-formedness, so it is parsed in full
+                // and then dropped.
+                self.scan_element_declaration()?;
+            } else if self.starts_with(self.pos, b"<!NOTATION") {
+                self.scan_notation_declaration()?;
             } else if self.at(self.pos, b'%') {
                 self.scan_parameter_reference(ctx)?;
             } else {
@@ -598,6 +634,11 @@ impl<E: Encoding> Scanner<'_, E> {
             return Err(Error::new(ErrorKind::UnknownEntity(name), at));
         };
         ctx.charge(text.len(), at)?;
+        // Reading a parameter entity at all is enough to stop an undeclared
+        // general entity from being a well-formedness error: the declaration
+        // could have come from a subset this parser does not read, and no
+        // processor is required to tell the difference.
+        ctx.dtd.unread_declarations = true;
         ctx.enter(&name, at)?;
         let result = Scanner::<crate::encoding::Utf16>::over(&text)
             .and_then(|mut nested| nested.scan_subset(ctx, false));
@@ -643,6 +684,11 @@ impl<E: Encoding> Scanner<'_, E> {
                 unparsed = true;
             }
             if parameter {
+                if unparsed {
+                    return self.err(ErrorKind::BadDoctype(
+                        "a parameter entity may not name unparsed data",
+                    ));
+                }
                 // Declarations this parser will never see, which is what
                 // makes an undeclared reference something to leave alone
                 // rather than to reject.
@@ -754,20 +800,20 @@ impl<E: Encoding> Scanner<'_, E> {
     }
 
     /// `CDATA | ID | IDREF | IDREFS | ENTITY | ENTITIES | NMTOKEN | NMTOKENS |
-    /// NOTATION S '(' … ')' | '(' … ')'`
+    /// NOTATION S '(' Name ('|' Name)* ')' | '(' Nmtoken ('|' Nmtoken)* ')'`
     fn scan_attribute_type(&mut self) -> Result<AttKind> {
         if self.starts_with(self.pos, b"CDATA") {
             self.pos += 5;
             return Ok(AttKind::Cdata);
         }
         if self.at(self.pos, b'(') {
-            self.scan_parenthesized()?;
+            self.scan_alternatives(false)?;
             return Ok(AttKind::Tokenized);
         }
         if self.starts_with(self.pos, b"NOTATION") {
             self.pos += 8;
             self.require_whitespace()?;
-            self.scan_parenthesized()?;
+            self.scan_alternatives(true)?;
             return Ok(AttKind::Tokenized);
         }
         for name in [
@@ -787,18 +833,179 @@ impl<E: Encoding> Scanner<'_, E> {
         self.err(ErrorKind::BadDoctype("expected an attribute type"))
     }
 
-    /// The parenthesized list of an enumeration or a notation type.
-    fn scan_parenthesized(&mut self) -> Result<()> {
+    /// The parenthesized alternatives of an enumeration, whose members are
+    /// name tokens, or of a notation type, whose members are names.
+    fn scan_alternatives(&mut self, names: bool) -> Result<()> {
         self.expect(b"(", "`(`")?;
         loop {
-            let Some(unit) = self.unit(self.pos) else {
-                return self.err(ErrorKind::UnexpectedEof);
-            };
-            self.pos += 1;
-            if unit.is(b')') {
-                return Ok(());
+            self.skip_whitespace();
+            if names {
+                self.scan_name()?;
+            } else {
+                self.scan_nmtoken()?;
             }
+            self.skip_whitespace();
+            if self.at(self.pos, b'|') {
+                self.pos += 1;
+                continue;
+            }
+            return self.expect(b")", "`)` to end the list of allowed values");
         }
+    }
+
+    /// A `Nmtoken`: name characters, without the restriction on the first.
+    fn scan_nmtoken(&mut self) -> Result<()> {
+        let start = self.pos;
+        while self.pos < self.len() {
+            let (code, width) = self.scalar(self.pos)?;
+            if !is_name_char(code) {
+                break;
+            }
+            self.pos += width;
+        }
+        if self.pos == start {
+            return self.err(ErrorKind::ExpectedName);
+        }
+        Ok(())
+    }
+
+    /// `<!ELEMENT` S Name S contentspec S? `>`
+    fn scan_element_declaration(&mut self) -> Result<()> {
+        self.pos += 9;
+        self.require_whitespace()?;
+        self.scan_name()?;
+        self.require_whitespace()?;
+        self.scan_content_spec()?;
+        self.skip_whitespace();
+        self.expect(b">", "`>` to end an element declaration")
+    }
+
+    /// `EMPTY | ANY | Mixed | children`
+    fn scan_content_spec(&mut self) -> Result<()> {
+        if self.starts_with(self.pos, b"EMPTY") {
+            self.pos += 5;
+            return Ok(());
+        }
+        if self.starts_with(self.pos, b"ANY") {
+            self.pos += 3;
+            return Ok(());
+        }
+        if !self.at(self.pos, b'(') {
+            return self.err(ErrorKind::BadDoctype("expected a content model"));
+        }
+        let mut probe = self.pos + 1;
+        while self
+            .unit(probe)
+            .is_some_and(|unit| is_whitespace(unit.value()))
+        {
+            probe += 1;
+        }
+        if self.starts_with(probe, b"#PCDATA") {
+            return self.scan_mixed();
+        }
+        self.scan_particle_group(0)?;
+        self.scan_occurrence();
+        Ok(())
+    }
+
+    /// `'(' S? '#PCDATA' (S? '|' S? Name)* S? ')*' | '(' S? '#PCDATA' S? ')'`
+    fn scan_mixed(&mut self) -> Result<()> {
+        self.expect(b"(", "`(`")?;
+        self.skip_whitespace();
+        self.expect(b"#PCDATA", "`#PCDATA`")?;
+        let mut named = false;
+        loop {
+            self.skip_whitespace();
+            if !self.at(self.pos, b'|') {
+                break;
+            }
+            self.pos += 1;
+            self.skip_whitespace();
+            self.scan_name()?;
+            named = true;
+        }
+        self.expect(b")", "`)` to end a mixed content model")?;
+        if named {
+            // Naming element types alongside `#PCDATA` makes the repetition
+            // obligatory, not optional.
+            return self.expect(b"*", "`*` after a mixed content model");
+        }
+        if self.at(self.pos, b'*') {
+            self.pos += 1;
+        }
+        Ok(())
+    }
+
+    /// `choice | seq`: alternatives or a sequence, never both in one group.
+    fn scan_particle_group(&mut self, depth: usize) -> Result<()> {
+        if depth >= MAX_CONTENT_MODEL_DEPTH {
+            return self.err(ErrorKind::DepthLimit);
+        }
+        self.expect(b"(", "`(`")?;
+        self.skip_whitespace();
+        self.scan_particle(depth)?;
+        let mut separator: Option<u8> = None;
+        loop {
+            self.skip_whitespace();
+            let next = match self.unit(self.pos) {
+                Some(unit) if unit.is(b'|') => b'|',
+                Some(unit) if unit.is(b',') => b',',
+                _ => break,
+            };
+            if *separator.get_or_insert(next) != next {
+                return self.err(ErrorKind::BadDoctype(
+                    "a content model mixes `,` and `|` in one group",
+                ));
+            }
+            self.pos += 1;
+            self.skip_whitespace();
+            self.scan_particle(depth)?;
+        }
+        self.expect(b")", "`)` to end a content model")
+    }
+
+    /// `(Name | choice | seq) ('?' | '*' | '+')?`
+    fn scan_particle(&mut self, depth: usize) -> Result<()> {
+        if self.at(self.pos, b'(') {
+            self.scan_particle_group(depth + 1)?;
+        } else {
+            self.scan_name()?;
+        }
+        self.scan_occurrence();
+        Ok(())
+    }
+
+    /// The optional repetition mark that follows a particle.
+    fn scan_occurrence(&mut self) {
+        if self.at(self.pos, b'?') || self.at(self.pos, b'*') || self.at(self.pos, b'+') {
+            self.pos += 1;
+        }
+    }
+
+    /// `<!NOTATION` S Name S (ExternalID | PublicID) S? `>`
+    fn scan_notation_declaration(&mut self) -> Result<()> {
+        self.pos += 10;
+        self.require_whitespace()?;
+        self.scan_name()?;
+        self.require_whitespace()?;
+        if self.starts_with(self.pos, b"PUBLIC") {
+            self.pos += 6;
+            self.require_whitespace()?;
+            self.scan_pubid_literal()?;
+            // A notation may name a public identifier alone, where an
+            // external identifier would go on to a system one.
+            if self.skip_whitespace() && (self.at(self.pos, b'"') || self.at(self.pos, b'\'')) {
+                self.scan_quoted_literal()?;
+            }
+        } else if self.starts_with(self.pos, b"SYSTEM") {
+            self.pos += 6;
+            self.require_whitespace()?;
+            self.scan_quoted_literal()?;
+        } else {
+            return self.err(ErrorKind::BadDoctype("expected SYSTEM or PUBLIC"));
+        }
+        self.skip_whitespace();
+        self.expect(b">", "`>` to end a notation declaration")
     }
 
     /// `#REQUIRED | #IMPLIED | (#FIXED S)? AttValue`
@@ -874,29 +1081,6 @@ impl<E: Encoding> Scanner<'_, E> {
                     push_utf16(code, &mut out);
                     self.pos += width;
                 }
-            }
-        }
-    }
-
-    /// Step over a declaration whose content this processor does not act on,
-    /// keeping track of quoting so a `>` inside a literal does not end it.
-    fn skip_declaration(&mut self) -> Result<()> {
-        let mut quote: Option<u8> = None;
-        loop {
-            let Some(unit) = self.unit(self.pos) else {
-                return self.err(ErrorKind::UnexpectedEof);
-            };
-            self.pos += 1;
-            let value = unit.value();
-            match quote {
-                Some(open) if value == u32::from(open) => quote = None,
-                Some(_) => {}
-                None => match value {
-                    0x22 => quote = Some(b'"'),
-                    0x27 => quote = Some(b'\''),
-                    0x3E => return Ok(()),
-                    _ => {}
-                },
             }
         }
     }

@@ -254,3 +254,77 @@ fn a_malformed_subset_is_reported_rather_than_skipped() {
         "a"
     );
 }
+
+#[test]
+fn a_content_model_is_parsed_rather_than_stepped_over() {
+    assert_eq!(root("<!DOCTYPE a [<!ELEMENT a EMPTY>]><a/>").name, "a");
+    assert_eq!(root("<!DOCTYPE a [<!ELEMENT a ANY>]><a/>").name, "a");
+    assert_eq!(root("<!DOCTYPE a [<!ELEMENT a (#PCDATA)>]><a/>").name, "a");
+    assert_eq!(
+        root("<!DOCTYPE a [<!ELEMENT a (#PCDATA|b|c)*>]><a/>").name,
+        "a"
+    );
+    assert_eq!(
+        root("<!DOCTYPE a [<!ELEMENT a ((b|c)+, d?, (e, f)*)>]><a/>").name,
+        "a"
+    );
+
+    // A content model is not free text: the ways it can be written wrong are
+    // ways the document is not well-formed.
+    assert!(matches!(
+        kind("<!DOCTYPE a [<!ELEMENT a CDATA>]><a/>"),
+        ErrorKind::BadDoctype(_)
+    ));
+    assert!(matches!(
+        kind("<!DOCTYPE a [<!ELEMENT a (b, c | d)>]><a/>"),
+        ErrorKind::BadDoctype(_)
+    ));
+    assert!(matches!(
+        kind("<!DOCTYPE a [<!ELEMENT a (b c)>]><a/>"),
+        ErrorKind::Expected(_)
+    ));
+    assert!(matches!(
+        kind("<!DOCTYPE a [<!ELEMENT (a|b) EMPTY>]><a/>"),
+        ErrorKind::ExpectedName
+    ));
+    // Naming element types beside `#PCDATA` makes the repetition obligatory.
+    assert!(matches!(
+        kind("<!DOCTYPE a [<!ELEMENT a (#PCDATA|b)>]><a/>"),
+        ErrorKind::Expected(_)
+    ));
+
+    // An attribute's allowed values are alternatives, not a sequence.
+    assert!(matches!(
+        kind("<!DOCTYPE a [<!ATTLIST a k (one,two) #IMPLIED>]><a/>"),
+        ErrorKind::Expected(_)
+    ));
+}
+
+#[test]
+fn a_public_identifier_keeps_to_its_own_alphabet() {
+    assert_eq!(
+        root(r#"<!DOCTYPE a PUBLIC "-//Example//DTD a//EN" "a.dtd"><a/>"#).name,
+        "a"
+    );
+    assert!(matches!(
+        kind(r#"<!DOCTYPE a PUBLIC "a<b" "a.dtd"><a/>"#),
+        ErrorKind::BadDoctype(_)
+    ));
+    assert!(matches!(
+        kind("<!DOCTYPE a [<!NOTATION n PUBLIC \"a\tb\">]><a/>"),
+        ErrorKind::BadDoctype(_)
+    ));
+    // A notation may name a public identifier with no system one after it.
+    assert_eq!(
+        root(r#"<!DOCTYPE a [<!NOTATION n PUBLIC "-//X//NOTATION y//EN">]><a/>"#).name,
+        "a"
+    );
+}
+
+#[test]
+fn a_parameter_entity_may_not_name_unparsed_data() {
+    assert!(matches!(
+        kind(r#"<!DOCTYPE a [<!ENTITY % p SYSTEM "p.xml" NDATA n>]><a/>"#),
+        ErrorKind::BadDoctype(_)
+    ));
+}

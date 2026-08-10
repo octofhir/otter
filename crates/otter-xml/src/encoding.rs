@@ -293,9 +293,9 @@ pub struct Sniffed {
 pub fn sniff(bytes: &[u8]) -> Result<Sniffed> {
     let mark = |charset, bom_len| Ok(Sniffed { charset, bom_len });
     match bytes {
-        [0xFE, 0xFF, ..] => return mark(Charset::Utf16Be, 2),
-        [0xFF, 0xFE, ..] => return mark(Charset::Utf16Le, 2),
-        [0xEF, 0xBB, 0xBF, ..] => return mark(Charset::Utf8, 3),
+        [0xFE, 0xFF, rest @ ..] => return marked_utf16(rest, Charset::Utf16Be),
+        [0xFF, 0xFE, rest @ ..] => return marked_utf16(rest, Charset::Utf16Le),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => return marked_utf8(rest),
         // A declaration in UTF-16 with no mark still spells `<?` in its units.
         [0x00, 0x3C, 0x00, 0x3F, ..] => return mark(Charset::Utf16Be, 0),
         [0x3C, 0x00, 0x3F, 0x00, ..] => return mark(Charset::Utf16Le, 0),
@@ -317,6 +317,57 @@ pub fn sniff(bytes: &[u8]) -> Result<Sniffed> {
         _ => return Err(Error::new(ErrorKind::UnsupportedEncoding(name), 0)),
     };
     mark(charset, 0)
+}
+
+/// Input that opened with a UTF-8 byte-order mark. The mark settles the
+/// encoding, so a declaration that names another one contradicts what the
+/// bytes already said, and the specification makes that fatal.
+fn marked_utf8(rest: &[u8]) -> Result<Sniffed> {
+    if declared_encoding(rest).is_some_and(|name| {
+        !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "utf-8" | "utf8" | "us-ascii" | "ascii"
+        )
+    }) {
+        return Err(Error::new(
+            ErrorKind::BadDeclaration("a UTF-8 byte-order mark contradicts the declaration"),
+            0,
+        ));
+    }
+    Ok(Sniffed {
+        charset: Charset::Utf8,
+        bom_len: 3,
+    })
+}
+
+/// Input that opened with a UTF-16 byte-order mark, whose declaration — if it
+/// has one — is spelled in UTF-16 units and must name UTF-16 in turn.
+fn marked_utf16(rest: &[u8], charset: Charset) -> Result<Sniffed> {
+    let big_endian = charset == Charset::Utf16Be;
+    let mut ascii = Vec::new();
+    for pair in rest.chunks_exact(2).take(256) {
+        let (high, low) = if big_endian {
+            (pair[0], pair[1])
+        } else {
+            (pair[1], pair[0])
+        };
+        if high != 0 {
+            break;
+        }
+        ascii.push(low);
+    }
+    if declared_encoding(&ascii).is_some_and(|name| {
+        !name.to_ascii_lowercase().starts_with("utf-16") && !name.eq_ignore_ascii_case("utf16")
+    }) {
+        return Err(Error::new(
+            ErrorKind::BadDeclaration("a UTF-16 byte-order mark contradicts the declaration"),
+            0,
+        ));
+    }
+    Ok(Sniffed {
+        charset,
+        bom_len: 2,
+    })
 }
 
 /// Read the `encoding` pseudo-attribute out of a leading `<?xml … ?>`, if the

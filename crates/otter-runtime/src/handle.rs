@@ -476,8 +476,8 @@ fn discover_remote_requests(
         for request in crate::module_graph::scan_module_requests(source.text, source.kind)? {
             let target = loader.resolve(&request.specifier, Some(&source.url))?;
             if crate::module_loader::is_http_url(&target) {
-                remote.push((target, request.text));
-            } else if !request.text && !loader.is_hosted_url(&target) {
+                remote.push((target, request.data));
+            } else if !request.data && !loader.is_hosted_url(&target) {
                 queue.push(loader.load_resolved(target)?);
             }
         }

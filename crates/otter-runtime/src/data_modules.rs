@@ -58,6 +58,24 @@ pub enum DataFormat {
 }
 
 impl DataFormat {
+    /// Recognize a data format from a `with { type: "…" }` attribute.
+    ///
+    /// The attribute names the format outright, so it decides regardless of
+    /// what the file is called — that is the point of writing it.
+    #[must_use]
+    pub fn from_attribute(name: &str) -> Option<Self> {
+        Some(match name {
+            "json" => Self::Json,
+            "jsonc" => Self::Jsonc,
+            "json5" => Self::Json5,
+            "yaml" => Self::Yaml,
+            "toml" => Self::Toml,
+            "xml" => Self::Xml,
+            "text" => Self::Text,
+            _ => return None,
+        })
+    }
+
     /// Recognize a data format from a file extension.
     #[must_use]
     pub fn from_extension(extension: &str) -> Option<Self> {
@@ -336,6 +354,10 @@ mod tests {
         assert_eq!(DataFormat::from_extension("json5"), Some(DataFormat::Json5));
         assert_eq!(DataFormat::from_extension("txt"), Some(DataFormat::Text));
         assert_eq!(DataFormat::from_extension("xml"), Some(DataFormat::Xml));
+        assert_eq!(DataFormat::from_attribute("xml"), Some(DataFormat::Xml));
+        assert_eq!(DataFormat::from_attribute("text"), Some(DataFormat::Text));
+        assert_eq!(DataFormat::from_attribute("yml"), None);
+        assert_eq!(DataFormat::from_attribute("javascript"), None);
         assert_eq!(DataFormat::from_extension("ts"), None);
     }
 

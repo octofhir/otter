@@ -331,6 +331,23 @@ impl Interpreter {
         std::ptr::addr_of!(self.gc_heap).cast::<std::ffi::c_void>()
     }
 
+    /// Current safepoint-free nursery window for generated ordinary objects.
+    pub fn jit_receiver_allocation_window(&mut self) -> otter_gc::MachineAllocationWindow {
+        self.gc_heap
+            .machine_allocation_window::<crate::object::ObjectBody>()
+    }
+
+    /// Stable address of the aggregate JIT counter record for generated code.
+    pub fn jit_runtime_stats_mut_ptr(&mut self) -> *mut crate::JitRuntimeStats {
+        std::ptr::addr_of_mut!(self.jit_runtime_stats)
+    }
+
+    /// Collector cycle counts used to classify a rooted receiver fallback.
+    pub fn jit_gc_cycle_counts(&mut self) -> (u64, u64) {
+        let stats = self.gc_heap.gc_stats();
+        (stats.minor_gc_cycles, stats.gc_cycles)
+    }
+
     /// Address of the collector's incremental-marking flag byte, read by the
     /// inline write barrier compiled code emits for a pointer store.
     #[must_use]

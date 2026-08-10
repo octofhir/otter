@@ -1454,7 +1454,20 @@ impl Interpreter {
                 self.ensure_direct_callee_plan(context, callee, eager_direct_target_depth)
             {
                 debug_assert_eq!(plan.function_id, callee_fid);
-                let callee = jit::JitDirectCallee { plan };
+                let receiver_allocation = if is_construct && !callee.is_derived_constructor {
+                    let new_target_function_id = match op {
+                        Op::New | Op::NewSpread => callee_fid,
+                        Op::SuperConstruct | Op::SuperConstructSpread => fid,
+                        _ => callee_fid,
+                    };
+                    self.bake_receiver_allocation_plan(callee_fid, new_target_function_id)
+                } else {
+                    None
+                };
+                let callee = jit::JitDirectCallee {
+                    plan,
+                    receiver_allocation,
+                };
                 if is_construct {
                     view.direct_constructs.insert(call_byte_pc, callee);
                 } else {
@@ -1749,7 +1762,61 @@ impl Interpreter {
             target_index,
             target_count,
             guard,
-            callee: jit::JitDirectCallee { plan },
+            callee: jit::JitDirectCallee {
+                plan,
+                receiver_allocation: None,
+            },
+        })
+    }
+
+    /// Bake the already-observed class allocation program for one construct
+    /// edge. Handles are resolved only at compile time; the generated program
+    /// guards the live class prototype chain before carving a receiver.
+    fn bake_receiver_allocation_plan(
+        &self,
+        base_function_id: u32,
+        new_target_function_id: u32,
+    ) -> Option<jit::JitReceiverAllocationPlan> {
+        let key = (base_function_id, new_target_function_id);
+        let Some(&capacity) = self.constructor_field_capacity_cache.get(&key) else {
+            return Some(jit::JitReceiverAllocationPlan {
+                new_target_function_id,
+                receiver_shape: self.shape_root().offset(),
+                initial_field_count: 0,
+                reserved_capacity: 0,
+                prototype_shape_count: 0,
+                prototype_shapes: [0; jit::JIT_RECEIVER_PROTOTYPE_GUARD_CAP],
+            });
+        };
+        if capacity > crate::object::INLINE_SLOT_CAP {
+            return None;
+        }
+        let prototype_ids = self.constructor_prototype_shape_cache.get(&key)?;
+        if prototype_ids.is_empty() || prototype_ids.len() > jit::JIT_RECEIVER_PROTOTYPE_GUARD_CAP {
+            return None;
+        }
+        let mut prototype_shapes = [0; jit::JIT_RECEIVER_PROTOTYPE_GUARD_CAP];
+        for (destination, shape_id) in prototype_shapes.iter_mut().zip(prototype_ids) {
+            *destination = self.shape_runtime.handle_for_id(*shape_id)?.offset();
+        }
+        let (receiver_shape, initial_field_count) = match (
+            self.simple_constructor_init_cache
+                .get(&base_function_id)
+                .and_then(Option::as_ref),
+            self.simple_constructor_shape_cache.get(&base_function_id),
+        ) {
+            (Some(init), Some(shape)) if init.fields.len() <= capacity => {
+                (shape.offset(), u8::try_from(init.fields.len()).ok()?)
+            }
+            _ => (self.shape_root().offset(), 0),
+        };
+        Some(jit::JitReceiverAllocationPlan {
+            new_target_function_id,
+            receiver_shape,
+            initial_field_count,
+            reserved_capacity: u8::try_from(capacity).ok()?,
+            prototype_shape_count: u8::try_from(prototype_ids.len()).ok()?,
+            prototype_shapes,
         })
     }
 

@@ -21,6 +21,8 @@
 //!   already-validated native entry.
 //! - [`JitCodeGenerationSnapshot`] — explicit cold introspection over live
 //!   generations and retained entry-cell tombstones.
+//! - Collector-owned receiver-allocation windows and immutable constructor
+//!   allocation plans used by generated fixed, spread, and superclass linkage.
 //!
 //! # Invariants
 //! - DTOs are owned and borrow-free. JIT compilation must not hold references
@@ -36,6 +38,9 @@
 //!   logical resume PC.
 //! - A cached direct-call plan is reusable only at the registry invalidation
 //!   epoch at which it was selected. Dynamic callable state is never cached.
+//! - Generated receiver allocation may mutate only the published nursery
+//!   window and its accounting words; every miss returns to the rooted VM
+//!   allocator before any constructor effect begins.
 //!
 //! # See also
 //! - [`crate::execution_context`] for snapshot creation from frozen bytecode.
@@ -46,6 +51,25 @@ use std::sync::Arc;
 
 use otter_bytecode::{Op, Operand};
 use serde::Serialize;
+
+/// Opaque collector-owned nursery window carried by the compiled-entry ABI.
+pub type JitMachineAllocationWindow = otter_gc::MachineAllocationWindow;
+/// Machine allocation page-layout constants, derived on the VM side so the
+/// backend does not depend directly on the collector crate.
+pub const JIT_PAGE_SPACE_OFFSET: u32 =
+    std::mem::offset_of!(otter_gc::page::PageHeader, space) as u32;
+/// Byte offset of the nursery page's committed bump cursor.
+pub const JIT_PAGE_BUMP_CURSOR_OFFSET: u32 =
+    std::mem::offset_of!(otter_gc::page::PageHeader, bump_cursor) as u32;
+/// Byte offset of the nursery page's allocated-byte accounting word.
+pub const JIT_PAGE_ALLOCATED_BYTES_OFFSET: u32 =
+    std::mem::offset_of!(otter_gc::page::PageHeader, allocated_bytes) as u32;
+/// Machine discriminant proving a page is the active young from-space.
+pub const JIT_NEW_FROM_SPACE_KIND: u32 = otter_gc::page::SpaceKind::NewFrom as u32;
+/// Fixed regular GC page size used by the bump-limit check.
+pub const JIT_GC_PAGE_SIZE: u32 = otter_gc::page::PAGE_SIZE as u32;
+/// Header flag installed on a generated young object.
+pub const JIT_GC_YOUNG_FLAG: u8 = otter_gc::header::GENERATION_YOUNG_FLAG;
 
 use crate::{
     CodeBlock, CodeBlockInstruction,
@@ -132,6 +156,32 @@ pub struct JitClassConstructorLayout {
     pub callable_byte: u32,
     /// Byte offset from the wrapper body to its live superclass identity.
     pub super_constructor_byte: u32,
+    /// Byte offset from the wrapper body to its live instance prototype.
+    pub prototype_byte: u32,
+}
+
+/// Maximum ordinary prototype depth admitted by generated receiver allocation.
+pub const JIT_RECEIVER_PROTOTYPE_GUARD_CAP: usize = 8;
+
+/// One GC-movement-stable class receiver allocation program.
+///
+/// The program uses the live class wrapper's prototype value, guards its full
+/// ordinary shape chain, and initializes an in-body shaped object. Any mismatch
+/// is pre-effect and returns to rooted receiver preparation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitReceiverAllocationPlan {
+    /// Expected underlying constructor function of the live `new.target` class.
+    pub new_target_function_id: u32,
+    /// Initial receiver hidden class.
+    pub receiver_shape: u32,
+    /// Number of already-visible undefined slots described by that shape.
+    pub initial_field_count: u8,
+    /// Reserved in-body slot capacity for later constructor transitions.
+    pub reserved_capacity: u8,
+    /// Number of live entries in [`Self::prototype_shapes`].
+    pub prototype_shape_count: u8,
+    /// Complete nearest-first ordinary prototype chain.
+    pub prototype_shapes: [u32; JIT_RECEIVER_PROTOTYPE_GUARD_CAP],
 }
 
 /// One constructor-owned add-property transition executable in generated code.
@@ -267,6 +317,10 @@ pub struct JitCompileSnapshot {
     /// string-keyed slots or fewer holds them inline; a larger one spills to the
     /// out-of-line `values` vector whose base is a stable heap allocation.
     pub object_inline_slot_cap: u32,
+    /// Byte offset of the ordinary object's `[[Extensible]]` byte.
+    pub object_extensible_byte: u32,
+    /// Fixed aligned bytes in one ordinary object cell, header included.
+    pub object_cell_bytes: u32,
     /// Static GC layout for the inline generational write barrier emitted on a
     /// pointer-valued `StoreProperty`. Isolate-independent `#[repr(C)]` / `const`
     /// values; the card-mark is gated on [`cage_base`](Self::cage_base) being
@@ -743,6 +797,8 @@ pub struct JitDirectCallPlan {
 pub struct JitDirectCallee {
     /// Function identity, stable entry cell, and callee register-window shape.
     pub plan: JitDirectCallPlan,
+    /// Optional class-only safepoint-free receiver allocation program.
+    pub receiver_allocation: Option<JitReceiverAllocationPlan>,
 }
 
 /// One permanent global-declarative binding available to generated code.
@@ -1088,6 +1144,8 @@ impl JitCompileSnapshot {
             object_slab_handle_byte: 0,
             object_slab_len_byte: 0,
             object_inline_slot_cap: 0,
+            object_extensible_byte: 0,
+            object_cell_bytes: 0,
             gc_barrier: JitGcBarrierLayout::default(),
             jit_proto_byte: 0,
             closure_call_layout: JitClosureCallLayout::default(),

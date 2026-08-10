@@ -1919,6 +1919,16 @@ pub(crate) const OBJECT_BODY_SLAB_LEN_OFFSET: usize = std::mem::offset_of!(Objec
 /// line (an existing-slot slow store reserves ahead), and a spilled slab
 /// that shrinks back stays out of line.
 pub(crate) const OBJECT_BODY_SLAB_HANDLE_OFFSET: usize = std::mem::offset_of!(ObjectBody, slab);
+/// Byte offset of the ordinary `[[Extensible]]` flag.
+pub(crate) const OBJECT_BODY_EXTENSIBLE_OFFSET: usize =
+    std::mem::offset_of!(ObjectBody, extensible);
+/// Total fixed cell bytes for an ordinary object, including its GC header.
+pub(crate) const OBJECT_BODY_CELL_BYTES: usize = align_object_cell_bytes();
+
+const fn align_object_cell_bytes() -> usize {
+    let bytes = otter_gc::header::HEADER_SIZE + std::mem::size_of::<ObjectBody>();
+    (bytes + otter_gc::OBJECT_ALIGNMENT - 1) & !(otter_gc::OBJECT_ALIGNMENT - 1)
+}
 
 // The JIT bakes these offsets into emitted property loads, the inline `New`
 // store sequence, and the deopt frame-state record, so they are a frozen ABI:
@@ -1932,6 +1942,8 @@ const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET == 36);
 const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET == 56);
 const _: () = assert!(OBJECT_BODY_SLAB_LEN_OFFSET == 80);
 const _: () = assert!(OBJECT_BODY_SLAB_HANDLE_OFFSET == 16);
+const _: () = assert!(OBJECT_BODY_EXTENSIBLE_OFFSET == 40);
+const _: () = assert!(OBJECT_BODY_CELL_BYTES == 96);
 // The shape guard word must sit at offset 0 (single-compare guard) and the
 // slab base must stay 8-aligned for the JIT's pointer load.
 const _: () = assert!(OBJECT_BODY_VALUES_PTR_OFFSET.is_multiple_of(8));

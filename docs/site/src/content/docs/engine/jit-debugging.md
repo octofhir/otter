@@ -88,17 +88,22 @@ graph.
 
 Base-construct artifacts add `directConstructPrepare` between the shared guard
 and frame publication. Its nested `directConstructPrepareFast` region probes an
-already materialized own data `new.target.prototype` and allocates through an
-allocating/non-reentrant stub. For a conservatively matched straight-line base
-initializer, that stub reuses the VM's final hidden-class cache and creates
-undefined own slots up front. Fixed, spread, and generated `superConstruct`
-bodies then overwrite ordinary existing slots without a property-transition
-stub. This pre-shape is admitted only when every initializer name is absent
-from the selected prototype chain. `directConstructPrepareObservable` is the cold
-pre-effect-miss sibling for accessors, proxies, bound functions, and lazy or
-otherwise uncertain prototypes; it owns the exact observable lookup. Both
-paths root the receiver in the Machine safepoint area and initialize the same
-stack-owned `NativeFrame` used by plain and method calls. Derived construction
+already materialized own data `new.target.prototype`. Exact class wrappers then
+enter `directConstructReceiverAllocFast`, which guards the live wrapper,
+prototype chain, collector marking state, young from-space page, bump capacity,
+and heap cap before initializing the complete object and accounting it in
+generated code. `directConstructReceiverAllocCold` is the rooted allocator
+sibling for a structural guard miss, nursery refill/GC, stress mode, or OOM.
+For a conservatively matched straight-line base initializer, the immutable plan
+reuses the VM's final hidden-class cache and creates undefined own slots up
+front. Fixed, spread, and generated `superConstruct` bodies then overwrite
+ordinary existing slots without a property-transition stub. This pre-shape is
+admitted only when every initializer name is absent from the selected prototype
+chain. `directConstructPrepareObservable` is the cold pre-effect-miss sibling
+for accessors, proxies, bound functions, lazy or otherwise uncertain
+prototypes; it owns the exact observable lookup. All paths root the receiver in
+the Machine safepoint area and initialize the same stack-owned `NativeFrame`
+used by plain and method calls. Derived construction
 publishes a hole `this`, while `superConstruct` inherits the caller's live
 `new.target`; `BindThisValue` commits the returned superclass receiver in both
 stack-owned and materialized compiled activations. A later callee deopt resumes
@@ -119,6 +124,15 @@ derived selection in generated code; `directConstructResultThrow` is the cold
 primitive/uninitialized-`this` validator. Late tagged Machine roots cover fixed
 arguments across receiver preparation, so the allocator's early and late homes
 are not part of the call ABI.
+
+Runtime and engine-benchmark snapshots expose exact receiver-allocation
+attribution. `jit-receiver-alloc-attempts` equals generated successes plus
+guard and space misses. Every guard/space miss owns one
+`jit-receiver-alloc-cold-transitions` and one
+`jit-receiver-alloc-rust-transitions`; the cold sibling separately attributes
+GC transitions, page refills, and OOM. `jit-receiver-alloc-deopts` remains a
+separate semantic refusal count and should stay zero for allocation misses,
+which resume the already-selected construct instead of replaying it.
 
 For every monomorphic body admitted by the optimizing tier's inline budget,
 `inlineLowered` records the owning code object, parent/callee function ids,

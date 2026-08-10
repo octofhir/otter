@@ -60,6 +60,9 @@ pub struct ClassConstructorBody {
 /// Byte offset of the underlying callable in [`ClassConstructorBody`].
 pub const CLASS_CONSTRUCTOR_BODY_CTOR_OFFSET: usize =
     std::mem::offset_of!(ClassConstructorBody, ctor);
+/// Byte offset of the live instance prototype in [`ClassConstructorBody`].
+pub const CLASS_CONSTRUCTOR_BODY_PROTOTYPE_OFFSET: usize =
+    std::mem::offset_of!(ClassConstructorBody, prototype);
 /// Byte offset of the live superclass identity in [`ClassConstructorBody`].
 pub const CLASS_CONSTRUCTOR_BODY_CTOR_PROTO_OFFSET: usize =
     std::mem::offset_of!(ClassConstructorBody, ctor_proto);

@@ -6,6 +6,7 @@
 //! - Own/prototype guarded methods, exact receiver binding, and guard misses.
 //! - Base constructors with `new.target`, receiver substitution, and accessors.
 //! - Non-reentrant own-data prototype preparation and observable fallback.
+//! - Generated receiver allocation, exact cold attribution, and page refill.
 //! - Plain, base, derived, and superclass spread calls sharing that linkage.
 //! - Nested generated calls retaining a tagged value across moving GC.
 //!
@@ -374,6 +375,52 @@ JSON.stringify([
 ]);
 "#;
 
+const GENERATED_RECEIVER_ALLOCATION: &str = r#"
+class AllocationBase {
+  constructor(value) {
+    this.base = value + 1;
+  }
+}
+
+class AllocationDerived extends AllocationBase {
+  constructor(value) {
+    super(value);
+    this.derived = value + 2;
+  }
+}
+
+function allocateFixed(Ctor, count) {
+  let checksum = 0;
+  for (let i = 0; i < count; i++) checksum += new Ctor(i).base;
+  return checksum;
+}
+
+function allocateSpread(Ctor, count) {
+  let checksum = 0;
+  for (let i = 0; i < count; i++) checksum += new Ctor(...[i]).base;
+  return checksum;
+}
+
+function allocateDerived(Ctor, count) {
+  let checksum = 0;
+  for (let i = 0; i < count; i++) {
+    const value = new Ctor(i);
+    checksum += value.base + value.derived;
+  }
+  return checksum;
+}
+
+new AllocationBase(-1);
+new AllocationDerived(-1);
+allocateFixed(AllocationBase, 5000);
+allocateSpread(AllocationBase, 5000);
+allocateDerived(AllocationDerived, 5000);
+
+allocateFixed(AllocationBase, 20000)
+  + allocateSpread(AllocationBase, 20000)
+  + allocateDerived(AllocationDerived, 20000);
+"#;
+
 const SIMPLE_SHAPE_OBSERVABLE_SETTER: &str = r#"
 let setterEffects = 0;
 const setterPrototype = {
@@ -682,6 +729,8 @@ struct RunResult {
     used_generated_construct: bool,
     used_fast_construct_prepare: bool,
     used_observable_construct_prepare: bool,
+    used_generated_receiver_allocation: bool,
+    used_cold_receiver_allocation: bool,
     used_machine_derived_construct: bool,
     used_machine_super_construct: bool,
     used_generated_super_construct: bool,
@@ -751,6 +800,8 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
         || artifact_has("\"callKind\":\"construct\"", false);
     let used_fast_construct_prepare = code_map_has("directConstructPrepareFast");
     let used_observable_construct_prepare = code_map_has("directConstructPrepareObservable");
+    let used_generated_receiver_allocation = code_map_has("directConstructReceiverAllocFast");
+    let used_cold_receiver_allocation = code_map_has("directConstructReceiverAllocCold");
     let used_machine_derived_construct = artifact_has("\"callKind\": \"derivedConstruct\"", true)
         || artifact_has("\"callKind\":\"derivedConstruct\"", true);
     let used_machine_super_construct = artifact_has("\"callKind\": \"superConstruct\"", true)
@@ -783,6 +834,8 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
         used_generated_construct,
         used_fast_construct_prepare,
         used_observable_construct_prepare,
+        used_generated_receiver_allocation,
+        used_cold_receiver_allocation,
         used_machine_derived_construct,
         used_machine_super_construct,
         used_generated_super_construct,
@@ -949,7 +1002,74 @@ fn simple_constructor_shapes_cover_fixed_spread_and_super_linkage() {
     );
     assert!(production.used_fast_construct_prepare);
     assert!(production.stats.property_store_misses < 500);
-    assert!(production.stats.jit_alloc_stub_transitions > 0);
+    assert!(production.used_generated_receiver_allocation);
+    assert!(production.used_cold_receiver_allocation);
+    if std::env::var_os("OTTER_GC_STRESS").is_some() {
+        assert_eq!(production.stats.jit_receiver_alloc_generated, 0);
+        assert!(production.stats.jit_receiver_alloc_space_misses > 0);
+        assert!(production.stats.jit_receiver_alloc_gc_transitions > 0);
+    } else {
+        assert!(production.stats.jit_receiver_alloc_generated > 0);
+    }
+    assert_eq!(
+        production.stats.jit_receiver_alloc_attempts,
+        production.stats.jit_receiver_alloc_generated
+            + production.stats.jit_receiver_alloc_guard_misses
+            + production.stats.jit_receiver_alloc_space_misses
+    );
+    assert_eq!(
+        production.stats.jit_receiver_alloc_cold_transitions,
+        production.stats.jit_receiver_alloc_guard_misses
+            + production.stats.jit_receiver_alloc_space_misses
+    );
+    assert_eq!(
+        production.stats.jit_receiver_alloc_rust_transitions,
+        production.stats.jit_receiver_alloc_cold_transitions
+    );
+    assert_eq!(production.stats.jit_receiver_alloc_deopts, 0);
+    assert_eq!(production.stats.jit_receiver_alloc_oom, 0);
+}
+
+#[test]
+fn generated_receiver_allocation_owns_super_hot_path_and_refills() {
+    let production = run(
+        GENERATED_RECEIVER_ALLOCATION,
+        "jit-generated-receiver-allocation.js",
+        JitSelection::ProductionTiered,
+    );
+
+    assert_eq!(production.completion, "800060000");
+    assert!(production.stats.jit_generated_calls > 0);
+    assert!(
+        production.stats.jit_receiver_alloc_generated > 20_000,
+        "stats={:?}",
+        production.stats
+    );
+    assert!(production.stats.jit_receiver_alloc_space_misses > 0);
+    assert_eq!(production.stats.jit_receiver_alloc_guard_misses, 0);
+    assert_eq!(
+        production.stats.jit_receiver_alloc_attempts,
+        production.stats.jit_receiver_alloc_generated
+            + production.stats.jit_receiver_alloc_space_misses
+    );
+    assert_eq!(
+        production.stats.jit_receiver_alloc_cold_transitions,
+        production.stats.jit_receiver_alloc_space_misses
+    );
+    assert_eq!(
+        production.stats.jit_receiver_alloc_rust_transitions,
+        production.stats.jit_receiver_alloc_cold_transitions
+    );
+    assert_eq!(
+        production.stats.jit_receiver_alloc_refills,
+        production.stats.jit_receiver_alloc_space_misses
+    );
+    assert_eq!(production.stats.jit_receiver_alloc_deopts, 0);
+    assert_eq!(production.stats.jit_receiver_alloc_oom, 0);
+    assert!(
+        production.stats.jit_alloc_stub_transitions
+            < production.stats.jit_receiver_alloc_attempts / 100
+    );
 }
 
 #[test]

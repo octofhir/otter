@@ -61,11 +61,13 @@ It already owns:
   the spine before publication, inherited closure cells are appended exactly,
   and bounded two-edge target preparation closes an already-observed nested
   closure call without unbounded call-graph compilation;
-- split base-constructor receiver preparation: an already materialized own data
-  prototype uses an allocating/non-reentrant stub in fixed and spread template
-  or Machine linkage, while accessors, proxies, bound functions, lazy
-  prototypes, and uncertain shapes miss before effects into the one observable
-  fallback;
+- split base-constructor receiver preparation: exact class wrappers with an
+  already materialized own data prototype allocate the complete receiver from
+  a collector-published young from-space window in generated fixed, spread, and
+  superclass linkage. Guard, page-capacity, marking, GC-stress, heap-cap, and
+  OOM misses enter one rooted cold allocator before effects; accessors, proxies,
+  bound functions, lazy prototypes, and uncertain shapes still enter the one
+  observable fallback;
 - final-shape receiver allocation for conservative straight-line base
   initializers. The shared fixed, spread, and generated-super preparation path
   proves every initializer name absent from the selected prototype chain,
@@ -88,6 +90,9 @@ It already owns:
   return, constructor receiver preparation, callee overflow/deopt, propagated
   throw, nested/recursive generated calls, and moving minor GC all execute
   without replay or conservative stack scanning;
+- exact generated receiver-allocation attribution for attempts, successes,
+  structural and space misses, cold/Rust boundaries, GC, refills, OOM, and
+  deopts, plus `directConstructReceiverAllocFast` / `Cold` code-map proof;
 - catch-only exception-region CFGs with explicit landing-pad successors; the
   shared linkage fully unwinds publication, commits the thrown value to its
   allocator home, and transfers at the exact call PC without replay;

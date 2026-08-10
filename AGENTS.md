@@ -439,12 +439,15 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     `directCallEntryReject`; methods additionally expose `directMethodGuard`,
     while constructors expose `directConstructPrepare` with nested
     `directConstructPrepareFast` and `directConstructPrepareObservable`
-    regions. The fast region accepts an exact own data prototype and allocates
-    without reentry. Conservative straight-line base initializers also reuse
-    the VM final-shape cache: when every field is absent from the selected
+    regions. Exact class wrappers inside the fast region expose nested
+    `directConstructReceiverAllocFast` and `directConstructReceiverAllocCold`
+    regions. The former allocates from the collector-published nursery window;
+    guard, space, GC, stress, heap-cap, and OOM misses use the rooted cold
+    allocator before effects. Conservative straight-line base initializers also
+    reuse the VM final-shape cache: when every field is absent from the selected
     prototype chain, fixed, spread, and generated-super receivers start with
-    undefined own slots and their bodies perform ordinary existing-slot
-    stores. The observable region is the pre-effect miss fallback.
+    undefined own slots and their bodies perform ordinary existing-slot stores.
+    The observable region is the pre-effect miss fallback.
     Non-simple base/derived class-field additions may expose
     `machineConstructorFieldTransition`; this region guards the receiver and
     complete ordinary prototype chain before committing one VM-interned child

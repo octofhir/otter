@@ -98,6 +98,11 @@ It already owns:
   the shared generated linkage. Arguments, results, receiver roots, and
   moving-GC refreshes use the published inline-frame window rather than
   falling back to the generic construct transition;
+- indexed Map/Set keys finish with a low-bit avalanche before the GC-owned
+  ordered table selects a bucket. Adjacent integral doubles no longer collapse
+  into one collision chain: the alternating `native-boundary` process medians
+  fell by 59.02% with reductions, bytecode calls, JIT entries, deopts, runtime
+  transitions, and emitted code held identical;
 - catch-only exception-region CFGs with explicit landing-pad successors; the
   shared linkage fully unwinds publication, commits the thrown value to its
   allocator home, and transfers at the exact call PC without replay;
@@ -115,7 +120,7 @@ The old optimizing compiler and template emitter remain in the active graph
 only for operations and function shapes not yet selected by the replacement
 pipeline. They are fallback, not contracts to preserve.
 
-Latest accepted gate: 53 bytecode, 86 compiler, 283 JIT, and 836 VM tests;
+Latest accepted gate: 53 bytecode, 86 compiler, 283 JIT, and 837 VM tests;
 the complete runtime suite; all-target/all-feature Clippy;
 compile-fail/rooting checks; and 21/21 differential
 interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.

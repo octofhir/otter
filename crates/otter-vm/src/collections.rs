@@ -415,7 +415,10 @@ impl SetBody {
 /// `NaN` collapses to a single canonical hash so all `NaN` keys land in the
 /// same bucket (SameValueZero treats them equal); `-0`/`+0` were already
 /// collapsed in [`MapKey::from_value`]. Strings use the heap-free content
-/// [`JsString::cached_hash`]. Heap-independent by construction.
+/// [`JsString::cached_hash`]. The final avalanche is required because ordered
+/// tables select a bucket from the low hash bits: adjacent integral doubles
+/// differ mainly in their high IEEE-754 bits and otherwise collapse into one
+/// small-table bucket. Heap-independent by construction.
 fn map_key_hash(key: &MapKey) -> Option<u64> {
     use core::hash::{Hash, Hasher};
     let mut h = rustc_hash::FxHasher::default();
@@ -441,7 +444,18 @@ fn map_key_hash(key: &MapKey) -> Option<u64> {
         }
         MapKey::BigInt(_) | MapKey::Symbol(_) | MapKey::ObjectValue(_) => return None,
     }
-    Some(h.finish())
+    Some(avalanche_map_hash(h.finish()))
+}
+
+/// Spread every input bit into the low bits consumed by
+/// [`table::OrderedTableBody`].
+#[inline]
+fn avalanche_map_hash(mut hash: u64) -> u64 {
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    hash ^ (hash >> 33)
 }
 
 /// Locate the live entry index for `key` in `body`.
@@ -1888,6 +1902,22 @@ mod tests {
     fn young_object_value(heap: &mut otter_gc::GcHeap) -> Value {
         let mut no_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
         Value::object(crate::object::alloc_object_with_roots(heap, &mut no_roots).unwrap())
+    }
+
+    #[test]
+    fn small_integral_map_keys_do_not_collapse_into_one_bucket() {
+        let occupied = (0..64)
+            .map(|value| {
+                map_key_hash(&MapKey::Number(f64::from(value))).expect("number keys are indexed")
+                    & 63
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(
+            occupied.len() >= 32,
+            "64 adjacent integral keys occupied only {} buckets",
+            occupied.len()
+        );
     }
 
     #[test]

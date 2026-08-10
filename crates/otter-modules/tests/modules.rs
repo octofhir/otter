@@ -189,3 +189,71 @@ fn duplicate_hosted_specifier_is_a_build_error() {
         "unexpected error: {message}"
     );
 }
+
+#[test]
+fn otter_xml_parses_both_shapes_and_reports_bad_documents() {
+    let mut runtime = Runtime::builder().with_otter_modules().build().unwrap();
+    runtime
+        .eval(otter_runtime::SourceInput::from_javascript(
+            r##"
+            function check(actual, expected, what) {
+              const a = JSON.stringify(actual);
+              const e = JSON.stringify(expected);
+              if (a !== e) throw new Error(what + ": " + a + " !== " + e);
+            }
+            if (typeof Otter.XML.parse !== "function") throw new Error("Otter.XML.parse missing");
+
+            check(
+              Otter.XML.parse(
+                "<order id='A1'><customer>Ada</customer>" +
+                "<item sku='tea'>Green tea</item><item sku='mug'>Mug</item><paid/></order>"
+              ),
+              { order: {
+                  "@id": "A1",
+                  customer: "Ada",
+                  item: [
+                    { "@sku": "tea", "#text": "Green tea" },
+                    { "@sku": "mug", "#text": "Mug" },
+                  ],
+                  paid: "",
+              } },
+              "compact"
+            );
+
+            check(
+              Otter.XML.parse("<p class='lead'>Hello <b>world</b>!</p>", { compact: false }),
+              { name: "p", attributes: { class: "lead" }, children: [
+                  "Hello ",
+                  { name: "b", attributes: {}, children: ["world"] },
+                  "!",
+              ] },
+              "node"
+            );
+
+            // Entities, CDATA and line ends are resolved before the value is built.
+            check(
+              Otter.XML.parse("<a>&lt;&#65;<![CDATA[<raw>]]>x\r\ny</a>"),
+              { a: "<A<raw>x\ny" },
+              "text"
+            );
+
+            // Bytes are decoded per the declaration, not assumed to be UTF-8.
+            const ascii = (s) => Array.from(s, (c) => c.charCodeAt(0));
+            const latin1 = new Uint8Array([
+              ...ascii("<?xml version='1.0' encoding='ISO-8859-1'?><a b='"),
+              0xE9,
+              ...ascii("'/>"),
+            ]);
+            check(Otter.XML.parse(latin1), { a: { "@b": "é" } }, "latin-1 bytes");
+
+            let threw = null;
+            try { Otter.XML.parse("<a><b></a>"); } catch (error) { threw = error; }
+            if (!(threw instanceof SyntaxError)) throw new Error("expected a SyntaxError");
+            if (!threw.message.includes("</b>")) throw new Error("message: " + threw.message);
+
+            try { Otter.XML.parse(42); threw = null; } catch (error) { threw = error; }
+            if (!(threw instanceof TypeError)) throw new Error("expected a TypeError");
+            "##,
+        ))
+        .unwrap();
+}

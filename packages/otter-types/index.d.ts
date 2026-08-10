@@ -7,3 +7,4 @@
 /// <reference path="./sql.d.ts" />
 /// <reference path="./serve.d.ts" />
 /// <reference path="./ffi.d.ts" />
+/// <reference path="./xml.d.ts" />

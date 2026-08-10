@@ -2658,6 +2658,7 @@ dependencies = [
  "libloading",
  "otter-macros",
  "otter-runtime",
+ "otter-xml",
  "rusqlite",
  "serde_json",
  "smallvec",

@@ -83,6 +83,15 @@ pub trait Encoding {
     /// something above U+00FF; the scanner then widens the run to UTF-16.
     fn encode(code: u32, out: &mut Vec<Self::Unit>) -> bool;
 
+    /// Read a run of this document's units as text, without copying, when the
+    /// encoding spells that run the way Rust spells `str`.
+    ///
+    /// UTF-8 always can; ISO-8859-1 can while the run stays ASCII, since only
+    /// then does a byte mean the same character in both; UTF-16 never can,
+    /// because its units are not bytes. A sink that wants text in every case
+    /// falls back to walking the run's scalars.
+    fn as_str(units: &[Self::Unit]) -> Option<&str>;
+
     /// Append this document's structural positions to `out`, checking as it
     /// goes that every unit spells a character a document may contain.
     ///
@@ -166,6 +175,10 @@ impl Encoding for Utf8 {
         true
     }
 
+    fn as_str(units: &[u8]) -> Option<&str> {
+        core::str::from_utf8(units).ok()
+    }
+
     fn index_into(document: &[u8], out: &mut Vec<u32>) -> Result<()> {
         crate::index::bytes(document, true, out)
     }
@@ -185,6 +198,15 @@ impl Encoding for Latin1 {
         }
         out.push(code as u8);
         true
+    }
+
+    fn as_str(units: &[u8]) -> Option<&str> {
+        // Above ASCII the two disagree: 0xE9 is one character here and the
+        // start of a sequence there.
+        units
+            .is_ascii()
+            .then(|| core::str::from_utf8(units).ok())
+            .flatten()
     }
 
     fn index_into(document: &[u8], out: &mut Vec<u32>) -> Result<()> {
@@ -217,6 +239,10 @@ impl Encoding for Utf16 {
     fn encode(code: u32, out: &mut Vec<u16>) -> bool {
         push_utf16(code, out);
         true
+    }
+
+    fn as_str(_units: &[u16]) -> Option<&str> {
+        None
     }
 
     fn index_into(document: &[u16], out: &mut Vec<u32>) -> Result<()> {

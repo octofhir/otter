@@ -116,6 +116,7 @@ otter-compiler  = { path = "crates/otter-compiler" }
 otter-gc        = { path = "crates/otter-gc" }
 otter-jit       = { path = "crates/otter-jit" }
 otter-regex     = { path = "crates/otter-regex" }
+otter-xml       = { path = "crates/otter-xml" }
 otter-macros    = { path = "crates/otter-macros" }
 otter-vm        = { path = "crates/otter-vm" }
 otter-runtime   = { path = "crates/otter-runtime" }

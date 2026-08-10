@@ -15,6 +15,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 libloading = "0.8"
 otter-macros = { workspace = true }
 otter-runtime = { workspace = true }
+otter-xml = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { workspace = true }
 serde_json = { workspace = true }

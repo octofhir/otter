@@ -3134,6 +3134,37 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
+    fn base_construct_receiver_kernel_uses_allocating_non_reentrant_stub() {
+        let record = run_kernel(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../benchmarks/scripts/base-construct-receiver.js"),
+            "engineKernel".into(),
+            4_999_950_000.0,
+            EngineJitTier::ProductionTiered,
+            None,
+            1,
+            1,
+        );
+        assert!(record.failure.is_none(), "{:?}", record.failure);
+        let counter = |needle| {
+            record
+                .measurements
+                .jit_counters
+                .iter()
+                .find(|(name, _)| *name == needle)
+                .map_or(0, |(_, value)| *value)
+        };
+        assert!(counter("jit-generated-calls") > 300_000);
+        assert_eq!(counter("jit-generated-call-deopts"), 0);
+        assert_eq!(counter("jit-to-rust-call-transitions"), 0);
+        assert!(
+            counter("jit-alloc-stub-transitions") > 100_000,
+            "ordinary data prototypes must use non-reentrant receiver allocation"
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
     fn typed_runtime_boundary_kernel_stays_stack_owned() {
         let record = run_kernel(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -5,6 +5,7 @@
 //! - Exact return, callee-deopt, and throw semantics against the interpreter.
 //! - Own/prototype guarded methods, exact receiver binding, and guard misses.
 //! - Base constructors with `new.target`, receiver substitution, and accessors.
+//! - Non-reentrant own-data prototype preparation and observable fallback.
 //! - Plain, base, derived, and superclass spread calls sharing that linkage.
 //! - Nested generated calls retaining a tagged value across moving GC.
 //!
@@ -310,6 +311,25 @@ JSON.stringify([
 ]);
 "#;
 
+const DEFAULT_BASE_CONSTRUCT: &str = r#"
+function DefaultBase(value) {
+  this.value = value;
+  this.targetIsBase = new.target === DefaultBase;
+}
+
+function constructDefault(Ctor, value) {
+  return new Ctor(value);
+}
+
+for (let i = 0; i < 5000; i++) constructDefault(DefaultBase, i);
+const result = constructDefault(DefaultBase, 42);
+JSON.stringify([
+  result.value,
+  result.targetIsBase,
+  Object.getPrototypeOf(result) === DefaultBase.prototype
+]);
+"#;
+
 const CONSTRUCT_COLD_EXITS: &str = r#"
 let basePrototypeGets = 0;
 let otherPrototypeGets = 0;
@@ -586,6 +606,8 @@ struct RunResult {
     used_machine_method_call: bool,
     used_machine_construct: bool,
     used_generated_construct: bool,
+    used_fast_construct_prepare: bool,
+    used_observable_construct_prepare: bool,
     used_machine_derived_construct: bool,
     used_machine_super_construct: bool,
     used_generated_super_construct: bool,
@@ -630,6 +652,17 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
             })
         })
     };
+    let code_map_has = |needle: &str| {
+        result.jit_artifacts().is_some_and(|batch| {
+            batch.bundles().iter().any(|bundle| {
+                bundle
+                    .file(JitArtifactFileName::CodeMap)
+                    .is_some_and(|file| {
+                        std::str::from_utf8(file.contents()).is_ok_and(|text| text.contains(needle))
+                    })
+            })
+        })
+    };
     let used_machine_direct_call = artifact_has("directCallEntryCell", true);
     let used_machine_method_call = artifact_has("\"callKind\": \"method\"", true)
         || artifact_has("\"callKind\":\"method\"", true);
@@ -637,6 +670,8 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
         || artifact_has("\"callKind\":\"construct\"", true);
     let used_generated_construct = artifact_has("\"callKind\": \"construct\"", false)
         || artifact_has("\"callKind\":\"construct\"", false);
+    let used_fast_construct_prepare = code_map_has("directConstructPrepareFast");
+    let used_observable_construct_prepare = code_map_has("directConstructPrepareObservable");
     let used_machine_derived_construct = artifact_has("\"callKind\": \"derivedConstruct\"", true)
         || artifact_has("\"callKind\":\"derivedConstruct\"", true);
     let used_machine_super_construct = artifact_has("\"callKind\": \"superConstruct\"", true)
@@ -662,6 +697,8 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
         used_machine_method_call,
         used_machine_construct,
         used_generated_construct,
+        used_fast_construct_prepare,
+        used_observable_construct_prepare,
         used_machine_derived_construct,
         used_machine_super_construct,
         used_generated_super_construct,
@@ -684,6 +721,8 @@ fn assert_machine_construct(result: &RunResult) {
         result.used_machine_construct,
         "fixture must publish a typed Machine IR construct target"
     );
+    assert!(result.used_fast_construct_prepare);
+    assert!(result.used_observable_construct_prepare);
 }
 
 fn assert_machine_derived_construct(result: &RunResult) {
@@ -752,6 +791,34 @@ fn base_construct_executes_through_machine_ir() {
     assert_eq!(compiled.completion, oracle.completion);
     assert_eq!(compiled.completion, "[42,true,true,5001]");
     assert_machine_construct(&compiled);
+    assert!(compiled.stats.jit_reentrant_stub_transitions > 0);
+}
+
+#[test]
+fn default_base_construct_uses_non_reentrant_receiver_preparation_in_both_tiers() {
+    let oracle = run(
+        DEFAULT_BASE_CONSTRUCT,
+        "jit-default-base-construct.js",
+        JitSelection::InterpreterOnly,
+    );
+    let template = run(
+        DEFAULT_BASE_CONSTRUCT,
+        "jit-default-base-construct.js",
+        JitSelection::Template,
+    );
+    let production = run(
+        DEFAULT_BASE_CONSTRUCT,
+        "jit-default-base-construct.js",
+        JitSelection::ProductionTiered,
+    );
+
+    assert_eq!(oracle.completion, "[42,true,true]");
+    assert_eq!(template.completion, oracle.completion);
+    assert_eq!(production.completion, oracle.completion);
+    assert!(template.stats.jit_generated_calls > 0);
+    assert!(template.stats.jit_alloc_stub_transitions > 0);
+    assert_machine_construct(&production);
+    assert!(production.stats.jit_alloc_stub_transitions > 0);
 }
 
 #[test]

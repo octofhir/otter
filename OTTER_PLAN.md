@@ -61,6 +61,11 @@ It already owns:
   the spine before publication, inherited closure cells are appended exactly,
   and bounded two-edge target preparation closes an already-observed nested
   closure call without unbounded call-graph compilation;
+- split base-constructor receiver preparation: an already materialized own data
+  prototype uses an allocating/non-reentrant stub in fixed and spread template
+  or Machine linkage, while accessors, proxies, bound functions, lazy
+  prototypes, and uncertain shapes miss before effects into the one observable
+  fallback;
 - a VM-owned linked root chain for Machine values live across reentrant calls;
   return, constructor receiver preparation, callee overflow/deopt, propagated
   throw, nested/recursive generated calls, and moving minor GC all execute
@@ -111,7 +116,14 @@ BigInt/string-index loads, and class heritage / computed naming now use this
 same boundary; their former `jit_runtime_*` materialized-frame entrypoints and
 JIT-prefixed VM modules are deleted. Fixed base `new` consumes the same
 generated linkage as plain and method calls, while fresh/inherited upvalues
-remain stack-owned. Extend it to the remaining reentrant forms:
+remain stack-owned. Ordinary materialized data prototypes now allocate the base
+receiver without reentry; the observable preparation sibling remains the
+single authority for accessors, proxies, bound functions, and uncertain
+prototype state. The isolated base-receiver kernel moved all 700,000 measured
+preparations from the reentrant class to the allocating class and reduced the
+mean of alternating process medians by 5.70%, with identical reductions,
+generated calls, and zero call deopts. Extend it to the remaining reentrant
+forms:
 
 - admit nested catch/finally regions and complete multi-frame state through
   `lower_deopt_table`;

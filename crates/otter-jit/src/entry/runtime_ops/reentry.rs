@@ -4,7 +4,8 @@
 //! - Cold stable function-entry repair for generated calls.
 //! - Propagated-throw resumption in live compiled callers.
 //! - Reentrant construction and closure/function creation.
-//! - Generated base-constructor receiver preparation and return substitution.
+//! - Fast allocating and observable base-constructor receiver preparation,
+//!   plus return substitution.
 //! - Stack-owned built-in Array iterator collection and spread-result append.
 //! - Typed scalar, static value-load, and class-construction completion for both
 //!   materialized and stack-owned frames.
@@ -1282,6 +1283,49 @@ pub(crate) extern "C" fn jit_prepare_base_construct_stub(
         Ok(receiver) => JitRet {
             value: receiver.to_bits(),
             status: STATUS_RETURNED,
+        },
+        Err(error) => {
+            park_jit_error(ctx, error);
+            JitRet {
+                value: 0,
+                status: STATUS_THREW,
+            }
+        }
+    }
+}
+
+/// Allocate a base-constructor receiver without re-entering JavaScript when
+/// `new.target` exposes an exact own data prototype. A pre-effect miss asks
+/// generated linkage to call the observable preparation sibling.
+pub(crate) extern "C" fn jit_try_prepare_base_construct_stub(
+    ctx: *mut JitCtx,
+    callee_bits: u64,
+    new_target_bits: u64,
+    _reserved1: u64,
+    _reserved2: u64,
+) -> JitRet {
+    // SAFETY: the live `JitCtx` allocation contract publishes the caller's
+    // complete tagged window through its active native frame.
+    let ctx = unsafe { &mut *ctx };
+    let Some(activation) = ctx.checked_activation() else {
+        park_jit_error(ctx, VmError::InvalidOperand);
+        return JitRet {
+            value: 0,
+            status: STATUS_THREW,
+        };
+    };
+    let vm = unsafe { &mut *activation.vm_ptr() };
+    match vm.jit_try_prepare_base_construct_receiver(
+        otter_vm::Value::from_bits(callee_bits),
+        otter_vm::Value::from_bits(new_target_bits),
+    ) {
+        Ok(Some(receiver)) => JitRet {
+            value: receiver.to_bits(),
+            status: STATUS_RETURNED,
+        },
+        Ok(None) => JitRet {
+            value: 0,
+            status: STATUS_BAILED,
         },
         Err(error) => {
             park_jit_error(ctx, error);

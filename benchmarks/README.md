@@ -80,6 +80,8 @@ print output, access the filesystem, install packages, or depend on host APIs.
 | `typed-runtime-boundary.js` | Stack-owned scalar queries, static value loads, class heritage checks, and computed function naming | `10000400000` |
 | `string-concat.js` | Allocating primitive concat with a tagged result live across the second safepoint | `600000` |
 | `typed-parameter-loop.js` | Int32 parameter guards, loop phis, checked arithmetic, and OSR | `300000` |
+| `upvalue-call-families.js` | Closure-backed plain, method, and base-constructor linkage with stack-owned upvalues | `15000450000` |
+| `base-construct-receiver.js` | Fixed base construction with an exact own data prototype and isolated receiver preparation | `4999950000` |
 
 Run one fixture per isolate. Warmups and measured samples reuse that isolate
 and the same precompiled invocation stub, but every invocation must return the

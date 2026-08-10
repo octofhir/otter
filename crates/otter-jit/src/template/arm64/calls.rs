@@ -1186,7 +1186,6 @@ pub(super) fn emit_construct(
             table.entry(abi::STUB_JIT_RESOLVE_DIRECT_ENTRY),
             table.entry(abi::STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT),
             table.entry(abi::STUB_JIT_PREPARE_BASE_CONSTRUCT),
-            table.entry(abi::STUB_JIT_BASE_CONSTRUCT_RESULT),
             table.entry(abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT),
             0,
             table.entry(abi::STUB_JIT_INITIALIZE_UPVALUES),

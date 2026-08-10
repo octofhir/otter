@@ -31,8 +31,7 @@ use otter_vm::{
     JitArtifactFileName, JitCompileSnapshot,
     deopt::{DeoptExitDescriptor, DeoptExitId, DeoptRuntime},
     native_abi::{
-        STUB_JIT_BACKEDGE_POLL, STUB_JIT_BASE_CONSTRUCT_RESULT, STUB_JIT_BIND_DERIVED_THIS,
-        STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_COPY_SPREAD_ARGUMENTS,
+        STUB_JIT_BACKEDGE_POLL, STUB_JIT_BIND_DERIVED_THIS, STUB_JIT_COPY_SPREAD_ARGUMENTS,
         STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_DERIVED_CONSTRUCT_RESULT,
         STUB_JIT_INITIALIZE_UPVALUES, STUB_JIT_LOAD_UPVALUE_VALUE, STUB_JIT_PREPARE_BASE_CONSTRUCT,
         STUB_JIT_RESOLVE_DIRECT_ENTRY, STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
@@ -120,12 +119,10 @@ pub(crate) fn try_compile(
         transitions.entry(STUB_JIT_RESOLVE_DIRECT_ENTRY),
         transitions.entry(STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT),
         transitions.entry(STUB_JIT_PREPARE_BASE_CONSTRUCT),
-        transitions.entry(STUB_JIT_BASE_CONSTRUCT_RESULT),
         transitions.entry(STUB_JIT_DERIVED_CONSTRUCT_RESULT),
         transitions.entry(STUB_JIT_COPY_SPREAD_ARGUMENTS),
         transitions.entry(STUB_JIT_INITIALIZE_UPVALUES),
         transitions.entry(STUB_JIT_BIND_DERIVED_THIS),
-        transitions.entry(STUB_JIT_CLASS_SUPER_CONSTRUCTOR),
         transitions.entry(STUB_JIT_LOAD_UPVALUE_VALUE),
         otter_vm::runtime_stubs::STRING_CONCAT_ALLOC
             .entry_addr()
@@ -152,6 +149,8 @@ pub(crate) fn try_compile(
         relocations,
         osr_entries,
         osr_regions,
+        constructor_field_regions,
+        structural_regions,
     } = emission;
 
     let artifact = artifact_request.map(|request| {
@@ -173,6 +172,17 @@ pub(crate) fn try_compile(
         ));
         for &(logical_pc, start, end) in &osr_regions {
             code_map.record_osr(logical_pc, start, end);
+        }
+        for &(byte_pc, start, end) in &constructor_field_regions {
+            code_map.record(CodeRegion::structural_at_byte_pc(
+                "machineConstructorFieldTransition",
+                start,
+                end,
+                byte_pc,
+            ));
+        }
+        for &(kind, start, end) in &structural_regions {
+            code_map.record(CodeRegion::structural(kind, start, end));
         }
         build_bundle(
             request,
@@ -513,11 +523,36 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         ],
                     );
                     call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
-                    call.safepoint = Some(super::SafepointId(next_safepoint));
-                    next_safepoint = next_safepoint
-                        .checked_add(1)
-                        .expect("bounded scalar function safepoint count");
                     call
+                }
+                NumericNode::ConstructorFieldStore {
+                    object,
+                    value,
+                    byte_pc,
+                } => {
+                    let object = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        object,
+                    );
+                    let value = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        value,
+                    );
+                    let mut store = MachineInstruction::plain(
+                        MachineOpcode::ConstructorFieldStore(byte_pc),
+                        vec![
+                            MachineOperand::register_input(object),
+                            MachineOperand::register_input(value),
+                        ],
+                    );
+                    store.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
+                    store
                 }
                 NumericNode::IntegerConstant(value) => MachineInstruction::plain(
                     MachineOpcode::IntegerConstant(i64::from(value)),
@@ -927,6 +962,7 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                             }),
                         ),
                     );
+                    let argument_roots = arguments.clone();
                     let mut operands = Vec::with_capacity(arguments.len() + 2);
                     operands.push(MachineOperand::register_input(source_value));
                     operands.extend(arguments.into_iter().map(MachineOperand::register_input));
@@ -934,6 +970,7 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                     if let Some(receiver) = construct_receiver {
                         operands.push(MachineOperand::tagged_root(receiver));
                     }
+                    operands.extend(argument_roots.into_iter().map(MachineOperand::tagged_root));
                     let mut call = MachineInstruction::plain(
                         MachineOpcode::Call(descriptor_index as u32),
                         operands,
@@ -1168,12 +1205,12 @@ fn bind_derived_this_descriptor(landing_pad: Option<MachineBlock>) -> CallDescri
         target: CallTarget::RuntimeStub(otter_vm::native_abi::STUB_JIT_BIND_DERIVED_THIS),
         arguments: vec![MachineRepresentation::Tagged],
         result: Some(MachineRepresentation::Tagged),
-        effects: CallEffects::WRITES_HEAP.union(CallEffects::REENTRANT),
+        effects: CallEffects::WRITES_HEAP,
         clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
         exceptional: landing_pad
             .map(ExceptionalEdge::LandingPad)
             .unwrap_or(ExceptionalEdge::Propagate),
-        safepoint: SafepointKind::Gc,
+        safepoint: SafepointKind::None,
     }
 }
 
@@ -1210,7 +1247,13 @@ fn attach_safepoint_roots(
     if instruction.safepoint.is_none() {
         return;
     }
-    let roots = instruction
+    let mut roots = instruction
+        .operands
+        .iter()
+        .filter(|operand| operand.purpose == super::OperandPurpose::TaggedRoot)
+        .map(|operand| operand.value)
+        .collect::<BTreeSet<_>>();
+    let deopt_roots = instruction
         .operands
         .iter()
         .filter(|operand| operand.purpose == super::OperandPurpose::Deopt)
@@ -1219,9 +1262,19 @@ fn attach_safepoint_roots(
         })
         .map(|operand| operand.value)
         .collect::<BTreeSet<_>>();
-    instruction
+    roots.extend(deopt_roots);
+    let existing = instruction
         .operands
-        .extend(roots.into_iter().map(MachineOperand::tagged_root));
+        .iter()
+        .filter(|operand| operand.purpose == super::OperandPurpose::TaggedRoot)
+        .map(|operand| operand.value)
+        .collect::<BTreeSet<_>>();
+    instruction.operands.extend(
+        roots
+            .difference(&existing)
+            .copied()
+            .map(MachineOperand::tagged_root),
+    );
 }
 
 fn leaf_boolean_call_descriptor(

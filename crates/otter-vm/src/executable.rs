@@ -259,7 +259,14 @@ impl CodeBlock {
                 type_tag: crate::class_constructor::CLASS_CONSTRUCTOR_BODY_TYPE_TAG,
                 callable_byte: gc_header_bytes
                     + crate::class_constructor::CLASS_CONSTRUCTOR_BODY_CTOR_OFFSET as u32,
+                super_constructor_byte: gc_header_bytes
+                    + crate::class_constructor::CLASS_CONSTRUCTOR_BODY_CTOR_PROTO_OFFSET as u32,
             },
+            primitive_cell_type_tags: [
+                crate::string::JS_STRING_BODY_TYPE_TAG,
+                crate::symbol::SYMBOL_BODY_TYPE_TAG,
+                crate::bigint::BIG_INT_BODY_TYPE_TAG,
+            ],
             upvalue_value_byte: otter_gc::header::HEADER_SIZE as u32
                 + std::mem::offset_of!(crate::upvalue::UpvalueCellBody, value) as u32,
             collection_layout: crate::jit::JitCollectionLayout {
@@ -327,6 +334,7 @@ impl CodeBlock {
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             property_loads: rustc_hash::FxHashMap::default(),
             property_stores: rustc_hash::FxHashMap::default(),
+            constructor_field_transitions: rustc_hash::FxHashMap::default(),
             property_prototype_loads: rustc_hash::FxHashMap::default(),
             optimized_bail_pcs: std::collections::BTreeSet::new(),
             safepoints: rustc_hash::FxHashMap::default(),

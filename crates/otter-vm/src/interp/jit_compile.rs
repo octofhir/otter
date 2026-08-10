@@ -378,6 +378,7 @@ impl Interpreter {
         self.bake_guarded_method_calls(&mut snapshot);
         self.bake_element_accesses(&mut snapshot);
         self.bake_property_loads(&mut snapshot);
+        self.bake_constructor_field_transitions(&mut snapshot);
         snapshot.optimized_bail_pcs = self
             .jit_optimized_bail_pcs
             .get(&fid)
@@ -542,6 +543,7 @@ impl Interpreter {
         self.bake_guarded_method_calls(&mut view);
         self.bake_element_accesses(&mut view);
         self.bake_property_loads(&mut view);
+        self.bake_constructor_field_transitions(&mut view);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
         });
@@ -678,6 +680,49 @@ impl Interpreter {
             }
         }
         self.bake_prototype_loads(view);
+    }
+
+    /// Publish exact constructor field transitions learned during rooted
+    /// receiver preparation. The byte-PC key keeps the descriptor attached to
+    /// the original `StoreProperty`; generated guard failure deoptimizes before
+    /// that operation and never replays a committed store.
+    fn bake_constructor_field_transitions(&self, view: &mut jit::JitCompileSnapshot) {
+        if let Some(transitions) = self
+            .constructor_field_transition_cache
+            .get(&view.code_block.id)
+        {
+            view.constructor_field_transitions = transitions
+                .iter()
+                .filter_map(|(&byte_pc, transition)| {
+                    let from_shape = self
+                        .shape_runtime
+                        .handle_for_id(transition.from_shape)?
+                        .offset();
+                    let to_shape = self
+                        .shape_runtime
+                        .handle_for_id(transition.to_shape)?
+                        .offset();
+                    let prototype_shapes = transition
+                        .prototype_shapes
+                        .iter()
+                        .map(|&shape| {
+                            self.shape_runtime
+                                .handle_for_id(shape)
+                                .map(|shape| shape.offset())
+                        })
+                        .collect::<Option<Vec<_>>>()?;
+                    Some((
+                        byte_pc,
+                        jit::JitConstructorFieldTransition {
+                            from_shape,
+                            to_shape,
+                            prototype_shapes,
+                            slot: transition.slot,
+                        },
+                    ))
+                })
+                .collect();
+        }
     }
 
     /// Describe every load site whose programs all reach their slot through the

@@ -1,11 +1,14 @@
-//! Fast construction metadata for simple base-class initializers.
+//! Fast construction metadata for base and derived field initializers.
 //!
 //! This module recognizes bytecode constructors whose whole observable body is
-//! a sequence of own data writes to `this` followed by `return undefined`.
+//! a sequence of own data writes to `this` followed by `return undefined`, and
+//! separately locates exact `this` stores whose transition remains at the
+//! original bytecode operation.
 //!
 //! # Contents
 //! - [`SimpleConstructorInit`] — ordered property initializers.
 //! - [`match_simple_constructor_init`] — conservative bytecode matcher.
+//! - [`match_constructor_shape_stores`] — effect-tolerant exact-store matcher.
 //!
 //! # Invariants
 //! - Only base, ordinary, non-eval constructors are eligible.
@@ -14,12 +17,17 @@
 //! - Generated linkage may install the final shape with undefined slots before
 //!   entry only after proving every initializer name absent from the selected
 //!   prototype chain; the body overwrites those slots before any observation.
+//! - Derived and non-simple fields guard the receiver and complete prototype
+//!   chain before publishing a VM-baked transition at the original store.
 //!
 //! # See also
 //! - [`crate::call_ops`]
 //! - [`crate::object::ShapeRuntime`]
 
-use otter_bytecode::Op;
+use otter_bytecode::{
+    Op,
+    opcode_schema::{RegisterAccess, RegisterSource, opcode_schema},
+};
 
 use crate::executable::CodeBlock;
 use crate::{ExecutionContext, NumberValue, Value};
@@ -33,6 +41,14 @@ pub(crate) struct SimpleConstructorInit {
 pub(crate) struct SimpleConstructorField {
     pub(crate) name: String,
     pub(crate) source: SimpleConstructorSource,
+}
+
+/// One named store whose receiver is proven to be the current constructor's
+/// `this` value at that exact bytecode operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConstructorShapeStore {
+    pub(crate) byte_pc: u32,
+    pub(crate) name: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -151,6 +167,112 @@ pub(crate) fn match_simple_constructor_init(
     None
 }
 
+/// Locate constructor field-add sites without moving their observable timing.
+///
+/// Unlike [`match_simple_constructor_init`], this matcher does not require the
+/// complete body to be side-effect free: generated code applies each hidden
+/// class transition at the original `StoreProperty` after guarding the live
+/// receiver and its full prototype chain. Unknown operations only invalidate
+/// registers they declare as outputs, so an intervening value computation
+/// cannot erase a separately loaded `this` identity.
+pub(crate) fn match_constructor_shape_stores(
+    context: &ExecutionContext,
+    function: &CodeBlock,
+) -> Vec<ConstructorShapeStore> {
+    if function.contains_direct_eval {
+        return Vec::new();
+    }
+    let mut registers = vec![RegisterValue::Unknown; function.register_count as usize];
+    let mut stores = Vec::new();
+    for (instruction_index, instr) in function.code.iter().enumerate() {
+        let op = function.op(instr);
+        match op {
+            Op::LoadThis => {
+                if let Some(dst) = context.exec_register(instr, 0)
+                    && let Some(slot) = registers.get_mut(dst as usize)
+                {
+                    *slot = RegisterValue::This;
+                }
+                continue;
+            }
+            Op::StoreLocal => {
+                let Some(src) = context.exec_register(instr, 0) else {
+                    continue;
+                };
+                let Some(local) = context.exec_imm32(instr, 1) else {
+                    continue;
+                };
+                if local >= 0 {
+                    let value = registers
+                        .get(src as usize)
+                        .copied()
+                        .unwrap_or(RegisterValue::Unknown);
+                    if let Some(slot) = registers.get_mut(local as usize) {
+                        *slot = value;
+                    }
+                }
+                continue;
+            }
+            Op::LoadLocal => {
+                let (Some(dst), Some(local)) = (
+                    context.exec_register(instr, 0),
+                    context.exec_imm32(instr, 1),
+                ) else {
+                    continue;
+                };
+                let value = usize::try_from(local)
+                    .ok()
+                    .and_then(|local| registers.get(local).copied())
+                    .unwrap_or(RegisterValue::Unknown);
+                if let Some(slot) = registers.get_mut(dst as usize) {
+                    *slot = value;
+                }
+                continue;
+            }
+            Op::StoreProperty => {
+                let receiver = context.exec_register(instr, 0);
+                if receiver.is_some_and(|receiver| {
+                    registers.get(receiver as usize) == Some(&RegisterValue::This)
+                }) && let Some(name_index) = context.exec_const_index(instr, 1)
+                    && let Some(name) = context.string_constant_str(name_index)
+                    && name != "__proto__"
+                    && !stores
+                        .iter()
+                        .any(|store: &ConstructorShapeStore| store.name == name)
+                    && let Some(byte_pc) = function.instruction_byte_pc(instruction_index)
+                {
+                    stores.push(ConstructorShapeStore {
+                        byte_pc,
+                        name: name.to_owned(),
+                    });
+                }
+            }
+            _ => {}
+        }
+
+        if let Some(specs) = opcode_schema(op).operand_shape.prefix() {
+            for (operand, spec) in specs.iter().enumerate() {
+                if spec.register_access != RegisterAccess::Write {
+                    continue;
+                }
+                let register = match spec.register_source {
+                    Some(RegisterSource::RegisterOperand) => {
+                        context.exec_register(instr, operand).map(usize::from)
+                    }
+                    Some(RegisterSource::Imm32RegisterIndex) => context
+                        .exec_imm32(instr, operand)
+                        .and_then(|value| usize::try_from(value).ok()),
+                    None => None,
+                };
+                if let Some(slot) = register.and_then(|register| registers.get_mut(register)) {
+                    *slot = RegisterValue::Unknown;
+                }
+            }
+        }
+    }
+    stores
+}
+
 #[cfg(test)]
 mod tests {
     use otter_bytecode::{
@@ -158,7 +280,9 @@ mod tests {
         SourceKind,
     };
 
-    use super::{SimpleConstructorSource, match_simple_constructor_init};
+    use super::{
+        SimpleConstructorSource, match_constructor_shape_stores, match_simple_constructor_init,
+    };
     use crate::ExecutionContext;
 
     fn instr(pc: u32, op: Op, operands: impl AsRef<[Operand]>) -> Instruction {
@@ -221,6 +345,39 @@ mod tests {
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
         })
+    }
+
+    #[test]
+    fn tracks_this_across_unrelated_field_value_computation() {
+        let context = context_for(vec![
+            instr(0, Op::LoadThis, [Operand::Register(4)]),
+            instr(
+                1,
+                Op::AddImm,
+                [
+                    Operand::Register(5),
+                    Operand::Register(0),
+                    Operand::Imm32(1),
+                ],
+            ),
+            instr(
+                2,
+                Op::StoreProperty,
+                [
+                    Operand::Register(4),
+                    Operand::ConstIndex(0),
+                    Operand::Register(5),
+                    Operand::Register(6),
+                ],
+            ),
+            instr(3, Op::ReturnUndefined, []),
+        ]);
+        let function = context.exec_function(0).expect("test constructor");
+
+        let stores = match_constructor_shape_stores(&context, function);
+
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].name, "x");
     }
 
     #[test]

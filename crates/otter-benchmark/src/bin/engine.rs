@@ -489,6 +489,26 @@ fn jit_counter_deltas(before: JitRuntimeStats, after: JitRuntimeStats) -> Vec<(&
         ("jit-runtime-constructs", runtime_constructs),
         ("jit-generated-calls", generated_calls),
         ("jit-generated-call-deopts", generated_call_deopts),
+        (
+            "jit-base-construct-result-transitions",
+            base_construct_result_transitions
+        ),
+        (
+            "jit-derived-construct-result-transitions",
+            derived_construct_result_transitions
+        ),
+        (
+            "jit-derived-this-bind-transitions",
+            derived_this_bind_transitions
+        ),
+        (
+            "jit-class-super-resolution-transitions",
+            class_super_resolution_transitions
+        ),
+        (
+            "jit-constructor-field-transition-installs",
+            constructor_field_transition_installs
+        ),
         ("jit-caller-invalidations", caller_invalidations),
         ("jit-cold-entry-resolver-misses", cold_entry_resolver_misses),
         ("jit-to-rust-call-transitions", jit_to_rust_call_transitions),
@@ -3063,15 +3083,30 @@ mod tests {
             1,
         );
         assert!(record.failure.is_none(), "{:?}", record.failure);
-        assert!(
+        let counter = |name| {
             record
                 .measurements
                 .jit_counters
                 .iter()
-                .find(|(name, _)| *name == "jit-generated-calls")
-                .is_some_and(|(_, value)| *value > 300_000),
+                .find(|(metric, _)| *metric == name)
+                .map_or_else(
+                    || panic!("missing kernel diagnostic {name}"),
+                    |(_, value)| *value,
+                )
+        };
+        assert!(
+            counter("jit-generated-calls") > 300_000,
             "kernel must execute generated constructor linkage"
         );
+        assert_eq!(counter("jit-generated-call-deopts"), 0);
+        assert_eq!(counter("jit-to-rust-call-transitions"), 0);
+        assert_eq!(counter("jit-base-construct-result-transitions"), 0);
+        assert_eq!(counter("jit-derived-construct-result-transitions"), 0);
+        assert_eq!(counter("jit-derived-this-bind-transitions"), 47);
+        assert_eq!(counter("jit-class-super-resolution-transitions"), 2);
+        assert_eq!(counter("jit-compile-attempts"), 4);
+        assert_eq!(counter("jit-code-generations"), 6);
+        assert!(counter("jit-runtime-property-stubs") < 50_000);
         for metric in [
             "jit-compiler-wall-time-total",
             "jit-emitted-code-bytes",

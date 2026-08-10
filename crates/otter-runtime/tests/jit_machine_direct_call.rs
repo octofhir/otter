@@ -507,6 +507,7 @@ class Base {
 class Derived extends Base {
   constructor(value) {
     super(value);
+    this.extra = value + 1;
   }
 }
 
@@ -542,6 +543,7 @@ const override = { marker: "override" };
 const returned = constructReturner(Returner, override);
 JSON.stringify([
   result.value,
+  result.extra,
   Object.getPrototypeOf(result) === Derived.prototype,
   returned === override,
   baseRuns
@@ -684,6 +686,11 @@ struct RunResult {
     used_machine_super_construct: bool,
     used_generated_super_construct: bool,
     used_machine_spread_arguments: bool,
+    used_machine_constructor_field: bool,
+    used_machine_class_super_load: bool,
+    used_machine_derived_this_bind: bool,
+    used_direct_construct_result_fast: bool,
+    used_direct_construct_result_throw: bool,
     compile_diagnostics: Vec<String>,
 }
 
@@ -752,6 +759,11 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
         || artifact_has("\"callKind\":\"superConstruct\"", false);
     let used_machine_spread_arguments = artifact_has("\"argumentMode\": \"spread\"", false)
         || artifact_has("\"argumentMode\":\"spread\"", false);
+    let used_machine_constructor_field = code_map_has("machineConstructorFieldTransition");
+    let used_machine_class_super_load = code_map_has("machineClassSuperLoad");
+    let used_machine_derived_this_bind = code_map_has("machineDerivedThisBindFast");
+    let used_direct_construct_result_fast = code_map_has("directConstructResultFast");
+    let used_direct_construct_result_throw = code_map_has("directConstructResultThrow");
     let compile_diagnostics = result
         .jit_debug_report()
         .map(|report| {
@@ -775,6 +787,11 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
         used_machine_super_construct,
         used_generated_super_construct,
         used_machine_spread_arguments,
+        used_machine_constructor_field,
+        used_machine_class_super_load,
+        used_machine_derived_this_bind,
+        used_direct_construct_result_fast,
+        used_direct_construct_result_throw,
         compile_diagnostics,
     }
 }
@@ -805,8 +822,14 @@ fn assert_machine_derived_construct(result: &RunResult) {
     );
     assert!(
         result.used_machine_super_construct,
-        "fixture must publish a typed Machine IR super construct target"
+        "fixture must publish a typed Machine IR super construct target; diagnostics={:?}",
+        result.compile_diagnostics
     );
+    assert!(result.used_machine_constructor_field);
+    assert!(result.used_machine_class_super_load);
+    assert!(result.used_machine_derived_this_bind);
+    assert!(result.used_direct_construct_result_fast);
+    assert!(result.used_direct_construct_result_throw);
 }
 
 fn assert_machine_method_call(result: &RunResult) {
@@ -921,7 +944,8 @@ fn simple_constructor_shapes_cover_fixed_spread_and_super_linkage() {
     assert!(production.used_generated_construct);
     assert!(
         production.used_machine_super_construct || production.used_generated_super_construct,
-        "simple derived constructor must use typed super linkage"
+        "simple derived constructor must use typed super linkage; diagnostics={:?}",
+        production.compile_diagnostics
     );
     assert!(production.used_fast_construct_prepare);
     assert!(production.stats.property_store_misses < 500);
@@ -998,7 +1022,7 @@ fn derived_and_super_construct_execute_through_machine_ir() {
     );
 
     assert_eq!(compiled.completion, oracle.completion);
-    assert_eq!(compiled.completion, "[42,true,true,5001]");
+    assert_eq!(compiled.completion, "[42,43,true,true,5001]");
     assert_machine_derived_construct(&compiled);
 }
 

@@ -214,6 +214,11 @@ impl ShapeRuntime {
         self.handles_by_id.get(&id).map(Cell::get)
     }
 
+    #[must_use]
+    pub(crate) fn id_for_handle(&self, heap: &GcHeap, shape: ShapeHandle) -> ShapeId {
+        heap.read_payload(shape, ShapeBody::id)
+    }
+
     /// Intern a property key as a GC-managed string body plus its global atom.
     pub(crate) fn intern_key_with_roots(
         &mut self,

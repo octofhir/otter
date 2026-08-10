@@ -1259,7 +1259,7 @@ pub(crate) extern "C" fn jit_prepare_base_construct_stub(
     ctx: *mut JitCtx,
     callee_bits: u64,
     new_target_bits: u64,
-    _reserved1: u64,
+    function_id: u64,
     _reserved2: u64,
 ) -> JitRet {
     // SAFETY: the live `JitCtx` reentry contract.
@@ -1274,9 +1274,17 @@ pub(crate) extern "C" fn jit_prepare_base_construct_stub(
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
+    let Ok(function_id) = u32::try_from(function_id) else {
+        park_jit_error(ctx, VmError::InvalidOperand);
+        return JitRet {
+            value: 0,
+            status: STATUS_THREW,
+        };
+    };
     match vm.jit_prepare_base_construct_receiver(
         stack,
         context,
+        function_id,
         otter_vm::Value::from_bits(callee_bits),
         otter_vm::Value::from_bits(new_target_bits),
     ) {
@@ -1346,22 +1354,6 @@ pub(crate) extern "C" fn jit_try_prepare_base_construct_stub(
     }
 }
 
-/// Apply base-constructor return substitution without allocation or reentry.
-pub(crate) extern "C" fn jit_base_construct_result_stub(
-    _ctx: *mut JitCtx,
-    result_bits: u64,
-    receiver_bits: u64,
-    _reserved0: u64,
-    _reserved1: u64,
-) -> u64 {
-    let result = otter_vm::Value::from_bits(result_bits);
-    if result.is_object_type() {
-        result_bits
-    } else {
-        receiver_bits
-    }
-}
-
 /// Apply derived-constructor return validation and park any abrupt completion.
 pub(crate) extern "C" fn jit_derived_construct_result_stub(
     ctx: *mut JitCtx,
@@ -1380,6 +1372,7 @@ pub(crate) extern "C" fn jit_derived_construct_result_stub(
         };
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
+    vm.record_jit_derived_construct_result_transition();
     match vm.jit_derived_construct_result(
         otter_vm::Value::from_bits(result_bits),
         otter_vm::Value::from_bits(this_bits),
@@ -1408,6 +1401,10 @@ pub(crate) extern "C" fn jit_bind_derived_this_stub(
 ) -> JitRet {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    if let Some(activation) = ctx.checked_activation() {
+        let vm = unsafe { &mut *activation.vm_ptr() };
+        vm.record_jit_derived_this_bind_transition();
+    }
     match ctx
         .runtime_call()
         .and_then(|mut call| call.bind_derived_this_value(otter_vm::Value::from_bits(value_bits)))
@@ -1434,6 +1431,11 @@ pub(crate) extern "C" fn jit_class_super_constructor_stub(
     _reserved1: u64,
     _reserved2: u64,
 ) -> u64 {
+    // SAFETY: the leaf receives the current generated activation.
+    if let Some(activation) = unsafe { &mut *ctx }.checked_activation() {
+        let vm = unsafe { &mut *activation.vm_ptr() };
+        vm.record_jit_class_super_resolution_transition();
+    }
     // SAFETY: the live `JitCtx` entry contract.
     let ctx = unsafe { &mut *ctx };
     let Some(activation) = ctx.checked_activation() else {

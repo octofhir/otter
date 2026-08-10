@@ -130,6 +130,35 @@ pub struct JitClassConstructorLayout {
     /// Byte offset from the decompressed body pointer to its underlying
     /// callable value.
     pub callable_byte: u32,
+    /// Byte offset from the wrapper body to its live superclass identity.
+    pub super_constructor_byte: u32,
+}
+
+/// One constructor-owned add-property transition executable in generated code.
+///
+/// The receiver and every ordinary prototype shape are guarded immediately
+/// before the store. A miss therefore leaves the canonical `StoreProperty`
+/// operation completely unstarted; a hit appends exactly one pre-reserved
+/// slot, publishes the child hidden class, and performs the ordinary barrier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JitConstructorFieldTransition {
+    /// Receiver hidden class before the field is added.
+    pub from_shape: u32,
+    /// Receiver hidden class after the field is added.
+    pub to_shape: u32,
+    /// Full ordinary prototype-chain shapes, nearest first.
+    pub prototype_shapes: Vec<u32>,
+    /// Appended own-slot index.
+    pub slot: u16,
+}
+
+/// GC-movement-stable VM plan behind [`JitConstructorFieldTransition`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JitConstructorFieldTransitionPlan {
+    pub(crate) from_shape: crate::object::ShapeId,
+    pub(crate) to_shape: crate::object::ShapeId,
+    pub(crate) prototype_shapes: Vec<crate::object::ShapeId>,
+    pub(crate) slot: u16,
 }
 
 const _: [(); 36] = [(); std::mem::size_of::<JitClosureCallLayout>()];
@@ -176,6 +205,9 @@ pub struct JitCompileSnapshot {
     /// keyed by byte-PC. A store may not write through a prototype, so a
     /// settled store needs no hop check either.
     pub property_stores: rustc_hash::FxHashMap<u32, Vec<JitInlinePropertyLoad>>,
+    /// Constructor `StoreProperty` sites with a pre-reserved, guarded hidden
+    /// class transition, keyed by byte-PC.
+    pub constructor_field_transitions: rustc_hash::FxHashMap<u32, JitConstructorFieldTransition>,
     /// Load sites whose every program reaches its slot through the receiver's
     /// prototype, keyed by byte-PC. Guarding the receiver shape fixes which
     /// prototype the hop reaches and guarding the holder shape fixes the slot,
@@ -252,6 +284,8 @@ pub struct JitCompileSnapshot {
     pub closure_call_layout: JitClosureCallLayout,
     /// VM-baked class wrapper layout used by generated construct guards.
     pub class_constructor_layout: JitClassConstructorLayout,
+    /// GC body tags whose cell values remain ECMAScript primitives.
+    pub primitive_cell_type_tags: [u8; 3],
     /// Ready-to-use byte offsets and type tags for baseline collection method
     /// IC guards.
     pub collection_layout: JitCollectionLayout,
@@ -1058,6 +1092,7 @@ impl JitCompileSnapshot {
             jit_proto_byte: 0,
             closure_call_layout: JitClosureCallLayout::default(),
             class_constructor_layout: JitClassConstructorLayout::default(),
+            primitive_cell_type_tags: [0; 3],
             upvalue_value_byte: 0,
             collection_layout: JitCollectionLayout::default(),
             native_ref_byte: 0,
@@ -1074,6 +1109,7 @@ impl JitCompileSnapshot {
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             property_loads: rustc_hash::FxHashMap::default(),
             property_stores: rustc_hash::FxHashMap::default(),
+            constructor_field_transitions: rustc_hash::FxHashMap::default(),
             property_prototype_loads: rustc_hash::FxHashMap::default(),
             optimized_bail_pcs: std::collections::BTreeSet::new(),
             safepoints: rustc_hash::FxHashMap::default(),

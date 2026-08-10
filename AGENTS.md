@@ -445,6 +445,15 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     prototype chain, fixed, spread, and generated-super receivers start with
     undefined own slots and their bodies perform ordinary existing-slot
     stores. The observable region is the pre-effect miss fallback.
+    Non-simple base/derived class-field additions may expose
+    `machineConstructorFieldTransition`; this region guards the receiver and
+    complete ordinary prototype chain before committing one VM-interned child
+    shape and pre-reserved slot at the original `StoreProperty`. Generated
+    constructor semantics additionally expose `machineClassSuperLoad`,
+    `machineDerivedThisBindFast` / `machineDerivedThisBindCold`, and
+    `directConstructResultFast` / `directConstructResultThrow`. The fast result
+    region performs base substitution and valid derived selection without a
+    runtime stub; the throwing region is the cold invalid-result sibling.
     `functionId` is the caller. Typed `directCall` metadata names call kind,
     target function,
     planning-time `targetCodeObjectId`, tier, `thisMode`, `argumentMode`,

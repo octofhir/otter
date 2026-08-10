@@ -403,6 +403,30 @@ pub(crate) struct LeanCallbackState {
 }
 
 impl Interpreter {
+    /// Attribute one generated derived-constructor completion boundary.
+    pub fn record_jit_derived_construct_result_transition(&mut self) {
+        self.jit_runtime_stats.derived_construct_result_transitions = self
+            .jit_runtime_stats
+            .derived_construct_result_transitions
+            .saturating_add(1);
+    }
+
+    /// Attribute one generated derived-`this` binding boundary.
+    pub fn record_jit_derived_this_bind_transition(&mut self) {
+        self.jit_runtime_stats.derived_this_bind_transitions = self
+            .jit_runtime_stats
+            .derived_this_bind_transitions
+            .saturating_add(1);
+    }
+
+    /// Attribute one exact-class superclass resolution boundary.
+    pub fn record_jit_class_super_resolution_transition(&mut self) {
+        self.jit_runtime_stats.class_super_resolution_transitions = self
+            .jit_runtime_stats
+            .class_super_resolution_transitions
+            .saturating_add(1);
+    }
+
     /// Try the non-observable half of generated base-constructor receiver
     /// preparation.
     ///
@@ -451,6 +475,13 @@ impl Interpreter {
         } else {
             self.constructor_prototype_value("Object")?
         });
+        let reserved_field_count = self.prepare_constructor_field_transitions(
+            context,
+            function_id,
+            roots.new_target.get(),
+            roots.scratch_0.get(),
+            &roots,
+        )?;
         let simple_shape =
             self.jit_simple_constructor_shape(context, function_id, roots.scratch_0.get(), &roots)?;
         let receiver = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
@@ -464,11 +495,25 @@ impl Interpreter {
             crate::object::set_fresh_object_shape(receiver, &mut self.gc_heap, shape);
             let mut slots = SmallVec::<[Value; 8]>::new();
             slots.resize(field_count, Value::undefined());
-            crate::object::initialize_shaped_data_slots(
+            crate::object::initialize_shaped_data_slots_with_capacity(
                 receiver,
                 &mut self.gc_heap,
                 slots.as_slice(),
+                reserved_field_count.max(field_count),
             );
+        } else if reserved_field_count != 0 {
+            let mut receiver = roots
+                .receiver
+                .get()
+                .as_object()
+                .ok_or(VmError::InvalidOperand)?;
+            crate::object::reserve_fresh_object_slot_capacity(
+                &mut receiver,
+                &mut self.gc_heap,
+                reserved_field_count,
+            )
+            .map_err(VmError::from)?;
+            roots.receiver.set(Value::object(receiver));
         }
         crate::object::set_prototype_value(
             roots
@@ -535,6 +580,7 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
+        function_id: u32,
         callee: Value,
         new_target: Value,
     ) -> Result<Value, VmError> {
@@ -550,14 +596,268 @@ impl Interpreter {
             .construct_prototype_for_callee(stack, context, &new_target)?
             .unwrap_or(self.constructor_prototype_value("Object")?);
         roots.scratch_0.set(proto);
+        let reserved_field_count = self.prepare_constructor_field_transitions(
+            context,
+            function_id,
+            roots.new_target.get(),
+            roots.scratch_0.get(),
+            &roots,
+        )?;
         let receiver = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
         roots.receiver.set(Value::object(receiver));
+        if reserved_field_count != 0 {
+            let mut receiver = roots
+                .receiver
+                .get()
+                .as_object()
+                .ok_or(VmError::InvalidOperand)?;
+            crate::object::reserve_fresh_object_slot_capacity(
+                &mut receiver,
+                &mut self.gc_heap,
+                reserved_field_count,
+            )
+            .map_err(VmError::from)?;
+            roots.receiver.set(Value::object(receiver));
+        }
         crate::object::set_prototype_value(
             receiver,
             &mut self.gc_heap,
             Some(roots.scratch_0.get()),
         );
         Ok(roots.receiver.get())
+    }
+
+    /// Build guarded, pre-reserved field-transition programs for one exact
+    /// base→derived construction chain.
+    ///
+    /// Shape publication remains at each original `StoreProperty`. This phase
+    /// only interns the child shapes and reserves hidden slab capacity while
+    /// the selected prototype and `new.target` are rooted. A prototype field,
+    /// proxy/value prototype, duplicate name, or excessive chain stops the
+    /// plan before generated code can perform an effect.
+    /// Learn the exact base-to-derived field chain from a class wrapper without
+    /// performing an observable `prototype` lookup. This lets a legacy
+    /// materialized `New` caller seed the replacement backend before the
+    /// canonical construct runs; only receivers that fit the in-body slab are
+    /// admitted because this observation does not reserve an out-of-line slab.
+    pub(crate) fn observe_class_constructor_field_transitions(
+        &mut self,
+        context: &ExecutionContext,
+        new_target: Value,
+    ) -> Result<(), VmError> {
+        let Some(class) = new_target.as_class_constructor() else {
+            return Ok(());
+        };
+        let super_constructor = class.ctor_proto(&self.gc_heap);
+        let base_callable = super_constructor
+            .as_class_constructor()
+            .map(|class| class.ctor(&self.gc_heap))
+            .unwrap_or(super_constructor);
+        let Some(base_function_id) = base_callable.as_function().or_else(|| {
+            base_callable
+                .as_closure(&self.gc_heap)
+                .map(|closure| closure.function_id())
+        }) else {
+            return Ok(());
+        };
+        let derived_callable = class.ctor(&self.gc_heap);
+        let Some(derived_function_id) = derived_callable.as_function().or_else(|| {
+            derived_callable
+                .as_closure(&self.gc_heap)
+                .map(|closure| closure.function_id())
+        }) else {
+            return Ok(());
+        };
+        let store_count = [base_function_id, derived_function_id]
+            .into_iter()
+            .filter_map(|function_id| context.exec_function(function_id))
+            .map(|function| {
+                crate::constructor_fast_path::match_constructor_shape_stores(context, function)
+                    .len()
+            })
+            .sum::<usize>();
+        if store_count == 0 || store_count > crate::object::INLINE_SLOT_CAP {
+            return Ok(());
+        }
+
+        let roots = SyncJsCallRoots::construct(base_callable, new_target, SmallVec::new());
+        roots
+            .scratch_0
+            .set(Value::object(class.prototype(&self.gc_heap)));
+        let _roots_guard = self
+            .gc_heap
+            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+        self.prepare_constructor_field_transitions(
+            context,
+            base_function_id,
+            roots.new_target.get(),
+            roots.scratch_0.get(),
+            &roots,
+        )?;
+        Ok(())
+    }
+
+    fn prepare_constructor_field_transitions(
+        &mut self,
+        context: &ExecutionContext,
+        base_function_id: u32,
+        new_target: Value,
+        prototype: Value,
+        roots: &SyncJsCallRoots,
+    ) -> Result<usize, VmError> {
+        const MAX_PROTOTYPE_HOPS: usize = 64;
+        // This transition program is class-chain metadata. Ordinary function
+        // constructors retain their settled StoreProperty/IC path; installing
+        // and recompiling a one-off program there would perturb call-tier
+        // feedback without providing a stable class/prototype identity.
+        if !new_target.is_class_constructor() {
+            return Ok(0);
+        }
+        let derived_function_id = new_target
+            .as_class_constructor()
+            .map(|class| class.ctor(&self.gc_heap))
+            .unwrap_or(new_target)
+            .as_function()
+            .or_else(|| {
+                new_target
+                    .as_class_constructor()
+                    .map(|class| class.ctor(&self.gc_heap))
+                    .unwrap_or(new_target)
+                    .as_closure(&self.gc_heap)
+                    .map(|closure| closure.function_id())
+            })
+            .filter(|&function_id| {
+                function_id != base_function_id
+                    && context
+                        .exec_function(function_id)
+                        .is_some_and(|function| function.is_derived_constructor)
+            });
+        let chain_key = (
+            base_function_id,
+            derived_function_id.unwrap_or(base_function_id),
+        );
+        if let Some(&capacity) = self.constructor_field_capacity_cache.get(&chain_key) {
+            return Ok(capacity);
+        }
+        let Some(mut prototype_object) = prototype.as_object() else {
+            return Ok(0);
+        };
+        // Class prototypes are initially assembled in dictionary storage. A
+        // generated guard cannot name that mutable identity, so converge the
+        // selected prototype chain onto the ordinary hidden-class path before
+        // recording it. The migration roots and refreshes `prototype_object`.
+        self.migrate_slow_to_fast(&mut prototype_object);
+        roots.scratch_0.set(Value::object(prototype_object));
+        let mut prototype_shapes = Vec::new();
+        let mut current = Some(Value::object(prototype_object));
+        while let Some(value) = current {
+            let Some(object) = value.as_object() else {
+                return Ok(0);
+            };
+            if !crate::object::supports_fast_property_ic(object, &self.gc_heap)
+                || prototype_shapes.len() == MAX_PROTOTYPE_HOPS
+            {
+                return Ok(0);
+            }
+            if crate::object::shape(object, &self.gc_heap).is_null() {
+                return Ok(0);
+            }
+            let shape = crate::object::shape_id(object, &self.gc_heap);
+            prototype_shapes.push(shape);
+            current = crate::object::prototype_value(object, &self.gc_heap);
+        }
+
+        let mut functions = smallvec::SmallVec::<[u32; 2]>::new();
+        functions.push(base_function_id);
+        if let Some(function_id) = derived_function_id {
+            functions.push(function_id);
+        }
+
+        let mut shape = self.shape_root();
+        let mut slot = 0u16;
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut reopt_functions = smallvec::SmallVec::<[u32; 2]>::new();
+        for function_id in functions {
+            let Some(function) = context.exec_function(function_id) else {
+                break;
+            };
+            let stores =
+                crate::constructor_fast_path::match_constructor_shape_stores(context, function);
+            let receiver_is_pre_shaped = function_id == base_function_id
+                && crate::constructor_fast_path::match_simple_constructor_init(context, function)
+                    .is_some();
+            for store in stores {
+                if !seen.insert(store.name.clone())
+                    || !matches!(
+                        crate::object::lookup(prototype_object, &self.gc_heap, &store.name),
+                        crate::object::PropertyLookup::Absent
+                    )
+                {
+                    return Ok(usize::from(slot));
+                }
+                let from_shape = shape;
+                let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                    otter_gc::ExtraRootSource::visit_extra_roots(roots, visitor);
+                };
+                shape = if let Some(child) = self.shape_runtime.child_if_cached(
+                    &self.gc_heap,
+                    shape,
+                    &store.name,
+                    crate::object::PropertyFlags::data_default(),
+                    false,
+                ) {
+                    child
+                } else {
+                    self.shape_runtime
+                        .child_with_roots(
+                            &mut self.gc_heap,
+                            shape,
+                            &store.name,
+                            crate::object::PropertyFlags::data_default(),
+                            false,
+                            &mut external_visit,
+                        )
+                        .map_err(VmError::from)?
+                };
+                let transition = crate::jit::JitConstructorFieldTransitionPlan {
+                    from_shape: self.shape_runtime.id_for_handle(&self.gc_heap, from_shape),
+                    to_shape: self.shape_runtime.id_for_handle(&self.gc_heap, shape),
+                    prototype_shapes: prototype_shapes.clone(),
+                    slot,
+                };
+                if !receiver_is_pre_shaped {
+                    let transitions = self
+                        .constructor_field_transition_cache
+                        .entry(function_id)
+                        .or_default();
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        transitions.entry(store.byte_pc)
+                    {
+                        entry.insert(transition);
+                        self.jit_runtime_stats.constructor_field_transition_installs = self
+                            .jit_runtime_stats
+                            .constructor_field_transition_installs
+                            .saturating_add(1);
+                        if !reopt_functions.contains(&function_id) {
+                            reopt_functions.push(function_id);
+                        }
+                    }
+                }
+                slot = slot.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            }
+        }
+        // The first generated receiver preparation can discover these plans
+        // after an earlier hot loop already compiled the constructor. Retire
+        // that stale generation once; permanent function cells and generation
+        // leases keep the already-selected current call safe, while the next
+        // entry recompiles against the richer transition snapshot.
+        let capacity = usize::from(slot);
+        self.constructor_field_capacity_cache
+            .insert(chain_key, capacity);
+        for function_id in reopt_functions {
+            self.evict_compiled_for_reopt(function_id);
+        }
+        Ok(capacity)
     }
 
     /// Apply the derived-constructor return rules to one generated callee.

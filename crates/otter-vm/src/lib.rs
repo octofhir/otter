@@ -552,6 +552,16 @@ pub struct JitRuntimeStats {
     /// Compiler-generated stack-frame calls that cold-deoptimized and resumed
     /// through the interpreter.
     pub generated_call_deopts: u64,
+    /// Generated base-constructor result substitutions at the native boundary.
+    pub base_construct_result_transitions: u64,
+    /// Generated derived-constructor result validations at the native boundary.
+    pub derived_construct_result_transitions: u64,
+    /// Generated derived-`this` binding transitions.
+    pub derived_this_bind_transitions: u64,
+    /// Generated exact-class superclass resolution transitions.
+    pub class_super_resolution_transitions: u64,
+    /// VM-baked constructor field transitions published for recompilation.
+    pub constructor_field_transition_installs: u64,
     /// Generated callers invalidated because a callee generation changed.
     /// Stable function entry cells keep this at zero for tier publication.
     pub caller_invalidations: u64,
@@ -923,6 +933,16 @@ pub struct Interpreter {
     /// These handles are traced explicitly because a moving GC must rewrite the
     /// cache slot, not only the owning `shape_runtime` transition table.
     simple_constructor_shape_cache: rustc_hash::FxHashMap<u32, object::ShapeHandle>,
+    /// Generated constructor-field transition programs learned while the
+    /// exact receiver prototype is rooted during allocation.
+    constructor_field_transition_cache: rustc_hash::FxHashMap<
+        u32,
+        rustc_hash::FxHashMap<u32, jit::JitConstructorFieldTransitionPlan>,
+    >,
+    /// Reserved own-slot capacity for an already planned exact base/derived
+    /// chain. Plans remain guarded at their original stores, so repeated
+    /// receiver allocation need not rescan the prototype graph.
+    constructor_field_capacity_cache: rustc_hash::FxHashMap<(u32, u32), usize>,
     /// Final hidden class of an arguments object, keyed by argument count and
     /// mapped-ness. Same tracing contract as the constructor cache above.
     arguments_shape_cache: rustc_hash::FxHashMap<(u32, bool), object::ShapeHandle>,

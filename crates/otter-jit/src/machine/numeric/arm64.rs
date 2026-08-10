@@ -39,7 +39,7 @@
 
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 use otter_vm::{
-    JitCompileSnapshot, Value,
+    JitCompileSnapshot, NativeFrameFlags, Value,
     deopt::DeoptRuntime,
     native_abi::{
         RuntimeStubDescriptor, STUB_JIT_BACKEDGE_POLL, STUB_JIT_BIND_DERIVED_THIS,
@@ -68,12 +68,15 @@ use crate::{
         CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, MACHINE_ROOT_RECORD_BASE_OFFSET,
         MACHINE_ROOT_RECORD_CODE_OBJECT_ID_OFFSET, MACHINE_ROOT_RECORD_COUNT_OFFSET,
         MACHINE_ROOT_RECORD_PREVIOUS_OFFSET, MACHINE_ROOT_RECORD_SAFEPOINT_ID_OFFSET,
-        MACHINE_ROOT_RECORD_SIZE, MACHINE_ROOTS_PTR_OFFSET, NATIVE_FRAME_OFFSET,
-        NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
+        MACHINE_ROOT_RECORD_SIZE, MACHINE_ROOTS_PTR_OFFSET, NATIVE_FRAME_FLAGS_OFFSET,
+        NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
         NATIVE_FRAME_REGISTER_COUNT_OFFSET, NATIVE_FRAME_THIS_OFFSET, NUMBER_TAG_HI16,
-        STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THREAD_OFFSET, VALUE_UNDEFINED,
-        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_CODE_OBJECT_ID_OFFSET,
+        OBJECT_BODY_TYPE_TAG, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THREAD_OFFSET,
+        VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_CODE_OBJECT_ID_OFFSET,
         VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
+    },
+    template::arm64::values::{
+        CellTest, emit_cell_test, emit_slab_base, emit_write_barrier_with_context,
     },
 };
 use std::collections::BTreeMap;
@@ -130,6 +133,8 @@ pub(super) struct Emission {
     pub(super) relocations: RelocationCapture,
     pub(super) osr_entries: BTreeMap<u32, usize>,
     pub(super) osr_regions: Vec<(u32, usize, usize)>,
+    pub(super) constructor_field_regions: Vec<(u32, usize, usize)>,
+    pub(super) structural_regions: Vec<(&'static str, usize, usize)>,
 }
 
 struct OsrSite {
@@ -245,12 +250,10 @@ pub(super) fn emit(
     resolve_direct_entry: u64,
     try_prepare_construct_entry: u64,
     prepare_construct_entry: u64,
-    construct_result_entry: u64,
     derived_construct_result_entry: u64,
     copy_spread_arguments_entry: u64,
     initialize_upvalues_entry: u64,
     bind_derived_this_entry: u64,
-    class_super_constructor_entry: u64,
     load_upvalue_value_entry: u64,
     string_concat_entry: u64,
     number_rem_entry: u64,
@@ -279,6 +282,8 @@ pub(super) fn emit(
         .map(|_| ops.new_dynamic_label())
         .collect::<Vec<_>>();
     let mut relocations = RelocationCapture::new(capture_artifacts);
+    let mut constructor_field_regions = Vec::new();
+    let mut structural_regions = Vec::new();
     let block_labels = sequence
         .blocks()
         .iter()
@@ -710,6 +715,112 @@ pub(super) fn emit(
                 integer_register(locations[0])?,
                 integer_register(locations[1])?,
             ),
+            MachineOpcode::ConstructorFieldStore(byte_pc) => {
+                let transition = view
+                    .constructor_field_transitions
+                    .get(&byte_pc)
+                    .ok_or(Unsupported::OperandShape("constructor field transition"))?;
+                let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let start = ops.offset().0;
+                // x9-x16 are emitter scratch registers, and regalloc may also
+                // place the field value in x9. Preserve the early-use value
+                // in the non-allocatable x17 before the receiver guards
+                // overwrite any allocator-owned scratch home.
+                emit_load_allocated_tagged(&mut ops, frame, locations[1], 17, 0)?;
+                emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; movz x11, NUMBER_TAG_HI16, lsl #48
+                    ; orr x11, x11, #0x2
+                    ; tst x9, x11
+                    ; b.ne =>deopt
+                    ; mov w11, w9
+                );
+                emit_load_symbolic_u64(
+                    &mut ops,
+                    &mut relocations,
+                    12,
+                    view.cage_base as u64,
+                    RelocationTarget::GcCageBase,
+                );
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; add x13, x12, x11
+                    ; ldrb w16, [x13]
+                    ; cmp w16, OBJECT_BODY_TYPE_TAG
+                    ; b.ne =>deopt
+                    ; ldr w16, [x13, view.object_shape_byte]
+                );
+                emit_load_u64(&mut ops, 15, u64::from(transition.from_shape));
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; cmp w16, w15
+                    ; b.ne =>deopt
+                    ; ldrh w16, [x13, view.object_slab_len_byte]
+                    ; cmp w16, transition.slot as u32
+                    ; b.ne =>deopt
+                );
+                for &prototype_shape in &transition.prototype_shapes {
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr w11, [x13, view.jit_proto_byte]
+                        ; cbz w11, =>deopt
+                        ; add x13, x12, x11
+                        ; ldrb w16, [x13]
+                        ; cmp w16, OBJECT_BODY_TYPE_TAG
+                        ; b.ne =>deopt
+                        ; ldr w16, [x13, view.object_shape_byte]
+                    );
+                    emit_load_u64(&mut ops, 15, u64::from(prototype_shape));
+                    dynasm!(ops ; .arch aarch64 ; cmp w16, w15 ; b.ne =>deopt);
+                }
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr w11, [x13, view.jit_proto_byte]
+                    ; cbnz w11, =>deopt
+                );
+
+                // Recompute the receiver after walking the prototype chain;
+                // every observable guard precedes the first mutation.
+                emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; mov w11, w9 ; add x13, x12, x11);
+                emit_load_u64(&mut ops, 14, u64::from(transition.to_shape));
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; str w14, [x13, view.object_shape_byte]
+                    ; mov w15, transition.slot as u32 + 1
+                    ; strh w15, [x13, view.object_slab_len_byte]
+                    ; mov x12, x13
+                );
+                if transition.slot == 0 {
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; add x16, x13, view.object_inline_values_byte
+                        ; str x16, [x13, view.object_values_ptr_byte]
+                    );
+                }
+                dynasm!(ops ; .arch aarch64 ; mov x10, x17);
+                dynasm!(ops ; .arch aarch64 ; mov x13, x12);
+                emit_slab_base(&mut ops, view, 13, 14);
+                let slot_byte = u32::from(transition.slot) * 8;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; str x10, [x13, slot_byte]
+                    ; sub sp, sp, #16
+                    ; stp x12, x10, [sp]
+                );
+                // The barrier implementation owns x14-x16 as scratch, so the
+                // raw shape handle must live in a disjoint argument register
+                // if marking makes this call take its slow sibling.
+                emit_load_u64(&mut ops, 3, u64::from(transition.to_shape));
+                emit_write_barrier_with_context(&mut ops, &mut relocations, view, 12, 3, 19);
+                dynasm!(ops ; .arch aarch64 ; ldp x12, x10, [sp] ; add sp, sp, #16);
+                let value_barrier_done = ops.new_dynamic_label();
+                emit_cell_test(&mut ops, 10, 14, CellTest::IsNotCell, value_barrier_done);
+                emit_write_barrier_with_context(&mut ops, &mut relocations, view, 12, 10, 19);
+                dynasm!(ops ; .arch aarch64 ; =>value_barrier_done);
+                constructor_field_regions.push((byte_pc, start, ops.offset().0));
+            }
             MachineOpcode::Return => {
                 let source = integer_register(locations[0])?;
                 dynasm!(ops
@@ -848,7 +959,6 @@ pub(super) fn emit(
                         resolve_direct_entry,
                         try_prepare_construct_entry,
                         prepare_construct_entry,
-                        construct_result_entry,
                         derived_construct_result_entry,
                         copy_spread_arguments_entry,
                         initialize_upvalues_entry,
@@ -858,9 +968,28 @@ pub(super) fn emit(
                         direct_done,
                         19,
                         |ops, source, target, sp_bias| {
-                            let location = *locations
+                            let operand = instruction
+                                .operands
                                 .get(usize::from(source))
                                 .ok_or(Unsupported::OperandShape("scalar direct call source"))?;
+                            // A moving safepoint rewrites the canonical save
+                            // slot named by the late TaggedRoot metadata. Read
+                            // that slot directly after receiver preparation;
+                            // its allocator early/late homes may differ and
+                            // either register may have been clobbered meanwhile.
+                            if let Some(root) =
+                                site.roots.iter().find(|root| root.value == operand.value)
+                            {
+                                let offset = root_offset(frame, root.save_slot)?
+                                    .checked_add(sp_bias)
+                                    .and_then(|offset| offset.checked_add(MACHINE_ROOT_RECORD_SIZE))
+                                    .ok_or(Unsupported::OperandShape(
+                                        "scalar direct call canonical root offset",
+                                    ))?;
+                                emit_sp_ldr_x(ops, target, offset);
+                                return Ok(());
+                            }
+                            let location = locations[usize::from(source)];
                             emit_load_allocated_tagged(
                                 ops,
                                 frame,
@@ -1021,19 +1150,35 @@ pub(super) fn emit(
                             return Err(Unsupported::OperandShape("scalar class-super load call"));
                         }
                         let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                        let start = ops.offset().0;
                         emit_load_allocated_tagged(&mut ops, frame, locations[0], 1, 0)?;
-                        dynasm!(ops ; .arch aarch64 ; mov x0, x19);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; movz x11, NUMBER_TAG_HI16, lsl #48
+                            ; orr x11, x11, #0x2
+                            ; tst x1, x11
+                            ; b.ne =>deopt
+                            ; mov w11, w1
+                        );
                         emit_load_symbolic_u64(
                             &mut ops,
                             &mut relocations,
-                            16,
-                            class_super_constructor_entry,
-                            RelocationTarget::runtime_stub(STUB_JIT_CLASS_SUPER_CONSTRUCTOR),
+                            12,
+                            view.cage_base as u64,
+                            RelocationTarget::GcCageBase,
                         );
-                        dynasm!(ops ; .arch aarch64 ; blr x16);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; add x13, x12, x11
+                            ; ldrb w14, [x13]
+                            ; cmp w14, view.class_constructor_layout.type_tag as u32
+                            ; b.ne =>deopt
+                            ; ldr x0, [x13, view.class_constructor_layout.super_constructor_byte]
+                        );
                         emit_load_u64(&mut ops, 16, Value::hole().to_bits());
                         dynasm!(ops ; .arch aarch64 ; cmp x0, x16 ; b.eq =>deopt);
                         emit_store_allocated_tagged(&mut ops, frame, locations[1], 0, 0)?;
+                        structural_regions.push(("machineClassSuperLoad", start, ops.offset().0));
                         if !is_terminator {
                             emit_edits(
                                 &mut ops,
@@ -1051,18 +1196,43 @@ pub(super) fn emit(
                         if locations.len() < 2 {
                             return Err(Unsupported::OperandShape("scalar derived-this bind call"));
                         }
-                        let site = safepoints
-                            .site(id)
-                            .filter(|site| instruction.safepoint == Some(site.id))
-                            .ok_or(Unsupported::OperandShape(
-                                "scalar derived-this bind safepoint",
-                            ))?;
                         let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                        let fast_start = ops.offset().0;
+                        let bind_cold = ops.new_dynamic_label();
+                        let bind_returned = ops.new_dynamic_label();
                         let bind_done = ops.new_dynamic_label();
-                        emit_save_safepoint_roots(&mut ops, frame, site)?;
                         emit_load_allocated_tagged(&mut ops, frame, locations[0], 1, 0)?;
-                        emit_publish_machine_roots(&mut ops, frame, site)?;
-                        dynasm!(ops ; .arch aarch64 ; mov x0, x19);
+                        let required_flags = u32::from(
+                            NativeFrameFlags::STACK_REGISTERS
+                                | NativeFrameFlags::DERIVED_CONSTRUCTOR,
+                        );
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr x16, [x19, NATIVE_FRAME_OFFSET]
+                            ; ldrb w14, [x16, NATIVE_FRAME_FLAGS_OFFSET]
+                            ; and w14, w14, required_flags
+                            ; cmp w14, required_flags
+                            ; b.ne =>bind_cold
+                            ; ldr x14, [x16, NATIVE_FRAME_THIS_OFFSET]
+                        );
+                        emit_load_u64(&mut ops, 15, Value::hole().to_bits());
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; cmp x14, x15
+                            ; b.ne =>bind_cold
+                            ; str x1, [x16, NATIVE_FRAME_THIS_OFFSET]
+                            ; mov x0, x1
+                        );
+                        emit_store_allocated_tagged(&mut ops, frame, locations[1], 0, 0)?;
+                        dynasm!(ops ; .arch aarch64 ; b =>bind_done);
+                        structural_regions.push((
+                            "machineDerivedThisBindFast",
+                            fast_start,
+                            ops.offset().0,
+                        ));
+
+                        dynasm!(ops ; .arch aarch64 ; =>bind_cold ; mov x0, x19);
+                        let cold_start = ops.offset().0;
                         emit_load_symbolic_u64(
                             &mut ops,
                             &mut relocations,
@@ -1073,15 +1243,11 @@ pub(super) fn emit(
                         dynasm!(ops
                             ; .arch aarch64
                             ; blr x16
-                            ; mov x6, x0
                             ; and x5, x1, #0xff
                         );
-                        emit_clear_machine_roots(&mut ops);
-                        emit_reload_safepoint_roots(&mut ops, frame, site)?;
                         dynasm!(ops
                             ; .arch aarch64
-                            ; mov x0, x6
-                            ; cbz x5, =>bind_done
+                            ; cbz x5, =>bind_returned
                             ; cmp x5, STATUS_THREW as u32
                             ; b.ne =>deopt
                         );
@@ -1100,8 +1266,14 @@ pub(super) fn emit(
                                 ));
                             }
                         }
-                        dynasm!(ops ; .arch aarch64 ; =>bind_done);
+                        dynasm!(ops ; .arch aarch64 ; =>bind_returned);
                         emit_store_allocated_tagged(&mut ops, frame, locations[1], 0, 0)?;
+                        structural_regions.push((
+                            "machineDerivedThisBindCold",
+                            cold_start,
+                            ops.offset().0,
+                        ));
+                        dynasm!(ops ; .arch aarch64 ; =>bind_done);
                         if !is_terminator {
                             emit_edits(
                                 &mut ops,
@@ -1368,6 +1540,8 @@ pub(super) fn emit(
         relocations,
         osr_entries,
         osr_regions,
+        constructor_field_regions,
+        structural_regions,
     })
 }
 
@@ -2149,6 +2323,15 @@ fn emit_sp_address_x9(ops: &mut dynasmrt::aarch64::Assembler, offset: u32) {
     } else {
         emit_load_u64(ops, 9, u64::from(offset));
         dynasm!(ops ; .arch aarch64 ; add x9, sp, x9);
+    }
+}
+
+fn emit_sp_ldr_x(ops: &mut dynasmrt::aarch64::Assembler, register: u8, offset: u32) {
+    if offset <= 32_760 && offset.is_multiple_of(8) {
+        dynasm!(ops ; .arch aarch64 ; ldr X(register), [sp, offset]);
+    } else {
+        emit_sp_address_x9(ops, offset);
+        dynasm!(ops ; .arch aarch64 ; ldr X(register), [x9]);
     }
 }
 

@@ -2891,11 +2891,25 @@ pub(crate) fn alloc_object_with_shape_roots(
 /// Initialize a freshly allocated shaped object with the values for every
 /// hidden-class data slot, in shape order.
 pub(crate) fn initialize_shaped_data_slots(obj: JsObject, heap: &mut GcHeap, values: &[Value]) {
+    initialize_shaped_data_slots_with_capacity(obj, heap, values, values.len());
+}
+
+/// Initialize the visible prefix of a freshly shaped object while reserving
+/// room for later constructor-owned transitions.
+///
+/// Capacity is not observable: `slab_len` advances only for `values`, and each
+/// later field becomes visible at its original `StoreProperty` operation.
+pub(crate) fn initialize_shaped_data_slots_with_capacity(
+    obj: JsObject,
+    heap: &mut GcHeap,
+    values: &[Value],
+    capacity: usize,
+) {
     let mut obj = obj;
     let stored = SmallVec::<[Value; 8]>::from_slice(values);
     let expected = heap.read_payload(obj, |body| body_property_count(heap, body));
     let mut stored = stored;
-    if reserve_slot_capacity(&mut obj, heap, stored.len(), &mut stored).is_err() {
+    if reserve_slot_capacity(&mut obj, heap, capacity.max(stored.len()), &mut stored).is_err() {
         return;
     }
     heap.with_payload(obj, |body| {
@@ -2916,6 +2930,17 @@ pub(crate) fn initialize_shaped_data_slots(obj: JsObject, heap: &mut GcHeap, val
     for &value in &stored {
         record_slot_write(heap, obj, value);
     }
+}
+
+/// Reserve an empty fresh object's hidden property slab without publishing a
+/// property or changing its root hidden class.
+pub(crate) fn reserve_fresh_object_slot_capacity(
+    obj: &mut JsObject,
+    heap: &mut GcHeap,
+    capacity: usize,
+) -> Result<(), otter_gc::OutOfMemory> {
+    debug_assert_eq!(heap.read_payload(*obj, ObjectBody::slab_len), 0);
+    reserve_slot_capacity(obj, heap, capacity, &mut [])
 }
 
 /// Replace the root hidden class on a fresh, slotless object before bulk

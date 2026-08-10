@@ -1282,26 +1282,15 @@ pub const STUB_JIT_PREPARE_BASE_CONSTRUCT: RuntimeStubDescriptor = descriptor(
     87,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
-    2,
+    3,
     RuntimeStubEffects::reentrant(true),
     RuntimeStubException::Status,
     RuntimeStubResultAbi::StatusPair,
 );
 
-/// Pure base-constructor return substitution over `(result, receiver)`.
-pub const STUB_JIT_BASE_CONSTRUCT_RESULT: RuntimeStubDescriptor = descriptor(
-    88,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::Variadic,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::ValueWord,
-);
-
 /// Derived-constructor return validation over `(result, bound_this)`.
 pub const STUB_JIT_DERIVED_CONSTRUCT_RESULT: RuntimeStubDescriptor = descriptor(
-    89,
+    88,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
     2,
@@ -1312,18 +1301,18 @@ pub const STUB_JIT_DERIVED_CONSTRUCT_RESULT: RuntimeStubDescriptor = descriptor(
 
 /// Bind one Machine IR value as the current derived constructor's `this`.
 pub const STUB_JIT_BIND_DERIVED_THIS: RuntimeStubDescriptor = descriptor(
-    90,
-    RuntimeStubClass::Reentrant,
+    89,
+    RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::Variadic,
     1,
-    RuntimeStubEffects::reentrant(true),
+    RuntimeStubEffects::leaf(true, false),
     RuntimeStubException::Status,
     RuntimeStubResultAbi::StatusPair,
 );
 
 /// Read the live superclass constructor from an exact class wrapper.
 pub const STUB_JIT_CLASS_SUPER_CONSTRUCTOR: RuntimeStubDescriptor = descriptor(
-    91,
+    90,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::Variadic,
     1,
@@ -1334,7 +1323,7 @@ pub const STUB_JIT_CLASS_SUPER_CONSTRUCTOR: RuntimeStubDescriptor = descriptor(
 
 /// Read one captured binding directly into an SSA result.
 pub const STUB_JIT_LOAD_UPVALUE_VALUE: RuntimeStubDescriptor = descriptor(
-    92,
+    91,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::Variadic,
     1,
@@ -1351,7 +1340,7 @@ pub const STUB_JIT_LOAD_UPVALUE_VALUE: RuntimeStubDescriptor = descriptor(
 /// ignored. The source is the compiler-created dense argument array; a
 /// different value reports a pre-entry guard miss.
 pub const STUB_JIT_COPY_SPREAD_ARGUMENTS: RuntimeStubDescriptor = descriptor(
-    93,
+    92,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::Variadic,
     3,
@@ -1362,7 +1351,7 @@ pub const STUB_JIT_COPY_SPREAD_ARGUMENTS: RuntimeStubDescriptor = descriptor(
 /// Allocate fresh capture cells and complete an unpublished generated frame's
 /// stack-owned upvalue spine.
 pub const STUB_JIT_INITIALIZE_UPVALUES: RuntimeStubDescriptor = descriptor(
-    94,
+    93,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -1377,7 +1366,7 @@ pub const STUB_JIT_INITIALIZE_UPVALUES: RuntimeStubDescriptor = descriptor(
 /// the exact generated target so conservative straight-line initializers can
 /// allocate their receiver with the final hidden class and undefined slots.
 pub const STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT: RuntimeStubDescriptor = descriptor(
-    95,
+    94,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::Variadic,
     3,
@@ -1539,14 +1528,13 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         85 => "number_pow_f64_leaf",
         86 => "number_to_int32_f64_leaf",
         87 => "jit_prepare_base_construct",
-        88 => "jit_base_construct_result",
-        89 => "jit_derived_construct_result",
-        90 => "jit_bind_derived_this",
-        91 => "jit_class_super_constructor",
-        92 => "jit_load_upvalue_value",
-        93 => "jit_copy_spread_arguments",
-        94 => "jit_initialize_upvalues",
-        95 => "jit_try_prepare_base_construct",
+        88 => "jit_derived_construct_result",
+        89 => "jit_bind_derived_this",
+        90 => "jit_class_super_constructor",
+        91 => "jit_load_upvalue_value",
+        92 => "jit_copy_spread_arguments",
+        93 => "jit_initialize_upvalues",
+        94 => "jit_try_prepare_base_construct",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1640,7 +1628,6 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_NUMBER_POW_F64_LEAF,
     STUB_NUMBER_TO_INT32_F64_LEAF,
     STUB_JIT_PREPARE_BASE_CONSTRUCT,
-    STUB_JIT_BASE_CONSTRUCT_RESULT,
     STUB_JIT_DERIVED_CONSTRUCT_RESULT,
     STUB_JIT_BIND_DERIVED_THIS,
     STUB_JIT_CLASS_SUPER_CONSTRUCTOR,

@@ -1003,7 +1003,7 @@ impl ModuleLoader {
         // formats are the same shape, parsed by the host so the module body
         // is a JSON literal either way.
         if let Some(format) = crate::data_modules::DataFormat::from_extension(extension) {
-            let raw = std::fs::read_to_string(path).map_err(|e| LoaderError::Load {
+            let raw = std::fs::read(path).map_err(|e| LoaderError::Load {
                 url: url.clone(),
                 message: e.to_string(),
             })?;

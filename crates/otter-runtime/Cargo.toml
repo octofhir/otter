@@ -16,6 +16,7 @@ otter-gc = { workspace = true }
 otter-jit = { workspace = true }
 otter-syntax = { workspace = true }
 otter-vm = { workspace = true }
+otter-xml = { workspace = true }
 oxc_ast = { workspace = true }
 oxc_ast_visit = { workspace = true }
 oxc_resolver = { workspace = true }

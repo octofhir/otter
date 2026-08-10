@@ -373,3 +373,50 @@ fn a_sink_may_be_driven_directly_over_utf16() {
     otter_xml::scan::parse::<Latin1, _>(b"<a>\xFF</a>", &mut sink).unwrap();
     assert_eq!(text_children(&sink.finish().unwrap()), vec!["ÿ"]);
 }
+
+#[test]
+fn a_byte_order_mark_and_the_declaration_have_to_agree() {
+    let ascii = |text: &str| text.bytes().collect::<Vec<u8>>();
+    let mut utf8_bom = vec![0xEF, 0xBB, 0xBF];
+    utf8_bom.extend(ascii("<?xml version='1.0' encoding='utf-8'?><a/>"));
+    assert_eq!(parse_bytes(&utf8_bom).unwrap().name, "a");
+
+    let mut contradicted = vec![0xEF, 0xBB, 0xBF];
+    contradicted.extend(ascii("<?xml version='1.0' encoding='iso-8859-1'?><a/>"));
+    assert!(matches!(
+        parse_bytes(&contradicted).unwrap_err().kind,
+        ErrorKind::BadDeclaration(_)
+    ));
+
+    let utf16 = |text: &str, bom: [u8; 2]| {
+        let mut bytes = bom.to_vec();
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    };
+    let agreed = utf16("<?xml version='1.0' encoding='utf-16'?><a/>", [0xFF, 0xFE]);
+    assert_eq!(parse_bytes(&agreed).unwrap().name, "a");
+    let contradicted = utf16("<?xml version='1.0' encoding='utf-8'?><a/>", [0xFF, 0xFE]);
+    assert!(matches!(
+        parse_bytes(&contradicted).unwrap_err().kind,
+        ErrorKind::BadDeclaration(_)
+    ));
+}
+
+#[test]
+fn the_declaration_needs_whitespace_between_its_parts() {
+    assert_eq!(root("<?xml version='1.0' standalone='yes'?><a/>").name, "a");
+    assert!(matches!(
+        kind("<?xml version='1.0'standalone='yes'?><a/>"),
+        ErrorKind::ExpectedWhitespace
+    ));
+    assert!(matches!(
+        kind("<?xml version='1.0'encoding='utf-8'?><a/>"),
+        ErrorKind::ExpectedWhitespace
+    ));
+    assert!(matches!(
+        kind("<?xml version='1.0' encoding='utf-8'standalone='no'?><a/>"),
+        ErrorKind::ExpectedWhitespace
+    ));
+}

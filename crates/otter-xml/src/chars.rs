@@ -109,9 +109,51 @@ pub const fn is_name_char(code: u32) -> bool {
         || (0x203F <= code && code <= 0x2040)
 }
 
+/// Whether `code` may appear in a public identifier, whose alphabet the
+/// grammar narrows to what every character set of the day spelled the same
+/// way.
+#[inline]
+#[must_use]
+pub const fn is_pubid_char(code: u32) -> bool {
+    matches!(code, 0x20 | 0xD | 0xA)
+        || matches!(code, 0x30..=0x39 | 0x41..=0x5A | 0x61..=0x7A)
+        || matches!(
+            code,
+            0x2D | 0x27
+                | 0x28
+                | 0x29
+                | 0x2B
+                | 0x2C
+                | 0x2E
+                | 0x2F
+                | 0x3A
+                | 0x3D
+                | 0x3F
+                | 0x3B
+                | 0x21
+                | 0x2A
+                | 0x23
+                | 0x40
+                | 0x24
+                | 0x5F
+                | 0x25
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_identifiers_keep_to_their_own_alphabet() {
+        assert!(is_pubid_char(u32::from(b'A')) && is_pubid_char(u32::from(b'9')));
+        assert!(is_pubid_char(u32::from(b'-')) && is_pubid_char(u32::from(b'\'')));
+        assert!(is_pubid_char(0x20) && is_pubid_char(0xA) && is_pubid_char(0xD));
+        assert!(!is_pubid_char(0x9));
+        assert!(!is_pubid_char(u32::from(b'<')) && !is_pubid_char(u32::from(b'"')));
+        assert!(!is_pubid_char(u32::from(b'[')) && !is_pubid_char(u32::from(b'\\')));
+        assert!(!is_pubid_char(0xE9));
+    }
 
     #[test]
     fn char_production_excludes_controls_surrogates_and_noncharacters() {

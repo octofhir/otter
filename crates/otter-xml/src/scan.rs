@@ -385,7 +385,7 @@ impl<'a, E: Encoding> Scanner<'a, E> {
         {
             return self.err(ErrorKind::BadDeclaration("version must be 1.x"));
         }
-        let had_space = self.skip_whitespace();
+        let mut had_space = self.skip_whitespace();
         if self.starts_with(self.pos, b"encoding") {
             if !had_space {
                 return self.err(ErrorKind::ExpectedWhitespace);
@@ -399,9 +399,12 @@ impl<'a, E: Encoding> Scanner<'a, E> {
             if !legal {
                 return self.err(ErrorKind::BadDeclaration("encoding name is not a name"));
             }
-            self.skip_whitespace();
+            had_space = self.skip_whitespace();
         }
         if self.starts_with(self.pos, b"standalone") {
+            if !had_space {
+                return self.err(ErrorKind::ExpectedWhitespace);
+            }
             self.pos += 10;
             let value = self.scan_pseudo_attribute_value()?;
             let units = &self.units[value];

@@ -5,6 +5,8 @@
 //! - Spill-slot addressing and register/location loads and stores.
 //! - Representation conversions, boxing, constant materialization.
 //! - Frame prologue and epilogue.
+//! - Published root/spliced register-window addressing across temporary
+//!   generated-linkage stack reservations.
 //!
 //! # Invariants
 //! - Nothing here decides *what* to emit; every function lowers one already
@@ -493,6 +495,37 @@ pub(super) fn emit_window_base(
     } else {
         emit_load_u32(ops, 12, offset);
         dynasm!(ops ; .arch aarch64 ; add x8, sp, x12);
+    }
+    Ok(WINDOW_SCRATCH)
+}
+
+/// Register-window base while generated linkage has temporarily moved `sp`.
+///
+/// Root windows are heap/interpreter-owned through `x19` and never move. An
+/// inlined frame's window belongs to this code object's fixed stack frame, so
+/// linkage reports the exact downward stack bias that must be added back
+/// before addressing it. `offset_scratch` must not contain a value the caller
+/// is about to store through the returned base.
+pub(super) fn emit_window_base_with_bias(
+    ops: &mut Assembler,
+    windows: &InlineWindows,
+    inline: InlineId,
+    sp_bias: u32,
+    offset_scratch: u8,
+) -> Result<u8, Unsupported> {
+    if inline == InlineId::ROOT {
+        return Ok(19);
+    }
+    let offset = windows
+        .get(inline)?
+        .window
+        .checked_add(sp_bias)
+        .ok_or(Unsupported::OperandShape("optimizing biased inline window"))?;
+    if offset <= 4095 {
+        dynasm!(ops ; .arch aarch64 ; add x8, sp, offset);
+    } else {
+        emit_load_u32(ops, offset_scratch, offset);
+        dynasm!(ops ; .arch aarch64 ; add x8, sp, X(offset_scratch));
     }
     Ok(WINDOW_SCRATCH)
 }

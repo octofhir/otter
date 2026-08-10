@@ -3120,8 +3120,8 @@ mod tests {
                 )
         };
         assert!(
-            counter("jit-generated-calls") > 300_000,
-            "kernel must execute generated constructor linkage"
+            (350_000..450_000).contains(&counter("jit-generated-calls")),
+            "the wrapper must inline while both constructor edges retain generated linkage"
         );
         assert_eq!(counter("jit-generated-call-deopts"), 0);
         assert_eq!(counter("jit-to-rust-call-transitions"), 0);
@@ -3129,8 +3129,8 @@ mod tests {
         assert_eq!(counter("jit-derived-construct-result-transitions"), 0);
         assert_eq!(counter("jit-derived-this-bind-transitions"), 47);
         assert_eq!(counter("jit-class-super-resolution-transitions"), 2);
-        assert_eq!(counter("jit-compile-attempts"), 4);
-        assert_eq!(counter("jit-code-generations"), 6);
+        assert_eq!(counter("jit-compile-attempts"), 3);
+        assert_eq!(counter("jit-code-generations"), 5);
         assert!(counter("jit-runtime-property-stubs") < 50_000);
         for metric in [
             "jit-compiler-wall-time-total",

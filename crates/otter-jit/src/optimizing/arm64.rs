@@ -10,8 +10,8 @@
 //!   exact-PC chain exits for reentrant operations in spliced frames.
 //! - Direct live-value reads from baked global lexical cells and guarded
 //!   global-object property records.
-//! - Baked stable-entry plain and method calls with stack-owned rooted callee
-//!   frames.
+//! - Baked stable-entry plain, method, and constructor calls with stack-owned
+//!   rooted callee frames, including calls owned by spliced bodies.
 //! - Guarded plain- and method-callee splicing with multi-frame exact-PC
 //!   deoptimization and synthetic `this` binding.
 //! - Loop-invariant method-identity caching and receiver-property guard fusion.
@@ -67,6 +67,10 @@
 //!   frame's is a reservation in this generation's own stack frame, published
 //!   as a stack-owned activation — together with every spliced frame it is
 //!   paused inside — for the duration of the call.
+//! - Generated construction inside a spliced frame reads arguments and writes
+//!   results through that published window. Receiver preparation and callee
+//!   execution may move objects, so every generated-linkage cleanup reloads
+//!   tagged SSA homes before the inline body resumes or deoptimizes.
 //! - A baked global lexical address names a permanent old-space cell. Generated
 //!   code loads the cell's current value and uses the canonical transition for
 //!   TDZ holes.
@@ -101,10 +105,12 @@ use otter_bytecode::{Op, Operand};
 use otter_vm::deopt::{DeoptExitDescriptor, DeoptExitId, DeoptRuntime, DeoptTable};
 use otter_vm::native_abi::{
     FrameMap, NO_FRAME_STATE, RuntimeStubDescriptor, STUB_JIT_BACKEDGE_POLL, STUB_JIT_CONSTRUCT,
-    STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_LOAD_ELEMENT,
-    STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROPERTY, STUB_JIT_LOAD_STRING, STUB_JIT_LOAD_UPVALUE,
-    STUB_JIT_LOOSE_EQ, STUB_JIT_SPREAD_CALL_OP, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY,
-    STUB_JIT_STORE_UPVALUE, STUB_JIT_STORE_UPVALUE_CHECKED, SafepointId, SafepointRecord,
+    STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_DERIVED_CONSTRUCT_RESULT,
+    STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROPERTY, STUB_JIT_LOAD_STRING,
+    STUB_JIT_LOAD_UPVALUE, STUB_JIT_LOOSE_EQ, STUB_JIT_PREPARE_BASE_CONSTRUCT,
+    STUB_JIT_SPREAD_CALL_OP, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY,
+    STUB_JIT_STORE_UPVALUE, STUB_JIT_STORE_UPVALUE_CHECKED, STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
+    SafepointId, SafepointRecord,
 };
 use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG};
 
@@ -122,7 +128,7 @@ use crate::{
     CompiledCode,
     arm64::{
         DirectCallArguments, DirectCallForm, DirectCallSite, direct_call_target_is_supported,
-        emit_direct_call, emit_method_guard_from_tagged_register,
+        emit_direct_call, emit_direct_call_with_access, emit_method_guard_from_tagged_register,
     },
     artifact::{
         ArtifactRequest, CodeMapCapture, CodeRegion, NativeCompileOutput, build_bundle,
@@ -407,6 +413,12 @@ struct EmissionPlan<'a> {
     load_string_entry: ResolvedRuntimeEntry,
     loose_eq_entry: ResolvedRuntimeEntry,
     construct_entry: ResolvedRuntimeEntry,
+    /// Safepoint-free exact base-receiver preparation used by generated `new`.
+    try_prepare_construct_entry: ResolvedRuntimeEntry,
+    /// Rooted observable/cold base-receiver preparation sibling.
+    prepare_construct_entry: ResolvedRuntimeEntry,
+    /// Canonical derived-constructor result selection and validation.
+    derived_construct_result_entry: ResolvedRuntimeEntry,
     /// Completes a method-call guard miss through canonical `GetMethod + Call`.
     method_call_entry: ResolvedRuntimeEntry,
     /// Rebuilds every owed interpreter frame from deopt metadata at an exit.
@@ -625,6 +637,18 @@ pub(super) fn compile_with_artifacts(
             construct_entry: ResolvedRuntimeEntry::new(
                 STUB_JIT_CONSTRUCT,
                 transitions.variadic_entry(STUB_JIT_CONSTRUCT),
+            ),
+            try_prepare_construct_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
+                transitions.entry(STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT),
+            ),
+            prepare_construct_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_PREPARE_BASE_CONSTRUCT,
+                transitions.entry(STUB_JIT_PREPARE_BASE_CONSTRUCT),
+            ),
+            derived_construct_result_entry: ResolvedRuntimeEntry::new(
+                STUB_JIT_DERIVED_CONSTRUCT_RESULT,
+                transitions.entry(STUB_JIT_DERIVED_CONSTRUCT_RESULT),
             ),
             method_call_entry: ResolvedRuntimeEntry::new(
                 STUB_JIT_SPREAD_CALL_OP,
@@ -994,6 +1018,9 @@ fn emit(
         load_string_entry,
         loose_eq_entry,
         construct_entry,
+        try_prepare_construct_entry,
+        prepare_construct_entry,
+        derived_construct_result_entry,
         method_call_entry,
         deopt_writeback_entry,
         poll_entry,
@@ -2881,8 +2908,8 @@ fn emit(
                             .expect("eligibility checked construct destination");
                         let callee = instruction.input_registers[0];
                         let arg_regs = &instruction.input_registers[1..];
-                        let argc = arg_regs.len() as u32;
-                        let packed = pack_method_arg_regs(arg_regs);
+                        let frame = frame_of(tree, instruction)?;
+                        let byte_pc = frame_byte_pc(tree, instruction)?;
                         let site = eligibility
                             .element_transitions
                             .sites
@@ -2914,55 +2941,255 @@ fn emit(
                             &mut deopt_exits,
                             instruction,
                         )?;
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; mov x0, x20
-                            ; movz x1, dst as u32
-                            ; movz x2, callee as u32
-                            ; movz x3, argc
-                        );
-                        emit_load_u64(&mut ops, 4, packed);
-                        emit_runtime_entry(&mut ops, &mut relocations, 16, construct_entry);
-                        let succeeded = ops.new_dynamic_label();
-                        let bail = ops.new_dynamic_label();
-                        dynasm!(ops ; .arch aarch64 ; blr x16);
-                        emit_unpublish_transition_frame(
-                            &mut ops,
-                            &inline_windows,
-                            transition_depth,
-                        )?;
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; cmp x0, #1
-                            ; b.eq =>threw
-                            ; cmp x0, #2
-                            ; b.eq =>bail
-                            ; cbz x0, =>succeeded
-                            ; b =>threw
-                            ; =>succeeded
-                        );
-                        emit_reload_element_transition(
-                            &mut ops,
-                            allocation,
-                            &inline_windows,
-                            instruction.inline,
-                            site,
-                            Some((
-                                dst,
-                                allocation.location(
-                                    instruction
-                                        .result
-                                        .expect("eligibility checked construct result"),
-                                ),
-                            )),
-                        )?;
-                        // A non-constructor report (`2`) has no committed effects;
-                        // deopt re-runs the opcode to create the canonical TypeError.
-                        deopt_exits.push((
-                            bail,
-                            deopt_exit_at(frame_states, instruction)?,
-                            instruction.pc,
-                        ));
+                        let direct_target = frame.body.direct_constructs.get(&byte_pc);
+                        if let Some(target) =
+                            direct_target.filter(|target| direct_call_target_is_supported(target))
+                        {
+                            let succeeded = ops.new_dynamic_label();
+                            let finished = ops.new_dynamic_label();
+                            let direct_bail = ops.new_dynamic_label();
+                            let direct_threw = ops.new_dynamic_label();
+                            let deopt = ops.new_dynamic_label();
+                            let call_kind = if target.plan.is_derived_constructor {
+                                otter_vm::JitDirectCallKind::DerivedConstruct
+                            } else {
+                                otter_vm::JitDirectCallKind::Construct
+                            };
+                            let form = if target.plan.is_derived_constructor {
+                                DirectCallForm::DerivedConstruct { callable: callee }
+                            } else {
+                                DirectCallForm::Construct {
+                                    callable: callee,
+                                    receiver: dst,
+                                }
+                            };
+                            emit_direct_call_with_access(
+                                &mut ops,
+                                &mut relocations,
+                                view,
+                                DirectCallSite {
+                                    target,
+                                    caller_function_id: frame.function_id(),
+                                    logical_pc: instruction.pc,
+                                    byte_pc,
+                                    dst,
+                                    form,
+                                    arguments: DirectCallArguments::Fixed(arg_regs),
+                                },
+                                deopt_stack_call_entry.address,
+                                resolve_direct_entry.address,
+                                try_prepare_construct_entry.address,
+                                prepare_construct_entry.address,
+                                derived_construct_result_entry.address,
+                                0,
+                                initialize_upvalues_entry.address,
+                                code_map.as_mut(),
+                                direct_bail,
+                                direct_threw,
+                                succeeded,
+                                20,
+                                |ops, source, target, sp_bias| {
+                                    let window = emit_window_base_with_bias(
+                                        ops,
+                                        &inline_windows,
+                                        instruction.inline,
+                                        sp_bias,
+                                        if target == 12 { 11 } else { 12 },
+                                    )?;
+                                    emit_load_frame_register_in(
+                                        ops,
+                                        window,
+                                        u32::from(source),
+                                        target,
+                                    )
+                                },
+                                |ops, destination, source, sp_bias| {
+                                    let window = emit_window_base_with_bias(
+                                        ops,
+                                        &inline_windows,
+                                        instruction.inline,
+                                        sp_bias,
+                                        if source == 12 { 11 } else { 12 },
+                                    )?;
+                                    emit_store_frame_register_in(
+                                        ops,
+                                        window,
+                                        u32::from(destination),
+                                        source,
+                                    )
+                                },
+                                |ops| {
+                                    emit_reload_element_transition(
+                                        ops,
+                                        allocation,
+                                        &inline_windows,
+                                        instruction.inline,
+                                        site,
+                                        None,
+                                    )
+                                },
+                                |ops, source, sp_bias| {
+                                    let window = emit_window_base_with_bias(
+                                        ops,
+                                        &inline_windows,
+                                        instruction.inline,
+                                        sp_bias,
+                                        if source == 12 { 11 } else { 12 },
+                                    )?;
+                                    emit_store_frame_register_in(
+                                        ops,
+                                        window,
+                                        u32::from(dst),
+                                        source,
+                                    )
+                                },
+                                |_, _| Ok(()),
+                            )?;
+                            if let Some(events) = direct_call_events.as_mut() {
+                                events.insert(
+                                    (byte_pc, 0),
+                                    optimizing_direct_call_event(
+                                        call_kind,
+                                        instruction.pc,
+                                        byte_pc,
+                                        target,
+                                        0,
+                                        1,
+                                        otter_vm::JitDirectCallLoweringOutcome::Generated {
+                                            code_object_id: target.plan.code_object_id,
+                                            target_tier: optimizing_direct_call_target_tier(target),
+                                            this_mode: target.plan.this_mode,
+                                        },
+                                    ),
+                                );
+                            }
+                            dynasm!(ops ; .arch aarch64 ; =>succeeded);
+                            emit_unpublish_transition_frame(
+                                &mut ops,
+                                &inline_windows,
+                                transition_depth,
+                            )?;
+                            emit_reload_element_transition(
+                                &mut ops,
+                                allocation,
+                                &inline_windows,
+                                instruction.inline,
+                                site,
+                                Some((
+                                    dst,
+                                    allocation.location(
+                                        instruction
+                                            .result
+                                            .expect("eligibility checked construct result"),
+                                    ),
+                                )),
+                            )?;
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; b =>finished
+                                ; =>direct_bail
+                            );
+                            emit_unpublish_transition_frame(
+                                &mut ops,
+                                &inline_windows,
+                                transition_depth,
+                            )?;
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; b =>deopt
+                                ; =>direct_threw
+                            );
+                            emit_unpublish_transition_frame(
+                                &mut ops,
+                                &inline_windows,
+                                transition_depth,
+                            )?;
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; b =>threw
+                            );
+                            deopt_exits.push((
+                                deopt,
+                                deopt_exit_at(frame_states, instruction)?,
+                                instruction.pc,
+                            ));
+                            dynasm!(ops ; .arch aarch64 ; =>finished);
+                        } else {
+                            if let (Some(events), Some(target)) =
+                                (direct_call_events.as_mut(), direct_target)
+                            {
+                                let call_kind = if target.plan.is_derived_constructor {
+                                    otter_vm::JitDirectCallKind::DerivedConstruct
+                                } else {
+                                    otter_vm::JitDirectCallKind::Construct
+                                };
+                                events.insert(
+                                    (byte_pc, 0),
+                                    optimizing_direct_call_event(
+                                        call_kind,
+                                        instruction.pc,
+                                        byte_pc,
+                                        target,
+                                        0,
+                                        1,
+                                        otter_vm::JitDirectCallLoweringOutcome::Rejected {
+                                            reason: otter_vm::JitDirectCallLoweringRejectionReason::LayoutUnsupported,
+                                        },
+                                    ),
+                                );
+                            }
+                            let argc = arg_regs.len() as u32;
+                            let packed = pack_method_arg_regs(arg_regs);
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; mov x0, x20
+                                ; movz x1, dst as u32
+                                ; movz x2, callee as u32
+                                ; movz x3, argc
+                            );
+                            emit_load_u64(&mut ops, 4, packed);
+                            emit_runtime_entry(&mut ops, &mut relocations, 16, construct_entry);
+                            let succeeded = ops.new_dynamic_label();
+                            let bail = ops.new_dynamic_label();
+                            dynasm!(ops ; .arch aarch64 ; blr x16);
+                            emit_unpublish_transition_frame(
+                                &mut ops,
+                                &inline_windows,
+                                transition_depth,
+                            )?;
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; cmp x0, #1
+                                ; b.eq =>threw
+                                ; cmp x0, #2
+                                ; b.eq =>bail
+                                ; cbz x0, =>succeeded
+                                ; b =>threw
+                                ; =>succeeded
+                            );
+                            emit_reload_element_transition(
+                                &mut ops,
+                                allocation,
+                                &inline_windows,
+                                instruction.inline,
+                                site,
+                                Some((
+                                    dst,
+                                    allocation.location(
+                                        instruction
+                                            .result
+                                            .expect("eligibility checked construct result"),
+                                    ),
+                                )),
+                            )?;
+                            // A non-constructor report (`2`) has no committed effects;
+                            // deopt re-runs the opcode to create the canonical TypeError.
+                            deopt_exits.push((
+                                bail,
+                                deopt_exit_at(frame_states, instruction)?,
+                                instruction.pc,
+                            ));
+                        }
                     }
                     Op::LogicalNot => {
                         let result = instruction

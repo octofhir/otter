@@ -93,12 +93,17 @@ It already owns:
 - exact generated receiver-allocation attribution for attempts, successes,
   structural and space misses, cold/Rust boundaries, GC, refills, OOM, and
   deopts, plus `directConstructReceiverAllocFast` / `Cold` code-map proof;
+- complete legacy-optimizer splices consume dead numeric boxing at the removed
+  call boundary while constructor descriptors inside the spliced body retain
+  the shared generated linkage. Arguments, results, receiver roots, and
+  moving-GC refreshes use the published inline-frame window rather than
+  falling back to the generic construct transition;
 - catch-only exception-region CFGs with explicit landing-pad successors; the
   shared linkage fully unwinds publication, commits the thrown value to its
   allocator home, and transfers at the exact call PC without replay;
 - representation-checked entry and OSR guards with no replay after a started
   operation; method guard misses deopt before lookup effects and tier/frame
-  publication changes do not require caller recompilation.
+  publication changes do not require caller recompilation;
 - one typed `RuntimeCall` boundary for scalar query/coercion, static value-load,
   class-construction, ordinary prototype mutation, and built-in Array iterator
   operations. These families
@@ -110,7 +115,7 @@ The old optimizing compiler and template emitter remain in the active graph
 only for operations and function shapes not yet selected by the replacement
 pipeline. They are fallback, not contracts to preserve.
 
-Latest accepted gate: 53 bytecode, 86 compiler, 282 JIT, and 835 VM tests;
+Latest accepted gate: 53 bytecode, 86 compiler, 283 JIT, and 836 VM tests;
 the complete runtime suite; all-target/all-feature Clippy;
 compile-fail/rooting checks; and 21/21 differential
 interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.

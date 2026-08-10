@@ -33,6 +33,7 @@ pub mod index;
 pub mod scan;
 pub mod simd;
 pub mod sink;
+pub mod stringify;
 pub mod tree;
 
 pub use error::{Error, ErrorKind, Result};

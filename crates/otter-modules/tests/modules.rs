@@ -335,3 +335,76 @@ fn otter_xml_keeps_keys_when_elements_of_one_name_differ() {
         ))
         .unwrap();
 }
+
+#[test]
+fn otter_xml_writes_documents_back_out() {
+    let mut runtime = Runtime::builder().with_otter_modules().build().unwrap();
+    runtime
+        .eval(otter_runtime::SourceInput::from_javascript(
+            r##"
+            function check(actual, expected, what) {
+              if (actual !== expected) throw new Error(what + ": " + actual + " !== " + expected);
+            }
+            if (typeof Otter.XML.stringify !== "function") throw new Error("stringify missing");
+
+            const doc = "<order id='A1'><customer>Ada</customer>" +
+              "<item sku='tea'>Green tea</item><item sku='mug'>Mug</item><paid/></order>";
+
+            // Both shapes write, and what they write parses back to the same
+            // value.
+            for (const compact of [true, false]) {
+              const value = Otter.XML.parse(doc, { compact });
+              const text = Otter.XML.stringify(value);
+              const again = Otter.XML.parse(text, { compact });
+              check(JSON.stringify(again), JSON.stringify(value), "round trip compact=" + compact);
+            }
+
+            check(
+              Otter.XML.stringify({ a: { "@k": "1 < 2 & 3", "#text": "x > y" } }),
+              "<a k=\"1 &lt; 2 &amp; 3\">x &gt; y</a>",
+              "escaping"
+            );
+
+            check(
+              Otter.XML.stringify({ a: { b: [{ "@i": "1" }, { "@i": "2" }] } }, null, 2),
+              "<a>\n  <b i=\"1\"/>\n  <b i=\"2\"/>\n</a>",
+              "indent"
+            );
+
+            // Numbers and booleans are written as their text; what
+            // JSON.stringify drops is dropped here too.
+            check(
+              Otter.XML.stringify({ a: { "@n": 42, "@t": true, "@u": undefined, b: null } }),
+              "<a n=\"42\" t=\"true\"/>",
+              "primitives"
+            );
+
+            // A replacer applies to each key and value, and a list of keys
+            // keeps only those.
+            check(
+              Otter.XML.stringify({ a: { "@k": "v", b: "text" } }, (key, value) =>
+                key === "b" ? "replaced" : value),
+              "<a k=\"v\"><b>replaced</b></a>",
+              "function replacer"
+            );
+            check(
+              Otter.XML.stringify({ a: { "@k": "v", b: "text", c: "gone" } }, ["a", "@k", "b"]),
+              "<a k=\"v\"><b>text</b></a>",
+              "key list replacer"
+            );
+
+            let threw = null;
+            try { Otter.XML.stringify({ "not a name": "x" }); } catch (error) { threw = error; }
+            if (!(threw instanceof TypeError)) throw new Error("expected a TypeError for a bad name");
+            try { Otter.XML.stringify("bare"); threw = null; } catch (error) { threw = error; }
+            if (!(threw instanceof TypeError)) throw new Error("expected a TypeError for a non-document");
+
+            // A value that refers to itself has no end, and says so.
+            const cyclic = { a: {} };
+            cyclic.a.self = cyclic;
+            try { Otter.XML.stringify(cyclic); threw = null; } catch (error) { threw = error; }
+            if (!(threw instanceof TypeError)) throw new Error("expected a TypeError for a cycle");
+            "##,
+        ))
+        .unwrap();
+}

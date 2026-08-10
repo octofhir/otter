@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - [`parse`] — the native behind `Otter.XML.parse`.
+//! - [`stringify`] — the native behind `Otter.XML.stringify`.
 //! - [`otter_xml_global_installer`] — installs the namespace on the `Otter`
 //!   global.
 //!
@@ -18,6 +19,10 @@
 //!   values directly, so a document is walked once.
 //! - Text runs are accumulated in Rust, not as JavaScript strings, so an
 //!   element split across several runs still yields one string.
+//! - Writing goes the other way through one owning Rust tree, so every rule
+//!   about escaping, legal names and layout lives in `otter_xml::stringify`
+//!   and not in two places. Reading a JavaScript value is bounded by an
+//!   explicit depth, so a cyclic value fails rather than recurses forever.
 //!
 //! # See also
 //! - [Handle scopes](../../../docs/site/src/content/docs/extensions/handle-scopes.md)
@@ -34,6 +39,11 @@ use otter_xml::encoding::{Charset, Encoding, Latin1, Utf8, Utf16};
 use otter_xml::sink::{Piece, Sink};
 
 const NAME: &str = "Otter.XML.parse";
+const WRITE: &str = "Otter.XML.stringify";
+
+/// How deeply a value handed to [`stringify`] may nest. A cyclic value has no
+/// end, so the depth is what stops it.
+const MAX_VALUE_DEPTH: usize = 512;
 
 /// Which shape the caller asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,6 +397,269 @@ impl<E: Encoding> Sink<E::Unit> for Builder<'_, '_, '_, E> {
     }
 }
 
+/// Write a value as an XML document, in whichever shape it is written in.
+///
+/// `replacer` is a function applied to each key and value, or a list of the
+/// keys to keep, as `JSON.stringify` takes it. `space` is a string, or a count
+/// of spaces, that one level of nesting indents by; content that is not
+/// entirely made of elements is never indented, since white space there is
+/// part of the document.
+///
+/// # Errors
+/// A value that is not a document, or a name XML cannot spell, raises a
+/// `TypeError`.
+pub fn stringify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    ctx.scope(|mut scope| {
+        let input = scope.argument(args, 0);
+        let replacer = scope.argument(args, 1);
+        let space = scope.argument(args, 2);
+        let indent = read_indent(&mut scope, space)?;
+        let filter = Filter::read(&mut scope, replacer)?;
+        let document = if is_node_shape(&mut scope, input)? {
+            let node = read_node(&mut scope, input, &filter, 0)?;
+            otter_xml::stringify::node(&node, indent.as_deref())
+        } else {
+            let Some(value) = read_value(&mut scope, input, &filter, 0)? else {
+                return Err(NativeError::TypeError {
+                    name: WRITE,
+                    reason: "expected an object naming one element".to_owned(),
+                });
+            };
+            otter_xml::stringify::value(&value, indent.as_deref())
+        };
+        let document = document.map_err(write_error)?;
+        let text = scope.string(&document)?;
+        Ok(scope.finish(text))
+    })
+}
+
+fn write_error(error: otter_xml::Error) -> NativeError {
+    NativeError::TypeError {
+        name: WRITE,
+        reason: error.kind.to_string(),
+    }
+}
+
+fn depth_error() -> NativeError {
+    NativeError::TypeError {
+        name: WRITE,
+        reason: "the value nests too deeply, or refers to itself".to_owned(),
+    }
+}
+
+/// The text one level of nesting indents by.
+fn read_indent(
+    scope: &mut NativeScope<'_, '_>,
+    space: Local<'_>,
+) -> Result<Option<String>, NativeError> {
+    if scope.is_string(space) {
+        let text: String = scope.string_value(space)?.chars().take(10).collect();
+        return Ok((!text.is_empty()).then_some(text));
+    }
+    let Ok(count) = scope.number_value(space) else {
+        return Ok(None);
+    };
+    if !count.is_finite() || count < 1.0 {
+        return Ok(None);
+    }
+    Ok(Some(" ".repeat(count.min(10.0) as usize)))
+}
+
+/// What the caller asked to be left out, or rewritten, on the way.
+enum Filter<'s> {
+    /// Everything is written as it stands.
+    All,
+    /// A function of key and value, applied as `JSON.stringify` applies it.
+    Function(Local<'s>),
+    /// The keys to keep.
+    Keys(Vec<String>),
+}
+
+impl<'s> Filter<'s> {
+    fn read(
+        scope: &mut NativeScope<'s, '_>,
+        replacer: Local<'s>,
+    ) -> Result<Filter<'s>, NativeError> {
+        if scope.is_callable(replacer) {
+            return Ok(Filter::Function(replacer));
+        }
+        if scope.is_array(replacer)? {
+            let length = scope.array_length(replacer)?;
+            let mut keys = Vec::with_capacity(length);
+            for index in 0..length {
+                let key = scope.index(replacer, index)?;
+                if scope.is_string(key) {
+                    keys.push(scope.string_value(key)?);
+                }
+            }
+            return Ok(Filter::Keys(keys));
+        }
+        Ok(Filter::All)
+    }
+
+    /// Whether a key of an object survives a list of keys to keep.
+    fn keeps(&self, key: &str) -> bool {
+        match self {
+            Filter::Keys(keys) => keys.iter().any(|kept| kept == key),
+            _ => true,
+        }
+    }
+
+    /// The value to write for `key`, once a function replacer has seen it.
+    fn apply<'v>(
+        &self,
+        scope: &mut NativeScope<'v, '_>,
+        holder: Local<'_>,
+        key: &str,
+        value: Local<'v>,
+    ) -> Result<Local<'v>, NativeError> {
+        let Filter::Function(function) = self else {
+            return Ok(value);
+        };
+        let key = scope.string(key)?;
+        scope.call(*function, holder, &[key, value])
+    }
+}
+
+/// Whether a value is written in the shape that keeps document order.
+fn is_node_shape(scope: &mut NativeScope<'_, '_>, value: Local<'_>) -> Result<bool, NativeError> {
+    if !scope.is_object(value) || scope.is_array(value)? {
+        return Ok(false);
+    }
+    if !scope.has_own_string_property(value, "name") {
+        return Ok(false);
+    }
+    let name = scope.get(value, "name")?;
+    Ok(scope.is_string(name)
+        && (scope.has_own_string_property(value, "children")
+            || scope.has_own_string_property(value, "attributes")))
+}
+
+/// Read one element of the document-order shape.
+fn read_node(
+    scope: &mut NativeScope<'_, '_>,
+    value: Local<'_>,
+    filter: &Filter<'_>,
+    depth: usize,
+) -> Result<otter_xml::Node, NativeError> {
+    if depth >= MAX_VALUE_DEPTH {
+        return Err(depth_error());
+    }
+    scope.scope(|mut scope| {
+        let name = scope.get(value, "name")?;
+        let mut node = otter_xml::Node {
+            name: scope.string_value(name)?,
+            ..otter_xml::Node::default()
+        };
+        let attributes = scope.get(value, "attributes")?;
+        if scope.is_object(attributes) {
+            for key in scope.enumerable_own_string_keys(attributes)? {
+                if !filter.keeps(&key) {
+                    continue;
+                }
+                let attribute = scope.get(attributes, &key)?;
+                let attribute = filter.apply(&mut scope, attributes, &key, attribute)?;
+                let Some(text) = primitive_text(&mut scope, attribute)? else {
+                    continue;
+                };
+                node.attributes.push((key, text));
+            }
+        }
+        let children = scope.get(value, "children")?;
+        if scope.is_array(children)? {
+            for index in 0..scope.array_length(children)? {
+                let child = scope.index(children, index)?;
+                let child = filter.apply(&mut scope, children, &index.to_string(), child)?;
+                if scope.is_object(child) {
+                    let element = read_node(&mut scope, child, filter, depth + 1)?;
+                    node.children.push(otter_xml::Child::Element(element));
+                    continue;
+                }
+                if let Some(text) = primitive_text(&mut scope, child)? {
+                    node.children.push(otter_xml::Child::Text(text));
+                }
+            }
+        }
+        Ok(node)
+    })
+}
+
+/// Read one value of the compact shape, or nothing where `JSON.stringify`
+/// would write nothing.
+fn read_value(
+    scope: &mut NativeScope<'_, '_>,
+    value: Local<'_>,
+    filter: &Filter<'_>,
+    depth: usize,
+) -> Result<Option<otter_xml::Value>, NativeError> {
+    if depth >= MAX_VALUE_DEPTH {
+        return Err(depth_error());
+    }
+    if scope.is_array(value)? {
+        return scope.scope(|mut scope| {
+            let mut items = Vec::with_capacity(scope.array_length(value)?);
+            for index in 0..scope.array_length(value)? {
+                let item = scope.index(value, index)?;
+                let item = filter.apply(&mut scope, value, &index.to_string(), item)?;
+                if let Some(item) = read_value(&mut scope, item, filter, depth + 1)? {
+                    items.push(item);
+                }
+            }
+            Ok(Some(otter_xml::Value::Array(items)))
+        });
+    }
+    if scope.is_object(value) && !scope.is_callable(value) {
+        return scope.scope(|mut scope| {
+            let keys = scope.enumerable_own_string_keys(value)?;
+            let mut entries = Vec::with_capacity(keys.len());
+            for key in keys {
+                if !filter.keeps(&key) {
+                    continue;
+                }
+                let entry = scope.get(value, &key)?;
+                let entry = filter.apply(&mut scope, value, &key, entry)?;
+                if let Some(entry) = read_value(&mut scope, entry, filter, depth + 1)? {
+                    entries.push((key, entry));
+                }
+            }
+            Ok(Some(otter_xml::Value::Object(entries)))
+        });
+    }
+    Ok(primitive_text(scope, value)?.map(otter_xml::Value::Text))
+}
+
+/// The text a primitive is written as, or nothing for what is left out:
+/// `undefined`, `null` and functions, as `JSON.stringify` leaves them out.
+fn primitive_text(
+    scope: &mut NativeScope<'_, '_>,
+    value: Local<'_>,
+) -> Result<Option<String>, NativeError> {
+    if scope.is_string(value) {
+        return Ok(Some(scope.string_value(value)?));
+    }
+    if scope.is_undefined(value) || scope.is_null(value) || scope.is_callable(value) {
+        return Ok(None);
+    }
+    if let Ok(boolean) = scope.boolean_value(value) {
+        return Ok(Some(boolean.to_string()));
+    }
+    if let Ok(number) = scope.number_value(value) {
+        if !number.is_finite() {
+            return Ok(None);
+        }
+        let text = if number.fract() == 0.0 && number.abs() < 1e21 {
+            format!("{number:.0}")
+        } else {
+            number.to_string()
+        };
+        return Ok(Some(text));
+    }
+    Err(NativeError::TypeError {
+        name: WRITE,
+        reason: "a document holds text, not this".to_owned(),
+    })
+}
+
 /// Install `Otter.XML` on the global object.
 #[must_use]
 pub fn otter_xml_global_installer() -> RuntimeExtensionInstaller {
@@ -397,12 +670,19 @@ fn install_global_xml(runtime: &mut RuntimeExtensionContext<'_>) -> Result<(), O
     // A plain function pointer, not a closure: parsing captures nothing, and
     // a static native survives a snapshot without a factory to rebuild it.
     runtime.install_native_global_call("__otterXmlParse", 2, RuntimeNativeCall::Static(parse))?;
+    runtime.install_native_global_call(
+        "__otterXmlStringify",
+        3,
+        RuntimeNativeCall::Static(stringify),
+    )?;
     runtime.install_script(SourceInput::from_javascript(
         r#"
         (function (g) {
           'use strict';
           var parse = g.__otterXmlParse;
+          var stringify = g.__otterXmlStringify;
           delete g.__otterXmlParse;
+          delete g.__otterXmlStringify;
           var ns = g.Otter;
           if (ns == null || (typeof ns !== 'object' && typeof ns !== 'function')) {
             ns = {};
@@ -410,6 +690,12 @@ fn install_global_xml(runtime: &mut RuntimeExtensionContext<'_>) -> Result<(), O
           var xml = {};
           Object.defineProperty(xml, 'parse', {
             value: parse,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          });
+          Object.defineProperty(xml, 'stringify', {
+            value: stringify,
             writable: true,
             enumerable: true,
             configurable: true,

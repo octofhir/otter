@@ -30,6 +30,7 @@ pub mod encoding;
 pub mod error;
 pub mod index;
 pub mod scan;
+pub mod simd;
 pub mod sink;
 pub mod tree;
 

@@ -82,6 +82,16 @@ pub trait Encoding {
     /// Only ISO-8859-1 can fail, and only for a character reference naming
     /// something above U+00FF; the scanner then widens the run to UTF-16.
     fn encode(code: u32, out: &mut Vec<Self::Unit>) -> bool;
+
+    /// Append this document's structural positions to `out`, checking as it
+    /// goes that every unit spells a character a document may contain.
+    ///
+    /// Each encoding picks the producer that suits its units: the byte
+    /// encodings classify a block at a time, UTF-16 walks its units.
+    ///
+    /// # Errors
+    /// Returns the first ill-formed or forbidden character.
+    fn index_into(document: &[Self::Unit], out: &mut Vec<u32>) -> Result<()>;
 }
 
 /// UTF-8, the default for byte input.
@@ -155,6 +165,10 @@ impl Encoding for Utf8 {
         }
         true
     }
+
+    fn index_into(document: &[u8], out: &mut Vec<u32>) -> Result<()> {
+        crate::index::bytes(document, true, out)
+    }
 }
 
 impl Encoding for Latin1 {
@@ -171,6 +185,12 @@ impl Encoding for Latin1 {
         }
         out.push(code as u8);
         true
+    }
+
+    fn index_into(document: &[u8], out: &mut Vec<u32>) -> Result<()> {
+        // Every byte is a character in its own right, so nothing above ASCII
+        // needs a second look.
+        crate::index::bytes(document, false, out)
     }
 }
 
@@ -197,6 +217,10 @@ impl Encoding for Utf16 {
     fn encode(code: u32, out: &mut Vec<u16>) -> bool {
         push_utf16(code, out);
         true
+    }
+
+    fn index_into(document: &[u16], out: &mut Vec<u32>) -> Result<()> {
+        crate::index::units::<Self>(document, out)
     }
 }
 

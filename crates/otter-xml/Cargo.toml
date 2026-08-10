@@ -11,5 +11,19 @@ description = "Standalone, VM-agnostic XML 1.0 parser for Otter."
 # into the VM, the collector, or any host surface.
 [dependencies]
 
-[lints]
-workspace = true
+[lints.rust]
+# `unsafe_code` ban lifted for this crate: the structural index is built by
+# target-specific vector intrinsics, which are unsafe to call. The unsafety is
+# confined to `src/simd/`, where every block is a fixed-size array and every
+# entry point is guarded by a runtime feature check. Every other `crates/*`
+# crate keeps the workspace `forbid(unsafe_code)`.
+missing_docs = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+# The same design-style allowances the workspace makes; spelled out here
+# because naming `[lints.rust]` above opts this crate out of inheriting them.
+result_large_err = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+arc_with_non_send_sync = "allow"

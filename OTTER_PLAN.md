@@ -66,6 +66,11 @@ It already owns:
   or Machine linkage, while accessors, proxies, bound functions, lazy
   prototypes, and uncertain shapes miss before effects into the one observable
   fallback;
+- final-shape receiver allocation for conservative straight-line base
+  initializers. The shared fixed, spread, and generated-super preparation path
+  proves every initializer name absent from the selected prototype chain,
+  installs undefined own slots before entry, and lets the body overwrite them
+  without StoreProperty shape-transition reentry;
 - a VM-owned linked root chain for Machine values live across reentrant calls;
   return, constructor receiver preparation, callee overflow/deopt, propagated
   throw, nested/recursive generated calls, and moving minor GC all execute
@@ -119,11 +124,13 @@ generated linkage as plain and method calls, while fresh/inherited upvalues
 remain stack-owned. Ordinary materialized data prototypes now allocate the base
 receiver without reentry; the observable preparation sibling remains the
 single authority for accessors, proxies, bound functions, and uncertain
-prototype state. The isolated base-receiver kernel moved all 700,000 measured
-preparations from the reentrant class to the allocating class and reduced the
-mean of alternating process medians by 5.70%, with identical reductions,
-generated calls, and zero call deopts. Extend it to the remaining reentrant
-forms:
+  prototype state. Simple ordinary base initializers now share their one final
+hidden-class contract with generated fixed, spread, and superclass receiver
+allocation. The expanded causal kernel moved 4.2 million field additions out
+of StoreProperty stubs, reduced total runtime-stub transitions by 54.44% and
+reentrant transitions by 99.34%, and reduced the mean of alternating process
+medians by 15.34%; reductions, bytecode calls, generated calls, and zero call
+deopts remained identical. Extend the typed boundary to the remaining forms:
 
 - admit nested catch/finally regions and complete multi-frame state through
   `lower_deopt_table`;

@@ -1301,7 +1301,7 @@ pub(crate) extern "C" fn jit_try_prepare_base_construct_stub(
     ctx: *mut JitCtx,
     callee_bits: u64,
     new_target_bits: u64,
-    _reserved1: u64,
+    function_id: u64,
     _reserved2: u64,
 ) -> JitRet {
     // SAFETY: the live `JitCtx` allocation contract publishes the caller's
@@ -1315,7 +1315,16 @@ pub(crate) extern "C" fn jit_try_prepare_base_construct_stub(
         };
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
+    let context = unsafe { &*activation.context_ptr() };
+    let Ok(function_id) = u32::try_from(function_id) else {
+        return JitRet {
+            value: 0,
+            status: STATUS_BAILED,
+        };
+    };
     match vm.jit_try_prepare_base_construct_receiver(
+        context,
+        function_id,
         otter_vm::Value::from_bits(callee_bits),
         otter_vm::Value::from_bits(new_target_bits),
     ) {

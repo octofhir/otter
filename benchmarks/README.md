@@ -81,7 +81,7 @@ print output, access the filesystem, install packages, or depend on host APIs.
 | `string-concat.js` | Allocating primitive concat with a tagged result live across the second safepoint | `600000` |
 | `typed-parameter-loop.js` | Int32 parameter guards, loop phis, checked arithmetic, and OSR | `300000` |
 | `upvalue-call-families.js` | Closure-backed plain, method, and base-constructor linkage with stack-owned upvalues | `15000450000` |
-| `base-construct-receiver.js` | Fixed base construction with an exact own data prototype and isolated receiver preparation | `4999950000` |
+| `base-construct-receiver.js` | Pre-shaped fixed, spread, and derived/super receiver preparation with two own fields | `15001950000` |
 
 Run one fixture per isolate. Warmups and measured samples reuse that isolate
 and the same precompiled invocation stub, but every invocation must return the
@@ -98,6 +98,10 @@ activity. Stable-link health is explicit through
 `jit-caller-invalidations`, `jit-cold-entry-resolver-misses`,
 `jit-to-rust-call-transitions`, and `jit-code-generations`; compare those with
 `jit-generated-calls` to distinguish native residency from compile churn.
+The pre-shaped constructor kernel additionally requires zero measured
+`StoreProperty` stubs/misses across fixed, spread, and generated-super bodies;
+its bounded reentrant remainder is cold tier/class setup rather than a
+per-receiver transition.
 
 The same snapshot window reports `vm-reductions`, `vm-bytecode-calls`,
 named-property load-IC hits, misses, and installs, plus retained ordinary-call

@@ -1373,12 +1373,14 @@ pub const STUB_JIT_INITIALIZE_UPVALUES: RuntimeStubDescriptor = descriptor(
 
 /// Allocating, non-reentrant `OrdinaryCreateFromConstructor` fast path for a
 /// generated base constructor. An uncertain or observable `prototype` lookup
-/// reports a pre-effect miss through the status pair.
+/// reports a pre-effect miss through the status pair. The third operand names
+/// the exact generated target so conservative straight-line initializers can
+/// allocate their receiver with the final hidden class and undefined slots.
 pub const STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT: RuntimeStubDescriptor = descriptor(
     95,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::Variadic,
-    2,
+    3,
     RuntimeStubEffects::allocating(true, true),
     RuntimeStubException::Status,
     RuntimeStubResultAbi::StatusPair,

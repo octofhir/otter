@@ -80,6 +80,7 @@ use crate::{UpvalueCell, Value, read_upvalue, store_upvalue};
 use otter_gc::GcHeap;
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
+use smallvec::SmallVec;
 
 mod descriptor;
 mod descriptor_core;
@@ -2891,7 +2892,7 @@ pub(crate) fn alloc_object_with_shape_roots(
 /// hidden-class data slot, in shape order.
 pub(crate) fn initialize_shaped_data_slots(obj: JsObject, heap: &mut GcHeap, values: &[Value]) {
     let mut obj = obj;
-    let stored = values.to_vec();
+    let stored = SmallVec::<[Value; 8]>::from_slice(values);
     let expected = heap.read_payload(obj, |body| body_property_count(heap, body));
     let mut stored = stored;
     if reserve_slot_capacity(&mut obj, heap, stored.len(), &mut stored).is_err() {

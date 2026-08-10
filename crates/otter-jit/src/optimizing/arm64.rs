@@ -12,6 +12,8 @@
 //!   global-object property records.
 //! - Baked stable-entry plain, method, and constructor calls with stack-owned
 //!   rooted callee frames, including calls owned by spliced bodies.
+//! - Identity-guarded Int32 `Math.abs`, `Math.max`, and `Math.min` completion
+//!   without a Rust leaf transition.
 //! - Guarded plain- and method-callee splicing with multi-frame exact-PC
 //!   deoptimization and synthetic `this` binding.
 //! - Loop-invariant method-identity caching and receiver-property guard fusion.
@@ -82,6 +84,10 @@
 //!   code. A method guard-chain miss completes through the canonical
 //!   `GetMethod + Call` transition; plain-call misses and native-entry lease
 //!   failures take the caller's exact deopt exit.
+//! - An Int32 Math intrinsic executes only after the same exact bootstrap
+//!   identity guard as its declared leaf call. `abs(INT32_MIN)` materializes
+//!   the representable Number `2147483648`; every other supported result stays
+//!   a tagged Int32.
 //! - A spliced method guard may be cached only when the receiver is defined
 //!   outside one natural loop and every loop operation is non-mutating and
 //!   non-reentrant. Entry and OSR initialize the cache independently; the
@@ -165,8 +171,9 @@ use crate::{
     },
     template::arm64::ic_probe::{
         DenseIndexForm, element_access_for, emit_element_address, emit_element_read,
-        emit_element_write, emit_guarded_method_call, emit_native_leaf_call,
-        guarded_method_call_is_supported, native_leaf_call_is_supported, native_leaf_call_name,
+        emit_element_write, emit_guarded_method_call, emit_guarded_method_guard,
+        emit_native_leaf_call, emit_native_leaf_guard, guarded_method_call_is_supported,
+        native_leaf_call_is_supported, native_leaf_call_name,
     },
     template::arm64::values::{CellTest, emit_cell_test},
 };
@@ -2820,23 +2827,48 @@ fn emit(
                             // did not settle on is a slower call, not a wrong
                             // speculation to deoptimize over.
                             let leaf_miss = ops.new_dynamic_label();
-                            emit_guarded_method_call(
-                                &mut ops,
-                                &mut relocations,
-                                view,
-                                call,
-                                receiver,
-                                byte_pc,
-                                |ops, index, register| {
-                                    let source = arg_regs.get(usize::from(index)).copied().ok_or(
-                                        Unsupported::OperandShape("guarded method argument"),
-                                    )?;
-                                    crate::template::arm64::values::emit_load_reg(
-                                        ops, register, source,
-                                    )
-                                },
-                                leaf_miss,
-                            )?;
+                            if guarded_int32_math_intrinsic_is_supported(
+                                call.entry_stub_id,
+                                reprs,
+                                instruction,
+                            ) {
+                                emit_guarded_method_guard(
+                                    &mut ops,
+                                    &mut relocations,
+                                    view,
+                                    call,
+                                    receiver,
+                                    byte_pc,
+                                    leaf_miss,
+                                )?;
+                                emit_guarded_int32_math_intrinsic_body(
+                                    &mut ops,
+                                    call.entry_stub_id,
+                                    allocation,
+                                    instruction,
+                                )?;
+                            } else {
+                                emit_guarded_method_call(
+                                    &mut ops,
+                                    &mut relocations,
+                                    view,
+                                    call,
+                                    receiver,
+                                    byte_pc,
+                                    |ops, index, register| {
+                                        let source = arg_regs
+                                            .get(usize::from(index))
+                                            .copied()
+                                            .ok_or(Unsupported::OperandShape(
+                                                "guarded method argument",
+                                            ))?;
+                                        crate::template::arm64::values::emit_load_reg(
+                                            ops, register, source,
+                                        )
+                                    },
+                                    leaf_miss,
+                                )?;
+                            }
                             emit_store_frame_register(&mut ops, u32::from(dst), 0)?;
                             dynasm!(ops
                                 ; .arch aarch64
@@ -3880,27 +3912,49 @@ fn emit(
                                     instruction.inputs[0],
                                     9,
                                 )?;
-                                emit_native_leaf_call(
-                                    &mut ops,
-                                    &mut relocations,
-                                    view,
-                                    stub_id,
-                                    target.builtin_native_ref,
-                                    9,
-                                    |ops, index, register| {
-                                        let value = instruction
-                                            .inputs
-                                            .get(usize::from(index) + 1)
-                                            .copied()
-                                            .ok_or(Unsupported::OperandShape(
-                                                "native leaf call argument",
-                                            ))?;
-                                        emit_load_boxed_value(
-                                            ops, reprs, allocation, value, register,
-                                        )
-                                    },
-                                    bail,
-                                )?;
+                                let int32_math_intrinsic =
+                                    guarded_int32_math_intrinsic_is_supported(
+                                        stub_id,
+                                        reprs,
+                                        instruction,
+                                    );
+                                if int32_math_intrinsic {
+                                    emit_native_leaf_guard(
+                                        &mut ops,
+                                        view,
+                                        target.builtin_native_ref,
+                                        9,
+                                        bail,
+                                    )?;
+                                    emit_guarded_int32_math_intrinsic_body(
+                                        &mut ops,
+                                        stub_id,
+                                        allocation,
+                                        instruction,
+                                    )?;
+                                } else {
+                                    emit_native_leaf_call(
+                                        &mut ops,
+                                        &mut relocations,
+                                        view,
+                                        stub_id,
+                                        target.builtin_native_ref,
+                                        9,
+                                        |ops, index, register| {
+                                            let value = instruction
+                                                .inputs
+                                                .get(usize::from(index) + 1)
+                                                .copied()
+                                                .ok_or(Unsupported::OperandShape(
+                                                    "native leaf call argument",
+                                                ))?;
+                                            emit_load_boxed_value(
+                                                ops, reprs, allocation, value, register,
+                                            )
+                                        },
+                                        bail,
+                                    )?;
+                                }
                                 emit_store_tagged_location(
                                     &mut ops,
                                     allocation.location(
@@ -3912,7 +3966,11 @@ fn emit(
                                 )?;
                                 if let Some(code_map) = code_map.as_mut() {
                                     code_map.record(CodeRegion::static_native_structural(
-                                        "nativeLeafCall",
+                                        if int32_math_intrinsic {
+                                            "nativeInt32MathIntrinsic"
+                                        } else {
+                                            "nativeLeafCall"
+                                        },
                                         start,
                                         ops.offset().0,
                                         frame.function_id(),

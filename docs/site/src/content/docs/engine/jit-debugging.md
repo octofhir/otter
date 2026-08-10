@@ -153,13 +153,18 @@ before reading the live value; a mismatch uses the canonical lookup.
 Ordinary `Op::Call` feedback uses one typed target population for bytecode
 callees and static-native operations. When that population is monomorphic for
 the original realm `Math.abs`, `compilePrepared.staticNativeCalls` counts the
-site and `staticNativeCallPlan` reports target `mathAbs`. After a successful
+site and `staticNativeCallPlan` reports target `math_abs_leaf`. After a successful
 compile, `staticNativeCallLowered` reports `callerCodeObjectId` and the
 backend's actual result: `generated`, or `rejected` with
 `arityUnsupported`, `layoutUnsupported`, or `eliminated`. A generated result
-means the backend emitted an exact native function identity guard plus the
-numeric leaf; it does not mean Rust was entered. Separate plan and lowering
-events keep feedback selection distinct from emitted machine code.
+means the backend emitted an exact native function identity guard plus either
+the declared leaf call or equivalent generated completion; it does not mean
+Rust was entered. Proven Int32 `Math.abs`, `Math.max`, and `Math.min` use the
+latter path. An extracted static call exposes a
+`nativeInt32MathIntrinsic` code-map region, while the absence of the matching
+Math leaf from `relocations.json` proves that the guarded hit stays in machine
+code. Separate plan and lowering events keep feedback selection distinct from
+emitted machine code.
 
 `generatedCallDeopt` is emitted only when an already-started generated callee
 bails into cold interpreter continuation. It records baked `callKind`, exact

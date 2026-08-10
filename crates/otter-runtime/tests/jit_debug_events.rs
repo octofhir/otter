@@ -150,7 +150,7 @@ fn template_osr_emits_ordered_compile_events() {
 
 #[test]
 #[cfg(target_arch = "aarch64")]
-fn unary_feedback_recompiles_extracted_native_call_loop_after_warmup_bail() {
+fn extracted_int32_math_call_publishes_one_stable_optimizing_body() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
         .jit_osr_threshold(1)
@@ -193,9 +193,10 @@ fn unary_feedback_recompiles_extracted_native_call_loop_after_warmup_bail() {
             )
         })
         .count();
-    assert!(
-        optimizing_compiles >= 2,
-        "feedback refresh must republish the optimizing OSR body: {:?}",
+    assert_eq!(
+        optimizing_compiles,
+        1,
+        "guarded Int32 Math lowering must not need feedback-refresh recompilation: {:?}",
         report.events()
     );
     let optimizing_bails = report
@@ -213,8 +214,20 @@ fn unary_feedback_recompiles_extracted_native_call_loop_after_warmup_bail() {
         .count();
     assert_eq!(
         optimizing_bails,
-        1,
-        "only the pre-refresh body may bail on incomplete Add feedback: {:?}",
+        0,
+        "guarded Int32 Math lowering must avoid the warmup leaf bail: {:?}",
+        report.events()
+    );
+    assert!(
+        report.events().iter().any(|event| matches!(
+            event,
+            JitDebugEvent::StaticNativeCallLowered {
+                tier: JitDebugTier::Optimizing,
+                target: "math_abs_leaf",
+                ..
+            }
+        )),
+        "the stable body must report the guarded static-native plan: {:?}",
         report.events()
     );
 }

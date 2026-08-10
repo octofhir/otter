@@ -433,7 +433,7 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     complete iteration. Any miss, accessor/proxy path, or non-number keeps the
     original property operation; cached slots contain no GC references and are
     reset on every non-backedge loop entry and OSR activation.
-- Compiler-generated plain, method, fixed-argument constructor, and spread
+  - Compiler-generated plain, method, fixed-argument constructor, and spread
     call-family operations expose `directCallGuard`, `directCallFrameSetup`,
     `directCallNativeEntry`, `directCallReturn`, `directCallCleanup`, and
     `directCallEntryReject`; methods additionally expose `directMethodGuard`,
@@ -470,6 +470,11 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     Compiler-generated default-Array iterator collection inside a generated
     spread wrapper remains on the published stack-owned activation; observable
     iterator overrides side-exit before effects to the materialized path.
+    Optimizing calls to the exact bootstrap `Math.abs`, `Math.max`, and
+    `Math.min` complete directly for proven Int32 operands after the same
+    static or method identity guard as the declared leaf call. Extracted static
+    calls use the `nativeInt32MathIntrinsic` code-map region and carry no
+    relocation for the replaced Math leaf.
     Generated code links through the permanent function cell and reads the
     selected generation's actual code-object id, tier, and frame reservation
     before entry; tier publication does not recompile callers. Eager target

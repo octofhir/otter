@@ -6,6 +6,8 @@
 //! - [`GcHeap`] — the orchestrator the rest of the runtime sees.
 //! - [`RootSlotVisitor`] — caller-supplied root source closure for full GC.
 //! - [`HeapStats`] — tiny snapshot of accounting (used by tests).
+//! - [`MachineAllocationWindow`] — the audited nursery/accounting view exposed
+//!   to generated-code allocators.
 //! - Ephemeron registry and split mark/sweep hooks used by weak
 //!   collections in the VM.
 //! - Weak-reference/finalization registry bookkeeping used by VM
@@ -24,6 +26,9 @@
 //! - Pages live forever inside the heap or are returned to the
 //!   cage on full-GC sweep. Pages are never leaked across heap
 //!   drops.
+//! - A machine allocation window names only the active young from-space page,
+//!   is disabled during marking, GC stress, or a pending major collection, and
+//!   is refreshed after every rooted cold allocation transition.
 //! - Weak collection tables are registered as type-erased raw
 //!   handles; VM code runs the ephemeron fixpoint between
 //!   [`GcHeap::mark_phase`] and [`GcHeap::sweep_phase`].
@@ -120,6 +125,47 @@ pub struct HeapStats {
     pub reserved_bytes: u64,
     /// Configured heap cap in bytes (`0` = disabled).
     pub max_heap_bytes: u64,
+}
+
+/// Narrow nursery window published to audited generated-code allocators.
+///
+/// This is not a general heap-mutation API. A consumer may carve only one
+/// already-registered fixed-size body, must update the pointed page and type
+/// counters exactly once, and must reject the window unless the page still
+/// belongs to [`crate::page::SpaceKind::NewFrom`]. All conditions requiring a
+/// collector handshake are represented by a disabled (null-page) window.
+#[doc(hidden)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MachineAllocationWindow {
+    /// Current nursery page header, or null when generated allocation is not
+    /// permitted without a safepoint.
+    pub page_header: *mut crate::page::PageHeader,
+    /// Per-type live-byte counter.
+    pub type_live_bytes: *mut usize,
+    /// Per-type monotone allocation-count counter.
+    pub type_alloc_count: *mut u64,
+    /// Per-type monotone allocated-byte counter.
+    pub type_alloc_bytes: *mut u64,
+    /// Heap-cap accounting word, or null when cap accounting is disabled.
+    pub tracked_bytes: *mut u64,
+    /// Current heap cap (`0` when disabled).
+    pub max_heap_bytes: u64,
+}
+
+impl MachineAllocationWindow {
+    /// A window that forces the caller through its rooted cold path.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            page_header: std::ptr::null_mut(),
+            type_live_bytes: std::ptr::null_mut(),
+            type_alloc_count: std::ptr::null_mut(),
+            type_alloc_bytes: std::ptr::null_mut(),
+            tracked_bytes: std::ptr::null_mut(),
+            max_heap_bytes: 0,
+        }
+    }
 }
 
 /// Orchestrator. Owned by the runtime; passed by `&mut` to every
@@ -942,6 +988,42 @@ impl GcHeap {
     /// never going to die.
     pub const fn set_tenure_all(&mut self, tenure_all: bool) {
         self.tenure_all = tenure_all;
+    }
+
+    /// Publish the current safepoint-free nursery window for one body type.
+    ///
+    /// Heap caps, stress collection, incremental marking, bootstrap tenuring,
+    /// and a due major collection all retain the ordinary rooted allocation
+    /// path. The page pointer is stable as an address but its space kind is
+    /// not; generated code must revalidate `NewFrom` on every use.
+    #[doc(hidden)]
+    pub fn machine_allocation_window<T: Traceable>(&mut self) -> MachineAllocationWindow {
+        if self.tenure_all
+            || (self.gc_stress_stride != 0 && self.gc_stress_armed && !self.in_major_gc)
+            || self.major_gc_due()
+            || self.marking.is_marking()
+        {
+            return MachineAllocationWindow::disabled();
+        }
+        if self.max_heap_bytes != 0 {
+            self.drain_shared_external_releases();
+        }
+        let Some(page) = self.new_space.machine_active_page() else {
+            return MachineAllocationWindow::disabled();
+        };
+        let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
+        MachineAllocationWindow {
+            page_header: page.header_mut(),
+            type_live_bytes: std::ptr::addr_of_mut!(row.live_bytes),
+            type_alloc_count: std::ptr::addr_of_mut!(row.alloc_count_total),
+            type_alloc_bytes: std::ptr::addr_of_mut!(row.alloc_bytes_total),
+            tracked_bytes: if self.max_heap_bytes == 0 {
+                std::ptr::null_mut()
+            } else {
+                std::ptr::addr_of_mut!(self.tracked_bytes)
+            },
+            max_heap_bytes: self.max_heap_bytes,
+        }
     }
 
     /// Try to allocate a `T` in young space without running any collection.

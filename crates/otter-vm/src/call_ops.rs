@@ -25,6 +25,9 @@
 //! - Derived bytecode constructors enter with no receiver and preserve the
 //!   caller's stable argument window; their direct `super(...)` dispatch owns
 //!   the single prototype lookup and receiver allocation.
+//! - Generated receiver allocation uses the same VM-planned shape/capacity
+//!   contract as the ordinary allocator; a nursery-window miss returns here
+//!   while all constructor inputs remain rooted and no effect has started.
 //! - Nested call/construct dispatch appends above an `ActivationFloor` on the
 //!   current rooted stack; native boundary slots are collector-rewritten in
 //!   their original storage.
@@ -649,10 +652,15 @@ impl Interpreter {
             return Ok(());
         };
         let super_constructor = class.ctor_proto(&self.gc_heap);
-        let base_callable = super_constructor
-            .as_class_constructor()
-            .map(|class| class.ctor(&self.gc_heap))
-            .unwrap_or(super_constructor);
+        let class_callable = class.ctor(&self.gc_heap);
+        let base_callable = if super_constructor.is_undefined() {
+            class_callable
+        } else {
+            super_constructor
+                .as_class_constructor()
+                .map(|class| class.ctor(&self.gc_heap))
+                .unwrap_or(super_constructor)
+        };
         let Some(base_function_id) = base_callable.as_function().or_else(|| {
             base_callable
                 .as_closure(&self.gc_heap)
@@ -660,7 +668,7 @@ impl Interpreter {
         }) else {
             return Ok(());
         };
-        let derived_callable = class.ctor(&self.gc_heap);
+        let derived_callable = class_callable;
         let Some(derived_function_id) = derived_callable.as_function().or_else(|| {
             derived_callable
                 .as_closure(&self.gc_heap)
@@ -668,7 +676,12 @@ impl Interpreter {
         }) else {
             return Ok(());
         };
-        let store_count = [base_function_id, derived_function_id]
+        let mut chain_functions = smallvec::SmallVec::<[u32; 2]>::new();
+        chain_functions.push(base_function_id);
+        if derived_function_id != base_function_id {
+            chain_functions.push(derived_function_id);
+        }
+        let store_count = chain_functions
             .into_iter()
             .filter_map(|function_id| context.exec_function(function_id))
             .map(|function| {
@@ -783,9 +796,12 @@ impl Interpreter {
             };
             let stores =
                 crate::constructor_fast_path::match_constructor_shape_stores(context, function);
-            let receiver_is_pre_shaped = function_id == base_function_id
-                && crate::constructor_fast_path::match_simple_constructor_init(context, function)
-                    .is_some();
+            let simple_init = (function_id == base_function_id)
+                .then(|| {
+                    crate::constructor_fast_path::match_simple_constructor_init(context, function)
+                })
+                .flatten();
+            let receiver_is_pre_shaped = simple_init.is_some();
             for store in stores {
                 if !seen.insert(store.name.clone())
                     || !matches!(
@@ -845,6 +861,12 @@ impl Interpreter {
                 }
                 slot = slot.checked_add(1).ok_or(VmError::InvalidOperand)?;
             }
+            if let Some(init) = simple_init {
+                self.simple_constructor_init_cache
+                    .insert(function_id, Some(init));
+                self.simple_constructor_shape_cache
+                    .insert(function_id, shape);
+            }
         }
         // The first generated receiver preparation can discover these plans
         // after an earlier hot loop already compiled the constructor. Retire
@@ -854,6 +876,8 @@ impl Interpreter {
         let capacity = usize::from(slot);
         self.constructor_field_capacity_cache
             .insert(chain_key, capacity);
+        self.constructor_prototype_shape_cache
+            .insert(chain_key, prototype_shapes);
         for function_id in reopt_functions {
             self.evict_compiled_for_reopt(function_id);
         }

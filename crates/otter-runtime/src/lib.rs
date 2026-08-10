@@ -965,6 +965,26 @@ pub struct RuntimeExecutionStats {
     pub jit_alloc_value_stub_out_of_memory: u64,
     /// Executed `AllocValueStub` entries that returned another non-`Ok` status.
     pub jit_alloc_value_stub_other: u64,
+    /// Generated receiver-allocation plan attempts.
+    pub jit_receiver_alloc_attempts: u64,
+    /// Receivers allocated entirely in generated code.
+    pub jit_receiver_alloc_generated: u64,
+    /// Pre-effect allocation-plan guard misses.
+    pub jit_receiver_alloc_guard_misses: u64,
+    /// Nursery-window capacity/state misses.
+    pub jit_receiver_alloc_space_misses: u64,
+    /// Rooted cold receiver-preparation transitions.
+    pub jit_receiver_alloc_cold_transitions: u64,
+    /// Cold receiver transitions that ran a GC cycle.
+    pub jit_receiver_alloc_gc_transitions: u64,
+    /// Cold receiver transitions that refreshed the nursery window.
+    pub jit_receiver_alloc_refills: u64,
+    /// Receiver allocation out-of-memory results.
+    pub jit_receiver_alloc_oom: u64,
+    /// Receiver allocation deoptimizations.
+    pub jit_receiver_alloc_deopts: u64,
+    /// Receiver allocation transitions into Rust.
+    pub jit_receiver_alloc_rust_transitions: u64,
     /// VM-published collection method IC mirror slots.
     pub jit_collection_method_ic_slots: u64,
     /// Empty collection method IC mirror slots.
@@ -4147,6 +4167,16 @@ impl Runtime {
             jit_alloc_value_stub_miss: jit.alloc_value_stub_miss,
             jit_alloc_value_stub_out_of_memory: jit.alloc_value_stub_out_of_memory,
             jit_alloc_value_stub_other: jit.alloc_value_stub_other,
+            jit_receiver_alloc_attempts: jit.receiver_alloc_attempts,
+            jit_receiver_alloc_generated: jit.receiver_alloc_generated,
+            jit_receiver_alloc_guard_misses: jit.receiver_alloc_guard_misses,
+            jit_receiver_alloc_space_misses: jit.receiver_alloc_space_misses,
+            jit_receiver_alloc_cold_transitions: jit.receiver_alloc_cold_transitions,
+            jit_receiver_alloc_gc_transitions: jit.receiver_alloc_gc_transitions,
+            jit_receiver_alloc_refills: jit.receiver_alloc_refills,
+            jit_receiver_alloc_oom: jit.receiver_alloc_oom,
+            jit_receiver_alloc_deopts: jit.receiver_alloc_deopts,
+            jit_receiver_alloc_rust_transitions: jit.receiver_alloc_rust_transitions,
             jit_collection_method_ic_slots: collection_method_ics.slots,
             jit_collection_method_ic_empty_slots: collection_method_ics.empty_slots,
             jit_collection_method_ic_collection_slots: collection_method_ics.collection_slots,

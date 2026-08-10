@@ -100,6 +100,16 @@ impl NewSpace {
         }
     }
 
+    /// Current mutator page for a generated-code allocation probe.
+    ///
+    /// The returned page remains cage-owned for the heap lifetime. Generated
+    /// code must still validate its live [`SpaceKind`] and bump limit before
+    /// carving a cell because a collection may flip the semispaces after this
+    /// view is captured.
+    pub(crate) fn machine_active_page(&self) -> Option<&Page> {
+        self.from.get(self.active)
+    }
+
     /// Bump-allocate inside `to`-space — used by the scavenger
     /// while evacuating survivors.
     pub fn alloc_in_to(&mut self, size_aligned: usize) -> Option<u32> {

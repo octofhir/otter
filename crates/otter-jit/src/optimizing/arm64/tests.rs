@@ -224,6 +224,8 @@ fn execute_at(
         activation_top_ptr: std::ptr::null_mut(),
         activation_limit: 0,
         machine_roots_ptr: std::ptr::null_mut(),
+        receiver_alloc: otter_vm::jit::JitMachineAllocationWindow::disabled(),
+        runtime_stats: std::ptr::null_mut(),
         global_this_offset: std::ptr::null(),
         native_stack_limit: 0,
         generated_feedback_clean: 1,

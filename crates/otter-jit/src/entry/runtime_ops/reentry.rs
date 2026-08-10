@@ -1310,7 +1310,7 @@ pub(crate) extern "C" fn jit_try_prepare_base_construct_stub(
     callee_bits: u64,
     new_target_bits: u64,
     function_id: u64,
-    _reserved2: u64,
+    planned_allocation: u64,
 ) -> JitRet {
     // SAFETY: the live `JitCtx` allocation contract publishes the caller's
     // complete tagged window through its active native frame.
@@ -1324,18 +1324,45 @@ pub(crate) extern "C" fn jit_try_prepare_base_construct_stub(
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
     let context = unsafe { &*activation.context_ptr() };
+    let before_page = ctx.receiver_alloc.page_header;
+    let before_cycles = vm.jit_gc_cycle_counts();
+    if planned_allocation != 0 && !ctx.runtime_stats.is_null() {
+        // SAFETY: `enter_compiled` publishes the interpreter-owned counter
+        // record for the complete JIT context lifetime.
+        let stats = unsafe { &mut *ctx.runtime_stats };
+        stats.receiver_alloc_cold_transitions =
+            stats.receiver_alloc_cold_transitions.saturating_add(1);
+        stats.receiver_alloc_rust_transitions =
+            stats.receiver_alloc_rust_transitions.saturating_add(1);
+    }
     let Ok(function_id) = u32::try_from(function_id) else {
         return JitRet {
             value: 0,
             status: STATUS_BAILED,
         };
     };
-    match vm.jit_try_prepare_base_construct_receiver(
+    let result = vm.jit_try_prepare_base_construct_receiver(
         context,
         function_id,
         otter_vm::Value::from_bits(callee_bits),
         otter_vm::Value::from_bits(new_target_bits),
-    ) {
+    );
+    ctx.receiver_alloc = vm.jit_receiver_allocation_window();
+    if planned_allocation != 0 && !ctx.runtime_stats.is_null() {
+        // SAFETY: same stable counter record as above.
+        let stats = unsafe { &mut *ctx.runtime_stats };
+        if vm.jit_gc_cycle_counts() != before_cycles {
+            stats.receiver_alloc_gc_transitions =
+                stats.receiver_alloc_gc_transitions.saturating_add(1);
+        }
+        if ctx.receiver_alloc.page_header != before_page {
+            stats.receiver_alloc_refills = stats.receiver_alloc_refills.saturating_add(1);
+        }
+        if matches!(result, Err(VmError::OutOfMemory { .. })) {
+            stats.receiver_alloc_oom = stats.receiver_alloc_oom.saturating_add(1);
+        }
+    }
+    match result {
         Ok(Some(receiver)) => JitRet {
             value: receiver.to_bits(),
             status: STATUS_RETURNED,
@@ -1727,6 +1754,8 @@ mod tests {
             activation_top_ptr: std::ptr::null_mut(),
             activation_limit: 0,
             machine_roots_ptr: std::ptr::null_mut(),
+            receiver_alloc: otter_vm::jit::JitMachineAllocationWindow::disabled(),
+            runtime_stats: std::ptr::null_mut(),
             global_this_offset: std::ptr::null(),
             native_stack_limit: 0,
             generated_feedback_clean: 1,

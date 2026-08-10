@@ -232,6 +232,9 @@ impl CodeBlock {
             object_slab_len_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_SLAB_LEN_OFFSET as u32,
             object_inline_slot_cap: crate::object::INLINE_SLOT_CAP as u32,
+            object_extensible_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::OBJECT_BODY_EXTENSIBLE_OFFSET as u32,
+            object_cell_bytes: crate::object::OBJECT_BODY_CELL_BYTES as u32,
             gc_barrier: crate::jit::JitGcBarrierLayout {
                 header_flags_byte: otter_gc::header::HEADER_FLAGS_BYTE_OFFSET as u32,
                 young_flag: otter_gc::header::GENERATION_YOUNG_FLAG as u32,
@@ -261,6 +264,8 @@ impl CodeBlock {
                     + crate::class_constructor::CLASS_CONSTRUCTOR_BODY_CTOR_OFFSET as u32,
                 super_constructor_byte: gc_header_bytes
                     + crate::class_constructor::CLASS_CONSTRUCTOR_BODY_CTOR_PROTO_OFFSET as u32,
+                prototype_byte: gc_header_bytes
+                    + crate::class_constructor::CLASS_CONSTRUCTOR_BODY_PROTOTYPE_OFFSET as u32,
             },
             primitive_cell_type_tags: [
                 crate::string::JS_STRING_BODY_TYPE_TAG,

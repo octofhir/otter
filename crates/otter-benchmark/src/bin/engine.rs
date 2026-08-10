@@ -548,6 +548,31 @@ fn jit_counter_deltas(before: JitRuntimeStats, after: JitRuntimeStats) -> Vec<(&
             alloc_value_stub_out_of_memory
         ),
         ("jit-alloc-value-stub-other", alloc_value_stub_other),
+        ("jit-receiver-alloc-attempts", receiver_alloc_attempts),
+        ("jit-receiver-alloc-generated", receiver_alloc_generated),
+        (
+            "jit-receiver-alloc-guard-misses",
+            receiver_alloc_guard_misses
+        ),
+        (
+            "jit-receiver-alloc-space-misses",
+            receiver_alloc_space_misses
+        ),
+        (
+            "jit-receiver-alloc-cold-transitions",
+            receiver_alloc_cold_transitions
+        ),
+        (
+            "jit-receiver-alloc-gc-transitions",
+            receiver_alloc_gc_transitions
+        ),
+        ("jit-receiver-alloc-refills", receiver_alloc_refills),
+        ("jit-receiver-alloc-oom", receiver_alloc_oom),
+        ("jit-receiver-alloc-deopts", receiver_alloc_deopts),
+        (
+            "jit-receiver-alloc-rust-transitions",
+            receiver_alloc_rust_transitions
+        ),
     ]
 }
 

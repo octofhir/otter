@@ -535,6 +535,7 @@ pub fn oom_to_vm(err: otter_gc::OutOfMemory) -> VmError {
 }
 
 /// Aggregate native-tier runtime counters.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JitRuntimeStats {
     /// Optimizing-tier function and OSR entries.
@@ -612,6 +613,26 @@ pub struct JitRuntimeStats {
     pub alloc_value_stub_out_of_memory: u64,
     /// Executed `AllocValueStub` entries that returned another non-`Ok` status.
     pub alloc_value_stub_other: u64,
+    /// Generated receiver-allocation plans entered before any mutation.
+    pub receiver_alloc_attempts: u64,
+    /// Receivers carved and initialized entirely in generated code.
+    pub receiver_alloc_generated: u64,
+    /// Plan identity/prototype guards that selected the rooted cold path.
+    pub receiver_alloc_guard_misses: u64,
+    /// Nursery-window capacity/state misses that selected the rooted cold path.
+    pub receiver_alloc_space_misses: u64,
+    /// Rooted cold receiver-preparation calls from a generated allocation plan.
+    pub receiver_alloc_cold_transitions: u64,
+    /// Cold calls that crossed a minor or full collector cycle.
+    pub receiver_alloc_gc_transitions: u64,
+    /// Cold calls that refreshed the generated nursery page window.
+    pub receiver_alloc_refills: u64,
+    /// Cold receiver allocations that reported out-of-memory.
+    pub receiver_alloc_oom: u64,
+    /// Generated receiver allocation exits that deoptimized the construct.
+    pub receiver_alloc_deopts: u64,
+    /// Generated receiver plans that entered a Rust allocation boundary.
+    pub receiver_alloc_rust_transitions: u64,
 }
 
 /// Snapshot of VM-published collection method IC mirror slots.
@@ -943,6 +964,8 @@ pub struct Interpreter {
     /// chain. Plans remain guarded at their original stores, so repeated
     /// receiver allocation need not rescan the prototype graph.
     constructor_field_capacity_cache: rustc_hash::FxHashMap<(u32, u32), usize>,
+    /// Ordinary prototype-chain shapes for each planned class allocation.
+    constructor_prototype_shape_cache: rustc_hash::FxHashMap<(u32, u32), Vec<object::ShapeId>>,
     /// Final hidden class of an arguments object, keyed by argument count and
     /// mapped-ness. Same tracing contract as the constructor cache above.
     arguments_shape_cache: rustc_hash::FxHashMap<(u32, bool), object::ShapeHandle>,

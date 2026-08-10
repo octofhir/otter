@@ -162,6 +162,18 @@ struct Vm<'a, 's, 'rt> {
 }
 
 impl Vm<'_, '_, '_> {
+    /// Put a fresh object in the frame stack at `depth`.
+    ///
+    /// Called the first time an element takes a key, which is the first
+    /// moment the compact shape knows the element will not collapse to its
+    /// text.
+    fn ensure_object(&mut self, depth: usize) {
+        self.step(|scope, stack| {
+            let element = scope.object()?;
+            scope.set_index(stack, depth, element)
+        });
+    }
+
     /// Run `body` in a nested handle scope, keeping the first failure.
     ///
     /// The nested scope is what bounds the arena: handles the step mints are
@@ -238,19 +250,23 @@ impl<E: Encoding> Sink<E::Unit> for Builder<'_, '_, '_, E> {
             self.root_name.push_str(&name);
         }
 
-        let shape = self.shape;
-        self.vm.step(|scope, stack| {
-            let element = scope.object()?;
-            if shape == Shape::Node {
+        // The compact shape does not know yet whether this element becomes an
+        // object or collapses to its text, and a leaf with neither attributes
+        // nor child elements collapses. Allocating here would throw that
+        // object away for every such leaf, which in a document of records is
+        // most of them; `ensure_object` allocates at the first key instead.
+        if self.shape == Shape::Node {
+            self.vm.step(|scope, stack| {
+                let element = scope.object()?;
                 let element_name = scope.string(&name)?;
                 scope.set(element, "name", element_name)?;
                 let attributes = scope.object()?;
                 scope.set(element, "attributes", attributes)?;
                 let children = scope.array(0)?;
                 scope.set(element, "children", children)?;
-            }
-            scope.set_index(stack, depth, element)
-        });
+                scope.set_index(stack, depth, element)
+            });
+        }
         self.depth += 1;
     }
 
@@ -270,6 +286,9 @@ impl<E: Encoding> Sink<E::Unit> for Builder<'_, '_, '_, E> {
         } else {
             &name
         };
+        if shape == Shape::Compact && self.frames[depth].keys == 1 {
+            self.vm.ensure_object(depth);
+        }
         self.vm.step(|scope, stack| {
             let element = scope.index(stack, depth)?;
             let text = scope.string(&value)?;
@@ -309,6 +328,9 @@ impl<E: Encoding> Sink<E::Unit> for Builder<'_, '_, '_, E> {
             let at = self.frames[depth - 1].children;
             self.frames[depth - 1].children += 1;
             self.frames[depth - 1].keys += 1;
+            if shape == Shape::Compact && self.frames[depth - 1].keys == 1 {
+                self.vm.ensure_object(depth - 1);
+            }
             at
         } else {
             0

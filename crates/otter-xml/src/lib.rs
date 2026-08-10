@@ -26,6 +26,7 @@
 //! - <https://www.w3.org/TR/2008/REC-xml-20081126/>
 
 pub mod chars;
+pub(crate) mod dtd;
 pub mod encoding;
 pub mod error;
 pub mod index;

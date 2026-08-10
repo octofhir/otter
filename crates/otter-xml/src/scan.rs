@@ -19,15 +19,21 @@
 //!   newline or carriage return becomes a space, while the same character
 //!   written as a reference is kept as itself.
 //! - Comments and processing instructions are validated and discarded.
+//! - An entity whose replacement text holds markup is parsed by a scanner of
+//!   its own over that text, which is what makes the specification's rule that
+//!   a parsed entity must match the `content` production hold by construction:
+//!   an element opened inside an entity has nowhere else to close.
 //!
 //! # See also
 //! - <https://www.w3.org/TR/2008/REC-xml-20081126/>
 //! - [`crate::index`] — where the stopping positions come from.
+//! - [`crate::dtd`] — the declarations that drive expansion.
 
 use core::ops::Range;
 
 use crate::chars::{is_char, is_name_char, is_name_start, is_whitespace};
-use crate::encoding::{Encoding, Unit, push_utf16};
+use crate::dtd::{self, Context, Resolved};
+use crate::encoding::{Encoding, Unit, Utf16, push_utf16};
 use crate::error::{Error, ErrorKind, Result};
 use crate::index::{self, Index};
 use crate::sink::{Piece, Sink};
@@ -40,8 +46,53 @@ pub const MAX_DEPTH: usize = 4096;
 /// # Errors
 /// Returns the first way in which the document is not well-formed.
 pub fn parse<E: Encoding, S: Sink<E::Unit>>(units: &[E::Unit], sink: &mut S) -> Result<()> {
-    let index = index::build::<E>(units)?;
-    Scanner::<E>::new(units, index).run(sink)
+    let mut ctx = Context::new();
+    Scanner::<E>::over(units)?.run(sink, &mut ctx)
+}
+
+/// A sink driven by a scanner over an entity's replacement text, forwarding to
+/// the sink of the document that referred to the entity.
+///
+/// Replacement text is held as UTF-16, so its pieces reach the document's sink
+/// as [`Piece::Widened`] whatever the document's own code unit is.
+struct Expanded<'s, U: Unit> {
+    inner: &'s mut dyn Sink<U>,
+}
+
+/// The same run of replacement text, addressed to a sink of `U`.
+fn widened<U: Unit>(piece: Piece<'_, u16>) -> Piece<'_, U> {
+    match piece {
+        Piece::Source { units, .. } | Piece::Rewritten(units) | Piece::Widened(units) => {
+            Piece::Widened(units)
+        }
+    }
+}
+
+impl<U: Unit> Sink<u16> for Expanded<'_, U> {
+    fn start_element(&mut self, name: Piece<'_, u16>) {
+        self.inner.start_element(widened(name));
+    }
+
+    fn attribute(&mut self, name: Piece<'_, u16>, value: Piece<'_, u16>) {
+        self.inner.attribute(widened(name), widened(value));
+    }
+
+    fn text(&mut self, text: Piece<'_, u16>) {
+        self.inner.text(widened(text));
+    }
+
+    fn end_element(&mut self) {
+        self.inner.end_element();
+    }
+}
+
+/// Where character data stopped.
+enum Data {
+    /// At markup or at the end of the text; the run has been emitted.
+    Stopped,
+    /// At a reference to an entity whose replacement text holds markup. The
+    /// run has been emitted; the text is for the caller to parse as content.
+    Entity(String, Vec<u16>),
 }
 
 /// Where the units of the run being assembled currently live.
@@ -55,13 +106,13 @@ enum Scratch {
     Wide,
 }
 
-struct Scanner<'a, E: Encoding> {
+pub(crate) struct Scanner<'a, E: Encoding> {
     units: &'a [E::Unit],
     index: Index,
     /// Forward-only position in the index.
     cursor: usize,
     /// Position in the document, in code units.
-    pos: usize,
+    pub(crate) pos: usize,
     /// Assembled units of the run in progress.
     scratch: Vec<E::Unit>,
     /// The same run, once something forced it to UTF-16.
@@ -76,6 +127,12 @@ struct Scanner<'a, E: Encoding> {
 }
 
 impl<'a, E: Encoding> Scanner<'a, E> {
+    /// Index `units` and open a scanner over them.
+    pub(crate) fn over(units: &'a [E::Unit]) -> Result<Self> {
+        let index = index::build::<E>(units)?;
+        Ok(Self::new(units, index))
+    }
+
     fn new(units: &'a [E::Unit], index: Index) -> Self {
         Self {
             units,
@@ -93,22 +150,27 @@ impl<'a, E: Encoding> Scanner<'a, E> {
 
     // ---- primitives -----------------------------------------------------
 
-    fn err<T>(&self, kind: ErrorKind) -> Result<T> {
+    pub(crate) fn err<T>(&self, kind: ErrorKind) -> Result<T> {
         Err(Error::new(kind, self.pos))
     }
 
+    /// How many code units the text being scanned has.
+    pub(crate) fn len(&self) -> usize {
+        self.units.len()
+    }
+
     #[inline]
-    fn unit(&self, pos: usize) -> Option<E::Unit> {
+    pub(crate) fn unit(&self, pos: usize) -> Option<E::Unit> {
         self.units.get(pos).copied()
     }
 
     #[inline]
-    fn at(&self, pos: usize, ascii: u8) -> bool {
+    pub(crate) fn at(&self, pos: usize, ascii: u8) -> bool {
         self.unit(pos).is_some_and(|unit| unit.is(ascii))
     }
 
     /// Whether the document has `literal` at `pos`.
-    fn starts_with(&self, pos: usize, literal: &[u8]) -> bool {
+    pub(crate) fn starts_with(&self, pos: usize, literal: &[u8]) -> bool {
         literal
             .iter()
             .enumerate()
@@ -116,7 +178,7 @@ impl<'a, E: Encoding> Scanner<'a, E> {
     }
 
     /// Advance over `literal`, or fail saying what was wanted.
-    fn expect(&mut self, literal: &'static [u8], what: &'static str) -> Result<()> {
+    pub(crate) fn expect(&mut self, literal: &'static [u8], what: &'static str) -> Result<()> {
         if !self.starts_with(self.pos, literal) {
             return self.err(ErrorKind::Expected(what));
         }
@@ -125,7 +187,7 @@ impl<'a, E: Encoding> Scanner<'a, E> {
     }
 
     /// Skip whitespace, reporting whether any was there.
-    fn skip_whitespace(&mut self) -> bool {
+    pub(crate) fn skip_whitespace(&mut self) -> bool {
         let start = self.pos;
         while self
             .unit(self.pos)
@@ -136,7 +198,7 @@ impl<'a, E: Encoding> Scanner<'a, E> {
         self.pos > start
     }
 
-    fn require_whitespace(&mut self) -> Result<()> {
+    pub(crate) fn require_whitespace(&mut self) -> Result<()> {
         if self.skip_whitespace() {
             Ok(())
         } else {
@@ -145,7 +207,7 @@ impl<'a, E: Encoding> Scanner<'a, E> {
     }
 
     /// The scalar at `pos`, which the index has already proven well-formed.
-    fn scalar(&self, pos: usize) -> Result<(u32, usize)> {
+    pub(crate) fn scalar(&self, pos: usize) -> Result<(u32, usize)> {
         let unit = self
             .unit(pos)
             .ok_or(Error::new(ErrorKind::UnexpectedEof, pos))?;
@@ -157,7 +219,7 @@ impl<'a, E: Encoding> Scanner<'a, E> {
     }
 
     /// Consume a `Name`, returning its span.
-    fn scan_name(&mut self) -> Result<Range<usize>> {
+    pub(crate) fn scan_name(&mut self) -> Result<Range<usize>> {
         let start = self.pos;
         let (code, width) = self.scalar(self.pos)?;
         if !is_name_start(code) {
@@ -254,12 +316,12 @@ impl<'a, E: Encoding> Scanner<'a, E> {
 
     // ---- document -------------------------------------------------------
 
-    fn run<S: Sink<E::Unit>>(&mut self, sink: &mut S) -> Result<()> {
-        self.scan_prolog()?;
+    fn run<S: Sink<E::Unit>>(&mut self, sink: &mut S, ctx: &mut Context) -> Result<()> {
+        self.scan_prolog(ctx)?;
         if !self.at(self.pos, b'<') || self.at(self.pos + 1, b'/') {
             return self.err(ErrorKind::RootElementCount);
         }
-        self.scan_element_tree(sink)?;
+        self.scan_element_tree(sink, ctx)?;
         self.scan_trailing_misc()?;
         if self.pos < self.units.len() {
             return self.err(ErrorKind::RootElementCount);
@@ -267,13 +329,13 @@ impl<'a, E: Encoding> Scanner<'a, E> {
         Ok(())
     }
 
-    fn scan_prolog(&mut self) -> Result<()> {
+    fn scan_prolog(&mut self, ctx: &mut Context) -> Result<()> {
         if self.starts_with(self.pos, b"<?xml")
             && self
                 .unit(self.pos + 5)
                 .is_some_and(|unit| is_whitespace(unit.value()))
         {
-            self.scan_xml_declaration()?;
+            self.scan_xml_declaration(ctx)?;
         }
         let mut seen_doctype = false;
         loop {
@@ -285,7 +347,7 @@ impl<'a, E: Encoding> Scanner<'a, E> {
                     return self.err(ErrorKind::Expected("a single document type declaration"));
                 }
                 seen_doctype = true;
-                self.skip_doctype()?;
+                self.scan_doctype(ctx)?;
             } else if self.starts_with(self.pos, b"<?") {
                 self.scan_processing_instruction()?;
             } else {
@@ -308,7 +370,7 @@ impl<'a, E: Encoding> Scanner<'a, E> {
     }
 
     /// `<?xml version="1.x" encoding="…"? standalone="…"? ?>`
-    fn scan_xml_declaration(&mut self) -> Result<()> {
+    fn scan_xml_declaration(&mut self, ctx: &mut Context) -> Result<()> {
         self.pos += 5;
         self.require_whitespace()?;
         self.expect(b"version", "a version pseudo-attribute")?;
@@ -349,6 +411,10 @@ impl<'a, E: Encoding> Scanner<'a, E> {
             if !yes && !no {
                 return self.err(ErrorKind::BadDeclaration("standalone must be yes or no"));
             }
+            // A document that stands alone promises there is nothing outside
+            // it to declare, which is what makes an undeclared entity an
+            // error rather than something to leave as written.
+            ctx.set_standalone(yes);
             self.skip_whitespace();
         }
         self.expect(b"?>", "`?>`")
@@ -380,10 +446,17 @@ impl<'a, E: Encoding> Scanner<'a, E> {
 
     // ---- elements -------------------------------------------------------
 
-    fn scan_element_tree<S: Sink<E::Unit>>(&mut self, sink: &mut S) -> Result<()> {
-        self.scan_start_tag(sink)?;
+    fn scan_element_tree<S: Sink<E::Unit>>(
+        &mut self,
+        sink: &mut S,
+        ctx: &mut Context,
+    ) -> Result<()> {
+        self.scan_start_tag(sink, ctx)?;
         while !self.open.is_empty() {
-            self.scan_char_data(sink)?;
+            if let Data::Entity(name, text) = self.scan_char_data(sink, ctx)? {
+                self.scan_entity_as_content(&name, &text, sink, ctx)?;
+                continue;
+            }
             if self.pos >= self.units.len() {
                 let name = self.open.last().cloned().unwrap_or(0..0);
                 return Err(Error::new(
@@ -391,26 +464,81 @@ impl<'a, E: Encoding> Scanner<'a, E> {
                     self.pos,
                 ));
             }
-            match self.unit(self.pos + 1) {
-                None => return self.err(ErrorKind::UnexpectedEof),
-                Some(unit) if unit.is(b'/') => self.scan_end_tag(sink)?,
-                Some(unit) if unit.is(b'?') => self.scan_processing_instruction()?,
-                Some(unit) if unit.is(b'!') => {
-                    if self.starts_with(self.pos, b"<!--") {
-                        self.scan_comment()?;
-                    } else if self.starts_with(self.pos, b"<![CDATA[") {
-                        self.scan_cdata(sink)?;
-                    } else {
-                        return self.err(ErrorKind::Expected("a comment or CDATA section"));
-                    }
-                }
-                Some(_) => self.scan_start_tag(sink)?,
-            }
+            self.scan_markup(sink, ctx)?;
         }
         Ok(())
     }
 
-    fn scan_start_tag<S: Sink<E::Unit>>(&mut self, sink: &mut S) -> Result<()> {
+    /// The `content` production of an entity's replacement text: everything a
+    /// document body may hold, ending only when the text does and with every
+    /// element it opened closed again.
+    fn run_entity_content<S: Sink<E::Unit>>(
+        &mut self,
+        sink: &mut S,
+        ctx: &mut Context,
+    ) -> Result<()> {
+        loop {
+            if let Data::Entity(name, text) = self.scan_char_data(sink, ctx)? {
+                self.scan_entity_as_content(&name, &text, sink, ctx)?;
+                continue;
+            }
+            if self.pos >= self.units.len() {
+                break;
+            }
+            self.scan_markup(sink, ctx)?;
+        }
+        if let Some(name) = self.open.last().cloned() {
+            return Err(Error::new(
+                ErrorKind::UnclosedElement(self.text_of(name)),
+                self.pos,
+            ));
+        }
+        Ok(())
+    }
+
+    /// One construct starting at the `<` the scanner is sitting on.
+    fn scan_markup<S: Sink<E::Unit>>(&mut self, sink: &mut S, ctx: &mut Context) -> Result<()> {
+        match self.unit(self.pos + 1) {
+            None => self.err(ErrorKind::UnexpectedEof),
+            Some(unit) if unit.is(b'/') => self.scan_end_tag(sink),
+            Some(unit) if unit.is(b'?') => self.scan_processing_instruction(),
+            Some(unit) if unit.is(b'!') => {
+                if self.starts_with(self.pos, b"<!--") {
+                    self.scan_comment()
+                } else if self.starts_with(self.pos, b"<![CDATA[") {
+                    self.scan_cdata(sink)
+                } else {
+                    self.err(ErrorKind::Expected("a comment or CDATA section"))
+                }
+            }
+            Some(_) => self.scan_start_tag(sink, ctx),
+        }
+    }
+
+    /// Parse an entity's replacement text as content, driving the same sink.
+    ///
+    /// The nested scanner keeps its own stack of open elements, so an element
+    /// the entity opens has to close inside it — the specification's rule that
+    /// a parsed entity matches `content`, enforced by construction.
+    fn scan_entity_as_content<S: Sink<E::Unit>>(
+        &mut self,
+        name: &str,
+        text: &[u16],
+        sink: &mut S,
+        ctx: &mut Context,
+    ) -> Result<()> {
+        ctx.enter(name, self.pos)?;
+        // The sink is held behind a trait object on purpose: an entity inside
+        // an entity would otherwise wrap the wrapper, and the sink's type
+        // would grow with every level of nesting.
+        let mut expanded = Expanded { inner: sink };
+        let result = Scanner::<Utf16>::over(text)
+            .and_then(|mut nested| nested.run_entity_content(&mut expanded, ctx));
+        ctx.leave();
+        result
+    }
+
+    fn scan_start_tag<S: Sink<E::Unit>>(&mut self, sink: &mut S, ctx: &mut Context) -> Result<()> {
         self.pos += 1;
         let name = self.scan_name()?;
         if self.open.len() >= MAX_DEPTH {
@@ -425,22 +553,60 @@ impl<'a, E: Encoding> Scanner<'a, E> {
             let had_space = self.skip_whitespace();
             if self.at(self.pos, b'>') {
                 self.pos += 1;
+                self.supply_declared_attributes(&name, sink, ctx);
                 self.open.push(name);
                 return Ok(());
             }
             if self.starts_with(self.pos, b"/>") {
                 self.pos += 2;
+                self.supply_declared_attributes(&name, sink, ctx);
                 sink.end_element();
                 return Ok(());
             }
             if !had_space {
                 return self.err(ErrorKind::ExpectedWhitespace);
             }
-            self.scan_attribute(sink)?;
+            self.scan_attribute(&name, sink, ctx)?;
         }
     }
 
-    fn scan_attribute<S: Sink<E::Unit>>(&mut self, sink: &mut S) -> Result<()> {
+    /// Give the sink the attributes the declarations supply and the tag did
+    /// not write, in declaration order and after everything it did write.
+    fn supply_declared_attributes<S: Sink<E::Unit>>(
+        &self,
+        element: &Range<usize>,
+        sink: &mut S,
+        ctx: &Context,
+    ) {
+        if !ctx.dtd.declares_attributes() {
+            return;
+        }
+        let element = self.text_of(element.clone());
+        let Some(defs) = ctx.dtd.attributes_of(&element) else {
+            return;
+        };
+        for def in defs {
+            let Some(value) = def.default_units() else {
+                continue;
+            };
+            let declared = String::from_utf16_lossy(def.name_units());
+            if self
+                .attr_names
+                .iter()
+                .any(|written| self.text_of(written.clone()) == declared)
+            {
+                continue;
+            }
+            sink.attribute(Piece::Widened(def.name_units()), Piece::Widened(value));
+        }
+    }
+
+    fn scan_attribute<S: Sink<E::Unit>>(
+        &mut self,
+        element: &Range<usize>,
+        sink: &mut S,
+        ctx: &mut Context,
+    ) -> Result<()> {
         let name = self.scan_name()?;
         if self
             .attr_names
@@ -462,7 +628,17 @@ impl<'a, E: Encoding> Scanner<'a, E> {
             _ => return self.err(ErrorKind::Expected("a quoted attribute value")),
         };
         self.pos += 1;
-        let (start, end) = self.scan_attribute_value(quote)?;
+        let (start, end) = self.scan_attribute_value(quote, ctx)?;
+        // An attribute declared as anything but CDATA has its spaces
+        // collapsed and trimmed, which only a declaration can tell us.
+        if ctx.dtd.declares_attributes()
+            && ctx
+                .dtd
+                .attribute_kind(&self.text_of(element.clone()), &self.text_of(name.clone()))
+                == dtd::AttKind::Tokenized
+        {
+            self.collapse_spaces(start, end);
+        }
         let units = self.units;
         let key = Piece::Source {
             units: &units[name.clone()],
@@ -473,10 +649,25 @@ impl<'a, E: Encoding> Scanner<'a, E> {
         Ok(())
     }
 
+    /// Trim the run's leading and trailing spaces and squeeze the runs inside
+    /// it, as the specification's normalization for a non-CDATA attribute
+    /// requires. Every white-space character is already a space by then.
+    fn collapse_spaces(&mut self, start: usize, end: usize) {
+        if self.state == Scratch::Untouched {
+            self.scratch.clear();
+            self.scratch.extend_from_slice(&self.units[start..end]);
+            self.state = Scratch::Narrow;
+        }
+        match self.state {
+            Scratch::Wide => squeeze(&mut self.wide, 0x20),
+            _ => squeeze(&mut self.scratch, E::Unit::from_ascii(0x20)),
+        }
+    }
+
     /// Scan an attribute value up to `quote`, applying both line-end and
     /// attribute-value normalization. Returns the value's span in the
     /// document, which is only meaningful when nothing was rewritten.
-    fn scan_attribute_value(&mut self, quote: u8) -> Result<(usize, usize)> {
+    fn scan_attribute_value(&mut self, quote: u8, ctx: &mut Context) -> Result<(usize, usize)> {
         let start = self.pos;
         self.begin_run(start);
         loop {
@@ -494,7 +685,7 @@ impl<'a, E: Encoding> Scanner<'a, E> {
                 0x3C => return self.err(ErrorKind::Expected("no `<` in an attribute value")),
                 0x26 => {
                     self.flush(self.pos)?;
-                    self.scan_reference()?;
+                    self.scan_reference_in_attribute(ctx)?;
                     self.verbatim_from = self.pos;
                 }
                 0x9 | 0xA | 0xD => {
@@ -540,10 +731,16 @@ impl<'a, E: Encoding> Scanner<'a, E> {
 
     // ---- content --------------------------------------------------------
 
-    /// Character data up to the next `<`, or to the end of the document.
-    fn scan_char_data<S: Sink<E::Unit>>(&mut self, sink: &mut S) -> Result<()> {
+    /// Character data up to the next `<`, to an entity that holds markup, or
+    /// to the end of the text.
+    fn scan_char_data<S: Sink<E::Unit>>(
+        &mut self,
+        sink: &mut S,
+        ctx: &mut Context,
+    ) -> Result<Data> {
         let start = self.pos;
         self.begin_run(start);
+        let mut entity = None;
         let end = loop {
             let Some(entry) = self.index.seek(&mut self.cursor, self.pos) else {
                 self.pos = self.units.len();
@@ -557,8 +754,14 @@ impl<'a, E: Encoding> Scanner<'a, E> {
             if unit.is(b'&') {
                 self.flush(entry)?;
                 self.pos = entry;
-                self.scan_reference()?;
+                let held = self.scan_reference_in_content(ctx)?;
                 self.verbatim_from = self.pos;
+                if let Some(held) = held {
+                    // The run ends where the reference began; what the entity
+                    // holds is markup and belongs to the caller to parse.
+                    entity = Some(held);
+                    break entry;
+                }
                 continue;
             }
             if unit.is(b'\r') {
@@ -575,9 +778,17 @@ impl<'a, E: Encoding> Scanner<'a, E> {
             }
             self.pos = entry + 1;
         };
-        self.flush_if_rewritten(end)?;
+        // A run that stopped at an entity was already flushed up to the `&`,
+        // and the scanner has moved past the reference, so there is nothing
+        // left between what was copied and where the run ends.
+        if entity.is_none() {
+            self.flush_if_rewritten(end)?;
+        }
         self.emit_run(start, end, sink);
-        Ok(())
+        match entity {
+            Some((name, text)) => Ok(Data::Entity(name, text)),
+            None => Ok(Data::Stopped),
+        }
     }
 
     fn scan_cdata<S: Sink<E::Unit>>(&mut self, sink: &mut S) -> Result<()> {
@@ -625,53 +836,122 @@ impl<'a, E: Encoding> Scanner<'a, E> {
         Ok(())
     }
 
-    /// A reference at `self.pos`, appended to the run in progress.
-    fn scan_reference(&mut self) -> Result<()> {
-        self.pos += 1;
-        if self.at(self.pos, b'#') {
+    /// A character reference whose `&` is at `self.pos`.
+    pub(crate) fn scan_character_reference(&mut self) -> Result<u32> {
+        self.pos += 2;
+        let hex = self.at(self.pos, b'x');
+        if hex {
             self.pos += 1;
-            let hex = self.at(self.pos, b'x');
-            if hex {
-                self.pos += 1;
-            }
-            let radix = if hex { 16 } else { 10 };
-            let start = self.pos;
-            let mut code: u32 = 0;
-            let mut overflow = false;
-            while let Some(digit) = self
-                .unit(self.pos)
-                .and_then(|unit| char::from_u32(unit.value()))
-                .and_then(|c| c.to_digit(radix))
-            {
-                code = code.saturating_mul(radix).saturating_add(digit);
-                overflow |= code > 0x10_FFFF;
-                self.pos += 1;
-            }
-            if self.pos == start {
-                return self.err(ErrorKind::BadCharacterReference);
-            }
-            self.expect(b";", "`;` after a character reference")?;
-            if overflow || !is_char(code) {
-                return self.err(ErrorKind::BadCharacterReference);
-            }
+        }
+        let radix = if hex { 16 } else { 10 };
+        let start = self.pos;
+        let mut code: u32 = 0;
+        let mut overflow = false;
+        while let Some(digit) = self
+            .unit(self.pos)
+            .and_then(|unit| char::from_u32(unit.value()))
+            .and_then(|c| c.to_digit(radix))
+        {
+            code = code.saturating_mul(radix).saturating_add(digit);
+            overflow |= code > 0x10_FFFF;
+            self.pos += 1;
+        }
+        if self.pos == start {
+            return self.err(ErrorKind::BadCharacterReference);
+        }
+        self.expect(b";", "`;` after a character reference")?;
+        if overflow || !is_char(code) {
+            return self.err(ErrorKind::BadCharacterReference);
+        }
+        Ok(code)
+    }
+
+    /// A reference inside an attribute value, appended to the run in progress.
+    ///
+    /// An attribute value is characters and nothing else, so an entity that
+    /// holds markup fails here rather than being parsed.
+    fn scan_reference_in_attribute(&mut self, ctx: &mut Context) -> Result<()> {
+        let at = self.pos;
+        if self.at(self.pos + 1, b'#') {
+            let code = self.scan_character_reference()?;
             return self.push_scalar(code);
         }
+        self.pos += 1;
         let name = self.scan_name()?;
         self.expect(b";", "`;` after an entity reference")?;
-        let replacement = match self.units[name.clone()].len() {
-            2 if self.name_is(&name, b"lt") => b'<',
-            2 if self.name_is(&name, b"gt") => b'>',
-            3 if self.name_is(&name, b"amp") => b'&',
-            4 if self.name_is(&name, b"apos") => b'\'',
-            4 if self.name_is(&name, b"quot") => b'"',
-            _ => {
-                return Err(Error::new(
-                    ErrorKind::UnknownEntity(self.text_of(name)),
-                    self.pos,
-                ));
+        if let Some(code) = self.predefined(&name) {
+            return self.push_scalar(code);
+        }
+        let name = self.text_of(name);
+        let mut text = Vec::new();
+        dtd::expand_in_attribute(ctx, &name, &mut text, at)?;
+        self.push_utf16(&text)
+    }
+
+    /// A reference in content. Returns the entity whose replacement text holds
+    /// markup, which the caller parses; anything else joins the run in
+    /// progress.
+    fn scan_reference_in_content(
+        &mut self,
+        ctx: &mut Context,
+    ) -> Result<Option<(String, Vec<u16>)>> {
+        let at = self.pos;
+        if self.at(self.pos + 1, b'#') {
+            let code = self.scan_character_reference()?;
+            self.push_scalar(code)?;
+            return Ok(None);
+        }
+        self.pos += 1;
+        let name = self.scan_name()?;
+        self.expect(b";", "`;` after an entity reference")?;
+        if let Some(code) = self.predefined(&name) {
+            self.push_scalar(code)?;
+            return Ok(None);
+        }
+        let name = self.text_of(name);
+        match dtd::resolve_in_content(ctx, &name, at)? {
+            Resolved::Text(text) => {
+                self.push_utf16(&text)?;
+                Ok(None)
             }
+            Resolved::Markup(text) => Ok(Some((name, text))),
+            Resolved::Skipped => Ok(None),
+        }
+    }
+
+    /// The character one of the five entities every processor knows stands
+    /// for, without building the name as text.
+    fn predefined(&self, name: &Range<usize>) -> Option<u32> {
+        let replacement = match self.units[name.clone()].len() {
+            2 if self.name_is(name, b"lt") => b'<',
+            2 if self.name_is(name, b"gt") => b'>',
+            3 if self.name_is(name, b"amp") => b'&',
+            4 if self.name_is(name, b"apos") => b'\'',
+            4 if self.name_is(name, b"quot") => b'"',
+            _ => return None,
         };
-        self.push_scalar(u32::from(replacement))
+        Some(u32::from(replacement))
+    }
+
+    /// Append UTF-16 replacement text to the run in progress.
+    fn push_utf16(&mut self, units: &[u16]) -> Result<()> {
+        let mut pos = 0;
+        while pos < units.len() {
+            let lead = u32::from(units[pos]);
+            pos += 1;
+            let code = if (0xD800..=0xDBFF).contains(&lead) {
+                let trail = units
+                    .get(pos)
+                    .copied()
+                    .ok_or_else(|| Error::new(ErrorKind::MalformedEncoding, self.pos))?;
+                pos += 1;
+                0x1_0000 + ((lead - 0xD800) << 10) + (u32::from(trail) - 0xDC00)
+            } else {
+                lead
+            };
+            self.push_scalar(code)?;
+        }
+        Ok(())
     }
 
     fn name_is(&self, span: &Range<usize>, literal: &[u8]) -> bool {
@@ -683,7 +963,7 @@ impl<'a, E: Encoding> Scanner<'a, E> {
 
     // ---- discarded constructs -------------------------------------------
 
-    fn scan_comment(&mut self) -> Result<()> {
+    pub(crate) fn scan_comment(&mut self) -> Result<()> {
         self.pos += 4;
         loop {
             match self.unit(self.pos) {
@@ -704,7 +984,7 @@ impl<'a, E: Encoding> Scanner<'a, E> {
         }
     }
 
-    fn scan_processing_instruction(&mut self) -> Result<()> {
+    pub(crate) fn scan_processing_instruction(&mut self) -> Result<()> {
         self.pos += 2;
         let target = self.scan_name()?;
         if self.units[target.clone()].len() == 3
@@ -731,36 +1011,8 @@ impl<'a, E: Encoding> Scanner<'a, E> {
         }
     }
 
-    /// Step over a document type declaration without interpreting it, keeping
-    /// track of quoting and of the internal subset's brackets so that a `>`
-    /// inside either does not end it.
-    fn skip_doctype(&mut self) -> Result<()> {
-        self.pos += 9;
-        let mut quote: Option<u8> = None;
-        let mut in_subset = false;
-        loop {
-            let Some(unit) = self.unit(self.pos) else {
-                return self.err(ErrorKind::UnexpectedEof);
-            };
-            self.pos += 1;
-            let value = unit.value();
-            match quote {
-                Some(open) if value == u32::from(open) => quote = None,
-                Some(_) => {}
-                None => match value {
-                    0x22 => quote = Some(b'"'),
-                    0x27 => quote = Some(b'\''),
-                    0x5B => in_subset = true,
-                    0x5D => in_subset = false,
-                    0x3E if !in_subset => return Ok(()),
-                    _ => {}
-                },
-            }
-        }
-    }
-
-    /// A name's text, for an error message.
-    fn text_of(&self, span: Range<usize>) -> String {
+    /// A name's text, for an error message or for matching a declaration.
+    pub(crate) fn text_of(&self, span: Range<usize>) -> String {
         let mut out = String::new();
         let mut pos = span.start;
         while pos < span.end {
@@ -772,4 +1024,26 @@ impl<'a, E: Encoding> Scanner<'a, E> {
         }
         out
     }
+}
+
+/// Trim `space` from both ends of `buffer` and squeeze every run of it inside
+/// to one, which is what an attribute of a declared non-CDATA type gets.
+fn squeeze<T: Copy + PartialEq>(buffer: &mut Vec<T>, space: T) {
+    let mut written = 0;
+    let mut pending = false;
+    for read in 0..buffer.len() {
+        let unit = buffer[read];
+        if unit == space {
+            pending = written > 0;
+            continue;
+        }
+        if pending {
+            buffer[written] = space;
+            written += 1;
+            pending = false;
+        }
+        buffer[written] = unit;
+        written += 1;
+    }
+    buffer.truncate(written);
 }

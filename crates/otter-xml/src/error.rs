@@ -52,6 +52,19 @@ pub enum ErrorKind {
     RootElementCount,
     /// A reference to an entity the document never declared.
     UnknownEntity(String),
+    /// An entity whose replacement text refers to itself, however indirectly.
+    RecursiveEntity(String),
+    /// Expansion produced more text than a document is allowed to unfold.
+    EntityExpansionLimit,
+    /// A reference to an entity declared with `NDATA`, which names binary data
+    /// rather than text and so cannot be expanded.
+    UnparsedEntityReference(String),
+    /// A reference, inside an attribute value, to an entity stored outside the
+    /// document. This parser reads no external entity, and the specification
+    /// forbids the reference there in any case.
+    ExternalEntityInAttribute(String),
+    /// A document type declaration whose internal subset is malformed.
+    BadDoctype(&'static str),
     /// A character reference that names no legal character.
     BadCharacterReference,
     /// A `<?xml …?>` declaration that is malformed or misplaced.
@@ -84,6 +97,20 @@ impl fmt::Display for ErrorKind {
             Self::TextOutsideRoot => f.write_str("character data outside the root element"),
             Self::RootElementCount => f.write_str("a document must have exactly one root element"),
             Self::UnknownEntity(name) => write!(f, "reference to undeclared entity &{name};"),
+            Self::RecursiveEntity(name) => write!(f, "entity {name:?} refers to itself"),
+            Self::EntityExpansionLimit => {
+                f.write_str("entity expansion exceeded this parser's budget")
+            }
+            Self::UnparsedEntityReference(name) => {
+                write!(f, "reference to unparsed entity &{name};")
+            }
+            Self::ExternalEntityInAttribute(name) => {
+                write!(
+                    f,
+                    "reference to external entity &{name}; in an attribute value"
+                )
+            }
+            Self::BadDoctype(what) => write!(f, "malformed document type declaration: {what}"),
             Self::BadCharacterReference => f.write_str("character reference is out of range"),
             Self::BadDeclaration(what) => write!(f, "malformed XML declaration: {what}"),
             Self::DepthLimit => f.write_str("element nesting is too deep"),

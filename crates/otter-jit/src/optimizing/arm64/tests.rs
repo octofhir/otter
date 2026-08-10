@@ -76,6 +76,87 @@ fn a_spliced_unit_compiles_and_guards_the_callee_identity() {
     assert_eq!(frame[2], box_i32(3));
 }
 
+/// Boxing recorded at an inlined call boundary is dead: the callee consumes
+/// the caller's SSA value directly and any real tagged use performs its own
+/// conversion. The final eligibility sweep must therefore accept the removed
+/// call site's conversion instead of rejecting the whole spliced unit.
+#[test]
+fn a_spliced_call_accepts_a_numeric_argument() {
+    use crate::ir::inline::InlineTree;
+
+    let mut view = JitCompileSnapshot::without_feedback(
+        7,
+        1,
+        5,
+        vec![
+            JitTestInstruction::new(
+                Op::LoadInt32,
+                0,
+                0,
+                vec![Operand::Register(1), Operand::Imm32(7)],
+            ),
+            JitTestInstruction::new(
+                Op::Call,
+                1,
+                8,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::ConstIndex(1),
+                    Operand::Register(1),
+                ],
+            ),
+            JitTestInstruction::new(
+                Op::Add,
+                2,
+                16,
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(1),
+                    Operand::Register(1),
+                ],
+            ),
+            JitTestInstruction::new(Op::ReturnValue, 3, 24, vec![Operand::Register(3)]),
+        ],
+    );
+    view.seed_arith_feedback_for_test(2, ArithFeedback::from_bits(ARITH_INT32));
+    let callee = JitCompileSnapshot::without_feedback(
+        9,
+        1,
+        2,
+        vec![JitTestInstruction::new(
+            Op::ReturnValue,
+            0,
+            0,
+            vec![Operand::Register(0)],
+        )],
+    );
+    let call_byte_pc = view.instructions[1].byte_pc;
+    view.inline_callees.insert(
+        call_byte_pc,
+        otter_vm::JitInlineCallee {
+            body: Arc::new(callee),
+        },
+    );
+
+    let tree = InlineTree::build(&view);
+    assert_eq!(tree.frames.len(), 2, "the fixture must splice");
+    let transitions = TransitionTable::resolve();
+    let output = compile_with_artifacts(&view, 92, &transitions, None, true)
+        .expect("the root unit remains compilable");
+    assert!(
+        output.diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            otter_vm::JitCompilerDiagnostic::InlineLowered {
+                outcome: otter_vm::JitInlineLoweringOutcome::Inlined,
+                ..
+            }
+        )),
+        "a numeric argument must not reject the spliced body: {:?}",
+        output.diagnostics
+    );
+}
+
 fn box_i32(value: i32) -> u64 {
     (0xfffe_u64 << 48) | u64::from(value as u32)
 }

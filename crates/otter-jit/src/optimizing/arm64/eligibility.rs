@@ -1039,6 +1039,14 @@ pub(super) fn check_eligibility(
                         op,
                         "tagged callee repr",
                     )?;
+                    // Representation selection still records the boxing that
+                    // the original bytecode call would require. The splice
+                    // removes that transition: callee parameters alias these
+                    // SSA values directly, and every surviving tagged use in
+                    // the callee owns its actual conversion. Validate and
+                    // consume the dead call-site records so the final sweep
+                    // does not reject an otherwise complete inline.
+                    check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                 }
                 // A spliced return hands its value to the continuation's merge
                 // through the edge at the merge's representation, so it needs

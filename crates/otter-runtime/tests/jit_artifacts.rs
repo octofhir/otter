@@ -617,7 +617,7 @@ fn optimizing_osr_returns_ir_deopt_and_safepoint_payloads() {
 }
 
 #[test]
-fn optimizing_math_artifact_uses_symbolic_runtime_identity() {
+fn optimizing_math_artifact_inlines_guarded_int32_abs() {
     let mut runtime = runtime_with_artifacts(JitSelection::ProductionTiered, 4);
     let result = runtime
         .run_script(
@@ -628,6 +628,13 @@ fn optimizing_math_artifact_uses_symbolic_runtime_identity() {
     let batch = result.jit_artifacts().expect("enabled artifact batch");
     let bundle = first_tier_bundle(batch, JitDebugTier::Optimizing);
     let kinds = bundle_relocation_target_kinds(bundle);
+    let relocations = std::str::from_utf8(
+        bundle
+            .file(JitArtifactFileName::Relocations)
+            .expect("optimizing Math relocations")
+            .contents(),
+    )
+    .expect("optimizing Math relocations are UTF-8");
     let optimized_ir = std::str::from_utf8(
         bundle
             .file(JitArtifactFileName::OptimizedIr)
@@ -644,7 +651,11 @@ fn optimizing_math_artifact_uses_symbolic_runtime_identity() {
     );
     assert!(
         kinds.contains("runtimeStub"),
-        "optimizing Math call must retain its runtime entry identity: {kinds:?}"
+        "optimizing Math code still needs unrelated runtime entries: {kinds:?}"
+    );
+    assert!(
+        !relocations.contains("math_abs_leaf"),
+        "guarded Int32 Math.abs must complete without the Rust leaf ABI: {relocations}"
     );
 }
 

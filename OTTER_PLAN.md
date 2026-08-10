@@ -103,6 +103,13 @@ It already owns:
   into one collision chain: the alternating `native-boundary` process medians
   fell by 59.02% with reductions, bytecode calls, JIT entries, deopts, runtime
   transitions, and emitted code held identical;
+- optimizing guarded calls to `Math.abs`, `Math.max`, and `Math.min` complete
+  directly in AArch64 when every operand is proven Int32. The exact bootstrap
+  callee or receiver/prototype/method identity guard remains mandatory, and
+  `abs(INT32_MIN)` materializes `2147483648` without crossing the Rust leaf ABI.
+  Alternating long process medians fell by 31.47% for the isolated Math slice
+  and 3.21% for the full `native-boundary` workload, with identical semantic
+  checksums and transition totals;
 - catch-only exception-region CFGs with explicit landing-pad successors; the
   shared linkage fully unwinds publication, commits the thrown value to its
   allocator home, and transfers at the exact call PC without replay;

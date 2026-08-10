@@ -18,10 +18,12 @@
 //!   separate IR nodes over a holder address the allocator placed.
 //! - [`emit_property_ic_load`] / [`emit_property_ic_store_guard`] — the
 //!   named-property cache probes.
-//! - [`emit_native_leaf_call`] — guard a callee's bootstrap identity and run
-//!   its declared leaf entry without materializing a frame.
-//! - [`emit_guarded_method_call`] — the same for `receiver.method(args…)`, over
-//!   a receiver proven by hidden class or by cell type tag.
+//! - [`emit_native_leaf_guard`] / [`emit_native_leaf_call`] — prove a static
+//!   callee's bootstrap identity, then optionally run its declared leaf entry
+//!   without materializing a frame.
+//! - [`emit_guarded_method_guard`] / [`emit_guarded_method_call`] — the same
+//!   split for `receiver.method(args…)`, over a receiver proven by hidden class
+//!   or by cell type tag.
 //! - [`emit_native_entry_call`] — one call sequence per declared ABI family.
 //!
 //! # Invariants
@@ -31,6 +33,9 @@
 //! - The call protocol is chosen by the family the entry id resolves in, never
 //!   by which builtin a site named. A read, an in-place mutation and an
 //!   allocating write reach the same sequence from one description.
+//! - Split call guards are the exact shared prefix of their corresponding
+//!   declared-entry calls. They load no arguments and perform no effects, so a
+//!   proven operation may instead continue into equivalent machine lowering.
 //! - Way stride is [`WHISKER_IC_WAY_BYTES`], asserted against the cell's own
 //!   layout where the cell is defined.
 //! - Register contract on entry: `x15` holds the cell address, `w14` the
@@ -893,6 +898,35 @@ pub(crate) fn emit_native_leaf_call<F>(
 where
     F: FnMut(&mut Assembler, u8, u8) -> Result<(), Unsupported>,
 {
+    emit_native_leaf_guard(ops, view, builtin_native_ref, callee_x, bail)?;
+
+    let Some(declaration) = otter_vm::math::jit_leaf_builtin(stub_id) else {
+        return Err(Unsupported::OperandShape("native leaf entry"));
+    };
+    emit_native_entry_call(
+        ops,
+        relocations,
+        stub_id,
+        NO_SAFEPOINT,
+        declaration.argument_count,
+        load_argument,
+        bail,
+    )
+}
+
+/// Guard one static native callee without choosing how its declared operation
+/// is lowered afterwards.
+///
+/// The optimizing tier uses the same bootstrap identity proof before replacing
+/// selected numeric leaf entries with equivalent machine instructions. Other
+/// callers continue from this guard into [`emit_native_entry_call`].
+pub(crate) fn emit_native_leaf_guard(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    builtin_native_ref: u32,
+    callee_x: u8,
+    bail: DynamicLabel,
+) -> Result<(), Unsupported> {
     debug_assert!(
         !(12..=16).contains(&callee_x),
         "the callee must survive the guard, which owns x12..x16"
@@ -913,19 +947,7 @@ where
         ; .arch aarch64
         ; b.ne =>bail
     );
-
-    let Some(declaration) = otter_vm::math::jit_leaf_builtin(stub_id) else {
-        return Err(Unsupported::OperandShape("native leaf entry"));
-    };
-    emit_native_entry_call(
-        ops,
-        relocations,
-        stub_id,
-        NO_SAFEPOINT,
-        declaration.argument_count,
-        load_argument,
-        bail,
-    )
+    Ok(())
 }
 
 /// Call a declared entry whose identity a caller has already guarded.
@@ -1091,12 +1113,49 @@ pub(crate) fn emit_guarded_method_call<F>(
 where
     F: FnMut(&mut Assembler, u8, u8) -> Result<(), Unsupported>,
 {
-    if view.cage_base == 0 || view.native_ref_byte == 0 {
-        return Err(Unsupported::OperandShape("guarded method call layout"));
-    }
     // An exotic receiver is passed to the entry as its first operand, because
     // the operation is on that body; a shaped receiver only supplies arguments.
     let receiver_is_operand = matches!(call.receiver, JitGuardedReceiver::Exotic { .. });
+    emit_guarded_method_guard(ops, relocations, view, call, receiver, byte_pc, miss)?;
+    // An exotic receiver occupies the entry's first operand word, so the call's
+    // own arguments shift one place along.
+    let receiver_word = u8::from(receiver_is_operand);
+    let value_count = receiver_word + call.argument_count;
+    emit_native_entry_call(
+        ops,
+        relocations,
+        call.entry_stub_id,
+        call.safepoint_id,
+        value_count,
+        |ops, index, register| {
+            if receiver_is_operand && index == 0 {
+                return emit_load_reg(ops, register, receiver);
+            }
+            load_argument(ops, index - receiver_word, register)
+        },
+        miss,
+    )
+}
+
+/// Guard the receiver, pinned method holder, and exact builtin identity while
+/// leaving completion of the already-proven operation to the caller.
+///
+/// This is the shared prefix for declared method entries and optimizing-tier
+/// machine intrinsics. It performs no argument loads and has no effects before
+/// a miss.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_guarded_method_guard(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    call: &JitGuardedMethodCall,
+    receiver: u16,
+    byte_pc: u32,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported> {
+    if view.cage_base == 0 || view.native_ref_byte == 0 {
+        return Err(Unsupported::OperandShape("guarded method call layout"));
+    }
     match call.receiver {
         // A cell carrying an ordinary object body whose shape is the one the
         // site recorded. The shape pins the slot offset; the identity guard
@@ -1164,24 +1223,7 @@ where
         call.builtin_native_ref,
         miss,
     );
-    // An exotic receiver occupies the entry's first operand word, so the call's
-    // own arguments shift one place along.
-    let receiver_word = u8::from(receiver_is_operand);
-    let value_count = receiver_word + call.argument_count;
-    emit_native_entry_call(
-        ops,
-        relocations,
-        call.entry_stub_id,
-        call.safepoint_id,
-        value_count,
-        |ops, index, register| {
-            if receiver_is_operand && index == 0 {
-                return emit_load_reg(ops, register, receiver);
-            }
-            load_argument(ops, index - receiver_word, register)
-        },
-        miss,
-    )
+    Ok(())
 }
 
 /// Prove the receiver is a heap cell carrying `receiver_type_tag`. On success

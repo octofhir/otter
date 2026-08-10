@@ -4,6 +4,8 @@
 //! - Control-flow edges, comparisons and edge moves.
 //! - Spill-slot addressing and register/location loads and stores.
 //! - Representation conversions, boxing, constant materialization.
+//! - Identity-guarded Int32 Math intrinsic bodies selected by the main
+//!   instruction dispatcher.
 //! - Frame prologue and epilogue.
 //! - Published root/spliced register-window addressing across temporary
 //!   generated-linkage stack reservations.
@@ -11,6 +13,8 @@
 //! # Invariants
 //! - Nothing here decides *what* to emit; every function lowers one already
 //!   chosen operation, so the dispatch in [`super`] owns all opcode policy.
+//! - Math intrinsic bodies receive already-proven Int32 operands and execute
+//!   only after the caller has emitted the exact builtin identity guard.
 
 use super::*;
 
@@ -1468,6 +1472,78 @@ pub(super) fn emit_box_double(ops: &mut Assembler, source: u8, destination: u8) 
         ; movz x14, DOUBLE_OFFSET_HI16, lsl #48
         ; add X(destination), X(destination), x14
     );
+}
+
+/// Whether one guarded Math leaf can complete from its unboxed Int32 SSA
+/// operands without crossing the Rust leaf ABI.
+pub(super) fn guarded_int32_math_intrinsic_is_supported(
+    stub_id: otter_vm::native_abi::RuntimeStubId,
+    reprs: &ReprMap,
+    instruction: &SsaInstr,
+) -> bool {
+    let arguments = &instruction.inputs[1..];
+    if stub_id == otter_vm::native_abi::STUB_MATH_ABS_LEAF.id {
+        return arguments.len() == 1 && reprs.representation(arguments[0]) == Representation::Int32;
+    }
+    if stub_id == otter_vm::native_abi::STUB_MATH_MAX_LEAF.id
+        || stub_id == otter_vm::native_abi::STUB_MATH_MIN_LEAF.id
+    {
+        return arguments.len() == 2
+            && arguments
+                .iter()
+                .all(|value| reprs.representation(*value) == Representation::Int32);
+    }
+    false
+}
+
+/// Emit one identity-guarded Math operation selected by
+/// [`guarded_int32_math_intrinsic_is_supported`]. The tagged result is left in
+/// `x0`, matching the ordinary declared-leaf ABI.
+pub(super) fn emit_guarded_int32_math_intrinsic_body(
+    ops: &mut Assembler,
+    stub_id: otter_vm::native_abi::RuntimeStubId,
+    allocation: &Allocation,
+    instruction: &SsaInstr,
+) -> Result<(), Unsupported> {
+    let arguments = &instruction.inputs[1..];
+    if stub_id == otter_vm::native_abi::STUB_MATH_ABS_LEAF.id {
+        emit_load_location(ops, allocation.location(arguments[0]), 9)?;
+        let minimum = ops.new_dynamic_label();
+        let done = ops.new_dynamic_label();
+        emit_load_u32(ops, 10, i32::MIN as u32);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp w9, w10
+            ; b.eq =>minimum
+            ; neg w10, w9
+            ; cmp w9, wzr
+            ; csel w0, w9, w10, ge
+        );
+        emit_box_int32(ops, 0, 10);
+        dynasm!(ops
+            ; .arch aarch64
+            ; b =>done
+            ; =>minimum
+        );
+        emit_load_u64(ops, 9, 2_147_483_648);
+        dynasm!(ops ; .arch aarch64 ; scvtf D(FP_SCRATCH), x9);
+        emit_box_double(ops, FP_SCRATCH, 0);
+        dynasm!(ops ; .arch aarch64 ; =>done);
+        return Ok(());
+    }
+
+    emit_load_location(ops, allocation.location(arguments[0]), 9)?;
+    emit_load_location(ops, allocation.location(arguments[1]), 10)?;
+    dynasm!(ops ; .arch aarch64 ; cmp w9, w10);
+    if stub_id == otter_vm::native_abi::STUB_MATH_MAX_LEAF.id {
+        dynasm!(ops ; .arch aarch64 ; csel w0, w9, w10, ge);
+    } else if stub_id == otter_vm::native_abi::STUB_MATH_MIN_LEAF.id {
+        dynasm!(ops ; .arch aarch64 ; csel w0, w9, w10, le);
+    } else {
+        return Err(Unsupported::OperandShape("guarded int32 Math intrinsic"));
+    }
+    emit_box_int32(ops, 0, 11);
+    Ok(())
 }
 
 pub(super) fn emit_load_i32(ops: &mut Assembler, register: u8, value: i32) {

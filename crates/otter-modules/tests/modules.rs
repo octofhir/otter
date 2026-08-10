@@ -257,3 +257,81 @@ fn otter_xml_parses_both_shapes_and_reports_bad_documents() {
         ))
         .unwrap();
 }
+
+#[test]
+fn otter_xml_keeps_keys_when_elements_of_one_name_differ() {
+    // An element is built with the hidden class the last element of its name
+    // closed with. Every way the next one can diverge from that class has to
+    // yield the same object as if nothing had been remembered.
+    let mut runtime = Runtime::builder().with_otter_modules().build().unwrap();
+    runtime
+        .eval(otter_runtime::SourceInput::from_javascript(
+            r##"
+            function check(actual, expected, what) {
+              const a = JSON.stringify(actual);
+              const e = JSON.stringify(expected);
+              if (a !== e) throw new Error(what + ": " + a + " !== " + e);
+            }
+
+            // A later element takes a key the earlier one did not, takes them
+            // in another order, takes fewer, and takes none at all.
+            check(
+              Otter.XML.parse(
+                "<r>" +
+                "<a x='1' y='2'/><a x='3' y='4'/>" +
+                "<a x='5' y='6' z='7'/><a y='8' x='9'/><a x='0'/><a>text</a>" +
+                "</r>"
+              ),
+              { r: { a: [
+                  { "@x": "1", "@y": "2" },
+                  { "@x": "3", "@y": "4" },
+                  { "@x": "5", "@y": "6", "@z": "7" },
+                  { "@y": "8", "@x": "9" },
+                  { "@x": "0" },
+                  "text",
+              ] } },
+              "diverging attributes"
+            );
+
+            // Repeating a child name is one key holding a list, however many
+            // times it repeats and whichever element of the name comes first.
+            check(
+              Otter.XML.parse(
+                "<r><e><c>1</c></e><e><c>2</c><c>3</c><c>4</c></e><e><d>5</d><c>6</c></e></r>"
+              ),
+              { r: { e: [
+                  { c: "1" },
+                  { c: ["2", "3", "4"] },
+                  { d: "5", c: "6" },
+              ] } },
+              "repeated children"
+            );
+
+            // Text joins the keys last, so an element that gains or loses it
+            // diverges at the end of the class rather than the middle.
+            check(
+              Otter.XML.parse("<r><v k='a'>one</v><v k='b'></v><v k='c'>two</v></r>"),
+              { r: { v: [
+                  { "@k": "a", "#text": "one" },
+                  { "@k": "b" },
+                  { "@k": "c", "#text": "two" },
+              ] } },
+              "text as a key"
+            );
+
+            // Enough divergence stops the speculation; the elements after it
+            // are still built correctly.
+            let parts = [];
+            for (let i = 0; i < 12; i++) {
+              parts.push(i % 2 === 0 ? "<a x='" + i + "'/>" : "<a y='" + i + "'/>");
+            }
+            const alternating = Otter.XML.parse("<r>" + parts.join("") + "</r>").r.a;
+            if (alternating.length !== 12) throw new Error("length " + alternating.length);
+            for (let i = 0; i < 12; i++) {
+              const expected = i % 2 === 0 ? { "@x": String(i) } : { "@y": String(i) };
+              check(alternating[i], expected, "alternating " + i);
+            }
+            "##,
+        ))
+        .unwrap();
+}

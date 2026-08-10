@@ -308,26 +308,24 @@ impl<'a> ModuleGraphBuilder<'a> {
         result
     }
 
-    fn read_text_file(&mut self, url: &str) -> Result<String, LoaderError> {
+    /// Read a data file's bytes, whose encoding is the format's business
+    /// rather than the loader's.
+    fn read_data_file(&mut self, url: &str) -> Result<Vec<u8>, LoaderError> {
         if crate::module_loader::is_http_url(url) {
             return self
                 .loader
                 .load_resolved(url.to_string())
-                .map(|source| source.text);
+                .map(|source| source.text.into_bytes());
         }
         let path = url.strip_prefix("file://").unwrap_or(url);
-        if self.timings.is_none() {
-            return std::fs::read_to_string(path).map_err(|error| LoaderError::Load {
-                url: url.to_string(),
-                message: error.to_string(),
-            });
-        }
         let started = Instant::now();
-        let result = std::fs::read_to_string(path).map_err(|error| LoaderError::Load {
+        let result = std::fs::read(path).map_err(|error| LoaderError::Load {
             url: url.to_string(),
             message: error.to_string(),
         });
-        self.add_load_time(started.elapsed());
+        if self.timings.is_some() {
+            self.add_load_time(started.elapsed());
+        }
         result
     }
 
@@ -397,13 +395,23 @@ impl<'a> ModuleGraphBuilder<'a> {
             let mut dynamic_specs: HashSet<String> = HashSet::new();
             for request in &requests {
                 self.check_interrupted()?;
-                // import-attributes `type: "text"` — the attribute is
-                // part of the module-map key, so the text variant gets
-                // its own marker URL and a synthesised
-                // `export default "<raw>"` module node. Resolution
-                // accepts extension-less fixture paths the normal
+                // An import attribute names the format outright, so it
+                // decides how the file is read whatever it is called. The
+                // attribute is part of the module-map key, so each type gets
+                // its own marker URL and its own synthesised module node.
+                // Resolution accepts extension-less fixture paths the normal
                 // probing resolver would reject.
-                if request.attr_type.as_deref() == Some("text") {
+                if let Some(kind) = request.attr_type.as_deref() {
+                    let format =
+                        crate::data_modules::DataFormat::from_attribute(kind).ok_or_else(|| {
+                            GraphError::Loader(LoaderError::Load {
+                                url: url.clone(),
+                                message: format!(
+                                    "unsupported import attribute type {kind:?} for '{}'",
+                                    request.specifier
+                                ),
+                            })
+                        })?;
                     let base = match self.resolve(&request.specifier, Some(&url)) {
                         Ok(target) => target,
                         Err(_) => resolve_plain_relative_file(&request.specifier, &url)
@@ -411,11 +419,11 @@ impl<'a> ModuleGraphBuilder<'a> {
                                 GraphError::Loader(LoaderError::Resolve {
                                     specifier: request.specifier.clone(),
                                     referrer: url.clone(),
-                                    message: "text module fixture not found".to_string(),
+                                    message: "data module not found".to_string(),
                                 })
                             })?,
                     };
-                    let target = format!("{base}{TEXT_MODULE_MARKER}");
+                    let target = format!("{base}{MODULE_TYPE_MARKER}{kind}");
                     resolved_imports.insert(request.specifier.clone(), target.clone());
                     if !request.deferred && !request.dynamic {
                         eager_static_specs.insert(request.specifier.clone());
@@ -425,9 +433,15 @@ impl<'a> ModuleGraphBuilder<'a> {
                         deferred: request.deferred,
                     });
                     if !self.nodes.contains_key(&target) {
-                        let raw = self.read_text_file(&base)?;
-                        let escaped = serde_json::to_string(&raw).unwrap_or_default();
-                        let shim = format!("export default ({escaped});\n");
+                        let raw = self.read_data_file(&base)?;
+                        let shim = crate::data_modules::data_module_source(format, &raw).map_err(
+                            |error| {
+                                GraphError::Loader(LoaderError::Load {
+                                    url: base.clone(),
+                                    message: error.message,
+                                })
+                            },
+                        )?;
                         queued.push((
                             target,
                             SourceKind::JavaScript,
@@ -625,7 +639,9 @@ fn collect_module_requests(program: &Program<'_>) -> Vec<ModuleRequest> {
 #[derive(Debug, Clone)]
 pub(crate) struct PrefetchRequest {
     pub(crate) specifier: String,
-    pub(crate) text: bool,
+    /// Whether an import attribute made this a data file, which has no
+    /// imports of its own to follow.
+    pub(crate) data: bool,
 }
 
 /// Parse one module off the async executor and return its literal dependency
@@ -639,7 +655,7 @@ pub(crate) fn scan_module_requests(
             .into_iter()
             .map(|request| PrefetchRequest {
                 specifier: request.specifier,
-                text: request.attr_type.as_deref() == Some("text"),
+                data: request.attr_type.is_some(),
             })
             .collect())
     })
@@ -649,11 +665,11 @@ pub(crate) fn scan_module_requests(
     })?
 }
 
-/// Module-map key suffix distinguishing the `with { type: "text" }`
-/// variant of a URL from its JavaScript-module variant. Stripped
-/// nowhere — the synthesised text node carries its full shim source,
-/// so the marker URL is never read from disk.
-const TEXT_MODULE_MARKER: &str = "#otter-module-type=text";
+/// Module-map key prefix distinguishing a `with { type: "…" }` variant of a
+/// URL from its JavaScript-module variant, and one type from another.
+/// Stripped nowhere — the synthesised node carries its full shim source, so
+/// the marker URL is never read from disk.
+const MODULE_TYPE_MARKER: &str = "#otter-module-type=";
 
 /// Join a relative specifier against the referrer's directory and
 /// canonicalise, without extension probing — text-module fixtures

@@ -107,6 +107,8 @@ impl Interpreter {
             shape_epoch: 0,
             simple_constructor_init_cache: rustc_hash::FxHashMap::default(),
             simple_constructor_shape_cache: rustc_hash::FxHashMap::default(),
+            constructor_field_transition_cache: rustc_hash::FxHashMap::default(),
+            constructor_field_capacity_cache: rustc_hash::FxHashMap::default(),
             arguments_shape_cache: rustc_hash::FxHashMap::default(),
             max_stack_depth: crate::DEFAULT_MAX_STACK_DEPTH,
             sync_reentry_depth: 0,

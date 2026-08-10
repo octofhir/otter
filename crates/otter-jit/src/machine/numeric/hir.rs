@@ -66,6 +66,11 @@ pub(super) enum NumericNode {
         byte_pc: u32,
         exceptional_edge: Option<u16>,
     },
+    ConstructorFieldStore {
+        object: NumericValue,
+        value: NumericValue,
+        byte_pc: u32,
+    },
     TaggedToBoolean(NumericValue),
     TaggedStrictEqual(NumericValue, NumericValue),
     TaggedStringConcat(NumericValue, NumericValue),
@@ -155,6 +160,7 @@ impl NumericNode {
             | Self::ClassSuperConstructor(..)
             | Self::Upvalue { .. }
             | Self::BindThis { .. }
+            | Self::ConstructorFieldStore { .. }
             | Self::TaggedStringConcat(..)
             | Self::DirectCall { .. }
             | Self::BlockParameter(NumericType::Tagged) => NumericType::Tagged,
@@ -447,6 +453,7 @@ impl NumericFunction {
                     &view.direct_callees,
                     &view.direct_constructs,
                     &view.direct_methods,
+                    &view.constructor_field_transitions,
                     &mut direct_call_targets,
                     &mut direct_call_arguments,
                     (pc == terminal_pc)
@@ -678,6 +685,11 @@ fn infer_instruction_parameters(
         }
         Op::BindThisValue => {
             let _ = read(register(instruction, code, 0)?)?;
+        }
+        Op::StoreProperty => {
+            let _ = read(register(instruction, code, 0)?)?;
+            let _ = read(register(instruction, code, 2)?)?;
+            *origins.get_mut(usize::from(register(instruction, code, 3)?))? = 0;
         }
         Op::Call | Op::New | Op::SuperConstruct => {
             let count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
@@ -1020,6 +1032,13 @@ fn instruction_accesses(
             vec![register(instruction, code, 0)?],
         )),
         Op::BindThisValue => Some((vec![register(instruction, code, 0)?], Vec::new())),
+        Op::StoreProperty => Some((
+            vec![
+                register(instruction, code, 0)?,
+                register(instruction, code, 2)?,
+            ],
+            vec![register(instruction, code, 3)?],
+        )),
         Op::Call | Op::New | Op::SuperConstruct => {
             let count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
             let mut reads = Vec::with_capacity(count + 1);
@@ -1227,6 +1246,10 @@ fn lower_instruction(
     direct_callees: &rustc_hash::FxHashMap<u32, otter_vm::JitDirectCallee>,
     direct_constructs: &rustc_hash::FxHashMap<u32, otter_vm::JitDirectCallee>,
     direct_methods: &rustc_hash::FxHashMap<u32, Vec<otter_vm::jit::JitDirectMethod>>,
+    constructor_field_transitions: &rustc_hash::FxHashMap<
+        u32,
+        otter_vm::jit::JitConstructorFieldTransition,
+    >,
     direct_call_targets: &mut Vec<NumericDirectCallTarget>,
     direct_call_arguments: &mut Vec<NumericValue>,
     exceptional_edge: Option<usize>,
@@ -1304,6 +1327,26 @@ fn lower_instruction(
                     logical_pc,
                     byte_pc: instruction.byte_pc,
                     exceptional_edge: exceptional_edge.map(u16::try_from).transpose().ok()?,
+                },
+            );
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
+            return Some(());
+        }
+        Op::StoreProperty if constructor_field_transitions.contains_key(&instruction.byte_pc) => {
+            let value = push(
+                nodes,
+                NumericNode::ConstructorFieldStore {
+                    object: read_value(registers, register(instruction, code, 0)?)?,
+                    value: read_value(registers, register(instruction, code, 2)?)?,
+                    byte_pc: instruction.byte_pc,
                 },
             );
             block_nodes.push(value);

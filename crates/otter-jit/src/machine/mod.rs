@@ -538,6 +538,8 @@ pub enum MachineOpcode {
     BoxUint32,
     /// Canonically box one Boolean represented as integer 0 or 1.
     BoxBoolean,
+    /// Apply one VM-baked constructor-owned add-property transition.
+    ConstructorFieldStore(u32),
     /// Target ABI call through a call descriptor.
     Call(u32),
     /// Interpreter-to-native loop-header entry marker. Its late-use operands

@@ -363,6 +363,19 @@ pub(crate) fn emit_write_barrier(
     parent: u8,
     child: u8,
 ) {
+    emit_write_barrier_with_context(ops, relocations, view, parent, child, 20);
+}
+
+/// Context-register-parametric form used by the Machine IR backend, whose
+/// generated-function ABI keeps the [`JitCtx`](otter_vm::JitCtx) in `x19`.
+pub(crate) fn emit_write_barrier_with_context(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    parent: u8,
+    child: u8,
+    context: u8,
+) {
     let flags_byte = view.gc_barrier.header_flags_byte;
     let young = view.gc_barrier.young_flag;
     let settled = young | view.gc_barrier.remembered_flag;
@@ -371,7 +384,7 @@ pub(crate) fn emit_write_barrier(
     dynasm!(ops
         ; .arch aarch64
         ; cbz W(child), =>done
-        ; ldr x14, [x20, THREAD_OFFSET]
+        ; ldr x14, [X(context), THREAD_OFFSET]
         ; ldr x14, [x14, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
         ; ldrb w14, [x14]
         ; cbnz w14, =>slow
@@ -400,7 +413,7 @@ pub(crate) fn emit_write_barrier(
         ; =>slow
         ; mov x1, X(parent)
         ; mov x2, X(child)
-        ; ldr x0, [x20, THREAD_OFFSET]
+        ; ldr x0, [X(context), THREAD_OFFSET]
         ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
     );
     emit_load_runtime_stub(

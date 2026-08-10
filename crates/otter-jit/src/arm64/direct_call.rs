@@ -227,6 +227,47 @@ fn emit_load_u64(ops: &mut Assembler, register: u8, value: u64) {
     }
 }
 
+/// Branch on the exact ECMAScript Object-vs-primitive split for one tagged
+/// value. Function-id immediates and every non-primitive GC body are Objects;
+/// strings, symbols, and bigints are the only primitive cell families.
+fn emit_object_type_branch(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    value: u8,
+    object: DynamicLabel,
+    primitive: DynamicLabel,
+) {
+    let non_cell = ops.new_dynamic_label();
+    emit_cell_test(ops, value, 9, CellTest::IsNotCell, non_cell);
+    dynasm!(ops ; .arch aarch64 ; mov w10, W(value));
+    crate::template::arm64::values::emit_load_symbol_u64(
+        ops,
+        relocations,
+        11,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; add x10, x11, x10
+        ; ldrb w10, [x10]
+    );
+    for tag in view.primitive_cell_type_tags {
+        dynasm!(ops ; .arch aarch64 ; cmp w10, tag as u32 ; b.eq =>primitive);
+    }
+    dynasm!(ops ; .arch aarch64 ; b =>object ; =>non_cell ; lsr x10, X(value), #48);
+    dynasm!(ops ; .arch aarch64 ; cbnz x10, =>primitive);
+    emit_load_u64(ops, 10, value_tag::FUNCTION_ID_TAG);
+    dynasm!(ops
+        ; .arch aarch64
+        ; and w11, W(value), #0xffff
+        ; cmp w11, w10
+        ; b.eq =>object
+        ; b =>primitive
+    );
+}
+
 /// Increment one isolate-serial machine-visible `u64` feedback counter.
 ///
 /// These counters cannot practically wrap within one process lifetime. Direct
@@ -507,7 +548,6 @@ pub(crate) fn emit_direct_call(
         0,
         0,
         0,
-        0,
         initialize_upvalues_entry,
         code_map,
         bail,
@@ -550,7 +590,6 @@ pub(crate) fn emit_direct_call_with_access<Load, Store, Restore, RootReceiver, R
     resolve_direct_entry: u64,
     try_prepare_construct_entry: u64,
     prepare_construct_entry: u64,
-    construct_result_entry: u64,
     derived_construct_result_entry: u64,
     copy_spread_arguments_entry: u64,
     initialize_upvalues_entry: u64,
@@ -1012,6 +1051,7 @@ where
             ; mov x0, X(context_register)
             ; mov x1, x9
         );
+        emit_load_u64(ops, 3, u64::from(site.target.plan.function_id));
         let observable_start = ops.offset().0;
         emit_runtime_stub(
             ops,
@@ -1282,26 +1322,64 @@ where
     emit_reset_generated_bail_streak(ops);
     dynasm!(ops ; .arch aarch64 ; b =>result_ready ; =>callee_returned);
     if site.form.prepared_receiver().is_some() {
+        let result_start = ops.offset().0;
+        let object = ops.new_dynamic_label();
+        let primitive = ops.new_dynamic_label();
+        let ready = ops.new_dynamic_label();
+        emit_object_type_branch(ops, relocations, view, 0, object, primitive);
         dynasm!(ops
             ; .arch aarch64
-            ; mov x1, x0
-            ; ldr x2, [sp, NATIVE_FRAME_THIS_OFFSET]
-            ; mov x0, X(context_register)
-        );
-        emit_runtime_stub(
-            ops,
-            relocations,
-            16,
-            construct_result_entry,
-            abi::STUB_JIT_BASE_CONSTRUCT_RESULT,
-        );
-        dynasm!(ops
-            ; .arch aarch64
-            ; blr x16
+            ; =>primitive
+            ; ldr x0, [sp, NATIVE_FRAME_THIS_OFFSET]
+            ; b =>ready
+            ; =>object
+            ; =>ready
             ; mov x1, xzr
+        );
+        record_region(
+            &mut code_map,
+            "directConstructResultFast",
+            result_start,
+            ops.offset().0,
+            site,
+            direct_call,
         );
     }
     if site.form.is_derived() {
+        let result_start = ops.offset().0;
+        let object = ops.new_dynamic_label();
+        let primitive = ops.new_dynamic_label();
+        let cold = ops.new_dynamic_label();
+        let ready = ops.new_dynamic_label();
+        emit_object_type_branch(ops, relocations, view, 0, object, primitive);
+        dynasm!(ops ; .arch aarch64 ; =>primitive);
+        emit_load_u64(ops, 9, VALUE_UNDEFINED);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp x0, x9
+            ; b.ne =>cold
+            ; ldr x2, [sp, NATIVE_FRAME_THIS_OFFSET]
+        );
+        emit_load_u64(ops, 9, VALUE_HOLE);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp x2, x9
+            ; b.eq =>cold
+            ; mov x0, x2
+            ; b =>ready
+            ; =>object
+            ; b =>ready
+        );
+        record_region(
+            &mut code_map,
+            "directConstructResultFast",
+            result_start,
+            ops.offset().0,
+            site,
+            direct_call,
+        );
+        dynasm!(ops ; .arch aarch64 ; =>cold);
+        let cold_start = ops.offset().0;
         dynasm!(ops
             ; .arch aarch64
             ; mov x1, x0
@@ -1316,6 +1394,15 @@ where
             abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT,
         );
         dynasm!(ops ; .arch aarch64 ; blr x16);
+        record_region(
+            &mut code_map,
+            "directConstructResultThrow",
+            cold_start,
+            ops.offset().0,
+            site,
+            direct_call,
+        );
+        dynasm!(ops ; .arch aarch64 ; =>ready);
     }
     emit_reset_generated_bail_streak(ops);
     dynasm!(ops

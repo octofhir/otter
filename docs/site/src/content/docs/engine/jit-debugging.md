@@ -105,6 +105,21 @@ stack-owned and materialized compiled activations. A later callee deopt resumes
 the already-started construct and retains the base/derived return contract; it
 never replays prototype lookup or `super(...)`.
 
+Non-simple class-constructor fields that can append an own data slot remain at their
+original bytecode position. `machineConstructorFieldTransition` identifies the
+generated guard-and-commit region: it proves the receiver and complete ordinary
+prototype chain, publishes the VM-interned child shape into pre-reserved
+storage, stores the live value, and runs the required barriers. Allocation
+caches only the immutable plan and reserved capacity; a guard miss deoptimizes
+before the source `StoreProperty` starts. `machineClassSuperLoad` reads an exact
+class wrapper's live superclass, `machineDerivedThisBindFast` commits the first
+successful `super()` result, and `machineDerivedThisBindCold` owns the repeated
+bind error. `directConstructResultFast` performs base substitution and valid
+derived selection in generated code; `directConstructResultThrow` is the cold
+primitive/uninitialized-`this` validator. Late tagged Machine roots cover fixed
+arguments across receiver preparation, so the allocator's early and late homes
+are not part of the call ABI.
+
 For every monomorphic body admitted by the optimizing tier's inline budget,
 `inlineLowered` records the owning code object, parent/callee function ids,
 parent logical and byte PCs, inline depth, and weighted cost. Its outcome is

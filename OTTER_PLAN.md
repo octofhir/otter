@@ -71,6 +71,19 @@ It already owns:
   proves every initializer name absent from the selected prototype chain,
   installs undefined own slots before entry, and lets the body overwrite them
   without StoreProperty shape-transition reentry;
+- exact class-constructor field transitions at original `StoreProperty` sites. The
+  VM retains movement-stable shape identities, the compile snapshot resolves
+  live handles, and Machine IR guards the receiver plus the complete ordinary
+  prototype chain before publishing shape, slab length, inline storage, and
+  both GC barriers. Non-simple base and derived class fields therefore stay native
+  without moving initializer effects earlier. The immutable plan and reserved
+  capacity are cached per exact base/derived chain, so receiver allocation does
+  not rescan prototypes after the guarded plan is installed;
+- generated superclass lookup, derived-`this` binding, and base/derived return
+  selection in Machine code. Materialized bind and invalid derived returns are
+  cold siblings; fixed/spread direct arguments remain late tagged roots across
+  receiver preparation, and result/type guards never replay a started callee.
+  The replaced base-result stub and descriptor no longer exist;
 - a VM-owned linked root chain for Machine values live across reentrant calls;
   return, constructor receiver preparation, callee overflow/deopt, propagated
   throw, nested/recursive generated calls, and moving minor GC all execute
@@ -147,7 +160,8 @@ not add a second call format.
 Implement in this order:
 
 1. nested/finally exceptional edges and multi-frame state;
-2. settled fields and elements with dependency tokens, guards, and barriers;
+2. complete general settled fields and elements with dependency tokens (the
+   exact constructor-owned add-property slice is native);
 3. inline object allocation, constructors, and virtual objects;
 4. OSR at every reducible loop and incremental-GC handshakes.
 

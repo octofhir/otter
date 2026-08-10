@@ -289,6 +289,17 @@ impl CodeRegion {
         }
     }
 
+    pub(crate) fn structural_at_byte_pc(
+        kind: &'static str,
+        start: usize,
+        end: usize,
+        byte_pc: u32,
+    ) -> Self {
+        let mut region = Self::structural(kind, start, end);
+        region.byte_pc = Some(byte_pc);
+        region
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn instruction(
         start: usize,

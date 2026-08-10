@@ -440,7 +440,11 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     while constructors expose `directConstructPrepare` with nested
     `directConstructPrepareFast` and `directConstructPrepareObservable`
     regions. The fast region accepts an exact own data prototype and allocates
-    without reentry; the observable region is its pre-effect miss fallback.
+    without reentry. Conservative straight-line base initializers also reuse
+    the VM final-shape cache: when every field is absent from the selected
+    prototype chain, fixed, spread, and generated-super receivers start with
+    undefined own slots and their bodies perform ordinary existing-slot
+    stores. The observable region is the pre-effect miss fallback.
     `functionId` is the caller. Typed `directCall` metadata names call kind,
     target function,
     planning-time `targetCodeObjectId`, tier, `thisMode`, `argumentMode`,

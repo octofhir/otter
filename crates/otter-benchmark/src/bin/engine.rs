@@ -3139,7 +3139,7 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../benchmarks/scripts/base-construct-receiver.js"),
             "engineKernel".into(),
-            4_999_950_000.0,
+            15_001_950_000.0,
             EngineJitTier::ProductionTiered,
             None,
             1,
@@ -3154,12 +3154,22 @@ mod tests {
                 .find(|(name, _)| *name == needle)
                 .map_or(0, |(_, value)| *value)
         };
-        assert!(counter("jit-generated-calls") > 300_000);
+        assert!(counter("jit-generated-calls") > 900_000);
         assert_eq!(counter("jit-generated-call-deopts"), 0);
         assert_eq!(counter("jit-to-rust-call-transitions"), 0);
         assert!(
-            counter("jit-alloc-stub-transitions") > 100_000,
-            "ordinary data prototypes must use non-reentrant receiver allocation"
+            counter("jit-alloc-stub-transitions") > 300_000,
+            "fixed, spread, and super receivers must use non-reentrant allocation"
+        );
+        assert_eq!(
+            counter("jit-runtime-property-stubs"),
+            0,
+            "pre-shaped simple receivers must not transition through StoreProperty"
+        );
+        assert_eq!(counter("property-ic-store-misses"), 0);
+        assert!(
+            counter("jit-reentrant-stub-transitions") < 20_000,
+            "only bounded tier-up/class setup may remain reentrant"
         );
     }
 

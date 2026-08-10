@@ -11,6 +11,9 @@
 //! - Only base, ordinary, non-eval constructors are eligible.
 //! - Every property write must target the `this` value loaded in the same body.
 //! - The fast path preserves the normal prototype lookup before allocation.
+//! - Generated linkage may install the final shape with undefined slots before
+//!   entry only after proving every initializer name absent from the selected
+//!   prototype chain; the body overwrites those slots before any observation.
 //!
 //! # See also
 //! - [`crate::call_ops`]

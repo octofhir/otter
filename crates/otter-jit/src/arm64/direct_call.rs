@@ -970,6 +970,7 @@ where
             ; mov x0, X(context_register)
             ; mov x1, x9
         );
+        emit_load_u64(ops, 3, u64::from(site.target.plan.function_id));
         let fast_start = ops.offset().0;
         emit_runtime_stub(
             ops,

@@ -330,6 +330,78 @@ JSON.stringify([
 ]);
 "#;
 
+const SIMPLE_SHAPED_CONSTRUCT_FAMILY: &str = r#"
+function ShapedBase(left) {
+  this.left = left;
+  this.right = 7;
+}
+
+class ShapedDerived extends ShapedBase {
+  constructor(left) {
+    super(left);
+  }
+}
+
+function constructShaped(Ctor, left) {
+  return new Ctor(left);
+}
+
+function constructShapedSpread(Ctor, args) {
+  return new Ctor(...args);
+}
+
+function constructShapedDerived(Ctor, left) {
+  return new Ctor(left);
+}
+
+for (let i = 0; i < 5000; i++) new ShapedDerived(i);
+
+for (let i = 0; i < 5000; i++) {
+  constructShaped(ShapedBase, i);
+  constructShapedSpread(ShapedBase, [i]);
+  constructShapedDerived(ShapedDerived, i);
+}
+
+const fixed = constructShaped(ShapedBase, 35);
+const spread = constructShapedSpread(ShapedBase, [35]);
+const derived = constructShapedDerived(ShapedDerived, 35);
+JSON.stringify([
+  fixed.left + fixed.right,
+  spread.left + spread.right,
+  derived.left + derived.right,
+  Object.keys(fixed).join(","),
+  Object.getPrototypeOf(derived) === ShapedDerived.prototype
+]);
+"#;
+
+const SIMPLE_SHAPE_OBSERVABLE_SETTER: &str = r#"
+let setterEffects = 0;
+const setterPrototype = {
+  set value(next) {
+    setterEffects++;
+    this.observed = next;
+  }
+};
+
+function SetterBase(value) {
+  this.value = value;
+}
+SetterBase.prototype = setterPrototype;
+
+function constructSetter(Ctor, value) {
+  return new Ctor(value);
+}
+
+for (let i = 0; i < 5000; i++) constructSetter(SetterBase, i);
+const result = constructSetter(SetterBase, 42);
+JSON.stringify([
+  setterEffects,
+  Object.hasOwn(result, "value"),
+  result.observed,
+  Object.getPrototypeOf(result) === setterPrototype
+]);
+"#;
+
 const CONSTRUCT_COLD_EXITS: &str = r#"
 let basePrototypeGets = 0;
 let otherPrototypeGets = 0;
@@ -819,6 +891,60 @@ fn default_base_construct_uses_non_reentrant_receiver_preparation_in_both_tiers(
     assert!(template.stats.jit_alloc_stub_transitions > 0);
     assert_machine_construct(&production);
     assert!(production.stats.jit_alloc_stub_transitions > 0);
+}
+
+#[test]
+fn simple_constructor_shapes_cover_fixed_spread_and_super_linkage() {
+    let oracle = run(
+        SIMPLE_SHAPED_CONSTRUCT_FAMILY,
+        "jit-simple-shaped-construct-family.js",
+        JitSelection::InterpreterOnly,
+    );
+    let template = run(
+        SIMPLE_SHAPED_CONSTRUCT_FAMILY,
+        "jit-simple-shaped-construct-family.js",
+        JitSelection::Template,
+    );
+    let production = run(
+        SIMPLE_SHAPED_CONSTRUCT_FAMILY,
+        "jit-simple-shaped-construct-family.js",
+        JitSelection::ProductionTiered,
+    );
+
+    assert_eq!(oracle.completion, r#"[42,42,42,"left,right",true]"#);
+    assert_eq!(template.completion, oracle.completion);
+    assert_eq!(production.completion, oracle.completion);
+    assert!(template.stats.jit_generated_calls > 0);
+    assert!(template.stats.property_store_misses < 500);
+    assert!(template.stats.jit_alloc_stub_transitions > 0);
+    assert_generated_spread_call(&production);
+    assert!(production.used_generated_construct);
+    assert!(
+        production.used_machine_super_construct || production.used_generated_super_construct,
+        "simple derived constructor must use typed super linkage"
+    );
+    assert!(production.used_fast_construct_prepare);
+    assert!(production.stats.property_store_misses < 500);
+    assert!(production.stats.jit_alloc_stub_transitions > 0);
+}
+
+#[test]
+fn inherited_setter_prevents_constructor_preshape_without_losing_effects() {
+    let oracle = run(
+        SIMPLE_SHAPE_OBSERVABLE_SETTER,
+        "jit-simple-shape-setter.js",
+        JitSelection::InterpreterOnly,
+    );
+    let compiled = run(
+        SIMPLE_SHAPE_OBSERVABLE_SETTER,
+        "jit-simple-shape-setter.js",
+        JitSelection::ProductionTiered,
+    );
+
+    assert_eq!(oracle.completion, r#"[5001,false,42,true]"#);
+    assert_eq!(compiled.completion, oracle.completion);
+    assert!(compiled.stats.jit_generated_calls > 0);
+    assert!(compiled.stats.jit_runtime_property_stubs > 0);
 }
 
 #[test]

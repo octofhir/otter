@@ -89,7 +89,12 @@ graph.
 Base-construct artifacts add `directConstructPrepare` between the shared guard
 and frame publication. Its nested `directConstructPrepareFast` region probes an
 already materialized own data `new.target.prototype` and allocates through an
-allocating/non-reentrant stub. `directConstructPrepareObservable` is the cold
+allocating/non-reentrant stub. For a conservatively matched straight-line base
+initializer, that stub reuses the VM's final hidden-class cache and creates
+undefined own slots up front. Fixed, spread, and generated `superConstruct`
+bodies then overwrite ordinary existing slots without a property-transition
+stub. This pre-shape is admitted only when every initializer name is absent
+from the selected prototype chain. `directConstructPrepareObservable` is the cold
 pre-effect-miss sibling for accessors, proxies, bound functions, and lazy or
 otherwise uncertain prototypes; it owns the exact observable lookup. Both
 paths root the receiver in the Machine safepoint area and initialize the same

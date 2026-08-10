@@ -413,6 +413,8 @@ impl Interpreter {
     /// caller can enter [`Self::jit_prepare_base_construct_receiver`].
     pub fn jit_try_prepare_base_construct_receiver(
         &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
         callee: Value,
         new_target: Value,
     ) -> Result<Option<Value>, VmError> {
@@ -449,14 +451,76 @@ impl Interpreter {
         } else {
             self.constructor_prototype_value("Object")?
         });
+        let simple_shape =
+            self.jit_simple_constructor_shape(context, function_id, roots.scratch_0.get(), &roots)?;
         let receiver = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
         roots.receiver.set(Value::object(receiver));
+        if let Some((shape, field_count)) = simple_shape {
+            let receiver = roots
+                .receiver
+                .get()
+                .as_object()
+                .ok_or(VmError::InvalidOperand)?;
+            crate::object::set_fresh_object_shape(receiver, &mut self.gc_heap, shape);
+            let mut slots = SmallVec::<[Value; 8]>::new();
+            slots.resize(field_count, Value::undefined());
+            crate::object::initialize_shaped_data_slots(
+                receiver,
+                &mut self.gc_heap,
+                slots.as_slice(),
+            );
+        }
         crate::object::set_prototype_value(
-            receiver,
+            roots
+                .receiver
+                .get()
+                .as_object()
+                .ok_or(VmError::InvalidOperand)?,
             &mut self.gc_heap,
             Some(roots.scratch_0.get()),
         );
         Ok(Some(roots.receiver.get()))
+    }
+
+    /// Resolve the hidden class a conservative generated constructor can own
+    /// before its body begins.
+    ///
+    /// The matcher admits only straight-line own data writes to `this` followed
+    /// by `return undefined`. Every matching name must also be absent from the
+    /// selected prototype chain. Installing the final shape with undefined
+    /// slots is therefore unobservable: the constructor cannot expose or
+    /// inspect its receiver before overwriting those slots in source order.
+    fn jit_simple_constructor_shape(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        prototype: Value,
+        roots: &SyncJsCallRoots,
+    ) -> Result<Option<(crate::object::ShapeHandle, usize)>, VmError> {
+        let Some(function) = context.exec_function(function_id) else {
+            return Ok(None);
+        };
+        let Some(init) = self.simple_constructor_init(context, function_id, function) else {
+            return Ok(None);
+        };
+        let Some(proto_obj) = prototype.as_object() else {
+            return Ok(None);
+        };
+        if init.fields.iter().any(|field| {
+            !matches!(
+                crate::object::lookup(proto_obj, &self.gc_heap, &field.name),
+                crate::object::PropertyLookup::Absent
+            )
+        }) {
+            return Ok(None);
+        }
+        let field_count = init.fields.len();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            otter_gc::ExtraRootSource::visit_extra_roots(roots, visitor);
+        };
+        let shape =
+            self.simple_constructor_shape_with_roots(function_id, &init, &mut external_visit)?;
+        Ok(Some((shape, field_count)))
     }
 
     /// Prepare the receiver for one compiler-generated base constructor.
@@ -2230,11 +2294,6 @@ impl Interpreter {
         values: &[Value],
         init: &crate::constructor_fast_path::SimpleConstructorInit,
     ) -> Result<crate::object::ShapeHandle, VmError> {
-        if let Some(shape) = self.simple_constructor_shape_cache.get(&function_id) {
-            return Ok(*shape);
-        }
-
-        let mut shape = self.shape_root();
         let roots = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
@@ -2249,6 +2308,20 @@ impl Interpreter {
                 value.trace_value_slots(visitor);
             }
         };
+        self.simple_constructor_shape_with_roots(function_id, init, &mut external_visit)
+    }
+
+    fn simple_constructor_shape_with_roots(
+        &mut self,
+        function_id: u32,
+        init: &crate::constructor_fast_path::SimpleConstructorInit,
+        external_visit: &mut dyn FnMut(&mut dyn FnMut(*mut RawGc)),
+    ) -> Result<crate::object::ShapeHandle, VmError> {
+        if let Some(shape) = self.simple_constructor_shape_cache.get(&function_id) {
+            return Ok(*shape);
+        }
+
+        let mut shape = self.shape_root();
         for field in &init.fields {
             if let Some(child) = self.shape_runtime.child_if_cached(
                 &self.gc_heap,
@@ -2268,7 +2341,7 @@ impl Interpreter {
                     &field.name,
                     crate::object::PropertyFlags::data_default(),
                     false,
-                    &mut external_visit,
+                    external_visit,
                 )
                 .map_err(VmError::from)?;
         }

@@ -1,0 +1,15 @@
+[package]
+name = "otter-xml"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Standalone, VM-agnostic XML 1.0 parser for Otter."
+
+# Dependency allowlist — ZERO Otter crates. The edge is one-way: the runtime
+# consumes this parser through its sink trait; the parser never reaches back
+# into the VM, the collector, or any host surface.
+[dependencies]
+
+[lints]
+workspace = true

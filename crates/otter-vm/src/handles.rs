@@ -57,6 +57,33 @@ use otter_gc::raw::RawGc;
 
 use crate::{Interpreter, JsString, Value, VmError};
 
+/// The hidden class for a fixed list of own data properties, in order.
+///
+/// Held as a shape id rather than a handle so it stays valid across
+/// collections: the shape runtime interns its nodes and traces them, and an id
+/// resolves to the current handle each time it is used. Build one with
+/// [`crate::NativeScope::object_layout`] and keep it for as long as objects of
+/// that shape keep coming.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectLayout {
+    shape: crate::object::ShapeId,
+    len: u32,
+}
+
+impl ObjectLayout {
+    /// How many properties an object of this layout has.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// Whether the layout has no properties at all.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 /// Contiguous scope-handle storage. One per [`crate::Interpreter`].
 ///
 /// Every live slot is traced — and rewritten in place — by the runtime root
@@ -311,6 +338,137 @@ impl Interpreter {
         // it, so the closure's `&mut self` reborrow is sound (mirrors
         // `Interpreter::run_callable_sync`).
         Some(self.gc_heap.register_extra_roots(extra))
+    }
+
+    /// The hidden class an object gets from appending `keys` in order to the
+    /// empty shape.
+    ///
+    /// The walk is paid once per distinct key list per isolate — every
+    /// transition after the first resolves from the transition cache — so a
+    /// caller that builds many objects of one shape should keep the answer.
+    pub(crate) fn object_layout(&mut self, keys: &[&str]) -> Result<ObjectLayout, VmError> {
+        let mut shape = self.shape_root();
+        for key in keys {
+            shape = self.layout_shape_child(shape, key)?;
+        }
+        Ok(ObjectLayout {
+            shape: self.shape_runtime.id_for_handle(&self.gc_heap, shape),
+            len: keys.len() as u32,
+        })
+    }
+
+    /// One transition of [`Self::object_layout`], cached where possible.
+    fn layout_shape_child(
+        &mut self,
+        parent: crate::object::ShapeHandle,
+        key: &str,
+    ) -> Result<crate::object::ShapeHandle, VmError> {
+        if let Some(child) = self.shape_runtime.child_if_cached(
+            &self.gc_heap,
+            parent,
+            key,
+            crate::object::PropertyFlags::data_default(),
+            false,
+        ) {
+            return Ok(child);
+        }
+        let roots = self.collect_runtime_roots_without_shape_runtime();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+        };
+        self.shape_runtime
+            .child_with_roots(
+                &mut self.gc_heap,
+                parent,
+                key,
+                crate::object::PropertyFlags::data_default(),
+                false,
+                &mut external_visit,
+            )
+            .map_err(VmError::from)
+    }
+
+    /// Build an object that already has `layout`'s properties, every one of
+    /// them `undefined`, ready for [`Self::scoped_set_slot`] to fill by index.
+    ///
+    /// The bulk counterpart of [`Self::scoped_set`]: for a surface that knows
+    /// an object's key list before its values arrive — a parser reading a
+    /// record of a repeating schema, a marshaller turning a Rust struct into
+    /// JavaScript — this costs one hidden class and one slab for the whole
+    /// object, where a `set` per property costs a presence lookup and a
+    /// transition each.
+    pub(crate) fn scoped_object_of_layout<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+        layout: ObjectLayout,
+    ) -> Result<Local<'s>, VmError> {
+        let shape = self
+            .shape_runtime
+            .handle_for_id(layout.shape)
+            .ok_or(VmError::TypeMismatch)?;
+        let object = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
+        let handle = self.scoped_value(scope, Value::object(object));
+        // Read the prototype after the allocation, as `scoped_object` does:
+        // allocating can relocate a young realm intrinsic.
+        if let Some(proto) = self.object_prototype_object_opt() {
+            let object = self.scoped_object_handle(handle)?;
+            crate::object::set_prototype(object, &mut self.gc_heap, Some(proto));
+        }
+        let count = layout.len as usize;
+        // The shape goes on while the object is still slotless; the slab is
+        // grown once; the slots are then appended without a further
+        // allocation, so no handle can go stale between them.
+        let object = self.scoped_object_handle(handle)?;
+        crate::object::set_fresh_object_shape(object, &mut self.gc_heap, shape);
+        let mut growable = object;
+        crate::object::reserve_slot_capacity(&mut growable, &mut self.gc_heap, count, &mut [])
+            .map_err(VmError::from)?;
+        let object = self.scoped_object_handle(handle)?;
+        for index in 0..count {
+            crate::object::push_layout_slot(object, &mut self.gc_heap, index, Value::undefined());
+        }
+        Ok(handle)
+    }
+
+    /// Overwrite slot `index` of an object built by
+    /// [`Self::scoped_object_of_layout`].
+    ///
+    /// The layout already says the slot exists and which name answers to it,
+    /// so this is a store and a write barrier — no lookup, no shape work.
+    pub(crate) fn scoped_set_slot(
+        &mut self,
+        _scope: &HandleScope,
+        obj: Local<'_>,
+        index: usize,
+        value: Local<'_>,
+    ) -> Result<(), VmError> {
+        let stored = self.handle_arena.get(value.index());
+        let object = self.scoped_object_handle(obj)?;
+        crate::object::write_layout_slot(object, &mut self.gc_heap, index, stored);
+        Ok(())
+    }
+
+    /// Read slot `index` of an object built by
+    /// [`Self::scoped_object_of_layout`].
+    pub(crate) fn scoped_slot<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+        obj: Local<'_>,
+        index: usize,
+    ) -> Result<Local<'s>, VmError> {
+        let object = self.scoped_object_handle(obj)?;
+        let value = crate::object::layout_slot(object, &self.gc_heap, index);
+        Ok(self.scoped_value(scope, value))
+    }
+
+    /// The object a handle currently names.
+    fn scoped_object_handle(&self, handle: Local<'_>) -> Result<crate::object::JsObject, VmError> {
+        self.handle_arena
+            .get(handle.index())
+            .as_object()
+            .ok_or(VmError::TypeMismatch)
     }
 
     /// Root an incoming raw `Value` in the current scope and hand back a
@@ -581,6 +739,15 @@ impl Interpreter {
         let receiver = self.handle_arena.get(obj.index());
         let stored = self.handle_arena.get(value.index());
         if let Some(mut object) = receiver.as_object() {
+            // The raw store, not `Interpreter::set_property`. Routing this
+            // through the shaped path was measured and rejected: appending a
+            // key that way costs a presence lookup, a shape-count read, a
+            // transition-cache probe keyed by the name, and then the store's
+            // own offset lookup, against one lookup and one owned key here.
+            // Building an object a `set` at a time therefore got 2x slower.
+            // The win a hidden class buys is real but belongs to a builder
+            // that knows an object's whole key list before it starts, and so
+            // pays for one shape rather than one per property.
             crate::object::set(&mut object, &mut self.gc_heap, key, stored);
             return Ok(());
         }

@@ -262,7 +262,7 @@ pub use collections::{CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet, MapKe
 pub use console::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use dynamic_import::{DynamicImportLoader, DynamicImportLoaderHandle, DynamicImportRegistry};
 pub use error_classes::{ErrorClassRegistry, ErrorKind};
-pub use handles::{HandleArena, Local};
+pub use handles::{HandleArena, Local, ObjectLayout};
 pub use host_strings::{HostAtom, HostAtomId, HostAtomInterner};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{

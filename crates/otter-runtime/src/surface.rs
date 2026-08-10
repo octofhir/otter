@@ -43,6 +43,8 @@ pub type RuntimeNativeScope<'s, 'rt> = otter_vm::NativeScope<'s, 'rt>;
 /// Runtime-owned local handle. Its lifetime pins it inside the active native
 /// scope, so moving collection rewrites remain invisible to contributor code.
 pub type RuntimeLocal<'s> = otter_vm::Local<'s>;
+/// Runtime-owned object-layout alias: the hidden class for a fixed key list.
+pub type RuntimeObjectLayout = otter_vm::ObjectLayout;
 /// Runtime-owned native error alias.
 pub type RuntimeNativeError = otter_vm::NativeError;
 /// Runtime-owned native fast function pointer.

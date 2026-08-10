@@ -141,6 +141,11 @@ impl otter_gc::SafeTraceable for ValueSlabBody {
             value.trace_value_slot_mut(visitor);
         }
     }
+
+    /// The trailing array lives in the heap cell, not in this body, so a
+    /// pending copy on the stack has nothing to trace: everything
+    /// `trace_slots_safe` walks is storage that does not exist yet.
+    fn trace_pending_slots_safe(&mut self, _visitor: &mut SlotVisitor<'_>) {}
 }
 
 /// Process address of `slab`'s first value, or null for a null handle.

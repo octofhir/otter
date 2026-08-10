@@ -144,6 +144,11 @@ impl otter_gc::SafeTraceable for UpvalueSpineBody {
             v(cell.cast::<RawGc>());
         }
     }
+
+    /// The trailing array lives in the heap cell, not in this body, so a
+    /// pending copy on the stack has nothing to trace: everything
+    /// `trace_slots_safe` walks is storage that does not exist yet.
+    fn trace_pending_slots_safe(&mut self, _visitor: &mut SlotVisitor<'_>) {}
 }
 
 /// Allocate a spine holding `cells`.

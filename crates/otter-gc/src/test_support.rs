@@ -156,6 +156,11 @@ impl OpaqueVector {
 
 impl Traceable for OpaqueVector {
     const TYPE_TAG: u8 = OPAQUE_VECTOR_TAG;
+
+    /// The trailing array lives in the heap cell, not in this body, so a
+    /// pending copy on the stack has nothing to trace.
+    unsafe fn trace_pending_slots(_this: *mut Self, _v: &mut SlotVisitor<'_>) {}
+
     unsafe fn trace_slots(this: *mut Self, v: &mut SlotVisitor<'_>) {
         // SAFETY: `this` precedes a valid header plus its trailing array.
         unsafe {

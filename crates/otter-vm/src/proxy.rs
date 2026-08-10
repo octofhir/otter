@@ -149,6 +149,11 @@ impl otter_gc::SafeTraceable for PrivateSlotsBody {
             slot.value.trace_value_slot_mut(visitor);
         }
     }
+
+    /// The trailing array lives in the heap cell, not in this body, so a
+    /// pending copy on the stack has nothing to trace: everything
+    /// `trace_slots_safe` walks is storage that does not exist yet.
+    fn trace_pending_slots_safe(&mut self, _visitor: &mut otter_gc::raw::SlotVisitor<'_>) {}
 }
 
 /// The private-slots payload behind `slots`, or `None` for a null handle.

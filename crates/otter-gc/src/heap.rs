@@ -1448,8 +1448,12 @@ impl GcHeap {
             external_visit(visitor);
             // SAFETY: `pending_value` points at the stack-owned payload that
             // will be copied into old-space after any cap-triggered full GC.
+            // The pending form is traced, not the in-heap one: `extra_bytes`
+            // of trailing storage do not exist yet, and a body that walks a
+            // trailing array through a stored count would run off the payload
+            // and into this frame's stack.
             unsafe {
-                T::trace_slots(pending_value, visitor);
+                T::trace_pending_slots(pending_value, visitor);
             }
         };
         if enforce_cap && self.max_heap_bytes != 0 {

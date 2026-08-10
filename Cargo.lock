@@ -2908,6 +2908,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "otter-xml"
+version = "0.0.0"
+
+[[package]]
 name = "owo-colors"
 version = "4.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

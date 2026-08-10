@@ -4554,6 +4554,39 @@ pub fn is_frozen(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 ///
 /// Fire the generational/incremental barrier for the value just stored in an
 /// object slot. Immediate values expose no outgoing edge through `GcStore`.
+/// Append `value` as the object's slot `index`, for a bulk builder that has
+/// already installed the whole hidden class and reserved the slab.
+///
+/// No presence lookup and no shape work: the layout the caller installed
+/// already says this slot exists and which name it answers to.
+pub(crate) fn push_layout_slot(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    index: usize,
+    value: Value,
+) {
+    heap.with_payload(obj, |body| {
+        body.push_slot(index, SlotMeta::data_default(), value);
+    });
+    record_slot_write(heap, obj, value);
+}
+
+/// Overwrite slot `index` of an object whose hidden class already names it.
+pub(crate) fn write_layout_slot(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    index: usize,
+    value: Value,
+) {
+    heap.with_payload(obj, |body| body.set_data_value(index, value));
+    record_slot_write(heap, obj, value);
+}
+
+/// Read slot `index` of an object whose hidden class already names it.
+pub(crate) fn layout_slot(obj: JsObject, heap: &otter_gc::GcHeap, index: usize) -> Value {
+    heap.read_payload(obj, |body| body.data_value(heap, index))
+}
+
 fn record_slot_write(heap: &mut otter_gc::GcHeap, obj: JsObject, slot: Value) {
     heap.record_write(obj, &slot);
 }

@@ -2489,6 +2489,68 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         self.get(receiver, atom.as_str())
     }
 
+    /// The hidden class an object gets from these property names, in order.
+    ///
+    /// Keep the answer: the walk is paid once per distinct key list per
+    /// isolate, and [`Self::object_with_layout`] then builds each object with
+    /// one shape instead of a transition per property.
+    ///
+    /// # Errors
+    /// Propagates an allocation failure from extending the shape chain.
+    pub fn object_layout(&mut self, keys: &[&str]) -> Result<crate::ObjectLayout, NativeError> {
+        let result = self.ctx.cx.interp.object_layout(keys);
+        result.map_err(|error| self.vm_error(error, "NativeScope::object_layout"))
+    }
+
+    /// Build an object that already has `layout`'s properties, every one of
+    /// them `undefined`, to be filled by index with [`Self::set_slot`].
+    ///
+    /// The bulk counterpart of [`Self::set`]: for a surface that knows an
+    /// object's key list before its values arrive, this costs one hidden
+    /// class and one slab for the whole object, where a `set` per property
+    /// costs a presence lookup and a hidden-class transition each.
+    ///
+    /// # Errors
+    /// Propagates allocation failures.
+    pub fn object_of_layout(
+        &mut self,
+        layout: crate::ObjectLayout,
+    ) -> Result<Local<'scope>, NativeError> {
+        let result = self
+            .ctx
+            .cx
+            .interp
+            .scoped_object_of_layout(self.token, layout);
+        result.map_err(|error| self.vm_error(error, "NativeScope::object_of_layout"))
+    }
+
+    /// Overwrite the layout slot at `index`.
+    ///
+    /// # Errors
+    /// Returns a `TypeError` when the handle is not an object.
+    pub fn set_slot(
+        &mut self,
+        object: Local<'_>,
+        index: usize,
+        value: Local<'_>,
+    ) -> Result<(), NativeError> {
+        let result = self
+            .ctx
+            .cx
+            .interp
+            .scoped_set_slot(self.token, object, index, value);
+        result.map_err(|error| self.vm_error(error, "NativeScope::set_slot"))
+    }
+
+    /// Read the layout slot at `index`.
+    ///
+    /// # Errors
+    /// Returns a `TypeError` when the handle is not an object.
+    pub fn slot(&mut self, object: Local<'_>, index: usize) -> Result<Local<'scope>, NativeError> {
+        let result = self.ctx.cx.interp.scoped_slot(self.token, object, index);
+        result.map_err(|error| self.vm_error(error, "NativeScope::slot"))
+    }
+
     /// Store a string-keyed property through the rooted object path.
     pub fn set(
         &mut self,

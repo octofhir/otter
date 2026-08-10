@@ -97,6 +97,31 @@ pub trait Traceable: 'static {
     /// - not read past the object's payload.
     unsafe fn trace_slots(this: *mut Self, visitor: &mut SlotVisitor<'_>);
 
+    /// Walk the outgoing references of a *pending* payload: the
+    /// stack-resident value an allocation is about to copy into the
+    /// heap, which a cap-triggered collection may have to see before
+    /// the cell it will live in exists.
+    ///
+    /// This differs from [`Self::trace_slots`] for a body that carries
+    /// a trailing array. That storage is part of the heap cell, not of
+    /// `Self`, so a body whose trace walks it through a stored count
+    /// must not walk it here: past the fixed part lies the caller's
+    /// stack, and handing those words to the collector as slots hands
+    /// it garbage. Such bodies override this to trace only their fixed
+    /// part — and if that part is all count, to trace nothing.
+    ///
+    /// # Safety
+    ///
+    /// `this` must reference a fully-constructed `Self`, which unlike
+    /// [`Self::trace_slots`] need not be in the heap. The same
+    /// no-allocate, no-retain, no-read-past-the-payload rules apply,
+    /// where "the payload" is `size_of::<Self>()` bytes.
+    unsafe fn trace_pending_slots(this: *mut Self, visitor: &mut SlotVisitor<'_>) {
+        // SAFETY: the caller upholds the contract above, which is the
+        // `trace_slots` contract minus the in-heap requirement.
+        unsafe { Self::trace_slots(this, visitor) }
+    }
+
     /// Walk weak ephemeron entries. The default is no ephemeron
     /// edges. Collectors must not treat keys as ordinary strong
     /// slots; values become strong only when the key has already
@@ -185,6 +210,17 @@ pub trait SafeTraceable: 'static {
     /// precondition).
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>);
 
+    /// Safe counterpart to [`Traceable::trace_pending_slots`]: what to
+    /// trace when `self` is still the allocation's stack-resident
+    /// payload and its trailing storage does not exist yet.
+    ///
+    /// A body with no trailing array keeps this default. A body that
+    /// traces a trailing array must override it, or the collector walks
+    /// the stack past the payload.
+    fn trace_pending_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
+        self.trace_slots_safe(visitor);
+    }
+
     /// Safe counterpart to [`Traceable::trace_ephemeron_slots`].
     /// Most heap objects are not ephemeron tables and keep this
     /// no-op implementation.
@@ -206,6 +242,14 @@ impl<T: SafeTraceable> Traceable for T {
         // for the duration of the safe call.
         unsafe {
             (*this).trace_slots_safe(visitor);
+        }
+    }
+
+    unsafe fn trace_pending_slots(this: *mut Self, visitor: &mut SlotVisitor<'_>) {
+        // SAFETY: same bridge contract as `trace_slots`, minus the
+        // in-heap requirement.
+        unsafe {
+            (*this).trace_pending_slots_safe(visitor);
         }
     }
 

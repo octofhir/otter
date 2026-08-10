@@ -301,6 +301,11 @@ impl<E: TableEntry> otter_gc::SafeTraceable for OrderedTableBody<E> {
             entry.trace_entry(visitor);
         }
     }
+
+    /// The entry array lives in the heap cell, not in this body, so a
+    /// pending copy on the stack has nothing to trace: everything
+    /// `trace_slots_safe` walks is storage that does not exist yet.
+    fn trace_pending_slots_safe(&mut self, _visitor: &mut SlotVisitor<'_>) {}
 }
 
 /// Handle to a collection's table.

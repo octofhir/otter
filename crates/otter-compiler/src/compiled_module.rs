@@ -229,6 +229,11 @@ pub struct CompiledExport {
     pub local: Option<String>,
     /// Re-export source specifier when this export forwards another module.
     pub from: Option<String>,
+    /// `type` import attribute the re-export source was written with.
+    /// Half of the key naming the forwarded module, as it is on an
+    /// import.
+    #[serde(default)]
+    pub from_attr_type: Option<String>,
 }
 
 /// Deterministic live-binding slot metadata.
@@ -327,9 +332,18 @@ impl ModuleMetadataVisitor<'_> {
         });
     }
 
-    fn record_export(&mut self, name: String, local: Option<String>, from: Option<String>) {
+    fn record_export(&mut self, name: String, local: Option<String>, from: Option<ImportRequest>) {
         self.live_binding_names.insert(name.clone());
-        self.exports.push(CompiledExport { name, local, from });
+        let (from, from_attr_type) = match from {
+            Some(request) => (Some(request.specifier), request.attr_type),
+            None => (None, None),
+        };
+        self.exports.push(CompiledExport {
+            name,
+            local,
+            from,
+            from_attr_type,
+        });
     }
 }
 
@@ -382,15 +396,14 @@ impl<'a> Visit<'a> for ModuleMetadataVisitor<'_> {
         if decl.export_kind.is_type() {
             return;
         }
-        let from = decl
-            .source
-            .as_ref()
-            .map(|src| src.value.as_str().to_string());
-        if let Some(specifier) = &from {
-            self.record_import(
-                ImportRequest::plain(specifier.as_str()),
-                CompiledImportKind::ReExport,
-            );
+        let from = decl.source.as_ref().map(|src| {
+            ImportRequest::new(
+                src.value.as_str(),
+                crate::import_attribute_type(decl.with_clause.as_deref()),
+            )
+        });
+        if let Some(request) = &from {
+            self.record_import(request.clone(), CompiledImportKind::ReExport);
         }
         if let Some(inner) = &decl.declaration {
             record_exports_from_declaration(self, inner, None);
@@ -407,11 +420,11 @@ impl<'a> Visit<'a> for ModuleMetadataVisitor<'_> {
         if decl.export_kind.is_type() {
             return;
         }
-        let source = decl.source.value.as_str().to_string();
-        self.record_import(
-            ImportRequest::plain(source.as_str()),
-            CompiledImportKind::ReExport,
+        let source = ImportRequest::new(
+            decl.source.value.as_str(),
+            crate::import_attribute_type(decl.with_clause.as_deref()),
         );
+        self.record_import(source.clone(), CompiledImportKind::ReExport);
         let exported = decl
             .exported
             .as_ref()
@@ -451,7 +464,7 @@ impl<'a> Visit<'a> for ModuleMetadataVisitor<'_> {
 fn record_exports_from_declaration(
     visitor: &mut ModuleMetadataVisitor<'_>,
     decl: &oxc_ast::ast::Declaration<'_>,
-    from: Option<String>,
+    from: Option<ImportRequest>,
 ) {
     match decl {
         oxc_ast::ast::Declaration::VariableDeclaration(var_decl) => {

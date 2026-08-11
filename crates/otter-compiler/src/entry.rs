@@ -1265,7 +1265,10 @@ pub fn compile_module_program(
                 // module loader has the target module available.
                 // <https://tc39.es/ecma262/#sec-exports>
                 if let Some(source) = decl.source.as_ref() {
-                    let request = ImportRequest::plain(source.value.as_str());
+                    let request = ImportRequest::new(
+                        source.value.as_str(),
+                        import_attribute_type(decl.with_clause.as_deref()),
+                    );
                     if !state.import_records.contains_key(&request) {
                         let uv = top.own_upvalue_count;
                         top.own_upvalue_count =
@@ -1282,8 +1285,13 @@ pub fn compile_module_program(
                 let self_source = decl
                     .source
                     .as_ref()
-                    .map(|s| s.value.as_str())
-                    .and_then(|spec| host.resolved_imports.get(&ImportRequest::plain(spec)))
+                    .map(|s| {
+                        ImportRequest::new(
+                            s.value.as_str(),
+                            import_attribute_type(decl.with_clause.as_deref()),
+                        )
+                    })
+                    .and_then(|request| host.resolved_imports.get(&request))
                     .is_some_and(|target| *target == host.module_url);
                 let has_source = decl.source.is_some();
                 for spec in &decl.specifiers {
@@ -1321,7 +1329,10 @@ pub fn compile_module_program(
                 // §16.2.3 ExportFromClause — `export * from "./other"`
                 // / `export * as ns from "./other"`. Register the
                 // source so the body-compile arm can look it up.
-                let request = ImportRequest::plain(decl.source.value.as_str());
+                let request = ImportRequest::new(
+                    decl.source.value.as_str(),
+                    import_attribute_type(decl.with_clause.as_deref()),
+                );
                 if !state.import_records.contains_key(&request) {
                     let uv = top.own_upvalue_count;
                     top.own_upvalue_count =

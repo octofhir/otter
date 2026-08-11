@@ -18,6 +18,9 @@
 //!   values directly, so a document is walked once.
 //! - Text runs are accumulated in Rust, not as JavaScript strings, so an
 //!   element split across several runs still yields one string.
+//! - Attribute values are interned for one parse and kept in the same pending
+//!   root arena. Repeated spellings therefore allocate one JavaScript string,
+//!   while unique values add no long-lived state beyond the result itself.
 //! - Writing goes the other way through one owning Rust tree, so every rule
 //!   about escaping, legal names and layout lives in `otter_xml::stringify`
 //!   and not in two places. Reading a JavaScript value is bounded by an
@@ -28,6 +31,8 @@
 //! - `otter_xml::sink` — the events consumed here.
 
 use std::borrow::Cow;
+
+use rustc_hash::FxHashMap;
 
 use otter_runtime::{
     OtterError, RuntimeExtensionContext, RuntimeExtensionInstaller, RuntimeHostAtom as HostAtom,
@@ -154,6 +159,7 @@ fn build<'s, E: Encoding>(
                 depth: 0,
                 frames: Vec::new(),
                 key: String::new(),
+                attribute_values: FxHashMap::default(),
                 root_atom: None,
                 compact_root: None,
                 encoding: std::marker::PhantomData,
@@ -240,6 +246,8 @@ struct PendingProperty {
     key: HostAtom,
     value: PendingValue,
     repeated_len: Option<usize>,
+    /// The parse-wide attribute-value cache owns this pending root.
+    retained: bool,
 }
 
 /// What is known about one open element while its children arrive.
@@ -264,6 +272,8 @@ struct Builder<'a, 's, 'rt, E: Encoding> {
     frames: Vec<Frame>,
     /// Reused buffer for the `@name` key of an attribute.
     key: String,
+    /// One collector-rooted JavaScript string per distinct attribute value.
+    attribute_values: FxHashMap<Box<str>, PendingValue>,
     /// The root element's atom, which the compact form keys its result by.
     root_atom: Option<HostAtom>,
     /// Compact root retained until the one-property document wrapper is built.
@@ -284,6 +294,19 @@ fn trimmed(text: &str) -> &str {
 }
 
 impl<E: Encoding> Builder<'_, '_, '_, E> {
+    /// Return the parse-wide JavaScript string for one attribute value.
+    fn attribute_value(&mut self, value: &str) -> Option<PendingValue> {
+        if let Some(cached) = self.attribute_values.get(value) {
+            return Some(*cached);
+        }
+        let pending = self.vm.step(|scope, _stack, pending| {
+            let text = scope.string(value)?;
+            Ok(scope.pending_value(pending, text))
+        })?;
+        self.attribute_values.insert(value.into(), pending);
+        Some(pending)
+    }
+
     fn append_compact_child(&mut self, parent_depth: usize, key: HostAtom, child: PendingValue) {
         let existing = self.frames[parent_depth]
             .properties
@@ -294,6 +317,7 @@ impl<E: Encoding> Builder<'_, '_, '_, E> {
                 key,
                 value: child,
                 repeated_len: None,
+                retained: false,
             });
             return;
         };
@@ -354,6 +378,7 @@ impl<E: Encoding> Builder<'_, '_, '_, E> {
                         key: scope.atom("#text"),
                         value: text,
                         repeated_len: None,
+                        retained: false,
                     });
                 }
                 let keys: Vec<&HostAtom> =
@@ -369,7 +394,9 @@ impl<E: Encoding> Builder<'_, '_, '_, E> {
                 let layout = scope.object_layout_for_atoms(&element_atom, &keys)?;
                 let object = scope.object_with_layout(layout, &values)?;
                 for property in &properties {
-                    let _ = scope.release_pending_value(pending, property.value);
+                    if !property.retained {
+                        let _ = scope.release_pending_value(pending, property.value);
+                    }
                 }
                 object
             };
@@ -425,27 +452,27 @@ impl<E: Encoding> Sink<E::Unit> for Builder<'_, '_, '_, E> {
         let value = text_of::<E>(value);
         let depth = self.depth - 1;
         let shape = self.shape;
+        let Some(text) = self.attribute_value(&value) else {
+            return;
+        };
         if shape == Shape::Compact {
             self.key.clear();
             self.key.push('@');
             self.key.push_str(&name);
             let key = self.vm.atom(&self.key);
-            let pending = self.vm.step(|scope, _stack, pending| {
-                let text = scope.string(&value)?;
-                Ok(scope.pending_value(pending, text))
+            self.frames[depth].properties.push(PendingProperty {
+                key,
+                value: text,
+                repeated_len: None,
+                retained: true,
             });
-            if let Some(value) = pending {
-                self.frames[depth].properties.push(PendingProperty {
-                    key,
-                    value,
-                    repeated_len: None,
-                });
-            }
             return;
         }
-        self.vm.step(|scope, stack, _pending| {
+        self.vm.step(|scope, stack, pending| {
             let element = scope.index(stack, depth)?;
-            let text = scope.string(&value)?;
+            let text = scope
+                .local_pending_value(pending, text)
+                .expect("interned attribute value");
             let attributes = scope.get(element, "attributes")?;
             scope.set(attributes, &name, text)
         });

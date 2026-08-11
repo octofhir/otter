@@ -56,9 +56,11 @@ enum Shape {
 
 /// Parse an XML document into JavaScript values.
 ///
-/// Accepts a string, or bytes as an `ArrayBuffer` or a view over one. A string
-/// is already-decoded text; bytes are decoded per their byte-order mark or
-/// `encoding` declaration.
+/// Accepts a string, or bytes as an `ArrayBuffer`, a view over one, or a
+/// `Blob`. A string is already-decoded text; bytes are decoded per their
+/// byte-order mark or `encoding` declaration. A `Blob` holds its bytes in
+/// memory, so they are read here rather than through the asynchronous
+/// `Blob.arrayBuffer()`.
 ///
 /// # Errors
 /// A document that is not well-formed raises a `SyntaxError`; a first argument
@@ -72,10 +74,17 @@ pub fn parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             let text = scope.string_value(input)?;
             build::<Utf8>(&mut scope, text.as_bytes(), shape)?
         } else {
-            let Some(bytes) = scope.buffer_source_bytes(input) else {
+            // A `Blob` is bytes too, and its class declares them, so the read
+            // goes through the VM's type-blind view rather than through a
+            // dependency on the crate that declares the class.
+            let Some(bytes) = scope
+                .buffer_source_bytes(input)
+                .or_else(|| scope.host_bytes(input))
+            else {
                 return Err(NativeError::TypeError {
                     name: NAME,
-                    reason: "expected a string, an ArrayBuffer, or a view over one".to_owned(),
+                    reason: "expected a string, an ArrayBuffer, a view over one, or a Blob"
+                        .to_owned(),
                 });
             };
             let sniffed = otter_xml::encoding::sniff(&bytes).map_err(syntax_error)?;

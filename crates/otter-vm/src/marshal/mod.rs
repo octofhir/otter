@@ -64,7 +64,7 @@ pub use from_js::{
 pub use host_class::{
     HostAncestry, HostClassMeta, HostInstance, JsUnionProbe, class_instance, construct_instance,
 };
-pub(crate) use host_class::{host_data_view_raw, host_data_view_raw_mut};
+pub(crate) use host_class::{host_bytes_view_raw, host_data_view_raw, host_data_view_raw_mut};
 pub use into_js::{ArrayBuffer, IntoJs, Uint8Array};
 
 #[cfg(test)]

@@ -39,9 +39,10 @@ declare namespace Otter {
      * Parse an XML document.
      *
      * A string is already-decoded text, so its `encoding` declaration is
-     * checked for syntax but otherwise ignored. Bytes are decoded per the XML
-     * rules: a byte-order mark or the `encoding` in the declaration selects
-     * UTF-8 (the default), UTF-16 (either byte order), or ISO-8859-1.
+     * checked for syntax but otherwise ignored. Bytes — an `ArrayBuffer`, a
+     * view over one, or a `Blob` — are decoded per the XML rules: a
+     * byte-order mark or the `encoding` in the declaration selects UTF-8 (the
+     * default), UTF-16 (either byte order), or ISO-8859-1.
      *
      * Every value in the result is a string; nothing is coerced to a number,
      * boolean, or null. Comments and processing instructions are dropped.
@@ -51,11 +52,11 @@ declare namespace Otter {
      * @throws {SyntaxError} if the document is not well-formed.
      */
     function parse(
-      input: string | ArrayBuffer | ArrayBufferView,
+      input: string | ArrayBuffer | ArrayBufferView | Blob,
       options?: XMLParseOptions & { compact?: true },
     ): XMLCompactElement;
     function parse(
-      input: string | ArrayBuffer | ArrayBufferView,
+      input: string | ArrayBuffer | ArrayBufferView | Blob,
       options: XMLParseOptions & { compact: false },
     ): XMLNode;
 

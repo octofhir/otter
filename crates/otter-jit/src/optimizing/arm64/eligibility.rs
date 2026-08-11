@@ -158,7 +158,33 @@ pub(super) fn guard_cache_safe_instruction(
         | Op::Jump
         | Op::JumpIfTrue
         | Op::JumpIfFalse => true,
-        Op::LoadProperty => inline_method_property(tree, instruction).is_some(),
+        // Generated element, property, and proven global probes neither
+        // allocate nor mutate. Their semantic miss paths clear every raw
+        // method-cache slot before publishing a reentrant transition frame.
+        Op::LoadElement => tree
+            .frames
+            .get(instruction.inline.0 as usize)
+            .and_then(|frame| {
+                frame
+                    .instructions()
+                    .get(instruction.pc as usize)
+                    .map(|metadata| (frame, metadata.byte_pc))
+            })
+            .is_some_and(|(frame, byte_pc)| element_access_for(&frame.body, byte_pc).is_some()),
+        Op::LoadProperty => true,
+        Op::LoadGlobalOrThrow => tree
+            .frames
+            .get(instruction.inline.0 as usize)
+            .and_then(|frame| {
+                frame
+                    .instructions()
+                    .get(instruction.pc as usize)
+                    .map(|metadata| (frame, metadata.byte_pc))
+            })
+            .is_some_and(|(frame, byte_pc)| {
+                frame.body.global_lexical_loads.contains_key(&byte_pc)
+                    || frame.body.global_object_loads.contains_key(&byte_pc)
+            }),
         Op::CallMethodValue => {
             if is_spliced_call(cfg, block, instruction) {
                 return true;

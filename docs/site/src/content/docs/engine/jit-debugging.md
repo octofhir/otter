@@ -274,9 +274,13 @@ Invariant receivers cache their validated body header. Varying exotic Map or
 string receivers cache only the pinned prototype method identity and still
 validate the current body on every iteration. Normal entry and every OSR
 trampoline initialize independent empty caches. Generated intrinsic misses
-clear all sites before the generic path can allocate, collect, or re-enter
-JavaScript, so the presence of this region never means a cold transition may
-retain a raw receiver pointer.
+and generated element, property, or global-read probe misses clear all sites
+before the generic path can allocate, collect, or re-enter JavaScript, so the
+presence of this region never means a cold transition may retain a raw
+receiver pointer. Element and global reads may coexist with the cache only
+when compile-time feedback prepared a generated hit path; an always-slow read
+keeps the loop uncached. Property reads use their generated exotic-length or
+self-patching IC probe and apply the same invalidation on its semantic miss.
 
 ### Template leaf-inline regions
 

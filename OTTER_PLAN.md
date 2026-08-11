@@ -142,6 +142,17 @@ It already owns:
   Map/string/Math kernel fell by 13.08%, with exact matching checksum,
   7,073,851 reductions, 35 optimized entries, 1,708 runtime-stub transitions,
   and zero deopts; emitted native code grew by 348 bytes;
+- activation-local method caches now survive generated dense-element,
+  property-IC/exotic-length, and guarded global reads. Element and global
+  eligibility requires a prepared allocation-free hit path; every semantic
+  miss clears all raw method-cache slots before frame publication and generic
+  reentry. The regression combines a global lexical array read, dense indexing,
+  string length, five cached methods, and element/property accessor misses that
+  allocate and replace `Map.prototype.get`. Alternating 10-warmup/25-sample
+  process medians improved the existing mixed Map kernel by 15.61%, Map.set by
+  11.77%, and Map.get-plus-length by 11.51%, with exact checksums, unchanged
+  reductions/runtime-stub counts, and zero deopts. Native code grew by 120, 60,
+  and 132 bytes respectively;
 - catch-only exception-region CFGs with explicit landing-pad successors; the
   shared linkage fully unwinds publication, commits the thrown value to its
   allocator home, and transfers at the exact call PC without replay;
@@ -159,7 +170,7 @@ The old optimizing compiler and template emitter remain in the active graph
 only for operations and function shapes not yet selected by the replacement
 pipeline. They are fallback, not contracts to preserve.
 
-Latest accepted gate: 53 bytecode, 86 compiler, 283 JIT, and 841 VM tests;
+Latest accepted gate: 53 bytecode, 86 compiler, 283 JIT, and 842 VM tests;
 the complete runtime suite; all-target/all-feature Clippy;
 compile-fail/rooting checks; and 21/21 differential
 interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.

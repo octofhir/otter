@@ -3,6 +3,8 @@
 //! # Contents
 //! - Multiple invariant Map and Math receivers in one natural loop.
 //! - Changing primitive-string receivers sharing one pinned prototype method.
+//! - Global-lexical, dense-element, and exotic-length reads in a cached loop.
+//! - Element/property slow reads that mutate a cached method during reentry.
 //! - Interpreter parity and artifact proof for every cached intrinsic site.
 //!
 //! # Invariants
@@ -11,19 +13,21 @@
 //!   pinned prototype method identity is reused.
 //! - Any generated intrinsic miss clears every raw cached receiver before the
 //!   canonical transition may allocate, collect, or re-enter JavaScript.
+//! - Any element/property/global probe miss applies the same invalidation
+//!   before its canonical lookup transition.
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 
 const LOOP_GUARD_MATRIX: &str = r#"
-function guardedLoop(table, math, first, second, needle, limit) {
+function guardedLoop(table, math, needle, limit) {
   let checksum = 0;
   for (let index = 0; index < limit; index++) {
-    let word = first;
-    if ((index & 1) !== 0) word = second;
+    const word = words[index & 1];
     const key = index & 7;
     table.set(key, word);
     checksum += table.get(key).charCodeAt(index & 3);
     checksum += word.indexOf(needle);
+    checksum += word.length;
     checksum += math.abs((index & 15) - 8);
   }
   return checksum;
@@ -31,8 +35,9 @@ function guardedLoop(table, math, first, second, needle, limit) {
 
 const table = new Map();
 for (let key = 0; key < 8; key++) table.set(key, "otter");
+const words = ["engine", "runtime"];
 for (let warm = 0; warm < 4010; warm++) {
-  guardedLoop(table, Math, "engine", "runtime", "e", 16);
+  guardedLoop(table, Math, "e", 16);
 }
 
 function fallbackLoop(table, word, plainNeedle, coerciveNeedle, limit) {
@@ -58,8 +63,56 @@ const coerciveNeedle = {
     return "e";
   }
 };
-const guarded = guardedLoop(table, Math, "engine", "runtime", "e", 1024);
+const guarded = guardedLoop(table, Math, "e", 1024);
 const fallback = fallbackLoop(table, "engine", "e", coerciveNeedle, 64);
+Map.prototype.get = originalGet;
+
+function elementMissLoop(table, values, limit) {
+  let checksum = 0;
+  for (let index = 0; index < limit; index++) {
+    checksum += table.get(0) === 1 ? 1 : 10;
+    checksum += values[index];
+  }
+  return checksum;
+}
+
+const elementValues = [];
+for (let index = 0; index < 64; index++) elementValues[index] = 1;
+Object.defineProperty(elementValues, 31, {
+  configurable: true,
+  get() {
+    Map.prototype.get = function() { return 10; };
+    for (let index = 0; index < 300; index++) ({ payload: [index, index + 1] });
+    return 5;
+  }
+});
+const elementTable = new Map([[0, 1]]);
+for (let warm = 0; warm < 4010; warm++) elementMissLoop(elementTable, [1, 1], 2);
+const elementMiss = elementMissLoop(elementTable, elementValues, 64);
+Map.prototype.get = originalGet;
+
+function propertyMissLoop(table, values, limit) {
+  let checksum = 0;
+  for (let index = 0; index < limit; index++) {
+    checksum += table.get(0) === 1 ? 1 : 10;
+    checksum += values[index].flag;
+  }
+  return checksum;
+}
+
+const propertyValues = [];
+for (let index = 0; index < 64; index++) propertyValues[index] = { flag: 1 };
+Object.defineProperty(propertyValues[31], "flag", {
+  configurable: true,
+  get() {
+    Map.prototype.get = function() { return 10; };
+    for (let index = 0; index < 300; index++) ({ payload: [index, index + 1] });
+    return 5;
+  }
+});
+const propertyTable = new Map([[0, 1]]);
+for (let warm = 0; warm < 4010; warm++) propertyMissLoop(propertyTable, [{ flag: 1 }, { flag: 1 }], 2);
+const propertyMiss = propertyMissLoop(propertyTable, propertyValues, 64);
 Map.prototype.get = originalGet;
 
 function nestedMaps(first, second, limit) {
@@ -76,10 +129,10 @@ function nestedMaps(first, second, limit) {
 const firstMap = new Map([[0, 1]]);
 const secondMap = new Map([[0, 10]]);
 const nested = nestedMaps(firstMap, secondMap, 64);
-JSON.stringify([guarded, table.size, fallback, coercions, nested]);
+JSON.stringify([guarded, table.size, fallback, coercions, elementMiss, propertyMiss, nested]);
 "#;
 
-fn run(selection: JitSelection, artifacts: bool) -> (String, u64, usize) {
+fn run(selection: JitSelection, artifacts: bool) -> (String, u64, usize, usize) {
     let builder = Runtime::builder()
         .jit_selection(selection)
         .jit_osr_threshold(4);
@@ -97,7 +150,7 @@ fn run(selection: JitSelection, artifacts: bool) -> (String, u64, usize) {
             "optimizing-loop-method-guard-cache.js",
         )
         .expect("loop guard-cache matrix");
-    let cache_regions = completion.jit_artifacts().map_or(0, |batch| {
+    let cache_region_counts = completion.jit_artifacts().map_or_else(Vec::new, |batch| {
         batch
             .bundles()
             .iter()
@@ -112,22 +165,25 @@ fn run(selection: JitSelection, artifacts: bool) -> (String, u64, usize) {
                         .count()
                 })
             })
-            .max()
-            .unwrap_or(0)
+            .collect()
     });
     (
         completion.completion_string().to_owned(),
         runtime.execution_stats().jit_optimized_entries,
-        cache_regions,
+        cache_region_counts.iter().copied().max().unwrap_or(0),
+        cache_region_counts
+            .iter()
+            .filter(|count| **count > 0)
+            .count(),
     )
 }
 
 #[test]
 fn loop_method_guard_caches_preserve_semantics() {
-    let (oracle, _, _) = run(JitSelection::InterpreterOnly, false);
-    let (compiled, optimized_entries, _) = run(JitSelection::ProductionTiered, false);
+    let (oracle, _, _, _) = run(JitSelection::InterpreterOnly, false);
+    let (compiled, optimized_entries, _, _) = run(JitSelection::ProductionTiered, false);
     assert_eq!(compiled, oracle);
-    assert_eq!(oracle, "[119040,8,352,1,2816]");
+    assert_eq!(oracle, "[125696,8,352,1,420,420,2816]");
     #[cfg(target_arch = "aarch64")]
     assert!(optimized_entries > 0, "fixture must enter optimizing code");
 }
@@ -135,11 +191,16 @@ fn loop_method_guard_caches_preserve_semantics() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn artifacts_expose_every_loop_method_guard_cache() {
-    let (compiled, optimized_entries, cache_regions) = run(JitSelection::ProductionTiered, true);
-    assert_eq!(compiled, "[119040,8,352,1,2816]");
+    let (compiled, optimized_entries, cache_regions, cache_bundles) =
+        run(JitSelection::ProductionTiered, true);
+    assert_eq!(compiled, "[125696,8,352,1,420,420,2816]");
     assert!(optimized_entries > 0, "fixture must enter optimizing code");
     assert_eq!(
         cache_regions, 5,
         "Map.set/get, charCodeAt, indexOf, and Math.abs each need one cache"
+    );
+    assert!(
+        cache_bundles >= 3,
+        "the mixed fast loop and both reentrant read loops must each cache a method guard"
     );
 }

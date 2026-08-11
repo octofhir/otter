@@ -21,7 +21,8 @@
 //! - Guarded plain- and method-callee splicing with multi-frame exact-PC
 //!   deoptimization and synthetic `this` binding.
 //! - Multi-site activation-local method-identity caching, invariant receiver
-//!   reuse, and receiver-property guard fusion.
+//!   reuse, receiver-property guard fusion, and precise invalidation before
+//!   slow element/property/global reads re-enter the VM.
 //! - Loop-versioned own-data Number property loads, activated only after one
 //!   complete all-hit iteration and invalidated by every semantic miss.
 //! - Unboxed numeric residency through source-lowered coercion scaffolding.
@@ -67,6 +68,9 @@
 //!   the same reduction and materializes the inverted canonical boolean.
 //! - Every reentrant transition boxes its operands plus tagged SSA values live
 //!   across the call into the register window of the frame that names them.
+//!   A transition reachable after caching a raw receiver/body header clears
+//!   every activation-local method cache before frame publication, so moving
+//!   collection and JavaScript reentry can never leave a stale raw pointer.
 //!   Its precise frame bitmap names every tagged input and live-across value;
 //!   moving-GC reloads restore live values and load results while numeric
 //!   machine locations remain untouched. A stub runs in the frame that owns
@@ -1569,6 +1573,11 @@ fn emit(
                             dynasm!(ops ; .arch aarch64 ; b =>done);
                         }
                         dynasm!(ops ; .arch aarch64 ; =>miss);
+                        emit_clear_cached_method_guards(
+                            &mut ops,
+                            cached_method_guard_base,
+                            eligibility.cached_method_guards.len(),
+                        );
                         emit_build_transition_frames(
                             &mut ops,
                             tree,
@@ -1930,6 +1939,11 @@ fn emit(
                         // Miss: the window transition resolves full `[[Get]]`
                         // semantics and self-patches this site's cell.
                         dynasm!(ops ; .arch aarch64 ; =>miss);
+                        emit_clear_cached_method_guards(
+                            &mut ops,
+                            cached_method_guard_base,
+                            eligibility.cached_method_guards.len(),
+                        );
                         emit_build_transition_frames(
                             &mut ops,
                             tree,
@@ -2428,6 +2442,11 @@ fn emit(
                             dynasm!(ops ; .arch aarch64 ; b =>done);
                         }
                         dynasm!(ops ; .arch aarch64 ; =>miss);
+                        emit_clear_cached_method_guards(
+                            &mut ops,
+                            cached_method_guard_base,
+                            eligibility.cached_method_guards.len(),
+                        );
                         emit_build_transition_frames(
                             &mut ops,
                             tree,

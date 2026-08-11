@@ -910,7 +910,11 @@ pub(crate) fn compile_statement(
                     let record_uv = cx
                         .module_state
                         .as_ref()
-                        .and_then(|s| s.import_records.get(src).copied())
+                        .and_then(|s| {
+                            s.import_records
+                                .get(&ImportRequest::plain(src.as_str()))
+                                .copied()
+                        })
                         .ok_or(CompileError::Unsupported {
                             node: format!(
                                 "ExportNamedDeclaration: unresolved re-export source `{src}`"
@@ -942,10 +946,11 @@ pub(crate) fn compile_statement(
                             // binding forwards the Module Namespace
                             // Exotic Object (§10.4.6).
                             let dst = cx.alloc_scratch();
-                            let spec_const = cx.intern_string_constant(&binding.specifier);
+                            let target = import_target_constant(cx, &binding.request);
+                            let target_const = cx.intern_string_constant(&target);
                             cx.emit(
                                 Op::ModuleNamespaceObject,
-                                vec![Operand::Register(dst), Operand::ConstIndex(spec_const)],
+                                vec![Operand::Register(dst), Operand::ConstIndex(target_const)],
                                 span,
                             );
                             dst
@@ -1104,13 +1109,16 @@ pub(crate) fn compile_statement(
                     span,
                 });
             }
-            let source = decl.source.value.as_str().to_string();
+            let source = ImportRequest::plain(decl.source.value.as_str());
             let record_uv = cx
                 .module_state
                 .as_ref()
                 .and_then(|s| s.import_records.get(&source).copied())
                 .ok_or(CompileError::Unsupported {
-                    node: format!("ExportAllDeclaration: unresolved source `{source}`"),
+                    node: format!(
+                        "ExportAllDeclaration: unresolved source `{}`",
+                        source.specifier
+                    ),
                     span,
                 })?;
             let env_uv = cx
@@ -1129,10 +1137,11 @@ pub(crate) fn compile_statement(
                 // Namespace Exotic Object becomes a named export.
                 Some(exported_alias) => {
                     let ns_reg = cx.alloc_scratch();
-                    let spec_const = cx.intern_string_constant(&source);
+                    let target = import_target_constant(cx, &source);
+                    let target_const = cx.intern_string_constant(&target);
                     cx.emit(
                         Op::ModuleNamespaceObject,
-                        vec![Operand::Register(ns_reg), Operand::ConstIndex(spec_const)],
+                        vec![Operand::Register(ns_reg), Operand::ConstIndex(target_const)],
                         span,
                     );
                     cx.emit_store_property(env_reg, &exported_alias, ns_reg, span);

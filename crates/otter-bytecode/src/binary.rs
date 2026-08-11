@@ -208,6 +208,7 @@ impl Writer {
     fn module_resolution(&mut self, edge: &ModuleResolution) {
         self.string(&edge.referrer);
         self.string(&edge.specifier);
+        self.optional_string(edge.attr_type.as_ref());
         self.string(&edge.target);
         self.bool(edge.deferred);
         self.bool(edge.dynamic);
@@ -460,6 +461,7 @@ impl<'a> Reader<'a> {
         Some(ModuleResolution {
             referrer: self.string()?,
             specifier: self.string()?,
+            attr_type: self.optional_string()?,
             target: self.string()?,
             deferred: self.bool()?,
             dynamic: self.bool()?,
@@ -714,6 +716,7 @@ mod tests {
             module_resolutions: vec![ModuleResolution {
                 referrer: "file:///entry.ts".to_string(),
                 specifier: "./other.ts".to_string(),
+                attr_type: Some("xml".to_string()),
                 target: "file:///other.ts".to_string(),
                 deferred: true,
                 dynamic: false,

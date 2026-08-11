@@ -163,10 +163,11 @@ pub(crate) fn compile_identifier_without_with(
         // record path below.
         if binding.is_namespace && !binding.is_deferred {
             let dst = cx.alloc_scratch();
-            let spec_const = cx.intern_string_constant(&binding.specifier);
+            let target = import_target_constant(cx, &binding.request);
+            let target_const = cx.intern_string_constant(&target);
             cx.emit(
                 Op::ModuleNamespaceObject,
-                vec![Operand::Register(dst), Operand::ConstIndex(spec_const)],
+                vec![Operand::Register(dst), Operand::ConstIndex(target_const)],
                 span,
             );
             return Ok(dst);
@@ -197,8 +198,7 @@ pub(crate) fn compile_identifier_without_with(
         // binding (raising ReferenceError if it is still in its TDZ).
         // The source URL is statically known from the host resolution
         // table, so the read needs no per-import record cell.
-        let source_url = module_specifier_target(cx, &binding.specifier)
-            .unwrap_or_else(|| binding.specifier.clone());
+        let source_url = import_target_constant(cx, &binding.request);
         let url_const = cx.intern_string_constant(&source_url);
         let name_const = cx.intern_string_constant(&binding.source_name);
         let dst = cx.alloc_scratch();

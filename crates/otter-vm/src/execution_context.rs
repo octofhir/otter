@@ -560,12 +560,24 @@ impl ExecutionContext {
     }
 
     /// Resolve a module import edge from the bytecode resolution table.
+    /// The key is the whole request — referrer, specifier, and the `type`
+    /// import attribute — because one module may import one specifier under
+    /// several types, each resolving to its own target.
     #[must_use]
-    pub fn module_resolution_target(&self, referrer: &str, specifier: &str) -> Option<&str> {
+    pub fn module_resolution_target(
+        &self,
+        referrer: &str,
+        specifier: &str,
+        attr_type: Option<&str>,
+    ) -> Option<&str> {
         self.module
             .module_resolutions
             .iter()
-            .find(|r| r.referrer == referrer && r.specifier == specifier)
+            .find(|r| {
+                r.referrer == referrer
+                    && r.specifier == specifier
+                    && r.attr_type.as_deref() == attr_type
+            })
             .map(|r| r.target.as_str())
     }
 

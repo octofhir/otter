@@ -72,6 +72,36 @@ fn an_import_attribute_names_the_format_whatever_the_file_is_called() {
 }
 
 #[test]
+fn one_file_read_as_two_types_in_one_module_gives_two_values() {
+    // The `type` attribute is half of what a module asks for, so the same
+    // path under two types is two requests, two targets and two bindings —
+    // in every import form, including the namespace one.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("both.data"), "<a k='1'>text</a>").unwrap();
+    let main = dir.path().join("main.mjs");
+    std::fs::write(
+        &main,
+        r##"
+            import parsed from "./both.data" with { type: "xml" };
+            import raw from "./both.data" with { type: "text" };
+            import * as parsedNs from "./both.data" with { type: "xml" };
+            import * as rawNs from "./both.data" with { type: "text" };
+
+            if (parsed.a["@k"] !== "1") throw new Error("xml: " + JSON.stringify(parsed));
+            if (raw !== "<a k='1'>text</a>") throw new Error("text: " + JSON.stringify(raw));
+            if (parsedNs.default !== parsed) throw new Error("xml namespace is not the xml module");
+            if (rawNs.default !== raw) throw new Error("text namespace is not the text module");
+            if (parsedNs === rawNs) throw new Error("both types share one namespace");
+            if (parsedNs.a["@k"] !== "1") throw new Error("xml named export: " + parsedNs.a);
+        "##,
+    )
+    .unwrap();
+
+    let mut runtime = Runtime::builder().build().unwrap();
+    runtime.run_module(&main).unwrap();
+}
+
+#[test]
 fn an_import_attribute_type_nothing_reads_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("thing.data"), "whatever").unwrap();

@@ -14,6 +14,51 @@
 
 use crate::*;
 
+/// What a module asks its host for: the raw specifier text plus the
+/// `type` import attribute that decides how the target is read. Both
+/// halves are the key — `import a from "./x" with { type: "xml" }` and
+/// `import b from "./x"` in one module are two requests resolving to
+/// two targets, so nothing downstream may key on the specifier alone.
+///
+/// <https://tc39.es/proposal-import-attributes/>
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ImportRequest {
+    /// Raw specifier text from the declaration (`"./other.ts"`).
+    pub specifier: String,
+    /// `type` attribute of the `with { … }` clause, when present.
+    pub attr_type: Option<String>,
+}
+
+impl ImportRequest {
+    /// A request carrying a `type` attribute.
+    #[must_use]
+    pub fn new(specifier: impl Into<String>, attr_type: Option<String>) -> Self {
+        Self {
+            specifier: specifier.into(),
+            attr_type,
+        }
+    }
+
+    /// A request with no import attributes — the ordinary case.
+    #[must_use]
+    pub fn plain(specifier: impl Into<String>) -> Self {
+        Self::new(specifier, None)
+    }
+}
+
+/// The `type` attribute of a `with { … }` clause, when it has one.
+pub(crate) fn import_attribute_type(
+    clause: Option<&oxc_ast::ast::WithClause<'_>>,
+) -> Option<String> {
+    clause?.with_entries.iter().find_map(|entry| {
+        let key = match &entry.key {
+            oxc_ast::ast::ImportAttributeKey::Identifier(id) => id.name.as_str(),
+            oxc_ast::ast::ImportAttributeKey::StringLiteral(lit) => lit.value.as_str(),
+        };
+        (key == "type").then(|| entry.value.value.as_str().to_string())
+    })
+}
+
 /// One pre-resolved import-record binding: maps an importer-side
 /// alias (`import { a as alias } from "./other.ts"`) to the
 /// import-record upvalue index plus the original source-side name
@@ -31,12 +76,12 @@ pub(crate) struct ImportBinding {
     pub(crate) source_name: String,
     /// `true` for `import * as ns from "./..."` — the alias binds
     /// to the Module Namespace Exotic Object, resolved from
-    /// `specifier` at read time (distinct from the raw env record).
+    /// `request` at read time (distinct from the raw env record).
     pub(crate) is_namespace: bool,
-    /// Raw source specifier of the import (e.g. `"./other.ts"`), used
-    /// to resolve the namespace exotic object for `is_namespace`
-    /// bindings.
-    pub(crate) specifier: String,
+    /// The import's request (`"./other.ts"` plus any `type`
+    /// attribute), used to resolve the target module this alias reads
+    /// from.
+    pub(crate) request: ImportRequest,
     /// `true` for `import defer * as ns` — the alias binds to the
     /// *deferred* namespace cell (lazy evaluation) rather than the
     /// eager Module Namespace Exotic Object.
@@ -54,9 +99,9 @@ pub(crate) struct ModuleState {
     pub(crate) module_env_uv: u16,
     /// Own-upvalue index of the `import_meta` JsObject (param 1).
     pub(crate) import_meta_uv: u16,
-    /// Per-specifier upvalue index of the import-record JsObject.
+    /// Per-request upvalue index of the import-record JsObject.
     /// Populated by the import pre-pass at the start of the body.
-    pub(crate) import_records: HashMap<String, u16>,
+    pub(crate) import_records: HashMap<ImportRequest, u16>,
     /// Importer-side alias → import-record binding info.
     pub(crate) imported_names: HashMap<String, ImportBinding>,
     /// Names that this module exports. Every assignment to a name
@@ -71,19 +116,19 @@ pub(crate) struct ModuleState {
     /// source binding (live binding, §16.2.1.7) rather than a one-time
     /// snapshot at the export statement.
     pub(crate) reexport_local_targets: HashMap<String, Vec<String>>,
-    /// Per-specifier resolved target URL — populated by the host
+    /// Per-request resolved target URL — populated by the host
     /// before module compilation begins. The compiler emits the
-    /// pre-resolved (referrer, specifier, target) triple into the
-    /// produced fragment's `module_resolutions` table.
-    pub(crate) pre_resolved_imports: HashMap<String, String>,
-    /// Specifiers imported via `import defer * as ns from "x"` →
+    /// pre-resolved (referrer, request, target) row into the produced
+    /// fragment's `module_resolutions` table.
+    pub(crate) pre_resolved_imports: HashMap<ImportRequest, String>,
+    /// Requests imported via `import defer * as ns from "x"` →
     /// dedicated upvalue index of the *deferred* namespace cell. Kept
     /// separate from `import_records` so an eager `import * as a` and a
     /// deferred `import defer * as b` of the same module bind to
     /// distinct objects (§16.2.1 deferred namespaces are distinct from
     /// eager ones). Two deferred imports of the same module share one
     /// cell, so their namespaces are identical.
-    pub(crate) deferred_import_records: HashMap<String, u16>,
+    pub(crate) deferred_import_records: HashMap<ImportRequest, u16>,
 }
 
 /// Pre-resolved import / export information passed by the host
@@ -96,10 +141,10 @@ pub struct ModuleHostInfo {
     /// Canonical URL of this module (e.g.,
     /// `"file:///abs/path/to/main.ts"`).
     pub module_url: String,
-    /// Specifier → target URL pairs — every specifier the
-    /// module references in a static `import` or
-    /// literal-string `import("./x")` must be present.
-    pub resolved_imports: HashMap<String, String>,
+    /// Request → target URL pairs — every request the module makes
+    /// in a static `import` or literal-string `import("./x")` must be
+    /// present.
+    pub resolved_imports: HashMap<ImportRequest, String>,
 }
 
 /// Module-level mutable state shared across nested function
@@ -141,15 +186,24 @@ pub(crate) fn find_module_import_binding(
     None
 }
 
-/// Resolve a raw import `specifier` to its canonical target URL via the
+/// The module URL an import op names at run time. The host resolved the
+/// request before compilation, so the op carries its target instead of a key
+/// the VM would have to resolve a second time. A request no enclosing module
+/// resolved (script-mode compilation) falls back to its raw specifier, which
+/// names no module and so reports itself in the failure.
+pub(crate) fn import_target_constant(cx: &Compiler, request: &ImportRequest) -> String {
+    module_specifier_target(cx, request).unwrap_or_else(|| request.specifier.clone())
+}
+
+/// Resolve an import `request` to its canonical target URL via the
 /// host-provided `pre_resolved_imports`, walking the context stack so a
 /// nested function (whose own `module_state` is `None`) still finds the
 /// enclosing module's resolution table. Returns `None` when no enclosing
-/// module recorded the specifier (e.g. script-mode compilation).
-pub(crate) fn module_specifier_target(cx: &Compiler, specifier: &str) -> Option<String> {
+/// module recorded the request (e.g. script-mode compilation).
+pub(crate) fn module_specifier_target(cx: &Compiler, request: &ImportRequest) -> Option<String> {
     for frame in cx.stack.iter().rev() {
         if let Some(state) = &frame.module_state
-            && let Some(target) = state.pre_resolved_imports.get(specifier)
+            && let Some(target) = state.pre_resolved_imports.get(request)
         {
             return Some(target.clone());
         }

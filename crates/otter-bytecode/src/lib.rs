@@ -713,16 +713,17 @@ pub enum Op {
     /// - <https://tc39.es/ecma262/#sec-import-call-runtime-semantics-evaluation>
     ImportNamespaceDynamic,
 
-    /// Resolve a module specifier to its `module_env` object.
-    /// Operands: `Register(dst), ConstIndex(specifier_const)`.
+    /// Load an imported module's `module_env` object.
+    /// Operands: `Register(dst), ConstIndex(target_const)`.
     ///
-    /// The constant pool slot at `specifier_const` is a
-    /// [`Constant::String`] holding the raw specifier text from
-    /// the source (`"./other.ts"`, `"@scope/x"`, etc.). At runtime
-    /// the dispatcher resolves it against the **caller frame's
-    /// module URL** (see [`Frame::module_url`] in the VM crate)
-    /// using the linker's pre-built specifier → URL table, then
-    /// writes `Value::Object(module_env)` into `dst`.
+    /// The constant pool slot at `target_const` is a
+    /// [`Constant::String`] holding the target module's canonical
+    /// URL. The host resolved the request — specifier plus any
+    /// `type` import attribute — before compilation, so the
+    /// instruction names its target outright and the dispatcher
+    /// writes `Value::Object(module_env)` into `dst` with a single
+    /// lookup. A specifier alone would not identify the target: the
+    /// same specifier imported under two types has two.
     ///
     /// Used by:
     /// - The `<entry>` synthesised driver to allocate fresh
@@ -743,7 +744,7 @@ pub enum Op {
     ImportNamespace,
     /// Resolve the *deferred* namespace object for a module imported
     /// via `import defer * as ns from "x"` and write it to `r<dst>`.
-    /// Operands: `Register(dst), ConstIndex(specifier)`. Unlike
+    /// Operands: `Register(dst), ConstIndex(target_url)`. Unlike
     /// [`Op::ImportNamespace`], the target module's body is **not**
     /// evaluated here; the returned exotic object triggers evaluation
     /// on first access (TC39 import defer).
@@ -774,8 +775,8 @@ pub enum Op {
     /// is never propagated through a star re-export.
     StarReexport,
     /// Resolve the Module Namespace Exotic Object (ECMA-262 §10.4.6)
-    /// for the module imported via `specifier` and write it to
-    /// `r<dst>`. Operands: `Register(dst), ConstIndex(specifier)`.
+    /// of an imported module and write it to `r<dst>`.
+    /// Operands: `Register(dst), ConstIndex(target_url)`.
     /// Distinct from [`Op::ImportNamespace`], which yields the raw
     /// module environment used for named-import indirection; this
     /// yields the exotic object bound by `import * as ns` /
@@ -2258,10 +2259,10 @@ pub struct BytecodeModule {
 }
 
 /// One linker-resolved import edge: `(referrer module URL,
-/// raw specifier text) → target module URL`. Stored as a flat
-/// vector inside [`BytecodeModule`] so the JSON dump round-trips
-/// cleanly; the runtime constructs an in-memory hashmap from
-/// these on first import.
+/// raw specifier text, `type` attribute) → target module URL`.
+/// Stored as a flat vector inside [`BytecodeModule`] so the JSON dump
+/// round-trips cleanly; the runtime constructs an in-memory hashmap
+/// from these on first import.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModuleResolution {
     /// Module URL of the importing source (e.g.
@@ -2270,6 +2271,12 @@ pub struct ModuleResolution {
     /// Raw specifier text from the import statement
     /// (`"./other.ts"`).
     pub specifier: String,
+    /// `type` import attribute of the request, when it carries one:
+    /// `import … with { type: "xml" }`. Part of the edge's key, not
+    /// decoration — one specifier imported under two types in one
+    /// module is two requests with two targets.
+    #[serde(default)]
+    pub attr_type: Option<String>,
     /// Resolved target module URL.
     pub target: String,
     /// `true` when this edge is a `import defer * as ns from "x"`

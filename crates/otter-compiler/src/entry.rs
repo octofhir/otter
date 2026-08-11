@@ -986,7 +986,7 @@ pub(crate) fn compile_program_with_mode_impl_super(
 ///    cells at function entry so closures defined inside the body
 ///    can capture them via the regular upvalue mechanism.
 /// 4. Allocate one own-upvalue cell per import source and emit
-///    `Op::ImportNamespace cell_dst, specifier_const` followed by
+///    `Op::ImportNamespace cell_dst, target_url_const` followed by
 ///    a `StoreUpvalue` to populate it. Subsequent reads of an
 ///    imported alias resolve through this cell.
 /// 5. Compile the rest of the body via the existing
@@ -1081,8 +1081,8 @@ pub fn compile_module_program(
 
     // Pre-pass: collect import sources + record per-source upvalue
     // slots; collect exported names + import bindings.
-    let mut import_sources_in_order: Vec<String> = Vec::new();
-    let mut deferred_sources_in_order: Vec<String> = Vec::new();
+    let mut import_sources_in_order: Vec<ImportRequest> = Vec::new();
+    let mut deferred_sources_in_order: Vec<ImportRequest> = Vec::new();
     // §16.2.1.7 InitializeEnvironment — exported binding slots that
     // must exist on the module environment from instantiation so the
     // namespace reports them (`'x' in ns`) and an access before the
@@ -1101,7 +1101,13 @@ pub fn compile_module_program(
     for stmt in &program.body {
         match stmt {
             Statement::ImportDeclaration(decl) if !decl.import_kind.is_type() => {
-                let specifier = decl.source.value.as_str().to_string();
+                // The `type` attribute is half the request key: the same
+                // specifier read as two formats is two targets and two
+                // record cells, never one shared binding.
+                let request = ImportRequest::new(
+                    decl.source.value.as_str(),
+                    import_attribute_type(decl.with_clause.as_deref()),
+                );
                 // TC39 import defer — `import defer * as ns from "x"`
                 // defers evaluation until the namespace is accessed.
                 // The grammar permits the namespace form only; named,
@@ -1134,25 +1140,25 @@ pub fn compile_module_program(
                 // not pulled into the eager-evaluation set and stay
                 // distinct from any eager namespace of the same module.
                 let record_uv = if is_defer_phase {
-                    if let Some(&uv) = state.deferred_import_records.get(&specifier) {
+                    if let Some(&uv) = state.deferred_import_records.get(&request) {
                         uv
                     } else {
                         let uv = top.own_upvalue_count;
                         top.own_upvalue_count =
                             top.own_upvalue_count.checked_add(1).expect("uv overflow");
-                        state.deferred_import_records.insert(specifier.clone(), uv);
-                        deferred_sources_in_order.push(specifier.clone());
+                        state.deferred_import_records.insert(request.clone(), uv);
+                        deferred_sources_in_order.push(request.clone());
                         uv
                     }
                 } else {
-                    if !state.import_records.contains_key(&specifier) {
+                    if !state.import_records.contains_key(&request) {
                         let uv = top.own_upvalue_count;
                         top.own_upvalue_count =
                             top.own_upvalue_count.checked_add(1).expect("uv overflow");
-                        state.import_records.insert(specifier.clone(), uv);
-                        import_sources_in_order.push(specifier.clone());
+                        state.import_records.insert(request.clone(), uv);
+                        import_sources_in_order.push(request.clone());
                     }
-                    state.import_records[&specifier]
+                    state.import_records[&request]
                 };
                 if let Some(specifiers) = &decl.specifiers {
                     for spec in specifiers.iter() {
@@ -1176,7 +1182,7 @@ pub fn compile_module_program(
                                         record_uv_idx: record_uv,
                                         source_name,
                                         is_namespace: false,
-                                        specifier: specifier.clone(),
+                                        request: request.clone(),
                                         is_deferred: is_defer_phase,
                                     },
                                 );
@@ -1189,7 +1195,7 @@ pub fn compile_module_program(
                                         record_uv_idx: record_uv,
                                         source_name: "default".to_string(),
                                         is_namespace: false,
-                                        specifier: specifier.clone(),
+                                        request: request.clone(),
                                         is_deferred: is_defer_phase,
                                     },
                                 );
@@ -1204,7 +1210,7 @@ pub fn compile_module_program(
                                         record_uv_idx: record_uv,
                                         source_name: String::new(),
                                         is_namespace: true,
-                                        specifier: specifier.clone(),
+                                        request: request.clone(),
                                         is_deferred: is_defer_phase,
                                     },
                                 );
@@ -1259,13 +1265,13 @@ pub fn compile_module_program(
                 // module loader has the target module available.
                 // <https://tc39.es/ecma262/#sec-exports>
                 if let Some(source) = decl.source.as_ref() {
-                    let specifier = source.value.as_str().to_string();
-                    if !state.import_records.contains_key(&specifier) {
+                    let request = ImportRequest::plain(source.value.as_str());
+                    if !state.import_records.contains_key(&request) {
                         let uv = top.own_upvalue_count;
                         top.own_upvalue_count =
                             top.own_upvalue_count.checked_add(1).expect("uv overflow");
-                        state.import_records.insert(specifier.clone(), uv);
-                        import_sources_in_order.push(specifier);
+                        state.import_records.insert(request.clone(), uv);
+                        import_sources_in_order.push(request);
                     }
                 }
                 // A re-export whose source resolves to this very module
@@ -1277,7 +1283,7 @@ pub fn compile_module_program(
                     .source
                     .as_ref()
                     .map(|s| s.value.as_str())
-                    .and_then(|spec| host.resolved_imports.get(spec))
+                    .and_then(|spec| host.resolved_imports.get(&ImportRequest::plain(spec)))
                     .is_some_and(|target| *target == host.module_url);
                 let has_source = decl.source.is_some();
                 for spec in &decl.specifiers {
@@ -1315,13 +1321,13 @@ pub fn compile_module_program(
                 // §16.2.3 ExportFromClause — `export * from "./other"`
                 // / `export * as ns from "./other"`. Register the
                 // source so the body-compile arm can look it up.
-                let specifier = decl.source.value.as_str().to_string();
-                if !state.import_records.contains_key(&specifier) {
+                let request = ImportRequest::plain(decl.source.value.as_str());
+                if !state.import_records.contains_key(&request) {
                     let uv = top.own_upvalue_count;
                     top.own_upvalue_count =
                         top.own_upvalue_count.checked_add(1).expect("uv overflow");
-                    state.import_records.insert(specifier.clone(), uv);
-                    import_sources_in_order.push(specifier);
+                    state.import_records.insert(request.clone(), uv);
+                    import_sources_in_order.push(request);
                 }
                 if let Some(exported) = decl.exported.as_ref() {
                     let name = module_export_name_to_str(exported);
@@ -1433,13 +1439,17 @@ pub fn compile_module_program(
 
     // For each import source, emit Op::ImportNamespace then
     // StoreUpvalue to populate the per-source record cell.
-    for specifier in &import_sources_in_order {
-        let record_uv = cx.module_state.as_ref().unwrap().import_records[specifier];
+    for request in &import_sources_in_order {
+        let record_uv = cx.module_state.as_ref().unwrap().import_records[request];
         let scratch = cx.alloc_scratch();
-        let spec_const = cx.intern_string_constant(specifier);
+        let target = import_target_constant(&cx, request);
+        let target_const = cx.intern_string_constant(&target);
         cx.emit(
             Op::ImportNamespace,
-            [Operand::Register(scratch), Operand::ConstIndex(spec_const)],
+            [
+                Operand::Register(scratch),
+                Operand::ConstIndex(target_const),
+            ],
             span0,
         );
         cx.emit(
@@ -1452,13 +1462,17 @@ pub fn compile_module_program(
     // For each `import defer` source, emit Op::ImportNamespaceDeferred
     // (resolves a deferred namespace object without evaluating the
     // module) then StoreUpvalue into the deferred record cell.
-    for specifier in &deferred_sources_in_order {
-        let record_uv = cx.module_state.as_ref().unwrap().deferred_import_records[specifier];
+    for request in &deferred_sources_in_order {
+        let record_uv = cx.module_state.as_ref().unwrap().deferred_import_records[request];
         let scratch = cx.alloc_scratch();
-        let spec_const = cx.intern_string_constant(specifier);
+        let target = import_target_constant(&cx, request);
+        let target_const = cx.intern_string_constant(&target);
         cx.emit(
             Op::ImportNamespaceDeferred,
-            [Operand::Register(scratch), Operand::ConstIndex(spec_const)],
+            [
+                Operand::Register(scratch),
+                Operand::ConstIndex(target_const),
+            ],
             span0,
         );
         cx.emit(
@@ -1575,9 +1589,9 @@ pub fn compile_module_program(
     // so resolution edges can be flagged. A specifier imported both
     // eagerly and via `import defer` counts as eager for reachability
     // (the module evaluates eagerly regardless), so it is excluded.
-    let deferred_only_specs: HashSet<String> = {
+    let deferred_only_specs: HashSet<ImportRequest> = {
         let ms = cx.module_state.as_ref();
-        let eager: HashSet<&String> = ms
+        let eager: HashSet<&ImportRequest> = ms
             .map(|s| s.import_records.keys().collect())
             .unwrap_or_default();
         ms.map(|s| {
@@ -1609,11 +1623,12 @@ pub fn compile_module_program(
     let module_resolutions: Vec<otter_bytecode::ModuleResolution> = host
         .resolved_imports
         .iter()
-        .map(|(specifier, target)| otter_bytecode::ModuleResolution {
+        .map(|(request, target)| otter_bytecode::ModuleResolution {
             referrer: host.module_url.clone(),
-            specifier: specifier.clone(),
+            specifier: request.specifier.clone(),
+            attr_type: request.attr_type.clone(),
             target: target.clone(),
-            deferred: deferred_only_specs.contains(specifier),
+            deferred: deferred_only_specs.contains(request),
             dynamic: false,
             synthetic: false,
         })

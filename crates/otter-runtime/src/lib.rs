@@ -5093,6 +5093,7 @@ impl Runtime {
                     .push(otter_bytecode::ModuleResolution {
                         referrer: entry_url.clone(),
                         specifier: url.to_string(),
+                        attr_type: None,
                         target: url.to_string(),
                         deferred: false,
                         dynamic: false,
@@ -5103,6 +5104,7 @@ impl Runtime {
                     .push(otter_bytecode::ModuleResolution {
                         referrer: String::new(),
                         specifier: url.to_string(),
+                        attr_type: None,
                         target: url.to_string(),
                         deferred: false,
                         dynamic: false,

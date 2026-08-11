@@ -80,7 +80,7 @@ pub use entry::{
     compile_script_source_with_top_level_await,
 };
 pub use errors::CompileError;
-pub use module_state::ModuleHostInfo;
+pub use module_state::{ImportRequest, ModuleHostInfo};
 pub use ts_erasure::unwrap_ts_expr;
 
 pub(crate) use std::cell::RefCell;
@@ -103,7 +103,7 @@ pub(crate) use functions::*;
 pub(crate) use hoist::*;
 pub(crate) use module_state::{
     ImportBinding, ModuleBuilder, ModuleState, bytecode_source_kind, find_module_import_binding,
-    module_export_name_to_str, module_specifier_target,
+    import_attribute_type, import_target_constant, module_export_name_to_str,
 };
 pub(crate) use params::*;
 pub(crate) use scope::{BindingInfo, BindingStorage, LoopFrame, Scope};
@@ -141,7 +141,7 @@ mod tests {
             module_url: "file:///test/main.ts".to_string(),
             resolved_imports: specifiers
                 .iter()
-                .map(|(s, t)| (s.to_string(), t.to_string()))
+                .map(|(s, t)| (ImportRequest::plain(*s), t.to_string()))
                 .collect(),
         }
     }

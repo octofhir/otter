@@ -18,6 +18,35 @@
 
 use super::*;
 
+/// Activation-local stack slot for one loop-invariant method guard.
+pub(super) fn cached_method_guard_slot(
+    eligibility: &Eligibility,
+    base: u32,
+    site: (InlineId, u32),
+) -> Option<u32> {
+    let index = eligibility
+        .cached_method_guards
+        .keys()
+        .position(|entry| *entry == site)?;
+    u32::try_from(index)
+        .ok()
+        .and_then(|index| index.checked_mul(STACK_SLOT_BYTES))
+        .and_then(|offset| base.checked_add(offset))
+}
+
+/// Clear every raw receiver header before a fresh entry or a cold transition
+/// that can allocate, collect, or re-enter JavaScript.
+pub(super) fn emit_clear_cached_method_guards(ops: &mut Assembler, base: u32, count: usize) {
+    if count == 0 {
+        return;
+    }
+    dynasm!(ops ; .arch aarch64 ; mov x9, xzr);
+    for index in 0..count {
+        let offset = base + u32::try_from(index).expect("cache count was frame-checked") * 8;
+        emit_sp_str_x(ops, 9, offset);
+    }
+}
+
 /// Emit one normal edge. Loop-carried phi destinations are populated before
 /// the poll because the poll's deopt state is the target header's entry state.
 #[allow(clippy::too_many_arguments)]

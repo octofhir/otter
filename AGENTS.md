@@ -424,10 +424,15 @@ Pure Rust implementation - no external JavaScript engine dependencies.
   - Optimizing plain/method splices use ordinary `instruction` regions keyed by
     `inlineFrame`; the caller call opcode owns the identity guard and the
     callee frame owns its body operations. `deopt.json` records the complete
-    outermost-first caller/callee chain. A loop-invariant method guard keeps
-    its full identity check on the first iteration and uses a native-stack
-    receiver-body cache on later iterations; entry and OSR caches are distinct
-    activations and start empty.
+    outermost-first caller/callee chain. Loop-invariant method guards keep
+    their full identity checks on the first iteration and use independent
+    native-stack caches on later iterations. Invariant receivers reuse their
+    validated body header; varying exotic Map/string receivers revalidate the
+    current body while reusing pinned prototype identity. Any cold intrinsic
+    miss clears every site before generic reentry or collection. Entry and OSR
+    caches are distinct activations and start empty. Inner loops are never
+    selected in isolation; their sites require the complete enclosing
+    outermost loop to satisfy the cache contract.
   - Side-effect-free optimizing loops may version invariant property reads.
     Activation requires every site to produce an own-data Number IC hit in one
     complete iteration. Any miss, accessor/proxy path, or non-number keeps the

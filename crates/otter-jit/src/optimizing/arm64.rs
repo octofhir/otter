@@ -20,7 +20,8 @@
 //!   `Map.set(Int32, value)` completion without a Rust collection entry.
 //! - Guarded plain- and method-callee splicing with multi-frame exact-PC
 //!   deoptimization and synthetic `this` binding.
-//! - Loop-invariant method-identity caching and receiver-property guard fusion.
+//! - Multi-site activation-local method-identity caching, invariant receiver
+//!   reuse, and receiver-property guard fusion.
 //! - Loop-versioned own-data Number property loads, activated only after one
 //!   complete all-hit iteration and invalidated by every semantic miss.
 //! - Unboxed numeric residency through source-lowered coercion scaffolding.
@@ -100,11 +101,15 @@
 //!   probe the baked compact old-space table. Missing keys, numeric
 //!   representation aliases, and bounded-chain exhaustion enter the canonical
 //!   method transition before effects.
-//! - A spliced method guard may be cached only when the receiver is defined
-//!   outside one natural loop and every loop operation is non-mutating and
-//!   non-reentrant. Entry and OSR initialize the cache independently; the
-//!   first iteration proves identity and later iterations reuse only the
-//!   guarded receiver body.
+//! - Method guards may be cached only in an outermost natural loop whose operations are
+//!   generated, non-allocating, and non-reentrant on their hit paths. Entry
+//!   and OSR initialize every site independently. An invariant receiver reuses
+//!   its validated body header; varying exotic Map/string receivers revalidate
+//!   the current body while reusing their pinned prototype method identity.
+//!   Any cold intrinsic miss clears the complete activation-local cache before
+//!   the canonical transition can allocate, collect, or re-enter JavaScript.
+//!   An inner loop is never selected in isolation; its sites are cached only
+//!   when the complete enclosing outermost loop satisfies the same contract.
 //!   Poll slow paths still bail so the interpreter owns interrupt/budget handling.
 //!
 //! # See also
@@ -183,7 +188,8 @@ use crate::{
     },
     template::arm64::ic_probe::{
         DenseIndexForm, element_access_for, emit_element_address, emit_element_read,
-        emit_element_write, emit_guarded_method_call, emit_guarded_method_guard,
+        emit_element_write, emit_guarded_exotic_method_receiver_preserving_receiver,
+        emit_guarded_method_call, emit_guarded_method_guard,
         emit_guarded_method_guard_preserving_receiver, emit_native_leaf_call,
         emit_native_leaf_guard, guarded_method_call_is_supported, native_leaf_call_is_supported,
         native_leaf_call_name,
@@ -233,6 +239,15 @@ struct GuardedUse {
     use_pc: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CachedMethodGuardKind {
+    /// The receiver is loop-invariant, so its validated body header is reused.
+    ReceiverHeader,
+    /// Exotic receivers may vary, but their pinned prototype method identity
+    /// is activation-invariant. Each iteration still validates its own body.
+    ExoticMethodIdentity,
+}
+
 #[derive(Debug)]
 struct Eligibility {
     guarded_uses: Vec<GuardedUse>,
@@ -250,10 +265,11 @@ struct Eligibility {
     /// reached, the interpreter runs it, records feedback, bumps the epoch,
     /// and the next compile sees real types.
     insufficient_feedback: BTreeSet<(InlineId, u32)>,
-    /// Sole monomorphic method guard proven loop-invariant for this unit. Its
-    /// receiver body is cached after the first exact identity check in each
-    /// native entry/OSR activation.
-    cached_method_guard: Option<(InlineId, u32)>,
+    /// Monomorphic method guards proven loop-invariant for this unit. Each
+    /// receiver body is cached after the first exact identity check in a
+    /// native entry/OSR activation. Any cold path that can re-enter or collect
+    /// clears the whole activation-local set first.
+    cached_method_guards: BTreeMap<(InlineId, u32), CachedMethodGuardKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1078,7 +1094,18 @@ fn emit(
     } else {
         allocated_spill_bytes
     };
-    let inline_window_base = after_fused_slots
+    let cached_method_guard_base = after_fused_slots;
+    let cached_method_guard_bytes = u32::try_from(eligibility.cached_method_guards.len())
+        .ok()
+        .and_then(|count| count.checked_mul(STACK_SLOT_BYTES))
+        .ok_or(Unsupported::OperandShape(
+            "optimizing method guard cache frame overflow",
+        ))?;
+    let inline_window_base = cached_method_guard_base
+        .checked_add(cached_method_guard_bytes)
+        .ok_or(Unsupported::OperandShape(
+            "optimizing method guard cache frame overflow",
+        ))?
         .checked_add(15)
         .map(|bytes| bytes & !15)
         .ok_or(Unsupported::OperandShape("optimizing spill frame overflow"))?;
@@ -1192,11 +1219,11 @@ fn emit(
         .collect();
     let entry = ops.offset();
     emit_prologue(&mut ops, saved_frame);
-    if eligibility.cached_method_guard.is_some() {
-        dynasm!(ops ; .arch aarch64 ; mov x9, xzr);
-        let receiver_slot = fused_method_receiver_slot.expect("cached guard reserves a slot");
-        emit_sp_str_x(&mut ops, 9, receiver_slot);
-    }
+    emit_clear_cached_method_guards(
+        &mut ops,
+        cached_method_guard_base,
+        eligibility.cached_method_guards.len(),
+    );
     if !eligibility.back_edges.is_empty() {
         dynasm!(ops ; .arch aarch64 ; movz w29, OPTIMIZED_POLL_BATCH);
     }
@@ -2737,14 +2764,17 @@ fn emit(
                             ssa,
                             cfg.blocks[callee_entry.0 as usize].inline,
                         );
-                        let cached = eligibility.cached_method_guard
-                            == Some((instruction.inline, instruction.pc));
-                        let already_guarded = cached.then(|| ops.new_dynamic_label());
+                        let cached_slot = cached_method_guard_slot(
+                            eligibility,
+                            cached_method_guard_base,
+                            (instruction.inline, instruction.pc),
+                        );
+                        let already_guarded = cached_slot.map(|_| ops.new_dynamic_label());
                         if let Some(already_guarded) = already_guarded {
                             emit_sp_ldr_x(
                                 &mut ops,
                                 17,
-                                fused_method_receiver_slot.expect("cached guard reserves a slot"),
+                                cached_slot.expect("cached guard reserves a slot"),
                             );
                             dynasm!(ops ; .arch aarch64 ; cbnz x17, =>already_guarded);
                         }
@@ -2763,15 +2793,18 @@ fn emit(
                             fused_receiver.then_some(17),
                             deopt,
                         )?;
+                        if fused_receiver && let Some(cached_slot) = cached_slot {
+                            emit_sp_str_x(&mut ops, 17, cached_slot);
+                        }
+                        if let Some(already_guarded) = already_guarded {
+                            dynasm!(ops ; .arch aarch64 ; =>already_guarded);
+                        }
                         if fused_receiver {
                             emit_sp_str_x(
                                 &mut ops,
                                 17,
                                 fused_method_receiver_slot.expect("fused site reserves a slot"),
                             );
-                        }
-                        if let Some(already_guarded) = already_guarded {
-                            dynasm!(ops ; .arch aarch64 ; =>already_guarded);
                         }
 
                         if instruction.inline == InlineId::ROOT {
@@ -2846,21 +2879,121 @@ fn emit(
                             // did not settle on is a slower call, not a wrong
                             // speculation to deoptimize over.
                             let leaf_miss = ops.new_dynamic_label();
-                            if guarded_map_intrinsic_is_supported(
+                            let cached_slot = cached_method_guard_slot(
+                                eligibility,
+                                cached_method_guard_base,
+                                (instruction.inline, instruction.pc),
+                            );
+                            let cached_kind = eligibility
+                                .cached_method_guards
+                                .get(&(instruction.inline, instruction.pc))
+                                .copied();
+                            let map_intrinsic = guarded_map_intrinsic_is_supported(
                                 call.entry_stub_id,
                                 reprs,
                                 instruction,
                                 view,
-                            ) {
-                                emit_guarded_method_guard_preserving_receiver(
-                                    &mut ops,
-                                    &mut relocations,
-                                    view,
-                                    call,
-                                    receiver,
-                                    byte_pc,
-                                    leaf_miss,
-                                )?;
+                            );
+                            let string_intrinsic = guarded_string_intrinsic_is_supported(
+                                call.entry_stub_id,
+                                reprs,
+                                instruction,
+                            );
+                            let math_intrinsic = guarded_int32_math_intrinsic_is_supported(
+                                call.entry_stub_id,
+                                reprs,
+                                instruction,
+                            );
+                            if map_intrinsic || string_intrinsic || math_intrinsic {
+                                let guard_start = ops.offset().0;
+                                match (cached_slot, cached_kind) {
+                                    (Some(slot), Some(CachedMethodGuardKind::ReceiverHeader)) => {
+                                        let already_guarded = ops.new_dynamic_label();
+                                        emit_sp_ldr_x(&mut ops, 13, slot);
+                                        dynasm!(ops ; .arch aarch64 ; cbnz x13, =>already_guarded);
+                                        emit_guarded_method_guard_preserving_receiver(
+                                            &mut ops,
+                                            &mut relocations,
+                                            view,
+                                            call,
+                                            receiver,
+                                            byte_pc,
+                                            leaf_miss,
+                                        )?;
+                                        emit_sp_str_x(&mut ops, 13, slot);
+                                        dynasm!(ops ; .arch aarch64 ; =>already_guarded);
+                                    }
+                                    (
+                                        Some(slot),
+                                        Some(CachedMethodGuardKind::ExoticMethodIdentity),
+                                    ) => {
+                                        let identity_cached = ops.new_dynamic_label();
+                                        let ready = ops.new_dynamic_label();
+                                        emit_sp_ldr_x(&mut ops, 9, slot);
+                                        dynasm!(ops ; .arch aarch64 ; cbnz x9, =>identity_cached);
+                                        emit_guarded_method_guard_preserving_receiver(
+                                            &mut ops,
+                                            &mut relocations,
+                                            view,
+                                            call,
+                                            receiver,
+                                            byte_pc,
+                                            leaf_miss,
+                                        )?;
+                                        dynasm!(ops ; .arch aarch64 ; movz x9, #1);
+                                        emit_sp_str_x(&mut ops, 9, slot);
+                                        dynasm!(ops ; .arch aarch64 ; b =>ready ; =>identity_cached);
+                                        emit_guarded_exotic_method_receiver_preserving_receiver(
+                                            &mut ops,
+                                            &mut relocations,
+                                            view,
+                                            call,
+                                            receiver,
+                                            leaf_miss,
+                                        )?;
+                                        dynasm!(ops ; .arch aarch64 ; =>ready);
+                                    }
+                                    (None, None) => {
+                                        if math_intrinsic {
+                                            emit_guarded_method_guard(
+                                                &mut ops,
+                                                &mut relocations,
+                                                view,
+                                                call,
+                                                receiver,
+                                                byte_pc,
+                                                leaf_miss,
+                                            )?;
+                                        } else {
+                                            emit_guarded_method_guard_preserving_receiver(
+                                                &mut ops,
+                                                &mut relocations,
+                                                view,
+                                                call,
+                                                receiver,
+                                                byte_pc,
+                                                leaf_miss,
+                                            )?;
+                                        }
+                                    }
+                                    _ => {
+                                        return Err(Unsupported::OperandShape(
+                                            "optimizing cached method guard layout",
+                                        ));
+                                    }
+                                }
+                                if cached_slot.is_some()
+                                    && let Some(code_map) = code_map.as_mut()
+                                {
+                                    code_map.record(CodeRegion::structural_at_byte_pc(
+                                        "loopInvariantMethodGuardCache",
+                                        guard_start,
+                                        ops.offset().0,
+                                        byte_pc,
+                                    ));
+                                }
+                            }
+                            if map_intrinsic {
                                 emit_guarded_map_intrinsic_body(
                                     &mut ops,
                                     &mut relocations,
@@ -2871,20 +3004,7 @@ fn emit(
                                     instruction,
                                     leaf_miss,
                                 )?;
-                            } else if guarded_string_intrinsic_is_supported(
-                                call.entry_stub_id,
-                                reprs,
-                                instruction,
-                            ) {
-                                emit_guarded_method_guard_preserving_receiver(
-                                    &mut ops,
-                                    &mut relocations,
-                                    view,
-                                    call,
-                                    receiver,
-                                    byte_pc,
-                                    leaf_miss,
-                                )?;
+                            } else if string_intrinsic {
                                 emit_guarded_string_intrinsic_body(
                                     &mut ops,
                                     &mut relocations,
@@ -2895,20 +3015,7 @@ fn emit(
                                     instruction,
                                     leaf_miss,
                                 )?;
-                            } else if guarded_int32_math_intrinsic_is_supported(
-                                call.entry_stub_id,
-                                reprs,
-                                instruction,
-                            ) {
-                                emit_guarded_method_guard(
-                                    &mut ops,
-                                    &mut relocations,
-                                    view,
-                                    call,
-                                    receiver,
-                                    byte_pc,
-                                    leaf_miss,
-                                )?;
+                            } else if math_intrinsic {
                                 emit_guarded_int32_math_intrinsic_body(
                                     &mut ops,
                                     call.entry_stub_id,
@@ -2943,6 +3050,13 @@ fn emit(
                                 ; b =>succeeded
                                 ; =>leaf_miss
                             );
+                            if cached_slot.is_some() {
+                                emit_clear_cached_method_guards(
+                                    &mut ops,
+                                    cached_method_guard_base,
+                                    eligibility.cached_method_guards.len(),
+                                );
+                            }
                         }
                         let packed_meta = u64::from(dst)
                             | (u64::from(receiver) << 16)
@@ -4391,11 +4505,11 @@ fn emit(
         let offset = ops.offset().0;
         let representation_bail = ops.new_dynamic_label();
         emit_prologue(&mut ops, saved_frame);
-        if eligibility.cached_method_guard.is_some() {
-            dynasm!(ops ; .arch aarch64 ; mov x9, xzr);
-            let receiver_slot = fused_method_receiver_slot.expect("cached guard reserves a slot");
-            emit_sp_str_x(&mut ops, 9, receiver_slot);
-        }
+        emit_clear_cached_method_guards(
+            &mut ops,
+            cached_method_guard_base,
+            eligibility.cached_method_guards.len(),
+        );
         if !eligibility.back_edges.is_empty() {
             dynasm!(ops ; .arch aarch64 ; movz w29, OPTIMIZED_POLL_BATCH);
         }

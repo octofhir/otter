@@ -2573,6 +2573,33 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         result.map_err(|error| self.vm_error(error, "NativeScope::object_layout"))
     }
 
+    /// Intern one property name in this isolate's host atom table.
+    ///
+    /// Cloning and comparing the returned handle is allocation-free. Repeated
+    /// calls with the same spelling return the same identity for the lifetime
+    /// of the isolate.
+    #[must_use]
+    pub fn atom(&self, name: &str) -> crate::HostAtom {
+        self.ctx.cx.interp.host_atom(name)
+    }
+
+    /// Return the hidden class cached for `tag + ordered keys`.
+    ///
+    /// The tag partitions record kinds even when their key sequence happens to
+    /// match. A cache hit performs atom-id comparisons only and returns the
+    /// final shape without replaying its transition chain.
+    ///
+    /// # Errors
+    /// Propagates an allocation failure while building a new signature's shape.
+    pub fn object_layout_for_atoms(
+        &mut self,
+        tag: &crate::HostAtom,
+        keys: &[&crate::HostAtom],
+    ) -> Result<crate::ObjectLayout, NativeError> {
+        let result = self.ctx.cx.interp.object_layout_for_atoms(tag, keys);
+        result.map_err(|error| self.vm_error(error, "NativeScope::object_layout_for_atoms"))
+    }
+
     /// Build an object that already has `layout`'s properties, every one of
     /// them `undefined`, to be filled by index with [`Self::set_slot`].
     ///
@@ -2668,7 +2695,12 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         atom: &crate::HostAtom,
         value: Local<'_>,
     ) -> Result<(), NativeError> {
-        self.set(object, atom.as_str(), value)
+        let result = self
+            .ctx
+            .cx
+            .interp
+            .scoped_set_atom(self.token, object, atom, value);
+        result.map_err(|error| self.vm_error(error, "NativeScope::set_atom"))
     }
 
     /// Store a symbol-keyed property on a rooted ordinary object or Array

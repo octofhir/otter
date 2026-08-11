@@ -30,10 +30,11 @@
 use std::borrow::Cow;
 
 use otter_runtime::{
-    OtterError, RuntimeExtensionContext, RuntimeExtensionInstaller, RuntimeLocal as Local,
-    RuntimeNativeCall, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeNativeScope as NativeScope, RuntimePendingValue as PendingValue,
-    RuntimePendingValues as PendingValues, RuntimeValue as Value, SourceInput,
+    OtterError, RuntimeExtensionContext, RuntimeExtensionInstaller, RuntimeHostAtom as HostAtom,
+    RuntimeLocal as Local, RuntimeNativeCall, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeNativeScope as NativeScope,
+    RuntimePendingValue as PendingValue, RuntimePendingValues as PendingValues,
+    RuntimeValue as Value, SourceInput,
 };
 use otter_xml::encoding::{Charset, Encoding, Latin1, Utf8, Utf16};
 use otter_xml::sink::{Piece, Sink};
@@ -141,7 +142,7 @@ fn build<'s, E: Encoding>(
         Shape::Compact => scope.value(Value::undefined()),
     };
     scope.with_pending_values(|scope, pending| {
-        let (outcome, failure, root_name, compact_root) = {
+        let (outcome, failure, root_atom, compact_root) = {
             let mut builder = Builder::<E> {
                 vm: Vm {
                     scope,
@@ -153,7 +154,7 @@ fn build<'s, E: Encoding>(
                 depth: 0,
                 frames: Vec::new(),
                 key: String::new(),
-                root_name: String::new(),
+                root_atom: None,
                 compact_root: None,
                 encoding: std::marker::PhantomData,
             };
@@ -161,7 +162,7 @@ fn build<'s, E: Encoding>(
             (
                 outcome,
                 builder.vm.failure.take(),
-                builder.root_name,
+                builder.root_atom,
                 builder.compact_root,
             )
         };
@@ -172,10 +173,11 @@ fn build<'s, E: Encoding>(
         match shape {
             Shape::Node => scope.index(stack, 0),
             Shape::Compact => {
+                let root_atom = root_atom.expect("root element opened");
                 let root = scope
                     .local_pending_value(pending, compact_root.expect("root element closed"))
                     .expect("live compact root");
-                let layout = scope.object_layout(&[&root_name])?;
+                let layout = scope.object_layout_for_atoms(&root_atom, &[&root_atom])?;
                 let wrapper = scope.object_with_layout(layout, &[root])?;
                 let _ = scope
                     .release_pending_value(pending, compact_root.expect("root element closed"));
@@ -197,6 +199,11 @@ struct Vm<'a, 's, 'rt> {
 }
 
 impl Vm<'_, '_, '_> {
+    /// Intern one parser name in the owning isolate's host atom table.
+    fn atom(&self, name: &str) -> HostAtom {
+        self.scope.atom(name)
+    }
+
     /// Run `body` in a nested handle scope, keeping the first failure.
     ///
     /// The nested scope bounds transient handles. Node values remain reachable
@@ -230,7 +237,7 @@ impl Vm<'_, '_, '_> {
 
 #[derive(Debug)]
 struct PendingProperty {
-    key: String,
+    key: HostAtom,
     value: PendingValue,
     repeated_len: Option<usize>,
 }
@@ -240,6 +247,8 @@ struct PendingProperty {
 struct Frame {
     /// The element's name, needed by its parent when it closes.
     name: String,
+    /// Stable atom for `name`, used by compact child signatures.
+    atom: Option<HostAtom>,
     /// Character data seen so far, joined across runs.
     text: String,
     /// Compact-form properties accumulated before one-shot materialization.
@@ -255,8 +264,8 @@ struct Builder<'a, 's, 'rt, E: Encoding> {
     frames: Vec<Frame>,
     /// Reused buffer for the `@name` key of an attribute.
     key: String,
-    /// The root element's name, which the compact form keys its result by.
-    root_name: String,
+    /// The root element's atom, which the compact form keys its result by.
+    root_atom: Option<HostAtom>,
     /// Compact root retained until the one-property document wrapper is built.
     compact_root: Option<PendingValue>,
     encoding: std::marker::PhantomData<E>,
@@ -275,7 +284,7 @@ fn trimmed(text: &str) -> &str {
 }
 
 impl<E: Encoding> Builder<'_, '_, '_, E> {
-    fn append_compact_child(&mut self, parent_depth: usize, key: String, child: PendingValue) {
+    fn append_compact_child(&mut self, parent_depth: usize, key: HostAtom, child: PendingValue) {
         let existing = self.frames[parent_depth]
             .properties
             .iter()
@@ -331,7 +340,7 @@ impl<E: Encoding> Builder<'_, '_, '_, E> {
 
     fn end_compact_element(&mut self, depth: usize) {
         let frame = &mut self.frames[depth];
-        let element_name = frame.name.clone();
+        let element_atom = frame.atom.clone().expect("open element atom");
         let content = trimmed(&frame.text);
         let mut properties = std::mem::take(&mut frame.properties);
         let value = self.vm.step(|scope, _stack, pending| {
@@ -342,15 +351,13 @@ impl<E: Encoding> Builder<'_, '_, '_, E> {
                     let text = scope.string(content)?;
                     let text = scope.pending_value(pending, text);
                     properties.push(PendingProperty {
-                        key: "#text".to_owned(),
+                        key: scope.atom("#text"),
                         value: text,
                         repeated_len: None,
                     });
                 }
-                let keys: Vec<&str> = properties
-                    .iter()
-                    .map(|property| property.key.as_str())
-                    .collect();
+                let keys: Vec<&HostAtom> =
+                    properties.iter().map(|property| &property.key).collect();
                 let values: Vec<Local<'_>> = properties
                     .iter()
                     .map(|property| {
@@ -359,7 +366,7 @@ impl<E: Encoding> Builder<'_, '_, '_, E> {
                             .expect("live compact property")
                     })
                     .collect();
-                let layout = scope.object_layout(&keys)?;
+                let layout = scope.object_layout_for_atoms(&element_atom, &keys)?;
                 let object = scope.object_with_layout(layout, &values)?;
                 for property in &properties {
                     let _ = scope.release_pending_value(pending, property.value);
@@ -374,7 +381,7 @@ impl<E: Encoding> Builder<'_, '_, '_, E> {
         if depth == 0 {
             self.compact_root = Some(value);
         } else {
-            self.append_compact_child(depth - 1, element_name, value);
+            self.append_compact_child(depth - 1, element_atom, value);
         }
     }
 }
@@ -392,9 +399,10 @@ impl<E: Encoding> Sink<E::Unit> for Builder<'_, '_, '_, E> {
         frame.children = 0;
         frame.name.clear();
         frame.name.push_str(&name);
+        let atom = self.vm.atom(&name);
+        frame.atom = Some(atom.clone());
         if depth == 0 {
-            self.root_name.clear();
-            self.root_name.push_str(&name);
+            self.root_atom = Some(atom);
         }
 
         if self.shape == Shape::Node {
@@ -421,13 +429,14 @@ impl<E: Encoding> Sink<E::Unit> for Builder<'_, '_, '_, E> {
             self.key.clear();
             self.key.push('@');
             self.key.push_str(&name);
+            let key = self.vm.atom(&self.key);
             let pending = self.vm.step(|scope, _stack, pending| {
                 let text = scope.string(&value)?;
                 Ok(scope.pending_value(pending, text))
             });
             if let Some(value) = pending {
                 self.frames[depth].properties.push(PendingProperty {
-                    key: self.key.clone(),
+                    key,
                     value,
                     repeated_len: None,
                 });

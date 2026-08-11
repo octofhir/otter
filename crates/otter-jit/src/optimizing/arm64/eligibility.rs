@@ -108,8 +108,11 @@ pub(super) fn fused_method_property_for_frame(
 pub(super) fn guard_cache_safe_instruction(
     tree: &InlineTree,
     cfg: &ControlFlowGraph,
+    ssa: &SsaFunction,
     block: BlockId,
     instruction: &SsaInstr,
+    generated_intrinsics: &BTreeMap<(InlineId, u32), (ValueId, bool)>,
+    loop_blocks: &BTreeSet<BlockId>,
 ) -> bool {
     let Some(op) = instruction.op.bytecode() else {
         // A primitive guard or field read touches no cache cell.
@@ -156,7 +159,24 @@ pub(super) fn guard_cache_safe_instruction(
         | Op::JumpIfTrue
         | Op::JumpIfFalse => true,
         Op::LoadProperty => inline_method_property(tree, instruction).is_some(),
-        Op::CallMethodValue => is_spliced_call(cfg, block, instruction),
+        Op::CallMethodValue => {
+            if is_spliced_call(cfg, block, instruction) {
+                return true;
+            }
+            let Some((receiver, allows_varying_receiver)) =
+                generated_intrinsics.get(&(instruction.inline, instruction.pc))
+            else {
+                return false;
+            };
+            // A generated intrinsic can fall through to the canonical method
+            // transition. Every such site in a cached loop therefore needs its
+            // own slot. Ordinary receivers must be invariant; exotic bodies
+            // may vary because each iteration revalidates the current body and
+            // reuses only pinned prototype identity.
+            ssa.values.get(receiver.0 as usize).is_some_and(|value| {
+                *allows_varying_receiver || !loop_blocks.contains(&value.def_block)
+            })
+        }
         Op::Return | Op::ReturnValue | Op::ReturnUndefined => matches!(
             cfg.blocks[block.0 as usize].terminator,
             Terminator::InlineReturn { .. }
@@ -165,15 +185,59 @@ pub(super) fn guard_cache_safe_instruction(
     }
 }
 
-pub(super) fn cached_method_guard_site(
+fn generated_method_intrinsic_receiver(
+    tree: &InlineTree,
+    ssa: &SsaFunction,
+    reprs: &ReprMap,
+    instruction: &SsaInstr,
+) -> Option<(ValueId, bool)> {
+    if instruction.inline != InlineId::ROOT
+        || instruction.op != SsaOp::Bytecode(Op::CallMethodValue)
+    {
+        return None;
+    }
+    let frame = tree.frames.first()?;
+    let byte_pc = frame.instructions().get(instruction.pc as usize)?.byte_pc;
+    let call = frame.body.guarded_method_calls.get(&byte_pc)?;
+    if instruction.inputs.len().saturating_sub(1) != usize::from(call.argument_count)
+        || !guarded_method_call_is_supported(&frame.body, call)
+        || !(guarded_map_intrinsic_is_supported(
+            call.entry_stub_id,
+            reprs,
+            instruction,
+            &frame.body,
+        ) || guarded_string_intrinsic_is_supported(call.entry_stub_id, reprs, instruction)
+            || guarded_int32_math_intrinsic_is_supported(call.entry_stub_id, reprs, instruction))
+    {
+        return None;
+    }
+    let receiver = ssa.copy_origin(*instruction.inputs.first()?)?;
+    let allows_varying_receiver = matches!(
+        call.receiver,
+        otter_vm::jit::JitGuardedReceiver::Exotic { .. }
+    );
+    Some((receiver, allows_varying_receiver))
+}
+
+pub(super) fn cached_method_guard_sites(
     tree: &InlineTree,
     cfg: &ControlFlowGraph,
     ssa: &SsaFunction,
+    reprs: &ReprMap,
     back_edges: &BTreeMap<(BlockId, BlockId), (DeoptExitId, u32)>,
-) -> Option<(InlineId, u32)> {
-    let mut candidates = Vec::new();
+) -> BTreeMap<(InlineId, u32), CachedMethodGuardKind> {
+    let mut candidates = BTreeMap::new();
+    let mut generated_intrinsics = BTreeMap::new();
     for block in &cfg.blocks {
         for instruction in &ssa.blocks[block.id.0 as usize].instrs {
+            if let Some((receiver, allows_varying_receiver)) =
+                generated_method_intrinsic_receiver(tree, ssa, reprs, instruction)
+            {
+                let site = (instruction.inline, instruction.pc);
+                candidates.insert(site, (block.id, receiver, allows_varying_receiver));
+                generated_intrinsics.insert(site, (receiver, allows_varying_receiver));
+                continue;
+            }
             if instruction.op != SsaOp::Bytecode(Op::CallMethodValue)
                 || !is_spliced_call(cfg, block.id, instruction)
             {
@@ -189,30 +253,89 @@ pub(super) fn cached_method_guard_site(
             ) {
                 continue;
             }
-            candidates.push((block.id, instruction));
+            let Some(receiver) = instruction
+                .inputs
+                .first()
+                .and_then(|receiver| ssa.copy_origin(*receiver))
+            else {
+                continue;
+            };
+            candidates.insert(
+                (instruction.inline, instruction.pc),
+                (block.id, receiver, false),
+            );
         }
     }
-    let [(call_block, call)] = candidates.as_slice() else {
-        return None;
-    };
-    let receiver = ssa.copy_origin(*call.inputs.first()?)?;
-    for &(latch, header) in back_edges.keys() {
-        let loop_blocks = natural_loop_blocks(cfg, latch, header);
-        if !loop_blocks.contains(call_block)
-            || loop_blocks.contains(&ssa.values.get(receiver.0 as usize)?.def_block)
-        {
-            continue;
-        }
-        if loop_blocks.iter().all(|block| {
-            ssa.blocks[block.0 as usize]
-                .instrs
+    let mut cached = BTreeMap::<(InlineId, u32), CachedMethodGuardKind>::new();
+    let natural_loops = back_edges
+        .keys()
+        .map(|&(latch, header)| natural_loop_blocks(cfg, latch, header))
+        .collect::<Vec<_>>();
+    for (&site, &(call_block, receiver, allows_varying_receiver)) in &candidates {
+        for loop_blocks in &natural_loops {
+            // Cache slots are initialized per activation, not per loop entry.
+            // An inner loop can be entered again after its outer loop changes a
+            // receiver or re-enters JavaScript, so never prove it in isolation.
+            // Its site may still be cached when the complete enclosing
+            // outermost loop satisfies this activation-lifetime contract.
+            if natural_loops
                 .iter()
-                .all(|instruction| guard_cache_safe_instruction(tree, cfg, *block, instruction))
-        }) {
-            return Some((call.inline, call.pc));
+                .any(|outer| loop_blocks.len() < outer.len() && loop_blocks.is_subset(outer))
+            {
+                continue;
+            }
+            let receiver_def = ssa
+                .values
+                .get(receiver.0 as usize)
+                .map(|value| value.def_block);
+            if !loop_blocks.contains(&call_block) || receiver_def.is_none() {
+                continue;
+            }
+            let receiver_is_invariant =
+                receiver_def.is_some_and(|block| !loop_blocks.contains(&block));
+            if !receiver_is_invariant && !allows_varying_receiver {
+                continue;
+            }
+            if loop_blocks.iter().all(|block| {
+                ssa.blocks[block.0 as usize]
+                    .instrs
+                    .iter()
+                    .all(|instruction| {
+                        let native_receiver =
+                            generated_intrinsics.get(&(instruction.inline, instruction.pc));
+                        let native_receiver_is_cacheable =
+                            native_receiver.is_none_or(|(receiver, allows_varying_receiver)| {
+                                *allows_varying_receiver
+                                    || ssa.values.get(receiver.0 as usize).is_some_and(|value| {
+                                        !loop_blocks.contains(&value.def_block)
+                                    })
+                            });
+                        native_receiver_is_cacheable
+                            && guard_cache_safe_instruction(
+                                tree,
+                                cfg,
+                                ssa,
+                                *block,
+                                instruction,
+                                &generated_intrinsics,
+                                loop_blocks,
+                            )
+                    })
+            }) {
+                let kind = if receiver_is_invariant {
+                    CachedMethodGuardKind::ReceiverHeader
+                } else {
+                    CachedMethodGuardKind::ExoticMethodIdentity
+                };
+                cached
+                    .entry(site)
+                    .and_modify(|existing| *existing = (*existing).min(kind))
+                    .or_insert(kind);
+                break;
+            }
         }
     }
-    None
+    cached
 }
 
 /// Canonical instruction index of `byte_pc` within `function_id`'s body.
@@ -1239,14 +1362,14 @@ pub(super) fn check_eligibility(
         element_transition_instructions,
     )?;
     let osr_entries = build_osr_entry_sites(cfg, ssa, liveness, frame_states, hoisted_loops)?;
-    let cached_method_guard = cached_method_guard_site(tree, cfg, ssa, &back_edges);
+    let cached_method_guards = cached_method_guard_sites(tree, cfg, ssa, reprs, &back_edges);
     Ok(Eligibility {
         guarded_uses: guarded_numeric_uses,
         back_edges,
         osr_entries,
         element_transitions,
         insufficient_feedback,
-        cached_method_guard,
+        cached_method_guards,
     })
 }
 

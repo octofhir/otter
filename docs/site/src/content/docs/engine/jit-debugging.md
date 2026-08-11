@@ -260,6 +260,24 @@ its `code-map.json` owns one `machineScalarFunction` structural region. Function
 not yet switched retain the legacy optimized-unit banner. Both are payloads of
 the one current artifact bundle, not separate artifact formats.
 
+### Optimizing loop method-guard caches
+
+An optimizing bundle may contain one `loopInvariantMethodGuardCache` region
+per cached method site. The region names the original `bytePc` and spans the
+activation-local cache probe plus the first exact identity proof. A function
+may publish several such regions for one outermost natural loop. Inner loops
+are never selected in isolation because an enclosing iteration could change a
+receiver before re-entry; their sites appear only when the complete enclosing
+outermost loop satisfies the cache contract.
+
+Invariant receivers cache their validated body header. Varying exotic Map or
+string receivers cache only the pinned prototype method identity and still
+validate the current body on every iteration. Normal entry and every OSR
+trampoline initialize independent empty caches. Generated intrinsic misses
+clear all sites before the generic path can allocate, collect, or re-enter
+JavaScript, so the presence of this region never means a cold transition may
+retain a raw receiver pointer.
+
 ### Template leaf-inline regions
 
 A template-tier `Call` or `MethodCall` may contain nested regions that expose

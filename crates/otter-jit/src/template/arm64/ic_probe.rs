@@ -1178,6 +1178,36 @@ pub(crate) fn emit_guarded_method_guard_preserving_receiver(
     emit_guarded_method_guard_impl(ops, relocations, view, call, receiver, byte_pc, miss, true)
 }
 
+/// Revalidate only the current exotic receiver after this activation has
+/// already proved the pinned prototype's exact builtin identity.
+///
+/// This is narrower than a complete method guard: changing exotic bodies may
+/// share one immutable realm prototype, but each body must still carry the
+/// expected type and have no own expando/descriptor override. On success the
+/// current receiver header is left in `x13` for generated intrinsic code.
+pub(crate) fn emit_guarded_exotic_method_receiver_preserving_receiver(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    call: &JitGuardedMethodCall,
+    receiver: u16,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let JitGuardedReceiver::Exotic {
+        type_tag, guard, ..
+    } = call.receiver
+    else {
+        return Err(Unsupported::OperandShape(
+            "cached method identity requires exotic receiver",
+        ));
+    };
+    emit_receiver_type_guard(ops, relocations, view, receiver, u32::from(type_tag), miss)?;
+    if let Some(guard) = guard {
+        emit_body_guard(ops, guard, miss);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_guarded_method_guard_impl(
     ops: &mut Assembler,

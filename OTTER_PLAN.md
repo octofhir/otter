@@ -131,6 +131,17 @@ It already owns:
   by 64.54% for isolated `Map.get`, 65.74% for `Map.set`, 58.60% for their
   combined slice, and 39.13% for the full `native-boundary` workload with
   exact matching checksums and unchanged optimizing entry/deopt topology;
+- optimizing outermost natural loops may cache multiple guarded Map, string, Math, and
+  spliced-method sites in one activation. Invariant receivers reuse their
+  validated body headers; varying exotic receivers revalidate the current body
+  while sharing the pinned prototype identity proof. Every entry and OSR path
+  starts empty, and any generated intrinsic miss clears all sites before the
+  canonical allocating/reentrant transition. A coercive replacement fixture
+  proves that a mid-loop `Map.prototype.get` mutation is observed after GC
+  pressure. Alternating 10-warmup/25-sample process medians for a five-site
+  Map/string/Math kernel fell by 13.08%, with exact matching checksum,
+  7,073,851 reductions, 35 optimized entries, 1,708 runtime-stub transitions,
+  and zero deopts; emitted native code grew by 348 bytes;
 - catch-only exception-region CFGs with explicit landing-pad successors; the
   shared linkage fully unwinds publication, commits the thrown value to its
   allocator home, and transfers at the exact call PC without replay;

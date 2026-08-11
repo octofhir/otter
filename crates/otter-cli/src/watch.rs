@@ -138,6 +138,7 @@ fn is_watched_path(root: &Path, path: &Path) -> bool {
                 | "yaml"
                 | "yml"
                 | "toml"
+                | "xml"
                 | "txt"
         )
     })
@@ -152,6 +153,7 @@ mod tests {
         let root = Path::new("/project");
         assert!(is_watched_path(root, Path::new("/project/src/index.ts")));
         assert!(is_watched_path(root, Path::new("/project/config.yaml")));
+        assert!(is_watched_path(root, Path::new("/project/feed.xml")));
         assert!(is_watched_path(root, Path::new("/project/package.json")));
     }
 

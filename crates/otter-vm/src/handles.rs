@@ -143,6 +143,95 @@ impl HandleArena {
     }
 }
 
+/// Collector-traced scratch roots for values that have not entered a heap
+/// object yet.
+///
+/// Unlike the scope handle arena, slots can be released and reused out of
+/// stack order. A streaming parser can therefore retain only the properties of
+/// currently open records, then recycle them as soon as a completed object owns
+/// the values. [`crate::NativeScope::with_pending_values`] registers the arena
+/// as a root source for exactly one host operation.
+#[derive(Debug, Default)]
+pub struct PendingValues {
+    slots: Vec<PendingSlot>,
+    free: Vec<u32>,
+}
+
+#[derive(Debug)]
+struct PendingSlot {
+    value: Value,
+    generation: u32,
+    occupied: bool,
+}
+
+/// Opaque reference to one collector-traced [`PendingValues`] slot.
+///
+/// Reusing a released slot advances its generation, so an accidentally stale
+/// token cannot read or release a later value that happens to occupy the same
+/// index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingValue {
+    index: u32,
+    generation: u32,
+}
+
+impl PendingValues {
+    /// Create an empty pending-root arena.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn insert(&mut self, value: Value) -> PendingValue {
+        if let Some(index) = self.free.pop() {
+            let slot = &mut self.slots[index as usize];
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.value = value;
+            slot.occupied = true;
+            return PendingValue {
+                index,
+                generation: slot.generation,
+            };
+        }
+        let index = u32::try_from(self.slots.len()).expect("pending-root arena exceeds u32 slots");
+        self.slots.push(PendingSlot {
+            value,
+            generation: 0,
+            occupied: true,
+        });
+        PendingValue {
+            index,
+            generation: 0,
+        }
+    }
+
+    pub(crate) fn get(&self, value: PendingValue) -> Option<Value> {
+        let slot = self.slots.get(value.index as usize)?;
+        (slot.occupied && slot.generation == value.generation).then_some(slot.value)
+    }
+
+    pub(crate) fn remove(&mut self, value: PendingValue) -> Option<Value> {
+        let slot = self.slots.get_mut(value.index as usize)?;
+        if !slot.occupied || slot.generation != value.generation {
+            return None;
+        }
+        slot.occupied = false;
+        let removed = std::mem::replace(&mut slot.value, Value::undefined());
+        self.free.push(value.index);
+        Some(removed)
+    }
+}
+
+impl otter_gc::ExtraRootSource for PendingValues {
+    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        for slot in &self.slots {
+            if slot.occupied {
+                slot.value.trace_value_slots(visitor);
+            }
+        }
+    }
+}
+
 /// Internal scope token. Created by the handle-scope frame behind
 /// [`crate::NativeCtx::scope`]; owns the arena range `[base, len)`, which is
 /// truncated when the scope exits.
@@ -430,6 +519,49 @@ impl Interpreter {
             crate::object::push_layout_slot(object, &mut self.gc_heap, index, Value::undefined());
         }
         Ok(handle)
+    }
+
+    /// Build an object whose layout slots contain `values` from its first
+    /// observable moment.
+    pub(crate) fn scoped_object_with_layout<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+        layout: ObjectLayout,
+        values: &[Local<'_>],
+    ) -> Result<Local<'s>, VmError> {
+        if values.len() != layout.len() {
+            return Err(VmError::TypeMismatch);
+        }
+        let mut shape = self
+            .shape_runtime
+            .handle_for_id(layout.shape)
+            .ok_or(VmError::TypeMismatch)?;
+        let mut stored = smallvec::SmallVec::<[Value; 8]>::with_capacity(values.len());
+        stored.extend(
+            values
+                .iter()
+                .map(|value| self.handle_arena.get(value.index())),
+        );
+        let mut prototype = self.object_prototype_object_opt();
+        let shape_slot = std::ptr::addr_of_mut!(shape).cast::<RawGc>();
+        let prototype_slot = prototype
+            .as_mut()
+            .map(|prototype| std::ptr::from_mut(prototype).cast::<RawGc>());
+        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visitor(shape_slot);
+            if let Some(prototype_slot) = prototype_slot {
+                visitor(prototype_slot);
+            }
+        };
+        let object = crate::object::alloc_object_with_shape_and_values_roots(
+            &mut self.gc_heap,
+            shape,
+            prototype,
+            &mut stored,
+            &mut roots,
+        )
+        .map_err(VmError::from)?;
+        Ok(self.scoped_value(scope, Value::object(object)))
     }
 
     /// Overwrite slot `index` of an object built by

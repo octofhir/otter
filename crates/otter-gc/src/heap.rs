@@ -1171,7 +1171,13 @@ impl GcHeap {
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<Gc<T>, OutOfMemory> {
         if self.tenure_all {
-            return self.alloc_old_with_roots_inner(value, true, extra_bytes, external_visit);
+            return self.alloc_old_with_roots_inner(
+                value,
+                true,
+                extra_bytes,
+                external_visit,
+                |_| {},
+            );
         }
         // A cell payload sits one `GcHeader` past an
         // `OBJECT_ALIGNMENT`-aligned cell start, so it is at most
@@ -1372,7 +1378,7 @@ impl GcHeap {
     #[inline]
     pub fn alloc_old<T: Traceable>(&mut self, value: T) -> Result<Gc<T>, OutOfMemory> {
         let mut empty = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        self.alloc_old_with_roots_inner(value, true, 0, &mut empty)
+        self.alloc_old_with_roots_inner(value, true, 0, &mut empty, |_| {})
     }
 
     /// Allocate a `T` directly in old-space while keeping caller-supplied
@@ -1390,7 +1396,7 @@ impl GcHeap {
         value: T,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<Gc<T>, OutOfMemory> {
-        self.alloc_old_with_roots_inner(value, true, 0, external_visit)
+        self.alloc_old_with_roots_inner(value, true, 0, external_visit, |_| {})
     }
 
     /// Allocate a diagnostic object directly in old-space without
@@ -1409,7 +1415,7 @@ impl GcHeap {
     #[inline]
     pub fn alloc_old_diagnostic<T: Traceable>(&mut self, value: T) -> Result<Gc<T>, OutOfMemory> {
         let mut empty = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        let out = self.alloc_old_with_roots_inner(value, false, 0, &mut empty)?;
+        let out = self.alloc_old_with_roots_inner(value, false, 0, &mut empty, |_| {})?;
         if self.max_heap_bytes != 0 {
             self.drain_shared_external_releases();
             self.tracked_bytes = self.live_bytes_total().saturating_add(self.reserved_bytes);
@@ -1425,6 +1431,7 @@ impl GcHeap {
         enforce_cap: bool,
         extra_bytes: usize,
         external_visit: &mut RootSlotVisitor<'_>,
+        initialize: impl FnOnce(&mut T),
     ) -> Result<Gc<T>, OutOfMemory> {
         // See `alloc_with_roots`: payloads are at most
         // `OBJECT_ALIGNMENT`-aligned, so over-aligned bodies must box.
@@ -1492,6 +1499,10 @@ impl GcHeap {
                     aligned - std::mem::size_of::<GcHeader>() - std::mem::size_of::<T>(),
                 );
             }
+            // The cell is still unreachable. Populate any trailing storage in
+            // its final address before the scan below records every outgoing
+            // edge established by the initializer.
+            initialize(&mut *payload_ptr);
             // The payload was installed with `ptr::write`, bypassing the
             // mutator write barrier. Any young children it carries are
             // old→young edges the next scavenge can only discover through
@@ -2356,7 +2367,29 @@ impl GcHeap {
         extra_bytes: usize,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<Gc<T>, OutOfMemory> {
-        self.alloc_old_with_roots_inner(value, true, extra_bytes, external_visit)
+        self.alloc_old_with_roots_inner(value, true, extra_bytes, external_visit, |_| {})
+    }
+
+    /// Allocate a variable old-space body and initialize its trailing storage
+    /// before the cell is published to the collector.
+    ///
+    /// `initialize` runs after the fixed body and zeroed tail reach their final
+    /// address, but before the allocator scans the new cell for old-to-young
+    /// and incremental-marking edges. Values destined for the tail do not exist
+    /// in the stack-resident pending body; callers must yield their buffer from
+    /// `external_visit` so a pre-allocation collection can rewrite it.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::alloc_variable_with_roots`].
+    pub fn alloc_variable_with_roots_initialized<T: Traceable>(
+        &mut self,
+        value: T,
+        extra_bytes: usize,
+        external_visit: &mut RootSlotVisitor<'_>,
+        initialize: impl FnOnce(&mut T),
+    ) -> Result<Gc<T>, OutOfMemory> {
+        self.alloc_old_with_roots_inner(value, true, extra_bytes, external_visit, initialize)
     }
 
     /// Old-space pages currently owned.

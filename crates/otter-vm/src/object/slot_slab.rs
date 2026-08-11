@@ -18,6 +18,8 @@
 //! - [`SlotSlabHandle`] — handle type stored by an object body.
 //! - [`alloc_slot_slab`] — allocate one, with the caller's roots live
 //!   across the allocation.
+//! - [`alloc_slot_slab_with_values`] — allocate and seed the live prefix
+//!   before publication.
 //!
 //! # Invariants
 //!
@@ -141,6 +143,47 @@ pub fn alloc_slot_slab(
     Ok(slab)
 }
 
+/// Allocate a slab whose visible prefix already contains `values`.
+///
+/// The caller-owned slice is traced as pending roots if allocation collects.
+/// The initializer then copies the collector-rewritten words into their final
+/// tail before the allocator performs its publication-time edge scan. No
+/// mutator store or per-word write barrier is needed afterward.
+///
+/// # Errors
+/// Propagates [`otter_gc::OutOfMemory`].
+pub fn alloc_slot_slab_with_values(
+    heap: &mut otter_gc::GcHeap,
+    capacity: usize,
+    values: &mut [Value],
+    external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+) -> Result<SlotSlabHandle, otter_gc::OutOfMemory> {
+    debug_assert!(values.len() <= capacity);
+    let values_base = values.as_mut_ptr();
+    let values_len = values.len();
+    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        external_visit(visitor);
+        for index in 0..values_len {
+            // SAFETY: the slice outlives the allocation, and the initialized
+            // prefix is exactly `0..values_len`.
+            unsafe { (*values_base.add(index)).trace_value_slot_mut(visitor) };
+        }
+    };
+    heap.alloc_variable_with_roots_initialized(
+        SlotSlabBody::new(capacity),
+        SlotSlabBody::trailing_bytes(capacity),
+        &mut visit,
+        |body| {
+            for index in 0..capacity {
+                let value = values.get(index).copied().unwrap_or_else(Value::undefined);
+                // SAFETY: `index < capacity`; the cell is unpublished and its
+                // trailing array was reserved by this allocation.
+                unsafe { *body.words_ptr().add(index) = value };
+            }
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,5 +222,25 @@ mod tests {
             });
             assert_eq!(word, Value::number_i32(index as i32));
         }
+    }
+
+    #[test]
+    fn values_can_be_installed_before_the_slab_is_published() {
+        let mut interp = Interpreter::new();
+        let mut values = [Value::number_i32(7), Value::number_i32(11)];
+        let slab = alloc_slot_slab_with_values(interp.gc_heap_mut(), 4, &mut values, &mut |_| {})
+            .expect("slab");
+        let words = interp.gc_heap().read_payload(slab, |body| {
+            (0..body.capacity())
+                .map(|index| {
+                    // SAFETY: the iterator is bounded by the slab capacity.
+                    unsafe { *body.words_ptr().add(index) }
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(words[0], Value::number_i32(7));
+        assert_eq!(words[1], Value::number_i32(11));
+        assert!(words[2].is_undefined());
+        assert!(words[3].is_undefined());
     }
 }

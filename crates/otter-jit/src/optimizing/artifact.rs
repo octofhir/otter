@@ -39,10 +39,13 @@ pub(crate) fn render_optimized_unit(unit: &OptimizedUnit) -> String {
     let mut out = String::from("; otter optimized unit\n");
     writeln!(
         out,
-        "; frames={} blocks={} values={} linear-scan-spills={} final-spills={}",
+        "; frames={} blocks={} values={} copy-webs={} coalesced-values={} inactive-values={} linear-scan-spills={} final-spills={}",
         unit.tree.frames.len(),
         unit.cfg.blocks.len(),
         unit.ssa.values.len(),
+        unit.allocation.copy_web_count,
+        unit.allocation.coalesced_value_count,
+        unit.allocation.inactive_value_count,
         unit.linear_scan_spill_slot_count,
         unit.spill_slot_count
     )

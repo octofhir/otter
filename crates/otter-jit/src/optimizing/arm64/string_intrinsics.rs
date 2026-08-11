@@ -16,7 +16,7 @@
 //!
 //! # See also
 //! - `otter_vm::jit::JitStringLayout` — stable tags and body offsets.
-//! - `crate::template::arm64::ic_probe::emit_guarded_method_guard_preserving_receiver`.
+//! - `crate::template::arm64::ic_probe::emit_guarded_method_guard_preserving_receiver_from_tagged_register`.
 
 use super::*;
 use crate::template::arm64::values::{emit_box_int32, emit_load_symbol_u64};

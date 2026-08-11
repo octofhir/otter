@@ -272,8 +272,27 @@ Inspect the first line of `optimized-ir.txt` before interpreting the payload.
 The replacement scalar-function path starts with `; backend=otter-machine-ir
 scalar-function`, followed by normalized Machine IR and exact regalloc2 output;
 its `code-map.json` owns one `machineScalarFunction` structural region. Functions
-not yet switched retain the legacy optimized-unit banner. Both are payloads of
-the one current artifact bundle, not separate artifact formats.
+not yet switched retain the legacy optimized-unit banner. Its second line names
+`copy-webs`, `coalesced-values`, and `inactive-values` before reporting raw and
+post-deopt spill counts. A copy web assigns one machine home to exact-bit
+`LoadLocal` / `StoreLocal` / `Reuse` aliases. Inactive values are unread block
+heads reconstructed as literals on deoptimization, so they consume no emitted
+machine state. Both IR families are payloads of the one current artifact bundle,
+not separate artifact formats.
+
+### Optimizing frame-free method intrinsics
+
+An optimizing bundle uses `machineMethodIntrinsic` for a generated Map, string,
+or Int32 Math method hit. The region spans the allocated-SSA receiver guard,
+generated body, and direct store into the result's allocated home. A successful
+region does not construct a transition frame, publish a VM PC, or write and
+reload the result through the interpreter register window.
+
+The miss edge is intentionally outside the region. It clears any activation
+cache, materializes the exact transition frame, publishes the original call PC,
+and resumes the canonical generic method path. The structural region therefore
+proves a faster hit topology, not permission to skip replacement, accessor,
+proxy, coercion, or exception semantics.
 
 ### Optimizing loop method-guard caches
 

@@ -7,7 +7,7 @@
 //! - Identity-guarded Int32 Math intrinsic bodies selected by the main
 //!   instruction dispatcher.
 //! - Activation-local loop cache addressing and complete cold-path clearing.
-//! - Frame prologue and epilogue.
+//! - Minimal frame prologue/epilogue over `x19,x21..x28` plus `d8..d15`.
 //! - Published root/spliced register-window addressing across temporary
 //!   generated-linkage stack reservations.
 //!
@@ -18,6 +18,12 @@
 //!   only after the caller has emitted the exact builtin identity guard.
 //! - Loop cache slots contain untraced raw addresses only while generated code
 //!   cannot allocate or re-enter; every cold transition clears the full set.
+//! - `x19` is an allocatable value register. Root-window helpers reload the
+//!   interpreter base through the fixed `x20` context only at VM boundaries.
+//!   Callers name any live scratch explicitly, so address materialization
+//!   cannot overwrite the value about to be published through that window.
+//! - The fixed context-pair save already preserves `x19`; the variable GPR
+//!   save prefix therefore covers only the used `x21..x28` suffix.
 
 use super::*;
 
@@ -478,13 +484,29 @@ pub(super) fn fp_move_register(register: u8) -> Result<u8, Unsupported> {
 }
 
 pub(super) fn emit_load_parameter(ops: &mut Assembler, index: u32, scratch: u8) {
+    let window = emit_root_window_base(ops, scratch);
     let offset = index * STACK_SLOT_BYTES;
     if offset <= MAX_PARAMETER_OFFSET {
-        dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [x19, offset]);
+        dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [X(window), offset]);
     } else {
         emit_load_u32(ops, 12, offset);
-        dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [x19, x12]);
+        dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [X(window), x12]);
     }
+}
+
+/// Reload the root interpreter-window base only at a boundary that needs it.
+fn emit_root_window_base(ops: &mut Assembler, protected: u8) -> u8 {
+    let window = if protected == WINDOW_SCRATCH {
+        HEADER_SCRATCH
+    } else {
+        WINDOW_SCRATCH
+    };
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr X(window), [x20, NATIVE_FRAME_OFFSET]
+        ; ldr X(window), [X(window), NATIVE_FRAME_REGISTER_BASE_OFFSET]
+    );
+    window
 }
 
 /// Reload a loop-header live set from its interpreter-window slots.
@@ -528,16 +550,25 @@ pub(super) fn emit_osr_materialization(
 
 /// Register holding the base of `inline`'s interpreter window.
 ///
-/// The root frame's window is the one the entry loaded into `x19`. A spliced
-/// frame's window is a reservation in this generation's own stack frame, so its
-/// base is materialized into the transition scratch register on demand.
+/// The root frame's window is reloaded through `x20` on demand. A spliced
+/// frame's window is a reservation in this generation's own stack frame.
 pub(super) fn emit_window_base(
     ops: &mut Assembler,
     windows: &InlineWindows,
     inline: InlineId,
 ) -> Result<u8, Unsupported> {
+    emit_window_base_protecting(ops, windows, inline, u8::MAX)
+}
+
+/// [`emit_window_base`] without clobbering one caller-owned scratch register.
+pub(super) fn emit_window_base_protecting(
+    ops: &mut Assembler,
+    windows: &InlineWindows,
+    inline: InlineId,
+    protected: u8,
+) -> Result<u8, Unsupported> {
     if inline == InlineId::ROOT {
-        return Ok(19);
+        return Ok(emit_root_window_base(ops, protected));
     }
     let offset = windows.get(inline)?.window;
     // `sp` is only addressable through the fixed-register forms, so the
@@ -553,20 +584,22 @@ pub(super) fn emit_window_base(
 
 /// Register-window base while generated linkage has temporarily moved `sp`.
 ///
-/// Root windows are heap/interpreter-owned through `x19` and never move. An
+/// Root windows are heap/interpreter-owned and reloaded through `x20`. An
 /// inlined frame's window belongs to this code object's fixed stack frame, so
-/// linkage reports the exact downward stack bias that must be added back
-/// before addressing it. `offset_scratch` must not contain a value the caller
-/// is about to store through the returned base.
+/// linkage reports the exact downward stack bias that must be added back.
+/// `offset_scratch` must not contain a value the caller is about to store
+/// through the returned base; `protected` names that source independently so
+/// root-window reload can choose its other address scratch.
 pub(super) fn emit_window_base_with_bias(
     ops: &mut Assembler,
     windows: &InlineWindows,
     inline: InlineId,
     sp_bias: u32,
     offset_scratch: u8,
+    protected: u8,
 ) -> Result<u8, Unsupported> {
     if inline == InlineId::ROOT {
-        return Ok(19);
+        return Ok(emit_root_window_base(ops, protected));
     }
     let offset = windows
         .get(inline)?
@@ -612,7 +645,7 @@ pub(super) fn emit_materialize_element_transition(
             continue;
         }
         emit_load_tagged_location(ops, allocation.location(live.value), 9)?;
-        let window = emit_window_base(ops, windows, live.inline)?;
+        let window = emit_window_base_protecting(ops, windows, live.inline, 9)?;
         emit_store_frame_register_in(ops, window, u32::from(live.register), 9)?;
     }
     Ok(())
@@ -640,7 +673,7 @@ pub(super) fn emit_materialize_frame_value(
             emit_box_double(ops, FP_SCRATCH, 9);
         }
     }
-    let window = emit_window_base(ops, windows, inline)?;
+    let window = emit_window_base_protecting(ops, windows, inline, 9)?;
     emit_store_frame_register_in(ops, window, u32::from(register), 9)
 }
 
@@ -932,7 +965,8 @@ pub(super) fn emit_load_frame_register(
     register: u32,
     scratch: u8,
 ) -> Result<(), Unsupported> {
-    emit_load_frame_register_in(ops, 19, register, scratch)
+    let window = emit_root_window_base(ops, scratch);
+    emit_load_frame_register_in(ops, window, register, scratch)
 }
 
 /// Read from an interpreter register window addressed by `window`.
@@ -961,14 +995,15 @@ pub(super) fn emit_store_frame_register(
     register: u32,
     scratch: u8,
 ) -> Result<(), Unsupported> {
-    emit_store_frame_register_in(ops, 19, register, scratch)
+    let window = emit_root_window_base(ops, scratch);
+    emit_store_frame_register_in(ops, window, register, scratch)
 }
 
 /// Store into an interpreter register window addressed by `window`.
 ///
-/// The root frame's window is `x19`; a spliced frame's is a reservation in
-/// this generation's own stack frame, and the callee's registers belong there
-/// and not in its caller's.
+/// The root frame's window is reloaded through `x20`; a spliced frame's is a
+/// reservation in this generation's own stack frame, and the callee's
+/// registers belong there and not in its caller's.
 pub(super) fn emit_store_frame_register_in(
     ops: &mut Assembler,
     window: u8,
@@ -1659,12 +1694,13 @@ pub(super) fn emit_runtime_entry(
 
 /// The callee-saved machine state one compiled body actually touches, and
 /// therefore the exact save/restore set its prologue and epilogue move.
-/// Registers are allocated lowest-index first, so the used set is a prefix of
-/// the allocatable file; an unused suffix is never saved. Entry cost is what a
-/// generated call pays per invocation, so the frame carries nothing idle.
+/// GPR index zero is `x19`, already covered by the fixed context-pair save;
+/// later indices are the `x21..x28` prefix recorded here. An unused suffix is
+/// never saved. Entry cost is what a generated call pays per invocation, so
+/// the frame carries nothing idle.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SavedFrame {
-    /// Used prefix of the allocatable GPR file (`x21..`), 0..=8.
+    /// Used prefix of the additional allocatable GPR file (`x21..`), 0..=8.
     pub(super) gpr_count: u8,
     /// Used prefix of the allocatable FP file (`d8..`), 0..=8.
     pub(super) fp_count: u8,
@@ -1679,7 +1715,8 @@ impl SavedFrame {
         for &location in allocation.locations.iter() {
             if let Location::Register(class, index) = location {
                 match class {
-                    RegClass::Gpr => gpr_count = gpr_count.max(index + 1),
+                    RegClass::Gpr if index > 0 => gpr_count = gpr_count.max(index),
+                    RegClass::Gpr => {}
                     RegClass::Fp => fp_count = fp_count.max(index + 1),
                 }
             }

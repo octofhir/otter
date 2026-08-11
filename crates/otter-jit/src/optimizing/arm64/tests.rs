@@ -385,7 +385,7 @@ extern "C" fn relocating_precise_element_load(
     receiver: u64,
     index: u64,
 ) -> u64 {
-    // SAFETY: this fixture compiles a twelve-slot frame and keeps it live
+    // SAFETY: this fixture compiles a twenty-six-slot frame and keeps it live
     // for the transition. Tagged slots model moving-GC rewrites; numeric
     // slots are deliberately poisoned to prove they are never reloaded.
     let regs = unsafe { fixture_registers(ctx) };
@@ -394,14 +394,17 @@ extern "C" fn relocating_precise_element_load(
         assert_eq!(*regs.add(index as usize), box_i32(0));
         assert_eq!(*regs.add(1), box_i32(20));
         assert_eq!(*regs.add(2), box_i32(30));
-        assert_eq!(*regs.add(4), otter_vm::Value::undefined().to_bits());
-        assert_eq!(*regs.add(5), otter_vm::Value::undefined().to_bits());
-        *regs.add(0) = box_i32(5);
-        *regs.add(1) = box_i32(7);
-        *regs.add(2) = box_i32(11);
-        *regs.add(3) = box_i32(1_000);
-        *regs.add(4) = box_i32(1_000);
-        *regs.add(5) = box_f64(1_000.0);
+        assert_eq!(*regs.add(11), otter_vm::Value::undefined().to_bits());
+        assert_eq!(*regs.add(12), otter_vm::Value::undefined().to_bits());
+        for (register, value) in [5, 7, 11, 13, 17, 19, 23, 29, 31, 37]
+            .into_iter()
+            .enumerate()
+        {
+            *regs.add(register) = box_i32(value);
+        }
+        *regs.add(10) = box_i32(1_000);
+        *regs.add(11) = box_i32(1_000);
+        *regs.add(12) = box_f64(1_000.0);
         *regs.add(dst as usize) = box_i32(37);
     }
     0
@@ -627,66 +630,128 @@ fn executes_element_load_and_reloads_relocated_tagged_values() {
 #[test]
 fn precise_element_load_reloads_tagged_spills_but_not_numeric_values() {
     let view = float_view(
-        3,
-        12,
+        10,
+        26,
         vec![
-            (Op::LoadInt32, vec![Operand::Register(3), Operand::Imm32(0)]),
-            (Op::LoadInt32, vec![Operand::Register(4), Operand::Imm32(4)]),
+            (
+                Op::LoadInt32,
+                vec![Operand::Register(10), Operand::Imm32(0)],
+            ),
+            (
+                Op::LoadInt32,
+                vec![Operand::Register(11), Operand::Imm32(4)],
+            ),
             (
                 Op::LoadNumber,
-                vec![Operand::Register(5), Operand::ConstIndex(0)],
+                vec![Operand::Register(12), Operand::ConstIndex(0)],
             ),
             (
                 Op::LoadElement,
                 vec![
-                    Operand::Register(6),
+                    Operand::Register(13),
                     Operand::Register(0),
-                    Operand::Register(3),
+                    Operand::Register(10),
                 ],
             ),
             (
                 Op::Add,
                 vec![
-                    Operand::Register(7),
-                    Operand::Register(6),
+                    Operand::Register(14),
+                    Operand::Register(13),
                     Operand::Register(0),
                 ],
             ),
             (
                 Op::Add,
                 vec![
-                    Operand::Register(8),
-                    Operand::Register(7),
+                    Operand::Register(15),
+                    Operand::Register(14),
                     Operand::Register(1),
                 ],
             ),
             (
                 Op::Add,
                 vec![
-                    Operand::Register(9),
-                    Operand::Register(8),
+                    Operand::Register(16),
+                    Operand::Register(15),
                     Operand::Register(2),
                 ],
             ),
             (
                 Op::Add,
                 vec![
-                    Operand::Register(10),
-                    Operand::Register(9),
+                    Operand::Register(17),
+                    Operand::Register(16),
+                    Operand::Register(3),
+                ],
+            ),
+            (
+                Op::Add,
+                vec![
+                    Operand::Register(18),
+                    Operand::Register(17),
                     Operand::Register(4),
                 ],
             ),
             (
                 Op::Add,
                 vec![
-                    Operand::Register(11),
-                    Operand::Register(10),
+                    Operand::Register(19),
+                    Operand::Register(18),
                     Operand::Register(5),
                 ],
             ),
-            (Op::ReturnValue, vec![Operand::Register(11)]),
+            (
+                Op::Add,
+                vec![
+                    Operand::Register(20),
+                    Operand::Register(19),
+                    Operand::Register(6),
+                ],
+            ),
+            (
+                Op::Add,
+                vec![
+                    Operand::Register(21),
+                    Operand::Register(20),
+                    Operand::Register(7),
+                ],
+            ),
+            (
+                Op::Add,
+                vec![
+                    Operand::Register(22),
+                    Operand::Register(21),
+                    Operand::Register(8),
+                ],
+            ),
+            (
+                Op::Add,
+                vec![
+                    Operand::Register(23),
+                    Operand::Register(22),
+                    Operand::Register(9),
+                ],
+            ),
+            (
+                Op::Add,
+                vec![
+                    Operand::Register(24),
+                    Operand::Register(23),
+                    Operand::Register(11),
+                ],
+            ),
+            (
+                Op::Add,
+                vec![
+                    Operand::Register(25),
+                    Operand::Register(24),
+                    Operand::Register(12),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(25)]),
         ],
-        &[8],
+        &[15],
         &[(2, 2.5)],
     );
     let transitions =
@@ -698,20 +763,32 @@ fn precise_element_load_reloads_tagged_spills_but_not_numeric_values() {
         "tagged live-across fixture must exercise optimizing spills"
     );
 
-    let result = execute(&code, &[box_i32(99), box_i32(20), box_i32(30)]);
+    let result = execute(
+        &code,
+        &[
+            box_i32(99),
+            box_i32(20),
+            box_i32(30),
+            box_i32(40),
+            box_i32(50),
+            box_i32(60),
+            box_i32(70),
+            box_i32(80),
+            box_i32(90),
+            box_i32(100),
+        ],
+    );
     assert_eq!(result.status, STATUS_RETURNED);
-    assert_eq!(result.value, box_f64(66.5));
+    assert_eq!(result.value, box_f64(235.5));
 
     let record = code.safepoint_record(0).expect("precise safepoint");
     assert_eq!(
         record.tagged_locations,
-        vec![
-            otter_vm::native_abi::TaggedLocation::frame_slot(0),
-            otter_vm::native_abi::TaggedLocation::frame_slot(1),
-            otter_vm::native_abi::TaggedLocation::frame_slot(2),
-        ]
+        (0..10)
+            .map(otter_vm::native_abi::TaggedLocation::frame_slot)
+            .collect::<Vec<_>>()
     );
-    assert_eq!(code.frame_map_bitmap_words(), &[0b111]);
+    assert_eq!(code.frame_map_bitmap_words(), &[0b11_1111_1111]);
 }
 
 #[test]
@@ -1631,15 +1708,29 @@ fn executes_forced_spills() {
         (Op::LoadInt32, vec![Operand::Register(5), Operand::Imm32(2)]),
         (Op::LoadInt32, vec![Operand::Register(6), Operand::Imm32(3)]),
         (Op::LoadInt32, vec![Operand::Register(7), Operand::Imm32(4)]),
+        (Op::LoadInt32, vec![Operand::Register(8), Operand::Imm32(5)]),
+        (Op::LoadInt32, vec![Operand::Register(9), Operand::Imm32(6)]),
+        (
+            Op::LoadInt32,
+            vec![Operand::Register(10), Operand::Imm32(7)],
+        ),
+        (
+            Op::LoadInt32,
+            vec![Operand::Register(11), Operand::Imm32(8)],
+        ),
     ];
     for (dst, left, right) in [
-        (8, 0, 1),
-        (9, 2, 3),
-        (10, 4, 5),
-        (11, 6, 7),
-        (12, 8, 9),
-        (13, 10, 11),
-        (14, 12, 13),
+        (12, 0, 1),
+        (13, 2, 3),
+        (14, 4, 5),
+        (15, 6, 7),
+        (16, 8, 9),
+        (17, 10, 11),
+        (18, 12, 13),
+        (19, 14, 15),
+        (20, 16, 17),
+        (21, 18, 19),
+        (22, 21, 20),
     ] {
         instructions.push((
             Op::Add,
@@ -1650,14 +1741,14 @@ fn executes_forced_spills() {
             ],
         ));
     }
-    instructions.push((Op::ReturnValue, vec![Operand::Register(14)]));
-    let view = view(4, 15, instructions);
+    instructions.push((Op::ReturnValue, vec![Operand::Register(22)]));
+    let view = view(4, 23, instructions);
     let code = compile(&view, 3).expect("spill expression is eligible");
     assert!(code.metadata().linear_scan_spill_slot_count > 0);
     assert!(code.metadata().spill_slot_count > 0);
     let result = execute(&code, &[box_i32(10), box_i32(20), box_i32(30), box_i32(40)]);
     assert_eq!(result.status, STATUS_RETURNED);
-    assert_eq!(unbox_i32(result.value), 110);
+    assert_eq!(unbox_i32(result.value), 136);
 }
 
 #[test]

@@ -2984,6 +2984,53 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
             })
     }
 
+    /// Copy an ASCII JavaScript string into parser-owned bytes.
+    ///
+    /// A rope is flattened once before the check, making a qualifying input a
+    /// stable contiguous parent for later substring views. Returns `None` for
+    /// non-ASCII content. The byte copy may outlive the payload borrow and can
+    /// therefore drive an allocating native parser safely; its offsets are
+    /// exact JavaScript UTF-16 offsets into `value`.
+    pub fn ascii_string_bytes(&mut self, value: Local<'_>) -> Result<Option<Vec<u8>>, NativeError> {
+        let raw = self.raw(value);
+        let string = raw
+            .as_string(self.ctx.heap())
+            .ok_or_else(|| NativeError::TypeError {
+                name: "NativeScope::ascii_string_bytes",
+                reason: "expected a string".to_string(),
+            })?;
+        if let Err(error) = string.flatten_in_place(self.ctx.heap_mut()) {
+            return Err(self.vm_error(VmError::from(error), "NativeScope::ascii_string_bytes"));
+        }
+        Ok(string
+            .with_latin1(self.ctx.heap(), |bytes| {
+                bytes.is_ascii().then(|| bytes.to_vec())
+            })
+            .flatten())
+    }
+
+    /// Build a substring view over a rooted JavaScript string.
+    ///
+    /// Flat Latin-1 and WTF-16 parents are retained without copying their
+    /// payload. Bounds are clamped to the source length.
+    ///
+    /// # Errors
+    /// Returns a `TypeError` when `source` is not a string and propagates
+    /// allocation failure for the small view body.
+    pub fn slice_string(
+        &mut self,
+        source: Local<'_>,
+        start: u32,
+        length: u32,
+    ) -> Result<Local<'scope>, NativeError> {
+        let result = self
+            .ctx
+            .cx
+            .interp
+            .scoped_string_slice(self.token, source, start, length);
+        result.map_err(|error| self.vm_error(error, "NativeScope::slice_string"))
+    }
+
     /// Borrow a JavaScript string as UTF-8 for one non-allocating callback.
     ///
     /// ASCII Latin-1 strings are borrowed directly from the GC body. Other

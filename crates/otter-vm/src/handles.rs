@@ -662,6 +662,24 @@ impl Interpreter {
         Ok(self.scoped_value(scope, Value::string(string)))
     }
 
+    /// Build a rooted substring view over a rooted JavaScript string.
+    pub(crate) fn scoped_string_slice<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+        source: Local<'_>,
+        start: u32,
+        length: u32,
+    ) -> Result<Local<'s>, VmError> {
+        let source = self
+            .handle_arena
+            .get(source.index())
+            .as_string(&self.gc_heap)
+            .ok_or(VmError::TypeMismatch)?;
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
+        let string = source.slice(start, length, &mut self.gc_heap)?;
+        Ok(self.scoped_value(scope, Value::string(string)))
+    }
+
     /// Build interned `JsString` values for `keys`, rooting each in a handle
     /// scope so an earlier key is never stranded by a later string allocation,
     /// and return them as plain `Value`s for immediate hand-off to an array

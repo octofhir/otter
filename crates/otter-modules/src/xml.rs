@@ -21,6 +21,9 @@
 //! - Attribute values are interned for one parse and kept in the same pending
 //!   root arena. Repeated spellings therefore allocate one JavaScript string,
 //!   while unique values add no long-lived state beyond the result itself.
+//! - Untouched runs from an ASCII JavaScript input become width-preserving
+//!   substring views over that input. Rewritten runs and byte-backed inputs
+//!   allocate standalone strings, so scanner offsets are never misapplied.
 //! - Writing goes the other way through one owning Rust tree, so every rule
 //!   about escaping, legal names and layout lives in `otter_xml::stringify`
 //!   and not in two places. Reading a JavaScript value is bounded by an
@@ -77,8 +80,15 @@ pub fn parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         let shape = read_shape(&mut scope, args)?;
 
         let root = if scope.is_string(input) {
-            let text = scope.string_value(input)?;
-            build::<Utf8>(&mut scope, text.as_bytes(), shape)?
+            if let Some(bytes) = scope.ascii_string_bytes(input)? {
+                // ASCII is simultaneously UTF-8, Latin-1, and one UTF-16 code
+                // unit per byte. Scanner source offsets can therefore address
+                // O(1) slices of the original JavaScript string exactly.
+                build::<Utf8>(&mut scope, &bytes, shape, Some(input))?
+            } else {
+                let text = scope.string_value(input)?;
+                build::<Utf8>(&mut scope, text.as_bytes(), shape, None)?
+            }
         } else {
             // A `Blob` is bytes too, and its class declares them, so the read
             // goes through the VM's type-blind view rather than through a
@@ -96,15 +106,15 @@ pub fn parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             let sniffed = otter_xml::encoding::sniff(&bytes).map_err(syntax_error)?;
             let body = &bytes[sniffed.bom_len..];
             match sniffed.charset {
-                Charset::Utf8 => build::<Utf8>(&mut scope, body, shape)?,
-                Charset::Latin1 => build::<Latin1>(&mut scope, body, shape)?,
+                Charset::Utf8 => build::<Utf8>(&mut scope, body, shape, None)?,
+                Charset::Latin1 => build::<Latin1>(&mut scope, body, shape, None)?,
                 Charset::Utf16Be | Charset::Utf16Le => {
                     let units = otter_xml::encoding::decode_utf16(
                         body,
                         sniffed.charset == Charset::Utf16Be,
                     )
                     .map_err(syntax_error)?;
-                    build::<Utf16>(&mut scope, &units, shape)?
+                    build::<Utf16>(&mut scope, &units, shape, None)?
                 }
             }
         };
@@ -139,6 +149,7 @@ fn build<'s, E: Encoding>(
     scope: &mut NativeScope<'s, '_>,
     document: &[E::Unit],
     shape: Shape,
+    source: Option<Local<'s>>,
 ) -> Result<Local<'s>, NativeError> {
     // Node-form parsing retains the existing rooted frame stack. Compact-form
     // values wait in the recyclable pending arena below and need no JS array.
@@ -156,6 +167,7 @@ fn build<'s, E: Encoding>(
                     failure: None,
                 },
                 shape,
+                source,
                 depth: 0,
                 frames: Vec::new(),
                 key: String::new(),
@@ -259,6 +271,8 @@ struct Frame {
     atom: Option<HostAtom>,
     /// Character data seen so far, joined across runs.
     text: String,
+    /// Exact source range when `text` is one untouched scanner run.
+    text_source: Option<(usize, usize)>,
     /// Compact-form properties accumulated before one-shot materialization.
     properties: Vec<PendingProperty>,
     /// How many children the node form has appended.
@@ -268,6 +282,8 @@ struct Frame {
 struct Builder<'a, 's, 'rt, E: Encoding> {
     vm: Vm<'a, 's, 'rt>,
     shape: Shape,
+    /// Original ASCII JavaScript input whose UTF-16 offsets equal scanner bytes.
+    source: Option<Local<'s>>,
     depth: usize,
     frames: Vec<Frame>,
     /// Reused buffer for the `@name` key of an attribute.
@@ -293,14 +309,32 @@ fn trimmed(text: &str) -> &str {
     text.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r'))
 }
 
+/// Exact document range of an untouched scanner run.
+fn source_range<U: otter_xml::encoding::Unit>(piece: Piece<'_, U>) -> Option<(usize, usize)> {
+    match piece {
+        Piece::Source { units, offset } => Some((offset, units.len())),
+        Piece::Rewritten(_) | Piece::Widened(_) => None,
+    }
+}
+
 impl<E: Encoding> Builder<'_, '_, '_, E> {
     /// Return the parse-wide JavaScript string for one attribute value.
-    fn attribute_value(&mut self, value: &str) -> Option<PendingValue> {
+    fn attribute_value(
+        &mut self,
+        value: &str,
+        source_range: Option<(usize, usize)>,
+    ) -> Option<PendingValue> {
         if let Some(cached) = self.attribute_values.get(value) {
             return Some(*cached);
         }
+        let source = self.source;
         let pending = self.vm.step(|scope, _stack, pending| {
-            let text = scope.string(value)?;
+            let text = match (source, source_range) {
+                (Some(source), Some((start, len))) => {
+                    scope.slice_string(source, start as u32, len as u32)?
+                }
+                _ => scope.string(value)?,
+            };
             Ok(scope.pending_value(pending, text))
         })?;
         self.attribute_values.insert(value.into(), pending);
@@ -366,13 +400,28 @@ impl<E: Encoding> Builder<'_, '_, '_, E> {
         let frame = &mut self.frames[depth];
         let element_atom = frame.atom.clone().expect("open element atom");
         let content = trimmed(&frame.text);
+        let leading = content.as_ptr() as usize - frame.text.as_ptr() as usize;
+        let text_source = frame
+            .text_source
+            .map(|(start, _)| (start + leading, content.len()));
+        let source = self.source;
         let mut properties = std::mem::take(&mut frame.properties);
         let value = self.vm.step(|scope, _stack, pending| {
             let value = if properties.is_empty() {
-                scope.string(content)?
+                match (source, text_source) {
+                    (Some(source), Some((start, len))) => {
+                        scope.slice_string(source, start as u32, len as u32)?
+                    }
+                    _ => scope.string(content)?,
+                }
             } else {
                 if !content.is_empty() {
-                    let text = scope.string(content)?;
+                    let text = match (source, text_source) {
+                        (Some(source), Some((start, len))) => {
+                            scope.slice_string(source, start as u32, len as u32)?
+                        }
+                        _ => scope.string(content)?,
+                    };
                     let text = scope.pending_value(pending, text);
                     properties.push(PendingProperty {
                         key: scope.atom("#text"),
@@ -422,6 +471,7 @@ impl<E: Encoding> Sink<E::Unit> for Builder<'_, '_, '_, E> {
         }
         let frame = &mut self.frames[depth];
         frame.text.clear();
+        frame.text_source = None;
         debug_assert!(frame.properties.is_empty());
         frame.children = 0;
         frame.name.clear();
@@ -449,10 +499,11 @@ impl<E: Encoding> Sink<E::Unit> for Builder<'_, '_, '_, E> {
 
     fn attribute(&mut self, name: Piece<'_, E::Unit>, value: Piece<'_, E::Unit>) {
         let name = text_of::<E>(name);
+        let value_source = self.source.and_then(|_| source_range(value));
         let value = text_of::<E>(value);
         let depth = self.depth - 1;
         let shape = self.shape;
-        let Some(text) = self.attribute_value(&value) else {
+        let Some(text) = self.attribute_value(&value, value_source) else {
             return;
         };
         if shape == Shape::Compact {
@@ -480,17 +531,32 @@ impl<E: Encoding> Sink<E::Unit> for Builder<'_, '_, '_, E> {
 
     fn text(&mut self, text: Piece<'_, E::Unit>) {
         let depth = self.depth - 1;
+        let text_source = self.source.and_then(|_| source_range(text));
         let run = text_of::<E>(text);
         if self.shape == Shape::Compact {
-            self.frames[depth].text.push_str(&run);
+            let frame = &mut self.frames[depth];
+            if !run.is_empty() {
+                if frame.text.is_empty() {
+                    frame.text_source = text_source;
+                } else {
+                    frame.text_source = None;
+                }
+                frame.text.push_str(&run);
+            }
             return;
         }
         let at = self.frames[depth].children;
         self.frames[depth].children += 1;
+        let source = self.source;
         self.vm.step(|scope, stack, _pending| {
             let element = scope.index(stack, depth)?;
             let children = scope.get(element, "children")?;
-            let run = scope.string(&run)?;
+            let run = match (source, text_source) {
+                (Some(source), Some((start, len))) => {
+                    scope.slice_string(source, start as u32, len as u32)?
+                }
+                _ => scope.string(&run)?,
+            };
             scope.set_index(children, at, run)
         });
     }

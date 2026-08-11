@@ -153,6 +153,18 @@ It already owns:
   11.77%, and Map.get-plus-length by 11.51%, with exact checksums, unchanged
   reductions/runtime-stub counts, and zero deopts. Native code grew by 120, 60,
   and 132 bytes respectively;
+- primitive string constants now live in address-stable boxed cache cells.
+  Compile snapshots publish only already-materialized traced cells; template
+  and optimizing code read the live `Value` directly, while cold literals keep
+  the canonical transition. Optimized `LoadString` no longer materializes a
+  frame or safepoint, and loop method caches may cross the pure cell read. A
+  257-cell VM regression proves address stability across hash growth and full
+  GC; a production-tier regression executes compiled literal code after 300
+  new eval chunks and moving collection. Typed `stringConstantCell`
+  relocations redact the address. Alternating 10-warmup/25-sample medians
+  improved the existing `indexOf` kernel by 53.33% and full `native-boundary`
+  by 20.66%, with exact checksums, unchanged reductions/stub counts, zero
+  deopts, and native-boundary code shrinking from 6,848 to 6,740 bytes;
 - catch-only exception-region CFGs with explicit landing-pad successors; the
   shared linkage fully unwinds publication, commits the thrown value to its
   allocator home, and transfers at the exact call PC without replay;
@@ -170,7 +182,7 @@ The old optimizing compiler and template emitter remain in the active graph
 only for operations and function shapes not yet selected by the replacement
 pipeline. They are fallback, not contracts to preserve.
 
-Latest accepted gate: 53 bytecode, 86 compiler, 283 JIT, and 842 VM tests;
+Latest accepted gate: 53 bytecode, 86 compiler, 283 JIT, and 843 VM tests;
 the complete runtime suite; all-target/all-feature Clippy;
 compile-fail/rooting checks; and 21/21 differential
 interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.

@@ -157,11 +157,28 @@ pub(super) fn emit_load_string(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
+    view: &JitCompileSnapshot,
     code_block_id: u32,
+    byte_pc: u32,
     dst: u16,
     constant: u32,
     threw: DynamicLabel,
-) {
+) -> Result<(), Unsupported> {
+    if let Some(target) = view.string_constant_loads.get(&byte_pc) {
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            13,
+            target.cell_addr as u64,
+            RelocationTarget::StringConstantCell {
+                function_id: code_block_id,
+                byte_pc,
+            },
+        );
+        dynasm!(ops ; .arch aarch64 ; ldr x9, [x13]);
+        emit_store_reg(ops, 9, dst)?;
+        return Ok(());
+    }
     emit_ctx_arg(ops);
     emit_load_u64(ops, 1, u64::from(code_block_id));
     dynasm!(ops ; .arch aarch64 ; movz x2, dst as u32);
@@ -173,6 +190,7 @@ pub(super) fn emit_load_string(
         abi::STUB_JIT_LOAD_STRING,
         threw,
     );
+    Ok(())
 }
 
 pub(super) fn emit_load_regexp(

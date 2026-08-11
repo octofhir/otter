@@ -495,6 +495,12 @@ fn symbolic_target(target: &RelocationTarget) -> String {
         } => {
             format!("globalLexicalCell(fid={function_id},bytePc={byte_pc})")
         }
+        RelocationTarget::StringConstantCell {
+            function_id,
+            byte_pc,
+        } => {
+            format!("stringConstantCell(fid={function_id},bytePc={byte_pc})")
+        }
         RelocationTarget::PropertyIcCell { access, ordinal } => format!(
             "propertyIcCell(access={},ordinal={ordinal})",
             match access {

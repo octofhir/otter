@@ -435,6 +435,8 @@ pub enum JitDebugEvent {
         global_load_sites: u32,
         /// Global lexical reads carrying one permanent direct-cell target.
         global_lexical_loads: u32,
+        /// Materialized string literals carrying one stable traced-cell target.
+        string_constant_loads: u32,
         /// Global object reads carrying one epoch-and-shape guarded own slot.
         global_object_loads: u32,
         /// Exact installed generations available for generated native linkage.
@@ -952,6 +954,7 @@ mod tests {
             method_feedback_sites: 3,
             global_load_sites: 6,
             global_lexical_loads: 4,
+            string_constant_loads: 3,
             global_object_loads: 5,
             direct_callees: 1,
             direct_constructs: 2,
@@ -980,6 +983,7 @@ mod tests {
                     "methodFeedbackSites": 3,
                     "globalLoadSites": 6,
                     "globalLexicalLoads": 4,
+                    "stringConstantLoads": 3,
                     "globalObjectLoads": 5,
                     "directCallees": 1,
                     "directConstructs": 2,

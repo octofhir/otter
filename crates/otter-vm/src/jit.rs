@@ -32,6 +32,9 @@
 //! - Baseline code uses the interpreter frame register array as its precise root
 //!   provider. Values may be cached in machine registers only between
 //!   safepoints; allocation and call slow paths must reload from frame slots.
+//! - A prepared string literal exposes only its address-stable traced `Value`
+//!   cell. Generated code never bakes the moving string handle; collection
+//!   rewrites the cell in place and the cell outlives isolate code objects.
 //! - Optimized entries use the same runtime activation and published native
 //!   frame as baseline entries. Before bailing they reconstruct every
 //!   interpreter register in the rooted frame window and publish the exact
@@ -354,6 +357,10 @@ pub struct JitCompileSnapshot {
     /// each non-moving cell; generated code reads its current value and takes
     /// the semantic stub only for a TDZ hole.
     pub global_lexical_loads: rustc_hash::FxHashMap<u32, JitGlobalLexicalLoad>,
+    /// Direct reads of address-stable, GC-traced primitive-string constant
+    /// cells keyed by `Op::LoadString` byte PC. Only already-materialized
+    /// literals are published; a cold literal keeps its runtime transition.
+    pub string_constant_loads: rustc_hash::FxHashMap<u32, JitStringConstantLoad>,
     /// Guarded own-data reads from the global object record keyed by the
     /// `Op::LoadGlobalOrThrow` byte-PC. Generated code validates both the live
     /// global-declarative epoch and the global object's hidden class before
@@ -845,6 +852,15 @@ pub struct JitGlobalLexicalLoad {
     pub cell_offset: u32,
 }
 
+/// One prepared primitive-string constant available to generated code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitStringConstantLoad {
+    /// Process-local address of the isolate-owned, GC-traced `Value` cell.
+    /// The cell allocation is stable and outlives every code object in the
+    /// isolate; artifacts retain only function/byte-PC identity.
+    pub cell_addr: usize,
+}
+
 /// One guarded own-data load from the global object record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JitGlobalObjectLoad {
@@ -1207,6 +1223,7 @@ impl JitCompileSnapshot {
             native_ref_byte: 0,
             instructions,
             global_lexical_loads: rustc_hash::FxHashMap::default(),
+            string_constant_loads: rustc_hash::FxHashMap::default(),
             global_object_loads: rustc_hash::FxHashMap::default(),
             static_native_calls: rustc_hash::FxHashMap::default(),
             direct_callees: rustc_hash::FxHashMap::default(),

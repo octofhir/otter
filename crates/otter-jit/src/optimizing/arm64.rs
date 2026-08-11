@@ -8,8 +8,8 @@
 //! - Bounded batched back-edge polling with loop-header bail writeback.
 //! - Precise live-tagged GC safepoints around root-frame transitions and
 //!   exact-PC chain exits for reentrant operations in spliced frames.
-//! - Direct live-value reads from baked global lexical cells and guarded
-//!   global-object property records.
+//! - Direct live-value reads from baked global lexical cells, address-stable
+//!   traced string-literal cells, and guarded global-object property records.
 //! - Baked stable-entry plain, method, and constructor calls with stack-owned
 //!   rooted callee frames, including calls owned by spliced bodies.
 //! - Identity-guarded Int32 `Math.abs`, `Math.max`, and `Math.min` completion
@@ -133,11 +133,11 @@ use otter_vm::deopt::{DeoptExitDescriptor, DeoptExitId, DeoptRuntime, DeoptTable
 use otter_vm::native_abi::{
     FrameMap, NO_FRAME_STATE, RuntimeStubDescriptor, STUB_JIT_BACKEDGE_POLL, STUB_JIT_CONSTRUCT,
     STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_DERIVED_CONSTRUCT_RESULT,
-    STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROPERTY, STUB_JIT_LOAD_STRING,
-    STUB_JIT_LOAD_UPVALUE, STUB_JIT_LOOSE_EQ, STUB_JIT_PREPARE_BASE_CONSTRUCT,
-    STUB_JIT_SPREAD_CALL_OP, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY,
-    STUB_JIT_STORE_UPVALUE, STUB_JIT_STORE_UPVALUE_CHECKED, STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
-    SafepointId, SafepointRecord,
+    STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROPERTY, STUB_JIT_LOAD_UPVALUE,
+    STUB_JIT_LOOSE_EQ, STUB_JIT_PREPARE_BASE_CONSTRUCT, STUB_JIT_SPREAD_CALL_OP,
+    STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY, STUB_JIT_STORE_UPVALUE,
+    STUB_JIT_STORE_UPVALUE_CHECKED, STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT, SafepointId,
+    SafepointRecord,
 };
 use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG};
 
@@ -456,7 +456,6 @@ struct EmissionPlan<'a> {
     load_property_entry: ResolvedRuntimeEntry,
     store_property_entry: ResolvedRuntimeEntry,
     load_global_entry: ResolvedRuntimeEntry,
-    load_string_entry: ResolvedRuntimeEntry,
     loose_eq_entry: ResolvedRuntimeEntry,
     construct_entry: ResolvedRuntimeEntry,
     /// Safepoint-free exact base-receiver preparation used by generated `new`.
@@ -671,10 +670,6 @@ pub(super) fn compile_with_artifacts(
             load_global_entry: ResolvedRuntimeEntry::new(
                 STUB_JIT_LOAD_GLOBAL,
                 transitions.variadic_entry(STUB_JIT_LOAD_GLOBAL),
-            ),
-            load_string_entry: ResolvedRuntimeEntry::new(
-                STUB_JIT_LOAD_STRING,
-                transitions.variadic_entry(STUB_JIT_LOAD_STRING),
             ),
             loose_eq_entry: ResolvedRuntimeEntry::new(
                 STUB_JIT_LOOSE_EQ,
@@ -1061,7 +1056,6 @@ fn emit(
         load_property_entry,
         store_property_entry,
         load_global_entry,
-        load_string_entry,
         loose_eq_entry,
         construct_entry,
         try_prepare_construct_entry,
@@ -2504,87 +2498,36 @@ fn emit(
                         )?;
                         dynasm!(ops ; .arch aarch64 ; =>done);
                     }
-                    // The pool entry is a heap string the collector may move,
-                    // so the constant is resolved at run time rather than baked.
+                    // Bake the address-stable traced cell, not the moving
+                    // string handle. Collection rewrites its live `Value` in
+                    // place before generated code reads it again.
                     Op::LoadString => {
-                        let dst = instruction
-                            .result_register
-                            .expect("eligibility checked string-load destination");
-                        let constant = frame_const_index(tree, instruction, 1)
-                            .ok_or(Unsupported::OperandShape("string-load constant"))?;
-                        let site = eligibility
-                            .element_transitions
-                            .sites
-                            .get(&(instruction.inline, instruction.pc))
-                            .ok_or(Unsupported::OperandShape(
-                                "optimizing string load missing site",
-                            ))?;
-                        debug_assert_eq!(site.safepoint_id, site.frame_map.id);
-                        emit_build_transition_frames(
-                            &mut ops,
-                            tree,
-                            &inline_windows,
-                            instruction,
-                            site,
+                        let frame = frame_of(tree, instruction)?;
+                        let byte_pc = frame_byte_pc(tree, instruction)?;
+                        let target = frame.body.string_constant_loads.get(&byte_pc).ok_or(
+                            Unsupported::OperandShape(
+                                "optimizing string load missing prepared cell",
+                            ),
                         )?;
-                        emit_materialize_element_transition(
+                        emit_load_symbolic_u64(
                             &mut ops,
-                            reprs,
-                            allocation,
-                            &inline_windows,
-                            instruction,
-                            site,
-                        )?;
-                        let transition_depth = emit_publish_transition_frame(
-                            &mut ops,
-                            tree,
-                            &inline_windows,
-                            frame_states,
-                            &mut deopt_exits,
-                            instruction,
-                        )?;
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; mov x0, x20
+                            &mut relocations,
+                            13,
+                            target.cell_addr as u64,
+                            RelocationTarget::StringConstantCell {
+                                function_id: frame.function_id(),
+                                byte_pc,
+                            },
                         );
-                        emit_load_u64(
+                        dynasm!(ops ; .arch aarch64 ; ldr x9, [x13]);
+                        emit_store_tagged_location(
                             &mut ops,
-                            1,
-                            u64::from(frame_of(tree, instruction)?.function_id()),
-                        );
-                        dynasm!(ops ; .arch aarch64 ; movz x2, dst as u32);
-                        emit_load_u64(&mut ops, 3, u64::from(constant));
-                        emit_runtime_entry(&mut ops, &mut relocations, 16, load_string_entry);
-                        let succeeded = ops.new_dynamic_label();
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; blr x16
-                        );
-                        emit_unpublish_transition_frame(
-                            &mut ops,
-                            &inline_windows,
-                            transition_depth,
-                        )?;
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; cbz x0, =>succeeded
-                            ; b =>threw
-                            ; =>succeeded
-                        );
-                        emit_reload_element_transition(
-                            &mut ops,
-                            allocation,
-                            &inline_windows,
-                            instruction.inline,
-                            site,
-                            Some((
-                                dst,
-                                allocation.location(
-                                    instruction
-                                        .result
-                                        .expect("eligibility checked string-load result"),
-                                ),
-                            )),
+                            allocation.location(
+                                instruction
+                                    .result
+                                    .expect("eligibility checked string-load result"),
+                            ),
+                            9,
                         )?;
                     }
                     Op::LooseEqual | Op::LooseNotEqual => {

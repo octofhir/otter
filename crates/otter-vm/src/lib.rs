@@ -839,9 +839,11 @@ pub struct Interpreter {
     /// Per-context string constant cache. `LoadString` materializes immutable
     /// primitive string literals once per linked chunk identity and
     /// constant-pool index, then reuses the GC string handle on later
-    /// executions. Values are traced from [`RuntimeState::trace_roots`] so a
-    /// moving collection can rewrite cached handles in place.
-    string_constant_cache: rustc_hash::FxHashMap<(usize, u32), Value>,
+    /// executions. Boxed cells retain a stable address across hash-table growth
+    /// so generated code may read a prepared cell directly. Values are traced
+    /// from [`RuntimeState::trace_roots`] so a moving collection rewrites each
+    /// cached handle in place.
+    string_constant_cache: rustc_hash::FxHashMap<(usize, u32), Box<Value>>,
     /// Decimal strings for small non-negative integers, served on demand
     /// (JSC `SmallStrings` / V8 number-string-cache idea, adapted). Integer →
     /// string is one of the most repeated allocations in real code (`"" + n`,
@@ -1502,7 +1504,7 @@ impl Interpreter {
 
     /// Root-tracing view of cached string constants.
     pub(crate) fn string_constants_for_trace(&self) -> impl Iterator<Item = &Value> {
-        self.string_constant_cache.values()
+        self.string_constant_cache.values().map(Box::as_ref)
     }
 
     /// Upper bound (exclusive) of the cached small-integer decimal strings.
@@ -1605,6 +1607,17 @@ impl Interpreter {
     }
 
     #[cfg(test)]
+    fn string_constant_cell_addr_for_test(
+        &self,
+        context: &ExecutionContext,
+        idx: u32,
+    ) -> Option<usize> {
+        self.string_constant_cache
+            .get(&context.constant_cache_key(idx))
+            .map(|cell| std::ptr::from_ref::<Value>(cell.as_ref()) as usize)
+    }
+
+    #[cfg(test)]
     fn bigint_constant_cache_len_for_test(&self) -> usize {
         self.bigint_constant_cache.len()
     }
@@ -1629,14 +1642,14 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         let key = context.constant_cache_key(idx);
         if let Some(value) = self.string_constant_cache.get(&key) {
-            return Ok(*value);
+            return Ok(**value);
         }
         let units = context
             .string_constant_units(idx)
             .ok_or_else(|| VmError::InvalidOperand)?;
         let string = JsString::from_utf16_units(units, self.gc_heap_mut())?;
         let value = Value::string(string);
-        self.string_constant_cache.insert(key, value);
+        self.string_constant_cache.insert(key, Box::new(value));
         Ok(value)
     }
 

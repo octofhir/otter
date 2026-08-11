@@ -17,6 +17,7 @@ otter-macros = { workspace = true }
 otter-runtime = { workspace = true }
 otter-xml = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
+rustc-hash = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 smallvec = { workspace = true }

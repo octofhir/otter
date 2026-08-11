@@ -231,6 +231,26 @@ fn otter_xml_parses_both_shapes_and_reports_bad_documents() {
               "node"
             );
 
+            // One parse-wide attribute string may be shared by many completed
+            // objects in either output shape.
+            check(
+              Otter.XML.parse("<r><e a='same'/><e a='same'/><e a='same'/></r>"),
+              { r: { e: [
+                  { "@a": "same" },
+                  { "@a": "same" },
+                  { "@a": "same" },
+              ] } },
+              "repeated compact attribute value"
+            );
+            check(
+              Otter.XML.parse("<r><e a='same'/><e a='same'/></r>", { compact: false }),
+              { name: "r", attributes: {}, children: [
+                  { name: "e", attributes: { a: "same" }, children: [] },
+                  { name: "e", attributes: { a: "same" }, children: [] },
+              ] },
+              "repeated node attribute value"
+            );
+
             // Entities, CDATA and line ends are resolved before the value is built.
             check(
               Otter.XML.parse("<a>&lt;&#65;<![CDATA[<raw>]]>x\r\ny</a>"),

@@ -881,9 +881,18 @@ impl Interpreter {
     /// cage base.
     pub(crate) fn bake_string_layout(view: &mut jit::JitCompileSnapshot) {
         let header = otter_gc::header::HEADER_SIZE as u32;
+        let repr = header + std::mem::offset_of!(crate::string::JsStringBody, repr) as u32;
         view.string_layout = jit::JitStringLayout {
             string_type_tag: crate::string::JS_STRING_BODY_TYPE_TAG,
             string_len_byte: header + std::mem::offset_of!(crate::string::JsStringBody, len) as u32,
+            string_repr_byte: repr,
+            string_repr_payload_byte: repr
+                + crate::string::gc_body::STRING_REPR_PAYLOAD_BYTE as u32,
+            string_body_size: header + std::mem::size_of::<crate::string::JsStringBody>() as u32,
+            inline_flat_tag: crate::string::gc_body::STRING_REPR_INLINE_FLAT,
+            seq_flat_tag: crate::string::gc_body::STRING_REPR_SEQ_FLAT,
+            inline_latin1_tag: crate::string::gc_body::STRING_REPR_INLINE_LATIN1,
+            seq_latin1_tag: crate::string::gc_body::STRING_REPR_SEQ_LATIN1,
         };
         view.cage_base = otter_gc::cage_base() as usize;
     }

@@ -1009,6 +1009,20 @@ pub struct JitStringLayout {
     pub string_type_tag: u8,
     /// Offset to `JsStringBody.len`, the UTF-16 code-unit length.
     pub string_len_byte: u32,
+    /// Offset to the stable [`crate::string::JsStringBodyRepr`] tag.
+    pub string_repr_byte: u32,
+    /// Offset to the contiguous representation payload.
+    pub string_repr_payload_byte: u32,
+    /// Offset immediately after the body, where sequential units begin.
+    pub string_body_size: u32,
+    /// Stable tag for inline UTF-16 units.
+    pub inline_flat_tag: u8,
+    /// Stable tag for sequential UTF-16 units.
+    pub seq_flat_tag: u8,
+    /// Stable tag for inline Latin-1 units.
+    pub inline_latin1_tag: u8,
+    /// Stable tag for sequential Latin-1 units.
+    pub seq_latin1_tag: u8,
 }
 
 /// Static GC layout the optimizing tier needs to emit an inline generational

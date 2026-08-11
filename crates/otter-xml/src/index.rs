@@ -28,7 +28,7 @@
 use crate::chars::is_char;
 use crate::encoding::{Encoding, Unit, Utf8};
 use crate::error::{Error, ErrorKind, Result};
-use crate::simd::{self, BLOCK, Classifier};
+use crate::simd::{self, BLOCK, Kernels, PRECEDING};
 
 /// The positions a scanner may have to stop at, in ascending order.
 #[derive(Debug, Default)]
@@ -83,12 +83,12 @@ pub fn build<E: Encoding>(units: &[E::Unit]) -> Result<Index> {
 /// # Errors
 /// As [`build`].
 pub fn bytes(document: &[u8], validate_utf8: bool, out: &mut Vec<u32>) -> Result<()> {
-    bytes_with(document, validate_utf8, out, simd::classifier())
+    bytes_with(document, validate_utf8, out, simd::current())
 }
 
-/// [`bytes`], with the classification kernel named explicitly.
+/// [`bytes`], with the kernels named explicitly.
 ///
-/// Tests use this to run the portable classifier against the one this machine
+/// Tests use this to run the portable kernels against the ones this machine
 /// would otherwise pick.
 ///
 /// # Errors
@@ -97,13 +97,19 @@ pub fn bytes_with(
     document: &[u8],
     validate_utf8: bool,
     out: &mut Vec<u32>,
-    classify: Classifier,
+    kernels: Kernels,
 ) -> Result<()> {
+    let Kernels { classify, validate } = kernels;
     let mut padded = [b' '; BLOCK];
+    // The bytes before the block being checked, so a sequence that straddles
+    // the boundary is still whole. They are read out of the document itself,
+    // which costs nothing per block; before the first block they are zeros,
+    // which are ASCII and so leave nothing owed.
+    let opening = [0u8; PRECEDING];
     let mut base = 0;
-    // How far the encoding has been checked; a sequence may run past the end
-    // of the block that started it.
-    let mut checked = 0usize;
+    // Whether anything above ASCII has been seen, which is the only reason
+    // the walk has to be closed off at the end.
+    let mut any_nonascii = false;
     while base < document.len() {
         let take = (document.len() - base).min(BLOCK);
         let block: &[u8; BLOCK] = if take == BLOCK {
@@ -131,17 +137,48 @@ pub fn bytes_with(
             out.push((base + structural.trailing_zeros() as usize) as u32);
             structural &= structural - 1;
         }
-        if validate_utf8 && masks.nonascii != 0 {
-            let first = base + masks.nonascii.trailing_zeros() as usize;
-            checked = check_utf8(document, checked.max(first), base + take)?;
+        // The vector check answers for the whole block at once, so legal text
+        // in any script costs no decoding at all. Only a block it rejects is
+        // walked, and only to say where and why.
+        if validate_utf8 && (masks.nonascii != 0 || any_nonascii) {
+            let preceding: &[u8; PRECEDING] = if base >= PRECEDING {
+                document[base - PRECEDING..base]
+                    .try_into()
+                    .expect("a fixed-width window is exactly that wide")
+            } else {
+                &opening
+            };
+            if validate(preceding, block) != 0 {
+                // The decoder says where and why. It starts from the top of
+                // the document because a sequence may have begun in an
+                // earlier block, and this is the failing path, walked once.
+                check_utf8(document, 0, base + take)?;
+            }
+            any_nonascii = masks.nonascii != 0;
         }
         base += take;
+    }
+    // A sequence the document ends inside owes bytes that never came. One
+    // block of spaces past the end demands them; what precedes that block is
+    // the tail of the last one, padding included.
+    if validate_utf8 && any_nonascii {
+        let mut tail = [b' '; PRECEDING];
+        let last = document.len().next_multiple_of(BLOCK);
+        if last == document.len() {
+            tail.copy_from_slice(&document[document.len() - PRECEDING..]);
+        } else {
+            tail.copy_from_slice(&padded[BLOCK - PRECEDING..]);
+        }
+        if validate(&tail, &[b' '; BLOCK]) != 0 {
+            check_utf8(document, 0, document.len())?;
+        }
     }
     Ok(())
 }
 
 /// Check that `document[from..]` spells legal characters at least as far as
-/// `to`, and report how far that took.
+/// `to`, and report how far that took. This is the slow path: the vector
+/// check sends the walk here only for a block it has already rejected.
 fn check_utf8(document: &[u8], from: usize, to: usize) -> Result<usize> {
     let mut pos = from;
     while pos < to {

@@ -1,8 +1,10 @@
-//! Vector classification of one block of document bytes.
+//! Vector classification and checking of one block of document bytes.
 //!
 //! # Contents
 //! - [`Masks`] — the three bit sets one 64-byte block yields.
-//! - [`Classifier`] — the kernel picked for this machine.
+//! - [`Classifier`] — what a block holds; [`Validator`] — whether its UTF-8
+//!   is legal.
+//! - [`Kernels`] — the pair an instruction set provides, picked together.
 //! - [`LUT_LO`] / [`LUT_HI`] — the nibble tables the kernels share with the
 //!   portable classifier, so the two cannot drift apart.
 //!
@@ -10,19 +12,26 @@
 //! - A kernel answers for exactly 64 bytes; callers pad a short tail with a
 //!   byte that classifies as nothing (a space).
 //! - Bit `n` of every mask describes byte `n` of the block.
-//! - Every kernel returns what [`classify_scalar`] returns. That is a test,
-//!   not a hope: `tests/index_agreement.rs` runs both over random input.
+//! - A machine runs one instruction set's kernels or another's, never one of
+//!   each: [`Kernels`] is what the dispatcher hands out.
+//! - Every kernel returns what [`classify_scalar`] / [`validate_scalar`]
+//!   return. That is a test, not a hope: `tests/index_agreement.rs` runs them
+//!   over random input.
 //! - The tables classify by nibble pair: `LUT_LO[low] & LUT_HI[high]` is
 //!   non-zero only for bytes that are structural or forbidden, which is what
 //!   lets one shuffle pair replace a ladder of comparisons.
 //!
 //! # See also
+//! - [`utf8`] — the UTF-8 tables and what they decide.
 //! - [`crate::index`] — the only caller.
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
+pub mod utf8;
 #[cfg(target_arch = "x86_64")]
 mod x86;
+
+pub use utf8::{PRECEDING, Validator, validate_scalar};
 
 /// How many bytes one classification covers.
 pub const BLOCK: usize = 64;
@@ -92,72 +101,86 @@ pub struct Masks {
 /// A kernel that classifies one block.
 pub type Classifier = fn(&[u8; BLOCK]) -> Masks;
 
-/// Every classifier this machine can actually run, named, portable one last.
+/// The pair of kernels one instruction set provides.
+#[derive(Debug, Clone, Copy)]
+pub struct Kernels {
+    /// What the block holds.
+    pub classify: Classifier,
+    /// Whether the block's UTF-8 is legal, given the block before it.
+    pub validate: Validator,
+}
+
+/// The portable pair, which every machine can run.
+pub const PORTABLE: Kernels = Kernels {
+    classify: classify_scalar,
+    validate: validate_scalar,
+};
+
+/// Every kernel pair this machine can actually run, named, portable one last.
 ///
 /// The dispatcher only ever hands out the first of these, but a machine that
-/// can run more than one kernel should be shown to agree on all of them, so
-/// the agreement test walks this list rather than [`classifier`] alone.
+/// can run more than one should be shown to agree on all of them, so the
+/// agreement test walks this list rather than [`current`] alone.
 #[must_use]
-pub fn kernels() -> Vec<(&'static str, Classifier)> {
+pub fn kernels() -> Vec<(&'static str, Kernels)> {
     let mut all = vector_kernels();
-    all.push(("scalar", classify_scalar));
+    all.push(("scalar", PORTABLE));
     all
 }
 
 /// The vector kernels this machine can run, best first.
 #[cfg(target_arch = "aarch64")]
-fn vector_kernels() -> Vec<(&'static str, Classifier)> {
-    vec![("neon", aarch64::classify_neon)]
+fn vector_kernels() -> Vec<(&'static str, Kernels)> {
+    vec![(
+        "neon",
+        Kernels {
+            classify: aarch64::classify_neon,
+            validate: aarch64::validate_neon,
+        },
+    )]
 }
 
 /// The vector kernels this machine can run, best first.
 #[cfg(target_arch = "x86_64")]
-fn vector_kernels() -> Vec<(&'static str, Classifier)> {
-    let mut all: Vec<(&'static str, Classifier)> = Vec::new();
+fn vector_kernels() -> Vec<(&'static str, Kernels)> {
+    let mut all: Vec<(&'static str, Kernels)> = Vec::new();
     if is_x86_feature_detected!("avx2") {
-        all.push(("avx2", x86::classify_avx2));
+        all.push((
+            "avx2",
+            Kernels {
+                classify: x86::classify_avx2,
+                validate: x86::validate_avx2,
+            },
+        ));
     }
     if is_x86_feature_detected!("ssse3") {
-        all.push(("ssse3", x86::classify_ssse3));
+        all.push((
+            "ssse3",
+            Kernels {
+                classify: x86::classify_ssse3,
+                validate: x86::validate_ssse3,
+            },
+        ));
     }
     all
 }
 
 /// The vector kernels this machine can run: none, on a target with no kernel.
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-fn vector_kernels() -> Vec<(&'static str, Classifier)> {
+fn vector_kernels() -> Vec<(&'static str, Kernels)> {
     Vec::new()
 }
 
-/// The best classifier this machine can run.
+/// The best kernels this machine can run.
 ///
 /// Advanced SIMD is part of the base aarch64 ABI, so there is nothing to
-/// detect there.
-#[cfg(target_arch = "aarch64")]
+/// detect there; elsewhere the choice is made at run time, and a target with
+/// no kernel of its own gets the portable pair.
 #[must_use]
-pub fn classifier() -> Classifier {
-    aarch64::classify_neon
-}
-
-/// The best classifier this machine can run, decided at run time.
-#[cfg(target_arch = "x86_64")]
-#[must_use]
-pub fn classifier() -> Classifier {
-    if is_x86_feature_detected!("avx2") {
-        return x86::classify_avx2;
-    }
-    if is_x86_feature_detected!("ssse3") {
-        return x86::classify_ssse3;
-    }
-    classify_scalar
-}
-
-/// The best classifier this machine can run. Targets with no kernel of their
-/// own get the portable one.
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-#[must_use]
-pub fn classifier() -> Classifier {
-    classify_scalar
+pub fn current() -> Kernels {
+    vector_kernels()
+        .first()
+        .map_or(PORTABLE, |(_, kernels)| *kernels)
 }
 
 /// The portable classifier, and the definition every kernel answers to.
@@ -219,7 +242,7 @@ mod tests {
         block[31] = b'&';
         block[63] = 0x01;
         block[7] = 0xC3;
-        let masks = classifier()(&block);
+        let masks = (current().classify)(&block);
         assert_eq!(masks.structural, (1 << 0) | (1 << 31));
         assert_eq!(masks.forbidden, 1 << 63);
         assert_eq!(masks.nonascii, 1 << 7);

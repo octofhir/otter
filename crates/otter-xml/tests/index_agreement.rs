@@ -1,28 +1,30 @@
-//! The vector classifier and the portable one must answer identically.
+//! The vector kernels and the portable ones must answer identically.
 //!
 //! The kernels are hand-written intrinsics, so this is the gate that keeps
 //! them honest: same positions, same first failure, on random input, on every
 //! alignment of a block boundary, and on documents larger than one block.
+//! It covers both halves of a kernel pair — what a block holds, and whether
+//! its UTF-8 is legal.
 
 use otter_xml::index::bytes_with;
-use otter_xml::simd::{BLOCK, Classifier, classify_scalar, kernels};
+use otter_xml::simd::{BLOCK, Kernels, PORTABLE, PRECEDING, kernels, validate_scalar};
 
 /// What one indexing run produced.
 type Answer = (Result<(), String>, Vec<u32>);
 
-fn index_with(document: &[u8], validate_utf8: bool, classify: Classifier) -> Answer {
+fn index_with(document: &[u8], validate_utf8: bool, kernels: Kernels) -> Answer {
     let mut out = Vec::new();
     let result =
-        bytes_with(document, validate_utf8, &mut out, classify).map_err(|err| err.to_string());
+        bytes_with(document, validate_utf8, &mut out, kernels).map_err(|err| err.to_string());
     (result, out)
 }
 
 /// Every kernel this machine can run must give what the portable one gives.
 fn assert_agree(document: &[u8], note: &str) {
     for validate_utf8 in [true, false] {
-        let portable = index_with(document, validate_utf8, classify_scalar);
-        for (name, classify) in kernels() {
-            let answer = index_with(document, validate_utf8, classify);
+        let portable = index_with(document, validate_utf8, PORTABLE);
+        for (name, kernels) in kernels() {
+            let answer = index_with(document, validate_utf8, kernels);
             assert_eq!(
                 answer,
                 portable,
@@ -127,6 +129,66 @@ fn every_byte_value_classifies_the_same_way_at_every_position() {
             let mut document = b"x".repeat(at + 1);
             document[at] = byte;
             assert_agree(&document, &format!("byte {byte:#04x} at {at}"));
+        }
+    }
+}
+
+#[test]
+fn every_kernel_checks_utf8_bit_for_bit_as_the_portable_one_does() {
+    // Going through the index would hide a kernel that rejects a block the
+    // portable checker accepts: the decoder is asked either way and has the
+    // last word. Comparing the masks directly does not hide it.
+    let mut state = 0x243F_6A88_85A3_08D3;
+    for round in 0..20_000 {
+        let mut prev = [0u8; PRECEDING];
+        let mut block = [0u8; BLOCK];
+        for byte in prev.iter_mut().chain(block.iter_mut()) {
+            *byte = ALPHABET[(xorshift(&mut state) as usize) % ALPHABET.len()];
+        }
+        let portable = validate_scalar(&prev, &block);
+        for (name, kernel) in kernels() {
+            assert_eq!(
+                (kernel.validate)(&prev, &block),
+                portable,
+                "{name}: round {round}, prev {prev:02X?}, block {block:02X?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_kernel_checks_a_sequence_at_every_position_of_a_block() {
+    // Each of the four positions a sequence can start relative to a vector
+    // lane, and each of the boundaries between them.
+    for sequence in [
+        &b"\xC3\xA9"[..],
+        b"\xE6\xBC\xA2",
+        b"\xF0\x9F\x99\x82",
+        b"\xEF\xBF\xBE",
+        b"\xED\xA0\x80",
+        b"\xC0\xAF",
+        b"\xF5\x80\x80\x80",
+        b"\xE2\x82",
+    ] {
+        for at in 0..(PRECEDING + BLOCK) {
+            let mut prev = [b'x'; PRECEDING];
+            let mut block = [b'y'; BLOCK];
+            for (offset, byte) in sequence.iter().enumerate() {
+                let position = at + offset;
+                if position < PRECEDING {
+                    prev[position] = *byte;
+                } else if position - PRECEDING < BLOCK {
+                    block[position - PRECEDING] = *byte;
+                }
+            }
+            let portable = validate_scalar(&prev, &block);
+            for (name, kernel) in kernels() {
+                assert_eq!(
+                    (kernel.validate)(&prev, &block),
+                    portable,
+                    "{name}: {sequence:02X?} at {at}"
+                );
+            }
         }
     }
 }

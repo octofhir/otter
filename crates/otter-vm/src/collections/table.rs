@@ -83,6 +83,16 @@ pub struct OrderedTableBody<E> {
     _entry: PhantomData<E>,
 }
 
+/// Stable header offsets consumed by generated collection probes.
+pub(crate) const ORDERED_TABLE_LEN_OFFSET: usize = std::mem::offset_of!(OrderedTableBody<()>, len);
+pub(crate) const ORDERED_TABLE_BUCKET_MASK_OFFSET: usize =
+    std::mem::offset_of!(OrderedTableBody<()>, bucket_mask);
+pub(crate) const ORDERED_TABLE_BODY_SIZE: usize = std::mem::size_of::<OrderedTableBody<()>>();
+
+const _: () = assert!(ORDERED_TABLE_LEN_OFFSET == 4);
+const _: () = assert!(ORDERED_TABLE_BUCKET_MASK_OFFSET == 8);
+const _: () = assert!(ORDERED_TABLE_BODY_SIZE == 16);
+
 impl<E: TableEntry> OrderedTableBody<E> {
     /// Buckets a table of `capacity` entries uses.
     ///

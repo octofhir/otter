@@ -16,6 +16,8 @@
 //!   without a Rust leaf transition.
 //! - Identity-guarded `String.prototype.charCodeAt(Int32)` and single-unit
 //!   `indexOf(String)` completion over contiguous Latin-1 / UTF-16 bodies.
+//! - Identity-guarded compact `Map.get(Int32)` and existing-key
+//!   `Map.set(Int32, value)` completion without a Rust collection entry.
 //! - Guarded plain- and method-callee splicing with multi-frame exact-PC
 //!   deoptimization and synthetic `this` binding.
 //! - Loop-invariant method-identity caching and receiver-property guard fusion.
@@ -94,6 +96,10 @@
 //!   They read immutable contiguous bodies directly; ropes, slices, coercive
 //!   arguments, out-of-range `charCodeAt`, and searches longer than 256 code
 //!   units enter the canonical method transition before observable effects.
+//! - Map intrinsics execute only after the exact bootstrap identity guard and
+//!   probe the baked compact old-space table. Missing keys, numeric
+//!   representation aliases, and bounded-chain exhaustion enter the canonical
+//!   method transition before effects.
 //! - A spliced method guard may be cached only when the receiver is defined
 //!   outside one natural loop and every loop operation is non-mutating and
 //!   non-reentrant. Entry and OSR initialize the cache independently; the
@@ -193,6 +199,9 @@ use emit_support::*;
 
 mod string_intrinsics;
 use string_intrinsics::*;
+
+mod map_intrinsics;
+use map_intrinsics::*;
 
 #[cfg(test)]
 mod tests;
@@ -2837,7 +2846,32 @@ fn emit(
                             // did not settle on is a slower call, not a wrong
                             // speculation to deoptimize over.
                             let leaf_miss = ops.new_dynamic_label();
-                            if guarded_string_intrinsic_is_supported(
+                            if guarded_map_intrinsic_is_supported(
+                                call.entry_stub_id,
+                                reprs,
+                                instruction,
+                                view,
+                            ) {
+                                emit_guarded_method_guard_preserving_receiver(
+                                    &mut ops,
+                                    &mut relocations,
+                                    view,
+                                    call,
+                                    receiver,
+                                    byte_pc,
+                                    leaf_miss,
+                                )?;
+                                emit_guarded_map_intrinsic_body(
+                                    &mut ops,
+                                    &mut relocations,
+                                    view,
+                                    call.entry_stub_id,
+                                    reprs,
+                                    allocation,
+                                    instruction,
+                                    leaf_miss,
+                                )?;
+                            } else if guarded_string_intrinsic_is_supported(
                                 call.entry_stub_id,
                                 reprs,
                                 instruction,

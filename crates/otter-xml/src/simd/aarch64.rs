@@ -4,6 +4,7 @@
 //! - [`classify_neon`] — the kernel [`super::classifier`] hands out on
 //!   aarch64.
 //! - [`validate_neon`] — the UTF-8 checker that goes with it.
+//! - [`classify_units_neon`] — the same for a document of UTF-16 units.
 //!
 //! # Invariants
 //! - Advanced SIMD is part of the base aarch64 ABI, so the kernels need no
@@ -17,13 +18,19 @@
 //! - [`super`] — the tables and the definitions these answer to.
 
 use core::arch::aarch64::{
-    uint8x16_t, vaddv_u8, vandq_u8, vceqq_u8, vdupq_n_u8, veorq_u8, vextq_u8, vget_high_u8,
-    vget_low_u8, vld1q_u8, vorrq_u8, vqsubq_u8, vqtbl1q_u8, vshrq_n_u8, vtstq_u8,
+    uint8x16_t, uint16x8_t, vaddv_u8, vand_u8, vandq_u8, vandq_u16, vbicq_u16, vceqq_u8, vceqq_u16,
+    vcgeq_u16, vcleq_u16, vdupq_n_u8, vdupq_n_u16, veorq_u8, vextq_u8, vget_high_u8, vget_low_u8,
+    vld1_u8, vld1q_u8, vld1q_u16, vmovn_u16, vorrq_u8, vorrq_u16, vqsubq_u8, vqtbl1q_u8,
+    vshrq_n_u8, vtstq_u8,
 };
 
 use super::utf8::{
     FOURTH_BYTE_BIAS, LEAD_HIGH, LEAD_LOW, NONCHAR_LEAD, NONCHAR_SECOND, NONCHAR_THIRD,
     NONCHAR_THIRD_MASK, PRECEDING, SECOND_HIGH, THIRD_BYTE_BIAS,
+};
+use super::utf16::{
+    FIRST_NONCHARACTER, HIGH_SURROGATE, LAST_CONTROL, LOW_SURROGATE, SURROGATE_MASK, UNIT_BLOCK,
+    UnitMasks,
 };
 use super::{BLOCK, FORBIDDEN_BITS, LUT_HI, LUT_LO, Masks, STRUCTURAL_BITS};
 
@@ -144,5 +151,70 @@ unsafe fn validate(prev: &[u8; PRECEDING], block: &[u8; BLOCK]) -> u64 {
             error |= u64::from(movemask(vtstq_u8(wrong, wrong))) << (lane * 16);
         }
         error
+    }
+}
+
+/// Classify one block of UTF-16 code units with Advanced SIMD.
+#[must_use]
+pub fn classify_units_neon(block: &[u16; UNIT_BLOCK]) -> UnitMasks {
+    // SAFETY: Advanced SIMD is guaranteed by the aarch64 ABI, and `units`
+    // reads only the block it was given.
+    unsafe { units(block) }
+}
+
+/// Gather the high bit of each 16-bit lane of a comparison result into one
+/// byte. Narrowing keeps the low byte of each lane, which for a comparison
+/// result is `0xFF` or `0x00`.
+#[target_feature(enable = "neon")]
+unsafe fn movemask16(vector: uint16x8_t) -> u8 {
+    const BITS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+    // SAFETY: `BITS` is exactly one half-vector wide.
+    unsafe { vaddv_u8(vand_u8(vmovn_u16(vector), vld1_u8(BITS.as_ptr()))) }
+}
+
+#[target_feature(enable = "neon")]
+unsafe fn units(block: &[u16; UNIT_BLOCK]) -> UnitMasks {
+    // SAFETY: every load below stays inside `block`.
+    unsafe {
+        let last_control = vdupq_n_u16(LAST_CONTROL);
+        let first_noncharacter = vdupq_n_u16(FIRST_NONCHARACTER);
+        let surrogate_mask = vdupq_n_u16(SURROGATE_MASK);
+        let high_surrogate = vdupq_n_u16(HIGH_SURROGATE);
+        let low_surrogate = vdupq_n_u16(LOW_SURROGATE);
+        let tab = vdupq_n_u16(0x09);
+        let newline = vdupq_n_u16(0x0A);
+        let carriage_return = vdupq_n_u16(0x0D);
+        let less_than = vdupq_n_u16(0x3C);
+        let greater_than = vdupq_n_u16(0x3E);
+        let ampersand = vdupq_n_u16(0x26);
+
+        let mut masks = UnitMasks::default();
+        for lane in 0..UNIT_BLOCK / 8 {
+            let value = vld1q_u16(block.as_ptr().add(lane * 8));
+            let is_return = vceqq_u16(value, carriage_return);
+
+            let structural = vorrq_u16(
+                vorrq_u16(vceqq_u16(value, less_than), vceqq_u16(value, greater_than)),
+                vorrq_u16(vceqq_u16(value, ampersand), is_return),
+            );
+            // A control that is not one of the three the grammar keeps, or
+            // one of the two code points it bars at the top of the plane.
+            let allowed_control = vorrq_u16(
+                vorrq_u16(vceqq_u16(value, tab), vceqq_u16(value, newline)),
+                is_return,
+            );
+            let forbidden = vorrq_u16(
+                vbicq_u16(vcleq_u16(value, last_control), allowed_control),
+                vcgeq_u16(value, first_noncharacter),
+            );
+            let surrogate = vandq_u16(value, surrogate_mask);
+
+            let shift = lane * 8;
+            masks.structural |= u64::from(movemask16(structural)) << shift;
+            masks.forbidden |= u64::from(movemask16(forbidden)) << shift;
+            masks.high |= u64::from(movemask16(vceqq_u16(surrogate, high_surrogate))) << shift;
+            masks.low |= u64::from(movemask16(vceqq_u16(surrogate, low_surrogate))) << shift;
+        }
+        masks
     }
 }

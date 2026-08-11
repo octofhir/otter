@@ -246,7 +246,7 @@ impl Encoding for Utf16 {
     }
 
     fn index_into(document: &[u16], out: &mut Vec<u32>) -> Result<()> {
-        crate::index::units::<Self>(document, out)
+        crate::index::utf16(document, out)
     }
 }
 

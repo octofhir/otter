@@ -4,7 +4,8 @@
 //! - Direct `Map.get(Int32)` and existing-key `Map.set(Int32, value)`.
 //! - Missing keys, tombstones, growth, SameValueZero fallback, and barriers.
 //! - Method replacement and own-method shadowing after tier-up.
-//! - Artifact proof that supported calls do not retain their Rust leaf ABI.
+//! - Artifact proof that generated hits retain neither a Rust leaf ABI nor a
+//!   published transition-frame prelude.
 //!
 //! # Invariants
 //! - Optimizing results match the interpreter oracle exactly.
@@ -115,7 +116,7 @@ fn optimizing_map_intrinsics_match_oracle_and_preserve_fallbacks() {
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn optimizing_map_artifacts_have_no_replaced_leaf_relocations() {
+fn optimizing_map_artifacts_expose_frame_free_machine_hits() {
     use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitDebugTier};
 
     let mut runtime = Runtime::builder()
@@ -151,5 +152,35 @@ fn optimizing_map_artifacts_have_no_replaced_leaf_relocations() {
     assert!(
         !relocations.contains("collection_map_set_mutating"),
         "existing-key Map.set must complete without the Rust leaf ABI: {relocations}"
+    );
+    let optimized_ir = optimizing
+        .iter()
+        .filter_map(|bundle| bundle.file(JitArtifactFileName::OptimizedIr))
+        .map(|file| std::str::from_utf8(file.contents()).expect("optimized IR is UTF-8"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        optimized_ir.contains("copy-webs=")
+            && optimized_ir.contains("coalesced-values=")
+            && optimized_ir.contains("inactive-values="),
+        "legacy optimizing artifacts must expose allocation-plan pressure: {optimized_ir}"
+    );
+    let machine_intrinsics = optimizing
+        .iter()
+        .filter_map(|bundle| bundle.file(JitArtifactFileName::CodeMap))
+        .map(|file| {
+            let map: serde_json::Value =
+                serde_json::from_slice(file.contents()).expect("valid code-map JSON");
+            map["regions"].as_array().map_or(0, |regions| {
+                regions
+                    .iter()
+                    .filter(|region| region["kind"] == "machineMethodIntrinsic")
+                    .count()
+            })
+        })
+        .sum::<usize>();
+    assert!(
+        machine_intrinsics >= 2,
+        "Map.get and Map.set must each expose a frame-free machine hit"
     );
 }

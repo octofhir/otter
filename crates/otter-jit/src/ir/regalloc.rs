@@ -3,6 +3,7 @@
 //! # Contents
 //! - [`LiveInterval`] — one conservative closed interval per SSA value.
 //! - [`Allocation`] — deterministic register/spill assignments and phi moves.
+//! - Identity-copy webs — one machine home for equivalent SSA values.
 //! - [`RegClass`] and [`RegisterBudget`] — representation-driven register files.
 //! - [`Allocation::compute`] — per-class Poletto-Sarkar linear scan.
 //! - [`Allocation::verify`] — pure structural, interference, and phi-move checks.
@@ -20,8 +21,13 @@
 //! - Phi edge moves preserve parallel-copy semantics and perform only lossless
 //!   representation widening. Each class reserves its register-budget count as
 //!   a move-only scratch never assigned to a value.
-//! - Structurally dead phis emit no edge copy. Backends initialize their homes
-//!   to a representation-valid value at block entry for safe deopt writeback.
+//! - Structurally dead phis emit no edge copy or machine initialization;
+//!   deoptimization reconstructs their representation-valid literal.
+//! - `LoadLocal`, `StoreLocal`, and `Reuse` values with identical
+//!   representations share one home across the union of their intervals.
+//! - Unread rematerializable block-head values consume neither a register nor
+//!   a distinct spill slot; generated code never reads or writes their nominal
+//!   location and deoptimization reconstructs them as literals.
 //! - Allocation reads immutable SSA, CFG, and liveness data and has no runtime
 //!   effect.
 //!
@@ -169,6 +175,12 @@ pub struct Allocation {
     pub register_budget: RegisterBudget,
     /// Number of distinct class-local spill slots assigned to values.
     pub spill_slot_counts: SpillSlotCounts,
+    /// Identity-copy results removed from independent allocation pressure.
+    pub coalesced_value_count: usize,
+    /// Distinct multi-value identity webs sharing one machine home.
+    pub copy_web_count: usize,
+    /// Unread rematerializable heads that own no emitted machine state.
+    pub inactive_value_count: usize,
 }
 
 /// Failure to construct or verify a register allocation.
@@ -379,6 +391,21 @@ pub enum RegallocError {
         /// Stored location.
         actual: Location,
     },
+    /// Stored copy-web statistics differ from the deterministic allocation plan.
+    PlanningStatisticsMismatch {
+        /// Expected number of coalesced identity-copy results.
+        expected_coalesced_values: usize,
+        /// Stored number of coalesced identity-copy results.
+        actual_coalesced_values: usize,
+        /// Expected number of distinct multi-value copy webs.
+        expected_copy_webs: usize,
+        /// Stored number of distinct multi-value copy webs.
+        actual_copy_webs: usize,
+        /// Expected number of inactive rematerializable values.
+        expected_inactive_values: usize,
+        /// Stored number of inactive rematerializable values.
+        actual_inactive_values: usize,
+    },
     /// Stored edge-move coverage or ordering differs from normal CFG edges.
     EdgeOrderMismatch {
         /// Edge index at which ordering diverged.
@@ -480,7 +507,10 @@ impl Allocation {
         let merges = MergeLiveness::compute(ssa);
         let linear = linearize(ssa, cfg)?;
         let intervals = build_intervals(ssa, cfg, liveness, &linear, &merges)?;
-        let (locations, spill_slot_counts) = linear_scan(&intervals, reprs, register_budget)?;
+        let plan = AllocationPlan::compute(ssa, reprs, &merges);
+        let (coalesced_value_count, copy_web_count, inactive_value_count) = plan.statistics();
+        let (locations, spill_slot_counts) =
+            linear_scan(&intervals, reprs, register_budget, &plan)?;
         let edge_moves = build_edge_moves(ssa, cfg, reprs, &locations, register_budget, &merges)?;
         Ok(Self {
             locations: locations.into_boxed_slice(),
@@ -488,6 +518,9 @@ impl Allocation {
             edge_moves: edge_moves.into_boxed_slice(),
             register_budget,
             spill_slot_counts,
+            coalesced_value_count,
+            copy_web_count,
+            inactive_value_count,
         })
     }
 
@@ -547,11 +580,27 @@ impl Allocation {
         let linear = linearize(ssa, cfg)?;
         verify_intervals(&self.intervals, ssa, cfg, liveness, &linear, &merges)?;
         self.verify_locations(reprs)?;
-        self.verify_interference()?;
-        self.verify_spills()?;
+        let plan = AllocationPlan::compute(ssa, reprs, &merges);
+        let (expected_coalesced_values, expected_copy_webs, expected_inactive_values) =
+            plan.statistics();
+        if self.coalesced_value_count != expected_coalesced_values
+            || self.copy_web_count != expected_copy_webs
+            || self.inactive_value_count != expected_inactive_values
+        {
+            return Err(RegallocError::PlanningStatisticsMismatch {
+                expected_coalesced_values,
+                actual_coalesced_values: self.coalesced_value_count,
+                expected_copy_webs,
+                actual_copy_webs: self.copy_web_count,
+                expected_inactive_values,
+                actual_inactive_values: self.inactive_value_count,
+            });
+        }
+        self.verify_interference(&plan)?;
+        self.verify_spills(&plan)?;
 
         let (expected_locations, expected_spills) =
-            linear_scan(&self.intervals, reprs, self.register_budget)?;
+            linear_scan(&self.intervals, reprs, self.register_budget, &plan)?;
         for (index, (&expected, &actual)) in expected_locations
             .iter()
             .zip(self.locations.iter())
@@ -614,12 +663,15 @@ impl Allocation {
         Ok(())
     }
 
-    fn verify_interference(&self) -> Result<(), RegallocError> {
+    fn verify_interference(&self, plan: &AllocationPlan) -> Result<(), RegallocError> {
         for first_index in 0..self.intervals.len() {
             for second_index in (first_index + 1)..self.intervals.len() {
                 let first = self.intervals[first_index];
                 let second = self.intervals[second_index];
-                if intervals_overlap(first, second)
+                if !plan.inactive[first_index]
+                    && !plan.inactive[second_index]
+                    && plan.representatives[first_index] != plan.representatives[second_index]
+                    && intervals_overlap(first, second)
                     && let (
                         Location::Register(first_class, first_register),
                         Location::Register(second_class, second_register),
@@ -639,10 +691,10 @@ impl Allocation {
         Ok(())
     }
 
-    fn verify_spills(&self) -> Result<(), RegallocError> {
+    fn verify_spills(&self, plan: &AllocationPlan) -> Result<(), RegallocError> {
         for class in RegClass::ALL {
             let spill_slot_count = self.spill_slot_counts.count(class);
-            let mut owners = BTreeMap::new();
+            let mut owners = BTreeMap::<u32, (Option<ValueId>, ValueId)>::new();
             for (index, &location) in self.locations.iter().enumerate() {
                 let Location::Spill(location_class, slot) = location else {
                     continue;
@@ -659,7 +711,10 @@ impl Allocation {
                         spill_slot_count,
                     });
                 }
-                if let Some(first) = owners.insert(slot, value) {
+                let owner = (!plan.inactive[index]).then_some(plan.representatives[index]);
+                if let Some(&(previous_owner, first)) = owners.get(&slot)
+                    && previous_owner != owner
+                {
                     return Err(RegallocError::SpillSlotAliasing {
                         first,
                         second: value,
@@ -667,6 +722,7 @@ impl Allocation {
                         slot,
                     });
                 }
+                owners.entry(slot).or_insert((owner, value));
             }
             let expected =
                 u32::try_from(owners.len()).map_err(|_| RegallocError::SpillSlotOverflow)?;
@@ -1098,27 +1154,175 @@ fn value_index(value: ValueId, value_count: usize) -> Result<usize, RegallocErro
     Ok(index)
 }
 
+/// Deterministic equivalence and materialization facts used only while
+/// assigning machine homes.
+pub(crate) struct AllocationPlan {
+    representatives: Box<[ValueId]>,
+    inactive: Box<[bool]>,
+}
+
+impl AllocationPlan {
+    pub(crate) fn compute(ssa: &SsaFunction, reprs: &ReprMap, merges: &MergeLiveness) -> Self {
+        let mut parents = (0..ssa.values.len())
+            .map(|index| ValueId(index as u32))
+            .collect::<Vec<_>>();
+        for value in &ssa.values {
+            let ValueDef::Op { op, inputs, .. } = &value.def else {
+                continue;
+            };
+            if !matches!(
+                op,
+                super::ssa::SsaOp::Bytecode(otter_bytecode::Op::LoadLocal)
+                    | super::ssa::SsaOp::Bytecode(otter_bytecode::Op::StoreLocal)
+                    | super::ssa::SsaOp::Reuse
+            ) || inputs.len() != 1
+            {
+                continue;
+            }
+            let input = inputs[0];
+            if reprs.representation(value.id) != reprs.representation(input) {
+                continue;
+            }
+            union_representatives(&mut parents, value.id, input);
+        }
+        for index in 0..parents.len() {
+            let representative = find_representative(&mut parents, ValueId(index as u32));
+            parents[index] = representative;
+        }
+        let inactive = ssa
+            .values
+            .iter()
+            .map(|value| {
+                !merges.has_non_dead_use(value.id)
+                    && (matches!(
+                        value.def,
+                        ValueDef::Uninitialized { .. } | ValueDef::InlineUndefinedReturn { .. }
+                    ) || merges.is_dead_phi(value.id))
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            representatives: parents.into_boxed_slice(),
+            inactive,
+        }
+    }
+
+    /// Whether two SSA identities carry exactly the same immutable bits.
+    #[must_use]
+    pub(crate) fn same_value(&self, first: ValueId, second: ValueId) -> bool {
+        self.representatives
+            .get(first.0 as usize)
+            .zip(self.representatives.get(second.0 as usize))
+            .is_some_and(|(first, second)| first == second)
+    }
+
+    fn statistics(&self) -> (usize, usize, usize) {
+        let coalesced_value_count = self
+            .representatives
+            .iter()
+            .enumerate()
+            .filter(|(index, representative)| representative.0 as usize != *index)
+            .count();
+        let mut web_sizes = BTreeMap::<ValueId, usize>::new();
+        for (index, &representative) in self.representatives.iter().enumerate() {
+            if !self.inactive[index] {
+                *web_sizes.entry(representative).or_default() += 1;
+            }
+        }
+        let copy_web_count = web_sizes.values().filter(|&&size| size > 1).count();
+        let inactive_value_count = self.inactive.iter().filter(|&&inactive| inactive).count();
+        (coalesced_value_count, copy_web_count, inactive_value_count)
+    }
+}
+
+fn find_representative(parents: &mut [ValueId], value: ValueId) -> ValueId {
+    let index = value.0 as usize;
+    let parent = parents[index];
+    if parent == value {
+        return value;
+    }
+    let root = find_representative(parents, parent);
+    parents[index] = root;
+    root
+}
+
+fn union_representatives(parents: &mut [ValueId], first: ValueId, second: ValueId) {
+    let first = find_representative(parents, first);
+    let second = find_representative(parents, second);
+    if first == second {
+        return;
+    }
+    let (root, child) = if first < second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    parents[child.0 as usize] = root;
+}
+
 fn linear_scan(
     intervals: &[LiveInterval],
     reprs: &ReprMap,
     register_budget: RegisterBudget,
+    plan: &AllocationPlan,
 ) -> Result<(Vec<Location>, SpillSlotCounts), RegallocError> {
     let mut locations = vec![None; intervals.len()];
     let mut spill_slot_counts = SpillSlotCounts::default();
     for class in RegClass::ALL {
-        let class_intervals = intervals
-            .iter()
-            .copied()
-            .filter(|interval| {
-                RegClass::from_representation(reprs.representation(interval.value)) == class
-            })
-            .collect::<Vec<_>>();
-        let spill_count = linear_scan_class(
-            &class_intervals,
+        let mut groups = BTreeMap::<ValueId, LiveInterval>::new();
+        for interval in intervals.iter().copied() {
+            let index = interval.value.0 as usize;
+            if plan.inactive[index]
+                || RegClass::from_representation(reprs.representation(interval.value)) != class
+            {
+                continue;
+            }
+            let representative = plan.representatives[index];
+            groups
+                .entry(representative)
+                .and_modify(|group| {
+                    group.start = group.start.min(interval.start);
+                    group.end = group.end.max(interval.end);
+                })
+                .or_insert(LiveInterval {
+                    value: representative,
+                    start: interval.start,
+                    end: interval.end,
+                });
+        }
+        let mut spill_count = linear_scan_class(
+            &groups.into_values().collect::<Vec<_>>(),
             class,
             register_budget.count(class),
             &mut locations,
         )?;
+        let inactive_location = if plan.inactive.iter().enumerate().any(|(index, inactive)| {
+            *inactive
+                && RegClass::from_representation(reprs.representation(ValueId(index as u32)))
+                    == class
+        }) {
+            if register_budget.count(class) == 0 {
+                let location = Location::Spill(class, spill_count);
+                spill_count = spill_count
+                    .checked_add(1)
+                    .ok_or(RegallocError::SpillSlotOverflow)?;
+                Some(location)
+            } else {
+                Some(Location::Register(class, 0))
+            }
+        } else {
+            None
+        };
+        for index in 0..intervals.len() {
+            if RegClass::from_representation(reprs.representation(ValueId(index as u32))) != class {
+                continue;
+            }
+            locations[index] = if plan.inactive[index] {
+                inactive_location
+            } else {
+                locations[plan.representatives[index].0 as usize]
+            };
+        }
         spill_slot_counts.set(class, spill_count);
     }
     let locations = locations
@@ -1718,6 +1922,78 @@ mod tests {
             Allocation::compute(&ssa, &cfg, &liveness, &reprs, budget(4, 4))
                 .expect("deterministic replay")
         );
+    }
+
+    #[test]
+    fn identity_copy_web_shares_one_machine_home() {
+        let (cfg, ssa, liveness, reprs) = analyses(
+            0,
+            3,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(7)]),
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(0), Operand::Imm32(1)],
+                ),
+                (Op::LoadLocal, vec![Operand::Register(2), Operand::Imm32(1)]),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        );
+        let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, budget(1, 1))
+            .expect("allocate copy web");
+        allocation
+            .verify(&ssa, &cfg, &liveness, &reprs)
+            .expect("verify copy web");
+
+        let first = op_value_at(&ssa, 0);
+        let stored = op_value_at(&ssa, 1);
+        let loaded = op_value_at(&ssa, 2);
+        assert_eq!(allocation.location(first), allocation.location(stored));
+        assert_eq!(allocation.location(stored), allocation.location(loaded));
+        assert_eq!(allocation.spill_slot_counts, SpillSlotCounts::default());
+        assert_eq!(allocation.coalesced_value_count, 2);
+        assert_eq!(allocation.copy_web_count, 1);
+    }
+
+    #[test]
+    fn unread_uninitialized_heads_create_no_register_pressure() {
+        let (cfg, ssa, liveness, reprs) =
+            analyses(1, 64, vec![(Op::ReturnValue, vec![Operand::Register(0)])]);
+        let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, budget(1, 1))
+            .expect("allocate sparse entry frame");
+        allocation
+            .verify(&ssa, &cfg, &liveness, &reprs)
+            .expect("verify sparse entry frame");
+
+        assert_eq!(allocation.spill_slot_counts, SpillSlotCounts::default());
+        assert_eq!(allocation.inactive_value_count, 63);
+        assert!(
+            allocation
+                .locations
+                .iter()
+                .all(|location| { *location == Location::Register(RegClass::Gpr, 0) })
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_corrupted_copy_web_statistics() {
+        let (cfg, ssa, liveness, reprs) = analyses(
+            0,
+            2,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(7)]),
+                (Op::LoadLocal, vec![Operand::Register(1), Operand::Imm32(0)]),
+                (Op::ReturnValue, vec![Operand::Register(1)]),
+            ],
+        );
+        let mut allocation =
+            Allocation::compute(&ssa, &cfg, &liveness, &reprs, budget(2, 2)).expect("allocate");
+        allocation.copy_web_count += 1;
+
+        assert!(matches!(
+            allocation.verify(&ssa, &cfg, &liveness, &reprs),
+            Err(RegallocError::PlanningStatisticsMismatch { .. })
+        ));
     }
 
     #[test]

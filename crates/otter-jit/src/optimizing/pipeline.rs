@@ -3,8 +3,8 @@
 //! This module owns the ordered transformation from an immutable VM snapshot to
 //! a verified [`OptimizedUnit`]. Machine backends provide only their register
 //! budget and inline-body acceptance policy; graph construction, SSA, liveness,
-//! representation selection, allocation, deopt legalization, and concrete
-//! frame lowering stay identical across backends.
+//! representation selection, identity-copy coalescing, allocation, deopt
+//! legalization, and concrete frame lowering stay identical across backends.
 //!
 //! # Contents
 //! - [`OptimizationPipeline`] — configuration and whole-unit analysis driver.
@@ -19,6 +19,8 @@
 //!   construction and SSA verification, so every later stage sees one graph.
 //! - Deopt legalization happens after recording raw linear-scan pressure and
 //!   before rebuilding phi edge moves and lowering the concrete deopt table.
+//!   Values in one exact-bit copy web remain one owner during legalization;
+//!   unread rematerializable heads never acquire a concrete home.
 //! - Analysis is pure over the compile snapshot; no executable memory or
 //!   runtime transition address is observed here.
 //!
@@ -42,7 +44,7 @@ use crate::{
         licm::hoist_loop_invariant_accesses,
         liveness::{Liveness, LivenessError},
         lower::lower_settled_property_accesses,
-        regalloc::{Allocation, Location, RegClass, RegallocError, RegisterBudget},
+        regalloc::{Allocation, AllocationPlan, Location, RegClass, RegallocError, RegisterBudget},
         repr::{ReprError, ReprMap},
         ssa::{SsaError, SsaFunction, ValueId},
     },
@@ -265,6 +267,7 @@ fn legalize_deopt_locations(
     merges: &crate::ir::regalloc::MergeLiveness,
 ) -> Result<Allocation, OptimizationError> {
     let mut legalized = allocation.clone();
+    let plan = AllocationPlan::compute(ssa, reprs, merges);
     for state in frame_states.states() {
         let mut owners = BTreeMap::<Location, ValueId>::new();
         let mut frame = Some(state);
@@ -274,7 +277,10 @@ fn legalize_deopt_locations(
                     continue;
                 }
                 let location = legalized.location(value);
-                if owners.get(&location).is_some_and(|owner| *owner != value) {
+                if owners
+                    .get(&location)
+                    .is_some_and(|owner| !plan.same_value(*owner, value))
+                {
                     let class = location.class();
                     let next_spill = match class {
                         RegClass::Gpr => &mut legalized.spill_slot_counts.gpr,

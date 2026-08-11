@@ -18,6 +18,8 @@
 //!   `indexOf(String)` completion over contiguous Latin-1 / UTF-16 bodies.
 //! - Identity-guarded compact `Map.get(Int32)` and existing-key
 //!   `Map.set(Int32, value)` completion without a Rust collection entry.
+//! - Frame-free generated method hits whose guards consume allocated SSA
+//!   receivers and whose tagged results return directly to allocated homes.
 //! - Guarded plain- and method-callee splicing with multi-frame exact-PC
 //!   deoptimization and synthetic `this` binding.
 //! - Multi-site activation-local global-object slot and method-identity
@@ -31,12 +33,14 @@
 //!   and bail exits backed by exact deopt frame states.
 //!
 //! # Invariants
-//! - `x20` retains the sole `JitCtx` argument and `x19` retains the canonical
-//!   `NativeFrame.register_base`.
-//!   GPR linear-scan registers `0..8` map to `x21..x28`, disjoint from both
-//!   fixed ABI registers; FP registers `0..8` map to the AAPCS64 callee-saved
+//! - `x20` retains the sole `JitCtx` argument. Root interpreter-window access
+//!   reloads its base on the cold path instead of pinning it in `x19`.
+//!   GPR linear-scan registers `0..9` map to callee-saved `x19,x21..x28`;
+//!   FP registers `0..8` map to the AAPCS64 callee-saved
 //!   `d8..d15`. `x8..x15` and `d16..d17` are caller-saved scratch registers.
 //!   GPR spill slots precede FP spill slots in one aligned stack frame.
+//!   Optimizing direct calls and guarded methods use allocator-aware value
+//!   access; no shared template helper may recover a root window through x19.
 //! - Every tagged numeric input, including an element-load result, is checked
 //!   with the VM's frozen number-tag mask before entering an unboxed operation.
 //!   `ToPrimitive` / `ToNumeric` accept only those checked number encodings;
@@ -51,8 +55,8 @@
 //!   exact ECMAScript number semantics; Float64 `Neg` is a native `fneg`.
 //! - Every CFG edge targets a block label in reverse postorder. Sequentialized
 //!   phi moves execute only on their owning edge before its final jump.
-//!   Structurally dead compiler-scratch phis are initialized at block entry
-//!   instead of receiving cross-representation edge copies.
+//!   Structurally dead compiler-scratch phis own no emitted home or edge copy;
+//!   exact deoptimization reconstructs their representation-valid literal.
 //! - Float64 arithmetic never bails for overflow or division by zero. NaNs
 //!   remain unordered in comparisons and are canonicalized whenever boxed.
 //! - Every backwards bytecode edge targets a dominating loop header. Its phi
@@ -96,6 +100,9 @@
 //!   code. A method guard-chain miss completes through the canonical
 //!   `GetMethod + Call` transition; plain-call misses and native-entry lease
 //!   failures take the caller's exact deopt exit.
+//! - Generated Map/string/Math hits never construct a transition frame,
+//!   publish a VM PC, or round-trip their result through the interpreter
+//!   window. Their cold miss performs all three before generic reentry.
 //! - An Int32 Math intrinsic executes only after the same exact bootstrap
 //!   identity guard as its declared leaf call. `abs(INT32_MIN)` materializes
 //!   the representable Number `2147483648`; every other supported result stays
@@ -145,7 +152,7 @@ use otter_vm::native_abi::{
     STUB_JIT_STORE_UPVALUE_CHECKED, STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT, SafepointId,
     SafepointRecord,
 };
-use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG};
+use otter_vm::{JitCompileSnapshot, JitGuardedReceiver, closure::JS_CLOSURE_BODY_TYPE_TAG};
 
 use crate::template::arm64::ic_probe;
 
@@ -161,7 +168,7 @@ use crate::{
     CompiledCode,
     arm64::{
         DirectCallArguments, DirectCallForm, DirectCallSite, direct_call_target_is_supported,
-        emit_direct_call, emit_direct_call_with_access, emit_method_guard_from_tagged_register,
+        emit_direct_call_with_access, emit_method_guard_from_tagged_register,
     },
     artifact::{
         ArtifactRequest, CodeMapCapture, CodeRegion, NativeCompileOutput, build_bundle,
@@ -198,11 +205,12 @@ use crate::{
     },
     template::arm64::ic_probe::{
         DenseIndexForm, element_access_for, emit_element_address, emit_element_read,
-        emit_element_write, emit_guarded_exotic_method_receiver_preserving_receiver,
-        emit_guarded_method_call, emit_guarded_method_guard,
-        emit_guarded_method_guard_preserving_receiver, emit_native_leaf_call,
-        emit_native_leaf_guard, guarded_method_call_is_supported, native_leaf_call_is_supported,
-        native_leaf_call_name,
+        emit_element_write,
+        emit_guarded_exotic_method_receiver_preserving_receiver_from_tagged_register,
+        emit_guarded_method_guard_from_tagged_register,
+        emit_guarded_method_guard_preserving_receiver_from_tagged_register, emit_native_entry_call,
+        emit_native_leaf_call, emit_native_leaf_guard, guarded_method_call_is_supported,
+        native_leaf_call_is_supported, native_leaf_call_name,
     },
     template::arm64::values::{CellTest, emit_cell_test},
 };
@@ -222,12 +230,13 @@ use map_intrinsics::*;
 #[cfg(test)]
 mod tests;
 
-const ALLOCATABLE_REGISTER_COUNT: u8 = 8;
+const ALLOCATABLE_REGISTER_COUNT: u8 = 9;
 const REGISTER_BUDGET: RegisterBudget = RegisterBudget {
     gpr: ALLOCATABLE_REGISTER_COUNT,
     fp: 8,
 };
-const VALUE_REGISTERS: [u8; ALLOCATABLE_REGISTER_COUNT as usize] = [21, 22, 23, 24, 25, 26, 27, 28];
+const VALUE_REGISTERS: [u8; ALLOCATABLE_REGISTER_COUNT as usize] =
+    [19, 21, 22, 23, 24, 25, 26, 27, 28];
 /// Where a spilled holder address is materialized for the node that reads it.
 const HEADER_SCRATCH: u8 = 13;
 /// Where the base of a spliced frame's interpreter window is materialized for
@@ -237,7 +246,7 @@ const FP_REGISTERS: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
 const FP_SCRATCH: u8 = 16;
 /// Transient register dump the shared deopt handler pushes below the spill
 /// frame before calling the writeback stub.
-const DEOPT_HANDLER_DUMP_BYTES: u32 = 128;
+const DEOPT_HANDLER_DUMP_BYTES: u32 = 144;
 const FP_SCRATCH_2: u8 = 17;
 const STACK_SLOT_BYTES: u32 = 8;
 const OPTIMIZED_POLL_BATCH: u32 = 16;
@@ -1255,8 +1264,6 @@ fn emit(
     dynasm!(ops
         ; .arch aarch64
         ; mov x20, x0
-        ; ldr x9, [x20, NATIVE_FRAME_OFFSET]
-        ; ldr x19, [x9, NATIVE_FRAME_REGISTER_BASE_OFFSET]
     );
     // Entry seeds initialize at their own defining block, not at the unit
     // entry: a spliced frame's seeds come alive only when control reaches that
@@ -2871,30 +2878,62 @@ fn emit(
                                 "optimizing method call missing site",
                             ))?;
                         debug_assert_eq!(site.safepoint_id, site.frame_map.id);
-                        emit_build_transition_frames(
-                            &mut ops,
-                            tree,
-                            &inline_windows,
-                            instruction,
-                            site,
-                        )?;
-                        emit_materialize_element_transition(
-                            &mut ops,
-                            reprs,
-                            allocation,
-                            &inline_windows,
-                            instruction,
-                            site,
-                        )?;
-                        emit_publish_transition_pc(&mut ops, tree, &inline_windows, instruction)?;
-
                         let succeeded = ops.new_dynamic_label();
+                        let finished = ops.new_dynamic_label();
                         let bail = ops.new_dynamic_label();
                         let native_leaf = (instruction.inline == InlineId::ROOT)
                             .then(|| frame.body.guarded_method_calls.get(&byte_pc))
                             .flatten()
                             .filter(|call| arg_regs.len() == usize::from(call.argument_count))
                             .filter(|call| guarded_method_call_is_supported(view, call));
+                        let map_intrinsic = native_leaf.is_some_and(|call| {
+                            guarded_map_intrinsic_is_supported(
+                                call.entry_stub_id,
+                                reprs,
+                                instruction,
+                                view,
+                            )
+                        });
+                        let string_intrinsic = native_leaf.is_some_and(|call| {
+                            guarded_string_intrinsic_is_supported(
+                                call.entry_stub_id,
+                                reprs,
+                                instruction,
+                            )
+                        });
+                        let math_intrinsic = native_leaf.is_some_and(|call| {
+                            guarded_int32_math_intrinsic_is_supported(
+                                call.entry_stub_id,
+                                reprs,
+                                instruction,
+                            )
+                        });
+                        let generated_intrinsic =
+                            map_intrinsic || string_intrinsic || math_intrinsic;
+                        if !generated_intrinsic {
+                            emit_build_transition_frames(
+                                &mut ops,
+                                tree,
+                                &inline_windows,
+                                instruction,
+                                site,
+                            )?;
+                            emit_materialize_element_transition(
+                                &mut ops,
+                                reprs,
+                                allocation,
+                                &inline_windows,
+                                instruction,
+                                site,
+                            )?;
+                            emit_publish_transition_pc(
+                                &mut ops,
+                                tree,
+                                &inline_windows,
+                                instruction,
+                            )?;
+                        }
+                        let generated_intrinsic_start = ops.offset().0;
                         if let Some(call) = native_leaf {
                             // A missed guard falls through to the generic
                             // method transition below: a receiver this site
@@ -2910,22 +2949,6 @@ fn emit(
                                 .cached_method_guards
                                 .get(&(instruction.inline, instruction.pc))
                                 .copied();
-                            let map_intrinsic = guarded_map_intrinsic_is_supported(
-                                call.entry_stub_id,
-                                reprs,
-                                instruction,
-                                view,
-                            );
-                            let string_intrinsic = guarded_string_intrinsic_is_supported(
-                                call.entry_stub_id,
-                                reprs,
-                                instruction,
-                            );
-                            let math_intrinsic = guarded_int32_math_intrinsic_is_supported(
-                                call.entry_stub_id,
-                                reprs,
-                                instruction,
-                            );
                             if map_intrinsic || string_intrinsic || math_intrinsic {
                                 let guard_start = ops.offset().0;
                                 match (cached_slot, cached_kind) {
@@ -2933,12 +2956,17 @@ fn emit(
                                         let already_guarded = ops.new_dynamic_label();
                                         emit_sp_ldr_x(&mut ops, 13, slot);
                                         dynasm!(ops ; .arch aarch64 ; cbnz x13, =>already_guarded);
-                                        emit_guarded_method_guard_preserving_receiver(
+                                        emit_load_tagged_location(
+                                            &mut ops,
+                                            allocation.location(instruction.inputs[0]),
+                                            9,
+                                        )?;
+                                        emit_guarded_method_guard_preserving_receiver_from_tagged_register(
                                             &mut ops,
                                             &mut relocations,
                                             view,
                                             call,
-                                            receiver,
+                                            9,
                                             byte_pc,
                                             leaf_miss,
                                         )?;
@@ -2953,46 +2981,61 @@ fn emit(
                                         let ready = ops.new_dynamic_label();
                                         emit_sp_ldr_x(&mut ops, 9, slot);
                                         dynasm!(ops ; .arch aarch64 ; cbnz x9, =>identity_cached);
-                                        emit_guarded_method_guard_preserving_receiver(
+                                        emit_load_tagged_location(
+                                            &mut ops,
+                                            allocation.location(instruction.inputs[0]),
+                                            9,
+                                        )?;
+                                        emit_guarded_method_guard_preserving_receiver_from_tagged_register(
                                             &mut ops,
                                             &mut relocations,
                                             view,
                                             call,
-                                            receiver,
+                                            9,
                                             byte_pc,
                                             leaf_miss,
                                         )?;
                                         dynasm!(ops ; .arch aarch64 ; movz x9, #1);
                                         emit_sp_str_x(&mut ops, 9, slot);
                                         dynasm!(ops ; .arch aarch64 ; b =>ready ; =>identity_cached);
-                                        emit_guarded_exotic_method_receiver_preserving_receiver(
+                                        emit_load_tagged_location(
+                                            &mut ops,
+                                            allocation.location(instruction.inputs[0]),
+                                            9,
+                                        )?;
+                                        emit_guarded_exotic_method_receiver_preserving_receiver_from_tagged_register(
                                             &mut ops,
                                             &mut relocations,
                                             view,
                                             call,
-                                            receiver,
+                                            9,
                                             leaf_miss,
                                         )?;
                                         dynasm!(ops ; .arch aarch64 ; =>ready);
                                     }
                                     (None, None) => {
+                                        emit_load_tagged_location(
+                                            &mut ops,
+                                            allocation.location(instruction.inputs[0]),
+                                            9,
+                                        )?;
                                         if math_intrinsic {
-                                            emit_guarded_method_guard(
+                                            emit_guarded_method_guard_from_tagged_register(
                                                 &mut ops,
                                                 &mut relocations,
                                                 view,
                                                 call,
-                                                receiver,
+                                                9,
                                                 byte_pc,
                                                 leaf_miss,
                                             )?;
                                         } else {
-                                            emit_guarded_method_guard_preserving_receiver(
+                                            emit_guarded_method_guard_preserving_receiver_from_tagged_register(
                                                 &mut ops,
                                                 &mut relocations,
                                                 view,
                                                 call,
-                                                receiver,
+                                                9,
                                                 byte_pc,
                                                 leaf_miss,
                                             )?;
@@ -3045,38 +3088,103 @@ fn emit(
                                     instruction,
                                 )?;
                             } else {
-                                emit_guarded_method_call(
+                                emit_load_boxed_value(
+                                    &mut ops,
+                                    reprs,
+                                    allocation,
+                                    instruction.inputs[0],
+                                    9,
+                                )?;
+                                emit_guarded_method_guard_from_tagged_register(
                                     &mut ops,
                                     &mut relocations,
                                     view,
                                     call,
-                                    receiver,
+                                    9,
                                     byte_pc,
+                                    leaf_miss,
+                                )?;
+                                let receiver_is_operand =
+                                    matches!(call.receiver, JitGuardedReceiver::Exotic { .. });
+                                let receiver_word = u8::from(receiver_is_operand);
+                                emit_native_entry_call(
+                                    &mut ops,
+                                    &mut relocations,
+                                    call.entry_stub_id,
+                                    call.safepoint_id,
+                                    receiver_word + call.argument_count,
                                     |ops, index, register| {
-                                        let source = arg_regs
-                                            .get(usize::from(index))
-                                            .copied()
-                                            .ok_or(Unsupported::OperandShape(
-                                                "guarded method argument",
-                                            ))?;
-                                        crate::template::arm64::values::emit_load_reg(
-                                            ops, register, source,
+                                        let input_index = if receiver_is_operand {
+                                            usize::from(index)
+                                        } else {
+                                            usize::from(index) + 1
+                                        };
+                                        let value =
+                                            instruction.inputs.get(input_index).copied().ok_or(
+                                                Unsupported::OperandShape(
+                                                    "guarded method argument",
+                                                ),
+                                            )?;
+                                        emit_load_boxed_value(
+                                            ops, reprs, allocation, value, register,
                                         )
                                     },
                                     leaf_miss,
                                 )?;
                             }
-                            emit_store_frame_register(&mut ops, u32::from(dst), 0)?;
-                            dynasm!(ops
-                                ; .arch aarch64
-                                ; b =>succeeded
-                                ; =>leaf_miss
-                            );
-                            if cached_slot.is_some() {
-                                emit_clear_loop_caches(
+                            if generated_intrinsic {
+                                emit_store_tagged_location(
                                     &mut ops,
-                                    cached_method_guard_base,
-                                    loop_cache_count,
+                                    allocation.location(
+                                        instruction.result.expect(
+                                            "eligibility checked generated intrinsic result",
+                                        ),
+                                    ),
+                                    0,
+                                )?;
+                                if let Some(code_map) = code_map.as_mut() {
+                                    code_map.record(CodeRegion::structural_at_byte_pc(
+                                        "machineMethodIntrinsic",
+                                        generated_intrinsic_start,
+                                        ops.offset().0,
+                                        byte_pc,
+                                    ));
+                                }
+                                dynasm!(ops ; .arch aarch64 ; b =>finished ; =>leaf_miss);
+                                if loop_cache_count != 0 {
+                                    emit_clear_loop_caches(
+                                        &mut ops,
+                                        cached_method_guard_base,
+                                        loop_cache_count,
+                                    );
+                                }
+                                emit_build_transition_frames(
+                                    &mut ops,
+                                    tree,
+                                    &inline_windows,
+                                    instruction,
+                                    site,
+                                )?;
+                                emit_materialize_element_transition(
+                                    &mut ops,
+                                    reprs,
+                                    allocation,
+                                    &inline_windows,
+                                    instruction,
+                                    site,
+                                )?;
+                                emit_publish_transition_pc(
+                                    &mut ops,
+                                    tree,
+                                    &inline_windows,
+                                    instruction,
+                                )?;
+                            } else {
+                                emit_store_frame_register(&mut ops, u32::from(dst), 0)?;
+                                dynasm!(ops
+                                    ; .arch aarch64
+                                    ; b =>succeeded
+                                    ; =>leaf_miss
                                 );
                             }
                         }
@@ -3137,6 +3245,7 @@ fn emit(
                             deopt_exit_at(frame_states, instruction)?,
                             instruction.pc,
                         ));
+                        dynasm!(ops ; .arch aarch64 ; =>finished);
                     }
                     Op::New => {
                         let dst = instruction
@@ -3231,6 +3340,7 @@ fn emit(
                                         instruction.inline,
                                         sp_bias,
                                         if target == 12 { 11 } else { 12 },
+                                        u8::MAX,
                                     )?;
                                     emit_load_frame_register_in(
                                         ops,
@@ -3246,6 +3356,7 @@ fn emit(
                                         instruction.inline,
                                         sp_bias,
                                         if source == 12 { 11 } else { 12 },
+                                        source,
                                     )?;
                                     emit_store_frame_register_in(
                                         ops,
@@ -3271,6 +3382,7 @@ fn emit(
                                         instruction.inline,
                                         sp_bias,
                                         if source == 12 { 11 } else { 12 },
+                                        source,
                                     )?;
                                     emit_store_frame_register_in(
                                         ops,
@@ -4247,7 +4359,7 @@ fn emit(
                             if let Some(target) = direct_target
                                 .filter(|target| direct_call_target_is_supported(target))
                             {
-                                emit_direct_call(
+                                emit_direct_call_with_access(
                                     &mut ops,
                                     &mut relocations,
                                     view,
@@ -4262,11 +4374,64 @@ fn emit(
                                     },
                                     deopt_stack_call_entry.address,
                                     resolve_direct_entry.address,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
                                     initialize_upvalues_entry.address,
                                     code_map.as_mut(),
                                     bail,
                                     threw,
                                     succeeded,
+                                    20,
+                                    |ops, source, target, sp_bias| {
+                                        let window = emit_window_base_with_bias(
+                                            ops,
+                                            &inline_windows,
+                                            instruction.inline,
+                                            sp_bias,
+                                            if target == 12 { 11 } else { 12 },
+                                            u8::MAX,
+                                        )?;
+                                        emit_load_frame_register_in(
+                                            ops,
+                                            window,
+                                            u32::from(source),
+                                            target,
+                                        )
+                                    },
+                                    |ops, destination, source, sp_bias| {
+                                        let window = emit_window_base_with_bias(
+                                            ops,
+                                            &inline_windows,
+                                            instruction.inline,
+                                            sp_bias,
+                                            if source == 12 { 11 } else { 12 },
+                                            source,
+                                        )?;
+                                        emit_store_frame_register_in(
+                                            ops,
+                                            window,
+                                            u32::from(destination),
+                                            source,
+                                        )
+                                    },
+                                    |ops| {
+                                        emit_reload_element_transition(
+                                            ops,
+                                            allocation,
+                                            &inline_windows,
+                                            instruction.inline,
+                                            site,
+                                            None,
+                                        )
+                                    },
+                                    |_, _, _| {
+                                        Err(Unsupported::OperandShape(
+                                            "optimizing plain-call receiver root",
+                                        ))
+                                    },
+                                    |_, _| Ok(()),
                                 )?;
                                 if let Some(events) = direct_call_events.as_mut() {
                                     events.insert(
@@ -4534,8 +4699,6 @@ fn emit(
         dynasm!(ops
             ; .arch aarch64
             ; mov x20, x0
-            ; ldr x9, [x20, NATIVE_FRAME_OFFSET]
-            ; ldr x19, [x9, NATIVE_FRAME_REGISTER_BASE_OFFSET]
         );
         emit_osr_materialization(&mut ops, reprs, allocation, site, representation_bail)?;
         // Arriving from the interpreter skips the pre-header, so this entry is
@@ -4626,19 +4789,22 @@ fn emit(
     deopt_runtime.exits = exit_descriptors.into_boxed_slice();
 
     let handler_start = ops.offset().0;
-    // Dump layout the stub indexes: ascending addresses hold x21..x28 then
-    // d8..d15, matching allocation register-id order.
+    // Dump layout the stub indexes: ascending addresses hold x19,x21..x28
+    // then d8..d15, matching allocation register-id order. One trailing word
+    // keeps `sp` 16-byte aligned across the runtime call.
     dynasm!(ops
         ; .arch aarch64
         ; =>shared_deopt
-        ; stp d14, d15, [sp, #-16]!
-        ; stp d12, d13, [sp, #-16]!
-        ; stp d10, d11, [sp, #-16]!
-        ; stp d8, d9, [sp, #-16]!
-        ; stp x27, x28, [sp, #-16]!
-        ; stp x25, x26, [sp, #-16]!
-        ; stp x23, x24, [sp, #-16]!
-        ; stp x21, x22, [sp, #-16]!
+        ; sub sp, sp, DEOPT_HANDLER_DUMP_BYTES
+        ; str x19, [sp]
+        ; stp x21, x22, [sp, #8]
+        ; stp x23, x24, [sp, #24]
+        ; stp x25, x26, [sp, #40]
+        ; stp x27, x28, [sp, #56]
+        ; stp d8, d9, [sp, #72]
+        ; stp d10, d11, [sp, #88]
+        ; stp d12, d13, [sp, #104]
+        ; stp d14, d15, [sp, #120]
         ; mov x0, x20
         ; mov w1, w17
     );
@@ -4652,8 +4818,9 @@ fn emit(
     dynasm!(ops
         ; .arch aarch64
         ; add x3, sp, #0
-        ; add x4, sp, #128
-        ; mov x5, x19
+        ; add x4, sp, DEOPT_HANDLER_DUMP_BYTES
+        ; ldr x5, [x20, NATIVE_FRAME_OFFSET]
+        ; ldr x5, [x5, NATIVE_FRAME_REGISTER_BASE_OFFSET]
     );
     emit_runtime_entry(&mut ops, &mut relocations, 16, deopt_writeback_entry);
     // The stub returns the entry ABI's `(value, status)` pair directly: a
@@ -4663,7 +4830,7 @@ fn emit(
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
-        ; add sp, sp, #128
+        ; add sp, sp, DEOPT_HANDLER_DUMP_BYTES
         ; cmp x1, STATUS_THREW as u32
         ; b.eq =>threw
     );

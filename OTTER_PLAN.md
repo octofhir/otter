@@ -177,6 +177,27 @@ It already owns:
   Math-only kernel by 47.29% and full `native-boundary` by 18.77%, with exact
   checksums, unchanged reductions/stub counts, zero deopts, and native-boundary
   code growing from 6,740 to 7,544 bytes;
+- the legacy optimizing backend now coalesces exact-bit `LoadLocal`,
+  `StoreLocal`, and `Reuse` SSA copy webs before linear scan, while unread
+  uninitialized/undefined/dead-phi heads remain literal-only deopt state. The
+  AArch64 allocator reclaims `x19` as a ninth GPR and reloads the root VM window
+  through `x20` only at cold boundaries. Optimizing direct-call linkage and
+  guarded native-method fallbacks now use allocator-aware load/store closures;
+  no template helper retains a hidden `x19 = register window` contract.
+  Generated Map, primitive-string, and Int32 Math method hits consume their
+  allocated receiver and return directly to the allocated result home;
+  transition-frame construction, VM-PC
+  publication, and interpreter-window result round-trips exist only on the
+  canonical miss. `optimized-ir.txt` reports copy-web/inactive counts and
+  `code-map.json` exposes `machineMethodIntrinsic`. The final `native-boundary`
+  artifact contains 11 copy webs, 23 coalesced values, 44 inactive values, six
+  frame-free intrinsic regions, six method caches, and two global caches; raw
+  and post-deopt spills fell from 33/48 to 8/12. Exact parent/current/current/
+  parent 10-warmup/25-sample medians improved the final full kernel 7.2376045 ->
+  5.2700000 ms (-27.19%), Math by 21.30%, Map.get by 14.28%, `charCodeAt` by
+  11.11%, Map.set by 10.39%, and mixed Map by 9.14%; checksums, 7,095,333 VM
+  reductions, 3,918 runtime-stub transitions, and zero deopts stayed identical.
+  Full-kernel emitted code grew from 7,544 to 8,216 bytes;
 - catch-only exception-region CFGs with explicit landing-pad successors; the
   shared linkage fully unwinds publication, commits the thrown value to its
   allocator home, and transfers at the exact call PC without replay;
@@ -194,7 +215,7 @@ The old optimizing compiler and template emitter remain in the active graph
 only for operations and function shapes not yet selected by the replacement
 pipeline. They are fallback, not contracts to preserve.
 
-Latest accepted gate: 53 bytecode, 86 compiler, 283 JIT, and 843 VM tests;
+Latest accepted gate: 53 bytecode, 86 compiler, 286 JIT, and 843 VM tests;
 the complete runtime suite; all-target/all-feature Clippy;
 compile-fail/rooting checks; and 21/21 differential
 interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.

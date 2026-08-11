@@ -1,7 +1,8 @@
 //! Feedback-guided optimizing tier with one shared AArch64 backend.
 //!
 //! Supported functions run the complete CFG, dominance, SSA, liveness,
-//! register-allocation, representation, frame-state, and deopt-lowering
+//! representation, identity-copy coalescing, register allocation, frame-state,
+//! and deopt-lowering
 //! pipeline before the AArch64 emitter checks its eligibility contract. The
 //! backend compiles multi-block int32 and float64
 //! arithmetic, element access, and reducible loops entered at function entry
@@ -10,6 +11,9 @@
 //! interrupt and fuel cells before returning to its dominating header.
 //! Side-effect-free loops version invariant own-data Number loads after one
 //! complete all-hit iteration, without moving accessor or miss semantics.
+//! Generated Map, string, and Int32 Math method hits guard allocated SSA
+//! receivers and return directly to allocated homes without publishing a
+//! transition frame or round-tripping through the interpreter window.
 //! Installed code enters through the shared reentrant `JitCtx` ABI and
 //! homes transition operands in the canonical native register window and
 //! publishes only precise tagged roots around allocating element transitions.
@@ -28,6 +32,8 @@
 //!   irreducible loops and exception edges are rejected.
 //! - The sole ABI argument is a dynamically valid `JitCtx`; parameters, OSR
 //!   materialization, and deopt writeback use its rooted interpreter window.
+//!   `x20` retains that context while `x19` joins `x21..x28` as an allocatable
+//!   callee-saved GPR; cold boundaries reload the window base on demand.
 //! - A two-word `JitRet` uses `x0` for a boxed returned value and `x1` for
 //!   `RETURNED`, `BAILED`, or `THREW` status.
 //! - Phi moves execute before a back-edge poll. Interrupt or exhausted fuel

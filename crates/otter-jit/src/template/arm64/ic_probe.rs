@@ -22,9 +22,9 @@
 //!   callee's bootstrap identity, then optionally run its declared leaf entry
 //!   without materializing a frame.
 //! - [`emit_guarded_method_guard`] / [`emit_guarded_method_call`] — the same
-//!   split for `receiver.method(args…)`, over a receiver proven by hidden class
-//!   or by cell type tag; the preserving guard variant keeps the exotic body
-//!   available for immediate allocation-free intrinsic completion.
+//!   split for `receiver.method(args…)`, over either a template frame register
+//!   or an optimizing-tier tagged machine register; the preserving guard keeps
+//!   the exotic body available for immediate allocation-free completion.
 //! - [`emit_native_entry_call`] — one call sequence per declared ABI family.
 //!
 //! # Invariants
@@ -1156,26 +1156,67 @@ pub(crate) fn emit_guarded_method_guard(
     byte_pc: u32,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported> {
-    emit_guarded_method_guard_impl(ops, relocations, view, call, receiver, byte_pc, miss, false)
+    emit_guarded_method_guard_impl(
+        ops,
+        relocations,
+        view,
+        call,
+        receiver,
+        None,
+        byte_pc,
+        miss,
+        false,
+    )
 }
 
-/// Emit [`emit_guarded_method_guard`] while retaining the guarded receiver
-/// header in `x13` for immediate intrinsic completion.
-///
-/// `x8` is caller-saved optimizing scratch and holds the header across the
-/// prototype and builtin-function checks. No receiver pointer is retained
-/// beyond this straight-line, allocation-free sequence.
+/// [`emit_guarded_method_guard`] with the tagged receiver already in a machine
+/// register, avoiding a template-frame materialization on optimizing hits.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_guarded_method_guard_preserving_receiver(
+pub(crate) fn emit_guarded_method_guard_from_tagged_register(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     call: &JitGuardedMethodCall,
-    receiver: u16,
+    receiver: u8,
     byte_pc: u32,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported> {
-    emit_guarded_method_guard_impl(ops, relocations, view, call, receiver, byte_pc, miss, true)
+    emit_guarded_method_guard_impl(
+        ops,
+        relocations,
+        view,
+        call,
+        0,
+        Some(receiver),
+        byte_pc,
+        miss,
+        false,
+    )
+}
+
+/// Preserving method guard over a tagged receiver already in a machine
+/// register. On success `x13` retains the guarded receiver header.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_guarded_method_guard_preserving_receiver_from_tagged_register(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    call: &JitGuardedMethodCall,
+    receiver: u8,
+    byte_pc: u32,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported> {
+    emit_guarded_method_guard_impl(
+        ops,
+        relocations,
+        view,
+        call,
+        0,
+        Some(receiver),
+        byte_pc,
+        miss,
+        true,
+    )
 }
 
 /// Revalidate only the current exotic receiver after this activation has
@@ -1185,12 +1226,25 @@ pub(crate) fn emit_guarded_method_guard_preserving_receiver(
 /// share one immutable realm prototype, but each body must still carry the
 /// expected type and have no own expando/descriptor override. On success the
 /// current receiver header is left in `x13` for generated intrinsic code.
-pub(crate) fn emit_guarded_exotic_method_receiver_preserving_receiver(
+/// Revalidate an exotic receiver already held as a tagged machine value.
+pub(crate) fn emit_guarded_exotic_method_receiver_preserving_receiver_from_tagged_register(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    call: &JitGuardedMethodCall,
+    receiver: u8,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported> {
+    emit_guarded_exotic_method_receiver_impl(ops, relocations, view, call, 0, Some(receiver), miss)
+}
+
+fn emit_guarded_exotic_method_receiver_impl(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     call: &JitGuardedMethodCall,
     receiver: u16,
+    tagged_receiver: Option<u8>,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let JitGuardedReceiver::Exotic {
@@ -1201,7 +1255,15 @@ pub(crate) fn emit_guarded_exotic_method_receiver_preserving_receiver(
             "cached method identity requires exotic receiver",
         ));
     };
-    emit_receiver_type_guard(ops, relocations, view, receiver, u32::from(type_tag), miss)?;
+    emit_receiver_type_guard_impl(
+        ops,
+        relocations,
+        view,
+        receiver,
+        tagged_receiver,
+        u32::from(type_tag),
+        miss,
+    )?;
     if let Some(guard) = guard {
         emit_body_guard(ops, guard, miss);
     }
@@ -1215,6 +1277,7 @@ fn emit_guarded_method_guard_impl(
     view: &JitCompileSnapshot,
     call: &JitGuardedMethodCall,
     receiver: u16,
+    tagged_receiver: Option<u8>,
     byte_pc: u32,
     miss: DynamicLabel,
     preserve_receiver: bool,
@@ -1229,7 +1292,15 @@ fn emit_guarded_method_guard_impl(
         // existing property leaves the shape alone.
         JitGuardedReceiver::Shape { shape } => {
             let shape_byte = view.object_shape_byte;
-            emit_receiver_type_guard(ops, relocations, view, receiver, OBJECT_BODY_TYPE_TAG, miss)?;
+            emit_receiver_type_guard_impl(
+                ops,
+                relocations,
+                view,
+                receiver,
+                tagged_receiver,
+                OBJECT_BODY_TYPE_TAG,
+                miss,
+            )?;
             if preserve_receiver {
                 dynasm!(ops ; .arch aarch64 ; mov x8, x13);
             }
@@ -1268,7 +1339,15 @@ fn emit_guarded_method_guard_impl(
             guard,
             proto_offset,
         } => {
-            emit_receiver_type_guard(ops, relocations, view, receiver, u32::from(type_tag), miss)?;
+            emit_receiver_type_guard_impl(
+                ops,
+                relocations,
+                view,
+                receiver,
+                tagged_receiver,
+                u32::from(type_tag),
+                miss,
+            )?;
             if preserve_receiver {
                 dynasm!(ops ; .arch aarch64 ; mov x8, x13);
             }
@@ -1301,19 +1380,24 @@ fn emit_guarded_method_guard_impl(
     Ok(())
 }
 
-/// Prove the receiver is a heap cell carrying `receiver_type_tag`. On success
-/// `x13` holds its header pointer.
-pub(crate) fn emit_receiver_type_guard(
+fn emit_receiver_type_guard_impl(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     receiver: u16,
+    tagged_receiver: Option<u8>,
     receiver_type_tag: u32,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported> {
-    emit_load_reg(ops, 9, receiver)?;
-    emit_cell_test(ops, 9, 11, CellTest::IsNotCell, miss);
-    dynasm!(ops ; .arch aarch64 ; mov w12, w9);
+    let tagged = if let Some(tagged) = tagged_receiver {
+        tagged
+    } else {
+        emit_load_reg(ops, 9, receiver)?;
+        9
+    };
+    let tag_scratch = if tagged == 11 { 10 } else { 11 };
+    emit_cell_test(ops, tagged, tag_scratch, CellTest::IsNotCell, miss);
+    dynasm!(ops ; .arch aarch64 ; mov w12, W(tagged));
     emit_load_symbol_u64(
         ops,
         relocations,

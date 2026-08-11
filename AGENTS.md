@@ -407,7 +407,10 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     the deterministic Otter optimized unit, while a scalar function compiled
     by the replacement pipeline starts with `; backend=otter-machine-ir
     scalar-function` and contains normalized Machine IR plus allocation. Its
-    code map uses the `machineScalarFunction` structural region.
+    code map uses the `machineScalarFunction` structural region. The legacy
+    unit's summary reports copy-web, coalesced-value, inactive-value, raw-spill,
+    and post-deopt spill counts. Exact-bit `LoadLocal` / `StoreLocal` / `Reuse`
+    webs share one home; unread rematerializable heads own no emitted state.
   - Exact code may contain process addresses and is not a portable golden.
     Compare `code-normalized.bin` across processes; its relocation tokens and
     branch targets are symbolic, and it is not executable. `relocations.json`
@@ -432,6 +435,12 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     values. A zero-width
     `inlineInstruction` is an intentionally coalesced operation, not missing
     capture.
+  - Optimizing generated Map, string, and Int32 Math method hits expose one
+    `machineMethodIntrinsic` region spanning their allocated-SSA receiver
+    guard, body, and direct result-home store. The hit constructs no transition
+    frame, publishes no VM PC, and never round-trips through the interpreter
+    window. The canonical frame-building generic miss is the cold sibling
+    outside that region.
   - Optimizing plain/method splices use ordinary `instruction` regions keyed by
     `inlineFrame`; the caller call opcode owns the identity guard and the
     callee frame owns its body operations. `deopt.json` records the complete

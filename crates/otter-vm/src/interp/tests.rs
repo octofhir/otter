@@ -292,6 +292,66 @@ fn load_string_constant_cache_distinguishes_standalone_contexts() {
 }
 
 #[test]
+fn string_constant_cell_stays_address_stable_across_growth_and_gc() {
+    fn module_with_literal(index: usize) -> BytecodeModule {
+        BytecodeModule {
+            module: format!("literal-{index}.js"),
+            template_sites: Vec::new(),
+            source_kind: BcSourceKind::JavaScript,
+            functions: vec![test_function(
+                0,
+                "<main>",
+                0,
+                1,
+                vec![
+                    Instruction {
+                        pc: 0,
+                        op: Op::LoadString,
+                        operands: vec![Operand::Register(0), Operand::ConstIndex(0)],
+                    },
+                    Instruction {
+                        pc: 1,
+                        op: Op::Return,
+                        operands: vec![Operand::Register(0)],
+                    },
+                ],
+            )],
+            constants: vec![Constant::String {
+                utf16: format!("stable literal {index}").encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        }
+    }
+
+    let mut interp = Interpreter::new();
+    let anchor = interp.link_module(module_with_literal(0));
+    assert!(interp.run(&anchor).expect("materialize anchor").is_string());
+    let before = interp
+        .string_constant_cell_addr_for_test(&anchor, 0)
+        .expect("anchor cell");
+
+    for index in 1..257 {
+        let context = interp.link_module(module_with_literal(index));
+        assert!(interp.run(&context).expect("materialize churn").is_string());
+    }
+    assert_eq!(interp.string_constant_cache_len_for_test(), 257);
+    assert_eq!(
+        interp.string_constant_cell_addr_for_test(&anchor, 0),
+        Some(before),
+        "hash-table growth must not move the traced cell allocation"
+    );
+
+    interp.force_gc().expect("full moving collection");
+    assert_eq!(
+        interp.string_constant_cell_addr_for_test(&anchor, 0),
+        Some(before),
+        "collection rewrites the cell value without moving the cell"
+    );
+    assert!(interp.run(&anchor).expect("reload anchor").is_string());
+}
+
+#[test]
 fn load_bigint_constant_reuses_traced_cache_entry() {
     let code = vec![
         Instruction {

@@ -50,6 +50,7 @@ const TARGET_GUARDED_HEAP_REFERENCE: u8 = 6;
 const TARGET_DIRECT_CALL_ENTRY_CELL: u8 = 8;
 const TARGET_GLOBAL_LEXICAL_CELL: u8 = 10;
 const TARGET_DEOPT_RUNTIME_DATA: u8 = 11;
+const TARGET_STRING_CONSTANT_CELL: u8 = 12;
 
 /// Whether a property inline-cache cell serves a load or a store site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -111,6 +112,11 @@ pub(crate) enum RelocationTarget {
     /// A byte PC names an instruction only inside its own body, so a spliced
     /// frame's read is identified by that body's function id as well.
     GlobalLexicalCell {
+        function_id: u32,
+        byte_pc: u32,
+    },
+    /// Address-stable GC-traced cell for one materialized string literal.
+    StringConstantCell {
         function_id: u32,
         byte_pc: u32,
     },
@@ -988,6 +994,14 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             byte_pc,
         } => {
             output.push(TARGET_GLOBAL_LEXICAL_CELL);
+            put_u32(output, *function_id);
+            put_u32(output, *byte_pc);
+        }
+        RelocationTarget::StringConstantCell {
+            function_id,
+            byte_pc,
+        } => {
+            output.push(TARGET_STRING_CONSTANT_CELL);
             put_u32(output, *function_id);
             put_u32(output, *byte_pc);
         }

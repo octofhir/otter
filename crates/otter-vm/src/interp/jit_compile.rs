@@ -124,6 +124,8 @@ impl Interpreter {
             global_load_sites: u32::try_from(global_load_sites).unwrap_or(u32::MAX),
             global_lexical_loads: u32::try_from(view.global_lexical_loads.len())
                 .unwrap_or(u32::MAX),
+            string_constant_loads: u32::try_from(view.string_constant_loads.len())
+                .unwrap_or(u32::MAX),
             global_object_loads: u32::try_from(view.global_object_loads.len()).unwrap_or(u32::MAX),
             direct_callees: u32::try_from(view.direct_callees.len()).unwrap_or(u32::MAX),
             direct_constructs: u32::try_from(view.direct_constructs.len()).unwrap_or(u32::MAX),
@@ -367,6 +369,7 @@ impl Interpreter {
         // there is nothing to inline.
         Self::bake_typed_array_layout(&mut snapshot);
         Self::bake_string_layout(&mut snapshot);
+        self.bake_string_constant_loads(&mut snapshot, context, fid);
         self.bake_global_lexical_loads(&mut snapshot, context, fid);
         self.bake_inline_callees(
             &mut snapshot,
@@ -532,6 +535,7 @@ impl Interpreter {
         self.publish_property_feedback_for_view(&view);
         Self::bake_typed_array_layout(&mut view);
         Self::bake_string_layout(&mut view);
+        self.bake_string_constant_loads(&mut view, context, fid);
         self.bake_global_lexical_loads(&mut view, context, fid);
         self.bake_inline_callees(
             &mut view,
@@ -1270,6 +1274,42 @@ impl Interpreter {
         }
     }
 
+    /// Bake direct reads of primitive-string literals already materialized in
+    /// this isolate's constant cache.
+    ///
+    /// The cache owns boxed `Value` cells: hash-table growth may move a box but
+    /// never its allocation, and root tracing rewrites the cell after moving
+    /// collection. A cold literal has no cell and retains the canonical
+    /// allocating transition until later feedback recompiles the body.
+    fn bake_string_constant_loads(
+        &self,
+        view: &mut jit::JitCompileSnapshot,
+        context: &ExecutionContext,
+        fid: u32,
+    ) {
+        let Some(owner) = context.for_function(fid) else {
+            return;
+        };
+        for instruction in &view.instructions {
+            if instruction.op(&view.code_block) != Op::LoadString {
+                continue;
+            }
+            let Some(constant) = instruction.const_index(&view.code_block, 1) else {
+                continue;
+            };
+            let key = owner.constant_cache_key(constant);
+            let Some(cell) = self.string_constant_cache.get(&key) else {
+                continue;
+            };
+            view.string_constant_loads.insert(
+                instruction.byte_pc,
+                jit::JitStringConstantLoad {
+                    cell_addr: std::ptr::from_ref::<Value>(cell.as_ref()) as usize,
+                },
+            );
+        }
+    }
+
     /// Bake one spliced body's own compile inputs.
     ///
     /// A body compiled inside another function resolves its constants, global
@@ -1288,6 +1328,7 @@ impl Interpreter {
         self.publish_property_feedback_for_view(&body);
         Self::bake_typed_array_layout(&mut body);
         Self::bake_string_layout(&mut body);
+        self.bake_string_constant_loads(&mut body, context, fid);
         self.bake_global_lexical_loads(&mut body, context, fid);
         self.bake_call_site_plans(&mut body, context, fid, tier, 0, false);
         self.bake_guarded_method_calls(&mut body);

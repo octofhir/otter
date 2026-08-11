@@ -172,6 +172,9 @@ pub(super) fn guard_cache_safe_instruction(
             })
             .is_some_and(|(frame, byte_pc)| element_access_for(&frame.body, byte_pc).is_some()),
         Op::LoadProperty => true,
+        // Optimizing eligibility requires every string literal to have an
+        // address-stable traced cell, so this is a pure live-slot read.
+        Op::LoadString => true,
         Op::LoadGlobalOrThrow => tree
             .frames
             .get(instruction.inline.0 as usize)
@@ -778,10 +781,9 @@ pub(super) fn check_eligibility(
                     ));
                 }
                 Op::LoadString => {
-                    // `WRITE_CONST`: the constant names a string in the code
-                    // block's pool and there are no register inputs. Resolving
-                    // it interns and may allocate, so it is a precise-rooted
-                    // transition like any other reentrant stub.
+                    // Optimized code reads only an already-materialized,
+                    // address-stable GC-traced cell. Cold literals stay on the
+                    // template tier until feedback recompiles the body.
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("string-load result"))?;
@@ -793,12 +795,13 @@ pub(super) fn check_eligibility(
                         op,
                         "string load shape",
                     )?;
-                    element_transition_instructions.push((
-                        instruction.inline,
-                        instruction.pc,
-                        block,
-                        instruction_index,
-                    ));
+                    let frame = frame_of(tree, instruction)?;
+                    let byte_pc = frame_byte_pc(tree, instruction)?;
+                    require(
+                        frame.body.string_constant_loads.contains_key(&byte_pc),
+                        op,
+                        "prepared string constant cell",
+                    )?;
                 }
                 Op::LooseEqual | Op::LooseNotEqual => {
                     // `WRITE_READ_READ`: two register operands compared under

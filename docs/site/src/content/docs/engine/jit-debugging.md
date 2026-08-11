@@ -45,8 +45,9 @@ that fires before the isolate replies may have no partial batch to write.
 
 `compilePrepared.globalLoadSites` counts all analyzed global reads.
 `globalLexicalLoads` counts permanent global-declarative cells available for
-direct generated reads, while `globalObjectLoads` counts guarded
-global-object dictionary slots. `directCallees`, `directConstructs`,
+direct generated reads, `stringConstantLoads` counts already-materialized
+primitive literals with address-stable traced cells, while `globalObjectLoads`
+counts guarded global-object dictionary slots. `directCallees`, `directConstructs`,
 `directMethodSites`, and `directMethodTargets` report stable function links
 whose current generations were available for generated plain, base-construct,
 and bounded polymorphic method linkage,
@@ -149,6 +150,13 @@ a TDZ hole still enters the canonical throwing global lookup.
 Global-object records similarly retain only structural identity and the
 property slot. Generated code proves the realm epoch and dictionary shape
 before reading the live value; a mismatch uses the canonical lookup.
+
+Prepared `LoadString` sites expose a `stringConstantCell` relocation keyed by
+function id and byte PC. The process address is redacted. The cell is rooted,
+address-stable across constant-cache growth, and rewritten in place by moving
+GC; generated code reads the current `Value` and never embeds the moving string
+handle. A literal without a materialized cell retains the canonical template
+transition and makes an optimizing body ineligible until later recompilation.
 
 Ordinary `Op::Call` feedback uses one typed target population for bytecode
 callees and static-native operations. When that population is monomorphic for

@@ -508,11 +508,13 @@ pub(super) fn compile(
                     &mut ops,
                     &mut relocations,
                     transitions,
+                    view,
                     code_block_id,
+                    instr.byte_pc,
                     dst,
                     constant,
                     threw,
-                );
+                )?;
             }
             TemplateOp::LoadRegExp { dst, constant } => {
                 transitions::emit_load_regexp(

@@ -364,8 +364,9 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     be spliced; `compilePrepared` reports `directConstructs`, `directMethodSites` and
     `directMethodTargets` separately from body-inline candidate counts, while
     `globalLoadSites` counts analyzed global reads, `globalLexicalLoads`
-    counts permanent global-declarative cells, and `globalObjectLoads` counts
-    guarded global-object slots available for direct reads. Capture is
+    counts permanent global-declarative cells, `stringConstantLoads` counts
+    materialized literals with stable traced cells, and `globalObjectLoads`
+    counts guarded global-object slots available for direct reads. Capture is
     default-off and bounded to 16,384 events per top-level run; `truncated`
     and `droppedEvents` report overflow without constructing further payloads.
   - Abrupt VM completion (for example, a thrown exception after tier-up) still
@@ -392,6 +393,12 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     permanent cell and a TDZ hole retains the canonical throwing transition.
     Guarded global-object reads prove the realm epoch, dictionary shape, and
     property slot before reading the live value.
+  - Prepared string literals expose `stringConstantCell` relocations keyed by
+    function id and byte PC. Exact addresses are redacted. Generated code reads
+    the current value from an address-stable GC-traced cell; moving collection
+    rewrites that cell in place, and no moving string handle is baked into code.
+    Cold literals retain the canonical transition and keep an optimizing body
+    ineligible until a later compile snapshot can publish the cell.
   - Inspect the first line of `optimized-ir.txt`: general legacy lowering emits
     the deterministic Otter optimized unit, while a scalar function compiled
     by the replacement pipeline starts with `; backend=otter-machine-ir

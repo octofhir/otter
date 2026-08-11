@@ -1,4 +1,10 @@
 // Otter Runtime Type Definitions
+//
+// The `Otter` global holds what the runtime installs on it — today
+// `Otter.serve` and `Otter.XML`. Those declarations are published, so they
+// are referenced here rather than written a second time.
+/// <reference path="../packages/otter-types/serve.d.ts" />
+/// <reference path="../packages/otter-types/xml.d.ts" />
 
 // Console API
 interface Console {
@@ -80,28 +86,6 @@ declare class URLSearchParams {
   [Symbol.iterator](): IterableIterator<[string, string]>;
 }
 
-// Otter Runtime API
-declare namespace Otter {
-  /** Command line arguments passed to the script */
-  export const args: string[];
-
-  /** Runtime version information */
-  export const version: {
-    otter: string;
-    jsc: string;
-    typescript: string;
-  };
-
-  /** Runtime capabilities/permissions */
-  export const capabilities: {
-    read: boolean;
-    write: boolean;
-    net: boolean;
-    env: boolean;
-    run: boolean;
-    ffi: boolean;
-  };
-}
-
-// Otter is available globally
+// Otter is available globally; what it holds is declared by the
+// referenced files at the top of this one.
 declare var Otter: typeof Otter;

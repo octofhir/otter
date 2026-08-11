@@ -102,7 +102,7 @@ otter-gc
    - `raft!` for grouped target bindings
    - `burrow!` for host-owned object surfaces
    - `lodge!` for hosted module loaders
-5. **Types Source Of Truth**: keep Otter `.d.ts` files under `crates/otter-pm/src/types/otter/`; treat `packages/otter-types/` as generated publish output.
+5. **Types Source Of Truth**: Otter `.d.ts` files live in `packages/otter-types/` and are written by hand. Nothing generates them, and no crate bundles a second copy.
 6. **Web API Placement**: standards-facing Web API work belongs in `crates/otter-web`, not in `crates/otter-modules`.
 
 7. **Module System**:

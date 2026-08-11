@@ -562,9 +562,8 @@ Practical rules when adding/altering APIs:
 
 ## TypeScript / Types
 
-- Bundled types live in `crates/otter-pm/src/types/` and get installed into `node_modules/@types` for editor resolution.
-- `crates/otter-pm/src/types/otter/` is the source of truth for Otter `.d.ts` files.
-- `packages/otter-types/` is a publish artifact and should be generated from that source, not edited independently.
+- Otter `.d.ts` files live in `packages/otter-types/`, hand-written, one file per surface (`serve`, `sql`, `ffi`, `xml`, `globals`), tied together by `index.d.ts`.
+- That directory is the only copy: no crate bundles types, and nothing generates them, so a runtime surface and its declaration change together.
 - If you add a new global API or built-in module surface, update the corresponding `.d.ts` file(s).
 - Type checking integration (tsgo) is still being re-enabled on the current runtime/compiler path.
 

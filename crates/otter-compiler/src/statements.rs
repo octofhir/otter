@@ -902,7 +902,12 @@ pub(crate) fn compile_statement(
             // through to module_env. When `decl.source` is set the
             // source is another module; we read from its import
             // record (already present courtesy of the pre-pass).
-            let from_source = decl.source.as_ref().map(|s| s.value.as_str().to_string());
+            let from_source = decl.source.as_ref().map(|s| {
+                ImportRequest::new(
+                    s.value.as_str(),
+                    import_attribute_type(decl.with_clause.as_deref()),
+                )
+            });
             for spec in &decl.specifiers {
                 let exported = module_export_name_to_str(&spec.exported);
                 let local = module_export_name_to_str(&spec.local);
@@ -910,14 +915,11 @@ pub(crate) fn compile_statement(
                     let record_uv = cx
                         .module_state
                         .as_ref()
-                        .and_then(|s| {
-                            s.import_records
-                                .get(&ImportRequest::plain(src.as_str()))
-                                .copied()
-                        })
+                        .and_then(|s| s.import_records.get(src).copied())
                         .ok_or(CompileError::Unsupported {
                             node: format!(
-                                "ExportNamedDeclaration: unresolved re-export source `{src}`"
+                                "ExportNamedDeclaration: unresolved re-export source `{}`",
+                                src.specifier
                             ),
                             span,
                         })?;
@@ -1109,7 +1111,10 @@ pub(crate) fn compile_statement(
                     span,
                 });
             }
-            let source = ImportRequest::plain(decl.source.value.as_str());
+            let source = ImportRequest::new(
+                decl.source.value.as_str(),
+                import_attribute_type(decl.with_clause.as_deref()),
+            );
             let record_uv = cx
                 .module_state
                 .as_ref()

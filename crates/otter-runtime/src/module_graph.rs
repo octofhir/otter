@@ -757,7 +757,12 @@ impl<'a> Visit<'a> for ModuleRequestVisitor {
         if !decl.export_kind.is_type()
             && let Some(src) = &decl.source
         {
-            self.record(src.value.as_str(), false, false);
+            self.record_with_type(
+                src.value.as_str(),
+                false,
+                false,
+                with_clause_type(decl.with_clause.as_deref()),
+            );
         }
         // Walk into nested declarations / expressions so they
         // contribute their own dynamic imports (e.g. an exported
@@ -767,7 +772,12 @@ impl<'a> Visit<'a> for ModuleRequestVisitor {
 
     fn visit_export_all_declaration(&mut self, decl: &oxc_ast::ast::ExportAllDeclaration<'a>) {
         if !decl.export_kind.is_type() {
-            self.record(decl.source.value.as_str(), false, false);
+            self.record_with_type(
+                decl.source.value.as_str(),
+                false,
+                false,
+                with_clause_type(decl.with_clause.as_deref()),
+            );
         }
     }
 
@@ -889,7 +899,8 @@ fn resolve_export(
             // `export { local as name } from "from"` — indirect named
             // re-export; resolve through the source module.
             (Some(local), Some(from)) => {
-                result = match resolve_specifier(nodes, url, from, None) {
+                result = match resolve_specifier(nodes, url, from, export.from_attr_type.as_deref())
+                {
                     Some(target) => resolve_export(nodes, target, local, path),
                     None => Resolution::Null,
                 };
@@ -899,7 +910,8 @@ fn resolve_export(
             // module's namespace binding, so two modules re-exporting
             // the same namespace match (unambiguous).
             (None, Some(from)) => {
-                result = match resolve_specifier(nodes, url, from, None) {
+                result = match resolve_specifier(nodes, url, from, export.from_attr_type.as_deref())
+                {
                     Some(target) => Resolution::Resolved {
                         module: target.to_string(),
                         binding: "*namespace*".to_string(),
@@ -979,7 +991,9 @@ fn resolve_export(
             let Some(from) = export.from.as_deref() else {
                 continue;
             };
-            let Some(target) = resolve_specifier(nodes, url, from, None) else {
+            let Some(target) =
+                resolve_specifier(nodes, url, from, export.from_attr_type.as_deref())
+            else {
                 continue;
             };
             match resolve_export(nodes, target, name, path) {
@@ -1035,7 +1049,14 @@ fn validate_resolution(nodes: &BTreeMap<String, ModuleNode>) -> Result<(), Graph
             // require a binding lookup; star and namespace re-exports
             // do not.
             if let (Some(local), Some(from)) = (export.local.as_deref(), export.from.as_deref()) {
-                check_binding(nodes, url, from, None, local, "re-export")?;
+                check_binding(
+                    nodes,
+                    url,
+                    from,
+                    export.from_attr_type.as_deref(),
+                    local,
+                    "re-export",
+                )?;
             }
         }
     }
@@ -1103,7 +1124,9 @@ fn module_exported_names(
             let Some(from) = export.from.as_deref() else {
                 continue;
             };
-            let Some(target) = resolve_specifier(nodes, url, from, None) else {
+            let Some(target) =
+                resolve_specifier(nodes, url, from, export.from_attr_type.as_deref())
+            else {
                 continue;
             };
             for name in module_exported_names(nodes, target, seen) {

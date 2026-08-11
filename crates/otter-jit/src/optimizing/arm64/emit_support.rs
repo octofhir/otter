@@ -6,6 +6,7 @@
 //! - Representation conversions, boxing, constant materialization.
 //! - Identity-guarded Int32 Math intrinsic bodies selected by the main
 //!   instruction dispatcher.
+//! - Activation-local loop cache addressing and complete cold-path clearing.
 //! - Frame prologue and epilogue.
 //! - Published root/spliced register-window addressing across temporary
 //!   generated-linkage stack reservations.
@@ -15,6 +16,8 @@
 //!   chosen operation, so the dispatch in [`super`] owns all opcode policy.
 //! - Math intrinsic bodies receive already-proven Int32 operands and execute
 //!   only after the caller has emitted the exact builtin identity guard.
+//! - Loop cache slots contain untraced raw addresses only while generated code
+//!   cannot allocate or re-enter; every cold transition clears the full set.
 
 use super::*;
 
@@ -34,9 +37,25 @@ pub(super) fn cached_method_guard_slot(
         .and_then(|offset| base.checked_add(offset))
 }
 
-/// Clear every raw receiver header before a fresh entry or a cold transition
-/// that can allocate, collect, or re-enter JavaScript.
-pub(super) fn emit_clear_cached_method_guards(ops: &mut Assembler, base: u32, count: usize) {
+/// Activation-local stack slot for one loop-invariant global-object read.
+pub(super) fn cached_global_object_load_slot(
+    eligibility: &Eligibility,
+    base: u32,
+    site: (InlineId, u32),
+) -> Option<u32> {
+    let index = eligibility
+        .cached_global_object_loads
+        .iter()
+        .position(|entry| *entry == site)?;
+    u32::try_from(index)
+        .ok()
+        .and_then(|index| index.checked_mul(STACK_SLOT_BYTES))
+        .and_then(|offset| base.checked_add(offset))
+}
+
+/// Clear every raw receiver header and property address before a fresh entry
+/// or a cold transition that can allocate, collect, or re-enter JavaScript.
+pub(super) fn emit_clear_loop_caches(ops: &mut Assembler, base: u32, count: usize) {
     if count == 0 {
         return;
     }

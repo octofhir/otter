@@ -4,6 +4,8 @@
 //! - Multiple invariant Map and Math receivers in one natural loop.
 //! - Changing primitive-string receivers sharing one pinned prototype method.
 //! - Global-lexical, dense-element, and exotic-length reads in a cached loop.
+//! - Global-object slot caching that makes a builtin namespace receiver
+//!   activation-invariant after one epoch/shape proof.
 //! - Element/property slow reads that mutate a cached method during reentry.
 //! - Interpreter parity and artifact proof for every cached intrinsic site.
 //!
@@ -15,6 +17,8 @@
 //!   canonical transition may allocate, collect, or re-enter JavaScript.
 //! - Any element/property/global probe miss applies the same invalidation
 //!   before its canonical lookup transition.
+//! - A cached global retains only a raw live-slot address; reentry clears it
+//!   together with method headers before moving GC or observable mutation.
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 
@@ -129,10 +133,67 @@ function nestedMaps(first, second, limit) {
 const firstMap = new Map([[0, 1]]);
 const secondMap = new Map([[0, 10]]);
 const nested = nestedMaps(firstMap, secondMap, 64);
-JSON.stringify([guarded, table.size, fallback, coercions, elementMiss, propertyMiss, nested]);
+
+function globalMathLoop(values, limit) {
+  let checksum = 0;
+  for (let index = 0; index < limit; index++) {
+    checksum += Math.abs(-1);
+    checksum += Math.max(index & 3, 2);
+    checksum += values[index].flag;
+  }
+  return checksum;
+}
+
+for (let warm = 0; warm < 4010; warm++) {
+  globalMathLoop([{ flag: 1 }, { flag: 1 }], 2);
+}
+const globalFastValues = [];
+for (let index = 0; index < 64; index++) globalFastValues[index] = { flag: 1 };
+const globalFast = globalMathLoop(globalFastValues, 64);
+
+const originalMath = Math;
+let replacementCalls = 0;
+const replacementMath = {
+  abs() {
+    replacementCalls += 1;
+    return 9;
+  },
+  max() {
+    replacementCalls += 1;
+    return 7;
+  }
+};
+const globalReentryValues = [];
+for (let index = 0; index < 64; index++) globalReentryValues[index] = { flag: 1 };
+Object.defineProperty(globalReentryValues[31], "flag", {
+  configurable: true,
+  get() {
+    Math = replacementMath;
+    for (let index = 0; index < 300; index++) ({ payload: [index, index + 1] });
+    return 5;
+  }
+});
+const globalReentry = globalMathLoop(globalReentryValues, 64);
+Math = originalMath;
+
+JSON.stringify([
+  guarded,
+  table.size,
+  fallback,
+  coercions,
+  elementMiss,
+  propertyMiss,
+  nested,
+  globalFast,
+  globalReentry,
+  replacementCalls
+]);
 "#;
 
-fn run(selection: JitSelection, artifacts: bool) -> (String, u64, usize, usize) {
+fn run(
+    selection: JitSelection,
+    artifacts: bool,
+) -> (String, u64, usize, usize, usize, usize, usize) {
     let builder = Runtime::builder()
         .jit_selection(selection)
         .jit_osr_threshold(4);
@@ -158,11 +219,16 @@ fn run(selection: JitSelection, artifacts: bool) -> (String, u64, usize, usize) 
             .map(|file| {
                 let map: serde_json::Value =
                     serde_json::from_slice(file.contents()).expect("valid code-map JSON");
-                map["regions"].as_array().map_or(0, |regions| {
-                    regions
+                map["regions"].as_array().map_or((0, 0), |regions| {
+                    let methods = regions
                         .iter()
                         .filter(|region| region["kind"] == "loopInvariantMethodGuardCache")
-                        .count()
+                        .count();
+                    let globals = regions
+                        .iter()
+                        .filter(|region| region["kind"] == "loopInvariantGlobalObjectLoadCache")
+                        .count();
+                    (methods, globals)
                 })
             })
             .collect()
@@ -170,20 +236,39 @@ fn run(selection: JitSelection, artifacts: bool) -> (String, u64, usize, usize) 
     (
         completion.completion_string().to_owned(),
         runtime.execution_stats().jit_optimized_entries,
-        cache_region_counts.iter().copied().max().unwrap_or(0),
         cache_region_counts
             .iter()
-            .filter(|count| **count > 0)
+            .map(|counts| counts.0)
+            .max()
+            .unwrap_or(0),
+        cache_region_counts
+            .iter()
+            .filter(|counts| counts.0 > 0)
             .count(),
+        cache_region_counts
+            .iter()
+            .map(|counts| counts.1)
+            .max()
+            .unwrap_or(0),
+        cache_region_counts
+            .iter()
+            .filter(|counts| counts.1 > 0)
+            .count(),
+        cache_region_counts
+            .iter()
+            .filter(|counts| counts.1 > 0)
+            .map(|counts| counts.0)
+            .max()
+            .unwrap_or(0),
     )
 }
 
 #[test]
 fn loop_method_guard_caches_preserve_semantics() {
-    let (oracle, _, _, _) = run(JitSelection::InterpreterOnly, false);
-    let (compiled, optimized_entries, _, _) = run(JitSelection::ProductionTiered, false);
+    let (oracle, _, _, _, _, _, _) = run(JitSelection::InterpreterOnly, false);
+    let (compiled, optimized_entries, _, _, _, _, _) = run(JitSelection::ProductionTiered, false);
     assert_eq!(compiled, oracle);
-    assert_eq!(oracle, "[125696,8,352,1,420,420,2816]");
+    assert_eq!(oracle, "[125696,8,352,1,420,420,2816,272,684,64]");
     #[cfg(target_arch = "aarch64")]
     assert!(optimized_entries > 0, "fixture must enter optimizing code");
 }
@@ -191,9 +276,16 @@ fn loop_method_guard_caches_preserve_semantics() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn artifacts_expose_every_loop_method_guard_cache() {
-    let (compiled, optimized_entries, cache_regions, cache_bundles) =
-        run(JitSelection::ProductionTiered, true);
-    assert_eq!(compiled, "[125696,8,352,1,420,420,2816]");
+    let (
+        compiled,
+        optimized_entries,
+        cache_regions,
+        cache_bundles,
+        global_cache_regions,
+        global_cache_bundles,
+        global_receiver_method_regions,
+    ) = run(JitSelection::ProductionTiered, true);
+    assert_eq!(compiled, "[125696,8,352,1,420,420,2816,272,684,64]");
     assert!(optimized_entries > 0, "fixture must enter optimizing code");
     assert_eq!(
         cache_regions, 5,
@@ -202,5 +294,17 @@ fn artifacts_expose_every_loop_method_guard_cache() {
     assert!(
         cache_bundles >= 3,
         "the mixed fast loop and both reentrant read loops must each cache a method guard"
+    );
+    assert_eq!(
+        global_cache_regions, 2,
+        "both global Math reads need activation-local live-slot caches"
+    );
+    assert!(
+        global_cache_bundles >= 1,
+        "the global Math loop must publish its live-slot cache"
+    );
+    assert!(
+        global_receiver_method_regions >= 2,
+        "cached Math values must unlock both namespace method guards"
     );
 }

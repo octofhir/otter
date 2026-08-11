@@ -20,9 +20,10 @@
 //!   `Map.set(Int32, value)` completion without a Rust collection entry.
 //! - Guarded plain- and method-callee splicing with multi-frame exact-PC
 //!   deoptimization and synthetic `this` binding.
-//! - Multi-site activation-local method-identity caching, invariant receiver
-//!   reuse, receiver-property guard fusion, and precise invalidation before
-//!   slow element/property/global reads re-enter the VM.
+//! - Multi-site activation-local global-object slot and method-identity
+//!   caching, invariant receiver reuse, receiver-property guard fusion, and
+//!   precise invalidation before slow element/property/global reads re-enter
+//!   the VM.
 //! - Loop-versioned own-data Number property loads, activated only after one
 //!   complete all-hit iteration and invalidated by every semantic miss.
 //! - Unboxed numeric residency through source-lowered coercion scaffolding.
@@ -68,9 +69,10 @@
 //!   the same reduction and materializes the inverted canonical boolean.
 //! - Every reentrant transition boxes its operands plus tagged SSA values live
 //!   across the call into the register window of the frame that names them.
-//!   A transition reachable after caching a raw receiver/body header clears
-//!   every activation-local method cache before frame publication, so moving
-//!   collection and JavaScript reentry can never leave a stale raw pointer.
+//!   A transition reachable after caching a raw receiver/body header or global
+//!   property address clears every activation-local loop cache before frame
+//!   publication, so moving collection and JavaScript reentry can never leave
+//!   a stale raw pointer.
 //!   Its precise frame bitmap names every tagged input and live-across value;
 //!   moving-GC reloads restore live values and load results while numeric
 //!   machine locations remain untouched. A stub runs in the frame that owns
@@ -87,7 +89,8 @@
 //!   TDZ holes.
 //! - A baked global-object load proves the realm epoch, dictionary shape, and
 //!   property slot before reading its live value; structural drift uses the
-//!   canonical transition.
+//!   canonical transition. A complete non-reentrant outermost loop may retain
+//!   the live slot address after the first proof, but never the loaded value.
 //! - A non-spliced call enters only its VM-baked native generation. Method
 //!   edges additionally prove receiver/prototype/slot identity in generated
 //!   code. A method guard-chain miss completes through the canonical
@@ -105,13 +108,16 @@
 //!   probe the baked compact old-space table. Missing keys, numeric
 //!   representation aliases, and bounded-chain exhaustion enter the canonical
 //!   method transition before effects.
-//! - Method guards may be cached only in an outermost natural loop whose operations are
-//!   generated, non-allocating, and non-reentrant on their hit paths. Entry
-//!   and OSR initialize every site independently. An invariant receiver reuses
-//!   its validated body header; varying exotic Map/string receivers revalidate
-//!   the current body while reusing their pinned prototype method identity.
-//!   Any cold intrinsic miss clears the complete activation-local cache before
-//!   the canonical transition can allocate, collect, or re-enter JavaScript.
+//! - Loop caches are admitted only in an outermost natural loop whose
+//!   operations are generated, non-allocating, and non-reentrant on their hit
+//!   paths. Entry and OSR initialize every site independently. A prepared
+//!   global-object read retains its live slot address and therefore makes a
+//!   builtin namespace receiver invariant for method caching. An invariant
+//!   receiver reuses its validated body header; varying exotic Map/string
+//!   receivers revalidate the current body while reusing their pinned
+//!   prototype method identity. Any cold intrinsic miss clears the complete
+//!   activation-local cache before the canonical transition can allocate,
+//!   collect, or re-enter JavaScript.
 //!   An inner loop is never selected in isolation; its sites are cached only
 //!   when the complete enclosing outermost loop satisfies the same contract.
 //!   Poll slow paths still bail so the interpreter owns interrupt/budget handling.
@@ -274,6 +280,11 @@ struct Eligibility {
     /// native entry/OSR activation. Any cold path that can re-enter or collect
     /// clears the whole activation-local set first.
     cached_method_guards: BTreeMap<(InlineId, u32), CachedMethodGuardKind>,
+    /// Prepared global-object reads proven invariant for one complete
+    /// outermost loop. Each slot caches the live property-value address after
+    /// the first epoch/shape proof; the same cold paths clear these raw
+    /// addresses before allocation, collection, or JavaScript reentry.
+    cached_global_object_loads: BTreeSet<(InlineId, u32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1099,10 +1110,29 @@ fn emit(
         .ok_or(Unsupported::OperandShape(
             "optimizing method guard cache frame overflow",
         ))?;
-    let inline_window_base = cached_method_guard_base
+    let cached_global_object_load_base = cached_method_guard_base
         .checked_add(cached_method_guard_bytes)
         .ok_or(Unsupported::OperandShape(
             "optimizing method guard cache frame overflow",
+        ))?;
+    let cached_global_object_load_bytes =
+        u32::try_from(eligibility.cached_global_object_loads.len())
+            .ok()
+            .and_then(|count| count.checked_mul(STACK_SLOT_BYTES))
+            .ok_or(Unsupported::OperandShape(
+                "optimizing global-object cache frame overflow",
+            ))?;
+    let loop_cache_count = eligibility
+        .cached_method_guards
+        .len()
+        .checked_add(eligibility.cached_global_object_loads.len())
+        .ok_or(Unsupported::OperandShape(
+            "optimizing loop cache count overflow",
+        ))?;
+    let inline_window_base = cached_global_object_load_base
+        .checked_add(cached_global_object_load_bytes)
+        .ok_or(Unsupported::OperandShape(
+            "optimizing global-object cache frame overflow",
         ))?
         .checked_add(15)
         .map(|bytes| bytes & !15)
@@ -1217,11 +1247,7 @@ fn emit(
         .collect();
     let entry = ops.offset();
     emit_prologue(&mut ops, saved_frame);
-    emit_clear_cached_method_guards(
-        &mut ops,
-        cached_method_guard_base,
-        eligibility.cached_method_guards.len(),
-    );
+    emit_clear_loop_caches(&mut ops, cached_method_guard_base, loop_cache_count);
     if !eligibility.back_edges.is_empty() {
         dynasm!(ops ; .arch aarch64 ; movz w29, OPTIMIZED_POLL_BATCH);
     }
@@ -1567,10 +1593,10 @@ fn emit(
                             dynasm!(ops ; .arch aarch64 ; b =>done);
                         }
                         dynasm!(ops ; .arch aarch64 ; =>miss);
-                        emit_clear_cached_method_guards(
+                        emit_clear_loop_caches(
                             &mut ops,
                             cached_method_guard_base,
-                            eligibility.cached_method_guards.len(),
+                            loop_cache_count,
                         );
                         emit_build_transition_frames(
                             &mut ops,
@@ -1933,10 +1959,10 @@ fn emit(
                         // Miss: the window transition resolves full `[[Get]]`
                         // semantics and self-patches this site's cell.
                         dynasm!(ops ; .arch aarch64 ; =>miss);
-                        emit_clear_cached_method_guards(
+                        emit_clear_loop_caches(
                             &mut ops,
                             cached_method_guard_base,
-                            eligibility.cached_method_guards.len(),
+                            loop_cache_count,
                         );
                         emit_build_transition_frames(
                             &mut ops,
@@ -2379,6 +2405,23 @@ fn emit(
                         } else if let Some(target) =
                             frame.body.global_object_loads.get(&metadata.byte_pc)
                         {
+                            let cache_start = ops.offset().0;
+                            let cached_slot = cached_global_object_load_slot(
+                                eligibility,
+                                cached_global_object_load_base,
+                                (instruction.inline, instruction.pc),
+                            );
+                            if let Some(slot) = cached_slot {
+                                let prove = ops.new_dynamic_label();
+                                emit_sp_ldr_x(&mut ops, 13, slot);
+                                dynasm!(ops
+                                    ; .arch aarch64
+                                    ; cbz x13, =>prove
+                                    ; ldr x9, [x13]
+                                );
+                                emit_store_tagged_location(&mut ops, result_location, 9)?;
+                                dynasm!(ops ; .arch aarch64 ; b =>done ; =>prove);
+                            }
                             dynasm!(ops
                                 ; .arch aarch64
                                 ; ldr x14, [x20, THREAD_OFFSET]
@@ -2427,19 +2470,36 @@ fn emit(
                                 );
                             }
                             crate::template::arm64::values::emit_slab_base(&mut ops, view, 13, 14);
-                            dynasm!(ops
-                                ; .arch aarch64
-                                ; cbz x13, =>miss
-                                ; ldr x9, [x13, target.value_byte]
-                            );
+                            dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);
+                            if let Some(slot) = cached_slot {
+                                emit_load_u64(&mut ops, 14, u64::from(target.value_byte));
+                                dynasm!(ops ; .arch aarch64 ; add x13, x13, x14);
+                                emit_sp_str_x(&mut ops, 13, slot);
+                                dynasm!(ops ; .arch aarch64 ; ldr x9, [x13]);
+                            } else {
+                                dynasm!(ops
+                                    ; .arch aarch64
+                                    ; ldr x9, [x13, target.value_byte]
+                                );
+                            }
                             emit_store_tagged_location(&mut ops, result_location, 9)?;
                             dynasm!(ops ; .arch aarch64 ; b =>done);
+                            if cached_slot.is_some()
+                                && let Some(code_map) = code_map.as_mut()
+                            {
+                                code_map.record(CodeRegion::structural_at_byte_pc(
+                                    "loopInvariantGlobalObjectLoadCache",
+                                    cache_start,
+                                    ops.offset().0,
+                                    metadata.byte_pc,
+                                ));
+                            }
                         }
                         dynasm!(ops ; .arch aarch64 ; =>miss);
-                        emit_clear_cached_method_guards(
+                        emit_clear_loop_caches(
                             &mut ops,
                             cached_method_guard_base,
-                            eligibility.cached_method_guards.len(),
+                            loop_cache_count,
                         );
                         emit_build_transition_frames(
                             &mut ops,
@@ -3013,10 +3073,10 @@ fn emit(
                                 ; =>leaf_miss
                             );
                             if cached_slot.is_some() {
-                                emit_clear_cached_method_guards(
+                                emit_clear_loop_caches(
                                     &mut ops,
                                     cached_method_guard_base,
-                                    eligibility.cached_method_guards.len(),
+                                    loop_cache_count,
                                 );
                             }
                         }
@@ -4467,11 +4527,7 @@ fn emit(
         let offset = ops.offset().0;
         let representation_bail = ops.new_dynamic_label();
         emit_prologue(&mut ops, saved_frame);
-        emit_clear_cached_method_guards(
-            &mut ops,
-            cached_method_guard_base,
-            eligibility.cached_method_guards.len(),
-        );
+        emit_clear_loop_caches(&mut ops, cached_method_guard_base, loop_cache_count);
         if !eligibility.back_edges.is_empty() {
             dynasm!(ops ; .arch aarch64 ; movz w29, OPTIMIZED_POLL_BATCH);
         }

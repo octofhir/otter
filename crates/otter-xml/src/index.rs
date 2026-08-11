@@ -4,8 +4,8 @@
 //! - [`Index`] — the positions, with a forward-only cursor over them.
 //! - [`build`] — the index of a document, and the encoding check that runs in
 //!   the same walk.
-//! - [`bytes`] / [`units`] — the byte and the portable producers, which the
-//!   encodings choose between.
+//! - [`bytes`] / [`utf16`] — the two producers, one per width of code unit,
+//!   which the encodings choose between.
 //!
 //! # Invariants
 //! - Indexed positions are exactly `<`, `>`, `&` and `\r`. Everything else a
@@ -17,18 +17,22 @@
 //! - A run of text with no entry between its ends therefore contains no
 //!   reference, no line-end to normalize and no `]]>`, so it can be handed on
 //!   as a slice of the input without being examined again.
-//! - The byte producer classifies 64 bytes at a time and only ever looks at a
-//!   byte one at a time to check an encoding, which for a document that is
-//!   mostly ASCII means almost never.
+//! - Both producers work a block at a time — 64 bytes, or 64 code units —
+//!   and never look at one on its own except to say where a block the kernel
+//!   already rejected went wrong.
+//! - Surrogate pairing is decided from the block's own bit sets: every
+//!   leading surrogate owes the unit after it, so one shift and one
+//!   comparison answer for a whole block, with a single bit carried between
+//!   blocks.
 //!
 //! # See also
 //! - [`crate::scan`] — the only consumer.
 //! - [`crate::simd`] — the classification kernels.
 
 use crate::chars::is_char;
-use crate::encoding::{Encoding, Unit, Utf8};
+use crate::encoding::{Encoding, Utf8};
 use crate::error::{Error, ErrorKind, Result};
-use crate::simd::{self, BLOCK, Kernels, PRECEDING};
+use crate::simd::{self, BLOCK, Kernels, PRECEDING, UNIT_BLOCK};
 
 /// The positions a scanner may have to stop at, in ascending order.
 #[derive(Debug, Default)]
@@ -99,7 +103,9 @@ pub fn bytes_with(
     out: &mut Vec<u32>,
     kernels: Kernels,
 ) -> Result<()> {
-    let Kernels { classify, validate } = kernels;
+    let Kernels {
+        classify, validate, ..
+    } = kernels;
     let mut padded = [b' '; BLOCK];
     // The bytes before the block being checked, so a sequence that straddles
     // the boundary is still whole. They are read out of the document itself,
@@ -195,40 +201,111 @@ fn check_utf8(document: &[u8], from: usize, to: usize) -> Result<usize> {
     Ok(pos)
 }
 
-/// Index a document one code unit at a time, for encodings with no kernel.
+/// Index a UTF-16 document, classifying a block of code units at a time.
 ///
 /// # Errors
-/// As [`build`].
-pub fn units<E: Encoding>(document: &[E::Unit], out: &mut Vec<u32>) -> Result<()> {
-    let mut pos = 0usize;
-    while pos < document.len() {
-        let value = document[pos].value();
-        if value < 0x80 {
-            let byte = value as u8;
-            let class = simd::LUT_LO[(byte & 0x0F) as usize] & simd::LUT_HI[(byte >> 4) as usize];
-            if class & simd::FORBIDDEN_BITS != 0 {
-                return Err(Error::new(ErrorKind::IllegalCharacter(value), pos));
-            }
-            if class & simd::STRUCTURAL_BITS != 0 {
-                out.push(pos as u32);
-            }
-            pos += 1;
-            continue;
+/// Returns [`ErrorKind::IllegalCharacter`] for a unit outside the `Char`
+/// production and [`ErrorKind::MalformedEncoding`] for a surrogate without
+/// its partner.
+pub fn utf16(document: &[u16], out: &mut Vec<u32>) -> Result<()> {
+    utf16_with(document, out, simd::current())
+}
+
+/// [`utf16`], with the kernels named explicitly.
+///
+/// Tests use this to run the portable kernels against the ones this machine
+/// would otherwise pick.
+///
+/// # Errors
+/// As [`utf16`].
+pub fn utf16_with(document: &[u16], out: &mut Vec<u32>, kernels: Kernels) -> Result<()> {
+    let classify_units = kernels.classify_units;
+    let mut padded = [simd::utf16::PAD; UNIT_BLOCK];
+    let mut base = 0;
+    // Whether the unit before this block was a leading surrogate, and so owes
+    // a trailing one to the block's first unit.
+    let mut owed = false;
+    while base < document.len() {
+        let take = (document.len() - base).min(UNIT_BLOCK);
+        let block: &[u16; UNIT_BLOCK] = if take == UNIT_BLOCK {
+            document[base..base + UNIT_BLOCK]
+                .try_into()
+                .expect("a full block is exactly one block wide")
+        } else {
+            padded[..take].copy_from_slice(&document[base..base + take]);
+            // A space classifies as nothing, so the padding cannot be
+            // mistaken for content — and a leading surrogate at the end of
+            // the document is left owing a partner, which is the error it is.
+            padded[take..].fill(simd::utf16::PAD);
+            &padded
+        };
+
+        let masks = (classify_units)(block);
+        // Every leading surrogate owes the unit after it, and every trailing
+        // one is owed by the unit before it. Shifting one mask by a lane says
+        // where the debts fall; the other says where they were paid.
+        let owes = (masks.high << 1) | u64::from(owed);
+        let unpaired = masks.low ^ owes;
+        if masks.forbidden != 0 || unpaired != 0 {
+            return Err(first_unit_error(
+                document,
+                base,
+                masks.forbidden,
+                unpaired,
+                owes,
+            ));
         }
-        // Non-ASCII is never structural, but it still has to spell a character
-        // the document is allowed to contain.
-        let (code, width) = E::decode(document, pos)?;
-        if !is_char(code) {
-            return Err(Error::new(ErrorKind::IllegalCharacter(code), pos));
+        let mut structural = masks.structural;
+        while structural != 0 {
+            out.push((base + structural.trailing_zeros() as usize) as u32);
+            structural &= structural - 1;
         }
-        pos += width;
+        owed = masks.high >> (UNIT_BLOCK - 1) != 0;
+        base += take;
+    }
+    // A leading surrogate in the document's last unit is owed a partner that
+    // never came. A short tail is padded, so only a document that fills its
+    // last block can reach here still owing one.
+    if owed {
+        return Err(Error::new(ErrorKind::MalformedEncoding, document.len() - 1));
     }
     Ok(())
+}
+
+/// Report whichever of the two problems in a block comes first, the way a
+/// walk over the units one at a time would have found it.
+fn first_unit_error(
+    document: &[u16],
+    base: usize,
+    forbidden: u64,
+    unpaired: u64,
+    owes: u64,
+) -> Error {
+    let forbidden_at = if forbidden == 0 {
+        usize::MAX
+    } else {
+        forbidden.trailing_zeros() as usize
+    };
+    let unpaired_at = if unpaired == 0 {
+        usize::MAX
+    } else {
+        unpaired.trailing_zeros() as usize
+    };
+    if forbidden_at <= unpaired_at {
+        let at = base + forbidden_at;
+        return Error::new(ErrorKind::IllegalCharacter(u32::from(document[at])), at);
+    }
+    // A debt that went unpaid is reported against the surrogate that owed it,
+    // one unit earlier; a payment nobody owed is reported where it lies.
+    let owed_here = owes & (1u64 << unpaired_at) != 0;
+    let at = base + unpaired_at - usize::from(owed_here);
+    Error::new(ErrorKind::MalformedEncoding, at)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chars::is_char;
     use crate::encoding::{Latin1, Utf16};
 
     fn positions_utf8(text: &str) -> Vec<u32> {
@@ -304,6 +381,98 @@ mod tests {
             assert_eq!(
                 build::<Utf8>(&doc).unwrap_err().kind,
                 ErrorKind::MalformedEncoding,
+                "pad {pad}"
+            );
+        }
+    }
+
+    /// The verdict a walk over the units one at a time would reach: the
+    /// definition the block walk has to match.
+    fn utf16_by_decoding(document: &[u16]) -> Result<Vec<u32>> {
+        let mut positions = Vec::new();
+        let mut pos = 0;
+        while pos < document.len() {
+            let value = u32::from(document[pos]);
+            if value < 0x80 {
+                if crate::simd::utf16::unit_is_forbidden(document[pos]) {
+                    return Err(Error::new(ErrorKind::IllegalCharacter(value), pos));
+                }
+                if crate::simd::utf16::unit_is_structural(document[pos]) {
+                    positions.push(pos as u32);
+                }
+                pos += 1;
+                continue;
+            }
+            let (code, width) = Utf16::decode(document, pos)?;
+            if !is_char(code) {
+                return Err(Error::new(ErrorKind::IllegalCharacter(code), pos));
+            }
+            pos += width;
+        }
+        Ok(positions)
+    }
+
+    fn assert_utf16_matches_the_decoder(text: &str, note: &str) {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let mut positions = Vec::new();
+        let block = utf16(&units, &mut positions).map(|()| positions);
+        assert_eq!(
+            block.as_ref().map_err(|err| (err.kind.clone(), err.offset)),
+            utf16_by_decoding(&units)
+                .as_ref()
+                .map_err(|err| (err.kind.clone(), err.offset)),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn a_utf16_document_is_indexed_as_the_decoder_would_index_it() {
+        for text in [
+            "<a b='1'>text</a>",
+            "<a>日本語 &amp; more</a>\r\n",
+            "<a>😀🚀 pairs across &lt;</a>",
+            "<a/>",
+            "",
+        ] {
+            assert_utf16_matches_the_decoder(text, text);
+            // …and at every offset around a block boundary.
+            for pad in 60..70 {
+                let padded = format!("{}{text}", "x".repeat(pad));
+                assert_utf16_matches_the_decoder(&padded, &format!("{text} at {pad}"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_surrogate_without_its_partner_is_caught_wherever_it_sits() {
+        for pad in 60..70usize {
+            for (units, at) in [
+                (vec![0xD800u16], 0usize),
+                (vec![0xDC00], 0),
+                (vec![0xD800, u16::from(b'x')], 0),
+                (vec![u16::from(b'x'), 0xDC00], 1),
+                (vec![0xD800, 0xD800, 0xDC00], 0),
+            ] {
+                let mut document: Vec<u16> = "x".repeat(pad).encode_utf16().collect();
+                let offset = document.len() + at;
+                document.extend_from_slice(&units);
+                let err = utf16(&document, &mut Vec::new()).unwrap_err();
+                assert_eq!(err.kind, ErrorKind::MalformedEncoding, "pad {pad}");
+                assert_eq!(err.offset, offset, "pad {pad}: {units:04X?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_pair_split_across_a_block_boundary_is_whole() {
+        for pad in 60..70usize {
+            let mut document: Vec<u16> = "x".repeat(pad).encode_utf16().collect();
+            document.extend("😀<a/>".encode_utf16());
+            let mut positions = Vec::new();
+            utf16(&document, &mut positions).unwrap();
+            assert_eq!(
+                positions,
+                vec![(pad + 2) as u32, (pad + 5) as u32],
                 "pad {pad}"
             );
         }

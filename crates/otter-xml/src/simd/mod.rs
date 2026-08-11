@@ -2,9 +2,10 @@
 //!
 //! # Contents
 //! - [`Masks`] — the three bit sets one 64-byte block yields.
-//! - [`Classifier`] — what a block holds; [`Validator`] — whether its UTF-8
-//!   is legal.
-//! - [`Kernels`] — the pair an instruction set provides, picked together.
+//! - [`Classifier`] — what a block of bytes holds; [`Validator`] — whether
+//!   its UTF-8 is legal; [`UnitClassifier`] — what a block of UTF-16 units
+//!   holds.
+//! - [`Kernels`] — the set an instruction set provides, picked together.
 //! - [`LUT_LO`] / [`LUT_HI`] — the nibble tables the kernels share with the
 //!   portable classifier, so the two cannot drift apart.
 //!
@@ -13,9 +14,11 @@
 //!   byte that classifies as nothing (a space).
 //! - Bit `n` of every mask describes byte `n` of the block.
 //! - A machine runs one instruction set's kernels or another's, never one of
-//!   each: [`Kernels`] is what the dispatcher hands out.
-//! - Every kernel returns what [`classify_scalar`] / [`validate_scalar`]
-//!   return. That is a test, not a hope: `tests/index_agreement.rs` runs them
+//!   each: [`Kernels`] is what the dispatcher hands out. The unit kernel is
+//!   the exception the x86 side states in place: 16-bit lanes pack across a
+//!   256-bit vector's halves, so both x86 sets share one.
+//! - Every kernel returns what [`classify_scalar`] / [`validate_scalar`] /
+//!   [`classify_units_scalar`] return. That is a test, not a hope: `tests/index_agreement.rs` runs them
 //!   over random input.
 //! - The tables classify by nibble pair: `LUT_LO[low] & LUT_HI[high]` is
 //!   non-zero only for bytes that are structural or forbidden, which is what
@@ -27,11 +30,13 @@
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
+pub mod utf16;
 pub mod utf8;
 #[cfg(target_arch = "x86_64")]
 mod x86;
 
 pub use utf8::{PRECEDING, Validator, validate_scalar};
+pub use utf16::{UNIT_BLOCK, UnitClassifier, UnitMasks, classify_units_scalar};
 
 /// How many bytes one classification covers.
 pub const BLOCK: usize = 64;
@@ -101,19 +106,22 @@ pub struct Masks {
 /// A kernel that classifies one block.
 pub type Classifier = fn(&[u8; BLOCK]) -> Masks;
 
-/// The pair of kernels one instruction set provides.
+/// The kernels one instruction set provides.
 #[derive(Debug, Clone, Copy)]
 pub struct Kernels {
-    /// What the block holds.
+    /// What a block of bytes holds.
     pub classify: Classifier,
-    /// Whether the block's UTF-8 is legal, given the block before it.
+    /// Whether a block's UTF-8 is legal, given the bytes before it.
     pub validate: Validator,
+    /// What a block of UTF-16 code units holds.
+    pub classify_units: UnitClassifier,
 }
 
-/// The portable pair, which every machine can run.
+/// The portable set, which every machine can run.
 pub const PORTABLE: Kernels = Kernels {
     classify: classify_scalar,
     validate: validate_scalar,
+    classify_units: classify_units_scalar,
 };
 
 /// Every kernel pair this machine can actually run, named, portable one last.
@@ -136,6 +144,7 @@ fn vector_kernels() -> Vec<(&'static str, Kernels)> {
         Kernels {
             classify: aarch64::classify_neon,
             validate: aarch64::validate_neon,
+            classify_units: aarch64::classify_units_neon,
         },
     )]
 }
@@ -150,6 +159,7 @@ fn vector_kernels() -> Vec<(&'static str, Kernels)> {
             Kernels {
                 classify: x86::classify_avx2,
                 validate: x86::validate_avx2,
+                classify_units: x86::classify_units_sse,
             },
         ));
     }
@@ -159,6 +169,7 @@ fn vector_kernels() -> Vec<(&'static str, Kernels)> {
             Kernels {
                 classify: x86::classify_ssse3,
                 validate: x86::validate_ssse3,
+                classify_units: x86::classify_units_sse,
             },
         ));
     }

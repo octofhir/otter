@@ -7,7 +7,11 @@
 //! its UTF-8 is legal.
 
 use otter_xml::index::bytes_with;
-use otter_xml::simd::{BLOCK, Kernels, PORTABLE, PRECEDING, kernels, validate_scalar};
+use otter_xml::index::utf16_with;
+use otter_xml::simd::{
+    BLOCK, Kernels, PORTABLE, PRECEDING, UNIT_BLOCK, classify_units_scalar, kernels,
+    validate_scalar,
+};
 
 /// What one indexing run produced.
 type Answer = (Result<(), String>, Vec<u32>);
@@ -187,6 +191,88 @@ fn every_kernel_checks_a_sequence_at_every_position_of_a_block() {
                     (kernel.validate)(&prev, &block),
                     portable,
                     "{name}: {sequence:02X?} at {at}"
+                );
+            }
+        }
+    }
+}
+
+/// Code units that make the classification interesting: the structural set,
+/// the controls on both sides of the allowed ones, both surrogate halves, and
+/// the two code points barred at the top of the plane.
+const UNIT_ALPHABET: &[u16] = &[
+    0x3C, 0x3E, 0x26, 0x0D, 0x0A, 0x09, 0x20, 0x3D, 0x22, 0x27, 0x61, 0x36, 0x00, 0x01, 0x08, 0x0B,
+    0x0C, 0x0E, 0x1F, 0x7F, 0x80, 0xE9, 0x4E00, 0xD7FF, 0xD800, 0xD83D, 0xDBFF, 0xDC00, 0xDE00,
+    0xDFFF, 0xE000, 0xFFFD, 0xFFFE, 0xFFFF,
+];
+
+#[test]
+fn every_kernel_classifies_units_bit_for_bit_as_the_portable_one_does() {
+    let mut state = 0xB504_F333_F9DE_6484;
+    for round in 0..20_000 {
+        let mut block = [0u16; UNIT_BLOCK];
+        for unit in &mut block {
+            *unit = UNIT_ALPHABET[(xorshift(&mut state) as usize) % UNIT_ALPHABET.len()];
+        }
+        let portable = classify_units_scalar(&block);
+        for (name, kernel) in kernels() {
+            assert_eq!(
+                (kernel.classify_units)(&block),
+                portable,
+                "{name}: round {round}, block {block:04X?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_kernel_indexes_a_utf16_document_the_same_way() {
+    let mut state = 0x1357_9BDF_2468_ACE0;
+    for round in 0..5_000 {
+        let len = (xorshift(&mut state) % 200) as usize;
+        let document: Vec<u16> = (0..len)
+            .map(|_| UNIT_ALPHABET[(xorshift(&mut state) as usize) % UNIT_ALPHABET.len()])
+            .collect();
+        let mut expected = Vec::new();
+        let portable =
+            utf16_with(&document, &mut expected, PORTABLE).map_err(|err| err.to_string());
+        for (name, kernel) in kernels() {
+            let mut positions = Vec::new();
+            let answer =
+                utf16_with(&document, &mut positions, kernel).map_err(|err| err.to_string());
+            assert_eq!(
+                (answer, positions),
+                (portable.clone(), expected.clone()),
+                "{name}: round {round}, {document:04X?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unit_agreement_holds_at_every_offset_of_a_block_boundary() {
+    for pad in 0..(3 * UNIT_BLOCK) {
+        for tail in [
+            &[0xD83Du16, 0xDE00][..],
+            &[0xD800],
+            &[0xDC00],
+            &[0xFFFE],
+            &[0x0001],
+            &[0x3C, 0x61, 0x2F, 0x3E],
+        ] {
+            let mut document: Vec<u16> = vec![u16::from(b'x'); pad];
+            document.extend_from_slice(tail);
+            let mut expected = Vec::new();
+            let portable =
+                utf16_with(&document, &mut expected, PORTABLE).map_err(|err| err.to_string());
+            for (name, kernel) in kernels() {
+                let mut positions = Vec::new();
+                let answer =
+                    utf16_with(&document, &mut positions, kernel).map_err(|err| err.to_string());
+                assert_eq!(
+                    (answer, positions),
+                    (portable.clone(), expected.clone()),
+                    "{name}: {tail:04X?} at {pad}"
                 );
             }
         }

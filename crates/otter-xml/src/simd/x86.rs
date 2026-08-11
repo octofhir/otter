@@ -4,6 +4,7 @@
 //! - [`classify_avx2`] / [`validate_avx2`] — 32 bytes per step.
 //! - [`classify_ssse3`] / [`validate_ssse3`] — 16 bytes per step, for
 //!   machines without AVX2.
+//! - [`classify_units_sse`] — a block of UTF-16 units, on any x86_64.
 //!
 //! # Invariants
 //! - Every kernel is reached only through [`super::kernels`], which checks the
@@ -18,9 +19,10 @@
 //! - [`super`] — the tables and the definitions these answer to.
 
 use core::arch::x86_64::{
-    __m128i, __m256i, _mm_alignr_epi8, _mm_and_si128, _mm_cmpeq_epi8, _mm_loadu_si128,
-    _mm_movemask_epi8, _mm_or_si128, _mm_set1_epi8, _mm_setzero_si128, _mm_shuffle_epi8,
-    _mm_srli_epi16, _mm_subs_epu8, _mm_xor_si128, _mm256_alignr_epi8, _mm256_and_si256,
+    __m128i, __m256i, _mm_alignr_epi8, _mm_and_si128, _mm_andnot_si128, _mm_cmpeq_epi8,
+    _mm_cmpeq_epi16, _mm_loadu_si128, _mm_movemask_epi8, _mm_or_si128, _mm_packs_epi16,
+    _mm_set1_epi8, _mm_set1_epi16, _mm_setzero_si128, _mm_shuffle_epi8, _mm_srli_epi16,
+    _mm_subs_epu8, _mm_subs_epu16, _mm_xor_si128, _mm256_alignr_epi8, _mm256_and_si256,
     _mm256_broadcastsi128_si256, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
     _mm256_or_si256, _mm256_permute2x128_si256, _mm256_set1_epi8, _mm256_setzero_si256,
     _mm256_shuffle_epi8, _mm256_srli_epi16, _mm256_subs_epu8, _mm256_xor_si256,
@@ -29,6 +31,10 @@ use core::arch::x86_64::{
 use super::utf8::{
     FOURTH_BYTE_BIAS, LEAD_HIGH, LEAD_LOW, NONCHAR_LEAD, NONCHAR_SECOND, NONCHAR_THIRD,
     NONCHAR_THIRD_MASK, PRECEDING, SECOND_HIGH, THIRD_BYTE_BIAS,
+};
+use super::utf16::{
+    FIRST_NONCHARACTER, HIGH_SURROGATE, LAST_CONTROL, LOW_SURROGATE, SURROGATE_MASK, UNIT_BLOCK,
+    UnitMasks,
 };
 use super::{BLOCK, FORBIDDEN_BITS, LUT_HI, LUT_LO, Masks, STRUCTURAL_BITS};
 
@@ -276,5 +282,90 @@ unsafe fn validate_with_ssse3(prev: &[u8; PRECEDING], block: &[u8; BLOCK]) -> u6
             error |= u64::from(!(_mm_movemask_epi8(right) as u16)) << (lane * 16);
         }
         error
+    }
+}
+
+/// Classify one block of UTF-16 code units with SSE2.
+///
+/// This is the x86 kernel, whatever else the machine can run. Packing 16-bit
+/// lanes down to a mask crosses the two halves of a 256-bit vector, so the
+/// wider register buys back less than the shuffle costs; and SSE2 is part of
+/// the x86_64 baseline, so unlike the byte kernels this one needs no
+/// detection at all.
+#[must_use]
+pub fn classify_units_sse(block: &[u16; UNIT_BLOCK]) -> UnitMasks {
+    // SAFETY: SSE2 is part of the x86_64 baseline, and `units` reads only the
+    // block it was given.
+    unsafe { units(block) }
+}
+
+#[target_feature(enable = "sse2")]
+unsafe fn units(block: &[u16; UNIT_BLOCK]) -> UnitMasks {
+    // SAFETY: every load below stays inside `block`.
+    unsafe {
+        let last_control = _mm_set1_epi16(LAST_CONTROL as i16);
+        let below_noncharacter = _mm_set1_epi16((FIRST_NONCHARACTER - 1) as i16);
+        let surrogate_mask = _mm_set1_epi16(SURROGATE_MASK as i16);
+        let high_surrogate = _mm_set1_epi16(HIGH_SURROGATE as i16);
+        let low_surrogate = _mm_set1_epi16(LOW_SURROGATE as i16);
+        let tab = _mm_set1_epi16(0x09);
+        let newline = _mm_set1_epi16(0x0A);
+        let carriage_return = _mm_set1_epi16(0x0D);
+        let less_than = _mm_set1_epi16(0x3C);
+        let greater_than = _mm_set1_epi16(0x3E);
+        let ampersand = _mm_set1_epi16(0x26);
+        let zero = _mm_setzero_si128();
+
+        // Two vectors of eight units pack into one mask of sixteen bits.
+        let mut masks = UnitMasks::default();
+        for pair in 0..UNIT_BLOCK / 16 {
+            let mut structural = [zero; 2];
+            let mut forbidden = [zero; 2];
+            let mut high = [zero; 2];
+            let mut low = [zero; 2];
+            for half in 0..2 {
+                let value: __m128i =
+                    _mm_loadu_si128(block.as_ptr().add(pair * 16 + half * 8).cast());
+                let is_return = _mm_cmpeq_epi16(value, carriage_return);
+
+                structural[half] = _mm_or_si128(
+                    _mm_or_si128(
+                        _mm_cmpeq_epi16(value, less_than),
+                        _mm_cmpeq_epi16(value, greater_than),
+                    ),
+                    _mm_or_si128(_mm_cmpeq_epi16(value, ampersand), is_return),
+                );
+                // Unsigned comparison, which SSE2 has no instruction for:
+                // saturating subtraction is zero exactly when the left side
+                // is the smaller.
+                let is_control = _mm_cmpeq_epi16(_mm_subs_epu16(value, last_control), zero);
+                let is_noncharacter =
+                    _mm_cmpeq_epi16(_mm_subs_epu16(below_noncharacter, value), zero);
+                let allowed_control = _mm_or_si128(
+                    _mm_or_si128(_mm_cmpeq_epi16(value, tab), _mm_cmpeq_epi16(value, newline)),
+                    is_return,
+                );
+                forbidden[half] = _mm_or_si128(
+                    _mm_andnot_si128(allowed_control, is_control),
+                    is_noncharacter,
+                );
+                let surrogate = _mm_and_si128(value, surrogate_mask);
+                high[half] = _mm_cmpeq_epi16(surrogate, high_surrogate);
+                low[half] = _mm_cmpeq_epi16(surrogate, low_surrogate);
+            }
+
+            // `packs` saturates each 16-bit lane into a byte, which turns a
+            // comparison result into `0xFF` or `0x00` and leaves the lanes in
+            // order.
+            let shift = pair * 16;
+            let gather = |halves: [__m128i; 2]| -> u64 {
+                u64::from(_mm_movemask_epi8(_mm_packs_epi16(halves[0], halves[1])) as u16)
+            };
+            masks.structural |= gather(structural) << shift;
+            masks.forbidden |= gather(forbidden) << shift;
+            masks.high |= gather(high) << shift;
+            masks.low |= gather(low) << shift;
+        }
+        masks
     }
 }

@@ -328,8 +328,8 @@ impl JsString {
         })
     }
 
-    /// O(1) substring view (or fresh body when the source is cons /
-    /// latin-1; see [`gc_body::slice_string_body`]).
+    /// O(1) substring view over either flat storage width. Cons sources
+    /// materialise only the requested range; see [`gc_body::slice_string_body`].
     ///
     /// # Errors
     /// Surfaces [`OutOfMemory`] verbatim.
@@ -453,26 +453,14 @@ impl JsString {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        heap.read_payload(self.handle, |body| match &body.repr {
-            JsStringBodyRepr::InlineLatin1(bytes) => Some(f(&bytes[..body.len as usize])),
-            JsStringBodyRepr::SeqLatin1 => Some(f(body.seq_latin1_bytes())),
-            _ => None,
-        })
+        gc_body::with_latin1(heap, self.handle, f)
     }
 
     /// `true` when content comparisons can read this body in place without
     /// materialising a temporary UTF-16 vector.
     #[must_use]
     pub fn is_flat_or_latin1(self, heap: &GcHeap) -> bool {
-        heap.read_payload(self.handle, |body| {
-            matches!(
-                body.repr,
-                JsStringBodyRepr::InlineFlat(_)
-                    | JsStringBodyRepr::SeqFlat
-                    | JsStringBodyRepr::InlineLatin1(_)
-                    | JsStringBodyRepr::SeqLatin1
-            )
-        })
+        gc_body::is_contiguous(heap, self.handle)
     }
 
     /// Code-unit at `index`, or `None` for out-of-range. Walks the
@@ -548,7 +536,7 @@ impl JsString {
             // match. Cheap reject before the body walk.
             return false;
         }
-        self.with_utf16(heap, |units| units.iter().copied().eq(s.encode_utf16()))
+        gc_body::eq_str(heap, self.handle, s)
     }
 
     /// Find `needle` starting at code-unit `from`. Returns the match
@@ -682,21 +670,10 @@ fn try_with_two_latin1<F, R>(a: JsString, b: JsString, heap: &GcHeap, f: F) -> O
 where
     F: FnOnce(&[u8], &[u8]) -> R,
 {
-    heap.read_payload(a.handle, |a_body| {
-        let a_bytes = match &a_body.repr {
-            JsStringBodyRepr::InlineLatin1(bytes) => &bytes[..a_body.len as usize],
-            JsStringBodyRepr::SeqLatin1 => a_body.seq_latin1_bytes(),
-            _ => return None,
-        };
-        heap.read_payload(b.handle, |b_body| {
-            let b_bytes = match &b_body.repr {
-                JsStringBodyRepr::InlineLatin1(bytes) => &bytes[..b_body.len as usize],
-                JsStringBodyRepr::SeqLatin1 => b_body.seq_latin1_bytes(),
-                _ => return None,
-            };
-            Some(f(a_bytes, b_bytes))
-        })
+    a.with_latin1(heap, |a_bytes| {
+        b.with_latin1(heap, |b_bytes| f(a_bytes, b_bytes))
     })
+    .flatten()
 }
 
 /// Loop-iteration budget at which `index_of` checks the interrupt

@@ -165,6 +165,18 @@ It already owns:
   improved the existing `indexOf` kernel by 53.33% and full `native-boundary`
   by 20.66%, with exact checksums, unchanged reductions/stub counts, zero
   deopts, and native-boundary code shrinking from 6,848 to 6,740 bytes;
+- guarded global-object reads inside a completely generated outermost loop now
+  cache the live property-slot address after one realm-epoch and shape proof.
+  The loaded value remains live, and a cached builtin namespace becomes an
+  activation-invariant receiver that unlocks its method-identity caches. Entry,
+  OSR, and every generated miss clear global and method raw addresses together
+  before collection or reentry. Artifact coverage exposes
+  `loopInvariantGlobalObjectLoadCache`; a property getter replaces global
+  `Math`, allocates under GC stress, and proves the next iteration observes both
+  replacement methods. Alternating 10-warmup/25-sample medians improved the
+  Math-only kernel by 47.29% and full `native-boundary` by 18.77%, with exact
+  checksums, unchanged reductions/stub counts, zero deopts, and native-boundary
+  code growing from 6,740 to 7,544 bytes;
 - catch-only exception-region CFGs with explicit landing-pad successors; the
   shared linkage fully unwinds publication, commits the thrown value to its
   allocator home, and transfers at the exact call PC without replay;

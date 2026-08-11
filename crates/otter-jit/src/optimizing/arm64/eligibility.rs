@@ -4,6 +4,8 @@
 //! - Which inline bodies and method splices the backend can lower.
 //! - Per-instruction operand, representation and constant checks.
 //! - OSR entry sites and per-frame reentrant-transition safepoints.
+//! - Whole-outermost-loop safety proofs for raw global-slot and method-guard
+//!   activation caches.
 //!
 //! # Invariants
 //! - Nothing here emits machine code. A function that answers "can this be
@@ -15,6 +17,8 @@
 //!   instruction. A logical PC and a byte PC name an instruction only inside
 //!   their own body, so the outermost function's tables are never consulted
 //!   for a spliced one.
+//! - A prepared global-object load counts as an invariant receiver only inside
+//!   a loop where every generated miss clears the complete raw cache set.
 
 use super::*;
 use crate::ir::licm::natural_loop_blocks;
@@ -112,6 +116,7 @@ pub(super) fn guard_cache_safe_instruction(
     block: BlockId,
     instruction: &SsaInstr,
     generated_intrinsics: &BTreeMap<(InlineId, u32), (ValueId, bool)>,
+    prepared_global_object_loads: &BTreeMap<(InlineId, u32), BlockId>,
     loop_blocks: &BTreeSet<BlockId>,
 ) -> bool {
     let Some(op) = instruction.op.bytecode() else {
@@ -201,9 +206,13 @@ pub(super) fn guard_cache_safe_instruction(
             // transition. Every such site in a cached loop therefore needs its
             // own slot. Ordinary receivers must be invariant; exotic bodies
             // may vary because each iteration revalidates the current body and
-            // reuses only pinned prototype identity.
+            // reuses only pinned prototype identity. A prepared global-object
+            // read is also invariant once its own activation-local slot has
+            // passed the epoch/shape proof.
             ssa.values.get(receiver.0 as usize).is_some_and(|value| {
-                *allows_varying_receiver || !loop_blocks.contains(&value.def_block)
+                *allows_varying_receiver
+                    || !loop_blocks.contains(&value.def_block)
+                    || value_is_prepared_global_object_load(value, prepared_global_object_loads)
             })
         }
         Op::Return | Op::ReturnValue | Op::ReturnUndefined => matches!(
@@ -212,6 +221,50 @@ pub(super) fn guard_cache_safe_instruction(
         ),
         _ => false,
     }
+}
+
+fn value_is_prepared_global_object_load(
+    value: &crate::ir::ssa::ValueData,
+    prepared: &BTreeMap<(InlineId, u32), BlockId>,
+) -> bool {
+    matches!(
+        &value.def,
+        ValueDef::Op {
+            inline,
+            pc,
+            op: SsaOp::Bytecode(Op::LoadGlobalOrThrow),
+            ..
+        } if prepared.contains_key(&(*inline, *pc))
+    )
+}
+
+fn prepared_global_object_load_sites(
+    tree: &InlineTree,
+    cfg: &ControlFlowGraph,
+    ssa: &SsaFunction,
+) -> BTreeMap<(InlineId, u32), BlockId> {
+    let mut sites = BTreeMap::new();
+    for block in &cfg.blocks {
+        for instruction in &ssa.blocks[block.id.0 as usize].instrs {
+            if instruction.op != SsaOp::Bytecode(Op::LoadGlobalOrThrow) {
+                continue;
+            }
+            let Some(frame) = tree.frames.get(instruction.inline.0 as usize) else {
+                continue;
+            };
+            let Some(metadata) = frame.instructions().get(instruction.pc as usize) else {
+                continue;
+            };
+            if frame
+                .body
+                .global_object_loads
+                .contains_key(&metadata.byte_pc)
+            {
+                sites.insert((instruction.inline, instruction.pc), block.id);
+            }
+        }
+    }
+    sites
 }
 
 fn generated_method_intrinsic_receiver(
@@ -248,13 +301,18 @@ fn generated_method_intrinsic_receiver(
     Some((receiver, allows_varying_receiver))
 }
 
-pub(super) fn cached_method_guard_sites(
+struct LoopCacheSites {
+    method_guards: BTreeMap<(InlineId, u32), CachedMethodGuardKind>,
+    global_object_loads: BTreeSet<(InlineId, u32)>,
+}
+
+fn loop_cache_sites(
     tree: &InlineTree,
     cfg: &ControlFlowGraph,
     ssa: &SsaFunction,
     reprs: &ReprMap,
     back_edges: &BTreeMap<(BlockId, BlockId), (DeoptExitId, u32)>,
-) -> BTreeMap<(InlineId, u32), CachedMethodGuardKind> {
+) -> LoopCacheSites {
     let mut candidates = BTreeMap::new();
     let mut generated_intrinsics = BTreeMap::new();
     for block in &cfg.blocks {
@@ -295,37 +353,23 @@ pub(super) fn cached_method_guard_sites(
             );
         }
     }
-    let mut cached = BTreeMap::<(InlineId, u32), CachedMethodGuardKind>::new();
+    let prepared_global_object_loads = prepared_global_object_load_sites(tree, cfg, ssa);
     let natural_loops = back_edges
         .keys()
         .map(|&(latch, header)| natural_loop_blocks(cfg, latch, header))
         .collect::<Vec<_>>();
-    for (&site, &(call_block, receiver, allows_varying_receiver)) in &candidates {
-        for loop_blocks in &natural_loops {
+    let safe_loops = natural_loops
+        .iter()
+        .filter(|loop_blocks| {
             // Cache slots are initialized per activation, not per loop entry.
-            // An inner loop can be entered again after its outer loop changes a
-            // receiver or re-enters JavaScript, so never prove it in isolation.
-            // Its site may still be cached when the complete enclosing
-            // outermost loop satisfies this activation-lifetime contract.
-            if natural_loops
+            // An inner loop can be entered again after its outer loop changes
+            // state, so it is selected only as part of a safe outermost loop.
+            !natural_loops
                 .iter()
                 .any(|outer| loop_blocks.len() < outer.len() && loop_blocks.is_subset(outer))
-            {
-                continue;
-            }
-            let receiver_def = ssa
-                .values
-                .get(receiver.0 as usize)
-                .map(|value| value.def_block);
-            if !loop_blocks.contains(&call_block) || receiver_def.is_none() {
-                continue;
-            }
-            let receiver_is_invariant =
-                receiver_def.is_some_and(|block| !loop_blocks.contains(&block));
-            if !receiver_is_invariant && !allows_varying_receiver {
-                continue;
-            }
-            if loop_blocks.iter().all(|block| {
+        })
+        .filter(|loop_blocks| {
+            loop_blocks.iter().all(|block| {
                 ssa.blocks[block.0 as usize]
                     .instrs
                     .iter()
@@ -337,6 +381,10 @@ pub(super) fn cached_method_guard_sites(
                                 *allows_varying_receiver
                                     || ssa.values.get(receiver.0 as usize).is_some_and(|value| {
                                         !loop_blocks.contains(&value.def_block)
+                                            || value_is_prepared_global_object_load(
+                                                value,
+                                                &prepared_global_object_loads,
+                                            )
                                     })
                             });
                         native_receiver_is_cacheable
@@ -347,24 +395,53 @@ pub(super) fn cached_method_guard_sites(
                                 *block,
                                 instruction,
                                 &generated_intrinsics,
+                                &prepared_global_object_loads,
                                 loop_blocks,
                             )
                     })
-            }) {
-                let kind = if receiver_is_invariant {
-                    CachedMethodGuardKind::ReceiverHeader
-                } else {
-                    CachedMethodGuardKind::ExoticMethodIdentity
-                };
-                cached
-                    .entry(site)
-                    .and_modify(|existing| *existing = (*existing).min(kind))
-                    .or_insert(kind);
-                break;
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let cached_global_object_loads = prepared_global_object_loads
+        .iter()
+        .filter(|(_, block)| safe_loops.iter().any(|blocks| blocks.contains(block)))
+        .map(|(&site, _)| site)
+        .collect::<BTreeSet<_>>();
+    let mut cached = BTreeMap::<(InlineId, u32), CachedMethodGuardKind>::new();
+    for (&site, &(call_block, receiver, allows_varying_receiver)) in &candidates {
+        for loop_blocks in &safe_loops {
+            let Some(receiver_value) = ssa.values.get(receiver.0 as usize) else {
+                continue;
+            };
+            if !loop_blocks.contains(&call_block) {
+                continue;
             }
+            let receiver_is_invariant = !loop_blocks.contains(&receiver_value.def_block)
+                || value_is_prepared_global_object_load(
+                    receiver_value,
+                    &prepared_global_object_loads,
+                );
+            if !receiver_is_invariant && !allows_varying_receiver {
+                continue;
+            }
+            let kind = if receiver_is_invariant {
+                CachedMethodGuardKind::ReceiverHeader
+            } else {
+                CachedMethodGuardKind::ExoticMethodIdentity
+            };
+            cached
+                .entry(site)
+                .and_modify(|existing| *existing = (*existing).min(kind))
+                .or_insert(kind);
+            break;
         }
     }
-    cached
+    LoopCacheSites {
+        method_guards: cached,
+        global_object_loads: cached_global_object_loads,
+    }
 }
 
 /// Canonical instruction index of `byte_pc` within `function_id`'s body.
@@ -1391,7 +1468,10 @@ pub(super) fn check_eligibility(
         element_transition_instructions,
     )?;
     let osr_entries = build_osr_entry_sites(cfg, ssa, liveness, frame_states, hoisted_loops)?;
-    let cached_method_guards = cached_method_guard_sites(tree, cfg, ssa, reprs, &back_edges);
+    let LoopCacheSites {
+        method_guards: cached_method_guards,
+        global_object_loads: cached_global_object_loads,
+    } = loop_cache_sites(tree, cfg, ssa, reprs, &back_edges);
     Ok(Eligibility {
         guarded_uses: guarded_numeric_uses,
         back_edges,
@@ -1399,6 +1479,7 @@ pub(super) fn check_eligibility(
         element_transitions,
         insufficient_feedback,
         cached_method_guards,
+        cached_global_object_loads,
     })
 }
 

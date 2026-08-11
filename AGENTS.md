@@ -392,7 +392,11 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     byte PC. Exact addresses are redacted; the generated hit reads the live
     permanent cell and a TDZ hole retains the canonical throwing transition.
     Guarded global-object reads prove the realm epoch, dictionary shape, and
-    property slot before reading the live value.
+    property slot before reading the live value. In a completely generated,
+    non-reentrant outermost loop, `loopInvariantGlobalObjectLoadCache` marks a
+    native-stack slot that retains the live property address after the first
+    proof. It never caches the loaded value; entry, OSR, and every cold path
+    clear the raw address before collection or JavaScript reentry.
   - Prepared string literals expose `stringConstantCell` relocations keyed by
     function id and byte PC. Exact addresses are redacted. Generated code reads
     the current value from an address-stable GC-traced cell; moving collection
@@ -431,14 +435,16 @@ Pure Rust implementation - no external JavaScript engine dependencies.
   - Optimizing plain/method splices use ordinary `instruction` regions keyed by
     `inlineFrame`; the caller call opcode owns the identity guard and the
     callee frame owns its body operations. `deopt.json` records the complete
-    outermost-first caller/callee chain. Loop-invariant method guards keep
-    their full identity checks on the first iteration and use independent
-    native-stack caches on later iterations. Invariant receivers reuse their
-    validated body header; varying exotic Map/string receivers revalidate the
-    current body while reusing pinned prototype identity. Any cold intrinsic
-    miss, or generated element/property/global-read probe miss, clears every
-    site before generic reentry or collection. Element and global reads require
-    a prepared generated hit path; always-slow reads keep the loop uncached.
+    outermost-first caller/callee chain. Loop-invariant global-object reads and
+    method guards keep their full proofs on the first iteration and use
+    independent native-stack caches on later iterations. A cached global slot
+    makes its loaded builtin namespace receiver activation-invariant; other
+    invariant receivers reuse their validated body header, while varying
+    exotic Map/string receivers revalidate the current body and reuse pinned
+    prototype identity. Any cold intrinsic miss, or generated
+    element/property/global-read probe miss, clears every site before generic
+    reentry or collection. Element and global reads require a prepared
+    generated hit path; always-slow reads keep the loop uncached.
     Entry and OSR caches are distinct activations and start empty. Inner loops
     are never selected in isolation; their sites require the complete
     enclosing outermost loop to satisfy the cache contract.

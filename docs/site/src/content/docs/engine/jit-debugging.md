@@ -150,6 +150,13 @@ a TDZ hole still enters the canonical throwing global lookup.
 Global-object records similarly retain only structural identity and the
 property slot. Generated code proves the realm epoch and dictionary shape
 before reading the live value; a mismatch uses the canonical lookup.
+For a completely generated, non-reentrant outermost loop, a
+`loopInvariantGlobalObjectLoadCache` code-map region identifies the first
+proof plus its activation-local fast reuse. The native-stack slot retains the
+live property address, not the loaded `Value`, so a same-slot value update is
+read live. Entry and OSR initialize the slot to empty. Every intrinsic or
+generated read miss clears all raw global and method caches before generic
+lookup, allocation, moving GC, or JavaScript reentry.
 
 Prepared `LoadString` sites expose a `stringConstantCell` relocation keyed by
 function id and byte PC. The process address is redacted. The cell is rooted,

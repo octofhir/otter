@@ -119,6 +119,18 @@ It already owns:
   30.29% for the isolated `charCodeAt` slice, 39.85% for `indexOf`, and 11.70%
   for the full `native-boundary` workload with exact matching checksums and
   zero optimizing deopts;
+- optimizing guarded `Map.get(Int32)` and existing-key
+  `Map.set(Int32, value)` calls hash and probe the GC-owned ordered table
+  directly in AArch64 after the exact receiver/prototype/method identity
+  proof. Map entries now occupy one stable 32-byte record containing the
+  original key, value, cached hash, chain link, and flags instead of retaining
+  a second projected `MapKey`; generated overwrites run the shared table-parent
+  write barrier only for cell values. Missing keys, `-0`/`+0` representation
+  aliases, long chains, insertions, and structural drift enter the canonical
+  pre-effect method path. Alternating 8-warmup/15-sample process medians fell
+  by 64.54% for isolated `Map.get`, 65.74% for `Map.set`, 58.60% for their
+  combined slice, and 39.13% for the full `native-boundary` workload with
+  exact matching checksums and unchanged optimizing entry/deopt topology;
 - catch-only exception-region CFGs with explicit landing-pad successors; the
   shared linkage fully unwinds publication, commits the thrown value to its
   allocator home, and transfers at the exact call PC without replay;

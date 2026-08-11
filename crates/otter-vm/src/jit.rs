@@ -425,6 +425,43 @@ pub struct JitCollectionLayout {
     pub guard_flags_byte: u32,
     /// `GcHeader::type_tag` for native-function bodies.
     pub native_function_type_tag: u8,
+    /// Compact `Map` table layout for generated Int32 probes.
+    pub map_table: JitMapTableLayout,
+}
+
+/// Stable words needed to probe one compact `Map` table from generated code.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JitMapTableLayout {
+    /// Byte offset from the Map header to its compressed table handle.
+    pub map_table_byte: u32,
+    /// `GcHeader::type_tag` for a Map's ordered table.
+    pub table_type_tag: u8,
+    /// Byte offset from the table header to its appended-entry length.
+    pub table_len_byte: u32,
+    /// Byte offset from the table header to `bucket_count - 1`.
+    pub table_bucket_mask_byte: u32,
+    /// Byte offset from the table header to the first bucket word.
+    pub table_buckets_byte: u32,
+    /// Width of one compact Map entry.
+    pub entry_size: u32,
+    /// Byte offset from an entry to its original key value.
+    pub entry_key_byte: u32,
+    /// Byte offset from an entry to its mapped value.
+    pub entry_value_byte: u32,
+    /// Byte offset from an entry to its collision-chain successor.
+    pub entry_next_byte: u32,
+    /// Byte offset from an entry to its state flags.
+    pub entry_flags_byte: u32,
+    /// State bit proving that an entry is live rather than tombstoned.
+    pub entry_live_flag: u32,
+    /// Word mixed first for a Number key.
+    pub number_hash_tag: u64,
+    /// Per-word Fx hash multiplier.
+    pub fx_hash_multiplier: u64,
+    /// First low-bit avalanche multiplier.
+    pub hash_avalanche_1: u64,
+    /// Second low-bit avalanche multiplier.
+    pub hash_avalanche_2: u64,
 }
 
 /// Width of one body word a declared layout guards.

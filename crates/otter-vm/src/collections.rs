@@ -241,14 +241,39 @@ pub(crate) const MAP_BODY_JIT_GUARD_FLAGS_OFFSET: usize =
 const _: () = assert!(MAP_BODY_JIT_GUARD_FLAGS_OFFSET.is_multiple_of(4));
 
 #[derive(Debug, Clone)]
+#[repr(C)]
 pub(crate) struct MapEntry {
-    key_hash: Option<MapKey>,
-    key: Option<Value>,
-    value: Option<Value>,
+    /// Original key value. The compact entry keeps the spec value once rather
+    /// than duplicating its potentially large [`MapKey`] projection.
+    key: Value,
+    /// Current mapped value.
+    value: Value,
+    /// Stable structural hash for indexed keys. Meaningful only when
+    /// [`MAP_ENTRY_INDEXED`] is set.
+    hash: u64,
     /// Next entry in the same bucket, or [`table::EMPTY`]. The chain
     /// lives in the entries themselves so the table needs no side index.
     next: u32,
+    /// Compact liveness/indexability bits with a stable generated-code layout.
+    flags: u32,
 }
+
+const MAP_ENTRY_LIVE: u32 = 1 << 0;
+const MAP_ENTRY_INDEXED: u32 = 1 << 1;
+
+pub(crate) const MAP_BODY_TABLE_OFFSET: usize = std::mem::offset_of!(MapBody, table);
+pub(crate) const MAP_ENTRY_KEY_OFFSET: usize = std::mem::offset_of!(MapEntry, key);
+pub(crate) const MAP_ENTRY_VALUE_OFFSET: usize = std::mem::offset_of!(MapEntry, value);
+pub(crate) const MAP_ENTRY_NEXT_OFFSET: usize = std::mem::offset_of!(MapEntry, next);
+pub(crate) const MAP_ENTRY_FLAGS_OFFSET: usize = std::mem::offset_of!(MapEntry, flags);
+pub(crate) const MAP_ENTRY_SIZE: usize = std::mem::size_of::<MapEntry>();
+pub(crate) const MAP_ENTRY_LIVE_FLAG: u32 = MAP_ENTRY_LIVE;
+
+const _: () = assert!(MAP_ENTRY_SIZE == 32);
+const _: () = assert!(MAP_ENTRY_KEY_OFFSET == 0);
+const _: () = assert!(MAP_ENTRY_VALUE_OFFSET == 8);
+const _: () = assert!(MAP_ENTRY_NEXT_OFFSET == 24);
+const _: () = assert!(MAP_ENTRY_FLAGS_OFFSET == 28);
 
 impl table::TableEntry for MapEntry {
     const TABLE_TYPE_TAG: u8 = MAP_TABLE_BODY_TYPE_TAG;
@@ -258,7 +283,7 @@ impl table::TableEntry for MapEntry {
     }
 
     fn entry_hash(&self) -> Option<u64> {
-        map_key_hash(self.key_hash.as_ref()?)
+        (self.flags & MAP_ENTRY_INDEXED != 0).then_some(self.hash)
     }
 
     fn next(&self) -> u32 {
@@ -271,54 +296,53 @@ impl table::TableEntry for MapEntry {
 
     fn vacant() -> Self {
         Self {
-            key_hash: None,
-            key: None,
-            value: None,
+            key: Value::hole(),
+            value: Value::hole(),
+            hash: 0,
             next: table::EMPTY,
+            flags: 0,
         }
     }
 }
 
 impl crate::pelt::PeltField for MapEntry {
     fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
-        if let Some(key_hash) = &mut self.key_hash {
-            <MapKey as crate::pelt::PeltField>::pelt_trace(key_hash, visitor);
-        }
-        if let Some(key) = &mut self.key {
-            key.trace_value_slot_mut(visitor);
-        }
-        if let Some(value) = &mut self.value {
-            value.trace_value_slot_mut(visitor);
+        if self.is_live() {
+            self.key.trace_value_slot_mut(visitor);
+            self.value.trace_value_slot_mut(visitor);
         }
     }
 }
 
 impl MapEntry {
     fn live(key_hash: MapKey, key: Value, value: Value) -> Self {
+        let hash = map_key_hash(&key_hash);
         Self {
-            key_hash: Some(key_hash),
-            key: Some(key),
-            value: Some(value),
+            key,
+            value,
+            hash: hash.unwrap_or(0),
             next: table::EMPTY,
+            flags: MAP_ENTRY_LIVE | (u32::from(hash.is_some()) * MAP_ENTRY_INDEXED),
         }
     }
 
+    fn is_live(&self) -> bool {
+        self.flags & MAP_ENTRY_LIVE != 0
+    }
+
     fn key_matches(&self, key: &MapKey, heap: &otter_gc::GcHeap) -> bool {
-        self.value.is_some()
-            && self
-                .key_hash
-                .as_ref()
-                .is_some_and(|stored| stored.matches(key, heap))
+        self.is_live() && MapKey::from_value(&self.key, heap).matches(key, heap)
     }
 
     fn pair(&self) -> Option<(Value, Value)> {
-        Some((*self.key.as_ref()?, *self.value.as_ref()?))
+        self.is_live().then_some((self.key, self.value))
     }
 
     fn clear(&mut self) {
-        self.key_hash = None;
-        self.key = None;
-        self.value = None;
+        self.key = Value::hole();
+        self.value = Value::hole();
+        self.hash = 0;
+        self.flags = 0;
     }
 }
 
@@ -420,31 +444,40 @@ impl SetBody {
 /// differ mainly in their high IEEE-754 bits and otherwise collapse into one
 /// small-table bucket. Heap-independent by construction.
 fn map_key_hash(key: &MapKey) -> Option<u64> {
-    use core::hash::{Hash, Hasher};
-    let mut h = rustc_hash::FxHasher::default();
+    let mut hash = 0;
     match key {
-        MapKey::Undefined => 0u8.hash(&mut h),
-        MapKey::Null => 1u8.hash(&mut h),
+        MapKey::Undefined => hash = fx_hash_word(hash, 0),
+        MapKey::Null => hash = fx_hash_word(hash, 1),
         MapKey::Boolean(b) => {
-            2u8.hash(&mut h);
-            b.hash(&mut h);
+            hash = fx_hash_word(hash, 2);
+            hash = fx_hash_word(hash, u64::from(*b));
         }
         MapKey::Number(f) => {
-            3u8.hash(&mut h);
+            hash = fx_hash_word(hash, MAP_NUMBER_HASH_TAG);
             let bits = if f.is_nan() {
                 f64::NAN.to_bits()
             } else {
                 f.to_bits()
             };
-            bits.hash(&mut h);
+            hash = fx_hash_word(hash, bits);
         }
         MapKey::String(s) => {
-            4u8.hash(&mut h);
-            s.cached_hash().hash(&mut h);
+            hash = fx_hash_word(hash, 4);
+            hash = fx_hash_word(hash, u64::from(s.cached_hash()));
         }
         MapKey::BigInt(_) | MapKey::Symbol(_) | MapKey::ObjectValue(_) => return None,
     }
-    Some(avalanche_map_hash(h.finish()))
+    Some(avalanche_map_hash(hash.rotate_left(26)))
+}
+
+pub(crate) const MAP_FX_HASH_MULTIPLIER: u64 = 0xf135_7aea_2e62_a9c5;
+pub(crate) const MAP_HASH_AVALANCHE_1: u64 = 0xff51_afd7_ed55_8ccd;
+pub(crate) const MAP_HASH_AVALANCHE_2: u64 = 0xc4ce_b9fe_1a85_ec53;
+pub(crate) const MAP_NUMBER_HASH_TAG: u64 = 3;
+
+#[inline]
+fn fx_hash_word(hash: u64, word: u64) -> u64 {
+    hash.wrapping_add(word).wrapping_mul(MAP_FX_HASH_MULTIPLIER)
 }
 
 /// Spread every input bit into the low bits consumed by
@@ -452,9 +485,9 @@ fn map_key_hash(key: &MapKey) -> Option<u64> {
 #[inline]
 fn avalanche_map_hash(mut hash: u64) -> u64 {
     hash ^= hash >> 33;
-    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    hash = hash.wrapping_mul(MAP_HASH_AVALANCHE_1);
     hash ^= hash >> 33;
-    hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    hash = hash.wrapping_mul(MAP_HASH_AVALANCHE_2);
     hash ^ (hash >> 33)
 }
 
@@ -554,7 +587,7 @@ pub fn map_len(map: JsMap, heap: &otter_gc::GcHeap) -> usize {
     heap.read_payload(map, |body| {
         body.entries()
             .iter()
-            .filter(|entry| entry.value.is_some())
+            .filter(|entry| entry.is_live())
             .count()
     })
 }
@@ -570,7 +603,7 @@ pub fn map_is_empty(map: JsMap, heap: &otter_gc::GcHeap) -> bool {
 pub fn map_get(map: JsMap, heap: &otter_gc::GcHeap, key: &Value) -> Option<Value> {
     let k = MapKey::from_value(key, heap);
     heap.read_payload(map, |body| {
-        map_find_entry(body, &k, heap).and_then(|idx| body.entries()[idx].value)
+        map_find_entry(body, &k, heap).map(|idx| body.entries()[idx].value)
     })
 }
 
@@ -609,7 +642,7 @@ pub fn map_set(
     let existing_idx = heap.read_payload(map, |body| map_find_entry(body, &k, heap));
     let exists = existing_idx.is_some();
     heap.with_payload(map, |body| match existing_idx {
-        Some(idx) => body.entries_mut()[idx].value = Some(value),
+        Some(idx) => body.entries_mut()[idx].value = value,
         None => {
             if let Some(table) = body.table_mut() {
                 table.push(MapEntry::live(k, key, value));
@@ -641,7 +674,7 @@ pub fn map_set_existing(
     let Some(idx) = heap.read_payload(map, |body| map_find_entry(body, &k, heap)) else {
         return false;
     };
-    heap.with_payload(map, |body| body.entries_mut()[idx].value = Some(value));
+    heap.with_payload(map, |body| body.entries_mut()[idx].value = value);
     record_map_write(heap, map, &value);
     true
 }
@@ -672,7 +705,7 @@ pub(crate) fn map_set_with_roots(
     let existing_idx = heap.read_payload(*map, |body| map_find_entry(body, &k, heap));
     let exists = existing_idx.is_some();
     heap.with_payload(*map, |body| match existing_idx {
-        Some(idx) => body.entries_mut()[idx].value = Some(value),
+        Some(idx) => body.entries_mut()[idx].value = value,
         None => {
             if let Some(table) = body.table_mut() {
                 table.push(MapEntry::live(k, key, value));
@@ -721,7 +754,7 @@ pub fn map_keys(map: JsMap, heap: &otter_gc::GcHeap) -> Vec<Value> {
     heap.read_payload(map, |body| {
         body.entries()
             .iter()
-            .filter_map(|entry| entry.key)
+            .filter_map(|entry| entry.is_live().then_some(entry.key))
             .collect()
     })
 }
@@ -732,7 +765,7 @@ pub fn map_values(map: JsMap, heap: &otter_gc::GcHeap) -> Vec<Value> {
     heap.read_payload(map, |body| {
         body.entries()
             .iter()
-            .filter_map(|entry| entry.value)
+            .filter_map(|entry| entry.is_live().then_some(entry.value))
             .collect()
     })
 }
@@ -1745,14 +1778,9 @@ fn record_map_table_contents(heap: &mut otter_gc::GcHeap, table: table::TableHan
     // SAFETY: the handle names a live table payload.
     let entries: Vec<MapEntry> = unsafe { (*body).entries().to_vec() };
     for entry in entries {
-        if let Some(key) = entry.key {
-            heap.record_write(table, &key);
-        }
-        if let Some(value) = entry.value {
-            heap.record_write(table, &value);
-        }
-        if let Some(key_hash) = entry.key_hash {
-            key_hash.record_into(heap, table);
+        if entry.is_live() {
+            heap.record_write(table, &entry.key);
+            heap.record_write(table, &entry.value);
         }
     }
 }
@@ -1918,6 +1946,15 @@ mod tests {
             "64 adjacent integral keys occupied only {} buckets",
             occupied.len()
         );
+    }
+
+    #[test]
+    fn map_entries_keep_the_compact_generated_layout() {
+        assert_eq!(std::mem::size_of::<MapEntry>(), 32);
+        assert_eq!(MAP_ENTRY_KEY_OFFSET, 0);
+        assert_eq!(MAP_ENTRY_VALUE_OFFSET, 8);
+        assert_eq!(MAP_ENTRY_NEXT_OFFSET, 24);
+        assert_eq!(MAP_ENTRY_FLAGS_OFFSET, 28);
     }
 
     #[test]

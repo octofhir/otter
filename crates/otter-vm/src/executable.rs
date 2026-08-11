@@ -280,6 +280,27 @@ impl CodeBlock {
                 guard_flags_byte: otter_gc::header::HEADER_SIZE as u32
                     + crate::collections::MAP_BODY_JIT_GUARD_FLAGS_OFFSET as u32,
                 native_function_type_tag: crate::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG,
+                map_table: crate::jit::JitMapTableLayout {
+                    map_table_byte: gc_header_bytes
+                        + crate::collections::MAP_BODY_TABLE_OFFSET as u32,
+                    table_type_tag: crate::collections::MAP_TABLE_BODY_TYPE_TAG,
+                    table_len_byte: gc_header_bytes
+                        + crate::collections::table::ORDERED_TABLE_LEN_OFFSET as u32,
+                    table_bucket_mask_byte: gc_header_bytes
+                        + crate::collections::table::ORDERED_TABLE_BUCKET_MASK_OFFSET as u32,
+                    table_buckets_byte: gc_header_bytes
+                        + crate::collections::table::ORDERED_TABLE_BODY_SIZE as u32,
+                    entry_size: crate::collections::MAP_ENTRY_SIZE as u32,
+                    entry_key_byte: crate::collections::MAP_ENTRY_KEY_OFFSET as u32,
+                    entry_value_byte: crate::collections::MAP_ENTRY_VALUE_OFFSET as u32,
+                    entry_next_byte: crate::collections::MAP_ENTRY_NEXT_OFFSET as u32,
+                    entry_flags_byte: crate::collections::MAP_ENTRY_FLAGS_OFFSET as u32,
+                    entry_live_flag: crate::collections::MAP_ENTRY_LIVE_FLAG,
+                    number_hash_tag: crate::collections::MAP_NUMBER_HASH_TAG,
+                    fx_hash_multiplier: crate::collections::MAP_FX_HASH_MULTIPLIER,
+                    hash_avalanche_1: crate::collections::MAP_HASH_AVALANCHE_1,
+                    hash_avalanche_2: crate::collections::MAP_HASH_AVALANCHE_2,
+                },
             },
             native_ref_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::native_function::NATIVE_FUNCTION_BODY_NATIVE_REF_OFFSET as u32,

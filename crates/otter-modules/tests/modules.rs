@@ -5,6 +5,7 @@ use otter_modules::kv::KvStore;
 use otter_modules::sql::SqlDatabase;
 use otter_modules::{OtterModulesBuilderExt, hosted_modules};
 use otter_runtime::{CapabilitySet, Permission, Runtime};
+use otter_web::WebApiBuilderExt;
 use serde_json::json;
 
 #[test]
@@ -252,6 +253,66 @@ fn otter_xml_parses_both_shapes_and_reports_bad_documents() {
             if (!threw.message.includes("</b>")) throw new Error("message: " + threw.message);
 
             try { Otter.XML.parse(42); threw = null; } catch (error) { threw = error; }
+            if (!(threw instanceof TypeError)) throw new Error("expected a TypeError");
+            "##,
+        ))
+        .unwrap();
+}
+
+#[test]
+fn otter_xml_parses_blob_and_file_bytes() {
+    // A Blob holds its bytes in memory, so `parse` reads them where it
+    // reads an ArrayBuffer's — through the VM's type-blind host-byte view,
+    // which also reaches the bytes a `File` inherits from its `Blob`.
+    let mut runtime = Runtime::builder()
+        .with_web_apis()
+        .with_otter_modules()
+        .build()
+        .unwrap();
+    runtime
+        .eval(otter_runtime::SourceInput::from_javascript(
+            r##"
+            function check(actual, expected, what) {
+              const a = JSON.stringify(actual);
+              const e = JSON.stringify(expected);
+              if (a !== e) throw new Error(what + ": " + a + " !== " + e);
+            }
+
+            check(
+              Otter.XML.parse(new Blob(["<a b='1'>text</a>"])),
+              { a: { "@b": "1", "#text": "text" } },
+              "blob"
+            );
+
+            // The bytes decide the encoding, not the Blob's media type.
+            const ascii = (s) => Array.from(s, (c) => c.charCodeAt(0));
+            const latin1 = new Uint8Array([
+              ...ascii("<?xml version='1.0' encoding='ISO-8859-1'?><a b='"),
+              0xE9,
+              ...ascii("'/>"),
+            ]);
+            check(
+              Otter.XML.parse(new Blob([latin1], { type: "application/xml" })),
+              { a: { "@b": "é" } },
+              "latin-1 blob"
+            );
+
+            check(
+              Otter.XML.parse(new File(["<a/>"], "doc.xml")),
+              { a: "" },
+              "file"
+            );
+
+            // A slice is its own Blob, and a JS subclass keeps the bytes.
+            const whole = new Blob(["xx<a/>"]);
+            check(Otter.XML.parse(whole.slice(2)), { a: "" }, "blob slice");
+            class Doc extends Blob {}
+            check(Otter.XML.parse(new Doc(["<a/>"])), { a: "" }, "blob subclass");
+
+            // A host object that is not a byte sequence is still a TypeError.
+            let threw = null;
+            try { Otter.XML.parse(new URL("https://example.com/")); }
+            catch (error) { threw = error; }
             if (!(threw instanceof TypeError)) throw new Error("expected a TypeError");
             "##,
         ))

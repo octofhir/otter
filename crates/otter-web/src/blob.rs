@@ -19,6 +19,9 @@
 //! - Blob bytes are immutable snapshots (`Arc<[u8]>`): every part is
 //!   copied at construction time per the File API, and clones (async
 //!   reads, `slice`) share the buffer instead of copying again.
+//! - The byte field is declared `#[host_class(bytes)]`, so natives in
+//!   other crates read a `Blob` (or a `File`, through the ancestry)
+//!   synchronously without depending on this crate.
 //! - `type` normalization matches the spec: any byte outside
 //!   0x20–0x7E empties the type, otherwise it lowercases.
 //!
@@ -34,6 +37,7 @@ use otter_runtime::marshal::{ArrayBuffer, BufferSource, Sequence, USVString, Uin
 /// Owned Blob record: immutable bytes + normalized MIME type.
 #[derive(Debug, Clone, PartialEq, Eq, HostClass)]
 pub struct Blob {
+    #[host_class(bytes)]
     bytes: Arc<[u8]>,
     content_type: String,
 }

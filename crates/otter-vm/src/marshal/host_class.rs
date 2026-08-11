@@ -21,10 +21,14 @@
 //! - [`construct_instance`] — prototype-correct instance building.
 //! - [`host_data_view`] — brand-checked reads used by
 //!   [`super::HostRef`] and receiver glue.
+//! - [`host_bytes_view_raw`] — type-blind read of a class that *is* a
+//!   byte sequence, so a native can accept a `Blob` without depending
+//!   on the crate that declares it.
 //!
 //! # Invariants
 //! - The caster is a plain `fn` pointer: no captures, no per-isolate
-//!   state, no `thread_local`.
+//!   state, no `thread_local`. The byte view is a second such pointer,
+//!   monomorphized the same way.
 //! - `host_data_view::<T>` accepts both a [`HostInstance`] whose
 //!   ancestry contains `T` and a legacy bare-`T` host object, so
 //!   migrated and unmigrated classes interoperate during the
@@ -68,6 +72,18 @@ pub trait HostAncestry: Any + Sized {
             None
         }
     }
+
+    /// The bytes this instance *is*, when the class is a byte
+    /// sequence a caller may read synchronously (`Blob`, and anything
+    /// that inherits from one). A class that holds no such sequence
+    /// returns `None`, which is the default.
+    ///
+    /// The bytes must live in `self`: the borrow is handed out while
+    /// the GC payload is borrowed and must not depend on anything the
+    /// callback could invalidate.
+    fn host_bytes(&self) -> Option<&[u8]> {
+        None
+    }
 }
 
 fn cast_thunk<T: HostAncestry>(any: &dyn Any, target: TypeId) -> Option<&dyn Any> {
@@ -78,12 +94,17 @@ fn cast_mut_thunk<T: HostAncestry>(any: &mut dyn Any, target: TypeId) -> Option<
     any.downcast_mut::<T>()?.ancestor_mut(target)
 }
 
+fn bytes_thunk<T: HostAncestry>(any: &dyn Any) -> Option<&[u8]> {
+    any.downcast_ref::<T>()?.host_bytes()
+}
+
 /// The branded data cell a declared host class stores in its
 /// instance's host slot.
 pub struct HostInstance {
     data: Box<dyn Any>,
     cast: for<'a> fn(&'a dyn Any, TypeId) -> Option<&'a dyn Any>,
     cast_mut: for<'a> fn(&'a mut dyn Any, TypeId) -> Option<&'a mut dyn Any>,
+    bytes: for<'a> fn(&'a dyn Any) -> Option<&'a [u8]>,
     class_name: &'static str,
 }
 
@@ -105,6 +126,7 @@ impl HostInstance {
             data: Box::new(data),
             cast: cast_thunk::<T>,
             cast_mut: cast_mut_thunk::<T>,
+            bytes: bytes_thunk::<T>,
             class_name,
         }
     }
@@ -127,6 +149,29 @@ impl HostInstance {
     pub fn view_mut<T: Any>(&mut self) -> Option<&mut T> {
         (self.cast_mut)(self.data.as_mut(), TypeId::of::<T>())?.downcast_mut::<T>()
     }
+
+    /// The bytes the stored data exposes, if its class is a byte
+    /// sequence. See [`HostAncestry::host_bytes`].
+    #[must_use]
+    pub fn bytes(&self) -> Option<&[u8]> {
+        (self.bytes)(self.data.as_ref())
+    }
+}
+
+/// Borrow the bytes of a host-class instance without naming its Rust
+/// type, so a native can read a `Blob` (or any other byte-sequence
+/// class) without its crate depending on the crate that declares it.
+/// `None` covers every value that is not such an instance.
+///
+/// The callback runs while the GC payload is borrowed and therefore
+/// must not allocate JavaScript values or re-enter the VM.
+pub(crate) fn host_bytes_view_raw<R>(
+    raw: Value,
+    heap: &otter_gc::GcHeap,
+    f: impl FnOnce(&[u8]) -> R,
+) -> Option<R> {
+    let object = raw.as_object()?;
+    object::with_host_data::<HostInstance, _>(object, heap, |cell| cell.bytes().map(f)).ok()?
 }
 
 /// Brand-checked read of host-class data of type `T` behind a scope

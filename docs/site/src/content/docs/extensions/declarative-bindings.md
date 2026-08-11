@@ -95,6 +95,24 @@ List the parent class before the subclass at registration; the
 subclass resolves `Blob.prototype` / the `Blob` constructor off the
 global at install.
 
+### Classes that are bytes
+
+```rust
+#[derive(Debug, Clone, HostClass)]
+pub struct Blob {
+    #[host_class(bytes)]    // a native elsewhere can read these
+    bytes: Arc<[u8]>,
+    content_type: String,
+}
+```
+
+`#[host_class(bytes)]` declares the class to *be* a byte sequence, so
+a native in another crate reads it through
+`NativeScope::with_host_bytes` / `host_bytes` without naming the Rust
+type — that is how `Otter.XML.parse` accepts a `Blob`. A class with
+only a `parent` inherits the parent's bytes, so `File` reads as its
+`Blob`.
+
 ### The escape hatch: `raw`
 
 ```rust

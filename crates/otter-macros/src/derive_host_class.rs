@@ -8,6 +8,11 @@
 //! (`File`): the field's own `HostAncestry` impl continues the chain,
 //! so arbitrarily deep native hierarchies compose.
 //!
+//! Marking one field `#[host_class(bytes)]` declares the class to *be*
+//! that byte sequence, which is what lets a native read a `Blob`'s
+//! bytes without naming the Rust type. A class with only a parent
+//! inherits the parent's answer, so `File` reads as its `Blob`.
+//!
 //! # Surface
 //!
 //! ```rust,ignore
@@ -21,7 +26,10 @@
 //! ```
 //!
 //! # Invariants
-//! - At most one field carries `#[host_class(parent)]`.
+//! - At most one field carries `#[host_class(parent)]`, and at most
+//!   one `#[host_class(bytes)]`.
+//! - A `bytes` field derefs to `[u8]`; the emitted view borrows from
+//!   `self`, never from a temporary.
 //! - The emitted walk returns views into `self` only — the
 //!   `HostAncestry` contract the cell caster relies on.
 //!
@@ -64,20 +72,39 @@ fn expand_inner(input: &DeriveInput) -> Result<proc_macro2::TokenStream> {
     };
 
     let mut parent_field = None;
+    let mut bytes_field = None;
     for field in &fields.named {
         for attr in &field.attrs {
             if !attr.path().is_ident("host_class") {
                 continue;
             }
             let mut is_parent = false;
+            let mut is_bytes = false;
             attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("parent") {
                     is_parent = true;
                     Ok(())
+                } else if meta.path.is_ident("bytes") {
+                    is_bytes = true;
+                    Ok(())
                 } else {
-                    Err(meta.error("host_class supports only `parent`"))
+                    Err(meta.error("host_class supports only `parent` and `bytes`"))
                 }
             })?;
+            if is_bytes {
+                if bytes_field.is_some() {
+                    return Err(Error::new(
+                        field.span(),
+                        "HostClass allows at most one #[host_class(bytes)] field",
+                    ));
+                }
+                bytes_field = Some(
+                    field
+                        .ident
+                        .clone()
+                        .ok_or_else(|| Error::new(field.span(), "bytes field must be named"))?,
+                );
+            }
             if is_parent {
                 if parent_field.is_some() {
                     return Err(Error::new(
@@ -96,9 +123,27 @@ fn expand_inner(input: &DeriveInput) -> Result<proc_macro2::TokenStream> {
     }
 
     let ident = &input.ident;
+    // A class that names its own byte field is that byte sequence; one that
+    // only has a parent inherits whatever the parent is (a `File` reads as
+    // its `Blob`); anything else is not a byte sequence at all.
+    let host_bytes = match (&bytes_field, &parent_field) {
+        (Some(bytes), _) => quote! {
+            fn host_bytes(&self) -> ::core::option::Option<&[u8]> {
+                ::core::option::Option::Some(::core::convert::AsRef::<[u8]>::as_ref(&self.#bytes))
+            }
+        },
+        (None, Some(parent)) => quote! {
+            fn host_bytes(&self) -> ::core::option::Option<&[u8]> {
+                ::otter_vm::__macro_support::marshal::HostAncestry::host_bytes(&self.#parent)
+            }
+        },
+        (None, None) => quote! {},
+    };
     let body = match parent_field {
         Some(parent) => quote! {
             impl ::otter_vm::__macro_support::marshal::HostAncestry for #ident {
+                #host_bytes
+
                 fn ancestor(
                     &self,
                     target: ::core::any::TypeId,
@@ -123,7 +168,9 @@ fn expand_inner(input: &DeriveInput) -> Result<proc_macro2::TokenStream> {
             }
         },
         None => quote! {
-            impl ::otter_vm::__macro_support::marshal::HostAncestry for #ident {}
+            impl ::otter_vm::__macro_support::marshal::HostAncestry for #ident {
+                #host_bytes
+            }
         },
     };
     Ok(body)

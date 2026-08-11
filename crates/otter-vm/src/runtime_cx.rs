@@ -2213,6 +2213,28 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         self.with_buffer_source_bytes(value, <[u8]>::to_vec)
     }
 
+    /// Borrow the bytes of a host-class instance that *is* a byte sequence —
+    /// a `Blob`, a `File`, or any later class declaring the same — for one
+    /// non-allocating callback. Everything else yields `None`, including host
+    /// objects of classes that hold no such sequence.
+    ///
+    /// This is how a native reads those bytes without naming the Rust type,
+    /// and therefore without its crate depending on the crate that declares
+    /// the class. The callback runs while the GC payload is borrowed and must
+    /// not allocate JavaScript values or re-enter the VM.
+    pub fn with_host_bytes<R>(&self, value: Local<'_>, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        crate::marshal::host_bytes_view_raw(self.raw(value), self.ctx.heap(), f)
+    }
+
+    /// Copy the bytes out of a host-class instance that is a byte sequence.
+    /// The owned result stays valid across later VM allocations and
+    /// collections; prefer [`Self::with_host_bytes`] when the caller can
+    /// consume the bytes synchronously without copying.
+    #[must_use]
+    pub fn host_bytes(&self, value: Local<'_>) -> Option<Vec<u8>> {
+        self.with_host_bytes(value, <[u8]>::to_vec)
+    }
+
     /// Copy the bytes from an exact `ArrayBuffer`/`SharedArrayBuffer` value.
     ///
     /// Unlike [`Self::buffer_source_bytes`], typed-array views are not

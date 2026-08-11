@@ -54,8 +54,8 @@ use otter_bytecode::{
     ModuleResolution, Op, Operand, SourceKind as BytecodeSourceKind, SpanEntry,
 };
 use otter_compiler::{
-    CompileError, CompiledExport, CompiledModuleMetadata, ModuleHostInfo, ResolvedBinding,
-    compile_module_program_to_module,
+    CompileError, CompiledExport, CompiledModuleMetadata, ImportRequest, ModuleHostInfo,
+    ResolvedBinding, compile_module_program_to_module,
 };
 use otter_syntax::{SourceKind, SyntaxError, with_program};
 use oxc_ast::ast::{Expression, Program};
@@ -388,7 +388,7 @@ impl<'a> ModuleGraphBuilder<'a> {
         let timing_enabled = self.timings.is_some();
         let compile_program = |program: &Program<'_>| {
             let requests = collect_module_requests(program);
-            let mut resolved_imports: HashMap<String, String> = HashMap::new();
+            let mut resolved_imports: HashMap<ImportRequest, String> = HashMap::new();
             let mut deps: Vec<ModuleEdge> = Vec::with_capacity(requests.len());
             let mut queued: Vec<(String, SourceKind, String, bool)> = Vec::new();
             let mut eager_static_specs: HashSet<String> = HashSet::new();
@@ -424,7 +424,10 @@ impl<'a> ModuleGraphBuilder<'a> {
                             })?,
                     };
                     let target = format!("{base}{MODULE_TYPE_MARKER}{kind}");
-                    resolved_imports.insert(request.specifier.clone(), target.clone());
+                    resolved_imports.insert(
+                        ImportRequest::new(request.specifier.clone(), request.attr_type.clone()),
+                        target.clone(),
+                    );
                     if !request.deferred && !request.dynamic {
                         eager_static_specs.insert(request.specifier.clone());
                     }
@@ -458,7 +461,10 @@ impl<'a> ModuleGraphBuilder<'a> {
                     let loaded = self.load_resolved(requested_target)?;
                     (loaded.url.clone(), Some(loaded))
                 };
-                resolved_imports.insert(request.specifier.clone(), target.clone());
+                resolved_imports.insert(
+                    ImportRequest::plain(request.specifier.clone()),
+                    target.clone(),
+                );
                 if request.dynamic {
                     dynamic_specs.insert(request.specifier.clone());
                 } else if !request.deferred {
@@ -829,17 +835,20 @@ fn is_resolvable_module(nodes: &BTreeMap<String, ModuleNode>, url: &str) -> bool
         .is_some_and(|node| !node.metadata.source_url.is_empty())
 }
 
-/// Resolve `specifier` against `from_url`'s recorded import edges to
-/// the canonical target URL, if statically known.
+/// Resolve a request — `specifier` plus the `type` attribute it was
+/// written with — against `from_url`'s recorded import edges to the
+/// canonical target URL, if statically known. The attribute is part of
+/// the key: one specifier imported under two types is two edges.
 fn resolve_specifier<'a>(
     nodes: &'a BTreeMap<String, ModuleNode>,
     from_url: &str,
     specifier: &str,
+    attr_type: Option<&str>,
 ) -> Option<&'a str> {
     let meta = &nodes.get(from_url)?.metadata;
     meta.imports
         .iter()
-        .find(|import| import.specifier == specifier)
+        .find(|import| import.specifier == specifier && import.attr_type.as_deref() == attr_type)
         .and_then(|import| import.target.as_deref())
 }
 
@@ -880,7 +889,7 @@ fn resolve_export(
             // `export { local as name } from "from"` — indirect named
             // re-export; resolve through the source module.
             (Some(local), Some(from)) => {
-                result = match resolve_specifier(nodes, url, from) {
+                result = match resolve_specifier(nodes, url, from, None) {
                     Some(target) => resolve_export(nodes, target, local, path),
                     None => Resolution::Null,
                 };
@@ -890,7 +899,7 @@ fn resolve_export(
             // module's namespace binding, so two modules re-exporting
             // the same namespace match (unambiguous).
             (None, Some(from)) => {
-                result = match resolve_specifier(nodes, url, from) {
+                result = match resolve_specifier(nodes, url, from, None) {
                     Some(target) => Resolution::Resolved {
                         module: target.to_string(),
                         binding: "*namespace*".to_string(),
@@ -915,7 +924,12 @@ fn resolve_export(
                     .cloned();
                 result = match via_import {
                     Some(imp) if imp.is_namespace => {
-                        match resolve_specifier(nodes, url, &imp.specifier) {
+                        match resolve_specifier(
+                            nodes,
+                            url,
+                            &imp.specifier,
+                            imp.attr_type.as_deref(),
+                        ) {
                             Some(target) => Resolution::Resolved {
                                 module: target.to_string(),
                                 // §16.2.1.6: re-exporting an `import defer * as`
@@ -929,7 +943,12 @@ fn resolve_export(
                             None => Resolution::Null,
                         }
                     }
-                    Some(imp) => match resolve_specifier(nodes, url, &imp.specifier) {
+                    Some(imp) => match resolve_specifier(
+                        nodes,
+                        url,
+                        &imp.specifier,
+                        imp.attr_type.as_deref(),
+                    ) {
                         Some(target) => resolve_export(nodes, target, &imp.name, path),
                         None => Resolution::Null,
                     },
@@ -960,7 +979,7 @@ fn resolve_export(
             let Some(from) = export.from.as_deref() else {
                 continue;
             };
-            let Some(target) = resolve_specifier(nodes, url, from) else {
+            let Some(target) = resolve_specifier(nodes, url, from, None) else {
                 continue;
             };
             match resolve_export(nodes, target, name, path) {
@@ -1002,14 +1021,21 @@ fn validate_resolution(nodes: &BTreeMap<String, ModuleNode>) -> Result<(), Graph
             if import.is_namespace {
                 continue;
             }
-            check_binding(nodes, url, &import.specifier, &import.name, "import")?;
+            check_binding(
+                nodes,
+                url,
+                &import.specifier,
+                import.attr_type.as_deref(),
+                &import.name,
+                "import",
+            )?;
         }
         for export in &node.metadata.exports {
             // Only named re-exports (`export { local as name } from`)
             // require a binding lookup; star and namespace re-exports
             // do not.
             if let (Some(local), Some(from)) = (export.local.as_deref(), export.from.as_deref()) {
-                check_binding(nodes, url, from, local, "re-export")?;
+                check_binding(nodes, url, from, None, local, "re-export")?;
             }
         }
     }
@@ -1022,10 +1048,11 @@ fn check_binding(
     nodes: &BTreeMap<String, ModuleNode>,
     url: &str,
     specifier: &str,
+    attr_type: Option<&str>,
     name: &str,
     kind: &str,
 ) -> Result<(), GraphError> {
-    let Some(target) = resolve_specifier(nodes, url, specifier) else {
+    let Some(target) = resolve_specifier(nodes, url, specifier, attr_type) else {
         return Ok(());
     };
     if !is_resolvable_module(nodes, target) {
@@ -1076,7 +1103,7 @@ fn module_exported_names(
             let Some(from) = export.from.as_deref() else {
                 continue;
             };
-            let Some(target) = resolve_specifier(nodes, url, from) else {
+            let Some(target) = resolve_specifier(nodes, url, from, None) else {
                 continue;
             };
             for name in module_exported_names(nodes, target, seen) {

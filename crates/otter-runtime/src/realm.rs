@@ -637,6 +637,7 @@ fn execute_linked_module_in_active_realm(
                 .push(otter_bytecode::ModuleResolution {
                     referrer: referrer.to_string(),
                     specifier: url.to_string(),
+                    attr_type: None,
                     target: url.to_string(),
                     deferred: false,
                     dynamic: false,

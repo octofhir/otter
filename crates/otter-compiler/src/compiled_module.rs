@@ -29,7 +29,7 @@ use oxc_ast::ast::{Expression, Program};
 use oxc_ast_visit::Visit;
 use serde::{Deserialize, Serialize};
 
-use crate::{ModuleHostInfo, module_export_name_to_str};
+use crate::{ImportRequest, ModuleHostInfo, module_export_name_to_str};
 
 /// Frozen compiler/runtime boundary product for one source module.
 ///
@@ -120,6 +120,11 @@ pub struct ResolvedBinding {
 pub struct NamedImport {
     /// Raw source specifier of the importing declaration.
     pub specifier: String,
+    /// `type` import attribute of the declaration, when it carries
+    /// one — the other half of the key that names this import's
+    /// target.
+    #[serde(default)]
+    pub attr_type: Option<String>,
     /// Imported export name (`"default"` for a default import, empty
     /// for a namespace import).
     pub name: String,
@@ -192,6 +197,11 @@ pub struct CompiledSourceSpan {
 pub struct CompiledImport {
     /// Raw source specifier.
     pub specifier: String,
+    /// `type` import attribute of the request, when it carries one.
+    /// The specifier alone does not identify an edge: the same file
+    /// imported under two types is two edges with two targets.
+    #[serde(default)]
+    pub attr_type: Option<String>,
     /// Host-resolved target URL when statically known.
     pub target: Option<String>,
     /// Import edge kind.
@@ -295,23 +305,24 @@ fn compiled_spans_from_bytecode(bytecode: &BytecodeModule) -> Vec<CompiledSource
 }
 
 struct ModuleMetadataVisitor<'a> {
-    resolved_imports: &'a HashMap<String, String>,
+    resolved_imports: &'a HashMap<ImportRequest, String>,
     imports: Vec<CompiledImport>,
     exports: Vec<CompiledExport>,
     named_imports: Vec<NamedImport>,
     live_binding_names: BTreeSet<String>,
-    seen_imports: HashSet<(String, CompiledImportKind)>,
+    seen_imports: HashSet<(ImportRequest, CompiledImportKind)>,
 }
 
 impl ModuleMetadataVisitor<'_> {
-    fn record_import(&mut self, specifier: &str, kind: CompiledImportKind) {
-        let key = (specifier.to_string(), kind);
-        if !self.seen_imports.insert(key) {
+    fn record_import(&mut self, request: ImportRequest, kind: CompiledImportKind) {
+        let target = self.resolved_imports.get(&request).cloned();
+        if !self.seen_imports.insert((request.clone(), kind)) {
             return;
         }
         self.imports.push(CompiledImport {
-            specifier: specifier.to_string(),
-            target: self.resolved_imports.get(specifier).cloned(),
+            specifier: request.specifier,
+            attr_type: request.attr_type,
+            target,
             kind,
         });
     }
@@ -328,7 +339,11 @@ impl<'a> Visit<'a> for ModuleMetadataVisitor<'_> {
             return;
         }
         let specifier = decl.source.value.as_str();
-        self.record_import(specifier, CompiledImportKind::Static);
+        let attr_type = crate::import_attribute_type(decl.with_clause.as_deref());
+        self.record_import(
+            ImportRequest::new(specifier, attr_type.clone()),
+            CompiledImportKind::Static,
+        );
         // Record each *named* binding request (`import { x as y }`
         // and `import d`) for link-time ResolveExport validation.
         // Namespace (`import * as ns`) carries no single export name.
@@ -353,6 +368,7 @@ impl<'a> Visit<'a> for ModuleMetadataVisitor<'_> {
                 };
                 self.named_imports.push(NamedImport {
                     specifier: specifier.to_string(),
+                    attr_type: attr_type.clone(),
                     name,
                     local,
                     is_namespace,
@@ -371,7 +387,10 @@ impl<'a> Visit<'a> for ModuleMetadataVisitor<'_> {
             .as_ref()
             .map(|src| src.value.as_str().to_string());
         if let Some(specifier) = &from {
-            self.record_import(specifier, CompiledImportKind::ReExport);
+            self.record_import(
+                ImportRequest::plain(specifier.as_str()),
+                CompiledImportKind::ReExport,
+            );
         }
         if let Some(inner) = &decl.declaration {
             record_exports_from_declaration(self, inner, None);
@@ -389,7 +408,10 @@ impl<'a> Visit<'a> for ModuleMetadataVisitor<'_> {
             return;
         }
         let source = decl.source.value.as_str().to_string();
-        self.record_import(&source, CompiledImportKind::ReExport);
+        self.record_import(
+            ImportRequest::plain(source.as_str()),
+            CompiledImportKind::ReExport,
+        );
         let exported = decl
             .exported
             .as_ref()
@@ -417,7 +439,10 @@ impl<'a> Visit<'a> for ModuleMetadataVisitor<'_> {
 
     fn visit_import_expression(&mut self, imp: &oxc_ast::ast::ImportExpression<'a>) {
         if let Expression::StringLiteral(lit) = &imp.source {
-            self.record_import(lit.value.as_str(), CompiledImportKind::DynamicLiteral);
+            self.record_import(
+                ImportRequest::plain(lit.value.as_str()),
+                CompiledImportKind::DynamicLiteral,
+            );
         }
         oxc_ast_visit::walk::walk_import_expression(self, imp);
     }
@@ -468,7 +493,7 @@ mod tests {
             module_url: "file:///test/main.ts".to_string(),
             resolved_imports: specifiers
                 .iter()
-                .map(|(specifier, target)| (specifier.to_string(), target.to_string()))
+                .map(|(specifier, target)| (ImportRequest::plain(*specifier), target.to_string()))
                 .collect(),
         }
     }

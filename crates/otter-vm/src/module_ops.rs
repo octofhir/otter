@@ -51,25 +51,28 @@ struct ModuleEvalState {
 }
 
 impl Interpreter {
+    /// `Op::ImportNamespace` — write the raw module environment of the
+    /// import's target to `dst`. The compiler resolved the request
+    /// (specifier plus any `type` attribute) before emitting this, so the
+    /// operand names the target module outright and nothing here re-derives
+    /// it from a specifier that two requests could share.
     pub(crate) fn run_import_namespace_reg(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
-        spec_idx: u32,
+        target_idx: u32,
     ) -> Result<(), VmError> {
         let function_id = stack[frame_index].function_id;
-        let specifier = context
-            .string_constant_str_for_function(function_id, spec_idx)
+        let target = context
+            .string_constant_str_for_function(function_id, target_idx)
             .ok_or(VmError::InvalidOperand)?;
-        let referrer: String = context
-            .exec_function(function_id)
-            .map(|f| f.module_url.as_ref().to_string())
-            .unwrap_or_default();
         let namespace = self
-            .resolve_module_namespace(context, referrer.as_str(), specifier)
-            .ok_or_else(|| self.err_unknown_intrinsic(format!("import \"{specifier}\"").into()))?;
+            .module_environments
+            .get(target)
+            .copied()
+            .ok_or_else(|| self.err_unknown_intrinsic(format!("import \"{target}\"").into()))?;
         let frame = &mut stack[frame_index];
         write_register(frame, dst, Value::object(namespace))?;
         frame.advance_pc()?;
@@ -77,30 +80,27 @@ impl Interpreter {
     }
 
     /// `Op::ModuleNamespaceObject` — resolve the Module Namespace
-    /// Exotic Object (§10.4.6) for `specifier` and write it to `dst`.
-    /// Used by `import * as ns` / `export * as ns`; distinct from the
-    /// raw module environment yielded by [`Op::ImportNamespace`].
+    /// Exotic Object (§10.4.6) of the import's target and write it to
+    /// `dst`. Used by `import * as ns` / `export * as ns`; distinct from
+    /// the raw module environment yielded by [`Op::ImportNamespace`]. The
+    /// operand is the resolved target URL, as it is there.
     pub(crate) fn run_module_namespace_object_reg(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
-        spec_idx: u32,
+        target_idx: u32,
     ) -> Result<(), VmError> {
         let function_id = stack[frame_index].function_id;
-        let specifier = context
-            .string_constant_str_for_function(function_id, spec_idx)
+        let target = context
+            .string_constant_str_for_function(function_id, target_idx)
             .ok_or(VmError::InvalidOperand)?
             .to_string();
-        let referrer: String = context
-            .exec_function(function_id)
-            .map(|f| f.module_url.as_ref().to_string())
-            .unwrap_or_default();
         let namespace = self
-            .resolve_module_namespace_object(context, referrer.as_str(), specifier.as_str())
+            .get_or_create_module_namespace(target.as_str())
             .ok_or_else(|| {
-                self.err_unknown_intrinsic(format!("import * as \"{specifier}\"").into())
+                self.err_unknown_intrinsic(format!("import * as \"{target}\"").into())
             })?;
         let frame = &mut stack[frame_index];
         write_register(frame, dst, Value::object(namespace))?;
@@ -147,32 +147,22 @@ impl Interpreter {
     }
 
     /// `Op::ImportNamespaceDeferred` — resolve (or lazily create) the
-    /// deferred namespace object for `specifier` and write it to `dst`.
-    /// The target module is **not** evaluated here (TC39 import defer).
+    /// deferred namespace object of the import's target and write it to
+    /// `dst`. The target module is **not** evaluated here (TC39 import
+    /// defer). The operand is the resolved target URL.
     pub(crate) fn run_import_namespace_deferred_reg(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
-        spec_idx: u32,
+        target_idx: u32,
     ) -> Result<(), VmError> {
         let function_id = stack[frame_index].function_id;
-        let specifier = context
-            .string_constant_str_for_function(function_id, spec_idx)
-            .ok_or(VmError::InvalidOperand)?
-            .to_string();
-        let referrer: String = context
-            .exec_function(function_id)
-            .map(|f| f.module_url.as_ref().to_string())
-            .unwrap_or_default();
         let target = context
-            .module_resolution_target(referrer.as_str(), specifier.as_str())
-            .ok_or_else(|| {
-                self.err_unknown_intrinsic(format!("import defer \"{specifier}\"").into())
-            })?
-            .to_string();
-        let target_url: std::sync::Arc<str> = std::sync::Arc::from(target.as_str());
+            .string_constant_str_for_function(function_id, target_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let target_url: std::sync::Arc<str> = std::sync::Arc::from(target);
         let ns = self.get_or_create_deferred_namespace(target_url)?;
         let frame = &mut stack[frame_index];
         write_register(frame, dst, Value::object(ns))?;
@@ -1342,7 +1332,7 @@ impl Interpreter {
         let promise = match self.coerce_to_string(stack, context, &spec_value) {
             Ok(specifier) => {
                 if let Some(target) =
-                    context.module_resolution_target(referrer.as_str(), &specifier)
+                    context.module_resolution_target(referrer.as_str(), &specifier, None)
                 {
                     let target = target.to_string();
                     // §16.2.1.4 Evaluate step 1 / §13.3.10 — a dynamic

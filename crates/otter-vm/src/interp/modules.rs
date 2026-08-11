@@ -319,12 +319,13 @@ impl Interpreter {
         self.module_resolved_exports.clear();
     }
 
-    /// Resolve a specifier seen by the running module to the
-    /// target module's `module_env`. Returns `None` when the
-    /// linker did not register a resolution for the
-    /// `(referrer, specifier)` pair, or when the resolution
-    /// pointed at a URL that no `module_env` has been recorded
-    /// for yet.
+    /// Resolve a specifier a running module named at run time — a
+    /// dynamic `import("./x")` — to the target module's `module_env`.
+    /// Static imports do not come through here: their target is
+    /// resolved at compile time and rides the instruction. Returns
+    /// `None` when the linker registered no resolution for the
+    /// `(referrer, specifier)` pair, or when the resolution pointed at
+    /// a URL no `module_env` has been recorded for yet.
     ///
     /// # Algorithm
     /// 1. Look in `module_resolution_cache` keyed by
@@ -353,35 +354,12 @@ impl Interpreter {
         let target_url = if let Some(hit) = self.module_resolution_cache.get(&key) {
             hit.clone()
         } else {
-            let target = context.module_resolution_target(referrer, specifier)?;
+            let target = context.module_resolution_target(referrer, specifier, None)?;
             let target_rc: std::sync::Arc<str> = std::sync::Arc::from(target);
             self.module_resolution_cache.insert(key, target_rc.clone());
             target_rc
         };
         self.module_environments.get(target_url.as_ref()).cloned()
-    }
-
-    /// Resolve `(referrer, specifier)` to the eager Module Namespace
-    /// Exotic Object (§10.4.6) — used by the user-visible `import * as
-    /// ns` binding and `export * as ns`, distinct from the raw module
-    /// environment used for named-import indirection.
-    pub(crate) fn resolve_module_namespace_object(
-        &mut self,
-        context: &ExecutionContext,
-        referrer: &str,
-        specifier: &str,
-    ) -> Option<JsObject> {
-        let referrer_rc: std::sync::Arc<str> = std::sync::Arc::from(referrer);
-        let key = (referrer_rc, specifier.to_string());
-        let target_url = if let Some(hit) = self.module_resolution_cache.get(&key) {
-            hit.clone()
-        } else {
-            let target = context.module_resolution_target(referrer, specifier)?;
-            let target_rc: std::sync::Arc<str> = std::sync::Arc::from(target);
-            self.module_resolution_cache.insert(key, target_rc.clone());
-            target_rc
-        };
-        self.get_or_create_module_namespace(target_url.as_ref())
     }
 
     /// Eager Module Namespace Exotic Object (§10.4.6) wrapping the

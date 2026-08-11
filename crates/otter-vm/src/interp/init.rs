@@ -195,6 +195,8 @@ impl Interpreter {
             lean_callback_roots: Vec::new(),
             pending_error_detail: std::cell::RefCell::new(None),
             handle_arena: crate::handles::HandleArena::new(),
+            host_atoms: crate::HostAtomInterner::new(),
+            object_layout_cache: crate::object_layout_cache::ObjectLayoutCache::default(),
             json_stringify_capacity_hint: 0,
             external_memory_adjustment: None,
             array_index_accessor_protector: false,

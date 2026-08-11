@@ -164,6 +164,7 @@ pub mod native_function;
 pub mod number;
 pub mod object;
 mod object_internal_ops;
+mod object_layout_cache;
 pub mod object_statics;
 mod operand_decode;
 pub mod pelt;
@@ -878,6 +879,13 @@ pub struct Interpreter {
     /// than maintaining parallel root stores. Truncated back to the opening
     /// length when each scope returns. See [`crate::handles`].
     handle_arena: handles::HandleArena,
+    /// Stable host-side name identities minted for this isolate's native
+    /// surfaces. Keeping the interner on the isolate lets repeated parser calls
+    /// reuse the same opaque atoms instead of rebuilding host name tables.
+    host_atoms: host_strings::HostAtomInterner,
+    /// Complete hidden classes indexed by atomized host record signatures.
+    /// Derived non-GC state; snapshot restore starts it empty.
+    object_layout_cache: object_layout_cache::ObjectLayoutCache,
     /// Byte length of the most recent `JSON.stringify` output, used to
     /// pre-size the next call's scratch buffer. Repeated stringify of
     /// similarly-shaped data then never re-grows the buffer from empty.

@@ -4683,8 +4683,35 @@ fn record_slot_write(heap: &mut otter_gc::GcHeap, obj: JsObject, slot: Value) {
 /// into the caller's handle so a sequence of `set` calls on a freshly allocated
 /// object never writes through a stale handle.
 pub fn set(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) {
+    set_inner(obj, heap, key, None, value);
+}
+
+/// [`set`] with an isolate atom for shaped-object presence lookup.
+///
+/// Dictionary append and storage retain the spelling because dictionary keys
+/// are owned strings. Existing shaped slots, however, resolve through the
+/// shape's atom chain and never compare property text.
+pub(crate) fn set_atomized(
+    obj: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    key: AtomizedPropertyKey<'_>,
+    value: Value,
+) {
+    set_inner(obj, heap, key.name(), Some(key), value);
+}
+
+fn set_inner(
+    obj: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    key: &str,
+    atomized: Option<AtomizedPropertyKey<'_>>,
+    value: Value,
+) {
     let mut stored = value;
-    let existing_offset = heap.read_payload(*obj, |body| body_offset_of(heap, body, key));
+    let existing_offset = heap.read_payload(*obj, |body| match atomized {
+        Some(atomized) => body_offset_of_atom(heap, body, atomized),
+        None => body_offset_of(heap, body, key),
+    });
     if existing_offset.is_none() {
         // A fresh key demotes this object to dictionary mode, and the
         // key list and slot metadata demotion writes live in the

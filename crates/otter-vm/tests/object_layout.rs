@@ -123,6 +123,41 @@ fn the_same_key_list_gives_the_same_layout() {
 }
 
 #[test]
+fn atomized_record_signatures_reuse_the_complete_layout() {
+    let (first, second, reordered) = with_context(|ctx| {
+        ctx.scope(|mut scope| {
+            let tag = scope.atom("entry");
+            let id = scope.atom("@id");
+            let kind = scope.atom("@kind");
+            let first = scope.object_layout_for_atoms(&tag, &[&id, &kind]).unwrap();
+            let second = scope.object_layout_for_atoms(&tag, &[&id, &kind]).unwrap();
+            let reordered = scope.object_layout_for_atoms(&tag, &[&kind, &id]).unwrap();
+            (first, second, reordered)
+        })
+    });
+    assert_eq!(first, second, "one cached layout per atom signature");
+    assert_ne!(first, reordered, "ordered property atoms are significant");
+}
+
+#[test]
+fn set_atom_updates_a_shaped_slot_by_atom_identity() {
+    let value = with_context(|ctx| {
+        ctx.scope(|mut scope| {
+            let tag = scope.atom("entry");
+            let key = scope.atom("@id");
+            let layout = scope.object_layout_for_atoms(&tag, &[&key]).unwrap();
+            let initial = scope.string("before").unwrap();
+            let object = scope.object_with_layout(layout, &[initial]).unwrap();
+            let replacement = scope.string("after").unwrap();
+            scope.set_atom(object, &key, replacement).unwrap();
+            let value = scope.get(object, "@id").unwrap();
+            scope.string_value(value).unwrap()
+        })
+    });
+    assert_eq!(value, "after");
+}
+
+#[test]
 fn an_empty_layout_builds_an_object_with_nothing_on_it() {
     let has_any = with_context(|ctx| {
         ctx.scope(|mut scope| {

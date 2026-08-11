@@ -21,6 +21,9 @@
 //!   [`Interpreter`].
 //! - [`HandleScope`] — a scope token owning an arena range `[base, len)`.
 //! - [`Local`] — a `Copy` index handle whose lifetime pins it to its scope.
+//! - [`PendingValues`] — recyclable traced roots for values waiting to enter a
+//!   heap object.
+//! - [`ObjectLayout`] — stable token for a complete ordered property shape.
 //!
 //! # Invariants
 //!
@@ -444,6 +447,33 @@ impl Interpreter {
             shape: self.shape_runtime.id_for_handle(&self.gc_heap, shape),
             len: keys.len() as u32,
         })
+    }
+
+    /// Intern a host property name in this interpreter's stable host table.
+    #[must_use]
+    pub(crate) fn host_atom(&self, name: &str) -> crate::HostAtom {
+        self.host_atoms.intern(name)
+    }
+
+    /// Resolve the complete hidden class for an atomized record signature.
+    ///
+    /// The first occurrence builds the ordinary shape chain. Later occurrences
+    /// compare only the tag and ordered property atom ids and return the final
+    /// layout directly.
+    pub(crate) fn object_layout_for_atoms(
+        &mut self,
+        tag: &crate::HostAtom,
+        keys: &[&crate::HostAtom],
+    ) -> Result<ObjectLayout, VmError> {
+        if let Some(layout) = self.object_layout_cache.get(tag, keys) {
+            return Ok(layout);
+        }
+
+        let spellings: smallvec::SmallVec<[&str; 8]> =
+            keys.iter().map(|key| key.as_str()).collect();
+        let layout = self.object_layout(&spellings)?;
+        self.object_layout_cache.insert(tag, keys, layout);
+        Ok(layout)
     }
 
     /// One transition of [`Self::object_layout`], cached where possible.
@@ -891,6 +921,39 @@ impl Interpreter {
                 return Err(VmError::TypeMismatch);
             }
             crate::array::set_named_property(array, &mut self.gc_heap, key, stored)
+                .map_err(|_| VmError::TypeMismatch)?;
+            return Ok(());
+        }
+        Err(VmError::TypeMismatch)
+    }
+
+    /// Atom-aware counterpart of [`Self::scoped_set`].
+    pub(crate) fn scoped_set_atom(
+        &mut self,
+        _scope: &HandleScope,
+        obj: Local<'_>,
+        atom: &crate::HostAtom,
+        value: Local<'_>,
+    ) -> Result<(), VmError> {
+        let names = std::sync::Arc::clone(&self.names);
+        let atom_id = self.object_layout_cache.atom_id(&names, atom);
+        let key = crate::property_atom::AtomizedPropertyKey::new(
+            crate::property_atom::PropertyAtom::new(atom_id),
+            atom.as_str(),
+        );
+        let receiver = self.handle_arena.get(obj.index());
+        let stored = self.handle_arena.get(value.index());
+        if let Some(mut object) = receiver.as_object() {
+            crate::object::set_atomized(&mut object, &mut self.gc_heap, key, stored);
+            return Ok(());
+        }
+        if let Some(array) = receiver.as_array() {
+            if key.name() == "length"
+                || crate::object::array_index_property_name(key.name()).is_some()
+            {
+                return Err(VmError::TypeMismatch);
+            }
+            crate::array::set_named_property(array, &mut self.gc_heap, key.name(), stored)
                 .map_err(|_| VmError::TypeMismatch)?;
             return Ok(());
         }

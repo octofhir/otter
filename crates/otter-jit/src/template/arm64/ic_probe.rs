@@ -23,7 +23,8 @@
 //!   without materializing a frame.
 //! - [`emit_guarded_method_guard`] / [`emit_guarded_method_call`] — the same
 //!   split for `receiver.method(args…)`, over a receiver proven by hidden class
-//!   or by cell type tag.
+//!   or by cell type tag; the preserving guard variant keeps the exotic body
+//!   available for immediate allocation-free intrinsic completion.
 //! - [`emit_native_entry_call`] — one call sequence per declared ABI family.
 //!
 //! # Invariants
@@ -36,6 +37,8 @@
 //! - Split call guards are the exact shared prefix of their corresponding
 //!   declared-entry calls. They load no arguments and perform no effects, so a
 //!   proven operation may instead continue into equivalent machine lowering.
+//!   The preserving method form keeps a raw body pointer only across the same
+//!   allocation-free guard sequence and never across a transition.
 //! - Way stride is [`WHISKER_IC_WAY_BYTES`], asserted against the cell's own
 //!   layout where the cell is defined.
 //! - Register contract on entry: `x15` holds the cell address, `w14` the
@@ -1153,6 +1156,39 @@ pub(crate) fn emit_guarded_method_guard(
     byte_pc: u32,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported> {
+    emit_guarded_method_guard_impl(ops, relocations, view, call, receiver, byte_pc, miss, false)
+}
+
+/// Emit [`emit_guarded_method_guard`] while retaining the guarded receiver
+/// header in `x13` for immediate intrinsic completion.
+///
+/// `x8` is caller-saved optimizing scratch and holds the header across the
+/// prototype and builtin-function checks. No receiver pointer is retained
+/// beyond this straight-line, allocation-free sequence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_guarded_method_guard_preserving_receiver(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    call: &JitGuardedMethodCall,
+    receiver: u16,
+    byte_pc: u32,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported> {
+    emit_guarded_method_guard_impl(ops, relocations, view, call, receiver, byte_pc, miss, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_guarded_method_guard_impl(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    call: &JitGuardedMethodCall,
+    receiver: u16,
+    byte_pc: u32,
+    miss: DynamicLabel,
+    preserve_receiver: bool,
+) -> Result<(), Unsupported> {
     if view.cage_base == 0 || view.native_ref_byte == 0 {
         return Err(Unsupported::OperandShape("guarded method call layout"));
     }
@@ -1164,6 +1200,9 @@ pub(crate) fn emit_guarded_method_guard(
         JitGuardedReceiver::Shape { shape } => {
             let shape_byte = view.object_shape_byte;
             emit_receiver_type_guard(ops, relocations, view, receiver, OBJECT_BODY_TYPE_TAG, miss)?;
+            if preserve_receiver {
+                dynasm!(ops ; .arch aarch64 ; mov x8, x13);
+            }
             dynasm!(ops
                 ; .arch aarch64
                 ; ldr w14, [x13, shape_byte]
@@ -1200,6 +1239,9 @@ pub(crate) fn emit_guarded_method_guard(
             proto_offset,
         } => {
             emit_receiver_type_guard(ops, relocations, view, receiver, u32::from(type_tag), miss)?;
+            if preserve_receiver {
+                dynasm!(ops ; .arch aarch64 ; mov x8, x13);
+            }
             if let Some(guard) = guard {
                 emit_body_guard(ops, guard, miss);
             }
@@ -1223,6 +1265,9 @@ pub(crate) fn emit_guarded_method_guard(
         call.builtin_native_ref,
         miss,
     );
+    if preserve_receiver {
+        dynasm!(ops ; .arch aarch64 ; mov x13, x8);
+    }
     Ok(())
 }
 

@@ -110,6 +110,15 @@ It already owns:
   Alternating long process medians fell by 31.47% for the isolated Math slice
   and 3.21% for the full `native-boundary` workload, with identical semantic
   checksums and transition totals;
+- optimizing guarded primitive-string calls complete directly in AArch64 for
+  `charCodeAt(Int32)` and single-code-unit `indexOf(String)` over contiguous
+  inline or sequential Latin-1 / UTF-16 bodies. The existing exact prototype
+  method identity guard remains mandatory; ropes, slices, coercive arguments,
+  out-of-range reads, and searches longer than 256 code units enter the one
+  canonical pre-effect fallback. Alternating long process medians fell by
+  30.29% for the isolated `charCodeAt` slice, 39.85% for `indexOf`, and 11.70%
+  for the full `native-boundary` workload with exact matching checksums and
+  zero optimizing deopts;
 - catch-only exception-region CFGs with explicit landing-pad successors; the
   shared linkage fully unwinds publication, commits the thrown value to its
   allocator home, and transfers at the exact call PC without replay;
@@ -127,7 +136,7 @@ The old optimizing compiler and template emitter remain in the active graph
 only for operations and function shapes not yet selected by the replacement
 pipeline. They are fallback, not contracts to preserve.
 
-Latest accepted gate: 53 bytecode, 86 compiler, 283 JIT, and 837 VM tests;
+Latest accepted gate: 53 bytecode, 86 compiler, 283 JIT, and 841 VM tests;
 the complete runtime suite; all-target/all-feature Clippy;
 compile-fail/rooting checks; and 21/21 differential
 interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.

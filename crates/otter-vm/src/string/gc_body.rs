@@ -12,6 +12,8 @@
 //! # Contents
 //! - [`JsStringId`] — stable intern-table identity for shape keys.
 //! - [`JsStringBody`] / [`JsStringBodyRepr`] — variant-enum body.
+//! - Stable representation tags and payload offsets consumed by generated
+//!   code for contiguous string operations.
 //! - `alloc_*` helpers and heap-level
 //!   [`concat`] / [`slice`] / [`flatten`] / [`equals`] / [`to_utf16_vec`].
 //!
@@ -31,6 +33,9 @@
 //! - Slicing a flat body is O(1) for either storage width. Slicing a `Cons`
 //!   materialises only the requested span; slicing a `Sliced` collapses into a
 //!   single view (no `Sliced(Sliced(...))`).
+//! - [`JsStringBodyRepr`] uses `repr(C, u8)`: its tag byte and aligned payload
+//!   union are an explicit generated-code contract. Changing either requires
+//!   updating the baked JIT layout and its machine-code consumers together.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-ecmascript-language-types-string-type>
@@ -50,6 +55,19 @@ pub const MAX_ROPE_DEPTH: u8 = 254;
 pub const INLINE_FLAT_CAP: usize = 12;
 /// Latin-1 bytes stored directly inside a Latin-1 string body.
 pub const INLINE_LATIN1_CAP: usize = 24;
+
+/// Inline UTF-16 representation tag exposed to generated code.
+pub const STRING_REPR_INLINE_FLAT: u8 = 0;
+/// Sequential UTF-16 representation tag exposed to generated code.
+pub const STRING_REPR_SEQ_FLAT: u8 = 1;
+/// Inline Latin-1 representation tag exposed to generated code.
+pub const STRING_REPR_INLINE_LATIN1: u8 = 2;
+/// Sequential Latin-1 representation tag exposed to generated code.
+pub const STRING_REPR_SEQ_LATIN1: u8 = 3;
+/// Rope representation tag; generated code must use the cold path.
+pub const STRING_REPR_CONS: u8 = 4;
+/// Slice representation tag; generated code must use the cold path.
+pub const STRING_REPR_SLICED: u8 = 5;
 
 /// GC handle to a JavaScript string body. `Copy`. Packs into
 /// [`crate::Value`] under `TAG_PTR_STRING`.
@@ -76,21 +94,22 @@ impl JsStringId {
 
 /// Internal representation of a [`JsStringBody`].
 #[derive(Debug)]
+#[repr(C, u8)]
 pub enum JsStringBodyRepr {
     /// Small flat WTF-16 code units stored inside the GC body. The live prefix
     /// length is [`JsStringBody::len`].
-    InlineFlat([u16; INLINE_FLAT_CAP]),
+    InlineFlat([u16; INLINE_FLAT_CAP]) = STRING_REPR_INLINE_FLAT,
     /// Flat WTF-16 code units stored in the body's own trailing storage.
     /// The live length is [`JsStringBody::len`]; the units start one body
     /// past the body, in the same GC cell.
-    SeqFlat,
+    SeqFlat = STRING_REPR_SEQ_FLAT,
     /// Small Latin-1 code units stored inside the GC body. The live prefix
     /// length is [`JsStringBody::len`].
-    InlineLatin1([u8; INLINE_LATIN1_CAP]),
+    InlineLatin1([u8; INLINE_LATIN1_CAP]) = STRING_REPR_INLINE_LATIN1,
     /// Latin-1 code units stored in the body's own trailing storage. Each
     /// byte zero-extends to a `u16` on read. The live length is
     /// [`JsStringBody::len`].
-    SeqLatin1,
+    SeqLatin1 = STRING_REPR_SEQ_LATIN1,
     /// Rope concatenation node. Tracing visits both children.
     Cons {
         /// Left child.
@@ -100,15 +119,22 @@ pub enum JsStringBodyRepr {
         /// Maximum depth of either child plus one. Bounded by
         /// [`MAX_ROPE_DEPTH`].
         depth: u8,
-    },
+    } = STRING_REPR_CONS,
     /// Slice view over a parent string. Tracing visits the parent.
     Sliced {
         /// Parent body.
         parent: JsStringHandle,
         /// Start offset (code units) into the parent.
         start: u32,
-    },
+    } = STRING_REPR_SLICED,
 }
+
+/// Byte offset from the start of [`JsStringBodyRepr`] to the payload union.
+///
+/// `repr(C, u8)` lays the explicit tag first and aligns the payload to the
+/// enum's alignment. Generated code reads only the four contiguous variants;
+/// cons and sliced bodies retain the Rust walker.
+pub const STRING_REPR_PAYLOAD_BYTE: usize = std::mem::align_of::<JsStringBodyRepr>();
 
 /// Materialising a large rope / Latin-1 body into `Vec<u16>` is O(len).
 /// Subjects re-scanned many times (a `/g` regex `exec` loop re-widens the
@@ -1411,6 +1437,30 @@ mod tests {
     use super::*;
 
     fn empty_roots(_v: &mut dyn FnMut(*mut RawGc)) {}
+
+    #[test]
+    fn contiguous_repr_tags_match_generated_code_contract() {
+        fn tag(repr: &JsStringBodyRepr) -> u8 {
+            // SAFETY: `JsStringBodyRepr` is declared `repr(C, u8)`, which
+            // stores its discriminant as the first byte for every variant.
+            unsafe { std::ptr::from_ref(repr).cast::<u8>().read() }
+        }
+
+        assert_eq!(
+            tag(&JsStringBodyRepr::InlineFlat([0; INLINE_FLAT_CAP])),
+            STRING_REPR_INLINE_FLAT
+        );
+        assert_eq!(tag(&JsStringBodyRepr::SeqFlat), STRING_REPR_SEQ_FLAT);
+        assert_eq!(
+            tag(&JsStringBodyRepr::InlineLatin1([0; INLINE_LATIN1_CAP])),
+            STRING_REPR_INLINE_LATIN1
+        );
+        assert_eq!(tag(&JsStringBodyRepr::SeqLatin1), STRING_REPR_SEQ_LATIN1);
+        assert_eq!(
+            STRING_REPR_PAYLOAD_BYTE,
+            std::mem::align_of::<JsStringBodyRepr>()
+        );
+    }
 
     #[test]
     fn allocates_empty_flat_string() {

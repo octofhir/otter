@@ -14,6 +14,8 @@
 //!   rooted callee frames, including calls owned by spliced bodies.
 //! - Identity-guarded Int32 `Math.abs`, `Math.max`, and `Math.min` completion
 //!   without a Rust leaf transition.
+//! - Identity-guarded `String.prototype.charCodeAt(Int32)` and single-unit
+//!   `indexOf(String)` completion over contiguous Latin-1 / UTF-16 bodies.
 //! - Guarded plain- and method-callee splicing with multi-frame exact-PC
 //!   deoptimization and synthetic `this` binding.
 //! - Loop-invariant method-identity caching and receiver-property guard fusion.
@@ -88,6 +90,10 @@
 //!   identity guard as its declared leaf call. `abs(INT32_MIN)` materializes
 //!   the representable Number `2147483648`; every other supported result stays
 //!   a tagged Int32.
+//! - String intrinsics execute only after the exact bootstrap identity guard.
+//!   They read immutable contiguous bodies directly; ropes, slices, coercive
+//!   arguments, out-of-range `charCodeAt`, and searches longer than 256 code
+//!   units enter the canonical method transition before observable effects.
 //! - A spliced method guard may be cached only when the receiver is defined
 //!   outside one natural loop and every loop operation is non-mutating and
 //!   non-reentrant. Entry and OSR initialize the cache independently; the
@@ -172,8 +178,9 @@ use crate::{
     template::arm64::ic_probe::{
         DenseIndexForm, element_access_for, emit_element_address, emit_element_read,
         emit_element_write, emit_guarded_method_call, emit_guarded_method_guard,
-        emit_native_leaf_call, emit_native_leaf_guard, guarded_method_call_is_supported,
-        native_leaf_call_is_supported, native_leaf_call_name,
+        emit_guarded_method_guard_preserving_receiver, emit_native_leaf_call,
+        emit_native_leaf_guard, guarded_method_call_is_supported, native_leaf_call_is_supported,
+        native_leaf_call_name,
     },
     template::arm64::values::{CellTest, emit_cell_test},
 };
@@ -183,6 +190,9 @@ use eligibility::*;
 
 mod emit_support;
 use emit_support::*;
+
+mod string_intrinsics;
+use string_intrinsics::*;
 
 #[cfg(test)]
 mod tests;
@@ -2827,7 +2837,31 @@ fn emit(
                             // did not settle on is a slower call, not a wrong
                             // speculation to deoptimize over.
                             let leaf_miss = ops.new_dynamic_label();
-                            if guarded_int32_math_intrinsic_is_supported(
+                            if guarded_string_intrinsic_is_supported(
+                                call.entry_stub_id,
+                                reprs,
+                                instruction,
+                            ) {
+                                emit_guarded_method_guard_preserving_receiver(
+                                    &mut ops,
+                                    &mut relocations,
+                                    view,
+                                    call,
+                                    receiver,
+                                    byte_pc,
+                                    leaf_miss,
+                                )?;
+                                emit_guarded_string_intrinsic_body(
+                                    &mut ops,
+                                    &mut relocations,
+                                    view,
+                                    call.entry_stub_id,
+                                    reprs,
+                                    allocation,
+                                    instruction,
+                                    leaf_miss,
+                                )?;
+                            } else if guarded_int32_math_intrinsic_is_supported(
                                 call.entry_stub_id,
                                 reprs,
                                 instruction,

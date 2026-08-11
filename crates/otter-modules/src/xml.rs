@@ -10,11 +10,10 @@
 //! - Values are built bottom up as the scanner reports events: when an element
 //!   ends, everything about it is known and its children already exist, so it
 //!   is written once rather than revised.
-//! - The handle arena stays bounded. Only one handle spans the whole parse —
-//!   the frame stack, an array holding the element under construction at each
-//!   depth — and every event does its work in a nested scope whose handles are
-//!   released as soon as it returns. Values written into the rooted frame stack
-//!   stay live without a handle of their own.
+//! - The handle arena stays bounded. Node-form parsing keeps one rooted frame
+//!   array; compact-form parsing keeps not-yet-published properties in a
+//!   recyclable pending-root arena. Every event uses a nested handle scope, and
+//!   a compact object takes ownership of its complete value prefix at close.
 //! - No intermediate tree is built: the scanner's events drive the JavaScript
 //!   values directly, so a document is walked once.
 //! - Text runs are accumulated in Rust, not as JavaScript strings, so an
@@ -33,7 +32,8 @@ use std::borrow::Cow;
 use otter_runtime::{
     OtterError, RuntimeExtensionContext, RuntimeExtensionInstaller, RuntimeLocal as Local,
     RuntimeNativeCall, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeNativeScope as NativeScope, RuntimeValue as Value, SourceInput,
+    RuntimeNativeScope as NativeScope, RuntimePendingValue as PendingValue,
+    RuntimePendingValues as PendingValues, RuntimeValue as Value, SourceInput,
 };
 use otter_xml::encoding::{Charset, Encoding, Latin1, Utf8, Utf16};
 use otter_xml::sink::{Piece, Sink};
@@ -134,83 +134,105 @@ fn build<'s, E: Encoding>(
     document: &[E::Unit],
     shape: Shape,
 ) -> Result<Local<'s>, NativeError> {
-    // One handle for the whole parse: the frame stack. Everything an element
-    // owns is reachable from it, so nothing else needs a handle that outlives
-    // the event that made it.
-    let stack = scope.array(0)?;
-    let (outcome, failure, root_name) = {
-        let mut builder = Builder::<E> {
-            vm: Vm {
-                scope,
-                stack,
-                failure: None,
-            },
-            shape,
-            depth: 0,
-            frames: Vec::new(),
-            key: String::new(),
-            root_name: String::new(),
-            encoding: std::marker::PhantomData,
-        };
-        let outcome = otter_xml::scan::parse::<E, _>(document, &mut builder);
-        (outcome, builder.vm.failure.take(), builder.root_name)
+    // Node-form parsing retains the existing rooted frame stack. Compact-form
+    // values wait in the recyclable pending arena below and need no JS array.
+    let stack = match shape {
+        Shape::Node => scope.array(0)?,
+        Shape::Compact => scope.value(Value::undefined()),
     };
-    outcome.map_err(syntax_error)?;
-    if let Some(failure) = failure {
-        return Err(failure);
-    }
-    let root = scope.index(stack, 0)?;
-    match shape {
-        Shape::Node => Ok(root),
-        Shape::Compact => {
-            let wrapper = scope.object()?;
-            scope.set(wrapper, &root_name, root)?;
-            Ok(wrapper)
+    scope.with_pending_values(|scope, pending| {
+        let (outcome, failure, root_name, compact_root) = {
+            let mut builder = Builder::<E> {
+                vm: Vm {
+                    scope,
+                    stack,
+                    pending,
+                    failure: None,
+                },
+                shape,
+                depth: 0,
+                frames: Vec::new(),
+                key: String::new(),
+                root_name: String::new(),
+                compact_root: None,
+                encoding: std::marker::PhantomData,
+            };
+            let outcome = otter_xml::scan::parse::<E, _>(document, &mut builder);
+            (
+                outcome,
+                builder.vm.failure.take(),
+                builder.root_name,
+                builder.compact_root,
+            )
+        };
+        outcome.map_err(syntax_error)?;
+        if let Some(failure) = failure {
+            return Err(failure);
         }
-    }
+        match shape {
+            Shape::Node => scope.index(stack, 0),
+            Shape::Compact => {
+                let root = scope
+                    .local_pending_value(pending, compact_root.expect("root element closed"))
+                    .expect("live compact root");
+                let layout = scope.object_layout(&[&root_name])?;
+                let wrapper = scope.object_with_layout(layout, &[root])?;
+                let _ = scope
+                    .release_pending_value(pending, compact_root.expect("root element closed"));
+                Ok(wrapper)
+            }
+        }
+    })
 }
 
-/// The scope and the one handle that spans the parse.
+/// Mutator state shared by scanner event callbacks.
 ///
 /// Kept apart from the rest of the builder so that a step can borrow the
 /// scope mutably while still reading the builder's Rust-side buffers.
 struct Vm<'a, 's, 'rt> {
     scope: &'a mut NativeScope<'s, 'rt>,
     stack: Local<'s>,
+    pending: &'a mut PendingValues,
     failure: Option<NativeError>,
 }
 
 impl Vm<'_, '_, '_> {
-    /// Put a fresh object in the frame stack at `depth`.
-    ///
-    /// Called the first time an element takes a key, which is the first
-    /// moment the compact shape knows the element will not collapse to its
-    /// text.
-    fn ensure_object(&mut self, depth: usize) {
-        self.step(|scope, stack| {
-            let element = scope.object()?;
-            scope.set_index(stack, depth, element)
-        });
-    }
-
     /// Run `body` in a nested handle scope, keeping the first failure.
     ///
-    /// The nested scope is what bounds the arena: handles the step mints are
-    /// released as it returns, while anything it stored into the frame stack
-    /// stays live.
-    fn step(
+    /// The nested scope bounds transient handles. Node values remain reachable
+    /// from `stack`; compact values that are not in an object yet remain in
+    /// `pending`.
+    fn step<R>(
         &mut self,
-        body: impl FnOnce(&mut NativeScope<'_, '_>, Local<'_>) -> Result<(), NativeError>,
-    ) {
+        body: impl FnOnce(
+            &mut NativeScope<'_, '_>,
+            Local<'_>,
+            &mut PendingValues,
+        ) -> Result<R, NativeError>,
+    ) -> Option<R> {
         if self.failure.is_some() {
-            return;
+            return None;
         }
         let stack = self.stack;
-        let result = self.scope.scope(|mut child| body(&mut child, stack));
-        if let Err(error) = result {
-            self.failure = Some(error);
+        let pending = &mut *self.pending;
+        match self
+            .scope
+            .scope(|mut child| body(&mut child, stack, pending))
+        {
+            Ok(result) => Some(result),
+            Err(error) => {
+                self.failure = Some(error);
+                None
+            }
         }
     }
+}
+
+#[derive(Debug)]
+struct PendingProperty {
+    key: String,
+    value: PendingValue,
+    repeated_len: Option<usize>,
 }
 
 /// What is known about one open element while its children arrive.
@@ -220,9 +242,8 @@ struct Frame {
     name: String,
     /// Character data seen so far, joined across runs.
     text: String,
-    /// How many keys the compact object has, which decides whether the element
-    /// collapses to its text.
-    keys: usize,
+    /// Compact-form properties accumulated before one-shot materialization.
+    properties: Vec<PendingProperty>,
     /// How many children the node form has appended.
     children: usize,
 }
@@ -236,6 +257,8 @@ struct Builder<'a, 's, 'rt, E: Encoding> {
     key: String,
     /// The root element's name, which the compact form keys its result by.
     root_name: String,
+    /// Compact root retained until the one-property document wrapper is built.
+    compact_root: Option<PendingValue>,
     encoding: std::marker::PhantomData<E>,
 }
 
@@ -251,6 +274,111 @@ fn trimmed(text: &str) -> &str {
     text.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r'))
 }
 
+impl<E: Encoding> Builder<'_, '_, '_, E> {
+    fn append_compact_child(&mut self, parent_depth: usize, key: String, child: PendingValue) {
+        let existing = self.frames[parent_depth]
+            .properties
+            .iter()
+            .position(|property| property.key == key);
+        let Some(index) = existing else {
+            self.frames[parent_depth].properties.push(PendingProperty {
+                key,
+                value: child,
+                repeated_len: None,
+            });
+            return;
+        };
+
+        let property = &self.frames[parent_depth].properties[index];
+        let current = property.value;
+        let repeated_len = property.repeated_len;
+        let replacement = self.vm.step(|scope, _stack, pending| {
+            let child_local = scope
+                .local_pending_value(pending, child)
+                .expect("live child pending root");
+            if let Some(at) = repeated_len {
+                let array = scope
+                    .local_pending_value(pending, current)
+                    .expect("live repeated-child array");
+                scope.set_index(array, at, child_local)?;
+                let _ = scope.release_pending_value(pending, child);
+                return Ok(None);
+            }
+
+            let previous = scope
+                .local_pending_value(pending, current)
+                .expect("live first child");
+            let array = scope.array(0)?;
+            scope.set_index(array, 0, previous)?;
+            scope.set_index(array, 1, child_local)?;
+            let replacement = scope.pending_value(pending, array);
+            let _ = scope.release_pending_value(pending, current);
+            let _ = scope.release_pending_value(pending, child);
+            Ok(Some(replacement))
+        });
+        if self.vm.failure.is_some() {
+            return;
+        }
+        let property = &mut self.frames[parent_depth].properties[index];
+        match replacement.flatten() {
+            Some(replacement) => {
+                property.value = replacement;
+                property.repeated_len = Some(2);
+            }
+            None => property.repeated_len = repeated_len.map(|len| len + 1),
+        }
+    }
+
+    fn end_compact_element(&mut self, depth: usize) {
+        let frame = &mut self.frames[depth];
+        let element_name = frame.name.clone();
+        let content = trimmed(&frame.text);
+        let mut properties = std::mem::take(&mut frame.properties);
+        let value = self.vm.step(|scope, _stack, pending| {
+            let value = if properties.is_empty() {
+                scope.string(content)?
+            } else {
+                if !content.is_empty() {
+                    let text = scope.string(content)?;
+                    let text = scope.pending_value(pending, text);
+                    properties.push(PendingProperty {
+                        key: "#text".to_owned(),
+                        value: text,
+                        repeated_len: None,
+                    });
+                }
+                let keys: Vec<&str> = properties
+                    .iter()
+                    .map(|property| property.key.as_str())
+                    .collect();
+                let values: Vec<Local<'_>> = properties
+                    .iter()
+                    .map(|property| {
+                        scope
+                            .local_pending_value(pending, property.value)
+                            .expect("live compact property")
+                    })
+                    .collect();
+                let layout = scope.object_layout(&keys)?;
+                let object = scope.object_with_layout(layout, &values)?;
+                for property in &properties {
+                    let _ = scope.release_pending_value(pending, property.value);
+                }
+                object
+            };
+            Ok(scope.pending_value(pending, value))
+        });
+        let Some(value) = value else {
+            return;
+        };
+        if depth == 0 {
+            self.compact_root = Some(value);
+        } else {
+            self.append_compact_child(depth - 1, element_name, value);
+        }
+    }
+}
+
 impl<E: Encoding> Sink<E::Unit> for Builder<'_, '_, '_, E> {
     fn start_element(&mut self, name: Piece<'_, E::Unit>) {
         let name = text_of::<E>(name);
@@ -260,7 +388,7 @@ impl<E: Encoding> Sink<E::Unit> for Builder<'_, '_, '_, E> {
         }
         let frame = &mut self.frames[depth];
         frame.text.clear();
-        frame.keys = 0;
+        debug_assert!(frame.properties.is_empty());
         frame.children = 0;
         frame.name.clear();
         frame.name.push_str(&name);
@@ -269,13 +397,8 @@ impl<E: Encoding> Sink<E::Unit> for Builder<'_, '_, '_, E> {
             self.root_name.push_str(&name);
         }
 
-        // The compact shape does not know yet whether this element becomes an
-        // object or collapses to its text, and a leaf with neither attributes
-        // nor child elements collapses. Allocating here would throw that
-        // object away for every such leaf, which in a document of records is
-        // most of them; `ensure_object` allocates at the first key instead.
         if self.shape == Shape::Node {
-            self.vm.step(|scope, stack| {
+            self.vm.step(|scope, stack, _pending| {
                 let element = scope.object()?;
                 let element_name = scope.string(&name)?;
                 scope.set(element, "name", element_name)?;
@@ -298,26 +421,24 @@ impl<E: Encoding> Sink<E::Unit> for Builder<'_, '_, '_, E> {
             self.key.clear();
             self.key.push('@');
             self.key.push_str(&name);
-            self.frames[depth].keys += 1;
+            let pending = self.vm.step(|scope, _stack, pending| {
+                let text = scope.string(&value)?;
+                Ok(scope.pending_value(pending, text))
+            });
+            if let Some(value) = pending {
+                self.frames[depth].properties.push(PendingProperty {
+                    key: self.key.clone(),
+                    value,
+                    repeated_len: None,
+                });
+            }
+            return;
         }
-        let key: &str = if shape == Shape::Compact {
-            &self.key
-        } else {
-            &name
-        };
-        if shape == Shape::Compact && self.frames[depth].keys == 1 {
-            self.vm.ensure_object(depth);
-        }
-        self.vm.step(|scope, stack| {
+        self.vm.step(|scope, stack, _pending| {
             let element = scope.index(stack, depth)?;
             let text = scope.string(&value)?;
-            match shape {
-                Shape::Compact => scope.set(element, key, text),
-                Shape::Node => {
-                    let attributes = scope.get(element, "attributes")?;
-                    scope.set(attributes, key, text)
-                }
-            }
+            let attributes = scope.get(element, "attributes")?;
+            scope.set(attributes, &name, text)
         });
     }
 
@@ -330,7 +451,7 @@ impl<E: Encoding> Sink<E::Unit> for Builder<'_, '_, '_, E> {
         }
         let at = self.frames[depth].children;
         self.frames[depth].children += 1;
-        self.vm.step(|scope, stack| {
+        self.vm.step(|scope, stack, _pending| {
             let element = scope.index(stack, depth)?;
             let children = scope.get(element, "children")?;
             let run = scope.string(&run)?;
@@ -341,67 +462,25 @@ impl<E: Encoding> Sink<E::Unit> for Builder<'_, '_, '_, E> {
     fn end_element(&mut self) {
         self.depth -= 1;
         let depth = self.depth;
-        let shape = self.shape;
-        let keys = self.frames[depth].keys;
+        if self.shape == Shape::Compact {
+            self.end_compact_element(depth);
+            return;
+        }
         let parent_children = if depth > 0 {
             let at = self.frames[depth - 1].children;
             self.frames[depth - 1].children += 1;
-            self.frames[depth - 1].keys += 1;
-            if shape == Shape::Compact && self.frames[depth - 1].keys == 1 {
-                self.vm.ensure_object(depth - 1);
-            }
             at
         } else {
             0
         };
-        // The step borrows the scope mutably and these two buffers by
-        // reference; they are separate fields, so both borrows stand.
-        let frame = &self.frames[depth];
-        let text: &str = &frame.text;
-        let element_name: &str = &frame.name;
-
-        self.vm.step(|scope, stack| {
+        self.vm.step(|scope, stack, _pending| {
             let element = scope.index(stack, depth)?;
-            // The compact form collapses an element with no attributes and no
-            // child elements to its text, and only then names its text.
-            let value = if shape == Shape::Compact {
-                let content = trimmed(text);
-                if keys == 0 {
-                    scope.string(content)?
-                } else {
-                    if !content.is_empty() {
-                        let content = scope.string(content)?;
-                        scope.set(element, "#text", content)?;
-                    }
-                    element
-                }
-            } else {
-                element
-            };
             if depth == 0 {
-                return scope.set_index(stack, 0, value);
+                return scope.set_index(stack, 0, element);
             }
             let parent = scope.index(stack, depth - 1)?;
-            match shape {
-                Shape::Node => {
-                    let children = scope.get(parent, "children")?;
-                    scope.set_index(children, parent_children, value)
-                }
-                Shape::Compact => {
-                    if !scope.has_own_string_property(parent, element_name) {
-                        return scope.set(parent, element_name, value);
-                    }
-                    let existing = scope.get(parent, element_name)?;
-                    if scope.is_exact_array(existing) {
-                        let at = scope.array_length(existing)?;
-                        return scope.set_index(existing, at, value);
-                    }
-                    let repeated = scope.array(0)?;
-                    scope.set_index(repeated, 0, existing)?;
-                    scope.set_index(repeated, 1, value)?;
-                    scope.set(parent, element_name, repeated)
-                }
-            }
+            let children = scope.get(parent, "children")?;
+            scope.set_index(children, parent_children, element)
         });
     }
 }

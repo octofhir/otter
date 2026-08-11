@@ -1715,6 +1715,55 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         })
     }
 
+    /// Run a host operation with a recyclable arena for not-yet-published
+    /// JavaScript values.
+    ///
+    /// The arena is registered as an isolate-local GC root source for the
+    /// closure's lifetime. It is intended for streaming builders whose values
+    /// must survive several nested handle scopes before one final object owns
+    /// them; released slots are reused, so root storage is bounded by the live
+    /// construction frontier rather than the total input size.
+    pub fn with_pending_values<R>(
+        &mut self,
+        body: impl FnOnce(&mut Self, &mut crate::PendingValues) -> R,
+    ) -> R {
+        let mut pending = crate::PendingValues::new();
+        let roots = otter_gc::ExtraRoots::new(&pending);
+        let guard = self.ctx.cx.interp.gc_heap_mut().register_extra_roots(roots);
+        let result = body(self, &mut pending);
+        drop(guard);
+        result
+    }
+
+    /// Move a rooted local into a recyclable pending-root slot.
+    #[must_use]
+    pub fn pending_value(
+        &self,
+        pending: &mut crate::PendingValues,
+        value: Local<'_>,
+    ) -> crate::PendingValue {
+        pending.insert(self.raw(value))
+    }
+
+    /// Park the current value of a pending root in this handle scope.
+    #[must_use]
+    pub fn local_pending_value(
+        &mut self,
+        pending: &crate::PendingValues,
+        value: crate::PendingValue,
+    ) -> Option<Local<'scope>> {
+        pending.get(value).map(|value| self.value(value))
+    }
+
+    /// Release a pending root after its value has entered a traced heap object.
+    pub fn release_pending_value(
+        &mut self,
+        pending: &mut crate::PendingValues,
+        value: crate::PendingValue,
+    ) -> bool {
+        pending.remove(value).is_some()
+    }
+
     /// Root an incoming VM value in this scope.
     #[must_use]
     #[inline]
@@ -2544,6 +2593,30 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
             .interp
             .scoped_object_of_layout(self.token, layout);
         result.map_err(|error| self.vm_error(error, "NativeScope::object_of_layout"))
+    }
+
+    /// Build an object whose layout slots contain `values` from its first
+    /// observable moment.
+    ///
+    /// The values are resolved from their collector-rewritten handle slots at
+    /// the allocation boundary. The object and any overflow slab are allocated
+    /// with the final values already installed; there is no intermediate
+    /// `undefined` prefix and no follow-up property store.
+    ///
+    /// # Errors
+    /// Returns a `TypeError` when the number of values differs from the layout,
+    /// and propagates allocation failures.
+    pub fn object_with_layout(
+        &mut self,
+        layout: crate::ObjectLayout,
+        values: &[Local<'_>],
+    ) -> Result<Local<'scope>, NativeError> {
+        let result = self
+            .ctx
+            .cx
+            .interp
+            .scoped_object_with_layout(self.token, layout, values);
+        result.map_err(|error| self.vm_error(error, "NativeScope::object_with_layout"))
     }
 
     /// Overwrite the layout slot at `index`.

@@ -55,6 +55,60 @@ fn slots_start_undefined_and_answer_to_their_names_once_written() {
 }
 
 #[test]
+fn values_are_present_when_a_layout_object_is_first_observable() {
+    let (first, last) = with_context(|ctx| {
+        ctx.scope(|mut scope| {
+            let layout = scope.object_layout(&["a", "b", "c", "d", "e"]).unwrap();
+            let values =
+                ["one", "two", "three", "four", "five"].map(|text| scope.string(text).unwrap());
+            let object = scope.object_with_layout(layout, &values).unwrap();
+            let first = scope.get(object, "a").unwrap();
+            let last = scope.get(object, "e").unwrap();
+            (
+                scope.string_value(first).unwrap(),
+                scope.string_value(last).unwrap(),
+            )
+        })
+    });
+    assert_eq!(first, "one");
+    assert_eq!(last, "five");
+}
+
+#[test]
+fn object_with_layout_rejects_a_value_count_mismatch() {
+    with_context(|ctx| {
+        ctx.scope(|mut scope| {
+            let layout = scope.object_layout(&["a", "b"]).unwrap();
+            let only = scope.number(1.0);
+            assert!(scope.object_with_layout(layout, &[only]).is_err());
+        });
+    });
+}
+
+#[test]
+fn pending_values_survive_nested_scopes_and_can_be_released() {
+    let value = with_context(|ctx| {
+        ctx.scope(|mut scope| {
+            scope.with_pending_values(|scope, pending| {
+                let token = scope.scope(|mut child| {
+                    let value = child.string("rooted").unwrap();
+                    child.pending_value(pending, value)
+                });
+                for _ in 0..128 {
+                    let _ = scope.object().unwrap();
+                }
+                let value = scope.local_pending_value(pending, token).unwrap();
+                let text = scope.string_value(value).unwrap();
+                assert!(scope.release_pending_value(pending, token));
+                assert!(scope.local_pending_value(pending, token).is_none());
+                text
+            })
+        })
+    });
+    assert_eq!(value, "rooted");
+}
+
+#[test]
 fn the_same_key_list_gives_the_same_layout() {
     let (first, second, other) = with_context(|ctx| {
         ctx.scope(|mut scope| {

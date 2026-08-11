@@ -2905,6 +2905,88 @@ pub(crate) fn alloc_object_with_shape_roots(
     heap.alloc_with_roots(empty_object_body_with_shape(shape), external_visit)
 }
 
+/// Allocate a fresh shaped object whose complete data-slot prefix is installed
+/// before the object becomes reachable.
+///
+/// Inline values live directly in the young object body. Wider objects first
+/// allocate an old-space slab with its collector-rewritten values already in
+/// the trailing words, then publish the object that owns that slab. In either
+/// case no empty property is exposed and no later per-property mutator store is
+/// required.
+pub(crate) fn alloc_object_with_shape_and_values_roots(
+    heap: &mut GcHeap,
+    mut shape: ShapeHandle,
+    mut prototype: Option<JsObject>,
+    values: &mut [Value],
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsObject, otter_gc::OutOfMemory> {
+    debug_assert_eq!(
+        shape_property_count(shape, heap) as usize,
+        values.len(),
+        "shape slot count and initialization values diverged"
+    );
+
+    let shape_slot = std::ptr::addr_of_mut!(shape).cast::<RawGc>();
+    let prototype_slot = prototype
+        .as_mut()
+        .map(|prototype| std::ptr::from_mut(prototype).cast::<RawGc>());
+    let mut visit_owner_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
+        visitor(shape_slot);
+        if let Some(prototype_slot) = prototype_slot {
+            visitor(prototype_slot);
+        }
+    };
+
+    let slab = if values.len() > INLINE_SLOT_CAP {
+        let capacity = values.len().max(INLINE_SLOT_CAP * 2);
+        slot_slab::alloc_slot_slab_with_values(heap, capacity, values, &mut visit_owner_roots)?
+    } else {
+        slot_slab::SlotSlabHandle::null()
+    };
+
+    let mut inline_values = [Value::default(); INLINE_SLOT_CAP];
+    if slab.is_null() {
+        inline_values[..values.len()].copy_from_slice(values);
+    }
+    let body = ObjectBody {
+        shape,
+        values_ptr: Cell::new(std::ptr::null_mut()),
+        slab,
+        inline_values,
+        slab_len: u16::try_from(values.len()).expect("object layout exceeds u16 slots"),
+        dictionary_shape_id: ShapeId::UNASSIGNED,
+        shape_cache_mode: ShapeCacheMode::Fast,
+        jit_proto: prototype.unwrap_or_default(),
+        extensible: true,
+        slot_attrs_overridden: false,
+        exotic: ExoticSlot::null(),
+    };
+    body.refresh_values_ptr();
+
+    let slab_slot = (!slab.is_null()).then(|| std::ptr::addr_of!(slab).cast_mut().cast::<RawGc>());
+    let values_base = values.as_mut_ptr();
+    let values_len = values.len();
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
+        if let Some(slab_slot) = slab_slot {
+            visitor(slab_slot);
+        }
+        for index in 0..values_len {
+            // SAFETY: `index < values_len`; the caller-owned pending buffer
+            // outlives this allocation and is rewritten in place.
+            unsafe { (*values_base.add(index)).trace_value_slot_mut(visitor) };
+        }
+    };
+    let object = heap.alloc_with_roots(body, &mut visit)?;
+    // A young allocation is not post-scanned by the allocator because it
+    // needs no remembered-set edges. Its cached inline base was copied from
+    // the pending stack body, though, so retarget it to the final cell before
+    // returning the first observable handle.
+    heap.with_payload(object, |body| body.refresh_values_ptr());
+    Ok(object)
+}
+
 /// Initialize a freshly allocated shaped object with the values for every
 /// hidden-class data slot, in shape order.
 pub(crate) fn initialize_shaped_data_slots(obj: JsObject, heap: &mut GcHeap, values: &[Value]) {

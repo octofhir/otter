@@ -45,6 +45,10 @@ pub type RuntimeNativeScope<'s, 'rt> = otter_vm::NativeScope<'s, 'rt>;
 pub type RuntimeLocal<'s> = otter_vm::Local<'s>;
 /// Runtime-owned object-layout alias: the hidden class for a fixed key list.
 pub type RuntimeObjectLayout = otter_vm::ObjectLayout;
+/// Runtime-owned pending-root arena for streaming native builders.
+pub type RuntimePendingValues = otter_vm::PendingValues;
+/// Runtime-owned token naming one value in a pending-root arena.
+pub type RuntimePendingValue = otter_vm::PendingValue;
 /// Runtime-owned native error alias.
 pub type RuntimeNativeError = otter_vm::NativeError;
 /// Runtime-owned native fast function pointer.

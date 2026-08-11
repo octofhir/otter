@@ -304,7 +304,7 @@ unsafe fn units(block: &[u16; UNIT_BLOCK]) -> UnitMasks {
     // SAFETY: every load below stays inside `block`.
     unsafe {
         let last_control = _mm_set1_epi16(LAST_CONTROL as i16);
-        let below_noncharacter = _mm_set1_epi16((FIRST_NONCHARACTER - 1) as i16);
+        let first_noncharacter = _mm_set1_epi16(FIRST_NONCHARACTER as i16);
         let surrogate_mask = _mm_set1_epi16(SURROGATE_MASK as i16);
         let high_surrogate = _mm_set1_epi16(HIGH_SURROGATE as i16);
         let low_surrogate = _mm_set1_epi16(LOW_SURROGATE as i16);
@@ -339,8 +339,11 @@ unsafe fn units(block: &[u16; UNIT_BLOCK]) -> UnitMasks {
                 // saturating subtraction is zero exactly when the left side
                 // is the smaller.
                 let is_control = _mm_cmpeq_epi16(_mm_subs_epu16(value, last_control), zero);
+                // Saturating the other way round asks the other question:
+                // this is zero exactly when the unit is the larger, and the
+                // comparison has to include the constant itself.
                 let is_noncharacter =
-                    _mm_cmpeq_epi16(_mm_subs_epu16(below_noncharacter, value), zero);
+                    _mm_cmpeq_epi16(_mm_subs_epu16(first_noncharacter, value), zero);
                 let allowed_control = _mm_or_si128(
                     _mm_or_si128(_mm_cmpeq_epi16(value, tab), _mm_cmpeq_epi16(value, newline)),
                     is_return,

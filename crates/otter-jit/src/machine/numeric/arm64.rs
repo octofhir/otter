@@ -1194,7 +1194,7 @@ pub(super) fn emit(
                 if let CallTarget::Direct {
                     kind,
                     argument_mode,
-                    callee,
+                    candidates,
                     caller_function_id,
                     logical_pc,
                     byte_pc,
@@ -1208,57 +1208,10 @@ pub(super) fn emit(
                     let direct_done = ops.new_dynamic_label();
                     let direct_threw = ops.new_dynamic_label();
                     let direct_bail = ops.new_dynamic_label();
-                    let method_guard_miss = ops.new_dynamic_label();
+                    let final_method_guard_miss = ops.new_dynamic_label();
                     emit_save_safepoint_roots(&mut ops, frame, site)?;
                     emit_publish_machine_roots(&mut ops, frame, site)?;
                     let result_index = descriptor.arguments.len();
-                    let form = match kind {
-                        DirectCallKind::Plain => DirectCallForm::Plain { callable: 0 },
-                        DirectCallKind::Method { guard } => {
-                            let receiver = *locations
-                                .first()
-                                .ok_or(Unsupported::OperandShape("scalar method receiver"))?;
-                            emit_load_allocated_tagged(
-                                &mut ops,
-                                frame,
-                                receiver,
-                                9,
-                                MACHINE_ROOT_RECORD_SIZE,
-                            )?;
-                            emit_method_guard_from_tagged_register(
-                                &mut ops,
-                                &mut relocations,
-                                view,
-                                guard,
-                                9,
-                                17,
-                                None,
-                                method_guard_miss,
-                            )?;
-                            DirectCallForm::Method {
-                                callable: 17,
-                                receiver: 0,
-                            }
-                        }
-                        DirectCallKind::Construct => DirectCallForm::Construct {
-                            callable: 0,
-                            receiver: u16::try_from(result_index + 1).map_err(|_| {
-                                Unsupported::OperandShape("scalar construct receiver root")
-                            })?,
-                        },
-                        DirectCallKind::DerivedConstruct => {
-                            DirectCallForm::DerivedConstruct { callable: 0 }
-                        }
-                        DirectCallKind::SuperConstruct => DirectCallForm::SuperConstruct {
-                            callable: 0,
-                            receiver: u16::try_from(result_index + 1).map_err(|_| {
-                                Unsupported::OperandShape("scalar super receiver root")
-                            })?,
-                        },
-                        DirectCallKind::DerivedSuperConstruct => {
-                            DirectCallForm::DerivedSuperConstruct { callable: 0 }
-                        }
-                    };
                     let arguments = (1..result_index)
                         .map(|index| {
                             u16::try_from(index).map_err(|_| {
@@ -1270,128 +1223,208 @@ pub(super) fn emit(
                         DirectCallArgumentMode::Fixed => DirectCallArguments::Fixed(&arguments),
                         DirectCallArgumentMode::Spread => DirectCallArguments::Spread(1),
                     };
-                    emit_direct_call_with_access(
-                        &mut ops,
-                        &mut relocations,
-                        view,
-                        DirectCallSite {
-                            target: callee,
-                            caller_function_id: *caller_function_id,
-                            logical_pc: *logical_pc,
-                            byte_pc: *byte_pc,
-                            dst: u16::try_from(result_index).map_err(|_| {
-                                Unsupported::OperandShape("scalar direct call result")
-                            })?,
-                            form,
-                            arguments,
-                        },
-                        deopt_stack_call_entry,
-                        resolve_direct_entry,
-                        try_prepare_construct_entry,
-                        prepare_construct_entry,
-                        derived_construct_result_entry,
-                        copy_spread_arguments_entry,
-                        initialize_upvalues_entry,
-                        None,
-                        direct_bail,
-                        direct_threw,
-                        direct_done,
-                        19,
-                        |ops, source, target, sp_bias| {
-                            let operand = instruction
-                                .operands
-                                .get(usize::from(source))
-                                .ok_or(Unsupported::OperandShape("scalar direct call source"))?;
-                            // A moving safepoint rewrites the canonical save
-                            // slot named by the late TaggedRoot metadata. Read
-                            // that slot directly after receiver preparation;
-                            // its allocator early/late homes may differ and
-                            // either register may have been clobbered meanwhile.
-                            if let Some(root) =
-                                site.roots.iter().find(|root| root.value == operand.value)
-                            {
+                    for (candidate_index, candidate) in candidates.iter().enumerate() {
+                        let candidate_start = ops.offset().0;
+                        let next_method_candidate = (*kind == DirectCallKind::Method
+                            && candidate_index + 1 != candidates.len())
+                        .then(|| ops.new_dynamic_label());
+                        let method_guard_miss =
+                            next_method_candidate.unwrap_or(final_method_guard_miss);
+                        let form = match kind {
+                            DirectCallKind::Plain => DirectCallForm::Plain { callable: 0 },
+                            DirectCallKind::Method => {
+                                let guard = candidate.guard.as_ref().ok_or(
+                                    Unsupported::OperandShape("scalar method candidate guard"),
+                                )?;
+                                let receiver = *locations
+                                    .first()
+                                    .ok_or(Unsupported::OperandShape("scalar method receiver"))?;
+                                let guard_start = ops.offset().0;
+                                emit_load_allocated_tagged(
+                                    &mut ops,
+                                    frame,
+                                    receiver,
+                                    9,
+                                    MACHINE_ROOT_RECORD_SIZE,
+                                )?;
+                                emit_method_guard_from_tagged_register(
+                                    &mut ops,
+                                    &mut relocations,
+                                    view,
+                                    guard,
+                                    9,
+                                    17,
+                                    None,
+                                    method_guard_miss,
+                                )?;
+                                structural_regions.push((
+                                    "machineDirectMethodGuard",
+                                    Some(*byte_pc),
+                                    guard_start,
+                                    ops.offset().0,
+                                ));
+                                DirectCallForm::Method {
+                                    callable: 17,
+                                    receiver: 0,
+                                }
+                            }
+                            DirectCallKind::Construct => DirectCallForm::Construct {
+                                callable: 0,
+                                receiver: u16::try_from(result_index + 1).map_err(|_| {
+                                    Unsupported::OperandShape("scalar construct receiver root")
+                                })?,
+                            },
+                            DirectCallKind::DerivedConstruct => {
+                                DirectCallForm::DerivedConstruct { callable: 0 }
+                            }
+                            DirectCallKind::SuperConstruct => DirectCallForm::SuperConstruct {
+                                callable: 0,
+                                receiver: u16::try_from(result_index + 1).map_err(|_| {
+                                    Unsupported::OperandShape("scalar super receiver root")
+                                })?,
+                            },
+                            DirectCallKind::DerivedSuperConstruct => {
+                                DirectCallForm::DerivedSuperConstruct { callable: 0 }
+                            }
+                        };
+                        emit_direct_call_with_access(
+                            &mut ops,
+                            &mut relocations,
+                            view,
+                            DirectCallSite {
+                                target: &candidate.callee,
+                                target_index: candidate.target_index,
+                                target_count: candidate.target_count,
+                                caller_function_id: *caller_function_id,
+                                logical_pc: *logical_pc,
+                                byte_pc: *byte_pc,
+                                dst: u16::try_from(result_index).map_err(|_| {
+                                    Unsupported::OperandShape("scalar direct call result")
+                                })?,
+                                form,
+                                arguments,
+                            },
+                            deopt_stack_call_entry,
+                            resolve_direct_entry,
+                            try_prepare_construct_entry,
+                            prepare_construct_entry,
+                            derived_construct_result_entry,
+                            copy_spread_arguments_entry,
+                            initialize_upvalues_entry,
+                            None,
+                            direct_bail,
+                            direct_threw,
+                            direct_done,
+                            19,
+                            |ops, source, target, sp_bias| {
+                                let operand = instruction.operands.get(usize::from(source)).ok_or(
+                                    Unsupported::OperandShape("scalar direct call source"),
+                                )?;
+                                // A moving safepoint rewrites the canonical save
+                                // slot named by the late TaggedRoot metadata. Read
+                                // that slot directly after receiver preparation;
+                                // its allocator early/late homes may differ and
+                                // either register may have been clobbered meanwhile.
+                                if let Some(root) =
+                                    site.roots.iter().find(|root| root.value == operand.value)
+                                {
+                                    let offset = root_offset(frame, root.save_slot)?
+                                        .checked_add(sp_bias)
+                                        .and_then(|offset| {
+                                            offset.checked_add(MACHINE_ROOT_RECORD_SIZE)
+                                        })
+                                        .ok_or(Unsupported::OperandShape(
+                                            "scalar direct call canonical root offset",
+                                        ))?;
+                                    emit_sp_ldr_x(ops, target, offset);
+                                    return Ok(());
+                                }
+                                let location = locations[usize::from(source)];
+                                emit_load_allocated_tagged(
+                                    ops,
+                                    frame,
+                                    location,
+                                    target,
+                                    sp_bias.checked_add(MACHINE_ROOT_RECORD_SIZE).ok_or(
+                                        Unsupported::OperandShape("scalar direct call stack bias"),
+                                    )?,
+                                )
+                            },
+                            |ops, destination, source, sp_bias| {
+                                let location = *locations.get(usize::from(destination)).ok_or(
+                                    Unsupported::OperandShape("scalar direct call destination"),
+                                )?;
+                                emit_store_allocated_tagged(ops, frame, location, source, sp_bias)
+                            },
+                            |ops| {
+                                // x17 is outside regalloc2's allocatable bank and
+                                // survives the activation-root descriptor cleanup.
+                                dynasm!(ops ; .arch aarch64 ; mov x17, x0);
+                                emit_clear_machine_roots(ops);
+                                emit_reload_safepoint_roots(ops, frame, site)?;
+                                dynasm!(ops ; .arch aarch64 ; mov x0, x17);
+                                Ok(())
+                            },
+                            |ops, source, sp_bias| {
+                                let receiver = instruction
+                                    .operands
+                                    .get(result_index + 1)
+                                    .ok_or(Unsupported::OperandShape(
+                                        "scalar construct receiver operand",
+                                    ))?
+                                    .value;
+                                let root = site
+                                    .roots
+                                    .iter()
+                                    .find(|root| root.value == receiver)
+                                    .ok_or(Unsupported::OperandShape(
+                                        "scalar construct receiver save home",
+                                    ))?;
                                 let offset = root_offset(frame, root.save_slot)?
                                     .checked_add(sp_bias)
-                                    .and_then(|offset| offset.checked_add(MACHINE_ROOT_RECORD_SIZE))
                                     .ok_or(Unsupported::OperandShape(
-                                        "scalar direct call canonical root offset",
+                                        "scalar construct linkage root offset",
+                                    ))?
+                                    .checked_add(MACHINE_ROOT_RECORD_SIZE)
+                                    .ok_or(Unsupported::OperandShape(
+                                        "scalar construct receiver root offset",
                                     ))?;
-                                emit_sp_ldr_x(ops, target, offset);
-                                return Ok(());
-                            }
-                            let location = locations[usize::from(source)];
-                            emit_load_allocated_tagged(
-                                ops,
-                                frame,
-                                location,
-                                target,
-                                sp_bias.checked_add(MACHINE_ROOT_RECORD_SIZE).ok_or(
-                                    Unsupported::OperandShape("scalar direct call stack bias"),
-                                )?,
-                            )
-                        },
-                        |ops, destination, source, sp_bias| {
-                            let location = *locations.get(usize::from(destination)).ok_or(
-                                Unsupported::OperandShape("scalar direct call destination"),
-                            )?;
-                            emit_store_allocated_tagged(ops, frame, location, source, sp_bias)
-                        },
-                        |ops| {
-                            // x17 is outside regalloc2's allocatable bank and
-                            // survives the activation-root descriptor cleanup.
-                            dynasm!(ops ; .arch aarch64 ; mov x17, x0);
-                            emit_clear_machine_roots(ops);
-                            emit_reload_safepoint_roots(ops, frame, site)?;
-                            dynasm!(ops ; .arch aarch64 ; mov x0, x17);
-                            Ok(())
-                        },
-                        |ops, source, sp_bias| {
-                            let receiver = instruction
-                                .operands
-                                .get(result_index + 1)
-                                .ok_or(Unsupported::OperandShape(
-                                    "scalar construct receiver operand",
-                                ))?
-                                .value;
-                            let root = site
-                                .roots
-                                .iter()
-                                .find(|root| root.value == receiver)
-                                .ok_or(Unsupported::OperandShape(
-                                    "scalar construct receiver save home",
-                                ))?;
-                            let offset = root_offset(frame, root.save_slot)?
-                                .checked_add(sp_bias)
-                                .ok_or(Unsupported::OperandShape(
-                                    "scalar construct linkage root offset",
-                                ))?
-                                .checked_add(MACHINE_ROOT_RECORD_SIZE)
-                                .ok_or(Unsupported::OperandShape(
-                                    "scalar construct receiver root offset",
-                                ))?;
-                            dynasm!(ops ; .arch aarch64 ; str X(source), [sp, offset]);
-                            Ok(())
-                        },
-                        |ops, sp_bias| {
-                            emit_reload_safepoint_roots_with_bias(
-                                ops,
-                                frame,
-                                site,
-                                sp_bias.checked_add(MACHINE_ROOT_RECORD_SIZE).ok_or(
-                                    Unsupported::OperandShape("scalar construct root reload bias"),
-                                )?,
-                            )
-                        },
-                    )?;
+                                dynasm!(ops ; .arch aarch64 ; str X(source), [sp, offset]);
+                                Ok(())
+                            },
+                            |ops, sp_bias| {
+                                emit_reload_safepoint_roots_with_bias(
+                                    ops,
+                                    frame,
+                                    site,
+                                    sp_bias.checked_add(MACHINE_ROOT_RECORD_SIZE).ok_or(
+                                        Unsupported::OperandShape(
+                                            "scalar construct root reload bias",
+                                        ),
+                                    )?,
+                                )
+                            },
+                        )?;
+                        if *kind == DirectCallKind::Method {
+                            structural_regions.push((
+                                "machineDirectMethodCandidate",
+                                Some(*byte_pc),
+                                candidate_start,
+                                ops.offset().0,
+                            ));
+                        }
+                        if let Some(next_method_candidate) = next_method_candidate {
+                            dynasm!(ops ; .arch aarch64 ; =>next_method_candidate);
+                        }
+                    }
+                    if *kind == DirectCallKind::Method {
+                        dynasm!(ops ; .arch aarch64 ; =>final_method_guard_miss);
+                        emit_clear_machine_roots(&mut ops);
+                        emit_reload_safepoint_roots(&mut ops, frame, site)?;
+                        dynasm!(ops ; .arch aarch64 ; b =>deopt);
+                    }
                     dynasm!(ops
                         ; .arch aarch64
-                        ; =>method_guard_miss
-                    );
-                    emit_clear_machine_roots(&mut ops);
-                    emit_reload_safepoint_roots(&mut ops, frame, site)?;
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; b =>deopt
                         ; =>direct_bail
                         ; b =>deopt
                         ; =>direct_threw
@@ -1419,6 +1452,18 @@ pub(super) fn emit(
                     }
                     dynasm!(ops ; .arch aarch64 ; =>direct_done);
                 } else {
+                    if let CallTarget::ColdCallExit { byte_pc, .. } = &descriptor.target {
+                        let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                        let start = ops.offset().0;
+                        dynasm!(ops ; .arch aarch64 ; b =>deopt);
+                        structural_regions.push((
+                            "machineColdCallExit",
+                            Some(*byte_pc),
+                            start,
+                            ops.offset().0,
+                        ));
+                        continue;
+                    }
                     if matches!(
                         descriptor.target,
                         CallTarget::RuntimeStub(target)
@@ -1604,6 +1649,9 @@ pub(super) fn emit(
                             return Err(Unsupported::OperandShape("scalar runtime call target"));
                         }
                         CallTarget::Direct { .. } => unreachable!("handled direct call above"),
+                        CallTarget::ColdCallExit { .. } => {
+                            unreachable!("handled cold call exit above")
+                        }
                     };
                     if integer_register(locations[result_index])? != 0 {
                         return Err(Unsupported::OperandShape("scalar runtime call result"));

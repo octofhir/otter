@@ -109,6 +109,8 @@ pub(super) fn emit_spread_call_op(
             view,
             DirectCallSite {
                 target,
+                target_index: 0,
+                target_count: 1,
                 caller_function_id: view.code_block.id,
                 logical_pc,
                 byte_pc,

@@ -301,6 +301,24 @@ TDZ/malformed-layout exit contract. Primitive-string and dense-array `.length`
 may appear inside `machinePropertyLoad`; an unsigned length outside the int32
 tag range exits to canonical Number boxing.
 
+Scalar Machine method calls may contain a complete dense chain of one to four
+observed targets. `code-map.json` emits one `machineDirectMethodGuard` and one
+`machineDirectMethodCandidate` region per target. The corresponding
+`directCallEntryCell` relocations carry `targetIndex` and `targetCount`; indices
+must be exactly `0..targetCount`, and every candidate at the site reports the
+same count. Receiver and argument roots, the safepoint, and the exact pre-call
+deopt state are shared by the chain. A candidate guard miss tries the next
+candidate; the final miss exits before lookup or call effects.
+
+`machineColdCallExit` represents a plain or method branch that had never been
+executed when the snapshot was frozen. It has no call operands, safepoint,
+clobbers, or effects and unconditionally takes the source opcode's exact deopt
+exit. The VM records a real call attempt before semantic work and invalidates
+the obsolete caller generation, so a newly reached cold branch executes once
+canonically and cannot remain in a generated deopt loop. An already-attempted
+site without a complete generated plan makes the whole function use the legacy
+fallback instead of being mislabeled cold.
+
 ### Optimizing frame-free method intrinsics
 
 An optimizing bundle uses `machineMethodIntrinsic` for a generated Map, string,

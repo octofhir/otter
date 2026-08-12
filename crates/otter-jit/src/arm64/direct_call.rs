@@ -357,6 +357,8 @@ impl DirectCallForm {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DirectCallSite<'a> {
     pub(crate) target: &'a JitDirectCallee,
+    pub(crate) target_index: u32,
+    pub(crate) target_count: u32,
     pub(crate) caller_function_id: u32,
     pub(crate) logical_pc: u32,
     pub(crate) byte_pc: u32,
@@ -665,6 +667,8 @@ fn layout_and_artifact(
             DirectCallArguments::Spread(_) => DirectCallArgumentModeArtifact::Spread,
         },
         target_function_id: site.target.plan.function_id,
+        target_index: site.target_index,
+        target_count: site.target_count,
         target_code_object_id: site.target.plan.code_object_id,
         target_tier: match site.target.plan.tier {
             abi::NativeFrameKind::Baseline => DirectCallTierArtifact::Template,

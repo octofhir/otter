@@ -1128,6 +1128,13 @@ pub struct JitInstructionMetadata {
     /// `ConstF64` node without reaching back into the constant pool. `None` for
     /// every other opcode.
     pub load_number: Option<f64>,
+    /// Whether this call-family instruction reached semantic dispatch.
+    ///
+    /// Recording precedes callable and method-property resolution. `false`
+    /// therefore proves a genuinely unattempted cold branch; a throwing,
+    /// non-callable, static-native, or otherwise unsupported hot site reports
+    /// `true` even when it has no compiler-native direct target.
+    pub call_attempted: bool,
     /// Arithmetic representation observations frozen for this canonical PC.
     pub(crate) arith_feedback: ArithFeedback,
 }
@@ -1141,6 +1148,7 @@ impl JitInstructionMetadata {
             load_array_length: false,
             method_hint: JitMethodHint::None,
             load_number: None,
+            call_attempted: false,
             arith_feedback: ArithFeedback::default(),
         }
     }
@@ -1266,6 +1274,18 @@ impl JitCompileSnapshot {
             .get_mut(instruction_pc as usize)
             .expect("test feedback PC belongs to the snapshot")
             .arith_feedback = feedback;
+    }
+
+    /// Mark one backend-test call site as previously attempted.
+    ///
+    /// Production snapshots obtain this fact from their owning CodeBlock's
+    /// dense feedback cell.
+    #[doc(hidden)]
+    pub fn seed_call_attempted_for_test(&mut self, instruction_pc: u32) {
+        self.instructions
+            .get_mut(instruction_pc as usize)
+            .expect("test feedback PC belongs to the snapshot")
+            .call_attempted = true;
     }
 }
 

@@ -497,8 +497,16 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     `directConstructResultFast` / `directConstructResultThrow`. The fast result
     region performs base substitution and valid derived selection without a
     runtime stub; the throwing region is the cold invalid-result sibling.
+    A scalar Machine method site may emit a complete dense chain of one to four
+    candidates. It exposes one `machineDirectMethodGuard` and one
+    `machineDirectMethodCandidate` region per candidate while sharing a single
+    descriptor, root publication, safepoint, and deopt state. The final guard
+    miss exits before method lookup or call effects. A never-executed plain or
+    method branch may instead expose `machineColdCallExit`; its first real
+    attempt records feedback and evicts the obsolete caller generation before
+    canonical execution, so the exit cannot become a permanent deopt loop.
     `functionId` is the caller. Typed `directCall` metadata names call kind,
-    target function,
+    target function, `targetIndex`, `targetCount`,
     planning-time `targetCodeObjectId`, tier, `thisMode`, `argumentMode`,
     captured callee-native-frame bytes, caller linkage bytes, captured total
     reservation, register count, `ownUpvalueCount`, and

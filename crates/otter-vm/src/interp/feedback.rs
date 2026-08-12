@@ -436,55 +436,80 @@ impl FeedbackDirectory {
         site: usize,
         stub_id: crate::native_abi::RuntimeStubId,
         method_site: MethodSite,
-    ) {
+    ) -> bool {
         if !self
             .address(site)
             .is_some_and(FeedbackSlotAddress::is_method)
         {
-            return;
+            return false;
         }
         let Some(feedback) = self.method_targets.get_mut(site) else {
-            return;
+            return false;
         };
-        match feedback {
-            None => {
-                *feedback = Some(MethodCallFeedback::MonoNativeLeaf {
-                    stub_id,
-                    recv_shape: method_site.recv_shape,
-                    proto_chain: method_site.proto_chain,
-                    method_value_byte: method_site.method_value_byte,
-                    recv_shape_offset: method_site.recv_shape_offset,
-                    holder_shape_offset: method_site.holder_shape_offset,
-                });
-            }
-            Some(MethodCallFeedback::MonoNativeLeaf {
-                stub_id: seen_stub,
-                recv_shape,
-                proto_chain,
-                method_value_byte,
-                ..
-            }) => {
-                if *seen_stub != stub_id
-                    || *recv_shape != method_site.recv_shape
-                    || !proto_chain.same(&method_site.proto_chain)
-                    || *method_value_byte != method_site.method_value_byte
-                {
-                    *feedback = Some(MethodCallFeedback::Megamorphic);
-                }
-            }
-            Some(_) => {}
-        }
+        record_method_native_leaf_distribution(feedback, stub_id, method_site)
     }
 
-    fn record_method_target(&mut self, site: usize, method_fid: u32, method_site: MethodSite) {
+    fn record_method_target(
+        &mut self,
+        site: usize,
+        method_fid: u32,
+        method_site: MethodSite,
+    ) -> bool {
         if !self
             .address(site)
             .is_some_and(FeedbackSlotAddress::is_method)
         {
-            return;
+            return false;
         }
         if let Some(targets) = self.method_targets.get_mut(site) {
-            record_method_distribution(targets, method_fid, method_site);
+            return record_method_distribution(targets, method_fid, method_site);
+        }
+        false
+    }
+}
+
+/// Apply declared-native method transitions to isolate-owned method feedback.
+/// A bytecode/native mixture cannot share one direct guard chain and therefore
+/// saturates the site instead of retaining an incomplete immutable chain.
+fn record_method_native_leaf_distribution(
+    feedback: &mut Option<MethodCallFeedback>,
+    stub_id: crate::native_abi::RuntimeStubId,
+    method_site: MethodSite,
+) -> bool {
+    match feedback {
+        None => {
+            *feedback = Some(MethodCallFeedback::MonoNativeLeaf {
+                stub_id,
+                recv_shape: method_site.recv_shape,
+                proto_chain: method_site.proto_chain,
+                method_value_byte: method_site.method_value_byte,
+                recv_shape_offset: method_site.recv_shape_offset,
+                holder_shape_offset: method_site.holder_shape_offset,
+            });
+            true
+        }
+        Some(MethodCallFeedback::MonoNativeLeaf {
+            stub_id: seen_stub,
+            recv_shape,
+            proto_chain,
+            method_value_byte,
+            ..
+        }) => {
+            if *seen_stub != stub_id
+                || *recv_shape != method_site.recv_shape
+                || !proto_chain.same(&method_site.proto_chain)
+                || *method_value_byte != method_site.method_value_byte
+            {
+                *feedback = Some(MethodCallFeedback::Megamorphic);
+                true
+            } else {
+                false
+            }
+        }
+        Some(MethodCallFeedback::Megamorphic) => false,
+        Some(_) => {
+            *feedback = Some(MethodCallFeedback::Megamorphic);
+            true
         }
     }
 }
@@ -495,7 +520,7 @@ fn record_method_distribution(
     feedback: &mut Option<MethodCallFeedback>,
     method_fid: u32,
     site: MethodSite,
-) {
+) -> bool {
     let new_target = PolyMethodTarget {
         method_fid,
         recv_shape: site.recv_shape,
@@ -511,6 +536,7 @@ fn record_method_distribution(
                 proto_chain: site.proto_chain,
                 method_value_byte: site.method_value_byte,
             });
+            true
         }
         Some(MethodCallFeedback::Mono {
             method_fid: seen_fid,
@@ -535,6 +561,9 @@ fn record_method_distribution(
                 targets.push(prior);
                 targets.push(new_target);
                 *feedback = Some(MethodCallFeedback::Poly(Box::new(targets)));
+                true
+            } else {
+                false
             }
         }
         Some(MethodCallFeedback::Poly(targets)) => {
@@ -543,18 +572,22 @@ fn record_method_distribution(
                 .find(|target| target.matches(method_fid, &site))
             {
                 existing.hits = existing.hits.saturating_add(1);
+                false
             } else if targets.len() < MAX_POLY_METHOD_TARGETS {
                 targets.push(new_target);
+                true
             } else {
                 *feedback = Some(MethodCallFeedback::Megamorphic);
+                true
             }
         }
-        Some(MethodCallFeedback::Megamorphic) => {}
+        Some(MethodCallFeedback::Megamorphic) => false,
         // A site that already resolved to a declared native leaf cannot also
         // carry a bytecode inline chain: the two need different guard
         // lowerings, so the second shape gives up rather than mixing them.
         Some(MethodCallFeedback::MonoNativeLeaf { .. }) => {
             *feedback = Some(MethodCallFeedback::Megamorphic);
+            true
         }
     }
 }
@@ -612,17 +645,17 @@ impl Interpreter {
     /// Record that one `Op::CallMethodValue` site resolved to a declared native
     /// leaf entry, with the receiver layout captured before the call.
     ///
-    /// A site that has already observed a bytecode target keeps it: mixing the
-    /// two would need a guard chain that can dispatch both, which no consumer
-    /// builds. The first shape wins and any other receiver misses to the stub.
+    /// A site that has already observed a bytecode target becomes megamorphic:
+    /// mixing both kinds would need a guard chain no consumer builds, and the
+    /// transition must retire any previously baked bytecode-only chain.
     pub(crate) fn record_method_native_leaf_feedback(
         &mut self,
         site: usize,
         stub_id: crate::native_abi::RuntimeStubId,
         method_site: MethodSite,
-    ) {
+    ) -> bool {
         self.feedback_directory
-            .record_method_native_leaf(site, stub_id, method_site);
+            .record_method_native_leaf(site, stub_id, method_site)
     }
 
     pub(crate) fn record_method_target_feedback(
@@ -630,9 +663,9 @@ impl Interpreter {
         site: usize,
         method_fid: u32,
         method_site: MethodSite,
-    ) {
+    ) -> bool {
         self.feedback_directory
-            .record_method_target(site, method_fid, method_site);
+            .record_method_target(site, method_fid, method_site)
     }
 }
 
@@ -655,25 +688,78 @@ mod tests {
     fn isolate_method_distribution_transitions_to_bounded_poly_then_mega() {
         let mut feedback = None;
         for raw in 1..=MAX_POLY_METHOD_TARGETS as u64 {
-            record_method_distribution(&mut feedback, raw as u32, method_site(raw));
+            assert!(record_method_distribution(
+                &mut feedback,
+                raw as u32,
+                method_site(raw)
+            ));
         }
         let Some(MethodCallFeedback::Poly(targets)) = &feedback else {
             panic!("bounded method distribution must be polymorphic");
         };
         assert_eq!(targets.len(), MAX_POLY_METHOD_TARGETS);
 
-        record_method_distribution(
+        assert!(!record_method_distribution(
             &mut feedback,
             MAX_POLY_METHOD_TARGETS as u32,
             method_site(MAX_POLY_METHOD_TARGETS as u64),
-        );
+        ));
         let Some(MethodCallFeedback::Poly(targets)) = &feedback else {
             panic!("repeated method target must remain polymorphic");
         };
         assert_eq!(targets.last().map(|target| target.hits), Some(2));
 
-        record_method_distribution(&mut feedback, 99, method_site(99));
+        assert!(record_method_distribution(
+            &mut feedback,
+            99,
+            method_site(99)
+        ));
         assert!(matches!(feedback, Some(MethodCallFeedback::Megamorphic)));
+        assert!(!record_method_distribution(
+            &mut feedback,
+            100,
+            method_site(100)
+        ));
+    }
+
+    #[test]
+    fn native_and_bytecode_method_targets_are_material_transitions() {
+        let native_site = method_site(1);
+        let mut feedback = None;
+        assert!(record_method_native_leaf_distribution(
+            &mut feedback,
+            7,
+            native_site
+        ));
+        assert!(!record_method_native_leaf_distribution(
+            &mut feedback,
+            7,
+            native_site
+        ));
+        assert!(record_method_distribution(
+            &mut feedback,
+            42,
+            method_site(2)
+        ));
+        assert!(matches!(feedback, Some(MethodCallFeedback::Megamorphic)));
+
+        let mut feedback = None;
+        assert!(record_method_distribution(
+            &mut feedback,
+            42,
+            method_site(1)
+        ));
+        assert!(record_method_native_leaf_distribution(
+            &mut feedback,
+            7,
+            method_site(2)
+        ));
+        assert!(matches!(feedback, Some(MethodCallFeedback::Megamorphic)));
+        assert!(!record_method_native_leaf_distribution(
+            &mut feedback,
+            7,
+            method_site(2)
+        ));
     }
 
     #[test]

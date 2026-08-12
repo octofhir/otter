@@ -619,10 +619,11 @@ impl ArithFeedback {
         self.0 & ARITH_STRING != 0 && self.0 & (ARITH_BIGINT | ARITH_OTHER) == 0
     }
 
-    /// `true` when this site has never executed. Optimized code may treat it
-    /// as unreachable-by-feedback and deoptimize unconditionally if it is ever
-    /// reached: the interpreter then records real feedback and the next
-    /// compile sees it.
+    /// `true` when this site has no interpreter observation. This does not
+    /// prove that the operation is cold: a compiled lower tier may already
+    /// execute it without updating this cell. Consumers must either keep the
+    /// generic operation or emit guarded speculation with an exact pre-effect
+    /// exit.
     #[must_use]
     pub const fn is_unseen(self) -> bool {
         self.0 == 0

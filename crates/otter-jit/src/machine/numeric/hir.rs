@@ -12,14 +12,21 @@
 //! # Invariants
 //! - Parameters remain tagged unless their uses prove a numeric representation;
 //!   inferred Number/Int32 parameters are guarded before effects.
+//! - Empty arithmetic feedback never proves that a site is cold. Such a site
+//!   keeps tagged inputs and performs an exact pre-operation numeric decode;
+//!   a non-number resumes the canonical bytecode before observable effects.
+//!   Later Int32 feedback may narrow a still-tagged input guard, but never an
+//!   established Number or Uint32 SSA value.
 //! - Tagged values produced inside the function may enter numeric-only regions
 //!   through an exact pre-operation guarded decode. A failed decode resumes the
 //!   original bytecode before any observable effect can be replayed.
 //! - Parameters outside the exact entry live-in set have no HIR value, load,
 //!   guard, or allocator interval.
 //! - Indexed loads and stores require a baked VM element program plus the GC
-//!   cage. Their frame state describes the exact pre-access register window;
-//!   every side exit precedes the load or the effect-only store.
+//!   cage. Scalar Number indices remain admissible and are boxed without
+//!   allocation for the existing tagged-index probe. Their frame state
+//!   describes the exact pre-access register window; every side exit precedes
+//!   the load or the effect-only store.
 //! - Ordinary property nodes exist independently of settled shape/slot
 //!   metadata. Selection either emits a guarded hit or exact-deoptimizes at the
 //!   original bytecode. Named `.length` loads retain their exotic fast-path
@@ -51,6 +58,9 @@
 //!   string concatenation uses the allocating stub family.
 //! - Register merges become typed block parameters. Only loop-header OSR
 //!   metadata retains the aligned VM-register sources needed at the entry ABI.
+//!   Heterogeneous numeric inputs join as Number, while any tagged or Boolean
+//!   mixture joins as Tagged. Constructor-transition functions conservatively
+//!   retain the legacy backend when such a heterogeneous join is required.
 //! - Loop headers receive explicit parameters for every numeric value live from
 //!   a forward predecessor; backedge arguments are attached after all blocks
 //!   are lowered.
@@ -457,6 +467,8 @@ pub(super) struct NumericFunction {
     pub(super) arithmetic_op_count: usize,
 }
 
+type PhiTypeOverrides = BTreeMap<(usize, u16), NumericType>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NumericFrameSlot {
     Value(NumericValue),
@@ -504,6 +516,24 @@ struct InstructionExceptionHandler {
 
 impl NumericFunction {
     pub(super) fn build(view: &JitCompileSnapshot) -> Option<Self> {
+        let mut phi_types = PhiTypeOverrides::new();
+        for _ in 0..MAX_FUNCTION_INSTRUCTIONS {
+            let (function, next_phi_types, retry) = Self::build_attempt(view, &phi_types)?;
+            if !retry {
+                return Some(function);
+            }
+            if next_phi_types == phi_types {
+                return None;
+            }
+            phi_types = next_phi_types;
+        }
+        None
+    }
+
+    fn build_attempt(
+        view: &JitCompileSnapshot,
+        phi_types: &PhiTypeOverrides,
+    ) -> Option<(Self, PhiTypeOverrides, bool)> {
         let code = view.code_block.as_ref();
         let parameter_count = code.param_count;
         let register_count = code.register_count;
@@ -564,6 +594,7 @@ impl NumericFunction {
         let mut frame_states = Vec::new();
         let mut direct_call_targets = Vec::new();
         let mut direct_call_arguments = Vec::new();
+        let mut requires_mixed_join = false;
 
         for (block_index, raw) in raw_blocks.iter().enumerate() {
             let (mut registers, mut parameters, mut parameter_regs) = if block_index == 0 {
@@ -587,6 +618,8 @@ impl NumericFunction {
                     &out_states,
                     &exceptional_out_states,
                     &mut nodes,
+                    phi_types,
+                    &mut requires_mixed_join,
                 )?
             } else {
                 merge_predecessors(
@@ -597,6 +630,8 @@ impl NumericFunction {
                     &out_states,
                     &exceptional_out_states,
                     &mut nodes,
+                    phi_types,
+                    &mut requires_mixed_join,
                 )?
             };
             if raw
@@ -610,6 +645,9 @@ impl NumericFunction {
                     &mut parameter_regs,
                     &mut nodes,
                     &live_in[block_index],
+                    block_index,
+                    phi_types,
+                    &mut requires_mixed_join,
                 )?;
             }
             let mut block_nodes = if block_index == 0 {
@@ -731,6 +769,8 @@ impl NumericFunction {
             });
         }
 
+        let mut next_phi_types = phi_types.clone();
+        let mut retry = false;
         for predecessor in 0..blocks.len() {
             for edge in 0..blocks[predecessor].successors.len() {
                 let successor = blocks[predecessor].successors[edge];
@@ -749,15 +789,34 @@ impl NumericFunction {
                         RegisterState::Unset => None,
                     })
                     .collect::<Option<Vec<_>>>()?;
-                if arguments.iter().zip(&blocks[successor].parameters).any(
-                    |(&argument, &parameter)| {
-                        value_type(&nodes, argument) != value_type(&nodes, parameter)
-                    },
-                ) {
-                    return None;
+                for ((&argument, &parameter), &register) in arguments
+                    .iter()
+                    .zip(&blocks[successor].parameters)
+                    .zip(&successor_registers)
+                {
+                    let argument_type = value_type(&nodes, argument)?;
+                    let parameter_type = value_type(&nodes, parameter)?;
+                    if argument_type == parameter_type {
+                        continue;
+                    }
+                    requires_mixed_join = true;
+                    let joined = join_representation_types(parameter_type, argument_type)?;
+                    if joined != parameter_type {
+                        let key = (successor, register);
+                        let requested = next_phi_types.get(&key).copied().unwrap_or(parameter_type);
+                        let requested = join_representation_types(requested, joined)?;
+                        if requested != parameter_type {
+                            next_phi_types.insert(key, requested);
+                            retry = true;
+                        }
+                    }
                 }
                 blocks[predecessor].successor_arguments[edge] = arguments;
             }
+        }
+
+        if requires_mixed_join && !view.constructor_field_transitions.is_empty() {
+            return None;
         }
 
         for (predecessor, block) in blocks.iter().enumerate() {
@@ -784,17 +843,21 @@ impl NumericFunction {
             }
         }
 
-        Some(Self {
-            function_id: code.id,
-            nodes,
-            blocks,
-            frame_states,
-            direct_call_targets,
-            direct_call_arguments,
-            parameter_count,
-            register_count,
-            arithmetic_op_count,
-        })
+        Some((
+            Self {
+                function_id: code.id,
+                nodes,
+                blocks,
+                frame_states,
+                direct_call_targets,
+                direct_call_arguments,
+                parameter_count,
+                register_count,
+                arithmetic_op_count,
+            },
+            next_phi_types,
+            retry,
+        ))
     }
 }
 
@@ -958,7 +1021,9 @@ fn infer_instruction_parameters(
         }
         Op::Neg | Op::Increment | Op::AddImm | Op::SubImm => {
             let source = read(register(instruction, code, 1)?)?;
-            *number_parameters |= source;
+            if !instruction.arith_feedback().is_empty() {
+                *number_parameters |= source;
+            }
             if instruction.arith_feedback().is_int32_only() {
                 *int32_parameters |= source;
                 *origins.get_mut(usize::from(register(instruction, code, 0)?))? = source;
@@ -976,7 +1041,9 @@ fn infer_instruction_parameters(
         Op::Add | Op::Sub | Op::Mul => {
             let left = read(register(instruction, code, 1)?)?;
             let right = read(register(instruction, code, 2)?)?;
-            *number_parameters |= left | right;
+            if !instruction.arith_feedback().is_empty() {
+                *number_parameters |= left | right;
+            }
             let destination = usize::from(register(instruction, code, 0)?);
             if instruction.arith_feedback().is_int32_only() {
                 *int32_parameters |= left | right;
@@ -999,7 +1066,9 @@ fn infer_instruction_parameters(
         Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
             let inputs =
                 read(register(instruction, code, 1)?)? | read(register(instruction, code, 2)?)?;
-            *number_parameters |= inputs;
+            if !instruction.arith_feedback().is_empty() {
+                *number_parameters |= inputs;
+            }
             if instruction.arith_feedback().is_int32_only() {
                 *int32_parameters |= inputs;
             }
@@ -1007,7 +1076,9 @@ fn infer_instruction_parameters(
         }
         Op::LessThanImm | Op::EqualImm | Op::NotEqualImm => {
             let source = read(register(instruction, code, 1)?)?;
-            *number_parameters |= source;
+            if !instruction.arith_feedback().is_empty() {
+                *number_parameters |= source;
+            }
             if instruction.arith_feedback().is_int32_only() {
                 *int32_parameters |= source;
             }
@@ -1022,15 +1093,21 @@ fn infer_instruction_parameters(
         | Op::Shl
         | Op::Shr
         | Op::Ushr => {
-            *number_parameters |=
+            let inputs =
                 read(register(instruction, code, 1)?)? | read(register(instruction, code, 2)?)?;
+            if !instruction.arith_feedback().is_empty() {
+                *number_parameters |= inputs;
+            }
             *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
         Op::ToBoolean | Op::LogicalNot => {
             *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
         Op::BitwiseNot | Op::BitwiseAndImm => {
-            *number_parameters |= read(register(instruction, code, 1)?)?;
+            let source = read(register(instruction, code, 1)?)?;
+            if !instruction.arith_feedback().is_empty() {
+                *number_parameters |= source;
+            }
             *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
         Op::JumpIfTrue
@@ -1518,6 +1595,8 @@ fn merge_predecessors(
     out_states: &[Vec<RegisterState>],
     exceptional_out_states: &[Option<Vec<RegisterState>>],
     nodes: &mut Vec<NumericNode>,
+    phi_types: &PhiTypeOverrides,
+    requires_mixed_join: &mut bool,
 ) -> Option<(Vec<RegisterState>, Vec<NumericValue>, Vec<u16>)> {
     let state = |predecessor: usize| {
         let edge = blocks
@@ -1549,18 +1628,34 @@ fn merge_predecessors(
         if states.iter().all(|&state| state == states[0]) {
             continue;
         }
-        let mut value_type = None;
+        let mut merged_type = None;
         for state in states {
             let RegisterState::Value(value) = state else {
                 return None;
             };
             let current = nodes.get(value.0)?.value_type();
-            if value_type.is_some_and(|expected| expected != current) {
+            merged_type = Some(match merged_type {
+                Some(previous) if previous != current => {
+                    *requires_mixed_join = true;
+                    join_representation_types(previous, current)?
+                }
+                Some(previous) => previous,
+                None => current,
+            });
+        }
+        let mut merged_type = merged_type?;
+        if let Some(requested) = phi_types
+            .get(&(successor, u16::try_from(register).ok()?))
+            .copied()
+        {
+            let widened = join_representation_types(merged_type, requested)?;
+            if widened != requested {
                 return None;
             }
-            value_type = Some(current);
+            *requires_mixed_join |= requested != merged_type;
+            merged_type = requested;
         }
-        let parameter = push(nodes, NumericNode::BlockParameter(value_type?));
+        let parameter = push(nodes, NumericNode::BlockParameter(merged_type));
         *merged_state = RegisterState::Value(parameter);
         parameters.push(parameter);
         parameter_registers.push(u16::try_from(register).ok()?);
@@ -1588,6 +1683,9 @@ fn force_loop_parameters(
     parameter_registers: &mut Vec<u16>,
     nodes: &mut Vec<NumericNode>,
     live_in: &[bool],
+    block_index: usize,
+    phi_types: &PhiTypeOverrides,
+    requires_mixed_join: &mut bool,
 ) -> Option<()> {
     for (register, state) in registers.iter_mut().enumerate() {
         if !live_in.get(register).copied().unwrap_or(false) {
@@ -1600,13 +1698,45 @@ fn force_loop_parameters(
         if parameter_registers.contains(&u16::try_from(register).ok()?) {
             continue;
         }
-        let value_type = nodes.get(value.0)?.value_type();
+        let mut value_type = nodes.get(value.0)?.value_type();
+        if let Some(requested) = phi_types
+            .get(&(block_index, u16::try_from(register).ok()?))
+            .copied()
+        {
+            let widened = join_representation_types(value_type, requested)?;
+            if widened != requested {
+                return None;
+            }
+            *requires_mixed_join |= requested != value_type;
+            value_type = requested;
+        }
         let parameter = push(nodes, NumericNode::BlockParameter(value_type));
         *state = RegisterState::Value(parameter);
         parameters.push(parameter);
         parameter_registers.push(u16::try_from(register).ok()?);
     }
     Some(())
+}
+
+fn join_representation_types(left: NumericType, right: NumericType) -> Option<NumericType> {
+    if left == right {
+        return Some(left);
+    }
+    if matches!(left, NumericType::Tagged | NumericType::Boolean)
+        || matches!(right, NumericType::Tagged | NumericType::Boolean)
+    {
+        return Some(NumericType::Tagged);
+    }
+    if matches!(
+        left,
+        NumericType::Int32 | NumericType::Uint32 | NumericType::Number
+    ) && matches!(
+        right,
+        NumericType::Int32 | NumericType::Uint32 | NumericType::Number
+    ) {
+        return Some(NumericType::Number);
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1870,7 +2000,10 @@ fn lower_instruction(
             let index = read_value(registers, register(instruction, code, 2)?)?;
             if !matches!(
                 value_type(nodes, index)?,
-                NumericType::Tagged | NumericType::Int32 | NumericType::Uint32
+                NumericType::Tagged
+                    | NumericType::Int32
+                    | NumericType::Uint32
+                    | NumericType::Number
             ) {
                 return None;
             }
@@ -1909,7 +2042,10 @@ fn lower_instruction(
             let index = read_value(registers, register(instruction, code, 1)?)?;
             if !matches!(
                 value_type(nodes, index)?,
-                NumericType::Tagged | NumericType::Int32 | NumericType::Uint32
+                NumericType::Tagged
+                    | NumericType::Int32
+                    | NumericType::Uint32
+                    | NumericType::Number
             ) {
                 return None;
             }
@@ -2289,16 +2425,16 @@ fn lower_instruction(
             return Some(());
         }
         Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Pow => {
-            if !instruction.arith_feedback().is_numeric_only() {
+            let feedback = instruction.arith_feedback();
+            if !feedback.is_numeric_only() && !feedback.is_empty() {
                 return None;
             }
-            let tagged_decode = if matches!(op, Op::Add | Op::Sub | Op::Mul)
-                && instruction.arith_feedback().is_int32_only()
-            {
-                TaggedNumericDecode::Int32
-            } else {
-                TaggedNumericDecode::Number
-            };
+            let tagged_decode =
+                if matches!(op, Op::Add | Op::Sub | Op::Mul) && feedback.is_int32_only() {
+                    TaggedNumericDecode::Int32
+                } else {
+                    TaggedNumericDecode::Number
+                };
             let left = read_number(
                 decode_site,
                 nodes,
@@ -2317,7 +2453,7 @@ fn lower_instruction(
             )?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
             if matches!(op, Op::Add | Op::Sub | Op::Mul)
-                && instruction.arith_feedback().is_int32_only()
+                && feedback.is_int32_only()
                 && value_type(nodes, left)? == NumericType::Int32
                 && value_type(nodes, right)? == NumericType::Int32
             {
@@ -2342,22 +2478,42 @@ fn lower_instruction(
             }
         }
         Op::Increment | Op::AddImm | Op::SubImm => {
-            if !instruction.arith_feedback().is_int32_only() {
+            let feedback = instruction.arith_feedback();
+            if !feedback.is_numeric_only() && !feedback.is_empty() {
                 return None;
             }
-            let source = read_int32(
+            let immediate = instruction.imm32(code, 2)?;
+            *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
+            let tagged_decode = if feedback.is_int32_only() {
+                TaggedNumericDecode::Int32
+            } else {
+                TaggedNumericDecode::Number
+            };
+            let source = read_number(
                 decode_site,
                 nodes,
                 block_nodes,
                 frame_states,
                 register(instruction, code, 1)?,
+                tagged_decode,
             )?;
-            let immediate = instruction.imm32(code, 2)?;
-            *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
-            match op {
-                Op::Increment | Op::AddImm => NumericNode::IntegerAddImmediate(source, immediate),
-                Op::SubImm => NumericNode::IntegerSubImmediate(source, immediate),
-                _ => unreachable!("matched immediate int32 operation"),
+            if feedback.is_int32_only() && value_type(nodes, source)? == NumericType::Int32 {
+                match op {
+                    Op::Increment | Op::AddImm => {
+                        NumericNode::IntegerAddImmediate(source, immediate)
+                    }
+                    Op::SubImm => NumericNode::IntegerSubImmediate(source, immediate),
+                    _ => unreachable!("matched immediate int32 operation"),
+                }
+            } else {
+                let source = widen_to_number(source, nodes, block_nodes)?;
+                let immediate = push(nodes, NumericNode::Constant(f64::from(immediate)));
+                block_nodes.push(immediate);
+                match op {
+                    Op::Increment | Op::AddImm => NumericNode::Add(source, immediate),
+                    Op::SubImm => NumericNode::Sub(source, immediate),
+                    _ => unreachable!("matched guarded immediate operation"),
+                }
             }
         }
         Op::BitwiseAndImm => {
@@ -2373,22 +2529,41 @@ fn lower_instruction(
             NumericNode::IntegerAndImmediate(source, immediate)
         }
         Op::LessThanImm | Op::EqualImm | Op::NotEqualImm => {
-            if !instruction.arith_feedback().is_int32_only() {
+            let feedback = instruction.arith_feedback();
+            if !feedback.is_numeric_only() && !feedback.is_empty() {
                 return None;
             }
-            let source = read_int32(
+            let immediate = instruction.imm32(code, 2)?;
+            let tagged_decode = if feedback.is_int32_only() {
+                TaggedNumericDecode::Int32
+            } else {
+                TaggedNumericDecode::Number
+            };
+            let source = read_number(
                 decode_site,
                 nodes,
                 block_nodes,
                 frame_states,
                 register(instruction, code, 1)?,
+                tagged_decode,
             )?;
-            let immediate = instruction.imm32(code, 2)?;
-            match op {
-                Op::LessThanImm => NumericNode::IntegerLessThanImmediate(source, immediate),
-                Op::EqualImm => NumericNode::IntegerEqualImmediate(source, immediate),
-                Op::NotEqualImm => NumericNode::IntegerNotEqualImmediate(source, immediate),
-                _ => unreachable!("matched immediate int32 comparison"),
+            if feedback.is_int32_only() && value_type(nodes, source)? == NumericType::Int32 {
+                match op {
+                    Op::LessThanImm => NumericNode::IntegerLessThanImmediate(source, immediate),
+                    Op::EqualImm => NumericNode::IntegerEqualImmediate(source, immediate),
+                    Op::NotEqualImm => NumericNode::IntegerNotEqualImmediate(source, immediate),
+                    _ => unreachable!("matched immediate int32 comparison"),
+                }
+            } else {
+                let source = widen_to_number(source, nodes, block_nodes)?;
+                let immediate = push(nodes, NumericNode::Constant(f64::from(immediate)));
+                block_nodes.push(immediate);
+                match op {
+                    Op::LessThanImm => NumericNode::LessThan(source, immediate),
+                    Op::EqualImm => NumericNode::Equal(source, immediate),
+                    Op::NotEqualImm => NumericNode::NotEqual(source, immediate),
+                    _ => unreachable!("matched guarded immediate comparison"),
+                }
             }
         }
         Op::BitwiseAnd | Op::BitwiseOr | Op::BitwiseXor | Op::Shl | Op::Shr | Op::Ushr => {
@@ -2429,10 +2604,11 @@ fn lower_instruction(
             NumericNode::IntegerNot(source)
         }
         Op::Neg => {
-            if !instruction.arith_feedback().is_numeric_only() {
+            let feedback = instruction.arith_feedback();
+            if !feedback.is_numeric_only() && !feedback.is_empty() {
                 return None;
             }
-            let tagged_decode = if instruction.arith_feedback().is_int32_only() {
+            let tagged_decode = if feedback.is_int32_only() {
                 TaggedNumericDecode::Int32
             } else {
                 TaggedNumericDecode::Number
@@ -2446,16 +2622,21 @@ fn lower_instruction(
                 tagged_decode,
             )?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
-            if instruction.arith_feedback().is_int32_only()
-                && value_type(nodes, source)? == NumericType::Int32
-            {
+            if feedback.is_int32_only() && value_type(nodes, source)? == NumericType::Int32 {
                 NumericNode::IntegerNeg(source)
             } else {
                 NumericNode::Neg(widen_to_number(source, nodes, block_nodes)?)
             }
         }
         Op::Equal | Op::NotEqual | Op::LooseEqual | Op::LooseNotEqual => {
-            if !instruction.arith_feedback().is_numeric_only() {
+            let feedback = instruction.arith_feedback();
+            let speculate_unseen_loose_numeric =
+                feedback.is_empty() && matches!(op, Op::LooseEqual | Op::LooseNotEqual) && {
+                    let left = read_value(registers, register(instruction, code, 1)?)?;
+                    let right = read_value(registers, register(instruction, code, 2)?)?;
+                    !value_is_static_nullish(nodes, left) && !value_is_static_nullish(nodes, right)
+                };
+            if !feedback.is_numeric_only() && !speculate_unseen_loose_numeric {
                 let left = read_value(registers, register(instruction, code, 1)?)?;
                 let right = read_value(registers, register(instruction, code, 2)?)?;
                 let value = if matches!(op, Op::Equal | Op::NotEqual) {
@@ -2524,7 +2705,7 @@ fn lower_instruction(
                 )?;
                 return Some(());
             }
-            let tagged_decode = if instruction.arith_feedback().is_int32_only() {
+            let tagged_decode = if feedback.is_int32_only() {
                 TaggedNumericDecode::Int32
             } else {
                 TaggedNumericDecode::Number
@@ -2545,7 +2726,7 @@ fn lower_instruction(
                 register(instruction, code, 2)?,
                 tagged_decode,
             )?;
-            if instruction.arith_feedback().is_int32_only()
+            if feedback.is_int32_only()
                 && value_type(nodes, left)? == NumericType::Int32
                 && value_type(nodes, right)? == NumericType::Int32
             {
@@ -2565,10 +2746,11 @@ fn lower_instruction(
             }
         }
         Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
-            if !instruction.arith_feedback().is_numeric_only() {
+            let feedback = instruction.arith_feedback();
+            if !feedback.is_numeric_only() && !feedback.is_empty() {
                 return None;
             }
-            let tagged_decode = if instruction.arith_feedback().is_int32_only() {
+            let tagged_decode = if feedback.is_int32_only() {
                 TaggedNumericDecode::Int32
             } else {
                 TaggedNumericDecode::Number
@@ -2589,7 +2771,7 @@ fn lower_instruction(
                 register(instruction, code, 2)?,
                 tagged_decode,
             )?;
-            if instruction.arith_feedback().is_int32_only()
+            if feedback.is_int32_only()
                 && value_type(nodes, left)? == NumericType::Int32
                 && value_type(nodes, right)? == NumericType::Int32
             {
@@ -2873,8 +3055,8 @@ mod tests {
     use otter_vm::{
         JitCompileSnapshot, JitDirectCallThisMode, JitDirectCallee, JitElementAccess,
         jit::{
-            JitDirectCallPlan, JitDirectMethod, JitGlobalLexicalLoad, JitGlobalObjectLoad,
-            JitMethodGuard, JitTestInstruction,
+            JitConstructorFieldTransition, JitDirectCallPlan, JitDirectMethod,
+            JitGlobalLexicalLoad, JitGlobalObjectLoad, JitMethodGuard, JitTestInstruction,
         },
         jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ArithFeedback},
         native_abi::NativeFrameKind,
@@ -3001,6 +3183,59 @@ mod tests {
         )
     }
 
+    fn number_index_element_view() -> JitCompileSnapshot {
+        let mut view = JitCompileSnapshot::without_feedback(
+            113,
+            3,
+            5,
+            vec![
+                JitTestInstruction::new(
+                    Op::Mul,
+                    0,
+                    0,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                JitTestInstruction::new(
+                    Op::LoadElement,
+                    1,
+                    8,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(0),
+                        Operand::Register(3),
+                    ],
+                ),
+                JitTestInstruction::new(
+                    Op::StoreElement,
+                    2,
+                    16,
+                    vec![
+                        Operand::Register(0),
+                        Operand::Register(3),
+                        Operand::Register(4),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 3, 24, vec![Operand::Register(4)]),
+            ],
+        );
+        view.cage_base = 0x1000;
+        for byte_pc in [8, 16] {
+            view.element_accesses.insert(
+                byte_pc,
+                JitElementAccess {
+                    type_tag: 1,
+                    base: JitElementBase::InBody { byte: 8 },
+                    ..JitElementAccess::default()
+                },
+            );
+        }
+        view
+    }
+
     fn global_load_view() -> JitCompileSnapshot {
         JitCompileSnapshot::without_feedback(
             113,
@@ -3059,6 +3294,97 @@ mod tests {
         );
         view.seed_arith_feedback_for_test(0, feedback);
         view
+    }
+
+    fn unseen_immediate_numeric_view(op: Op) -> JitCompileSnapshot {
+        debug_assert!(matches!(
+            op,
+            Op::LessThanImm | Op::EqualImm | Op::NotEqualImm
+        ));
+        JitCompileSnapshot::without_feedback(
+            119,
+            1,
+            2,
+            vec![
+                JitTestInstruction::new(
+                    op,
+                    0,
+                    24,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(0),
+                        Operand::Imm32(7),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 1, 32, vec![Operand::Register(1)]),
+            ],
+        )
+    }
+
+    fn unseen_div_view() -> JitCompileSnapshot {
+        JitCompileSnapshot::without_feedback(
+            120,
+            2,
+            3,
+            vec![
+                JitTestInstruction::new(
+                    Op::Div,
+                    0,
+                    40,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 1, 48, vec![Operand::Register(2)]),
+            ],
+        )
+    }
+
+    fn mixed_numeric_loop_view() -> JitCompileSnapshot {
+        let instructions = vec![
+            (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(1)]),
+            (
+                Op::LessThanImm,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::Imm32(3),
+                ],
+            ),
+            (
+                Op::JumpIfFalse,
+                vec![Operand::Imm32(4), Operand::Register(1)],
+            ),
+            (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(2)]),
+            (
+                Op::Div,
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(0),
+                    Operand::Register(2),
+                ],
+            ),
+            (
+                Op::StoreLocal,
+                vec![Operand::Register(3), Operand::Imm32(0)],
+            ),
+            (Op::Jump, vec![Operand::Imm32(-6)]),
+            (Op::ReturnValue, vec![Operand::Register(0)]),
+        ];
+        JitCompileSnapshot::without_feedback(
+            121,
+            0,
+            4,
+            instructions
+                .into_iter()
+                .enumerate()
+                .map(|(pc, (op, operands))| {
+                    JitTestInstruction::new(op, pc as u32, pc as u32 * 8, operands)
+                })
+                .collect(),
+        )
     }
 
     fn catch_liveness_view() -> JitCompileSnapshot {
@@ -3756,7 +4082,7 @@ mod tests {
     }
 
     #[test]
-    fn loose_equality_declines_coercive_and_malformed_shapes() {
+    fn unseen_loose_equality_guards_numeric_inputs_and_declines_malformed_shapes() {
         let generic = JitCompileSnapshot::without_feedback(
             116,
             2,
@@ -3775,10 +4101,30 @@ mod tests {
                 JitTestInstruction::new(Op::ReturnValue, 1, 8, vec![Operand::Register(2)]),
             ],
         );
+        let hir = NumericFunction::build(&generic).expect("guarded unseen loose-equality HIR");
+        let decodes = hir
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                matches!(node, NumericNode::TaggedToNumber(_)).then_some(NumericValue(index))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decodes.len(), 2);
         assert!(
-            NumericFunction::build(&generic).is_none(),
-            "generic tagged equality requires coercion and must stay legacy"
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::Equal(_, _)))
         );
+        for decode in decodes {
+            let state = hir
+                .frame_states
+                .iter()
+                .find(|state| state.point == NumericFramePoint::Node(decode))
+                .expect("exact pre-coercion state");
+            assert_eq!(state.byte_pc, 0);
+            assert_eq!(state.slots[2], NumericFrameSlot::Undefined);
+        }
 
         for operands in [
             vec![
@@ -3853,6 +4199,301 @@ mod tests {
         assert!(!live[2], "destination is killed before the operation");
         assert!(!live[3], "the catch supplies its exception register");
         assert!(live[4], "catch-only state survives the exact deopt exit");
+    }
+
+    #[test]
+    fn unseen_immediate_comparisons_decode_tagged_numbers_at_the_exact_site() {
+        for op in [Op::LessThanImm, Op::EqualImm, Op::NotEqualImm] {
+            let hir = NumericFunction::build(&unseen_immediate_numeric_view(op))
+                .expect("guarded unseen immediate comparison HIR");
+            let parameter = hir
+                .nodes
+                .iter()
+                .position(|node| {
+                    matches!(
+                        node,
+                        NumericNode::Parameter {
+                            register: 0,
+                            value_type: NumericType::Tagged
+                        }
+                    )
+                })
+                .map(NumericValue)
+                .expect("unseen input remains tagged");
+            let decode = hir
+                .nodes
+                .iter()
+                .position(|node| *node == NumericNode::TaggedToNumber(parameter))
+                .map(NumericValue)
+                .expect("exact tagged-number decode");
+            let immediate = hir
+                .nodes
+                .iter()
+                .position(|node| *node == NumericNode::Constant(7.0))
+                .map(NumericValue)
+                .expect("Float64 immediate");
+            assert!(hir.nodes.iter().any(|node| match (op, node) {
+                (Op::LessThanImm, NumericNode::LessThan(left, right))
+                | (Op::EqualImm, NumericNode::Equal(left, right))
+                | (Op::NotEqualImm, NumericNode::NotEqual(left, right)) => {
+                    (*left, *right) == (decode, immediate)
+                }
+                _ => false,
+            }));
+
+            let state = hir
+                .frame_states
+                .iter()
+                .find(|state| state.point == NumericFramePoint::Node(decode))
+                .expect("exact pre-comparison decode state");
+            assert_eq!(state.byte_pc, 24);
+            assert_eq!(state.slots[0], NumericFrameSlot::Value(parameter));
+            assert_eq!(state.slots[1], NumericFrameSlot::Undefined);
+        }
+    }
+
+    #[test]
+    fn unseen_division_guards_both_tagged_operands_without_entry_specialization() {
+        let hir = NumericFunction::build(&unseen_div_view()).expect("guarded unseen division HIR");
+        let parameters = (0..2_u16)
+            .map(|register| {
+                hir.nodes
+                    .iter()
+                    .position(|node| {
+                        matches!(
+                            node,
+                            NumericNode::Parameter {
+                                register: node_register,
+                                value_type: NumericType::Tagged
+                            } if *node_register == register
+                        )
+                    })
+                    .map(NumericValue)
+                    .expect("unseen division parameter remains tagged")
+            })
+            .collect::<Vec<_>>();
+        let decodes = parameters
+            .iter()
+            .map(|&parameter| {
+                hir.nodes
+                    .iter()
+                    .position(|node| *node == NumericNode::TaggedToNumber(parameter))
+                    .map(NumericValue)
+                    .expect("per-operand exact numeric decode")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| *node == NumericNode::Div(decodes[0], decodes[1]))
+        );
+        for &decode in &decodes {
+            let state = hir
+                .frame_states
+                .iter()
+                .find(|state| state.point == NumericFramePoint::Node(decode))
+                .expect("exact pre-division decode state");
+            assert_eq!(state.byte_pc, 40);
+            assert_eq!(state.slots[0], NumericFrameSlot::Value(parameters[0]));
+            assert_eq!(state.slots[1], NumericFrameSlot::Value(parameters[1]));
+            assert_eq!(state.slots[2], NumericFrameSlot::Undefined);
+        }
+    }
+
+    #[test]
+    fn unseen_number_product_remains_an_admissible_element_index() {
+        let hir =
+            NumericFunction::build(&number_index_element_view()).expect("Number-index element HIR");
+        let product = hir
+            .nodes
+            .iter()
+            .position(|node| matches!(node, NumericNode::Mul(..)))
+            .map(NumericValue)
+            .expect("guarded Float64 product");
+        assert_eq!(hir.nodes[product.0].value_type(), NumericType::Number);
+
+        let load = hir
+            .nodes
+            .iter()
+            .position(|node| {
+                matches!(
+                    node,
+                    NumericNode::ElementLoad {
+                        index,
+                        byte_pc: 8,
+                        ..
+                    } if *index == product
+                )
+            })
+            .map(NumericValue)
+            .expect("Number-index element load");
+        let store = hir
+            .nodes
+            .iter()
+            .position(|node| {
+                matches!(
+                    node,
+                    NumericNode::ElementStore {
+                        index,
+                        byte_pc: 16,
+                        ..
+                    } if *index == product
+                )
+            })
+            .map(NumericValue)
+            .expect("Number-index element store");
+        for (point, byte_pc) in [(load, 8), (store, 16)] {
+            let state = hir
+                .frame_states
+                .iter()
+                .find(|state| state.point == NumericFramePoint::Node(point))
+                .expect("exact pre-element Number-index state");
+            assert_eq!(state.byte_pc, byte_pc);
+            assert_eq!(state.slots[3], NumericFrameSlot::Value(product));
+        }
+    }
+
+    #[test]
+    fn int32_feedback_does_not_narrow_an_existing_number_ssa_value() {
+        for op in [
+            Op::Increment,
+            Op::AddImm,
+            Op::SubImm,
+            Op::LessThanImm,
+            Op::EqualImm,
+            Op::NotEqualImm,
+        ] {
+            let mut view = JitCompileSnapshot::without_feedback(
+                119,
+                0,
+                5,
+                vec![
+                    JitTestInstruction::new(
+                        Op::LoadUpvalue,
+                        0,
+                        0,
+                        vec![Operand::Register(0), Operand::Imm32(0)],
+                    ),
+                    JitTestInstruction::new(
+                        Op::ToPrimitive,
+                        1,
+                        8,
+                        vec![
+                            Operand::Register(1),
+                            Operand::Register(0),
+                            Operand::ConstIndex(13),
+                        ],
+                    ),
+                    JitTestInstruction::new(
+                        Op::ToNumeric,
+                        2,
+                        16,
+                        vec![Operand::Register(2), Operand::Register(1)],
+                    ),
+                    JitTestInstruction::new(
+                        op,
+                        3,
+                        24,
+                        vec![
+                            Operand::Register(3),
+                            Operand::Register(2),
+                            Operand::Imm32(1),
+                        ],
+                    ),
+                    JitTestInstruction::new(Op::ReturnValue, 4, 32, vec![Operand::Register(3)]),
+                ],
+            );
+            view.cage_base = 0x1000;
+            view.seed_arith_feedback_for_test(3, ArithFeedback::from_bits(ARITH_INT32));
+
+            let hir = NumericFunction::build(&view).expect("refined Number HIR");
+            let number = hir
+                .nodes
+                .iter()
+                .position(|node| matches!(node, NumericNode::TaggedToNumber(..)))
+                .map(NumericValue)
+                .expect("ToNumeric Number value");
+            assert_eq!(hir.nodes[number.0].value_type(), NumericType::Number);
+            assert!(hir.nodes.iter().any(|node| match (op, node) {
+                (Op::Increment | Op::AddImm, NumericNode::Add(left, _))
+                | (Op::SubImm, NumericNode::Sub(left, _))
+                | (Op::LessThanImm, NumericNode::LessThan(left, _))
+                | (Op::EqualImm, NumericNode::Equal(left, _))
+                | (Op::NotEqualImm, NumericNode::NotEqual(left, _)) => *left == number,
+                _ => false,
+            }));
+            assert!(hir.nodes.iter().all(|node| !matches!(
+                node,
+                NumericNode::IntegerAddImmediate(..)
+                    | NumericNode::IntegerSubImmediate(..)
+                    | NumericNode::IntegerLessThanImmediate(..)
+                    | NumericNode::IntegerEqualImmediate(..)
+                    | NumericNode::IntegerNotEqualImmediate(..)
+            )));
+        }
+    }
+
+    #[test]
+    fn mixed_numeric_loop_phi_retries_as_number_but_constructor_transitions_reject_it() {
+        let mut view = mixed_numeric_loop_view();
+        view.seed_arith_feedback_for_test(1, ArithFeedback::from_bits(ARITH_INT32));
+        let hir = NumericFunction::build(&view).expect("mixed numeric loop HIR");
+        let header = hir
+            .blocks
+            .iter()
+            .find(|block| block.logical_pc == 1)
+            .expect("loop header");
+        let index = header
+            .parameter_registers
+            .iter()
+            .position(|&register| register == 0)
+            .expect("loop-carried local");
+        let parameter = header.parameters[index];
+        assert_eq!(
+            hir.nodes[parameter.0],
+            NumericNode::BlockParameter(NumericType::Number)
+        );
+        let incoming_types = header
+            .predecessors
+            .iter()
+            .map(|&predecessor| {
+                let edge = hir.blocks[predecessor]
+                    .successors
+                    .iter()
+                    .position(|&successor| successor == 1)
+                    .expect("incoming header edge");
+                value_type(
+                    &hir.nodes,
+                    hir.blocks[predecessor].successor_arguments[edge][index],
+                )
+                .expect("incoming value type")
+            })
+            .collect::<Vec<_>>();
+        assert!(incoming_types.contains(&NumericType::Int32));
+        assert!(incoming_types.contains(&NumericType::Number));
+        assert!(hir.nodes.iter().any(|node| {
+            matches!(node, NumericNode::LessThan(left, right)
+                if *left == parameter
+                    && matches!(hir.nodes[right.0], NumericNode::Constant(3.0)))
+        }));
+        assert!(hir.nodes.iter().all(|node| {
+            !matches!(node, NumericNode::IntegerLessThanImmediate(source, 3) if *source == parameter)
+        }));
+
+        let mut constructor = view;
+        constructor.constructor_field_transitions.insert(
+            999,
+            JitConstructorFieldTransition {
+                from_shape: 1,
+                to_shape: 2,
+                prototype_shapes: vec![3],
+                slot: 0,
+            },
+        );
+        assert!(
+            NumericFunction::build(&constructor).is_none(),
+            "mixed representations must keep constructor transitions on the legacy backend"
+        );
     }
 
     #[test]

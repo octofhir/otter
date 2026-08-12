@@ -14,9 +14,17 @@
 //! - Machine locations, edits, and frame size come only from regalloc2 output.
 //! - Reducible loop headers publish one representation-checked OSR trampoline
 //!   that fills only live block parameters and never mutates the VM window.
+//! - Empty arithmetic feedback keeps tagged inputs and selects guarded Number
+//!   operations; it never becomes an unconditional exit. Heterogeneous phi
+//!   edges perform only lossless numeric widening or scalar boxing in explicit
+//!   split blocks, after the exact backedge poll when applicable.
+//! - Every representation-changing CFG edge is split. Lossless widening or
+//!   boxing executes after any exact backedge poll and before the successor's
+//!   phi moves; deopt state retains the original HIR values.
 //! - Settled element accesses consume late allocator locations, perform no
 //!   allocation or reentry on the generated path, and deopt before effects on
-//!   any receiver, index, bounds, layout, or representation miss.
+//!   any receiver, index, bounds, layout, or representation miss. Float64
+//!   indices use the non-allocating Number box before the tagged-index guard.
 //! - Settled own-data property accesses likewise consume tagged late locations;
 //!   metadata and shape misses deopt at the original operation before effects.
 //!   Stores whose pre-boxing scalar type proves a non-cell value omit both the
@@ -322,6 +330,21 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                 poll.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
                 instructions.push(poll);
             }
+            let successor_arguments = hir.blocks[predecessor].successor_arguments[edge]
+                .iter()
+                .zip(&hir.blocks[successor].parameters)
+                .map(|(&argument, &parameter)| {
+                    select_edge_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        argument,
+                        parameter,
+                        selection_cfg.originals[successor],
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let mut jump = MachineInstruction::plain(MachineOpcode::Jump, Vec::new());
             jump.control = ControlFlow::Branch;
             instructions.push(jump);
@@ -332,12 +355,7 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                 predecessors: vec![selection_cfg.originals[predecessor]],
                 successors: vec![selection_cfg.originals[successor]],
                 parameters: Vec::new(),
-                successor_arguments: vec![
-                    hir.blocks[predecessor].successor_arguments[edge]
-                        .iter()
-                        .map(|&value| machine_value(&values, value))
-                        .collect(),
-                ],
+                successor_arguments: vec![successor_arguments],
             });
             continue;
         };
@@ -598,11 +616,22 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                     index,
                     byte_pc,
                 } => {
+                    let index = if hir.nodes[index.0].value_type() == NumericType::Number {
+                        tagged_call_argument(
+                            hir,
+                            &values,
+                            &mut representations,
+                            &mut instructions,
+                            index,
+                        )
+                    } else {
+                        machine_value(&values, index)
+                    };
                     let mut load = MachineInstruction::plain(
                         MachineOpcode::ElementLoad(byte_pc),
                         vec![
                             MachineOperand::location_input(machine_value(&values, receiver)),
-                            MachineOperand::location_input(machine_value(&values, index)),
+                            MachineOperand::location_input(index),
                             MachineOperand::register_output(result),
                         ],
                     );
@@ -622,11 +651,22 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         &mut instructions,
                         value,
                     );
+                    let index = if hir.nodes[index.0].value_type() == NumericType::Number {
+                        tagged_call_argument(
+                            hir,
+                            &values,
+                            &mut representations,
+                            &mut instructions,
+                            index,
+                        )
+                    } else {
+                        machine_value(&values, index)
+                    };
                     let mut store = MachineInstruction::plain(
                         MachineOpcode::ElementStore(byte_pc),
                         vec![
                             MachineOperand::location_input(machine_value(&values, receiver)),
-                            MachineOperand::location_input(machine_value(&values, index)),
+                            MachineOperand::location_input(index),
                             MachineOperand::location_input(value),
                         ],
                     );
@@ -1727,7 +1767,10 @@ impl SelectionCfg {
         let mut split_edges = BTreeMap::new();
         for (successor, original) in originals.iter_mut().enumerate() {
             for (predecessor, edge) in incoming_edges(hir, successor) {
-                if is_critical_edge(hir, predecessor, successor) || successor <= predecessor {
+                if is_critical_edge(hir, predecessor, successor)
+                    || successor <= predecessor
+                    || edge_requires_representation_conversion(hir, predecessor, edge, successor)
+                {
                     let block = MachineBlock(order.len() as u32);
                     split_edges.insert((predecessor, edge), block);
                     order.push(SelectedBlock::SplitEdge {
@@ -1766,6 +1809,74 @@ fn incoming_edges(hir: &NumericFunction, successor: usize) -> Vec<(usize, usize)
 
 fn is_critical_edge(hir: &NumericFunction, predecessor: usize, successor: usize) -> bool {
     hir.blocks[predecessor].successors.len() > 1 && hir.blocks[successor].predecessors.len() > 1
+}
+
+fn edge_requires_representation_conversion(
+    hir: &NumericFunction,
+    predecessor: usize,
+    edge: usize,
+    successor: usize,
+) -> bool {
+    hir.blocks[predecessor].successor_arguments[edge]
+        .iter()
+        .zip(&hir.blocks[successor].parameters)
+        .any(|(&argument, &parameter)| {
+            hir.nodes[argument.0].value_type() != hir.nodes[parameter.0].value_type()
+        })
+}
+
+fn select_edge_argument(
+    hir: &NumericFunction,
+    values: &[MachineValue],
+    representations: &mut Vec<MachineRepresentation>,
+    instructions: &mut Vec<MachineInstruction>,
+    argument: hir::NumericValue,
+    parameter: hir::NumericValue,
+    successor: MachineBlock,
+) -> Result<MachineValue, super::VerificationError> {
+    let source_type = hir.nodes[argument.0].value_type();
+    let target_type = hir.nodes[parameter.0].value_type();
+    let source = machine_value(values, argument);
+    if source_type == target_type {
+        return Ok(source);
+    }
+    let (opcode, representation) = match (source_type, target_type) {
+        (NumericType::Int32, NumericType::Number) => (
+            MachineOpcode::Int32ToFloat64,
+            MachineRepresentation::Float64,
+        ),
+        (NumericType::Uint32, NumericType::Number) => (
+            MachineOpcode::Uint32ToFloat64,
+            MachineRepresentation::Float64,
+        ),
+        (NumericType::Int32, NumericType::Tagged) => {
+            (MachineOpcode::BoxInt32, MachineRepresentation::Tagged)
+        }
+        (NumericType::Uint32, NumericType::Tagged) => {
+            (MachineOpcode::BoxUint32, MachineRepresentation::Tagged)
+        }
+        (NumericType::Number, NumericType::Tagged) => {
+            (MachineOpcode::BoxNumber, MachineRepresentation::Tagged)
+        }
+        (NumericType::Boolean, NumericType::Tagged) => {
+            (MachineOpcode::BoxBoolean, MachineRepresentation::Tagged)
+        }
+        _ => {
+            return Err(super::VerificationError::BlockParameterRepresentation(
+                successor,
+                machine_value(values, parameter),
+            ));
+        }
+    };
+    let converted = push_value(representations, representation);
+    instructions.push(MachineInstruction::plain(
+        opcode,
+        vec![
+            MachineOperand::register_input(source),
+            MachineOperand::register_output(converted),
+        ],
+    ));
+    Ok(converted)
 }
 
 fn machine_block(
@@ -1856,10 +1967,141 @@ mod tests {
     use crate::entry::{JitCtx, JitEntry, JitRet, STATUS_BAILED, STATUS_RETURNED};
     use crate::machine::{
         AllocatedLocation, OperandConstraint, OperandPurpose, OperandTiming, SafepointId,
-        lower_deopt_table,
+        VerificationError, lower_deopt_table,
     };
 
     const POLL_BATCH: i32 = crate::arm64::GENERATED_POLL_BATCH as i32;
+
+    fn edge_conversion_hir(
+        source_type: NumericType,
+        target_type: NumericType,
+    ) -> (NumericFunction, hir::NumericValue, hir::NumericValue) {
+        let value = hir::NumericValue;
+        let mut nodes = Vec::new();
+        let source = match source_type {
+            NumericType::Tagged => {
+                nodes.push(NumericNode::TaggedConstant(Value::undefined().to_bits()));
+                value(0)
+            }
+            NumericType::Int32 => {
+                nodes.push(NumericNode::IntegerConstant(7));
+                value(0)
+            }
+            NumericType::Uint32 => {
+                nodes.extend([
+                    NumericNode::IntegerConstant(-1),
+                    NumericNode::IntegerConstant(0),
+                    NumericNode::IntegerShiftRightLogical(value(0), value(1)),
+                ]);
+                value(2)
+            }
+            NumericType::Number => {
+                nodes.push(NumericNode::Constant(7.5));
+                value(0)
+            }
+            NumericType::Boolean => {
+                nodes.push(NumericNode::BooleanConstant(true));
+                value(0)
+            }
+        };
+        let source_nodes = (0..nodes.len()).map(value).collect::<Vec<_>>();
+        let parameter = value(nodes.len());
+        nodes.push(NumericNode::BlockParameter(target_type));
+        (
+            NumericFunction {
+                function_id: 175,
+                nodes,
+                blocks: vec![
+                    hir::NumericBlock {
+                        logical_pc: 0,
+                        predecessors: Vec::new(),
+                        successors: vec![1],
+                        parameters: Vec::new(),
+                        parameter_registers: Vec::new(),
+                        successor_arguments: vec![vec![source]],
+                        nodes: source_nodes,
+                        terminator: NumericTerminator::Jump,
+                    },
+                    hir::NumericBlock {
+                        logical_pc: 1,
+                        predecessors: vec![0],
+                        successors: Vec::new(),
+                        parameters: vec![parameter],
+                        parameter_registers: vec![0],
+                        successor_arguments: Vec::new(),
+                        nodes: vec![parameter],
+                        terminator: NumericTerminator::Return(parameter),
+                    },
+                ],
+                frame_states: Vec::new(),
+                direct_call_targets: Vec::new(),
+                direct_call_arguments: Vec::new(),
+                parameter_count: 0,
+                register_count: 1,
+                arithmetic_op_count: 0,
+            },
+            source,
+            parameter,
+        )
+    }
+
+    fn tagged_backedge_conversion_hir() -> NumericFunction {
+        let value = hir::NumericValue;
+        NumericFunction {
+            function_id: 176,
+            nodes: vec![
+                NumericNode::TaggedConstant(Value::undefined().to_bits()),
+                NumericNode::BlockParameter(NumericType::Tagged),
+                NumericNode::IntegerConstant(1),
+            ],
+            blocks: vec![
+                hir::NumericBlock {
+                    logical_pc: 0,
+                    predecessors: Vec::new(),
+                    successors: vec![1],
+                    parameters: Vec::new(),
+                    parameter_registers: Vec::new(),
+                    successor_arguments: vec![vec![value(0)]],
+                    nodes: vec![value(0)],
+                    terminator: NumericTerminator::Jump,
+                },
+                hir::NumericBlock {
+                    logical_pc: 1,
+                    predecessors: vec![0, 2],
+                    successors: vec![2],
+                    parameters: vec![value(1)],
+                    parameter_registers: vec![0],
+                    successor_arguments: vec![Vec::new()],
+                    nodes: vec![value(1)],
+                    terminator: NumericTerminator::Jump,
+                },
+                hir::NumericBlock {
+                    logical_pc: 2,
+                    predecessors: vec![1],
+                    successors: vec![1],
+                    parameters: Vec::new(),
+                    parameter_registers: Vec::new(),
+                    successor_arguments: vec![vec![value(2)]],
+                    nodes: vec![value(2)],
+                    terminator: NumericTerminator::Jump,
+                },
+            ],
+            frame_states: vec![hir::NumericFrameState {
+                point: NumericFramePoint::Backedge {
+                    predecessor: 2,
+                    edge: 0,
+                },
+                function_id: 176,
+                byte_pc: 16,
+                slots: vec![hir::NumericFrameSlot::Value(value(2))],
+            }],
+            direct_call_targets: Vec::new(),
+            direct_call_arguments: Vec::new(),
+            parameter_count: 0,
+            register_count: 1,
+            arithmetic_op_count: 0,
+        }
+    }
 
     fn selection_direct_callee(function_id: u32) -> JitDirectCallee {
         JitDirectCallee {
@@ -5130,6 +5372,64 @@ mod tests {
     }
 
     #[test]
+    fn number_element_indices_box_for_the_probe_and_keep_float_deopt_state() {
+        let mut hir = element_selection_hir(true);
+        hir.nodes[1] = NumericNode::Parameter {
+            register: 1,
+            value_type: NumericType::Number,
+        };
+
+        let sequence = select(&hir).expect("Number-index element Machine IR");
+        let load = sequence
+            .instructions()
+            .iter()
+            .find(|instruction| instruction.opcode == MachineOpcode::ElementLoad(24))
+            .expect("Number-index element load");
+        let store = sequence
+            .instructions()
+            .iter()
+            .find(|instruction| instruction.opcode == MachineOpcode::ElementStore(40))
+            .expect("Number-index element store");
+        for boxed_index in [load.operands[1].value, store.operands[1].value] {
+            assert_eq!(
+                sequence.representations()[boxed_index.0 as usize],
+                MachineRepresentation::Tagged
+            );
+            assert!(sequence.instructions().iter().any(|instruction| {
+                instruction.opcode == MachineOpcode::BoxNumber
+                    && instruction.operands.first().map(|operand| operand.value)
+                        == Some(MachineValue(1))
+                    && instruction.operands.last().map(|operand| operand.value) == Some(boxed_index)
+            }));
+        }
+
+        let allocation = sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("Number-index element allocation");
+        let layout = arm64::frame_layout(&allocation, 0).expect("Number-index element frame");
+        let table = lower_deopt_table(
+            &sequence,
+            &allocation,
+            layout,
+            arm64::GPR_BUDGET,
+            arm64::FP_BUDGET,
+            &machine_frame_states(&hir),
+        )
+        .expect("Number-index element deopt table");
+        for exit in [DeoptExitId(0), DeoptExitId(3)] {
+            assert_eq!(
+                table
+                    .lookup(exit)
+                    .expect("Number-index element exit")
+                    .outermost()
+                    .slots[1]
+                    .repr,
+                otter_vm::deopt::DeoptRepr::Float64
+            );
+        }
+    }
+
+    #[test]
     fn element_store_deopt_preserves_boolean_value_semantics() {
         for source in [false, true] {
             let hir = element_selection_hir(source);
@@ -5808,20 +6108,23 @@ mod tests {
 
         let bitwise = NumericFunction::build(&float_bitwise_view(Op::BitwiseAnd))
             .expect("bitwise numeric HIR");
-        assert!(matches!(
-            bitwise.nodes[0],
-            NumericNode::Parameter {
-                value_type: NumericType::Number,
-                ..
-            }
-        ));
-        assert!(matches!(
-            bitwise.nodes[1],
-            NumericNode::Parameter {
-                value_type: NumericType::Number,
-                ..
-            }
-        ));
+        let parameters = [hir::NumericValue(0), hir::NumericValue(1)];
+        for parameter in parameters {
+            assert!(matches!(
+                bitwise.nodes[parameter.0],
+                NumericNode::Parameter {
+                    value_type: NumericType::Tagged,
+                    ..
+                }
+            ));
+            let number = bitwise
+                .nodes
+                .iter()
+                .position(|node| *node == NumericNode::TaggedToNumber(parameter))
+                .map(hir::NumericValue)
+                .expect("exact tagged-number decode");
+            assert!(bitwise.nodes.contains(&NumericNode::FloatToInt32(number)));
+        }
     }
 
     #[test]
@@ -5967,10 +6270,153 @@ mod tests {
     }
 
     #[test]
-    fn inconsistent_loop_backedge_representations_decline_before_selection() {
+    fn numeric_loop_join_widens_the_int32_entry_edge() {
         let mut view = typed_parameter_loop_view();
         view.seed_arith_feedback_for_test(4, ArithFeedback::from_bits(ARITH_INT32 | ARITH_FLOAT64));
-        assert!(NumericFunction::build(&view).is_none());
+        let hir = NumericFunction::build(&view).expect("mixed numeric loop HIR");
+        let sequence = select(&hir).expect("mixed numeric loop Machine IR");
+        assert!(sequence.instructions().iter().any(|instruction| {
+            instruction.opcode == MachineOpcode::Int32ToFloat64 && instruction.deopt.is_none()
+        }));
+    }
+
+    #[test]
+    fn splits_noncritical_edges_for_every_supported_representation_conversion() {
+        for (source_type, target_type, expected_opcode) in [
+            (
+                NumericType::Int32,
+                NumericType::Number,
+                MachineOpcode::Int32ToFloat64,
+            ),
+            (
+                NumericType::Uint32,
+                NumericType::Number,
+                MachineOpcode::Uint32ToFloat64,
+            ),
+            (
+                NumericType::Int32,
+                NumericType::Tagged,
+                MachineOpcode::BoxInt32,
+            ),
+            (
+                NumericType::Uint32,
+                NumericType::Tagged,
+                MachineOpcode::BoxUint32,
+            ),
+            (
+                NumericType::Number,
+                NumericType::Tagged,
+                MachineOpcode::BoxNumber,
+            ),
+            (
+                NumericType::Boolean,
+                NumericType::Tagged,
+                MachineOpcode::BoxBoolean,
+            ),
+        ] {
+            let (hir, source, parameter) = edge_conversion_hir(source_type, target_type);
+            let sequence = select(&hir).expect("convertible edge Machine IR");
+            assert_eq!(
+                sequence.blocks().len(),
+                hir.blocks.len() + 1,
+                "{source_type:?} -> {target_type:?} must split a noncritical edge"
+            );
+            let split = sequence
+                .blocks()
+                .iter()
+                .find(|block| {
+                    let instructions =
+                        &sequence.instructions()[block.first.0 as usize..block.end.0 as usize];
+                    instructions
+                        .first()
+                        .is_some_and(|instruction| instruction.opcode == expected_opcode)
+                })
+                .expect("representation-conversion split block");
+            let instructions =
+                &sequence.instructions()[split.first.0 as usize..split.end.0 as usize];
+            assert_eq!(instructions.len(), 2);
+            assert_eq!(instructions[0].opcode, expected_opcode);
+            assert_eq!(instructions[1].opcode, MachineOpcode::Jump);
+            assert_eq!(
+                instructions[0].operands[0],
+                MachineOperand::register_input(MachineValue(source.0 as u32))
+            );
+            let converted = instructions[0].operands[1].value;
+            assert_ne!(converted, MachineValue(source.0 as u32));
+            assert_eq!(split.successor_arguments, [vec![converted]]);
+            assert_eq!(
+                sequence.representations()[converted.0 as usize],
+                match target_type {
+                    NumericType::Tagged => MachineRepresentation::Tagged,
+                    NumericType::Number => MachineRepresentation::Float64,
+                    _ => unreachable!("conversion targets are Tagged or Number"),
+                }
+            );
+            let successor = &sequence.blocks()[split.successors[0].0 as usize];
+            assert_eq!(successor.parameters, [MachineValue(parameter.0 as u32)]);
+            let predecessor = &sequence.blocks()[split.predecessors[0].0 as usize];
+            assert!(predecessor.successor_arguments[0].is_empty());
+            sequence
+                .allocate(&TargetRegisterFile::aarch64_scalar_function())
+                .expect("representation-conversion allocation");
+        }
+    }
+
+    #[test]
+    fn rejects_an_unapproved_edge_representation_conversion() {
+        let (hir, _, _) = edge_conversion_hir(NumericType::Tagged, NumericType::Number);
+        let Err(error) = select(&hir) else {
+            panic!("Tagged -> Number edge conversion must be rejected")
+        };
+        assert!(matches!(
+            error,
+            VerificationError::BlockParameterRepresentation(..)
+        ));
+    }
+
+    #[test]
+    fn backedge_poll_precedes_boxing_and_keeps_the_original_exact_state() {
+        let hir = tagged_backedge_conversion_hir();
+        let sequence = select(&hir).expect("tagged mixed-backedge Machine IR");
+        let split = sequence
+            .blocks()
+            .iter()
+            .find(|block| {
+                sequence.instructions()[block.first.0 as usize].opcode
+                    == MachineOpcode::BackedgePoll
+            })
+            .expect("backedge split block");
+        let instructions = &sequence.instructions()[split.first.0 as usize..split.end.0 as usize];
+        assert_eq!(instructions.len(), 3);
+        assert_eq!(instructions[0].opcode, MachineOpcode::BackedgePoll);
+        assert_eq!(instructions[1].opcode, MachineOpcode::BoxInt32);
+        assert_eq!(instructions[2].opcode, MachineOpcode::Jump);
+        assert_eq!(instructions[0].deopt, Some(DeoptId(0)));
+        assert_eq!(
+            instructions[0]
+                .operands
+                .iter()
+                .map(|operand| (operand.value, operand.purpose))
+                .collect::<Vec<_>>(),
+            [(MachineValue(2), OperandPurpose::Deopt)]
+        );
+        assert_eq!(instructions[1].operands[0].value, MachineValue(2));
+        let converted = instructions[1].operands[1].value;
+        assert!(
+            instructions[0]
+                .operands
+                .iter()
+                .all(|operand| operand.value != converted),
+            "the backedge frame must not observe the post-poll boxed value"
+        );
+        assert_eq!(split.successor_arguments, [vec![converted]]);
+        assert_eq!(
+            sequence.representations()[converted.0 as usize],
+            MachineRepresentation::Tagged
+        );
+        sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("tagged backedge conversion allocation");
     }
 
     #[test]

@@ -60,7 +60,11 @@ It already owns:
   and existing-slot stores in Machine IR. Immutable mono/polymorphic snapshot
   programs replace mutable IC cells, every guard miss deoptimizes at the exact
   pre-operation frame state, and cell stores execute the collector barrier only
-  after all guards pass. Dense-array and primitive-string `.length` share the
+  after all guards pass. A Float64 index produced by guarded arithmetic boxes
+  through the allocation-free Number representation before the tagged dense
+  probe; integral values stay native, while fractional, negative-zero, NaN,
+  and out-of-range indices exact-deopt before the element operation. Dense-array
+  and primitive-string `.length` share the
   generated load family; lengths above int32 deopt to exact unsigned Number
   boxing instead of wrapping. Fixed TypedArray views over resizable buffers
   additionally prove the complete cached view extent against the live backing
@@ -278,14 +282,26 @@ improved 2.89%. The two small losses remain visible rather than being rounded
 away. Logs, manifests, and both binaries are retained under
 `/tmp/otter-r51-ab.YqJmjC`.
 
+Guarded empty-feedback numeric lowering plus heterogeneous scalar phis were
+then frozen against that R51 release with the same fresh-process B/C/C/B
+protocol. The accepted slice keeps established Number/Uint32 SSA wide when a
+later interpreter observation contains only Int32 values, so recompilation
+cannot narrow a `ToNumeric` result and eject a hot loop back to the template
+tier. Both NavierStokes `lin_solve` kernels remain Machine IR after their call
+plans and arithmetic feedback settle. Medians moved DeltaBlue 786.5 -> 1,004
+(+27.65%), Box2D 1,844 -> 1,969 (+6.78%), and NavierStokes 8,150 -> 12,347
+(+51.50%); the three-workload geometric mean improved 27.34%. Logs, manifests,
+and immutable binaries are retained under `/tmp/otter-r53-ab.uUTAuN`.
+
 The old optimizing compiler and template emitter remain in the active graph
 only for operations and function shapes not yet selected by the replacement
 pipeline. They are fallback, not contracts to preserve.
 
-Latest accepted gate: 53 bytecode, 86 compiler, 308 JIT, and 852 VM tests;
-the complete runtime suite; all-target/all-feature Clippy;
-compile-fail/rooting checks; and 21/21 differential
-interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.
+Latest accepted gate: formatting; strict workspace all-target/all-feature
+Clippy; 53 bytecode, 338 JIT, and 856 VM tests; compile-fail/rooting and runtime
+coverage including the four guarded-numeric cases; kernel ledger; and 21/21
+differential interpreter/tier/GC-stress cases. Test262 was not run for the
+engine slices.
 
 ## Active work
 

@@ -280,7 +280,10 @@ impl Interpreter {
                             })
                             .and_then(Value::as_native_function)
                             .and_then(|native| {
-                                crate::math::jit_static_call_target(native, &self.gc_heap)
+                                crate::jit_static_native::jit_static_call_target(
+                                    native,
+                                    &self.gc_heap,
+                                )
                             })
                     } else {
                         None

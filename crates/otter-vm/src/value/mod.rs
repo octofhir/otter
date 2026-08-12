@@ -312,6 +312,19 @@ impl Value {
         Self(box_int32(n), _NOT_SEND)
     }
 
+    /// Number from an unsigned 32-bit integer, preserving the int32 fast path
+    /// when possible and using an exact double for the upper half of the
+    /// range.
+    #[inline]
+    #[must_use]
+    pub fn number_u32(n: u32) -> Self {
+        if n <= i32::MAX as u32 {
+            Self::number_i32(n as i32)
+        } else {
+            Self::number_f64(f64::from(n))
+        }
+    }
+
     /// Number from an `f64`. NaNs are purified to the canonical pattern
     /// before the double offset is applied (so no boxed double aliases
     /// the cell space); integer-valued finite doubles are *not*
@@ -2065,6 +2078,18 @@ mod tests {
             assert!(v.is_int32());
             assert!(v.is_number());
         }
+    }
+
+    #[test]
+    fn uint32_uses_int32_or_exact_double_without_wrapping() {
+        let small = Value::number_u32(i32::MAX as u32);
+        assert_eq!(small.as_number(), Some(NumberValue::Smi(i32::MAX)));
+
+        let large = Value::number_u32(i32::MAX as u32 + 1);
+        assert_eq!(
+            large.as_number(),
+            Some(NumberValue::Double(2_147_483_648.0))
+        );
     }
 
     #[test]

@@ -263,7 +263,7 @@ fn unpack_call_target(packed: u64, kind: u8) -> CallTargetCount {
         CALL_TARGET_BYTECODE => OrdinaryCallTarget::Bytecode(payload),
         CALL_TARGET_STATIC_NATIVE => {
             debug_assert!(
-                crate::math::jit_leaf_builtin(payload).is_some(),
+                crate::jit_static_native::jit_leaf_builtin(payload).is_some(),
                 "native leaf call feedback names a declared entry"
             );
             OrdinaryCallTarget::StaticNative(payload)

@@ -63,9 +63,9 @@ fn assert_persisted_assembly(path: &std::path::Path) {
         "assembly retains exact native offsets:\n{assembly}"
     );
     assert!(
-        assembly.contains("pc=")
-            && assembly.contains("tier-op=")
-            && assembly.contains("relocation "),
+        assembly.lines().any(|line| {
+            line.trim_start().starts_with("; region kind=") && line.contains(" range=+0x")
+        }) && assembly.contains("relocation "),
         "assembly retains code-map and symbolic relocation annotations:\n{assembly}"
     );
     for line in assembly.lines().filter(|line| line.contains("relocation ")) {
@@ -396,7 +396,7 @@ fn jit_artifacts_are_complete_and_offset_consistent() {
     if manifest["tier"] == "template" {
         assert!(tier_input.starts_with("; otter template plan\n"));
     } else {
-        assert!(tier_input.starts_with("; otter optimized unit\n"));
+        assert!(tier_input.starts_with("; backend=otter-machine-ir scalar-function\n"));
     }
 
     let code_map: serde_json::Value = serde_json::from_slice(

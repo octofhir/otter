@@ -240,7 +240,7 @@ impl Interpreter {
             return Ok(None);
         };
         if key == "length" {
-            return Ok(Some(Value::number_i32(value.len() as i32)));
+            return Ok(Some(Value::number_u32(value.len())));
         }
         let Ok(index) = key.parse::<u32>() else {
             return Ok(None);

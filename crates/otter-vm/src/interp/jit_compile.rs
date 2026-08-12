@@ -643,7 +643,6 @@ impl Interpreter {
                     Op::LoadProperty | Op::StoreProperty
                 )
             })
-            .filter(|instr| !instr.load_array_length)
             .map(|instr| {
                 (
                     instr.byte_pc,
@@ -662,6 +661,7 @@ impl Interpreter {
             let Some(slots) = self.feedback_directory.settled_property_slots(site, kind) else {
                 continue;
             };
+            let slot_count = slots.len();
             // Every installed program must lower, or the chain would silently
             // drop a shape the site really sees and send it to the transition.
             let chain: Vec<_> = slots
@@ -674,7 +674,7 @@ impl Interpreter {
                     })
                 })
                 .collect();
-            if chain.is_empty() {
+            if chain.len() != slot_count || chain.is_empty() {
                 continue;
             }
             if op == Op::LoadProperty {
@@ -873,6 +873,7 @@ impl Interpreter {
                 handle_byte: buffer_byte + buffer::BUFFER_STORAGE_HANDLE_OFFSET as u32,
                 detached_byte: header + buffer::LOCAL_ARRAY_BUFFER_BODY_DETACHED_OFFSET as u32,
                 data_ptr_byte: header + buffer::LOCAL_ARRAY_BUFFER_BODY_DATA_OFFSET as u32,
+                byte_len_byte: header + buffer::LOCAL_ARRAY_BUFFER_BODY_BYTE_LEN_OFFSET as u32,
                 view_offset_byte: header + view::TYPED_ARRAY_BODY_BYTE_OFFSET_OFFSET as u32,
             },
             element,
@@ -1011,8 +1012,10 @@ impl Interpreter {
     ) -> Option<crate::native_abi::RuntimeStubId> {
         let name = context.property_atom_for_function(caller_fid, name_idx)?;
         let method = crate::object::get(recv.as_object()?, &self.gc_heap, name.name())?;
-        let declaration =
-            crate::math::jit_static_call_target(method.as_native_function()?, &self.gc_heap)?;
+        let declaration = crate::jit_static_native::jit_static_call_target(
+            method.as_native_function()?,
+            &self.gc_heap,
+        )?;
         (argc == usize::from(declaration.argument_count)).then_some(declaration.leaf_stub_id)
     }
 
@@ -1072,12 +1075,13 @@ impl Interpreter {
             if recv_shape_offset == 0 {
                 continue;
             }
-            let Some(declaration) = crate::math::jit_leaf_builtin(stub_id) else {
+            let Some(declaration) = crate::jit_static_native::jit_leaf_builtin(stub_id) else {
                 continue;
             };
             // A builtin this isolate never installed has no external-ref
             // index, so no live receiver could carry its identity.
-            let Some(builtin_native_ref) = crate::math::jit_static_call_ref(stub_id, &self.gc_heap)
+            let Some(builtin_native_ref) =
+                crate::jit_static_native::jit_static_call_ref(stub_id, &self.gc_heap)
             else {
                 continue;
             };
@@ -1412,14 +1416,15 @@ impl Interpreter {
                 feedback::OrdinaryCallTarget::Bytecode(callee_fid) => callee_fid,
                 feedback::OrdinaryCallTarget::StaticNative(stub_id) => {
                     let name = crate::native_abi::runtime_stub_name(stub_id);
-                    let declaration = crate::math::jit_leaf_builtin(stub_id)
+                    let declaration = crate::jit_static_native::jit_leaf_builtin(stub_id)
                         .expect("native leaf call feedback names a declared entry");
                     // Feedback recorded a call to this builtin, so the isolate
                     // installed it and its external-ref index exists.
                     let builtin_native_ref =
-                        crate::math::jit_static_call_ref(stub_id, &self.gc_heap).expect(
-                            "a builtin the site already called is interned in this isolate",
-                        );
+                        crate::jit_static_native::jit_static_call_ref(stub_id, &self.gc_heap)
+                            .expect(
+                                "a builtin the site already called is interned in this isolate",
+                            );
                     view.static_native_calls.insert(
                         call_byte_pc,
                         jit::JitStaticNativeCall {

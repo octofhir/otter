@@ -167,8 +167,9 @@ use super::{
 use crate::{
     CompiledCode,
     arm64::{
-        DirectCallArguments, DirectCallForm, DirectCallSite, direct_call_target_is_supported,
-        emit_direct_call_with_access, emit_method_guard_from_tagged_register,
+        DirectCallArguments, DirectCallForm, DirectCallSite, GENERATED_POLL_BATCH,
+        direct_call_target_is_supported, emit_direct_call_with_access,
+        emit_method_guard_from_tagged_register,
     },
     artifact::{
         ArtifactRequest, CodeMapCapture, CodeRegion, NativeCompileOutput, build_bundle,
@@ -249,7 +250,6 @@ const FP_SCRATCH: u8 = 16;
 const DEOPT_HANDLER_DUMP_BYTES: u32 = 144;
 const FP_SCRATCH_2: u8 = 17;
 const STACK_SLOT_BYTES: u32 = 8;
-const OPTIMIZED_POLL_BATCH: u32 = 16;
 const MAX_SPILL_FRAME_BYTES: u32 = 1 << 20;
 const MAX_PARAMETER_OFFSET: u32 = 32_760;
 
@@ -1258,7 +1258,7 @@ fn emit(
     emit_prologue(&mut ops, saved_frame);
     emit_clear_loop_caches(&mut ops, cached_method_guard_base, loop_cache_count);
     if !eligibility.back_edges.is_empty() {
-        dynasm!(ops ; .arch aarch64 ; movz w29, OPTIMIZED_POLL_BATCH);
+        dynasm!(ops ; .arch aarch64 ; movz w29, GENERATED_POLL_BATCH);
     }
 
     dynasm!(ops
@@ -4694,7 +4694,7 @@ fn emit(
         emit_prologue(&mut ops, saved_frame);
         emit_clear_loop_caches(&mut ops, cached_method_guard_base, loop_cache_count);
         if !eligibility.back_edges.is_empty() {
-            dynasm!(ops ; .arch aarch64 ; movz w29, OPTIMIZED_POLL_BATCH);
+            dynasm!(ops ; .arch aarch64 ; movz w29, GENERATED_POLL_BATCH);
         }
         dynasm!(ops
             ; .arch aarch64

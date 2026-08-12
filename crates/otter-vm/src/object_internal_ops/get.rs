@@ -878,7 +878,7 @@ impl Interpreter {
                     return Ok(VmGetOutcome::Value(Value::string(unit_str)));
                 }
                 if name == "length" {
-                    return Ok(VmGetOutcome::Value(Value::number_i32(s.len() as i32)));
+                    return Ok(VmGetOutcome::Value(Value::number_u32(s.len())));
                 }
             }
             let proto = self.constructor_prototype_value("String")?;

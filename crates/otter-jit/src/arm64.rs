@@ -3,6 +3,7 @@
 //! # Contents
 //! - [`emit_direct_call`] — compiler-generated monomorphic plain-call linkage.
 //! - Guarded static-native leaves for extracted builtins.
+//! - Shared generated-code policy constants used by multiple native tiers.
 //!
 //! # Invariants
 //! - Common emitters depend only on the crate-wide entry ABI and VM runtime
@@ -22,6 +23,13 @@
 
 mod direct_call;
 mod method_guard;
+
+/// Backedges between shared interrupt/fuel-cell probes in generated code.
+///
+/// `x29` holds the activation-local countdown in optimizing and scalar Machine
+/// IR bodies. Both tiers subtract this exact batch from shared VM fuel when the
+/// countdown expires, keeping accounting and interrupt latency aligned.
+pub(crate) const GENERATED_POLL_BATCH: u32 = 16;
 
 pub(crate) use direct_call::{
     DirectCallArguments, DirectCallForm, DirectCallSite, direct_call_artifact, emit_direct_call,

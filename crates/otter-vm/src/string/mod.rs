@@ -25,6 +25,8 @@
 //! - Reader methods (`to_utf16_vec`, `to_lossy_string`,
 //!   `char_code_at`, `index_of`, …) require an explicit
 //!   `&otter_gc::GcHeap` parameter; no thread-local heap.
+//! - Concatenation preserves the exact `u32` UTF-16 length contract. A wider
+//!   sum returns [`StringConcatError::StringTooLong`] before allocation.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-ecmascript-language-types-string-type>
@@ -50,7 +52,7 @@ use otter_gc::{GcHeap, OutOfMemory};
 
 pub use gc_body::{
     JS_STRING_BODY_TYPE_TAG, JsStringBody, JsStringBodyRepr, JsStringHandle, JsStringId,
-    MAX_ROPE_DEPTH as GC_MAX_ROPE_DEPTH, alloc_flat_string_body_with_roots,
+    MAX_ROPE_DEPTH as GC_MAX_ROPE_DEPTH, StringConcatError, alloc_flat_string_body_with_roots,
     alloc_latin1_string_body_with_roots, concat_string_bodies, eq_str, equals_string_bodies,
     flatten_string_body, hash_latin1, hash_utf16, slice_string_body, to_utf16_vec,
 };
@@ -59,6 +61,21 @@ pub use gc_body::{
 /// [`gc_body::MAX_ROPE_DEPTH`] cast to `usize` for callers that still
 /// reason in `Vec::with_capacity` units.
 pub const MAX_ROPE_DEPTH: usize = gc_body::MAX_ROPE_DEPTH as usize;
+
+/// Stable JS-visible message for the engine's exact string-length ceiling.
+pub(crate) const STRING_TOO_LONG_MESSAGE: &str = "Invalid string length";
+
+/// Map the value-model concat outcome onto the interpreter's catchable error
+/// contract without conflating a deterministic length overflow with heap OOM.
+pub(crate) fn concat_error_to_vm(
+    interp: &crate::Interpreter,
+    error: StringConcatError,
+) -> crate::VmError {
+    match error {
+        StringConcatError::StringTooLong { .. } => interp.err_range(STRING_TOO_LONG_MESSAGE.into()),
+        StringConcatError::OutOfMemory(error) => crate::oom_to_vm(error),
+    }
+}
 
 /// GC-backed JavaScript string handle.
 ///
@@ -310,8 +327,14 @@ impl JsString {
     /// side is empty (then returns the other handle unchanged).
     ///
     /// # Errors
-    /// Surfaces [`OutOfMemory`] verbatim.
-    pub fn concat(left: JsString, right: JsString, heap: &mut GcHeap) -> Result<Self, OutOfMemory> {
+    /// Returns [`StringConcatError::StringTooLong`] before allocation when the
+    /// exact UTF-16 length would exceed `u32::MAX`, or
+    /// [`StringConcatError::OutOfMemory`] when the collector refuses the body.
+    pub fn concat(
+        left: JsString,
+        right: JsString,
+        heap: &mut GcHeap,
+    ) -> Result<Self, StringConcatError> {
         if right.is_empty() {
             return Ok(left);
         }
@@ -969,6 +992,39 @@ mod tests {
         heap.read_payload(ab.handle(), |body| {
             assert!(matches!(body.repr, JsStringBodyRepr::Cons { .. }));
         });
+    }
+
+    #[test]
+    fn concat_rejects_the_32nd_doubling_before_allocation() {
+        let mut heap = h();
+        let mut rope = JsString::from_str("a", &mut heap).unwrap();
+        for _ in 0..31 {
+            rope = JsString::concat(rope, rope, &mut heap).unwrap();
+        }
+        assert_eq!(rope.len(), 1_u32 << 31);
+
+        let allocated_before = heap.gc_stats().alloc_bytes_total;
+        let error = JsString::concat(rope, rope, &mut heap).unwrap_err();
+        let allocated_after = heap.gc_stats().alloc_bytes_total;
+        assert_eq!(
+            error,
+            StringConcatError::StringTooLong {
+                left_len: 1_u32 << 31,
+                right_len: 1_u32 << 31,
+            }
+        );
+        assert_eq!(
+            allocated_after, allocated_before,
+            "length overflow must fail before allocating a rope node"
+        );
+
+        let reusable = JsString::concat(
+            JsString::from_str("still", &mut heap).unwrap(),
+            JsString::from_str("-usable", &mut heap).unwrap(),
+            &mut heap,
+        )
+        .unwrap();
+        assert_eq!(reusable.to_lossy_string(&heap), "still-usable");
     }
 
     #[test]

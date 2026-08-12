@@ -520,11 +520,10 @@ impl Interpreter {
                     .escape_scoped(rhs_string)
                     .as_string(&interp.gc_heap)
                     .ok_or(VmError::TypeMismatch)?;
-                Ok(Value::string(JsString::concat(
-                    lhs_string,
-                    rhs_string,
-                    interp.gc_heap_mut(),
-                )?))
+                let result = JsString::concat(lhs_string, rhs_string, interp.gc_heap_mut());
+                result
+                    .map(Value::string)
+                    .map_err(|error| crate::string::concat_error_to_vm(interp, error))
             } else {
                 let lhs_numeric = abstract_ops::to_numeric_kind(&lhs_value, &interp.gc_heap)
                     .ok_or(VmError::TypeMismatch)?;

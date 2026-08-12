@@ -11,9 +11,9 @@
 //! - Interpreter and tiered runs execute identical source and warmup programs.
 //! - Final store, read-modify-write, growth, and throw calls all enter already
 //!   optimized functions in the tiered run.
-//! - Array mutation remains owned by `STUB_JIT_STORE_ELEMENT`; optimized code
-//!   delegates through the canonical active frame without materializing an
-//!   interpreter activation.
+//! - Proven in-bounds primitive overwrites remain in generated Machine code.
+//!   Growth and invalid receivers leave through one exact pre-effect deopt and
+//!   resume the canonical interpreter operation without replay.
 //!
 //! # See also
 //! - `crates/otter-difftest/corpus/arrays_typed.js` exercises the same float
@@ -140,18 +140,23 @@ fn optimized_element_stores_match_interpreter() {
         r#"{"intResult":17,"intContents":17,"floatResult":2.75,"floatContents":2.75,"rmwResult":10,"rmwContents":[1,2,3,4],"growResult":42.5,"growLength":9,"growFirstPresent":false,"growStoredPresent":true,"throwName":"TypeError"}"#
     );
     assert_eq!(deltas.len(), 5);
-    for (operation, (optimized_entries, optimized_deopts)) in
-        ["int", "float", "read-modify-write", "growth", "throw"]
-            .into_iter()
-            .zip(deltas)
+    for ((operation, expected_deopts), (optimized_entries, optimized_deopts)) in [
+        ("int", 0),
+        ("float", 0),
+        ("read-modify-write", 0),
+        ("growth", 1),
+        ("throw", 1),
+    ]
+    .into_iter()
+    .zip(deltas)
     {
         assert!(
             optimized_entries >= 1,
             "{operation} store must enter optimized code: entries={optimized_entries}, deopts={optimized_deopts}"
         );
         assert_eq!(
-            optimized_deopts, 0,
-            "{operation} store must not deopt on supported values"
+            optimized_deopts, expected_deopts,
+            "{operation} store must follow its exact generated/deopt contract"
         );
     }
 }

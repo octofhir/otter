@@ -119,8 +119,7 @@ impl Interpreter {
         let s = read_register(frame, src)?
             .as_string(&self.gc_heap)
             .ok_or(VmError::TypeMismatch)?;
-        let len = NumberValue::from_i32(s.len() as i32);
-        write_register(frame, dst, Value::number(len))?;
+        write_register(frame, dst, Value::number_u32(s.len()))?;
         frame.advance_pc()?;
         Ok(())
     }

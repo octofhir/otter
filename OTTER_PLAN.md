@@ -39,10 +39,36 @@ It already owns:
   block parameters, tagged OSR inputs, checked arithmetic, and scalar VM leaves;
 - descriptor-driven leaf calls for exact tagged truthiness and strict equality,
   including heap-cell semantics, scalar argument boxing, allocator clobbers,
-  and exact miss deopt without a VM-window shuttle;
+  and exact miss deopt without a VM-window shuttle. The shared static-native
+  registry also lowers the exact bootstrap `parseInt(Int32)` call as an
+  allocation-free identity leaf; every other tag, arity, radix, or replaced
+  global exits before coercion effects;
 - descriptor-driven allocating primitive string concatenation with exact
   pre-operation deopt, allocator late-use roots, a reusable native root-save
-  area, VM `SafepointRecord` spill locations, and post-GC reloads;
+  area, VM `SafepointRecord` spill locations, and post-GC reloads. Rope length
+  uses checked `u32` arithmetic: an unrepresentable concatenation exits before
+  allocation and becomes one catchable `RangeError`, never a saturated body;
+- guarded dense indexed-element and ordinary settled own-data property loads
+  and existing-slot stores in Machine IR. Immutable mono/polymorphic snapshot
+  programs replace mutable IC cells, every guard miss deoptimizes at the exact
+  pre-operation frame state, and cell stores execute the collector barrier only
+  after all guards pass. Dense-array and primitive-string `.length` share the
+  generated load family; lengths above int32 deopt to exact unsigned Number
+  boxing instead of wrapping. Fixed TypedArray views over resizable buffers
+  additionally prove the complete cached view extent against the live backing
+  byte length before either a load or a store;
+- direct captured-upvalue reads through the published native frame, cage, and
+  cell layout, with exact TDZ deopt and no runtime-call round trip. Scalar
+  backedges use the shared activation-local batch countdown rather than reading
+  interrupt and fuel cells on every iteration;
+- frozen four-run fresh-process B/C/C/B validation against the pre-slice binary
+  moved NavierStokes 7,748.5 -> 8,269 (+6.72%), RayTrace 782.5 -> 788
+  (+0.70%), and Box2D 1,018 -> 1,881 (+84.77%). The captured Box2D run recorded
+  59 generated `parse_int_i32_leaf` lowering events and reduced observed
+  plain-`Call` bails from the earlier profile's 710 to 132. Its hot f980 body
+  remains Machine IR with 30
+  property loads, two non-cell stores, zero spills, no write-barrier stub, and
+  5,788 bytes of code (down from 6,064 before store specialization);
 - descriptor-driven monomorphic plain, guarded-method, and fixed-arity base,
   derived, and superclass JavaScript calls from Machine IR through the shared
   generated-linkage emitter, with exact pre-call FrameState, allocator-owned
@@ -215,7 +241,7 @@ The old optimizing compiler and template emitter remain in the active graph
 only for operations and function shapes not yet selected by the replacement
 pipeline. They are fallback, not contracts to preserve.
 
-Latest accepted gate: 53 bytecode, 86 compiler, 286 JIT, and 843 VM tests;
+Latest accepted gate: 53 bytecode, 86 compiler, 300 JIT, and 847 VM tests;
 the complete runtime suite; all-target/all-feature Clippy;
 compile-fail/rooting checks; and 21/21 differential
 interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.
@@ -270,8 +296,9 @@ not add a second call format.
 Implement in this order:
 
 1. nested/finally exceptional edges and multi-frame state;
-2. complete general settled fields and elements with dependency tokens (the
-   exact constructor-owned add-property slice is native);
+2. extend the native settled own-data field and dense-element families to the
+   remaining prototype, dictionary, typed/exotic, and dependency-token forms
+   (the exact constructor-owned add-property slice is native);
 3. inline object allocation, constructors, and virtual objects;
 4. OSR at every reducible loop and incremental-GC handshakes.
 

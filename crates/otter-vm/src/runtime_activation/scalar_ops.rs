@@ -152,7 +152,7 @@ impl RuntimeCall<'_> {
                     .read(src)?
                     .as_string(&vm.gc_heap)
                     .ok_or(VmError::TypeMismatch)?;
-                Value::number(NumberValue::from_i32(string.len() as i32))
+                Value::number_u32(string.len())
             }
         };
         let dst = match operation {

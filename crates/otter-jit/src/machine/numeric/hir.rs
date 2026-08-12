@@ -4,14 +4,31 @@
 //! - [`NumericFunction`] — bounded numeric SSA graph with explicit blocks.
 //! - [`NumericBlock`] and [`NumericTerminator`] — predecessor/successor edges,
 //!   block parameters, edge arguments, branches, and returns.
-//! - [`NumericNode`] — tagged/scalar parameters, constants, moves, coercions,
+//! - [`NumericNode`] — tagged/scalar parameters, constants, captured-binding
+//!   reads, guarded coercions, ordinary properties, indexed elements,
 //!   arithmetic, comparison, and typed plain/method calls.
 //!
 //! # Invariants
 //! - Parameters remain tagged unless their uses prove a numeric representation;
 //!   inferred Number/Int32 parameters are guarded before effects.
+//! - Tagged values produced inside the function may enter numeric-only regions
+//!   through an exact pre-operation guarded decode. A failed decode resumes the
+//!   original bytecode before any observable effect can be replayed.
 //! - Parameters outside the exact entry live-in set have no HIR value, load,
 //!   guard, or allocator interval.
+//! - Indexed loads and stores require a baked VM element program plus the GC
+//!   cage. Their frame state describes the exact pre-access register window;
+//!   every side exit precedes the load or the effect-only store.
+//! - Ordinary property nodes exist independently of settled shape/slot
+//!   metadata. Selection either emits a guarded hit or exact-deoptimizes at the
+//!   original bytecode. Named `.length` loads retain their exotic fast-path
+//!   marker; every property frame state describes the exact pre-access register
+//!   window.
+//! - Captured-binding reads require the GC cage and retain an exact pre-load
+//!   frame state so an invalid spine or TDZ hole resumes canonically.
+//! - A protected instruction's deopt state retains values used only by its
+//!   innermost catch. This implicit liveness is solved with normal CFG
+//!   liveness; element and scalar guards do not become generated throw edges.
 //! - Reentrant calls require one VM-planned direct target and carry an exact
 //!   pre-call FrameState. Guarded methods additionally retain the VM-baked
 //!   receiver/prototype/slot identity. Supported catch regions become explicit
@@ -29,7 +46,7 @@
 use std::collections::BTreeMap;
 
 use otter_bytecode::{Op, Operand};
-use otter_vm::{JitCompileSnapshot, JitInstructionMetadata};
+use otter_vm::{JitCompileSnapshot, JitElementBase, JitInstructionMetadata};
 
 const MAX_FUNCTION_INSTRUCTIONS: usize = 512;
 const MAX_FUNCTION_PARAMETERS: u16 = 16;
@@ -54,11 +71,13 @@ pub(super) enum NumericNode {
     },
     BlockParameter(NumericType),
     TaggedConstant(u64),
+    TaggedToNumber(NumericValue),
+    TaggedToInt32(NumericValue),
     This,
     ClassSuperConstructor(NumericValue),
     Upvalue {
         index: i32,
-        exceptional_edge: Option<u16>,
+        byte_pc: u32,
     },
     BindThis {
         source: NumericValue,
@@ -68,6 +87,27 @@ pub(super) enum NumericNode {
     },
     ConstructorFieldStore {
         object: NumericValue,
+        value: NumericValue,
+        byte_pc: u32,
+    },
+    PropertyLoad {
+        receiver: NumericValue,
+        byte_pc: u32,
+        exotic_length: bool,
+    },
+    PropertyStore {
+        receiver: NumericValue,
+        value: NumericValue,
+        byte_pc: u32,
+    },
+    ElementLoad {
+        receiver: NumericValue,
+        index: NumericValue,
+        byte_pc: u32,
+    },
+    ElementStore {
+        receiver: NumericValue,
+        index: NumericValue,
         value: NumericValue,
         byte_pc: u32,
     },
@@ -161,10 +201,15 @@ impl NumericNode {
             | Self::Upvalue { .. }
             | Self::BindThis { .. }
             | Self::ConstructorFieldStore { .. }
+            | Self::PropertyLoad { .. }
+            | Self::PropertyStore { .. }
+            | Self::ElementLoad { .. }
+            | Self::ElementStore { .. }
             | Self::TaggedStringConcat(..)
             | Self::DirectCall { .. }
             | Self::BlockParameter(NumericType::Tagged) => NumericType::Tagged,
             Self::IntegerConstant(..)
+            | Self::TaggedToInt32(..)
             | Self::FloatToInt32(..)
             | Self::BooleanToInt32(..)
             | Self::IntegerAdd(..)
@@ -208,6 +253,7 @@ impl NumericNode {
             Self::BooleanConstant(..) => NumericType::Boolean,
             Self::Parameter { value_type, .. } => value_type,
             Self::BlockParameter(NumericType::Number)
+            | Self::TaggedToNumber(..)
             | Self::Constant(..)
             | Self::WidenInt32(..)
             | Self::WidenUint32(..)
@@ -302,6 +348,12 @@ struct RawBlock {
     terminator: RawTerminator,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct InstructionExceptionHandler {
+    block: usize,
+    exception_register: u16,
+}
+
 impl NumericFunction {
     pub(super) fn build(view: &JitCompileSnapshot) -> Option<Self> {
         let code = view.code_block.as_ref();
@@ -329,9 +381,15 @@ impl NumericFunction {
         let raw_blocks = build_raw_blocks(view)?;
         let parameter_types =
             infer_parameter_types(view, &raw_blocks, parameter_count, register_count)?;
-        let live_in = build_liveness(view, &raw_blocks, register_count)?;
-        let instruction_live_in =
-            build_instruction_liveness(view, &raw_blocks, &live_in, register_count)?;
+        let exception_handlers = build_instruction_exception_handlers(view, &raw_blocks)?;
+        let live_in = build_liveness(view, &raw_blocks, &exception_handlers, register_count)?;
+        let instruction_live_in = build_instruction_liveness(
+            view,
+            &raw_blocks,
+            &live_in,
+            &exception_handlers,
+            register_count,
+        )?;
         let mut nodes = Vec::with_capacity(view.instructions.len() + register_count as usize);
         let mut entry = vec![RegisterState::Unset; usize::from(register_count)];
         let mut entry_nodes = Vec::with_capacity(parameter_count as usize);
@@ -454,6 +512,8 @@ impl NumericFunction {
                     &view.direct_constructs,
                     &view.direct_methods,
                     &view.constructor_field_transitions,
+                    &view.element_accesses,
+                    view.cage_base != 0,
                     &mut direct_call_targets,
                     &mut direct_call_arguments,
                     (pc == terminal_pc)
@@ -686,10 +746,26 @@ fn infer_instruction_parameters(
         Op::BindThisValue => {
             let _ = read(register(instruction, code, 0)?)?;
         }
+        Op::LoadProperty => {
+            let _ = read(register(instruction, code, 1)?)?;
+            let _ = instruction.const_index(code, 2)?;
+            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
+        }
         Op::StoreProperty => {
             let _ = read(register(instruction, code, 0)?)?;
+            let _ = instruction.const_index(code, 1)?;
             let _ = read(register(instruction, code, 2)?)?;
             *origins.get_mut(usize::from(register(instruction, code, 3)?))? = 0;
+        }
+        Op::LoadElement => {
+            let _ = read(register(instruction, code, 1)?)?;
+            let _ = read(register(instruction, code, 2)?)?;
+            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
+        }
+        Op::StoreElement => {
+            let _ = read(register(instruction, code, 0)?)?;
+            let _ = read(register(instruction, code, 1)?)?;
+            let _ = read(register(instruction, code, 2)?)?;
         }
         Op::Call | Op::New | Op::SuperConstruct => {
             let count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
@@ -922,42 +998,25 @@ fn build_raw_blocks(view: &JitCompileSnapshot) -> Option<Vec<RawBlock>> {
 fn build_liveness(
     view: &JitCompileSnapshot,
     blocks: &[RawBlock],
+    exception_handlers: &[Option<InstructionExceptionHandler>],
     register_count: u16,
 ) -> Option<Vec<Vec<bool>>> {
     let code = view.code_block.as_ref();
     let width = usize::from(register_count);
-    let mut uses = vec![vec![false; width]; blocks.len()];
-    let mut definitions = vec![vec![false; width]; blocks.len()];
-    for (block_index, block) in blocks.iter().enumerate() {
-        for pc in block.start..block.end {
-            let instruction = view.instructions.get(pc)?;
-            let (reads, writes) = instruction_accesses(instruction, code)?;
-            for read in reads {
-                let read = usize::from(read);
-                if !definitions[block_index][read] {
-                    uses[block_index][read] = true;
-                }
-            }
-            for write in writes {
-                definitions[block_index][usize::from(write)] = true;
-            }
-        }
-        if let Some(exception_register) = block.exception_register {
-            definitions[block_index][usize::from(exception_register)] = true;
-        }
-    }
-
     let mut live_in = vec![vec![false; width]; blocks.len()];
     loop {
         let mut changed = false;
         for block_index in (0..blocks.len()).rev() {
-            let mut next = uses[block_index].clone();
-            for &successor in &blocks[block_index].successors {
-                for register in 0..width {
-                    if live_in[successor][register] && !definitions[block_index][register] {
-                        next[register] = true;
-                    }
-                }
+            let block = blocks.get(block_index)?;
+            let mut next = block_live_out(block, &live_in, width)?;
+            for pc in (block.start..block.end).rev() {
+                transfer_instruction_liveness(
+                    view.instructions.get(pc)?,
+                    code,
+                    exception_handlers.get(pc).copied().flatten(),
+                    &live_in,
+                    &mut next,
+                )?;
             }
             if next != live_in[block_index] {
                 live_in[block_index] = next;
@@ -974,36 +1033,147 @@ fn build_instruction_liveness(
     view: &JitCompileSnapshot,
     blocks: &[RawBlock],
     block_live_in: &[Vec<bool>],
+    exception_handlers: &[Option<InstructionExceptionHandler>],
     register_count: u16,
 ) -> Option<Vec<Vec<bool>>> {
     let code = view.code_block.as_ref();
     let width = usize::from(register_count);
     let mut instruction_live_in = vec![vec![false; width]; view.instructions.len()];
     for block in blocks {
-        let mut live = vec![false; width];
-        for &successor in &block.successors {
-            for (register, &successor_live) in block_live_in[successor].iter().enumerate() {
-                live[register] |= successor_live;
-            }
-        }
+        let mut live = block_live_out(block, block_live_in, width)?;
         for pc in (block.start..block.end).rev() {
-            let instruction = view.instructions.get(pc)?;
-            let (reads, writes) = instruction_accesses(instruction, code)?;
-            if pc + 1 == block.end
-                && let Some(exception_register) = block.exception_register
-            {
-                live[usize::from(exception_register)] = false;
-            }
-            for write in writes {
-                live[usize::from(write)] = false;
-            }
-            for read in reads {
-                live[usize::from(read)] = true;
-            }
+            transfer_instruction_liveness(
+                view.instructions.get(pc)?,
+                code,
+                exception_handlers.get(pc).copied().flatten(),
+                block_live_in,
+                &mut live,
+            )?;
             instruction_live_in[pc] = live.clone();
         }
     }
     Some(instruction_live_in)
+}
+
+fn build_instruction_exception_handlers(
+    view: &JitCompileSnapshot,
+    blocks: &[RawBlock],
+) -> Option<Vec<Option<InstructionExceptionHandler>>> {
+    let code = view.code_block.as_ref();
+    let blocks_by_pc = blocks
+        .iter()
+        .enumerate()
+        .map(|(block, raw)| Some((u32::try_from(raw.start).ok()?, block)))
+        .collect::<Option<BTreeMap<_, _>>>()?;
+    let mut handlers = vec![None; view.instructions.len()];
+    for (pc, handler) in handlers.iter_mut().enumerate() {
+        let pc = u32::try_from(pc).ok()?;
+        let Some(region) = code.control_flow().enclosing_exception_region(pc) else {
+            continue;
+        };
+        let Some(catch_pc) = region.catch_pc else {
+            continue;
+        };
+        *handler = Some(InstructionExceptionHandler {
+            block: *blocks_by_pc.get(&catch_pc)?,
+            exception_register: region.exception_register,
+        });
+    }
+    Some(handlers)
+}
+
+fn block_live_out(
+    block: &RawBlock,
+    block_live_in: &[Vec<bool>],
+    width: usize,
+) -> Option<Vec<bool>> {
+    let mut live = vec![false; width];
+    for (edge, &successor) in block.successors.iter().enumerate() {
+        for (register, &successor_live) in
+            block_live_in.get(successor)?.iter().enumerate().take(width)
+        {
+            if block.exceptional_edge == Some(edge)
+                && block.exception_register == u16::try_from(register).ok()
+            {
+                continue;
+            }
+            live[register] |= successor_live;
+        }
+    }
+    Some(live)
+}
+
+fn transfer_instruction_liveness(
+    instruction: &JitInstructionMetadata,
+    code: &otter_vm::CodeBlock,
+    exception_handler: Option<InstructionExceptionHandler>,
+    block_live_in: &[Vec<bool>],
+    live: &mut [bool],
+) -> Option<()> {
+    let (reads, writes) = instruction_accesses(instruction, code)?;
+    for write in writes {
+        *live.get_mut(usize::from(write))? = false;
+    }
+    for read in reads {
+        *live.get_mut(usize::from(read))? = true;
+    }
+    if instruction_has_implicit_exception_side_exit(instruction.op(code))
+        && let Some(handler) = exception_handler
+    {
+        for (register, &handler_live) in block_live_in.get(handler.block)?.iter().enumerate() {
+            if register != usize::from(handler.exception_register) && handler_live {
+                *live.get_mut(register)? = true;
+            }
+        }
+    }
+    Some(())
+}
+
+fn instruction_has_implicit_exception_side_exit(op: Op) -> bool {
+    matches!(
+        op,
+        Op::GetPrototype
+            | Op::LoadUpvalue
+            | Op::BindThisValue
+            | Op::LoadProperty
+            | Op::StoreProperty
+            | Op::LoadElement
+            | Op::StoreElement
+            | Op::ToPrimitive
+            | Op::ToNumeric
+            | Op::ToNumber
+            | Op::ToBoolean
+            | Op::LogicalNot
+            | Op::Neg
+            | Op::Increment
+            | Op::BitwiseNot
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Rem
+            | Op::Pow
+            | Op::BitwiseAnd
+            | Op::BitwiseOr
+            | Op::BitwiseXor
+            | Op::Shl
+            | Op::Shr
+            | Op::Ushr
+            | Op::Equal
+            | Op::NotEqual
+            | Op::LessThan
+            | Op::LessEq
+            | Op::GreaterThan
+            | Op::GreaterEq
+            | Op::AddImm
+            | Op::SubImm
+            | Op::BitwiseAndImm
+            | Op::LessThanImm
+            | Op::EqualImm
+            | Op::NotEqualImm
+            | Op::JumpIfTrue
+            | Op::JumpIfFalse
+    )
 }
 
 fn instruction_accesses(
@@ -1032,12 +1202,37 @@ fn instruction_accesses(
             vec![register(instruction, code, 0)?],
         )),
         Op::BindThisValue => Some((vec![register(instruction, code, 0)?], Vec::new())),
-        Op::StoreProperty => Some((
+        Op::LoadProperty => {
+            let _ = instruction.const_index(code, 2)?;
+            Some((
+                vec![register(instruction, code, 1)?],
+                vec![register(instruction, code, 0)?],
+            ))
+        }
+        Op::StoreProperty => {
+            let _ = instruction.const_index(code, 1)?;
+            Some((
+                vec![
+                    register(instruction, code, 0)?,
+                    register(instruction, code, 2)?,
+                ],
+                vec![register(instruction, code, 3)?],
+            ))
+        }
+        Op::LoadElement => Some((
             vec![
-                register(instruction, code, 0)?,
+                register(instruction, code, 1)?,
                 register(instruction, code, 2)?,
             ],
-            vec![register(instruction, code, 3)?],
+            vec![register(instruction, code, 0)?],
+        )),
+        Op::StoreElement => Some((
+            vec![
+                register(instruction, code, 0)?,
+                register(instruction, code, 1)?,
+                register(instruction, code, 2)?,
+            ],
+            Vec::new(),
         )),
         Op::Call | Op::New | Op::SuperConstruct => {
             let count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
@@ -1231,6 +1426,20 @@ fn force_loop_parameters(
     Some(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaggedNumericDecode {
+    Number,
+    Int32,
+}
+
+#[derive(Clone, Copy)]
+struct NumericDecodeSite<'a> {
+    registers: &'a [RegisterState],
+    live_in: &'a [bool],
+    function_id: u32,
+    byte_pc: u32,
+}
+
 fn lower_instruction(
     instruction: &JitInstructionMetadata,
     code: &otter_vm::CodeBlock,
@@ -1250,11 +1459,19 @@ fn lower_instruction(
         u32,
         otter_vm::jit::JitConstructorFieldTransition,
     >,
+    element_accesses: &rustc_hash::FxHashMap<u32, otter_vm::JitElementAccess>,
+    cage_available: bool,
     direct_call_targets: &mut Vec<NumericDirectCallTarget>,
     direct_call_arguments: &mut Vec<NumericValue>,
     exceptional_edge: Option<usize>,
 ) -> Option<()> {
     let op = instruction.op(code);
+    let decode_site = NumericDecodeSite {
+        registers,
+        live_in,
+        function_id,
+        byte_pc: instruction.byte_pc,
+    };
     let node = match op {
         Op::Nop | Op::EnterTry | Op::LeaveTry => return Some(()),
         Op::StoreLocal => {
@@ -1271,11 +1488,18 @@ fn lower_instruction(
         Op::LoadNull => NumericNode::TaggedConstant(otter_vm::Value::null().to_bits()),
         Op::LoadThis => NumericNode::This,
         Op::LoadUpvalue => {
+            if !cage_available {
+                return None;
+            }
+            let index = instruction.imm32(code, 1)?;
+            if !(0..=4095).contains(&index) {
+                return None;
+            }
             let value = push(
                 nodes,
                 NumericNode::Upvalue {
-                    index: instruction.imm32(code, 1)?,
-                    exceptional_edge: exceptional_edge.map(u16::try_from).transpose().ok()?,
+                    index,
+                    byte_pc: instruction.byte_pc,
                 },
             );
             block_nodes.push(value);
@@ -1341,10 +1565,142 @@ fn lower_instruction(
             return Some(());
         }
         Op::StoreProperty if constructor_field_transitions.contains_key(&instruction.byte_pc) => {
+            let _ = instruction.const_index(code, 1)?;
             let value = push(
                 nodes,
                 NumericNode::ConstructorFieldStore {
                     object: read_value(registers, register(instruction, code, 0)?)?,
+                    value: read_value(registers, register(instruction, code, 2)?)?,
+                    byte_pc: instruction.byte_pc,
+                },
+            );
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
+            write(
+                registers,
+                register(instruction, code, 3)?,
+                RegisterState::Unset,
+            )?;
+            return Some(());
+        }
+        Op::LoadProperty => {
+            let _ = instruction.const_index(code, 2)?;
+            let value = push(
+                nodes,
+                NumericNode::PropertyLoad {
+                    receiver: read_value(registers, register(instruction, code, 1)?)?,
+                    byte_pc: instruction.byte_pc,
+                    exotic_length: instruction.load_array_length,
+                },
+            );
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
+            write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            )?;
+            return Some(());
+        }
+        Op::StoreProperty => {
+            let _ = instruction.const_index(code, 1)?;
+            let value = push(
+                nodes,
+                NumericNode::PropertyStore {
+                    receiver: read_value(registers, register(instruction, code, 0)?)?,
+                    value: read_value(registers, register(instruction, code, 2)?)?,
+                    byte_pc: instruction.byte_pc,
+                },
+            );
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
+            write(
+                registers,
+                register(instruction, code, 3)?,
+                RegisterState::Unset,
+            )?;
+            return Some(());
+        }
+        Op::LoadElement => {
+            if !element_access_is_usable(element_accesses, instruction.byte_pc, cage_available) {
+                return None;
+            }
+            let receiver = read_value(registers, register(instruction, code, 1)?)?;
+            if value_type(nodes, receiver)? != NumericType::Tagged {
+                return None;
+            }
+            let index = read_value(registers, register(instruction, code, 2)?)?;
+            if !matches!(
+                value_type(nodes, index)?,
+                NumericType::Tagged | NumericType::Int32 | NumericType::Uint32
+            ) {
+                return None;
+            }
+            let value = push(
+                nodes,
+                NumericNode::ElementLoad {
+                    receiver,
+                    index,
+                    byte_pc: instruction.byte_pc,
+                },
+            );
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
+            write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            )?;
+            return Some(());
+        }
+        Op::StoreElement => {
+            if !element_access_is_usable(element_accesses, instruction.byte_pc, cage_available) {
+                return None;
+            }
+            let receiver = read_value(registers, register(instruction, code, 0)?)?;
+            if value_type(nodes, receiver)? != NumericType::Tagged {
+                return None;
+            }
+            let index = read_value(registers, register(instruction, code, 1)?)?;
+            if !matches!(
+                value_type(nodes, index)?,
+                NumericType::Tagged | NumericType::Int32 | NumericType::Uint32
+            ) {
+                return None;
+            }
+            let value = push(
+                nodes,
+                NumericNode::ElementStore {
+                    receiver,
+                    index,
                     value: read_value(registers, register(instruction, code, 2)?)?,
                     byte_pc: instruction.byte_pc,
                 },
@@ -1597,7 +1953,14 @@ fn lower_instruction(
         }
         Op::ToPrimitive => {
             instruction.const_index(code, 2)?;
-            let value = read_number(registers, nodes, register(instruction, code, 1)?)?;
+            let value = read_number(
+                decode_site,
+                nodes,
+                block_nodes,
+                frame_states,
+                register(instruction, code, 1)?,
+                TaggedNumericDecode::Number,
+            )?;
             write(
                 registers,
                 register(instruction, code, 0)?,
@@ -1606,7 +1969,14 @@ fn lower_instruction(
             return Some(());
         }
         Op::ToNumeric | Op::ToNumber => {
-            let value = read_number(registers, nodes, register(instruction, code, 1)?)?;
+            let value = read_number(
+                decode_site,
+                nodes,
+                block_nodes,
+                frame_states,
+                register(instruction, code, 1)?,
+                TaggedNumericDecode::Number,
+            )?;
             write(
                 registers,
                 register(instruction, code, 0)?,
@@ -1670,8 +2040,29 @@ fn lower_instruction(
             if !instruction.arith_feedback().is_numeric_only() {
                 return None;
             }
-            let left = read_number(registers, nodes, register(instruction, code, 1)?)?;
-            let right = read_number(registers, nodes, register(instruction, code, 2)?)?;
+            let tagged_decode = if matches!(op, Op::Add | Op::Sub | Op::Mul)
+                && instruction.arith_feedback().is_int32_only()
+            {
+                TaggedNumericDecode::Int32
+            } else {
+                TaggedNumericDecode::Number
+            };
+            let left = read_number(
+                decode_site,
+                nodes,
+                block_nodes,
+                frame_states,
+                register(instruction, code, 1)?,
+                tagged_decode,
+            )?;
+            let right = read_number(
+                decode_site,
+                nodes,
+                block_nodes,
+                frame_states,
+                register(instruction, code, 2)?,
+                tagged_decode,
+            )?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
             if matches!(op, Op::Add | Op::Sub | Op::Mul)
                 && instruction.arith_feedback().is_int32_only()
@@ -1702,7 +2093,13 @@ fn lower_instruction(
             if !instruction.arith_feedback().is_int32_only() {
                 return None;
             }
-            let source = read_int32(registers, nodes, register(instruction, code, 1)?)?;
+            let source = read_int32(
+                decode_site,
+                nodes,
+                block_nodes,
+                frame_states,
+                register(instruction, code, 1)?,
+            )?;
             let immediate = instruction.imm32(code, 2)?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
             match op {
@@ -1713,9 +2110,10 @@ fn lower_instruction(
         }
         Op::BitwiseAndImm => {
             let source = read_int32_bits(
-                registers,
+                decode_site,
                 nodes,
                 block_nodes,
+                frame_states,
                 register(instruction, code, 1)?,
             )?;
             let immediate = instruction.imm32(code, 2)?;
@@ -1726,7 +2124,13 @@ fn lower_instruction(
             if !instruction.arith_feedback().is_int32_only() {
                 return None;
             }
-            let source = read_int32(registers, nodes, register(instruction, code, 1)?)?;
+            let source = read_int32(
+                decode_site,
+                nodes,
+                block_nodes,
+                frame_states,
+                register(instruction, code, 1)?,
+            )?;
             let immediate = instruction.imm32(code, 2)?;
             match op {
                 Op::LessThanImm => NumericNode::IntegerLessThanImmediate(source, immediate),
@@ -1737,15 +2141,17 @@ fn lower_instruction(
         }
         Op::BitwiseAnd | Op::BitwiseOr | Op::BitwiseXor | Op::Shl | Op::Shr | Op::Ushr => {
             let left = read_int32_bits(
-                registers,
+                decode_site,
                 nodes,
                 block_nodes,
+                frame_states,
                 register(instruction, code, 1)?,
             )?;
             let right = read_int32_bits(
-                registers,
+                decode_site,
                 nodes,
                 block_nodes,
+                frame_states,
                 register(instruction, code, 2)?,
             )?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
@@ -1761,9 +2167,10 @@ fn lower_instruction(
         }
         Op::BitwiseNot => {
             let source = read_int32_bits(
-                registers,
+                decode_site,
                 nodes,
                 block_nodes,
+                frame_states,
                 register(instruction, code, 1)?,
             )?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
@@ -1773,7 +2180,19 @@ fn lower_instruction(
             if !instruction.arith_feedback().is_numeric_only() {
                 return None;
             }
-            let source = read_number(registers, nodes, register(instruction, code, 1)?)?;
+            let tagged_decode = if instruction.arith_feedback().is_int32_only() {
+                TaggedNumericDecode::Int32
+            } else {
+                TaggedNumericDecode::Number
+            };
+            let source = read_number(
+                decode_site,
+                nodes,
+                block_nodes,
+                frame_states,
+                register(instruction, code, 1)?,
+                tagged_decode,
+            )?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
             if instruction.arith_feedback().is_int32_only()
                 && value_type(nodes, source)? == NumericType::Int32
@@ -1811,8 +2230,27 @@ fn lower_instruction(
                 )?;
                 return Some(());
             }
-            let left = read_number(registers, nodes, register(instruction, code, 1)?)?;
-            let right = read_number(registers, nodes, register(instruction, code, 2)?)?;
+            let tagged_decode = if instruction.arith_feedback().is_int32_only() {
+                TaggedNumericDecode::Int32
+            } else {
+                TaggedNumericDecode::Number
+            };
+            let left = read_number(
+                decode_site,
+                nodes,
+                block_nodes,
+                frame_states,
+                register(instruction, code, 1)?,
+                tagged_decode,
+            )?;
+            let right = read_number(
+                decode_site,
+                nodes,
+                block_nodes,
+                frame_states,
+                register(instruction, code, 2)?,
+                tagged_decode,
+            )?;
             if instruction.arith_feedback().is_int32_only()
                 && value_type(nodes, left)? == NumericType::Int32
                 && value_type(nodes, right)? == NumericType::Int32
@@ -1836,8 +2274,27 @@ fn lower_instruction(
             if !instruction.arith_feedback().is_numeric_only() {
                 return None;
             }
-            let left = read_number(registers, nodes, register(instruction, code, 1)?)?;
-            let right = read_number(registers, nodes, register(instruction, code, 2)?)?;
+            let tagged_decode = if instruction.arith_feedback().is_int32_only() {
+                TaggedNumericDecode::Int32
+            } else {
+                TaggedNumericDecode::Number
+            };
+            let left = read_number(
+                decode_site,
+                nodes,
+                block_nodes,
+                frame_states,
+                register(instruction, code, 1)?,
+                tagged_decode,
+            )?;
+            let right = read_number(
+                decode_site,
+                nodes,
+                block_nodes,
+                frame_states,
+                register(instruction, code, 2)?,
+                tagged_decode,
+            )?;
             if instruction.arith_feedback().is_int32_only()
                 && value_type(nodes, left)? == NumericType::Int32
                 && value_type(nodes, right)? == NumericType::Int32
@@ -1913,6 +2370,17 @@ fn push_frame_state(
     });
 }
 
+fn element_access_is_usable(
+    element_accesses: &rustc_hash::FxHashMap<u32, otter_vm::JitElementAccess>,
+    byte_pc: u32,
+    cage_available: bool,
+) -> bool {
+    cage_available
+        && element_accesses.get(&byte_pc).is_some_and(|access| {
+            access.type_tag != 0 && !matches!(access.base, JitElementBase::None)
+        })
+}
+
 fn push(nodes: &mut Vec<NumericNode>, node: NumericNode) -> NumericValue {
     let value = NumericValue(nodes.len());
     nodes.push(node);
@@ -1946,18 +2414,26 @@ fn read_state(registers: &[RegisterState], register: u16) -> Option<RegisterStat
 }
 
 fn read_number(
-    registers: &[RegisterState],
-    nodes: &[NumericNode],
+    site: NumericDecodeSite<'_>,
+    nodes: &mut Vec<NumericNode>,
+    block_nodes: &mut Vec<NumericValue>,
+    frame_states: &mut Vec<NumericFrameState>,
     register: u16,
+    tagged_decode: TaggedNumericDecode,
 ) -> Option<NumericValue> {
-    let RegisterState::Value(value) = read_state(registers, register)? else {
-        return None;
-    };
-    matches!(
-        nodes.get(value.0)?.value_type(),
-        NumericType::Int32 | NumericType::Uint32 | NumericType::Number
-    )
-    .then_some(value)
+    let value = read_value(site.registers, register)?;
+    match value_type(nodes, value)? {
+        NumericType::Int32 | NumericType::Uint32 | NumericType::Number => Some(value),
+        NumericType::Tagged => Some(push_tagged_numeric_decode(
+            site,
+            nodes,
+            block_nodes,
+            frame_states,
+            value,
+            tagged_decode,
+        )),
+        NumericType::Boolean => None,
+    }
 }
 
 fn read_value(registers: &[RegisterState], register: u16) -> Option<NumericValue> {
@@ -1968,34 +2444,79 @@ fn read_value(registers: &[RegisterState], register: u16) -> Option<NumericValue
 }
 
 fn read_int32(
-    registers: &[RegisterState],
-    nodes: &[NumericNode],
+    site: NumericDecodeSite<'_>,
+    nodes: &mut Vec<NumericNode>,
+    block_nodes: &mut Vec<NumericValue>,
+    frame_states: &mut Vec<NumericFrameState>,
     register: u16,
 ) -> Option<NumericValue> {
-    let RegisterState::Value(value) = read_state(registers, register)? else {
-        return None;
-    };
-    (value_type(nodes, value)? == NumericType::Int32).then_some(value)
+    let value = read_value(site.registers, register)?;
+    match value_type(nodes, value)? {
+        NumericType::Int32 => Some(value),
+        NumericType::Tagged => Some(push_tagged_numeric_decode(
+            site,
+            nodes,
+            block_nodes,
+            frame_states,
+            value,
+            TaggedNumericDecode::Int32,
+        )),
+        NumericType::Uint32 | NumericType::Number | NumericType::Boolean => None,
+    }
 }
 
 fn read_int32_bits(
-    registers: &[RegisterState],
+    site: NumericDecodeSite<'_>,
     nodes: &mut Vec<NumericNode>,
     block_nodes: &mut Vec<NumericValue>,
+    frame_states: &mut Vec<NumericFrameState>,
     register: u16,
 ) -> Option<NumericValue> {
-    let RegisterState::Value(value) = read_state(registers, register)? else {
-        return None;
-    };
+    let value = read_value(site.registers, register)?;
     let node = match value_type(nodes, value)? {
         NumericType::Int32 | NumericType::Uint32 => return Some(value),
         NumericType::Number => NumericNode::FloatToInt32(value),
         NumericType::Boolean => NumericNode::BooleanToInt32(value),
-        NumericType::Tagged => return None,
+        NumericType::Tagged => {
+            let number = push_tagged_numeric_decode(
+                site,
+                nodes,
+                block_nodes,
+                frame_states,
+                value,
+                TaggedNumericDecode::Number,
+            );
+            NumericNode::FloatToInt32(number)
+        }
     };
     let coerced = push(nodes, node);
     block_nodes.push(coerced);
     Some(coerced)
+}
+
+fn push_tagged_numeric_decode(
+    site: NumericDecodeSite<'_>,
+    nodes: &mut Vec<NumericNode>,
+    block_nodes: &mut Vec<NumericValue>,
+    frame_states: &mut Vec<NumericFrameState>,
+    source: NumericValue,
+    decode: TaggedNumericDecode,
+) -> NumericValue {
+    let node = match decode {
+        TaggedNumericDecode::Number => NumericNode::TaggedToNumber(source),
+        TaggedNumericDecode::Int32 => NumericNode::TaggedToInt32(source),
+    };
+    let value = push(nodes, node);
+    block_nodes.push(value);
+    push_frame_state(
+        frame_states,
+        NumericFramePoint::Node(value),
+        site.function_id,
+        site.byte_pc,
+        site.registers,
+        site.live_in,
+    );
+    value
 }
 
 fn value_type(nodes: &[NumericNode], value: NumericValue) -> Option<NumericType> {
@@ -2043,4 +2564,476 @@ fn widen_to_number(
 fn write(registers: &mut [RegisterState], register: u16, value: RegisterState) -> Option<()> {
     *registers.get_mut(usize::from(register))? = value;
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use otter_bytecode::{NO_HANDLER_OFFSET, Op, Operand};
+    use otter_vm::{
+        JitCompileSnapshot, JitDirectCallThisMode, JitDirectCallee, JitElementAccess,
+        jit::{JitDirectCallPlan, JitTestInstruction},
+        jit_feedback::{ARITH_INT32, ArithFeedback},
+        native_abi::NativeFrameKind,
+    };
+
+    use super::*;
+
+    fn catch_liveness_view() -> JitCompileSnapshot {
+        let instructions = vec![
+            (
+                Op::EnterTry,
+                vec![
+                    Operand::Imm32(10),
+                    Operand::Imm32(NO_HANDLER_OFFSET),
+                    Operand::Register(7),
+                ],
+            ),
+            (Op::LoadInt32, vec![Operand::Register(5), Operand::Imm32(7)]),
+            (
+                Op::Call,
+                vec![
+                    Operand::Register(6),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                ],
+            ),
+            (
+                Op::LoadInt32,
+                vec![Operand::Register(5), Operand::Imm32(41)],
+            ),
+            (Op::Jump, vec![Operand::Imm32(0)]),
+            (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(0)]),
+            (Op::LoadInt32, vec![Operand::Register(8), Operand::Imm32(2)]),
+            (
+                Op::LoadElement,
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ],
+            ),
+            (
+                Op::Mul,
+                vec![
+                    Operand::Register(4),
+                    Operand::Register(3),
+                    Operand::Register(8),
+                ],
+            ),
+            (Op::LeaveTry, Vec::new()),
+            (Op::ReturnValue, vec![Operand::Register(4)]),
+            (Op::ReturnValue, vec![Operand::Register(5)]),
+        ];
+        let mut view = JitCompileSnapshot::without_feedback(
+            91,
+            2,
+            9,
+            instructions
+                .into_iter()
+                .enumerate()
+                .map(|(pc, (op, operands))| {
+                    JitTestInstruction::new(op, pc as u32, pc as u32 * 8, operands)
+                })
+                .collect(),
+        );
+        view.seed_arith_feedback_for_test(8, ArithFeedback::from_bits(ARITH_INT32));
+        let call_byte_pc = view.instructions[2].byte_pc;
+        view.direct_callees.insert(
+            call_byte_pc,
+            JitDirectCallee {
+                plan: JitDirectCallPlan {
+                    function_id: 92,
+                    code_object_id: 1,
+                    entry_cell: 1,
+                    tier: NativeFrameKind::Baseline,
+                    this_mode: JitDirectCallThisMode::StrictOrLexical,
+                    is_derived_constructor: false,
+                    generated_stack_frame_bytes: Some(0),
+                    param_count: 0,
+                    register_count: 1,
+                    own_upvalue_count: 0,
+                    inherited_upvalue_count: 0,
+                },
+                receiver_allocation: None,
+            },
+        );
+        view.cage_base = 0x1000;
+        view.element_accesses.insert(
+            view.instructions[7].byte_pc,
+            JitElementAccess {
+                type_tag: 1,
+                base: JitElementBase::InBody { byte: 8 },
+                ..JitElementAccess::default()
+            },
+        );
+        view
+    }
+
+    fn property_view() -> JitCompileSnapshot {
+        JitCompileSnapshot::without_feedback(
+            101,
+            0,
+            4,
+            vec![
+                JitTestInstruction::new(
+                    Op::LoadInt32,
+                    0,
+                    0,
+                    vec![Operand::Register(0), Operand::Imm32(7)],
+                ),
+                JitTestInstruction::new(
+                    Op::LoadProperty,
+                    1,
+                    8,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::ConstIndex(9),
+                    ],
+                ),
+                JitTestInstruction::new(Op::LoadTrue, 2, 16, vec![Operand::Register(1)]),
+                JitTestInstruction::new(
+                    Op::StoreProperty,
+                    3,
+                    24,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstIndex(10),
+                        Operand::Register(1),
+                        Operand::Register(3),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 4, 32, vec![Operand::Register(2)]),
+            ],
+        )
+    }
+
+    fn property_catch_liveness_view() -> JitCompileSnapshot {
+        let instructions = vec![
+            (
+                Op::EnterTry,
+                vec![
+                    Operand::Imm32(10),
+                    Operand::Imm32(NO_HANDLER_OFFSET),
+                    Operand::Register(7),
+                ],
+            ),
+            (Op::LoadInt32, vec![Operand::Register(5), Operand::Imm32(7)]),
+            (
+                Op::Call,
+                vec![
+                    Operand::Register(6),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                ],
+            ),
+            (
+                Op::LoadInt32,
+                vec![Operand::Register(5), Operand::Imm32(41)],
+            ),
+            (Op::Jump, vec![Operand::Imm32(0)]),
+            (Op::Nop, Vec::new()),
+            (Op::Nop, Vec::new()),
+            (
+                Op::LoadProperty,
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(1),
+                    Operand::ConstIndex(1),
+                ],
+            ),
+            (Op::Nop, Vec::new()),
+            (Op::LeaveTry, Vec::new()),
+            (Op::ReturnValue, vec![Operand::Register(3)]),
+            (Op::ReturnValue, vec![Operand::Register(5)]),
+        ];
+        let mut view = JitCompileSnapshot::without_feedback(
+            102,
+            2,
+            8,
+            instructions
+                .into_iter()
+                .enumerate()
+                .map(|(pc, (op, operands))| {
+                    JitTestInstruction::new(op, pc as u32, pc as u32 * 8, operands)
+                })
+                .collect(),
+        );
+        let call_byte_pc = view.instructions[2].byte_pc;
+        view.direct_callees.insert(
+            call_byte_pc,
+            JitDirectCallee {
+                plan: JitDirectCallPlan {
+                    function_id: 103,
+                    code_object_id: 1,
+                    entry_cell: 1,
+                    tier: NativeFrameKind::Baseline,
+                    this_mode: JitDirectCallThisMode::StrictOrLexical,
+                    is_derived_constructor: false,
+                    generated_stack_frame_bytes: Some(0),
+                    param_count: 0,
+                    register_count: 1,
+                    own_upvalue_count: 0,
+                    inherited_upvalue_count: 0,
+                },
+                receiver_allocation: None,
+            },
+        );
+        view
+    }
+
+    #[test]
+    fn ordinary_properties_build_without_settled_metadata_and_keep_exact_states() {
+        let view = property_view();
+        assert!(view.property_loads.is_empty());
+        assert!(view.property_stores.is_empty());
+
+        let hir = NumericFunction::build(&view).expect("property HIR without settled metadata");
+        let receiver = hir
+            .nodes
+            .iter()
+            .position(|node| *node == NumericNode::IntegerConstant(7))
+            .map(NumericValue)
+            .expect("Int32 receiver");
+        let stored = hir
+            .nodes
+            .iter()
+            .position(|node| *node == NumericNode::BooleanConstant(true))
+            .map(NumericValue)
+            .expect("Boolean stored value");
+        let load = hir
+            .nodes
+            .iter()
+            .position(|node| {
+                *node
+                    == NumericNode::PropertyLoad {
+                        receiver,
+                        byte_pc: 8,
+                        exotic_length: false,
+                    }
+            })
+            .map(NumericValue)
+            .expect("ordinary property load");
+        let store = hir
+            .nodes
+            .iter()
+            .position(|node| {
+                *node
+                    == NumericNode::PropertyStore {
+                        receiver,
+                        value: stored,
+                        byte_pc: 24,
+                    }
+            })
+            .map(NumericValue)
+            .expect("ordinary property store");
+        assert_eq!(hir.nodes[load.0].value_type(), NumericType::Tagged);
+
+        let load_state = hir
+            .frame_states
+            .iter()
+            .find(|state| state.point == NumericFramePoint::Node(load))
+            .expect("exact pre-load state");
+        assert_eq!(load_state.byte_pc, 8);
+        assert_eq!(load_state.slots[0], NumericFrameSlot::Value(receiver));
+        assert_eq!(load_state.slots[2], NumericFrameSlot::Undefined);
+
+        let store_state = hir
+            .frame_states
+            .iter()
+            .find(|state| state.point == NumericFramePoint::Node(store))
+            .expect("exact pre-store state");
+        assert_eq!(store_state.byte_pc, 24);
+        assert_eq!(store_state.slots[0], NumericFrameSlot::Value(receiver));
+        assert_eq!(store_state.slots[1], NumericFrameSlot::Value(stored));
+        assert_eq!(store_state.slots[2], NumericFrameSlot::Value(load));
+        assert_eq!(store_state.slots[3], NumericFrameSlot::Undefined);
+    }
+
+    #[test]
+    fn named_length_property_load_retains_its_exotic_marker() {
+        let mut view = property_view();
+        view.instructions[1].load_array_length = true;
+
+        let hir = NumericFunction::build(&view).expect("named length property HIR");
+        assert!(hir.nodes.iter().any(|node| matches!(
+            node,
+            NumericNode::PropertyLoad {
+                byte_pc: 8,
+                exotic_length: true,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn property_inference_and_accesses_validate_constants_and_register_roles() {
+        let view = property_view();
+        let code = view.code_block.as_ref();
+        let mut origins = vec![1, 2, 4, 8];
+        let mut int32_parameters = 0;
+        let mut number_parameters = 0;
+
+        infer_instruction_parameters(
+            &view.instructions[1],
+            code,
+            &mut origins,
+            &mut int32_parameters,
+            &mut number_parameters,
+        )
+        .expect("property load inference");
+        assert_eq!(origins, [1, 2, 0, 8]);
+        assert_eq!(view.instructions[1].const_index(code, 2), Some(9));
+        assert_eq!(
+            instruction_accesses(&view.instructions[1], code),
+            Some((vec![0], vec![2]))
+        );
+
+        infer_instruction_parameters(
+            &view.instructions[3],
+            code,
+            &mut origins,
+            &mut int32_parameters,
+            &mut number_parameters,
+        )
+        .expect("property store inference");
+        assert_eq!(origins, [1, 2, 0, 0]);
+        assert_eq!(view.instructions[3].const_index(code, 1), Some(10));
+        assert_eq!(
+            instruction_accesses(&view.instructions[3], code),
+            Some((vec![0, 1], vec![3]))
+        );
+        assert_eq!(int32_parameters, 0);
+        assert_eq!(number_parameters, 0);
+    }
+
+    #[test]
+    fn property_store_kills_its_accessor_scratch() {
+        let view = JitCompileSnapshot::without_feedback(
+            104,
+            2,
+            3,
+            vec![
+                JitTestInstruction::new(
+                    Op::StoreProperty,
+                    0,
+                    0,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 1, 8, vec![Operand::Register(2)]),
+            ],
+        );
+        assert!(
+            NumericFunction::build(&view).is_none(),
+            "the opaque setter scratch must not become a reusable HIR value"
+        );
+    }
+
+    #[test]
+    fn load_property_implicit_exception_exit_keeps_catch_only_values_live() {
+        let view = property_catch_liveness_view();
+        let raw_blocks = build_raw_blocks(&view).expect("exception-aware raw blocks");
+        let handlers = build_instruction_exception_handlers(&view, &raw_blocks)
+            .expect("per-instruction catch handlers");
+        let live_in = build_liveness(&view, &raw_blocks, &handlers, 8)
+            .expect("exception-aware block liveness");
+        let property_block = raw_blocks
+            .iter()
+            .position(|block| block.start == 5)
+            .expect("property block after normal boundary");
+        assert!(
+            live_in[property_block][5],
+            "LoadProperty may throw to the catch that reads the redefined value"
+        );
+
+        let hir = NumericFunction::build(&view).expect("exception-aware property HIR");
+        let catch_value = hir
+            .nodes
+            .iter()
+            .position(|node| *node == NumericNode::IntegerConstant(41))
+            .map(NumericValue)
+            .expect("post-call catch-only definition");
+        let property = hir
+            .nodes
+            .iter()
+            .position(|node| matches!(node, NumericNode::PropertyLoad { .. }))
+            .map(NumericValue)
+            .expect("property load node");
+        let state = hir
+            .frame_states
+            .iter()
+            .find(|state| state.point == NumericFramePoint::Node(property))
+            .expect("exact pre-property state");
+        assert_eq!(state.slots[5], NumericFrameSlot::Value(catch_value));
+        assert_eq!(state.slots[7], NumericFrameSlot::Undefined);
+    }
+
+    #[test]
+    fn catch_only_definition_survives_later_element_and_decode_deopts() {
+        let view = catch_liveness_view();
+        let raw_blocks = build_raw_blocks(&view).expect("exception-aware raw blocks");
+        let handlers = build_instruction_exception_handlers(&view, &raw_blocks)
+            .expect("per-instruction catch handlers");
+        let live_in = build_liveness(&view, &raw_blocks, &handlers, 9)
+            .expect("exception-aware block liveness");
+        let after_call = raw_blocks
+            .iter()
+            .position(|block| block.start == 3)
+            .expect("post-call definition block");
+        let element_block = raw_blocks
+            .iter()
+            .position(|block| block.start == 5)
+            .expect("element block after normal boundary");
+        assert!(
+            !live_in[after_call][5],
+            "the definition must kill the call-edge value at block entry"
+        );
+        assert!(
+            live_in[element_block][5],
+            "the later catch side exit must retain the redefined value across the boundary"
+        );
+
+        let hir = NumericFunction::build(&view).expect("exception-aware numeric HIR");
+        let catch_value = hir
+            .nodes
+            .iter()
+            .position(|node| *node == NumericNode::IntegerConstant(41))
+            .map(NumericValue)
+            .expect("post-call catch-only definition");
+        let element = hir
+            .nodes
+            .iter()
+            .position(|node| matches!(node, NumericNode::ElementLoad { .. }))
+            .map(NumericValue)
+            .expect("element load node");
+        let decode = hir
+            .nodes
+            .iter()
+            .position(|node| matches!(node, NumericNode::TaggedToInt32(_)))
+            .map(NumericValue)
+            .expect("tagged Int32 decode node");
+
+        for point in [element, decode] {
+            let state = hir
+                .frame_states
+                .iter()
+                .find(|state| state.point == NumericFramePoint::Node(point))
+                .expect("exact pre-operation frame state");
+            assert_eq!(
+                state.slots[5],
+                NumericFrameSlot::Value(catch_value),
+                "catch-only redefinition must survive at {point:?}"
+            );
+            assert_eq!(
+                state.slots[7],
+                NumericFrameSlot::Undefined,
+                "the handler supplies the exception register"
+            );
+        }
+    }
 }

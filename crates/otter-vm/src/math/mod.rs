@@ -13,7 +13,6 @@
 //! - [`call`] — typed numeric dispatch shared by the native wrappers.
 //! - [`MathError`] — failure modes the dispatcher converts to
 //!   `VmError`.
-//! - Static-native identity selection for extracted-method JIT leaves.
 //!
 //! # Invariants
 //! - Extracted methods remain ordinary callable objects. Native leaf codegen is
@@ -22,6 +21,7 @@
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-math-object>
+//! - [`crate::jit_static_native`] for guarded static-native leaf declarations.
 
 use crate::native_function::NativeFastFn;
 use crate::number::{NumberValue, bitwise};
@@ -195,7 +195,7 @@ pub fn call(
     Ok(Value::number(value))
 }
 
-fn original_native_fn(method: otter_bytecode::method_id::MathMethod) -> NativeFastFn {
+pub(crate) fn original_native_fn(method: otter_bytecode::method_id::MathMethod) -> NativeFastFn {
     use otter_bytecode::method_id::MathMethod as M;
     match method {
         M::Abs => native_abs,
@@ -234,100 +234,6 @@ fn original_native_fn(method: otter_bytecode::method_id::MathMethod) -> NativeFa
         M::Tanh => native_tanh,
         M::Trunc => native_trunc,
     }
-}
-
-/// One numeric builtin a generated call site may reach through a declared leaf
-/// entry instead of a materialized frame.
-///
-/// The declared entry id is this row's identity everywhere downstream —
-/// feedback, relocations and diagnostics all carry it — so a builtin is named
-/// once, here, and nowhere in generated code.
-pub struct JitLeafBuiltin {
-    /// Bootstrap method whose original-realm function this row guards.
-    method: otter_bytecode::method_id::MathMethod,
-    /// Declared entry the guarded site calls once its guards pass.
-    pub leaf_stub_id: crate::native_abi::RuntimeStubId,
-    /// Exact JavaScript argument count the entry implements. A site passing any
-    /// other count keeps the ordinary path, so the variadic and defaulted forms
-    /// stay observable rather than being silently truncated to this entry.
-    pub argument_count: u8,
-}
-
-/// Bootstrap natives supported by leaf call codegen.
-///
-/// One row per builtin. A new one costs a row, its stub descriptor, and its
-/// Rust entry — no generated code, because the call site lowers every row the
-/// same way.
-const JIT_LEAF_BUILTINS: &[JitLeafBuiltin] = &[
-    JitLeafBuiltin {
-        method: otter_bytecode::method_id::MathMethod::Abs,
-        leaf_stub_id: crate::native_abi::STUB_MATH_ABS_LEAF.id,
-        argument_count: 1,
-    },
-    JitLeafBuiltin {
-        method: otter_bytecode::method_id::MathMethod::Floor,
-        leaf_stub_id: crate::native_abi::STUB_MATH_FLOOR_LEAF.id,
-        argument_count: 1,
-    },
-    JitLeafBuiltin {
-        method: otter_bytecode::method_id::MathMethod::Sqrt,
-        leaf_stub_id: crate::native_abi::STUB_MATH_SQRT_LEAF.id,
-        argument_count: 1,
-    },
-    JitLeafBuiltin {
-        method: otter_bytecode::method_id::MathMethod::Max,
-        leaf_stub_id: crate::native_abi::STUB_MATH_MAX_LEAF.id,
-        argument_count: 2,
-    },
-    JitLeafBuiltin {
-        method: otter_bytecode::method_id::MathMethod::Min,
-        leaf_stub_id: crate::native_abi::STUB_MATH_MIN_LEAF.id,
-        argument_count: 2,
-    },
-];
-
-/// Classify a callee against the leaf-callable builtin table.
-pub(crate) fn jit_static_call_target(
-    native: crate::NativeFunction,
-    heap: &otter_gc::GcHeap,
-) -> Option<&'static JitLeafBuiltin> {
-    for row in JIT_LEAF_BUILTINS {
-        if native.is_static_fn(heap, original_native_fn(row.method)) {
-            debug_assert_eq!(
-                native.native_ref(heap),
-                jit_static_call_ref(row.leaf_stub_id, heap),
-                "static-native classifier and JIT identity field must agree"
-            );
-            return Some(row);
-        }
-    }
-    None
-}
-
-/// Declaration behind a leaf entry id, or `None` when the id names an entry
-/// that is not a guarded callable builtin.
-#[must_use]
-pub fn jit_leaf_builtin(
-    stub_id: crate::native_abi::RuntimeStubId,
-) -> Option<&'static JitLeafBuiltin> {
-    JIT_LEAF_BUILTINS
-        .iter()
-        .find(|row| row.leaf_stub_id == stub_id)
-}
-
-/// External-reference index of the exact bootstrap function guarded before a
-/// declared leaf runs.
-///
-/// `None` when this isolate never installed the builtin, in which case no
-/// receiver can carry its identity and the site stays on the runtime path.
-#[must_use]
-pub fn jit_static_call_ref(
-    stub_id: crate::native_abi::RuntimeStubId,
-    heap: &otter_gc::GcHeap,
-) -> Option<u32> {
-    let row = jit_leaf_builtin(stub_id).expect("guarded leaf entry has a declaration");
-    heap.external_refs()
-        .lookup(original_native_fn(row.method) as *const () as usize)
 }
 
 fn native_call(

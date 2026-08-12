@@ -147,6 +147,7 @@ pub mod jit_registry;
 mod jit_runtime_ops;
 mod jit_spread_call_ops;
 mod jit_static_call_ops;
+pub mod jit_static_native;
 mod jit_structural_ops;
 mod jit_super_ops;
 mod jit_variadic_ops;

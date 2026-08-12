@@ -59,8 +59,8 @@ fn assert_array_sparse_power_indices_do_not_dense_allocate() {
     for _ in 0..32 {
         k *= 2;
         assert_eq!(
-            crate::array::get(arr, &heap, k - 2),
-            Value::number_f64(k as f64)
+            crate::array::get(arr, &heap, k - 2).as_f64(),
+            Some(k as f64)
         );
     }
 }

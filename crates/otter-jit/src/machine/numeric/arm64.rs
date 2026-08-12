@@ -31,6 +31,9 @@
 //!   value in allocator-owned late locations while one shared guard program
 //!   proves the VM-baked layout. A guard miss deoptimizes at the original
 //!   operation before effects; the generated hit cannot allocate or reenter.
+//!   Reducible non-reentrant packed-double loops may retain an untraced raw
+//!   base/length pair in the Machine frame across backedges. Entry, OSR, and
+//!   external loop-entry paths clear every pair before it can be observed.
 //! - Settled ordinary named properties consume the VM's complete monomorphic
 //!   or polymorphic shape/slot chain directly. Loads remain tagged; stores
 //!   guard the whole chain before one commit. Tagged values use the `x19`
@@ -60,7 +63,7 @@
 
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 use otter_vm::{
-    JitCompileSnapshot, NativeFrameFlags, UPVALUE_CELL_TYPE_TAG, Value,
+    JitCompileSnapshot, JitElementAccess, NativeFrameFlags, UPVALUE_CELL_TYPE_TAG, Value,
     deopt::DeoptRuntime,
     native_abi::{
         RuntimeStubDescriptor, STUB_ARRAY_CONSTRUCT_ALLOC, STUB_JIT_BACKEDGE_POLL,
@@ -74,7 +77,8 @@ use super::super::{
     AllocatedLocation, AllocatedSequence, AllocationEdit, AllocationPoint, CallTarget, DeoptId,
     DirectCallArgumentMode, DirectCallKind, InstructionSequence, MachineFrameLayout,
     MachineInstructionId, MachineOpcode, MachineOsrInput, MachineOsrType, MachineRepresentation,
-    MachineSafepointSite, MachineSafepointTable,
+    MachineSafepointSite, MachineSafepointTable, MachineValue, PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS,
+    PackedDoubleViewCacheId,
 };
 use crate::{
     CompiledCode, Unsupported,
@@ -100,9 +104,9 @@ use crate::{
         VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
     template::arm64::ic_probe::{
-        DenseIndexForm, element_access_for, emit_element_address, emit_element_read,
-        emit_element_write, emit_exotic_length_fast, emit_settled_property_load,
-        emit_settled_property_store_guard,
+        DenseIndexForm, element_access_for, emit_dense_element_view, emit_element_address,
+        emit_element_address_from_dense_view, emit_element_read, emit_element_write,
+        emit_exotic_length_fast, emit_settled_property_load, emit_settled_property_store_guard,
     },
     template::arm64::values::{
         CellTest, emit_cell_test, emit_slab_base, emit_write_barrier_with_context,
@@ -258,6 +262,7 @@ fn emit_float_to_int32_leaf(
     dynasm!(ops ; .arch aarch64 ; blr x16);
 }
 
+#[cfg(test)]
 pub(super) fn frame_layout(
     allocation: &AllocatedSequence,
     root_slots: u16,
@@ -269,6 +274,119 @@ pub(super) fn frame_layout(
         16,
     )
     .map_err(|_| Unsupported::OperandShape("scalar Machine IR frame layout"))
+}
+
+pub(super) fn frame_layout_with_raw_slots(
+    allocation: &AllocatedSequence,
+    root_slots: u16,
+    raw_slots: u16,
+) -> Result<MachineFrameLayout, Unsupported> {
+    MachineFrameLayout::new_with_raw_slots(
+        allocation,
+        root_slots,
+        raw_slots,
+        SavedFrame::from_allocation(allocation).fixed_bytes(),
+        16,
+    )
+    .map_err(|_| Unsupported::OperandShape("scalar Machine IR frame layout"))
+}
+
+fn packed_double_view_cache_offsets(
+    frame: MachineFrameLayout,
+    cache: PackedDoubleViewCacheId,
+) -> Result<(u32, u32), Unsupported> {
+    let base_slot = u16::try_from(cache.raw_word())
+        .map_err(|_| Unsupported::OperandShape("packed-double view-cache base slot"))?;
+    let length_slot = base_slot.checked_add(1).ok_or(Unsupported::OperandShape(
+        "packed-double view-cache length slot",
+    ))?;
+    Ok((
+        raw_offset(frame, base_slot)?,
+        raw_offset(frame, length_slot)?,
+    ))
+}
+
+fn emit_clear_packed_double_view_caches(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    frame: MachineFrameLayout,
+) -> Result<(), Unsupported> {
+    let cache_count = usize::from(frame.raw_slots()) / PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS;
+    for index in 0..cache_count {
+        let cache = PackedDoubleViewCacheId::new(index).ok_or(Unsupported::OperandShape(
+            "packed-double view-cache identity",
+        ))?;
+        let (base_offset, _) = packed_double_view_cache_offsets(frame, cache)?;
+        // Clear instructions own no clobber. AArch64's scaled unsigned STR
+        // reaches every bounded normal frame we admit without a scratch.
+        if base_offset > 32_760 || !base_offset.is_multiple_of(8) {
+            return Err(Unsupported::OperandShape(
+                "packed-double view-cache clear offset",
+            ));
+        }
+        dynasm!(ops ; .arch aarch64 ; str xzr, [sp, base_offset]);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_packed_double_element_address<R, I>(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    frame: MachineFrameLayout,
+    access: &JitElementAccess,
+    cache: Option<PackedDoubleViewCacheId>,
+    load_receiver: R,
+    load_index: I,
+    index_form: DenseIndexForm,
+    deopt: DynamicLabel,
+) -> Result<(), Unsupported>
+where
+    R: FnOnce(&mut dynasmrt::aarch64::Assembler, u8) -> Result<(), Unsupported>,
+    I: FnOnce(&mut dynasmrt::aarch64::Assembler, u8) -> Result<(), Unsupported>,
+{
+    let Some(cache) = cache else {
+        return emit_element_address(
+            ops,
+            relocations,
+            view,
+            access,
+            load_receiver,
+            load_index,
+            index_form,
+            deopt,
+        );
+    };
+    let (base_offset, length_offset) = packed_double_view_cache_offsets(frame, cache)?;
+    if base_offset > 32_760
+        || length_offset > 32_760
+        || !base_offset.is_multiple_of(8)
+        || !length_offset.is_multiple_of(8)
+    {
+        return Err(Unsupported::OperandShape(
+            "packed-double view-cache access offset",
+        ));
+    }
+    let cached = ops.new_dynamic_label();
+    let ready = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x16, [sp, base_offset]
+        ; cbnz x16, =>cached
+    );
+    emit_dense_element_view(ops, relocations, view, access, load_receiver, deopt)?;
+    // Publish base last. A zero base remains the inactive sentinel even if a
+    // cold proof exits before the pair is complete.
+    dynasm!(ops
+        ; .arch aarch64
+        ; str x14, [sp, length_offset]
+        ; str x16, [sp, base_offset]
+        ; b =>ready
+        ; =>cached
+        ; ldr x14, [sp, length_offset]
+        ; =>ready
+    );
+    emit_element_address_from_dense_view(ops, access, load_index, index_form, deopt)
 }
 
 pub(super) fn emit(
@@ -348,6 +466,7 @@ pub(super) fn emit(
         .any(|instruction| instruction.opcode == MachineOpcode::BackedgePoll);
 
     emit_prologue(&mut ops, frame, saved);
+    emit_clear_packed_double_view_caches(&mut ops, frame)?;
     if has_backedge_poll {
         dynasm!(ops ; .arch aarch64 ; movz w29, GENERATED_POLL_BATCH);
     }
@@ -577,6 +696,24 @@ pub(super) fn emit(
                     return Err(Unsupported::OperandShape("numeric ToInt32 leaf ABI"));
                 }
                 emit_float_to_int32_leaf(&mut ops, &mut relocations, number_to_int32_entry);
+            }
+            MachineOpcode::CheckedFloat64ToElementIndex(_) => {
+                let source = float_register(locations[0])?;
+                let destination = integer_register(locations[1])?;
+                let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                // `fcvtzu` saturates non-finite, negative, fractional, and
+                // out-of-range values away from an exact round trip. Positive
+                // zero and negative zero compare equal, which is the ordinary
+                // Array property-key behavior. The following element bounds
+                // check rejects every converted index outside the live prefix.
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; fcvtzu w16, D(source)
+                    ; ucvtf d31, w16
+                    ; fcmp D(source), d31
+                    ; b.ne =>deopt
+                    ; mov W(destination), w16
+                );
             }
             MachineOpcode::FloatNeg => {
                 let source = float_register(locations[0])?;
@@ -1076,6 +1213,100 @@ pub(super) fn emit(
                     ops.offset().0,
                 ));
             }
+            MachineOpcode::PackedDoubleElementLoad { byte_pc, cache } => {
+                let access =
+                    element_access_for(view, byte_pc)
+                        .copied()
+                        .ok_or(Unsupported::OperandShape(
+                            "scalar packed-double element load access",
+                        ))?;
+                if !super::hir::packed_double_element_access_is_exact(&access) {
+                    return Err(Unsupported::OperandShape(
+                        "scalar packed-double element load representation",
+                    ));
+                }
+                let index_value = instruction
+                    .operands
+                    .get(1)
+                    .ok_or(Unsupported::OperandShape(
+                        "scalar packed-double element load index",
+                    ))?
+                    .value;
+                let index_form =
+                    dense_index_form(sequence, index_value).ok_or(Unsupported::OperandShape(
+                        "scalar packed-double element load index representation",
+                    ))?;
+                let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let start = ops.offset().0;
+                emit_packed_double_element_address(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    frame,
+                    &access,
+                    cache,
+                    |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
+                    |ops, target| emit_load_allocated_integer(ops, frame, locations[1], target, 0),
+                    index_form,
+                    deopt,
+                )?;
+                let destination = float_register(locations[2])?;
+                dynasm!(ops ; .arch aarch64 ; ldr D(destination), [x16]);
+                structural_regions.push((
+                    "machinePackedDoubleElementLoad",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::PackedDoubleElementStore { byte_pc, cache } => {
+                let access =
+                    element_access_for(view, byte_pc)
+                        .copied()
+                        .ok_or(Unsupported::OperandShape(
+                            "scalar packed-double element store access",
+                        ))?;
+                if !super::hir::packed_double_element_access_is_exact(&access) {
+                    return Err(Unsupported::OperandShape(
+                        "scalar packed-double element store representation",
+                    ));
+                }
+                let index_value = instruction
+                    .operands
+                    .get(1)
+                    .ok_or(Unsupported::OperandShape(
+                        "scalar packed-double element store index",
+                    ))?
+                    .value;
+                let index_form =
+                    dense_index_form(sequence, index_value).ok_or(Unsupported::OperandShape(
+                        "scalar packed-double element store index representation",
+                    ))?;
+                let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let start = ops.offset().0;
+                emit_packed_double_element_address(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    frame,
+                    &access,
+                    cache,
+                    |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
+                    |ops, target| emit_load_allocated_integer(ops, frame, locations[1], target, 0),
+                    index_form,
+                    deopt,
+                )?;
+                let source = float_register(locations[2])?;
+                // This is the first and final effect. Every receiver, kind,
+                // index, bounds, and base proof is complete before the store.
+                dynasm!(ops ; .arch aarch64 ; str D(source), [x16]);
+                structural_regions.push((
+                    "machinePackedDoubleElementStore",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
             MachineOpcode::ElementLoad(byte_pc) => {
                 let access = element_access_for(view, byte_pc)
                     .copied()
@@ -1085,21 +1316,9 @@ pub(super) fn emit(
                     .get(1)
                     .ok_or(Unsupported::OperandShape("scalar element load index"))?
                     .value;
-                let index_form = match sequence
-                    .representations()
-                    .get(index_value.0 as usize)
-                    .copied()
-                {
-                    Some(MachineRepresentation::Tagged) => DenseIndexForm::Tagged,
-                    Some(MachineRepresentation::Int32 | MachineRepresentation::Uint32) => {
-                        DenseIndexForm::Int32
-                    }
-                    _ => {
-                        return Err(Unsupported::OperandShape(
-                            "scalar element load index representation",
-                        ));
-                    }
-                };
+                let index_form = dense_index_form(sequence, index_value).ok_or(
+                    Unsupported::OperandShape("scalar element load index representation"),
+                )?;
                 let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
                 let start = ops.offset().0;
                 emit_element_address(
@@ -1121,6 +1340,16 @@ pub(super) fn emit(
                     ops.offset().0,
                 ));
             }
+            MachineOpcode::ClearPackedDoubleViewCaches(_) => {
+                let start = ops.offset().0;
+                emit_clear_packed_double_view_caches(&mut ops, frame)?;
+                structural_regions.push((
+                    "machinePackedDoubleViewCacheClear",
+                    None,
+                    start,
+                    ops.offset().0,
+                ));
+            }
             MachineOpcode::ElementStore(byte_pc) => {
                 let access = element_access_for(view, byte_pc)
                     .copied()
@@ -1130,21 +1359,9 @@ pub(super) fn emit(
                     .get(1)
                     .ok_or(Unsupported::OperandShape("scalar element store index"))?
                     .value;
-                let index_form = match sequence
-                    .representations()
-                    .get(index_value.0 as usize)
-                    .copied()
-                {
-                    Some(MachineRepresentation::Tagged) => DenseIndexForm::Tagged,
-                    Some(MachineRepresentation::Int32 | MachineRepresentation::Uint32) => {
-                        DenseIndexForm::Int32
-                    }
-                    _ => {
-                        return Err(Unsupported::OperandShape(
-                            "scalar element store index representation",
-                        ));
-                    }
-                };
+                let index_form = dense_index_form(sequence, index_value).ok_or(
+                    Unsupported::OperandShape("scalar element store index representation"),
+                )?;
                 let value = instruction
                     .operands
                     .get(2)
@@ -2007,6 +2224,7 @@ pub(super) fn emit(
         let offset = ops.offset().0;
         let representation_bail = ops.new_dynamic_label();
         emit_prologue(&mut ops, frame, saved);
+        emit_clear_packed_double_view_caches(&mut ops, frame)?;
         if has_backedge_poll {
             dynasm!(ops ; .arch aarch64 ; movz w29, GENERATED_POLL_BATCH);
         }
@@ -2856,6 +3074,12 @@ fn root_offset(frame: MachineFrameLayout, slot: u16) -> Result<u32, Unsupported>
         .map_err(|_| Unsupported::OperandShape("scalar Machine IR root-save offset"))
 }
 
+fn raw_offset(frame: MachineFrameLayout, slot: u16) -> Result<u32, Unsupported> {
+    frame
+        .raw_offset(slot)
+        .map_err(|_| Unsupported::OperandShape("scalar Machine IR raw-cache offset"))
+}
+
 fn emit_sp_address_x9(ops: &mut dynasmrt::aarch64::Assembler, offset: u32) {
     if offset <= 4095 {
         dynasm!(ops ; .arch aarch64 ; add x9, sp, offset);
@@ -2908,11 +3132,51 @@ fn integer_register(location: AllocatedLocation) -> Result<u8, Unsupported> {
     }
 }
 
+fn dense_index_form(sequence: &InstructionSequence, value: MachineValue) -> Option<DenseIndexForm> {
+    match sequence.representations().get(value.0 as usize).copied()? {
+        MachineRepresentation::Tagged => Some(DenseIndexForm::Tagged),
+        MachineRepresentation::Int32 | MachineRepresentation::Uint32 => Some(DenseIndexForm::Int32),
+        _ => None,
+    }
+}
+
 fn float_register(location: AllocatedLocation) -> Result<u8, Unsupported> {
     match location {
         AllocatedLocation::Register(register) if register.is_float() => Ok(register.encoding()),
         AllocatedLocation::Register(_) | AllocatedLocation::Stack(_) => {
             Err(Unsupported::OperandShape("numeric floating register"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Rust's saturating float-to-Uint32 cast models AArch64 `fcvtzu`; the
+    /// emitter's following `ucvtf`/`fcmp` is exactly this equality test.
+    fn checked_element_index_model(value: f64) -> Option<u32> {
+        let index = value as u32;
+        (value == f64::from(index)).then_some(index)
+    }
+
+    #[test]
+    fn checked_element_index_accepts_only_exact_uint32_values() {
+        assert_eq!(checked_element_index_model(0.0), Some(0));
+        assert_eq!(checked_element_index_model(-0.0), Some(0));
+        assert_eq!(checked_element_index_model(1.0), Some(1));
+        assert_eq!(
+            checked_element_index_model(f64::from(u32::MAX)),
+            Some(u32::MAX)
+        );
+
+        for rejected in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.0,
+            0.5,
+            f64::from(u32::MAX) + 1.0,
+        ] {
+            assert_eq!(checked_element_index_model(rejected), None, "{rejected}");
         }
     }
 }

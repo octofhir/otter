@@ -79,6 +79,7 @@ mod constructor_fast_path;
 mod conversion;
 mod cpu_profile;
 pub mod date;
+mod element_feedback;
 pub mod eval_env;
 // `date` is a directory module — see `date/mod.rs`.
 mod activation_stack;

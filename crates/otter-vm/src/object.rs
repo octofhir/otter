@@ -2770,6 +2770,7 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
     heap.register_sever_restored::<crate::weak_refs::FinalizationRegistryBody>();
     register! {
         crate::array::ArrayBody,
+        crate::array::elements::ElementSlabBody,
         crate::value_slab::ValueSlabBody,
         crate::bigint::gc_body::BigIntBody,
         crate::binary::array_buffer::LocalArrayBufferBodyGc,

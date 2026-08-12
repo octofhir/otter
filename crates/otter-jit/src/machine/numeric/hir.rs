@@ -8,6 +8,8 @@
 //!   and prepared global reads, guarded coercions, ordinary properties,
 //!   indexed elements, arithmetic, comparison, typed array construction, and
 //!   typed plain/method calls.
+//! - [`NumericPackedDoubleViewCachePlan`] — bounded natural-loop sharing of
+//!   raw packed-array base/length proofs.
 //!
 //! # Invariants
 //! - Parameters remain tagged unless their uses prove a numeric representation;
@@ -23,10 +25,13 @@
 //! - Parameters outside the exact entry live-in set have no HIR value, load,
 //!   guard, or allocator interval.
 //! - Indexed loads and stores require a baked VM element program plus the GC
-//!   cage. Scalar Number indices remain admissible and are boxed without
-//!   allocation for the existing tagged-index probe. Their frame state
-//!   describes the exact pre-access register window; every side exit precedes
-//!   the load or the effect-only store.
+//!   cage. An ordinary packed-double array produces and consumes unboxed
+//!   Number values. Its scalar Number index is converted to an exact Uint32
+//!   before the address guard, while a still-tagged index retains the ordinary
+//!   exact int32-tag proof. Neither form boxes an already-scalar payload.
+//!   Other families retain the tagged-value contract.
+//!   Every conversion and access frame state describes the exact pre-access
+//!   register window; every side exit precedes the load or effect-only store.
 //! - Ordinary property nodes exist independently of settled shape/slot
 //!   metadata. Selection either emits a guarded hit or exact-deoptimizes at the
 //!   original bytecode. Named `.length` loads retain their exotic fast-path
@@ -64,13 +69,19 @@
 //! - Loop headers receive explicit parameters for every numeric value live from
 //!   a forward predecessor; backedge arguments are attached after all blocks
 //!   are lowered.
+//! - Packed-double view caches are planned only for reducible innermost loops
+//!   without allocation, JavaScript reentry, or incompatible stores. A cached
+//!   receiver is defined outside the loop or passes through an exact identity
+//!   header phi; every external entry edge is recorded for mandatory clearing.
 //! - HIR preserves source CFG edges; selection splits critical edges before
 //!   allocator move placement.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use otter_bytecode::{Op, Operand};
-use otter_vm::{JitCompileSnapshot, JitElementBase, JitInstructionMetadata};
+use otter_vm::{JitCompileSnapshot, JitElementBase, JitElementRepr, JitInstructionMetadata};
+
+use super::super::{MAX_PACKED_DOUBLE_VIEW_CACHES, PackedDoubleViewCacheId};
 
 const MAX_FUNCTION_INSTRUCTIONS: usize = 512;
 const MAX_FUNCTION_PARAMETERS: u16 = 16;
@@ -85,6 +96,15 @@ pub(super) enum NumericType {
     Uint32,
     Number,
     Boolean,
+}
+
+/// Value semantics selected by one immutable element-access snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NumericElementAccess {
+    /// Existing boxed arrays and typed views return/consume tagged values.
+    Tagged,
+    /// An ordinary Array whose live dense prefix is hole-free raw doubles.
+    PackedDouble,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -136,10 +156,16 @@ pub(super) enum NumericNode {
         receiver: NumericValue,
         index: NumericValue,
         byte_pc: u32,
+        access: NumericElementAccess,
     },
     ElementStore {
         receiver: NumericValue,
         index: NumericValue,
+        value: NumericValue,
+        byte_pc: u32,
+        access: NumericElementAccess,
+    },
+    CheckedFloat64ToElementIndex {
         value: NumericValue,
         byte_pc: u32,
     },
@@ -358,13 +384,16 @@ impl NumericNode {
             | Self::ConstructorFieldStore { .. }
             | Self::PropertyLoad { .. }
             | Self::PropertyStore { .. }
-            | Self::ElementLoad { .. }
             | Self::ElementStore { .. }
             | Self::ArrayConstruct { .. }
             | Self::TaggedStringConcat(..)
             | Self::DirectCall { .. }
             | Self::ColdCallExit { .. }
             | Self::BlockParameter(NumericType::Tagged) => NumericType::Tagged,
+            Self::ElementLoad {
+                access: NumericElementAccess::Tagged,
+                ..
+            } => NumericType::Tagged,
             Self::IntegerConstant(..)
             | Self::TaggedToInt32(..)
             | Self::FloatToInt32(..)
@@ -383,9 +412,9 @@ impl NumericNode {
             | Self::IntegerNot(..)
             | Self::IntegerAndImmediate(..)
             | Self::BlockParameter(NumericType::Int32) => NumericType::Int32,
-            Self::IntegerShiftRightLogical(..) | Self::BlockParameter(NumericType::Uint32) => {
-                NumericType::Uint32
-            }
+            Self::IntegerShiftRightLogical(..)
+            | Self::CheckedFloat64ToElementIndex { .. }
+            | Self::BlockParameter(NumericType::Uint32) => NumericType::Uint32,
             Self::LessThan(..)
             | Self::Equal(..)
             | Self::NotEqual(..)
@@ -411,6 +440,10 @@ impl NumericNode {
             Self::BooleanConstant(..) => NumericType::Boolean,
             Self::Parameter { value_type, .. } => value_type,
             Self::BlockParameter(NumericType::Number)
+            | Self::ElementLoad {
+                access: NumericElementAccess::PackedDouble,
+                ..
+            }
             | Self::TaggedToNumber(..)
             | Self::Constant(..)
             | Self::WidenInt32(..)
@@ -465,6 +498,44 @@ pub(super) struct NumericFunction {
     pub(super) parameter_count: u16,
     pub(super) register_count: u16,
     pub(super) arithmetic_op_count: usize,
+}
+
+/// One proven loop-scoped packed-double view shared by element sites.
+#[derive(Debug, Clone)]
+pub(super) struct NumericPackedDoubleViewCache {
+    /// Dense bounded identity used to address two raw frame words.
+    pub(super) id: PackedDoubleViewCacheId,
+    /// Reducible natural-loop header whose backedges may retain the view.
+    pub(super) loop_header: usize,
+    /// Canonical receiver value before any identity loop phi.
+    pub(super) receiver_root: NumericValue,
+    /// Outside-to-header edges that must clear this cache before entry.
+    pub(super) entry_edges: BTreeSet<(usize, usize)>,
+    /// Complete immutable VM layout proof shared by every grouped site.
+    pub(super) access: otter_vm::JitElementAccess,
+}
+
+/// Conservative target-neutral packed-double view-cache plan.
+#[derive(Debug, Clone, Default)]
+pub(super) struct NumericPackedDoubleViewCachePlan {
+    /// Cache descriptors in deterministic dense-id order.
+    pub(super) caches: Vec<NumericPackedDoubleViewCache>,
+    /// Element HIR value to its shared cache identity.
+    pub(super) sites: BTreeMap<NumericValue, PackedDoubleViewCacheId>,
+}
+
+impl NumericPackedDoubleViewCachePlan {
+    /// Cache identity assigned to one packed-double load or store.
+    #[must_use]
+    pub(super) fn cache_for(&self, site: NumericValue) -> Option<PackedDoubleViewCacheId> {
+        self.sites.get(&site).copied()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NumericNaturalLoop {
+    header: usize,
+    blocks: BTreeSet<usize>,
 }
 
 type PhiTypeOverrides = BTreeMap<(usize, u16), NumericType>;
@@ -528,6 +599,100 @@ impl NumericFunction {
             phi_types = next_phi_types;
         }
         None
+    }
+
+    /// Plan bounded raw view caches for safe packed-double loop sites.
+    ///
+    /// This analysis deliberately runs after HIR construction, when receiver
+    /// identity phis and the complete CFG are explicit. Failure to prove one
+    /// site merely leaves that site on its ordinary per-access guard path.
+    pub(super) fn plan_packed_double_view_caches(
+        &self,
+        view: &JitCompileSnapshot,
+    ) -> NumericPackedDoubleViewCachePlan {
+        let Some(loops) = innermost_reducible_natural_loops(&self.blocks) else {
+            return NumericPackedDoubleViewCachePlan::default();
+        };
+        let Some(node_blocks) = numeric_node_blocks(self) else {
+            return NumericPackedDoubleViewCachePlan::default();
+        };
+        let mut plan = NumericPackedDoubleViewCachePlan::default();
+
+        for natural_loop in loops {
+            if !packed_double_cache_loop_is_safe(self, &natural_loop) {
+                continue;
+            }
+            for &block_index in &natural_loop.blocks {
+                let Some(block) = self.blocks.get(block_index) else {
+                    continue;
+                };
+                for &site in &block.nodes {
+                    let Some((receiver, byte_pc)) =
+                        self.nodes.get(site.0).and_then(|node| match *node {
+                            NumericNode::ElementLoad {
+                                receiver,
+                                byte_pc,
+                                access: NumericElementAccess::PackedDouble,
+                                ..
+                            }
+                            | NumericNode::ElementStore {
+                                receiver,
+                                byte_pc,
+                                access: NumericElementAccess::PackedDouble,
+                                ..
+                            } => Some((receiver, byte_pc)),
+                            _ => None,
+                        })
+                    else {
+                        continue;
+                    };
+                    let Some(access) = view.element_accesses.get(&byte_pc).copied() else {
+                        continue;
+                    };
+                    if !packed_double_element_access_is_exact(&access) {
+                        continue;
+                    }
+                    let Some(receiver_root) = canonical_loop_invariant_receiver(
+                        self,
+                        &natural_loop,
+                        &node_blocks,
+                        receiver,
+                    ) else {
+                        continue;
+                    };
+
+                    let cache_id = plan
+                        .caches
+                        .iter()
+                        .find(|cache| {
+                            cache.loop_header == natural_loop.header
+                                && cache.receiver_root == receiver_root
+                                && same_element_access(&cache.access, &access)
+                        })
+                        .map(|cache| cache.id)
+                        .or_else(|| {
+                            let id = PackedDoubleViewCacheId::new(plan.caches.len())?;
+                            plan.caches.push(NumericPackedDoubleViewCache {
+                                id,
+                                loop_header: natural_loop.header,
+                                receiver_root,
+                                entry_edges: packed_double_cache_entry_edges(
+                                    &self.blocks,
+                                    &natural_loop,
+                                ),
+                                access,
+                            });
+                            Some(id)
+                        });
+                    if let Some(cache_id) = cache_id {
+                        plan.sites.insert(site, cache_id);
+                    }
+                }
+            }
+        }
+
+        debug_assert!(plan.caches.len() <= MAX_PACKED_DOUBLE_VIEW_CACHES);
+        plan
     }
 
     fn build_attempt(
@@ -859,6 +1024,220 @@ impl NumericFunction {
             retry,
         ))
     }
+}
+
+fn numeric_node_blocks(function: &NumericFunction) -> Option<Vec<Option<usize>>> {
+    let mut blocks = vec![None; function.nodes.len()];
+    for (block_index, block) in function.blocks.iter().enumerate() {
+        for &node in &block.nodes {
+            let owner = blocks.get_mut(node.0)?;
+            match *owner {
+                None => *owner = Some(block_index),
+                Some(previous) if previous == block_index => {}
+                Some(_) => return None,
+            }
+        }
+    }
+    Some(blocks)
+}
+
+fn innermost_reducible_natural_loops(blocks: &[NumericBlock]) -> Option<Vec<NumericNaturalLoop>> {
+    let dominators = numeric_dominators(blocks)?;
+    let mut loops = Vec::<NumericNaturalLoop>::new();
+    for (latch, block) in blocks.iter().enumerate() {
+        for &header in &block.successors {
+            if !dominators.get(latch)?.contains(&header) {
+                continue;
+            }
+            let mut members = BTreeSet::from([header, latch]);
+            let mut pending = (latch != header)
+                .then_some(latch)
+                .into_iter()
+                .collect::<Vec<_>>();
+            while let Some(member) = pending.pop() {
+                for &predecessor in &blocks.get(member)?.predecessors {
+                    if members.insert(predecessor) && predecessor != header {
+                        pending.push(predecessor);
+                    }
+                }
+            }
+            if members.iter().any(|&member| {
+                member != header
+                    && blocks[member]
+                        .predecessors
+                        .iter()
+                        .any(|predecessor| !members.contains(predecessor))
+            }) {
+                continue;
+            }
+            if let Some(existing) = loops
+                .iter_mut()
+                .find(|candidate| candidate.header == header)
+            {
+                existing.blocks.extend(members);
+            } else {
+                loops.push(NumericNaturalLoop {
+                    header,
+                    blocks: members,
+                });
+            }
+        }
+    }
+
+    let all_loops = loops.clone();
+    loops.retain(|candidate| {
+        !all_loops.iter().any(|inner| {
+            inner.header != candidate.header
+                && inner.blocks.len() < candidate.blocks.len()
+                && inner.blocks.is_subset(&candidate.blocks)
+        })
+    });
+    loops.sort_by_key(|natural_loop| natural_loop.header);
+    Some(loops)
+}
+
+fn numeric_dominators(blocks: &[NumericBlock]) -> Option<Vec<BTreeSet<usize>>> {
+    if blocks.is_empty() {
+        return None;
+    }
+    let all = (0..blocks.len()).collect::<BTreeSet<_>>();
+    let mut dominators = vec![all; blocks.len()];
+    dominators[0] = BTreeSet::from([0]);
+    loop {
+        let mut changed = false;
+        for block_index in 1..blocks.len() {
+            let block = blocks.get(block_index)?;
+            let mut next = block
+                .predecessors
+                .iter()
+                .map(|&predecessor| dominators.get(predecessor).cloned())
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .reduce(|left, right| left.intersection(&right).copied().collect())?;
+            next.insert(block_index);
+            if next != dominators[block_index] {
+                dominators[block_index] = next;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Some(dominators);
+        }
+    }
+}
+
+fn packed_double_cache_loop_is_safe(
+    function: &NumericFunction,
+    natural_loop: &NumericNaturalLoop,
+) -> bool {
+    natural_loop.blocks.iter().all(|&block_index| {
+        function.blocks.get(block_index).is_some_and(|block| {
+            block.nodes.iter().all(|&node| {
+                function.nodes.get(node.0).is_some_and(|node| {
+                    !matches!(
+                        node,
+                        NumericNode::DirectCall { .. }
+                            | NumericNode::ColdCallExit { .. }
+                            | NumericNode::ArrayConstruct { .. }
+                            | NumericNode::TaggedStringConcat(..)
+                            | NumericNode::BindThis { .. }
+                            | NumericNode::ClassSuperConstructor(..)
+                            | NumericNode::ConstructorFieldStore { .. }
+                            | NumericNode::PropertyStore { .. }
+                            | NumericNode::ElementStore {
+                                access: NumericElementAccess::Tagged,
+                                ..
+                            }
+                    )
+                })
+            })
+        })
+    })
+}
+
+fn packed_double_cache_entry_edges(
+    blocks: &[NumericBlock],
+    natural_loop: &NumericNaturalLoop,
+) -> BTreeSet<(usize, usize)> {
+    blocks
+        .iter()
+        .enumerate()
+        .filter(|(predecessor, _)| !natural_loop.blocks.contains(predecessor))
+        .flat_map(|(predecessor, block)| {
+            block
+                .successors
+                .iter()
+                .enumerate()
+                .filter_map(move |(edge, &successor)| {
+                    (successor == natural_loop.header).then_some((predecessor, edge))
+                })
+        })
+        .collect()
+}
+
+fn canonical_loop_invariant_receiver(
+    function: &NumericFunction,
+    natural_loop: &NumericNaturalLoop,
+    node_blocks: &[Option<usize>],
+    receiver: NumericValue,
+) -> Option<NumericValue> {
+    let header = function.blocks.get(natural_loop.header)?;
+    if let Some(parameter_index) = header
+        .parameters
+        .iter()
+        .position(|&parameter| parameter == receiver)
+    {
+        let mut root = None;
+        for &predecessor in &header.predecessors {
+            let edge = function
+                .blocks
+                .get(predecessor)?
+                .successors
+                .iter()
+                .position(|&successor| successor == natural_loop.header)?;
+            let argument = *function
+                .blocks
+                .get(predecessor)?
+                .successor_arguments
+                .get(edge)?
+                .get(parameter_index)?;
+            if natural_loop.blocks.contains(&predecessor) && argument != receiver {
+                return None;
+            }
+            if !natural_loop.blocks.contains(&predecessor) {
+                match root {
+                    Some(previous) if previous != argument => return None,
+                    Some(_) => {}
+                    None => root = Some(argument),
+                }
+            }
+        }
+        let root = root?;
+        return value_is_defined_outside_loop(node_blocks, natural_loop, root).then_some(root);
+    }
+    value_is_defined_outside_loop(node_blocks, natural_loop, receiver).then_some(receiver)
+}
+
+fn value_is_defined_outside_loop(
+    node_blocks: &[Option<usize>],
+    natural_loop: &NumericNaturalLoop,
+    value: NumericValue,
+) -> bool {
+    node_blocks
+        .get(value.0)
+        .is_some_and(|block| block.is_some_and(|block| !natural_loop.blocks.contains(&block)))
+}
+
+fn same_element_access(
+    left: &otter_vm::JitElementAccess,
+    right: &otter_vm::JitElementAccess,
+) -> bool {
+    left.type_tag == right.type_tag
+        && left.guards == right.guards
+        && left.length_byte == right.length_byte
+        && left.length_width == right.length_width
+        && left.base == right.base
+        && left.element == right.element
 }
 
 fn infer_parameter_types(
@@ -1990,14 +2369,13 @@ fn lower_instruction(
             return Some(());
         }
         Op::LoadElement => {
-            if !element_access_is_usable(element_accesses, instruction.byte_pc, cage_available) {
-                return None;
-            }
+            let access =
+                element_access_kind(element_accesses, instruction.byte_pc, cage_available)?;
             let receiver = read_value(registers, register(instruction, code, 1)?)?;
             if value_type(nodes, receiver)? != NumericType::Tagged {
                 return None;
             }
-            let index = read_value(registers, register(instruction, code, 2)?)?;
+            let mut index = read_value(registers, register(instruction, code, 2)?)?;
             if !matches!(
                 value_type(nodes, index)?,
                 NumericType::Tagged
@@ -2007,12 +2385,34 @@ fn lower_instruction(
             ) {
                 return None;
             }
+            if access == NumericElementAccess::PackedDouble
+                && value_type(nodes, index)? == NumericType::Number
+            {
+                let checked = push(
+                    nodes,
+                    NumericNode::CheckedFloat64ToElementIndex {
+                        value: index,
+                        byte_pc: instruction.byte_pc,
+                    },
+                );
+                block_nodes.push(checked);
+                push_frame_state(
+                    frame_states,
+                    NumericFramePoint::Node(checked),
+                    function_id,
+                    instruction.byte_pc,
+                    registers,
+                    live_in,
+                );
+                index = checked;
+            }
             let value = push(
                 nodes,
                 NumericNode::ElementLoad {
                     receiver,
                     index,
                     byte_pc: instruction.byte_pc,
+                    access,
                 },
             );
             block_nodes.push(value);
@@ -2032,14 +2432,13 @@ fn lower_instruction(
             return Some(());
         }
         Op::StoreElement => {
-            if !element_access_is_usable(element_accesses, instruction.byte_pc, cage_available) {
-                return None;
-            }
+            let access =
+                element_access_kind(element_accesses, instruction.byte_pc, cage_available)?;
             let receiver = read_value(registers, register(instruction, code, 0)?)?;
             if value_type(nodes, receiver)? != NumericType::Tagged {
                 return None;
             }
-            let index = read_value(registers, register(instruction, code, 1)?)?;
+            let mut index = read_value(registers, register(instruction, code, 1)?)?;
             if !matches!(
                 value_type(nodes, index)?,
                 NumericType::Tagged
@@ -2049,13 +2448,57 @@ fn lower_instruction(
             ) {
                 return None;
             }
+            if access == NumericElementAccess::PackedDouble
+                && value_type(nodes, index)? == NumericType::Number
+            {
+                let checked = push(
+                    nodes,
+                    NumericNode::CheckedFloat64ToElementIndex {
+                        value: index,
+                        byte_pc: instruction.byte_pc,
+                    },
+                );
+                block_nodes.push(checked);
+                push_frame_state(
+                    frame_states,
+                    NumericFramePoint::Node(checked),
+                    function_id,
+                    instruction.byte_pc,
+                    registers,
+                    live_in,
+                );
+                index = checked;
+            }
+            let source_register = register(instruction, code, 2)?;
+            let mut stored = read_value(registers, source_register)?;
+            if access == NumericElementAccess::PackedDouble {
+                stored = match value_type(nodes, stored)? {
+                    NumericType::Number => stored,
+                    NumericType::Int32 | NumericType::Uint32 => {
+                        widen_to_number(stored, nodes, block_nodes)?
+                    }
+                    NumericType::Tagged if instruction.arith_feedback().is_numeric_only() => {
+                        let decoded = read_number(
+                            decode_site,
+                            nodes,
+                            block_nodes,
+                            frame_states,
+                            source_register,
+                            TaggedNumericDecode::Number,
+                        )?;
+                        widen_to_number(decoded, nodes, block_nodes)?
+                    }
+                    NumericType::Tagged | NumericType::Boolean => return None,
+                };
+            }
             let value = push(
                 nodes,
                 NumericNode::ElementStore {
                     receiver,
                     index,
-                    value: read_value(registers, register(instruction, code, 2)?)?,
+                    value: stored,
                     byte_pc: instruction.byte_pc,
+                    access,
                 },
             );
             block_nodes.push(value);
@@ -2846,15 +3289,32 @@ fn push_frame_state(
     });
 }
 
-fn element_access_is_usable(
+fn element_access_kind(
     element_accesses: &rustc_hash::FxHashMap<u32, otter_vm::JitElementAccess>,
     byte_pc: u32,
     cage_available: bool,
-) -> bool {
-    cage_available
-        && element_accesses.get(&byte_pc).is_some_and(|access| {
-            access.type_tag != 0 && !matches!(access.base, JitElementBase::None)
-        })
+) -> Option<NumericElementAccess> {
+    let access = cage_available
+        .then(|| element_accesses.get(&byte_pc))
+        .flatten()?;
+    if access.type_tag == 0 || matches!(access.base, JitElementBase::None) {
+        return None;
+    }
+    if packed_double_element_access_is_exact(access) {
+        Some(NumericElementAccess::PackedDouble)
+    } else if access.element == JitElementRepr::Float64
+        && matches!(access.base, JitElementBase::InBody { .. })
+    {
+        // An in-body Float64 declaration without both ordinary-Array guards
+        // could reinterpret tagged words after a storage-kind transition.
+        None
+    } else {
+        Some(NumericElementAccess::Tagged)
+    }
+}
+
+pub(super) fn packed_double_element_access_is_exact(access: &otter_vm::JitElementAccess) -> bool {
+    access.is_packed_double_array()
 }
 
 fn push(nodes: &mut Vec<NumericNode>, node: NumericNode) -> NumericValue {
@@ -3234,6 +3694,193 @@ mod tests {
             );
         }
         view
+    }
+
+    fn packed_double_number_index_element_view() -> JitCompileSnapshot {
+        let mut view = number_index_element_view();
+        for access in view.element_accesses.values_mut() {
+            *access = JitElementAccess::packed_double_array();
+        }
+        view
+    }
+
+    fn packed_double_loop_view() -> JitCompileSnapshot {
+        let instructions = vec![
+            (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
+            (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(2)]),
+            (
+                Op::LessThan,
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ],
+            ),
+            (
+                Op::JumpIfFalse,
+                vec![Operand::Imm32(4), Operand::Register(3)],
+            ),
+            (
+                Op::LoadElement,
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (
+                Op::StoreElement,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::Register(3),
+                ],
+            ),
+            (
+                Op::AddImm,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(1),
+                    Operand::Imm32(1),
+                ],
+            ),
+            (Op::Jump, vec![Operand::Imm32(-6)]),
+            (Op::ReturnValue, vec![Operand::Register(0)]),
+        ];
+        let mut view = JitCompileSnapshot::without_feedback(
+            151,
+            1,
+            4,
+            instructions
+                .into_iter()
+                .enumerate()
+                .map(|(pc, (op, operands))| {
+                    JitTestInstruction::new(op, pc as u32, pc as u32 * 8, operands)
+                })
+                .collect(),
+        );
+        view.seed_arith_feedback_for_test(2, ArithFeedback::from_bits(ARITH_INT32));
+        view.seed_arith_feedback_for_test(6, ArithFeedback::from_bits(ARITH_INT32));
+        view.cage_base = 0x1000;
+        for byte_pc in [32, 40] {
+            view.element_accesses
+                .insert(byte_pc, JitElementAccess::packed_double_array());
+        }
+        view
+    }
+
+    fn packed_double_cache_function(
+        varying_receiver: bool,
+        unsafe_loop: bool,
+    ) -> (
+        NumericFunction,
+        JitCompileSnapshot,
+        NumericValue,
+        NumericValue,
+    ) {
+        let value = NumericValue;
+        let mut nodes = vec![
+            NumericNode::Parameter {
+                register: 0,
+                value_type: NumericType::Tagged,
+            },
+            NumericNode::BlockParameter(NumericType::Tagged),
+            NumericNode::IntegerConstant(0),
+            NumericNode::ElementLoad {
+                receiver: value(1),
+                index: value(2),
+                byte_pc: 24,
+                access: NumericElementAccess::PackedDouble,
+            },
+            NumericNode::ElementStore {
+                receiver: value(1),
+                index: value(2),
+                value: value(3),
+                byte_pc: 32,
+                access: NumericElementAccess::PackedDouble,
+            },
+            NumericNode::BooleanConstant(true),
+        ];
+        let mut loop_nodes = vec![value(2), value(3), value(4)];
+        if unsafe_loop {
+            nodes.push(NumericNode::ArrayConstruct {
+                length: value(2),
+                byte_pc: 40,
+            });
+            loop_nodes.push(value(6));
+        }
+        let backedge_receiver = if varying_receiver { value(2) } else { value(1) };
+        let function = NumericFunction {
+            function_id: 150,
+            nodes,
+            blocks: vec![
+                NumericBlock {
+                    logical_pc: 0,
+                    predecessors: Vec::new(),
+                    successors: vec![1],
+                    parameters: Vec::new(),
+                    parameter_registers: Vec::new(),
+                    successor_arguments: vec![vec![value(0)]],
+                    nodes: vec![value(0)],
+                    terminator: NumericTerminator::Jump,
+                },
+                NumericBlock {
+                    logical_pc: 1,
+                    predecessors: vec![0, 2],
+                    successors: vec![2, 3],
+                    parameters: vec![value(1)],
+                    parameter_registers: vec![0],
+                    successor_arguments: vec![Vec::new(), Vec::new()],
+                    nodes: vec![value(1), value(5)],
+                    terminator: NumericTerminator::Branch {
+                        condition: value(5),
+                        when_true: true,
+                    },
+                },
+                NumericBlock {
+                    logical_pc: 2,
+                    predecessors: vec![1],
+                    successors: vec![1],
+                    parameters: Vec::new(),
+                    parameter_registers: Vec::new(),
+                    successor_arguments: vec![vec![backedge_receiver]],
+                    nodes: loop_nodes,
+                    terminator: NumericTerminator::Jump,
+                },
+                NumericBlock {
+                    logical_pc: 3,
+                    predecessors: vec![1],
+                    successors: Vec::new(),
+                    parameters: Vec::new(),
+                    parameter_registers: Vec::new(),
+                    successor_arguments: Vec::new(),
+                    nodes: Vec::new(),
+                    terminator: NumericTerminator::Return(value(0)),
+                },
+            ],
+            frame_states: Vec::new(),
+            direct_call_targets: Vec::new(),
+            direct_call_arguments: Vec::new(),
+            parameter_count: 1,
+            register_count: 6,
+            arithmetic_op_count: 0,
+        };
+        let mut view = JitCompileSnapshot::without_feedback(
+            150,
+            1,
+            1,
+            vec![JitTestInstruction::new(
+                Op::ReturnValue,
+                0,
+                0,
+                vec![Operand::Register(0)],
+            )],
+        );
+        view.element_accesses
+            .insert(24, JitElementAccess::packed_double_array());
+        view.element_accesses
+            .insert(32, JitElementAccess::packed_double_array());
+        (function, view, value(3), value(4))
     }
 
     fn global_load_view() -> JitCompileSnapshot {
@@ -4351,6 +4998,209 @@ mod tests {
             assert_eq!(state.byte_pc, byte_pc);
             assert_eq!(state.slots[3], NumericFrameSlot::Value(product));
         }
+    }
+
+    #[test]
+    fn packed_double_elements_keep_payloads_unboxed_and_check_number_indices() {
+        let mut incomplete = packed_double_number_index_element_view();
+        incomplete
+            .element_accesses
+            .get_mut(&8)
+            .expect("packed load access")
+            .guards[1] = None;
+        assert!(
+            NumericFunction::build(&incomplete).is_none(),
+            "raw Float64 InBody storage is unsafe without the physical-kind guard"
+        );
+
+        let hir = NumericFunction::build(&packed_double_number_index_element_view())
+            .expect("PackedDouble Number-index element HIR");
+        let product = hir
+            .nodes
+            .iter()
+            .position(|node| matches!(node, NumericNode::Mul(..)))
+            .map(NumericValue)
+            .expect("guarded Float64 product");
+        let checks = hir
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| match node {
+                NumericNode::CheckedFloat64ToElementIndex { value, byte_pc }
+                    if *value == product =>
+                {
+                    Some((NumericValue(index), *byte_pc))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            checks
+                .iter()
+                .map(|(_, byte_pc)| *byte_pc)
+                .collect::<Vec<_>>(),
+            [8, 16]
+        );
+        for &(check, byte_pc) in &checks {
+            assert_eq!(hir.nodes[check.0].value_type(), NumericType::Uint32);
+            let state = hir
+                .frame_states
+                .iter()
+                .find(|state| state.point == NumericFramePoint::Node(check))
+                .expect("exact pre-element index conversion state");
+            assert_eq!(state.byte_pc, byte_pc);
+            assert_eq!(state.slots[3], NumericFrameSlot::Value(product));
+        }
+
+        let load = hir
+            .nodes
+            .iter()
+            .enumerate()
+            .find_map(|(index, node)| match node {
+                NumericNode::ElementLoad {
+                    index: checked,
+                    access: NumericElementAccess::PackedDouble,
+                    ..
+                } => Some((NumericValue(index), *checked)),
+                _ => None,
+            })
+            .expect("PackedDouble element load");
+        assert_eq!(load.1, checks[0].0);
+        assert_eq!(hir.nodes[load.0.0].value_type(), NumericType::Number);
+        assert!(
+            !hir.nodes.contains(&NumericNode::TaggedToNumber(load.0)),
+            "the packed load must not immediately decode its own result"
+        );
+
+        let store = hir
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(
+                    node,
+                    NumericNode::ElementStore {
+                        index,
+                        value,
+                        access: NumericElementAccess::PackedDouble,
+                        ..
+                    } if *index == checks[1].0 && *value == load.0
+                )
+            })
+            .expect("PackedDouble element store");
+        assert_eq!(store.value_type(), NumericType::Tagged);
+    }
+
+    #[test]
+    fn packed_double_view_cache_groups_identity_phi_sites_and_records_entries() {
+        let (function, view, load, store) = packed_double_cache_function(false, false);
+        let plan = function.plan_packed_double_view_caches(&view);
+        assert_eq!(plan.caches.len(), 1);
+        let cache = &plan.caches[0];
+        assert_eq!(cache.id.index(), 0);
+        assert_eq!(cache.loop_header, 1);
+        assert_eq!(cache.receiver_root, NumericValue(0));
+        assert_eq!(cache.entry_edges, BTreeSet::from([(0, 0)]));
+        assert!(cache.access.is_packed_double_array());
+        assert_eq!(plan.cache_for(load), Some(cache.id));
+        assert_eq!(plan.cache_for(store), Some(cache.id));
+    }
+
+    #[test]
+    fn built_hir_plans_one_cache_for_a_real_packed_double_loop() {
+        let view = packed_double_loop_view();
+        let function = NumericFunction::build(&view).expect("packed-double loop HIR");
+        let plan = function.plan_packed_double_view_caches(&view);
+        assert_eq!(plan.caches.len(), 1);
+        let cache = &plan.caches[0];
+        assert!(!cache.entry_edges.is_empty());
+        assert!(matches!(
+            function.nodes[cache.receiver_root.0],
+            NumericNode::Parameter {
+                register: 0,
+                value_type: NumericType::Tagged
+            }
+        ));
+        let sites = function
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| match node {
+                NumericNode::ElementLoad {
+                    byte_pc: 32,
+                    access: NumericElementAccess::PackedDouble,
+                    ..
+                }
+                | NumericNode::ElementStore {
+                    byte_pc: 40,
+                    access: NumericElementAccess::PackedDouble,
+                    ..
+                } => Some(NumericValue(index)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sites.len(), 2);
+        assert!(
+            sites
+                .into_iter()
+                .all(|site| plan.cache_for(site) == Some(cache.id))
+        );
+    }
+
+    #[test]
+    fn packed_double_view_cache_rejects_varying_receivers_and_reentrant_loops() {
+        let (varying, view, _, _) = packed_double_cache_function(true, false);
+        assert!(
+            varying
+                .plan_packed_double_view_caches(&view)
+                .caches
+                .is_empty(),
+            "a changing header phi must not retain a raw view"
+        );
+
+        let (unsafe_function, view, _, _) = packed_double_cache_function(false, true);
+        assert!(
+            unsafe_function
+                .plan_packed_double_view_caches(&view)
+                .caches
+                .is_empty(),
+            "an allocating loop must clear rather than retain raw addresses"
+        );
+    }
+
+    #[test]
+    fn packed_double_view_cache_plans_only_innermost_natural_loops() {
+        let block = |predecessors: Vec<usize>, successors: Vec<usize>| NumericBlock {
+            logical_pc: 0,
+            predecessors,
+            successor_arguments: vec![Vec::new(); successors.len()],
+            successors,
+            parameters: Vec::new(),
+            parameter_registers: Vec::new(),
+            nodes: Vec::new(),
+            terminator: NumericTerminator::Jump,
+        };
+        let blocks = vec![
+            block(Vec::new(), vec![1]),
+            block(vec![0, 4], vec![2, 5]),
+            block(vec![1, 3], vec![3, 4]),
+            block(vec![2], vec![2]),
+            block(vec![2], vec![1]),
+            block(vec![1], Vec::new()),
+        ];
+        let loops = innermost_reducible_natural_loops(&blocks).expect("reducible CFG");
+        assert_eq!(loops.len(), 1);
+        assert_eq!(loops[0].header, 2);
+        assert_eq!(loops[0].blocks, BTreeSet::from([2, 3]));
+
+        let self_loop = vec![
+            block(Vec::new(), vec![1]),
+            block(vec![0, 1], vec![1, 2]),
+            block(vec![1], Vec::new()),
+        ];
+        let loops = innermost_reducible_natural_loops(&self_loop).expect("self loop CFG");
+        assert_eq!(loops.len(), 1);
+        assert_eq!(loops[0].header, 1);
+        assert_eq!(loops[0].blocks, BTreeSet::from([1]));
     }
 
     #[test]

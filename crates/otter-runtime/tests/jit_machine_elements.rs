@@ -3,8 +3,10 @@
 //! # Contents
 //! - Dense numeric read-modify-write parity with exact Machine IR artifact
 //!   attribution for both generated element operations.
-//! - A post-store tagged-number guard miss proving exact resume without
-//!   replaying an already-committed element effect.
+//! - A packed-to-tagged receiver transition proving exact resume without
+//!   replaying an effect, followed by clean reuse of the runtime.
+//! - A delete-driven hole transition whose canonical read observes an inherited
+//!   index, advances feedback, and replaces the stale packed generation once.
 //! - Fixed-length typed-array load/store misses after resizable-buffer
 //!   shrinkage, including regrowth proof that an out-of-bounds store never ran.
 //! - A generated constructor with fresh capture cells between element
@@ -13,11 +15,11 @@
 //!
 //! # Invariants
 //! - Every production fixture publishes the named hot function through the
-//!   scalar Machine IR backend, with `machineElementLoad` and
-//!   `machineElementStore` regions in that exact function's code map.
-//! - Generated element guards deopt at the original bytecode before mutation;
-//!   a later numeric guard resumes after earlier mutations and never replays
-//!   them.
+//!   scalar Machine IR backend, with family-specific load/store regions in
+//!   that exact function's code map.
+//! - Generated packed-element guards deopt at the original bytecode before
+//!   mutation; canonical resume executes each effect once and does not evict
+//!   the reusable numeric body.
 //! - A fixed typed view is wholly out of bounds when its original extent no
 //!   longer fits its live backing buffer, even when the selected index remains
 //!   inside the buffer's retained prefix.
@@ -75,15 +77,64 @@ for (let warm = 0; warm < 5000; warm++) {
 "#;
 
 const NO_REPLAY_FINAL: &str = r#"
-globalThis.__machineReplayFinalValues = ["3", 0];
-globalThis.__machineReplayFinalEffects = [0];
+__machineReplayWarmValues[0] = "3";
+__machineReplayWarmEffects[0] = 0;
 globalThis.__machineReplayFinalResult = machineElementNoReplay(
-  __machineReplayFinalValues,
-  __machineReplayFinalEffects
+  __machineReplayWarmValues,
+  __machineReplayWarmEffects
+);
+globalThis.__machineReplayReuseValues = [8, 0];
+globalThis.__machineReplayReuseEffects = [0];
+globalThis.__machineReplayReuseResult = machineElementNoReplay(
+  __machineReplayReuseValues,
+  __machineReplayReuseEffects
 );
 JSON.stringify([
   __machineReplayFinalResult,
-  __machineReplayFinalEffects[0]
+  __machineReplayWarmEffects[0],
+  __machineReplayReuseResult,
+  __machineReplayReuseEffects[0]
+]);
+"#;
+
+const HOLE_TRANSITION_SETUP: &str = r#"
+function machineElementHoleTransition(values, effects) {
+  const loaded = values[1];
+  effects[0] = effects[0] + 1;
+  return loaded;
+}
+
+globalThis.__machineHoleValues = [10, 20, 30];
+globalThis.__machineHoleEffects = [0];
+for (let warm = 0; warm < 5000; warm++) {
+  machineElementHoleTransition(__machineHoleValues, __machineHoleEffects);
+}
+"#;
+
+const HOLE_TRANSITION_FINAL: &str = r#"
+Array.prototype[1] = 41;
+delete __machineHoleValues[1];
+__machineHoleEffects[0] = 0;
+globalThis.__machineHoleFirst = machineElementHoleTransition(
+  __machineHoleValues,
+  __machineHoleEffects
+);
+globalThis.__machineHoleSecond = machineElementHoleTransition(
+  __machineHoleValues,
+  __machineHoleEffects
+);
+globalThis.__machineHoleInherited = 1 in __machineHoleValues;
+globalThis.__machineHoleOwn = Object.prototype.hasOwnProperty.call(
+  __machineHoleValues,
+  1
+);
+delete Array.prototype[1];
+JSON.stringify([
+  __machineHoleFirst,
+  __machineHoleSecond,
+  __machineHoleEffects[0],
+  __machineHoleInherited,
+  __machineHoleOwn
 ]);
 "#;
 
@@ -166,12 +217,15 @@ struct FinalRun {
     completion: String,
     optimized_entries: u64,
     optimized_deopts: u64,
+    compile_attempts: u64,
+    code_generations: u64,
 }
 
 #[derive(Clone, Copy)]
 enum MachineArtifactShape {
-    Elements,
-    ElementsAroundConstructCapture,
+    PackedDoubleElements,
+    GenericElements,
+    PackedDoubleElementsAroundConstructCapture,
 }
 
 fn runtime(selection: JitSelection) -> Runtime {
@@ -232,11 +286,15 @@ fn assert_machine_element_artifact(
     let regions = code_map["regions"]
         .as_array()
         .expect("Machine element code-map regions");
-    for kind in [
-        "machineScalarFunction",
-        "machineElementLoad",
-        "machineElementStore",
-    ] {
+    let (load_kind, store_kind) = match shape {
+        MachineArtifactShape::PackedDoubleElements
+        | MachineArtifactShape::PackedDoubleElementsAroundConstructCapture => (
+            "machinePackedDoubleElementLoad",
+            "machinePackedDoubleElementStore",
+        ),
+        MachineArtifactShape::GenericElements => ("machineElementLoad", "machineElementStore"),
+    };
+    for kind in ["machineScalarFunction", load_kind, store_kind] {
         let matching = regions
             .iter()
             .filter(|region| region["kind"] == kind)
@@ -254,7 +312,10 @@ fn assert_machine_element_artifact(
             );
         }
     }
-    if matches!(shape, MachineArtifactShape::ElementsAroundConstructCapture) {
+    if matches!(
+        shape,
+        MachineArtifactShape::PackedDoubleElementsAroundConstructCapture
+    ) {
         let upvalue_loads = regions
             .iter()
             .filter(|region| region["kind"] == "machineUpvalueLoad")
@@ -352,6 +413,8 @@ fn run_fixture(
         completion,
         optimized_entries: after.jit_optimized_entries - before.jit_optimized_entries,
         optimized_deopts: after.jit_optimized_deopts - before.jit_optimized_deopts,
+        compile_attempts: after.jit_compile_attempts - before.jit_compile_attempts,
+        code_generations: after.jit_code_generations - before.jit_code_generations,
     }
 }
 
@@ -362,7 +425,7 @@ fn dense_numeric_rmw_uses_machine_element_regions_without_deopt() {
         DENSE_RMW_SETUP,
         "jit-machine-elements-rmw-setup.js",
         "machineDenseRmw",
-        MachineArtifactShape::Elements,
+        MachineArtifactShape::PackedDoubleElements,
         DENSE_RMW_FINAL,
         "jit-machine-elements-rmw-final.js",
     );
@@ -371,7 +434,7 @@ fn dense_numeric_rmw_uses_machine_element_regions_without_deopt() {
         DENSE_RMW_SETUP,
         "jit-machine-elements-rmw-setup.js",
         "machineDenseRmw",
-        MachineArtifactShape::Elements,
+        MachineArtifactShape::PackedDoubleElements,
         DENSE_RMW_FINAL,
         "jit-machine-elements-rmw-final.js",
     );
@@ -389,13 +452,13 @@ fn dense_numeric_rmw_uses_machine_element_regions_without_deopt() {
 }
 
 #[test]
-fn tagged_numeric_deopt_resumes_after_committed_element_effects() {
+fn packed_to_tagged_transition_deopts_once_without_replay_and_keeps_runtime_reusable() {
     let oracle = run_fixture(
         JitSelection::InterpreterOnly,
         NO_REPLAY_SETUP,
         "jit-machine-elements-no-replay-setup.js",
         "machineElementNoReplay",
-        MachineArtifactShape::Elements,
+        MachineArtifactShape::PackedDoubleElements,
         NO_REPLAY_FINAL,
         "jit-machine-elements-no-replay-final.js",
     );
@@ -404,20 +467,57 @@ fn tagged_numeric_deopt_resumes_after_committed_element_effects() {
         NO_REPLAY_SETUP,
         "jit-machine-elements-no-replay-setup.js",
         "machineElementNoReplay",
-        MachineArtifactShape::Elements,
+        MachineArtifactShape::PackedDoubleElements,
         NO_REPLAY_FINAL,
         "jit-machine-elements-no-replay-final.js",
     );
 
     assert_eq!(compiled.completion, oracle.completion);
-    assert_eq!(compiled.completion, "[6,1]");
+    assert_eq!(compiled.completion, "[6,1,16,1]");
     assert!(
         compiled.optimized_entries > 0,
-        "final string probe must enter optimized Machine IR: {compiled:?}"
+        "the tagged transition must first enter optimized Machine IR: {compiled:?}"
     );
     assert_eq!(
         compiled.optimized_deopts, 1,
-        "the tagged numeric guard must be the only deopt and must not replay effects: {compiled:?}"
+        "the tagged transition must deopt once, execute each effect once, and not storm on reuse: {compiled:?}"
+    );
+}
+
+#[test]
+fn hole_transition_reads_the_prototype_and_recompiles_without_a_deopt_storm() {
+    let oracle = run_fixture(
+        JitSelection::InterpreterOnly,
+        HOLE_TRANSITION_SETUP,
+        "jit-machine-elements-hole-setup.js",
+        "machineElementHoleTransition",
+        MachineArtifactShape::PackedDoubleElements,
+        HOLE_TRANSITION_FINAL,
+        "jit-machine-elements-hole-final.js",
+    );
+    let compiled = run_fixture(
+        JitSelection::ProductionTiered,
+        HOLE_TRANSITION_SETUP,
+        "jit-machine-elements-hole-setup.js",
+        "machineElementHoleTransition",
+        MachineArtifactShape::PackedDoubleElements,
+        HOLE_TRANSITION_FINAL,
+        "jit-machine-elements-hole-final.js",
+    );
+
+    assert_eq!(compiled.completion, oracle.completion);
+    assert_eq!(compiled.completion, "[41,41,2,true,false]");
+    assert!(
+        compiled.optimized_entries > 0,
+        "the first hole probe must reach the stale packed generation: {compiled:?}"
+    );
+    assert_eq!(
+        compiled.optimized_deopts, 1,
+        "the hole layout transition must advance feedback after one exact miss, not deopt once per call: {compiled:?}"
+    );
+    assert!(
+        compiled.compile_attempts > 0 && compiled.code_generations > 0,
+        "the feedback epoch change must admit a replacement generation: {compiled:?}"
     );
 }
 
@@ -428,7 +528,7 @@ fn fixed_typed_view_shrink_deopts_load_and_store_before_effects() {
         FIXED_RAB_SETUP,
         "jit-machine-elements-fixed-rab-setup.js",
         "machineFixedRabElement",
-        MachineArtifactShape::Elements,
+        MachineArtifactShape::GenericElements,
         FIXED_RAB_FINAL,
         "jit-machine-elements-fixed-rab-final.js",
     );
@@ -437,7 +537,7 @@ fn fixed_typed_view_shrink_deopts_load_and_store_before_effects() {
         FIXED_RAB_SETUP,
         "jit-machine-elements-fixed-rab-setup.js",
         "machineFixedRabElement",
-        MachineArtifactShape::Elements,
+        MachineArtifactShape::GenericElements,
         FIXED_RAB_FINAL,
         "jit-machine-elements-fixed-rab-final.js",
     );
@@ -461,7 +561,7 @@ fn element_roots_survive_generated_constructor_capture_initialization() {
         CONSTRUCT_SETUP,
         "jit-machine-elements-construct-setup.js",
         "machineElementsAroundConstruct",
-        MachineArtifactShape::ElementsAroundConstructCapture,
+        MachineArtifactShape::PackedDoubleElementsAroundConstructCapture,
         CONSTRUCT_FINAL,
         "jit-machine-elements-construct-final.js",
     );
@@ -470,7 +570,7 @@ fn element_roots_survive_generated_constructor_capture_initialization() {
         CONSTRUCT_SETUP,
         "jit-machine-elements-construct-setup.js",
         "machineElementsAroundConstruct",
-        MachineArtifactShape::ElementsAroundConstructCapture,
+        MachineArtifactShape::PackedDoubleElementsAroundConstructCapture,
         CONSTRUCT_FINAL,
         "jit-machine-elements-construct-final.js",
     );

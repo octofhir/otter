@@ -300,12 +300,30 @@ not separate artifact formats.
 
 Scalar Machine bundles attribute direct data access with
 `machineElementLoad`, `machineElementStore`, `machinePropertyLoad`, and
-`machinePropertyStore` regions. Each region carries the source `bytePc`.
+`machinePropertyStore` regions. Ordinary packed-double arrays instead use
+`machinePackedDoubleElementLoad` and `machinePackedDoubleElementStore`. Each
+region carries the source `bytePc`.
 Property regions execute an immutable settled shape/slot chain from the compile
 snapshot and therefore must not have a `propertyIcCell` relocation. Indexed
 element regions similarly guard the baked dense layout before the direct
 access. A load miss and every store guard miss use the exact pre-operation
 deopt state; a successful store commits once and never deoptimizes afterward.
+Packed-double Array regions additionally prove the ordinary receiver's exotic
+state and exact physical storage kind. Their payload remains Float64 across the
+load, arithmetic, and store, with no adjacent Number box/decode, hole test, or
+write barrier. A Float64 index uses an exact Uint32 check: integral values and
+`-0` address directly (`-0` is key 0), while fractional, negative, NaN, or
+out-of-Uint32 values leave before the element access.
+When a reducible non-reentrant loop has an invariant packed-double receiver,
+the normalized header reports `packed-double-view-caches=<N>` and packed access
+opcodes name `cache: Some(...)`. The first access proves the complete receiver
+and physical layout, then stores only an untraced raw base/length pair in the
+native frame. Later backedge iterations retain that pair while still checking
+the current index and bounds. `machinePackedDoubleViewCacheClear` regions mark
+external loop-entry resets; ordinary entry and every OSR trampoline also begin
+empty. Calls, allocations, tagged stores, and other representation-changing
+effects make a loop ineligible, and no loaded `Value` or GC reference enters a
+view-cache slot.
 Fixed TypedArray views over resizable ArrayBuffers also compare the complete
 baked view extent with the backing store's live byte length. A shrink therefore
 exits before either reading or writing even when the requested index still fits

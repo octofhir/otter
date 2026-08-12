@@ -283,8 +283,13 @@ impl Interpreter {
         idx_reg: u16,
     ) -> Result<(), VmError> {
         self.record_jit_runtime_property_stub();
+        let function_id = frame.function_id();
+        let instruction_pc = frame.pc();
         let receiver = frame.read(recv_reg)?;
         let key = frame.read(idx_reg)?;
+        if let Some(code_block) = context.exec_function(function_id) {
+            self.record_element_family_feedback(code_block, instruction_pc, function_id, receiver);
+        }
         let value = self.load_element_values(stack, context, receiver, key)?;
         frame.write(dst, value)
     }
@@ -458,9 +463,13 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         self.record_jit_runtime_property_stub();
         let function_id = frame.function_id();
+        let instruction_pc = frame.pc();
         let receiver = frame.read(recv_reg)?;
         let key_value = frame.read(idx_reg)?;
         let value = frame.read(src_reg)?;
+        if let Some(code_block) = context.exec_function(function_id) {
+            self.record_element_family_feedback(code_block, instruction_pc, function_id, receiver);
+        }
         self.store_element_values(stack, context, function_id, receiver, key_value, value)
     }
 

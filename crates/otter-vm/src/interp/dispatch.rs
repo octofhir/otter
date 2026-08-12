@@ -995,12 +995,17 @@ impl Interpreter {
                 }
                 Op::LoadElement => {
                     let operands = function.operand_view(instr);
-                    if let Some(feedback) = feedback
+                    if jit_installed
                         && let Some(recv_reg) = function.register(instr, 1)
                         && let Ok(recv) = read_register(&stack[top_idx], recv_reg)
                     {
                         let recv = *recv;
-                        feedback.record_element_family(self.element_family_of(recv));
+                        self.record_element_family_feedback(
+                            function,
+                            instr.instruction_pc,
+                            function_id,
+                            recv,
+                        );
                     }
                     if self.drive_load_element(stack, context, operands)? {
                         continue;
@@ -1106,8 +1111,15 @@ impl Interpreter {
                     if let Some(feedback) = feedback {
                         let value = *read_register(&stack[top_idx], src_reg)?;
                         feedback.record_arith(value, value);
+                    }
+                    if jit_installed {
                         let recv = *read_register(&stack[top_idx], recv_reg)?;
-                        feedback.record_element_family(self.element_family_of(recv));
+                        self.record_element_family_feedback(
+                            function,
+                            instr.instruction_pc,
+                            function_id,
+                            recv,
+                        );
                     }
                     // Copy the operands through a short representation-neutral
                     // view, then end the frame borrow before `[[Set]]` can

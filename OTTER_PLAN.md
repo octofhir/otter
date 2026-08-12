@@ -60,15 +60,27 @@ It already owns:
   and existing-slot stores in Machine IR. Immutable mono/polymorphic snapshot
   programs replace mutable IC cells, every guard miss deoptimizes at the exact
   pre-operation frame state, and cell stores execute the collector barrier only
-  after all guards pass. A Float64 index produced by guarded arithmetic boxes
-  through the allocation-free Number representation before the tagged dense
-  probe; integral values stay native, while fractional, negative-zero, NaN,
-  and out-of-range indices exact-deopt before the element operation. Dense-array
-  and primitive-string `.length` share the
+  after all guards pass. Ordinary arrays use Empty, holey-double,
+  packed-double, and terminal tagged physical storage; Machine IR consumes only
+  an immutable packed-double snapshot with exact receiver, exotic-state, and
+  storage-kind guards. Packed loads produce Float64 and packed stores consume
+  Float64 directly, so no element payload passes through `DecodeNumber`,
+  `BoxNumber`, a hole test, or a write barrier. A Float64 index produced by
+  guarded arithmetic uses an exact non-allocating Uint32 conversion before the
+  address guard. Integral values and `-0` stay generated (`-0` selects key 0);
+  fractional, negative, NaN, and out-of-Uint32 values exact-deopt before the
+  element operation. Dense-array and primitive-string `.length` share the
   generated load family; lengths above int32 deopt to exact unsigned Number
   boxing instead of wrapping. Fixed TypedArray views over resizable buffers
   additionally prove the complete cached view extent against the live backing
   byte length before either a load or a store;
+- loop-scoped packed-double view caching in scalar Machine IR. The planner
+  selects only innermost reducible loops with an invariant receiver and no
+  allocation, reentry, or representation-changing effect. A bounded untraced
+  native-stack base/length pair replaces repeated receiver, cage, type, exotic,
+  and physical-kind proofs after the first hit; function entry, OSR entry, and
+  every external loop-entry edge clear the pair, while generated backedges may
+  retain it. Per-access index and bounds proofs remain exact;
 - prepared global lexical and guarded global-object reads in Machine IR. The
   generated path reads the live permanent cell or live object slot after the
   same TDZ, realm-epoch, shape, and slab proofs as the canonical path; every

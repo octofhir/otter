@@ -24,6 +24,12 @@
 //! - Captured-binding reads walk the current frame's validated cell spine
 //!   without a runtime call and deopt at the original operation for TDZ or an
 //!   invalid layout.
+//! - Prepared global lexical and object reads carry their complete immutable
+//!   guard metadata into Machine IR. Their generated hits are non-allocating,
+//!   safepoint-free tagged loads with exact pre-operation deopt state.
+//! - Tagged loose equality against a static nullish literal classifies
+//!   immediates directly but exits before its Boolean definition for any cell,
+//!   preserving canonical HTMLDDA semantics without a generated call.
 //! - Allocating calls save every live tagged value from its exact late-use
 //!   location into the frame's collector-visible root area and reload it after
 //!   moving GC; no interpreter-window shuttle or emitter-local map exists.
@@ -508,6 +514,22 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                     load.clobbers = upvalue_load_clobbers();
                     load
                 }
+                NumericNode::GlobalLexicalLoad { byte_pc, target } => {
+                    let mut load = MachineInstruction::plain(
+                        MachineOpcode::GlobalLexicalLoad { byte_pc, target },
+                        vec![MachineOperand::register_output(result)],
+                    );
+                    load.clobbers = global_lexical_load_clobbers();
+                    load
+                }
+                NumericNode::GlobalObjectLoad { byte_pc, target } => {
+                    let mut load = MachineInstruction::plain(
+                        MachineOpcode::GlobalObjectLoad { byte_pc, target },
+                        vec![MachineOperand::register_output(result)],
+                    );
+                    load.clobbers = global_object_load_clobbers();
+                    load
+                }
                 NumericNode::BindThis {
                     source,
                     logical_pc: _,
@@ -964,6 +986,21 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                     call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
                     call
                 }
+                NumericNode::TaggedNullishEqual {
+                    value,
+                    equal,
+                    byte_pc,
+                } => {
+                    let mut compare = MachineInstruction::plain(
+                        MachineOpcode::TaggedNullishEqual { byte_pc, equal },
+                        vec![
+                            MachineOperand::register_input(machine_value(&values, value)),
+                            MachineOperand::register_output(result),
+                        ],
+                    );
+                    compare.clobbers = tagged_nullish_equal_clobbers();
+                    compare
+                }
                 NumericNode::TaggedStrictEqual(left, right) => {
                     let left = tagged_call_argument(
                         hir,
@@ -1376,6 +1413,24 @@ fn upvalue_load_clobbers() -> Vec<PhysicalRegister> {
         .into_iter()
         .map(PhysicalRegister::integer)
         .collect()
+}
+
+fn global_lexical_load_clobbers() -> Vec<PhysicalRegister> {
+    [9, 11, 13]
+        .into_iter()
+        .map(PhysicalRegister::integer)
+        .collect()
+}
+
+fn global_object_load_clobbers() -> Vec<PhysicalRegister> {
+    [9, 11, 12, 13, 14, 15]
+        .into_iter()
+        .map(PhysicalRegister::integer)
+        .collect()
+}
+
+fn tagged_nullish_equal_clobbers() -> Vec<PhysicalRegister> {
+    vec![PhysicalRegister::integer(16)]
 }
 
 fn intern_call_descriptor(
@@ -4098,6 +4153,113 @@ mod tests {
         }
     }
 
+    fn global_selection_hir() -> NumericFunction {
+        let value = |index| hir::NumericValue(index);
+        NumericFunction {
+            function_id: 95,
+            nodes: vec![
+                NumericNode::Parameter {
+                    register: 0,
+                    value_type: NumericType::Tagged,
+                },
+                NumericNode::GlobalLexicalLoad {
+                    byte_pc: 24,
+                    target: otter_vm::jit::JitGlobalLexicalLoad {
+                        cell_offset: 0x1234,
+                    },
+                },
+                NumericNode::GlobalObjectLoad {
+                    byte_pc: 32,
+                    target: otter_vm::jit::JitGlobalObjectLoad {
+                        shape: 0x5678,
+                        dictionary: true,
+                        value_byte: 40,
+                        global_lexical_epoch: 9,
+                    },
+                },
+            ],
+            blocks: vec![hir::NumericBlock {
+                logical_pc: 0,
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                parameters: Vec::new(),
+                parameter_registers: Vec::new(),
+                successor_arguments: Vec::new(),
+                nodes: (0..3).map(value).collect(),
+                terminator: NumericTerminator::Return(value(2)),
+            }],
+            frame_states: vec![
+                hir::NumericFrameState {
+                    point: NumericFramePoint::Node(value(1)),
+                    function_id: 95,
+                    byte_pc: 24,
+                    slots: vec![
+                        hir::NumericFrameSlot::Value(value(0)),
+                        hir::NumericFrameSlot::Undefined,
+                        hir::NumericFrameSlot::Undefined,
+                    ],
+                },
+                hir::NumericFrameState {
+                    point: NumericFramePoint::Node(value(2)),
+                    function_id: 95,
+                    byte_pc: 32,
+                    slots: vec![
+                        hir::NumericFrameSlot::Value(value(0)),
+                        hir::NumericFrameSlot::Value(value(1)),
+                        hir::NumericFrameSlot::Undefined,
+                    ],
+                },
+            ],
+            direct_call_targets: Vec::new(),
+            direct_call_arguments: Vec::new(),
+            parameter_count: 1,
+            register_count: 3,
+            arithmetic_op_count: 0,
+        }
+    }
+
+    fn tagged_nullish_selection_hir(equal: bool) -> NumericFunction {
+        let value = |index| hir::NumericValue(index);
+        NumericFunction {
+            function_id: 96,
+            nodes: vec![
+                NumericNode::Parameter {
+                    register: 0,
+                    value_type: NumericType::Tagged,
+                },
+                NumericNode::TaggedNullishEqual {
+                    value: value(0),
+                    equal,
+                    byte_pc: 24,
+                },
+            ],
+            blocks: vec![hir::NumericBlock {
+                logical_pc: 0,
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                parameters: Vec::new(),
+                parameter_registers: Vec::new(),
+                successor_arguments: Vec::new(),
+                nodes: (0..2).map(value).collect(),
+                terminator: NumericTerminator::Return(value(1)),
+            }],
+            frame_states: vec![hir::NumericFrameState {
+                point: NumericFramePoint::Node(value(1)),
+                function_id: 96,
+                byte_pc: 24,
+                slots: vec![
+                    hir::NumericFrameSlot::Value(value(0)),
+                    hir::NumericFrameSlot::Undefined,
+                ],
+            }],
+            direct_call_targets: Vec::new(),
+            direct_call_arguments: Vec::new(),
+            parameter_count: 1,
+            register_count: 2,
+            arithmetic_op_count: 0,
+        }
+    }
+
     fn property_store_emission_view(value_is_non_cell: bool) -> JitCompileSnapshot {
         let (parameter_count, store_byte_pc, instructions) = if value_is_non_cell {
             (
@@ -4427,6 +4589,229 @@ mod tests {
                 MachineInstructionId(call_id as u32)
             ))
         );
+    }
+
+    #[test]
+    fn selects_prepared_globals_as_tagged_exact_deopt_loads() {
+        let sequence = select(&global_selection_hir()).expect("global-load Machine IR");
+
+        let lexical = sequence
+            .instructions()
+            .iter()
+            .find(|instruction| {
+                matches!(
+                    instruction.opcode,
+                    MachineOpcode::GlobalLexicalLoad {
+                        byte_pc: 24,
+                        target: otter_vm::jit::JitGlobalLexicalLoad {
+                            cell_offset: 0x1234
+                        }
+                    }
+                )
+            })
+            .expect("selected global lexical load");
+        assert_eq!(
+            lexical.operands,
+            [
+                MachineOperand::register_output(MachineValue(1)),
+                MachineOperand::deopt(MachineValue(0)),
+            ]
+        );
+        assert_eq!(lexical.clobbers, global_lexical_load_clobbers());
+        assert_eq!(lexical.deopt, Some(DeoptId(0)));
+        assert_eq!(lexical.safepoint, None);
+        assert_eq!(sequence.representations()[1], MachineRepresentation::Tagged);
+
+        let object = sequence
+            .instructions()
+            .iter()
+            .find(|instruction| {
+                matches!(
+                    instruction.opcode,
+                    MachineOpcode::GlobalObjectLoad {
+                        byte_pc: 32,
+                        target: otter_vm::jit::JitGlobalObjectLoad {
+                            shape: 0x5678,
+                            dictionary: true,
+                            value_byte: 40,
+                            global_lexical_epoch: 9,
+                        }
+                    }
+                )
+            })
+            .expect("selected global object load");
+        assert_eq!(
+            object.operands,
+            [
+                MachineOperand::register_output(MachineValue(2)),
+                MachineOperand::deopt(MachineValue(0)),
+                MachineOperand::deopt(MachineValue(1)),
+            ]
+        );
+        assert_eq!(
+            object.clobbers,
+            [9, 11, 12, 13, 14, 15]
+                .into_iter()
+                .map(PhysicalRegister::integer)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(object.deopt, Some(DeoptId(1)));
+        assert_eq!(object.safepoint, None);
+        assert_eq!(sequence.representations()[2], MachineRepresentation::Tagged);
+
+        let normalized = sequence.normalized();
+        assert!(normalized.contains("GlobalLexicalLoad { byte_pc: 24"));
+        assert!(normalized.contains("GlobalObjectLoad { byte_pc: 32"));
+        sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("global-load allocation");
+    }
+
+    #[test]
+    fn verifier_rejects_malformed_prepared_global_loads() {
+        let valid = select(&global_selection_hir()).expect("valid global loads");
+        let lexical_id = valid
+            .instructions
+            .iter()
+            .position(|instruction| {
+                matches!(instruction.opcode, MachineOpcode::GlobalLexicalLoad { .. })
+            })
+            .expect("global lexical load");
+        let expected = Err(crate::machine::VerificationError::OpcodeSignatureMismatch(
+            MachineInstructionId(lexical_id as u32),
+        ));
+
+        let mut missing_output = valid.clone();
+        missing_output.instructions[lexical_id].operands.remove(0);
+        assert_eq!(missing_output.verify(), expected);
+
+        let mut ordinary_input = valid.clone();
+        ordinary_input.instructions[lexical_id]
+            .operands
+            .push(MachineOperand::location_input(MachineValue(0)));
+        assert_eq!(ordinary_input.verify(), expected);
+
+        let mut output_in_preop_state = valid.clone();
+        output_in_preop_state.instructions[lexical_id]
+            .operands
+            .push(MachineOperand::deopt(MachineValue(1)));
+        assert_eq!(output_in_preop_state.verify(), expected);
+
+        let mut wrong_representation = valid.clone();
+        wrong_representation.representations[1] = MachineRepresentation::Int32;
+        assert_eq!(wrong_representation.verify(), expected);
+
+        let mut missing_deopt = valid.clone();
+        missing_deopt.instructions[lexical_id].deopt = None;
+        assert_eq!(missing_deopt.verify(), expected);
+
+        let mut spurious_safepoint = valid;
+        spurious_safepoint.instructions[lexical_id].safepoint = Some(SafepointId(9));
+        assert_eq!(spurious_safepoint.verify(), expected);
+    }
+
+    #[test]
+    fn selects_tagged_nullish_equality_with_exact_deopt_and_boxing() {
+        for equal in [true, false] {
+            let sequence = select(&tagged_nullish_selection_hir(equal))
+                .expect("tagged nullish equality Machine IR");
+            let compare = sequence
+                .instructions()
+                .iter()
+                .find(|instruction| {
+                    instruction.opcode == MachineOpcode::TaggedNullishEqual { byte_pc: 24, equal }
+                })
+                .expect("selected tagged nullish equality");
+            assert_eq!(
+                compare.operands,
+                [
+                    MachineOperand::register_input(MachineValue(0)),
+                    MachineOperand::register_output(MachineValue(1)),
+                    MachineOperand::deopt(MachineValue(0)),
+                ]
+            );
+            assert_eq!(
+                sequence.representations()[compare.operands[0].value.0 as usize],
+                MachineRepresentation::Tagged
+            );
+            assert_eq!(
+                sequence.representations()[compare.operands[1].value.0 as usize],
+                MachineRepresentation::Boolean
+            );
+            assert_eq!(compare.clobbers, [PhysicalRegister::integer(16)]);
+            assert_eq!(compare.deopt, Some(DeoptId(0)));
+            assert_eq!(compare.safepoint, None);
+            assert!(sequence.instructions().iter().any(|instruction| {
+                instruction.opcode == MachineOpcode::BoxBoolean
+                    && instruction.operands
+                        == [
+                            MachineOperand::register_input(MachineValue(1)),
+                            MachineOperand::register_output(MachineValue(2)),
+                        ]
+            }));
+            assert!(sequence.normalized().contains(&format!(
+                "TaggedNullishEqual {{ byte_pc: 24, equal: {equal} }}"
+            )));
+            sequence
+                .allocate(&TargetRegisterFile::aarch64_scalar_function())
+                .expect("tagged nullish equality allocation");
+        }
+    }
+
+    #[test]
+    fn verifier_rejects_malformed_tagged_nullish_equality() {
+        let valid = select(&tagged_nullish_selection_hir(true)).expect("valid nullish equality");
+        let compare_id = valid
+            .instructions
+            .iter()
+            .position(|instruction| {
+                matches!(instruction.opcode, MachineOpcode::TaggedNullishEqual { .. })
+            })
+            .expect("tagged nullish equality");
+        let expected = Err(crate::machine::VerificationError::OpcodeSignatureMismatch(
+            MachineInstructionId(compare_id as u32),
+        ));
+
+        let mut missing_input = valid.clone();
+        missing_input.instructions[compare_id].operands.remove(0);
+        assert_eq!(missing_input.verify(), expected);
+
+        let mut wrong_input_representation = valid.clone();
+        wrong_input_representation.representations[0] = MachineRepresentation::Int32;
+        assert_eq!(wrong_input_representation.verify(), expected);
+
+        let mut spilled_input = valid.clone();
+        spilled_input.instructions[compare_id].operands[0] =
+            MachineOperand::location_input(MachineValue(0));
+        assert_eq!(spilled_input.verify(), expected);
+
+        let mut wrong_output_representation = valid.clone();
+        wrong_output_representation.representations[1] = MachineRepresentation::Tagged;
+        assert_eq!(wrong_output_representation.verify(), expected);
+
+        let mut output_in_preop_state = valid.clone();
+        output_in_preop_state.instructions[compare_id]
+            .operands
+            .push(MachineOperand::deopt(MachineValue(1)));
+        assert_eq!(output_in_preop_state.verify(), expected);
+
+        let mut duplicate_deopt = valid.clone();
+        duplicate_deopt.instructions[compare_id]
+            .operands
+            .push(MachineOperand::deopt(MachineValue(0)));
+        assert_eq!(duplicate_deopt.verify(), expected);
+
+        let mut missing_deopt = valid.clone();
+        missing_deopt.instructions[compare_id].deopt = None;
+        assert_eq!(missing_deopt.verify(), expected);
+
+        let mut spurious_safepoint = valid.clone();
+        spurious_safepoint.instructions[compare_id].safepoint = Some(SafepointId(9));
+        assert_eq!(spurious_safepoint.verify(), expected);
+
+        let mut wrong_clobber = valid;
+        wrong_clobber.instructions[compare_id].clobbers.clear();
+        assert_eq!(wrong_clobber.verify(), expected);
     }
 
     #[test]

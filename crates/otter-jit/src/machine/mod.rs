@@ -38,6 +38,10 @@
 //!   operands; their target locations come from that same allocation table.
 //! - Guarded element operands are late location uses, so target emission may
 //!   materialize stack or register homes without overwriting a live input.
+//! - Prepared global reads define exactly one tagged register value, carry one
+//!   exact pre-operation deopt state, and neither allocate nor own a safepoint.
+//! - Tagged nullish loose equality deoptimizes before its Boolean definition
+//!   for every non-nullish cell so canonical HTMLDDA semantics remain visible.
 //! - Target register files enumerate physical registers explicitly. There is
 //!   no synthetic constant register budget.
 //!
@@ -571,6 +575,15 @@ pub enum MachineOpcode {
     FloatToBoolean,
     /// Invert canonical Boolean bits.
     BooleanNot,
+    /// Compare one tagged value with a statically known `null` or `undefined`.
+    /// Non-nullish cells deopt before defining the result so the canonical
+    /// equality path can observe HTMLDDA objects.
+    TaggedNullishEqual {
+        /// Source bytecode offset used by artifacts and exact deoptimization.
+        byte_pc: u32,
+        /// `true` for loose equality and `false` for loose inequality.
+        equal: bool,
+    },
     /// Ordered floating-point less-than comparison producing 0 or 1.
     FloatLessThan,
     /// Floating-point equality comparison producing 0 or 1.
@@ -598,6 +611,22 @@ pub enum MachineOpcode {
         index: i32,
         /// Source bytecode offset used by artifacts and exact deoptimization.
         byte_pc: u32,
+    },
+    /// Read one VM-baked permanent global-declarative cell, deoptimizing at
+    /// the source operation if the live value is still in TDZ.
+    GlobalLexicalLoad {
+        /// Source bytecode offset used by artifacts and exact deoptimization.
+        byte_pc: u32,
+        /// Stable GC-cage cell identity copied from the compile snapshot.
+        target: otter_vm::jit::JitGlobalLexicalLoad,
+    },
+    /// Guard the live global-declarative epoch, global-object shape, and own
+    /// data slot before reading one VM-baked global-object property.
+    GlobalObjectLoad {
+        /// Source bytecode offset used by artifacts and exact deoptimization.
+        byte_pc: u32,
+        /// Complete epoch, shape, dictionary, and slot guard program.
+        target: otter_vm::jit::JitGlobalObjectLoad,
     },
     /// Guard and load one VM-baked indexed element, deoptimizing on any miss.
     ElementLoad(u32),
@@ -742,6 +771,9 @@ pub enum VerificationError {
     InvalidValue(MachineValue),
     /// A fixed register has the wrong class for its virtual value.
     FixedRegisterClass(MachineInstructionId, MachineValue),
+    /// A selected opcode's ordinary operands or effect metadata violate its
+    /// target-neutral signature.
+    OpcodeSignatureMismatch(MachineInstructionId),
     /// Metadata operands must be late uses.
     InvalidMetadataOperand(MachineInstructionId, MachineValue),
     /// Root metadata does not match the value representation.
@@ -998,6 +1030,79 @@ impl InstructionSequence {
                         return Err(VerificationError::InvalidValue(operand.value));
                     }
                 }
+                if matches!(
+                    instruction.opcode,
+                    MachineOpcode::GlobalLexicalLoad { .. }
+                        | MachineOpcode::GlobalObjectLoad { .. }
+                ) {
+                    let Some((output, metadata)) = instruction.operands.split_first() else {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    };
+                    let output_is_tagged_register = *output
+                        == MachineOperand::register_output(output.value)
+                        && self.representations[output.value.0 as usize]
+                            == MachineRepresentation::Tagged;
+                    let mut deopt_values = std::collections::BTreeSet::new();
+                    let metadata_is_exact_deopt = metadata.iter().all(|operand| {
+                        *operand == MachineOperand::deopt(operand.value)
+                            && operand.value != output.value
+                            && deopt_values.insert(operand.value)
+                    });
+                    let clobbers_are_exact = match &instruction.opcode {
+                        MachineOpcode::GlobalLexicalLoad { .. } => {
+                            instruction.clobbers
+                                == [
+                                    PhysicalRegister::integer(9),
+                                    PhysicalRegister::integer(11),
+                                    PhysicalRegister::integer(13),
+                                ]
+                        }
+                        MachineOpcode::GlobalObjectLoad { .. } => {
+                            instruction.clobbers
+                                == [9, 11, 12, 13, 14, 15]
+                                    .map(PhysicalRegister::integer)
+                                    .as_slice()
+                        }
+                        _ => false,
+                    };
+                    if !output_is_tagged_register
+                        || !metadata_is_exact_deopt
+                        || !clobbers_are_exact
+                        || instruction.deopt.is_none()
+                        || instruction.safepoint.is_some()
+                    {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    }
+                }
+                if matches!(instruction.opcode, MachineOpcode::TaggedNullishEqual { .. }) {
+                    let Some((ordinary, metadata)) = instruction.operands.split_at_checked(2)
+                    else {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    };
+                    let input = ordinary[0];
+                    let output = ordinary[1];
+                    let ordinary_signature = input == MachineOperand::register_input(input.value)
+                        && self.representations[input.value.0 as usize]
+                            == MachineRepresentation::Tagged
+                        && output == MachineOperand::register_output(output.value)
+                        && self.representations[output.value.0 as usize]
+                            == MachineRepresentation::Boolean;
+                    let mut deopt_values = std::collections::BTreeSet::new();
+                    let metadata_is_exact_deopt = metadata.iter().all(|operand| {
+                        *operand == MachineOperand::deopt(operand.value)
+                            && operand.value != output.value
+                            && deopt_values.insert(operand.value)
+                    });
+                    if !ordinary_signature
+                        || !metadata_is_exact_deopt
+                        || !deopt_values.contains(&input.value)
+                        || instruction.deopt.is_none()
+                        || instruction.safepoint.is_some()
+                        || instruction.clobbers != [PhysicalRegister::integer(16)]
+                    {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    }
+                }
                 if let MachineOpcode::Call(descriptor_index) = instruction.opcode {
                     let Some(descriptor) = self.call_descriptors.get(descriptor_index as usize)
                     else {
@@ -1140,5 +1245,121 @@ impl InstructionSequence {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn checked_instruction_sequence(
+        result_representation: MachineRepresentation,
+        mut checked: MachineInstruction,
+    ) -> InstructionSequence {
+        let input = MachineValue(0);
+        let result = MachineValue(1);
+        checked.deopt = Some(DeoptId(0));
+        let mut ret = MachineInstruction::plain(
+            MachineOpcode::Return,
+            vec![MachineOperand::register_input(result)],
+        );
+        ret.control = ControlFlow::Return;
+        InstructionSequence::new(
+            MachineBlock(0),
+            vec![MachineRepresentation::Tagged, result_representation],
+            Vec::new(),
+            vec![MachineBlockData {
+                first: MachineInstructionId(0),
+                end: MachineInstructionId(3),
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                parameters: Vec::new(),
+                successor_arguments: Vec::new(),
+            }],
+            vec![
+                MachineInstruction::plain(
+                    MachineOpcode::EntryValue(0),
+                    vec![MachineOperand::register_output(input)],
+                ),
+                checked,
+                ret,
+            ],
+        )
+        .expect("valid checked-opcode sequence")
+    }
+
+    #[test]
+    fn verifier_rejects_missing_global_load_scratch_clobbers() {
+        let input = MachineValue(0);
+        let result = MachineValue(1);
+        let cases = [
+            (
+                MachineOpcode::GlobalLexicalLoad {
+                    byte_pc: 8,
+                    target: otter_vm::jit::JitGlobalLexicalLoad { cell_offset: 32 },
+                },
+                [9, 11, 13].as_slice(),
+            ),
+            (
+                MachineOpcode::GlobalObjectLoad {
+                    byte_pc: 8,
+                    target: otter_vm::jit::JitGlobalObjectLoad {
+                        shape: 7,
+                        dictionary: false,
+                        value_byte: 16,
+                        global_lexical_epoch: 3,
+                    },
+                },
+                [9, 11, 12, 13, 14, 15].as_slice(),
+            ),
+        ];
+        for (opcode, clobbers) in cases {
+            let mut load = MachineInstruction::plain(
+                opcode,
+                vec![
+                    MachineOperand::register_output(result),
+                    MachineOperand::deopt(input),
+                ],
+            );
+            load.clobbers = clobbers
+                .iter()
+                .copied()
+                .map(PhysicalRegister::integer)
+                .collect();
+            let mut sequence = checked_instruction_sequence(MachineRepresentation::Tagged, load);
+            sequence.instructions[1].clobbers.clear();
+            assert_eq!(
+                sequence.verify(),
+                Err(VerificationError::OpcodeSignatureMismatch(
+                    MachineInstructionId(1)
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn verifier_requires_nullish_input_in_exact_deopt_metadata() {
+        let input = MachineValue(0);
+        let result = MachineValue(1);
+        let mut compare = MachineInstruction::plain(
+            MachineOpcode::TaggedNullishEqual {
+                byte_pc: 8,
+                equal: true,
+            },
+            vec![
+                MachineOperand::register_input(input),
+                MachineOperand::register_output(result),
+                MachineOperand::deopt(input),
+            ],
+        );
+        compare.clobbers = vec![PhysicalRegister::integer(16)];
+        let mut sequence = checked_instruction_sequence(MachineRepresentation::Boolean, compare);
+        sequence.instructions[1].operands.pop();
+        assert_eq!(
+            sequence.verify(),
+            Err(VerificationError::OpcodeSignatureMismatch(
+                MachineInstructionId(1)
+            ))
+        );
     }
 }

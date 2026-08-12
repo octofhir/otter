@@ -21,6 +21,10 @@
 //! - A failed entry Number guard writes logical PC zero. Mid-function tagged
 //!   numeric guards use allocator-driven exact deopt state at their owning
 //!   bytecode operation, always before externally visible effects.
+//! - Tagged loose comparisons against a static nullish operand return directly
+//!   for null, undefined, and non-cell primitives. Every cell exits at the
+//!   original comparison before the Boolean result is defined, preserving the
+//!   canonical HTMLDDA decision.
 //! - Checked integer overflow uses the allocator-driven VM [`DeoptRuntime`];
 //!   the emitter owns no parallel reconstruction recipe.
 //! - Settled dense and typed element accesses keep receiver, index, and store
@@ -82,16 +86,18 @@ use crate::{
     entry::{
         ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET,
         ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET,
-        CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, MACHINE_ROOT_RECORD_BASE_OFFSET,
-        MACHINE_ROOT_RECORD_CODE_OBJECT_ID_OFFSET, MACHINE_ROOT_RECORD_COUNT_OFFSET,
-        MACHINE_ROOT_RECORD_PREVIOUS_OFFSET, MACHINE_ROOT_RECORD_SAFEPOINT_ID_OFFSET,
-        MACHINE_ROOT_RECORD_SIZE, MACHINE_ROOTS_PTR_OFFSET, NATIVE_FRAME_FLAGS_OFFSET,
-        NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
+        CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, GLOBAL_THIS_OFFSET_PTR_OFFSET,
+        MACHINE_ROOT_RECORD_BASE_OFFSET, MACHINE_ROOT_RECORD_CODE_OBJECT_ID_OFFSET,
+        MACHINE_ROOT_RECORD_COUNT_OFFSET, MACHINE_ROOT_RECORD_PREVIOUS_OFFSET,
+        MACHINE_ROOT_RECORD_SAFEPOINT_ID_OFFSET, MACHINE_ROOT_RECORD_SIZE,
+        MACHINE_ROOTS_PTR_OFFSET, NATIVE_FRAME_FLAGS_OFFSET, NATIVE_FRAME_OFFSET,
+        NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
         NATIVE_FRAME_REGISTER_COUNT_OFFSET, NATIVE_FRAME_THIS_OFFSET,
         NATIVE_FRAME_UPVALUE_BASE_OFFSET, NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NUMBER_TAG_HI16,
         OBJECT_BODY_TYPE_TAG, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THREAD_OFFSET,
-        VALUE_HOLE, VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
-        VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
+        VALUE_HOLE, VALUE_NULL, VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
+        VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
+        VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
     template::arm64::ic_probe::{
         DenseIndexForm, element_access_for, emit_element_address, emit_element_read,
@@ -394,6 +400,104 @@ pub(super) fn emit(
                     ; ldr x16, [x19, NATIVE_FRAME_OFFSET]
                     ; ldr X(destination), [x16, NATIVE_FRAME_THIS_OFFSET]
                 );
+            }
+            MachineOpcode::GlobalLexicalLoad { byte_pc, target } => {
+                let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let start = ops.offset().0;
+                let cell_addr = view
+                    .cage_base
+                    .checked_add(target.cell_offset as usize)
+                    .ok_or(Unsupported::OperandShape(
+                        "scalar global lexical cell address",
+                    ))?;
+                emit_load_symbolic_u64(
+                    &mut ops,
+                    &mut relocations,
+                    13,
+                    cell_addr as u64,
+                    RelocationTarget::GlobalLexicalCell {
+                        function_id: view.code_block.id,
+                        byte_pc,
+                    },
+                );
+                dynasm!(ops ; .arch aarch64 ; ldr x9, [x13, view.upvalue_value_byte]);
+                emit_load_u64(&mut ops, 11, VALUE_HOLE);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; cmp x9, x11
+                    ; b.eq =>deopt
+                );
+                emit_store_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
+                structural_regions.push((
+                    "machineGlobalLexicalLoad",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::GlobalObjectLoad { byte_pc, target } => {
+                let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let start = ops.offset().0;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr x14, [x19, THREAD_OFFSET]
+                    ; ldr x14, [x14, VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET]
+                    ; cbz x14, =>deopt
+                    ; ldr x15, [x14]
+                );
+                emit_load_u64(&mut ops, 11, target.global_lexical_epoch);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; cmp x15, x11
+                    ; b.ne =>deopt
+                    ; ldr x14, [x19, GLOBAL_THIS_OFFSET_PTR_OFFSET]
+                    ; ldr w12, [x14]
+                );
+                emit_load_symbolic_u64(
+                    &mut ops,
+                    &mut relocations,
+                    14,
+                    view.cage_base as u64,
+                    RelocationTarget::GcCageBase,
+                );
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; add x13, x14, x12
+                    ; ldr w14, [x13, view.object_shape_byte]
+                );
+                if target.dictionary {
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; cbnz w14, =>deopt
+                        ; ldr x14, [x13, view.object_dictionary_shape_id_byte]
+                    );
+                    emit_load_u64(&mut ops, 11, target.shape);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; cmp x14, x11
+                        ; b.ne =>deopt
+                    );
+                } else {
+                    emit_load_u64(&mut ops, 11, target.shape);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; cmp w14, w11
+                        ; b.ne =>deopt
+                    );
+                }
+                emit_slab_base(&mut ops, view, 13, 14);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; cbz x13, =>deopt
+                    ; ldr x9, [x13, target.value_byte]
+                );
+                emit_store_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
+                structural_regions.push((
+                    "machineGlobalObjectLoad",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
             }
             MachineOpcode::TaggedConstant(bits) => {
                 emit_load_u64(&mut ops, integer_register(locations[0])?, bits);
@@ -730,6 +834,42 @@ pub(super) fn emit(
                     ; mov w16, #1
                     ; eor W(destination), W(source), w16
                 );
+            }
+            MachineOpcode::TaggedNullishEqual { byte_pc, equal } => {
+                let source = integer_register(locations[0])?;
+                let destination = integer_register(locations[1])?;
+                let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let nullish = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                let start = ops.offset().0;
+
+                // The two immediate members of the nullish equivalence class
+                // complete without reentry. Any cell must use the canonical
+                // comparison because HTMLDDA is observable there. Keep that
+                // guard before either possible write to the allocated result.
+                emit_load_u64(&mut ops, 16, VALUE_NULL);
+                dynasm!(ops ; .arch aarch64 ; cmp X(source), x16 ; b.eq =>nullish);
+                emit_load_u64(&mut ops, 16, VALUE_UNDEFINED);
+                dynasm!(ops ; .arch aarch64 ; cmp X(source), x16 ; b.eq =>nullish);
+                emit_cell_test(&mut ops, source, 16, CellTest::IsCell, deopt);
+                if equal {
+                    dynasm!(ops ; .arch aarch64 ; mov W(destination), wzr);
+                } else {
+                    dynasm!(ops ; .arch aarch64 ; mov W(destination), #1);
+                }
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>nullish);
+                if equal {
+                    dynasm!(ops ; .arch aarch64 ; mov W(destination), #1);
+                } else {
+                    dynasm!(ops ; .arch aarch64 ; mov W(destination), wzr);
+                }
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                structural_regions.push((
+                    "machineTaggedNullishEqual",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
             }
             MachineOpcode::BackedgePoll => {
                 let exit = instruction_deopt_label(instruction.deopt, &deopt_labels)?;

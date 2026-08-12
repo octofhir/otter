@@ -392,11 +392,20 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     byte PC. Exact addresses are redacted; the generated hit reads the live
     permanent cell and a TDZ hole retains the canonical throwing transition.
     Guarded global-object reads prove the realm epoch, dictionary shape, and
-    property slot before reading the live value. In a completely generated,
+    property slot before reading the live value. Scalar Machine IR names these
+    non-allocating operations `machineGlobalLexicalLoad` and
+    `machineGlobalObjectLoad`; every failed TDZ, epoch, shape, or slab proof
+    exact-deoptimizes at the original `LoadGlobalOrThrow` before publishing its
+    result. In a completely generated,
     non-reentrant outermost loop, `loopInvariantGlobalObjectLoadCache` marks a
     native-stack slot that retains the live property address after the first
     proof. It never caches the loaded value; entry, OSR, and every cold path
     clear the raw address before collection or JavaScript reentry.
+  - Scalar Machine IR represents `x == null`, `x != null`, and their
+    `undefined`-literal counterparts with `machineTaggedNullishEqual`. Null,
+    undefined, and non-cell primitives complete without reentry. Every
+    non-nullish Cell exact-deoptimizes before the Boolean destination is
+    defined so the canonical path remains authoritative for HTMLDDA objects.
   - Prepared string literals expose `stringConstantCell` relocations keyed by
     function id and byte PC. Exact addresses are redacted. Generated code reads
     the current value from an address-stable GC-traced cell; moving collection

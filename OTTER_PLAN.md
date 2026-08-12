@@ -65,6 +65,15 @@ It already owns:
   boxing instead of wrapping. Fixed TypedArray views over resizable buffers
   additionally prove the complete cached view extent against the live backing
   byte length before either a load or a store;
+- prepared global lexical and guarded global-object reads in Machine IR. The
+  generated path reads the live permanent cell or live object slot after the
+  same TDZ, realm-epoch, shape, and slab proofs as the canonical path; every
+  failed proof exact-deoptimizes at the original `LoadGlobalOrThrow` before
+  publishing its result and no global-read safepoint exists;
+- tagged loose comparison with a static `null` or `undefined` operand in
+  Machine IR. Nullish and non-cell primitive inputs complete directly, while
+  every Cell exits before defining the Boolean result so canonical HTMLDDA and
+  coercion semantics remain authoritative;
 - direct captured-upvalue reads through the published native frame, cage, and
   cell layout, with exact TDZ deopt and no runtime-call round trip. Scalar
   backedges use the shared activation-local batch countdown rather than reading
@@ -259,6 +268,15 @@ process. Four-score medians moved DeltaBlue 571.5 -> 835 (+46.11%), Box2D
 1,895 -> 2,013.5 (+6.25%), and Richards 1,185.5 -> 1,162 (-1.98%); the
 three-workload geometric mean improved 15.02%. The Richards loss remains an
 explicit next-profile target rather than being relabelled as noise.
+
+Prepared global reads plus static-nullish loose equality were frozen against
+the immediately preceding release and run as four fresh B/C/C/B processes,
+with a unique wrapper log and exit manifest per process. Four-score medians
+moved DeltaBlue 852.5 -> 941.5 (+10.44%), Box2D 2,013 -> 1,996.5 (-0.82%),
+and NavierStokes 8,436 -> 8,388 (-0.57%); the three-workload geometric mean
+improved 2.89%. The two small losses remain visible rather than being rounded
+away. Logs, manifests, and both binaries are retained under
+`/tmp/otter-r51-ab.YqJmjC`.
 
 The old optimizing compiler and template emitter remain in the active graph
 only for operations and function shapes not yet selected by the replacement

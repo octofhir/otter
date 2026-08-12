@@ -723,3 +723,52 @@ pub(super) fn emit_string_concat_alloc_call(
     dynasm!(ops ; .arch aarch64 ; b =>done);
     Ok(())
 }
+
+/// Allocate `Array()` or `Array(Int32)` through the shared `AllocValue3`
+/// boundary. The VM stub rejects a non-Int32 or negative length before any
+/// allocation; every non-success status therefore exits at the original
+/// `ArrayConstruct` and lets the canonical interpreter own wide/non-number
+/// semantics, `RangeError`, and OOM reporting.
+pub(super) fn emit_array_construct_alloc_call(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    dst: u16,
+    length: Option<u16>,
+    safepoint: otter_vm::SafepointId,
+    bail: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let descriptor = abi::STUB_ARRAY_CONSTRUCT_ALLOC;
+    let stub_addr = alloc_value_stub_by_id(descriptor.id)
+        .and_then(|stub| stub.entry_addr())
+        .ok_or(Unsupported::OperandShape(
+            "ArrayConstruct allocating stub entry",
+        ))?;
+    dynasm!(ops
+        ; .arch aarch64
+        ; sub sp, sp, ALLOC_CTX_STACK_SIZE
+        ; ldr x9, [x20, THREAD_OFFSET]
+        ; str x9, [sp, ALLOC_CTX_THREAD_OFFSET]
+        ; movz w9, safepoint
+        ; str w9, [sp, ALLOC_CTX_SAFEPOINT_ID_OFFSET]
+        ; strh wzr, [sp, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET]
+        ; str xzr, [sp, ALLOC_CTX_SPILL_SLOTS_OFFSET]
+        ; mov x0, sp
+    );
+    emit_load_u64(ops, 1, u64::from(safepoint));
+    if let Some(length) = length {
+        emit_load_reg(ops, 2, length)?;
+    } else {
+        emit_load_u64(ops, 2, otter_vm::Value::number_i32(0).to_bits());
+    }
+    emit_load_u64(ops, 3, VALUE_UNDEFINED);
+    emit_load_u64(ops, 4, VALUE_UNDEFINED);
+    emit_load_runtime_stub(ops, relocations, 16, stub_addr as u64, descriptor);
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; and x5, x1, #0xff
+        ; add sp, sp, ALLOC_CTX_STACK_SIZE
+        ; cbnz x5, =>bail
+    );
+    emit_store_reg(ops, 0, dst)
+}

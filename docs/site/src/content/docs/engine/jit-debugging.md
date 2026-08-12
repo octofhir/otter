@@ -68,7 +68,10 @@ publishing the callee frame.
 
 For every available plan in a successful compile, `directCallLowered` records
 the backend's actual choice: `generated`, `inlined`, or `rejected` because the
-bounded stack layout is unsupported or the site was eliminated. It repeats
+bounded stack layout is unsupported, the backend cost model prefers the
+smaller canonical transition, or the site was eliminated. The corresponding
+typed reasons are `layoutUnsupported`, `unprofitable`, and
+`eliminated`. It repeats
 `targetIndex` / `targetCount`; a generated outcome repeats the target
 generation and tier current when the caller compiled plus `thisMode`.
 Generated code retains only the permanent function-cell link: later tier
@@ -111,13 +114,16 @@ stack-owned and materialized compiled activations. A later callee deopt resumes
 the already-started construct and retains the base/derived return contract; it
 never replays prototype lookup or `super(...)`.
 
-Non-simple class-constructor fields that can append an own data slot remain at their
-original bytecode position. `machineConstructorFieldTransition` identifies the
-generated guard-and-commit region: it proves the receiver and complete ordinary
-prototype chain, publishes the VM-interned child shape into pre-reserved
-storage, stores the live value, and runs the required barriers. Allocation
-caches only the immutable plan and reserved capacity; a guard miss deoptimizes
-before the source `StoreProperty` starts. `machineClassSuperLoad` reads an exact
+Non-simple class-constructor fields and exact ordinary function-constructor
+fields that can append an own data slot remain at their original bytecode
+position. `machineConstructorFieldTransition` identifies the generated
+guard-and-commit region: it proves the receiver and complete ordinary prototype
+chain, publishes the VM-interned child shape into pre-reserved storage, stores
+the live value, and runs the required barriers. Ordinary functions use this
+path only when `new.target` is the entered function; a distinct ordinary target
+retains the canonical path. Allocation caches only the immutable plan and
+reserved capacity; a guard miss deoptimizes before the source `StoreProperty`
+starts. `machineClassSuperLoad` reads an exact
 class wrapper's live superclass, `machineDerivedThisBindFast` commits the first
 successful `super()` result, and `machineDerivedThisBindCold` owns the repeated
 bind error. `directConstructResultFast` performs base substitution and valid
@@ -300,6 +306,14 @@ the stale cached view length.
 TDZ/malformed-layout exit contract. Primitive-string and dense-array `.length`
 may appear inside `machinePropertyLoad`; an unsigned length outside the int32
 tag range exits to canonical Number boxing.
+
+`machineArrayConstruct` identifies zero-argument or exact-Int32 length-array
+allocation at its source `bytePc`. Its `array_construct_alloc` relocation is a
+VM-owned allocating boundary shared with the template tier: the current
+generated frame and Machine spill roots remain visible across moving GC. A
+non-Int32, negative, or failed allocation status exits at the original opcode
+before construction starts; wider-arity constructors stay on the canonical
+variadic path.
 
 Scalar Machine method calls may contain a complete dense chain of one to four
 observed targets. `code-map.json` emits one `machineDirectMethodGuard` and one

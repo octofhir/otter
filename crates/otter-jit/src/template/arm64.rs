@@ -1160,6 +1160,20 @@ pub(super) fn compile(
                     threw,
                 );
             }
+            TemplateOp::ArrayConstruct {
+                dst,
+                length,
+                safepoint,
+            } => {
+                transitions::emit_array_construct_alloc_call(
+                    &mut ops,
+                    &mut relocations,
+                    dst,
+                    length,
+                    safepoint,
+                    bail,
+                )?;
+            }
             TemplateOp::VariadicOp {
                 opcode,
                 prefix,

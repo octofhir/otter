@@ -422,6 +422,11 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     TypedArray view over a resizable ArrayBuffer also guards its complete baked
     extent against the backing store's live byte length before direct element
     access; shrink misses deopt before a load or store effect.
+    Zero-argument and exact-Int32 `ArrayConstruct` inside a Machine body uses
+    the `machineArrayConstruct` region at the source `bytePc` and relocates to
+    the shared `array_construct_alloc` stub. Template code uses the same stub
+    with a frame-slot-window safepoint. A non-Int32 or negative length misses
+    before allocation and resumes the canonical constructor exactly once.
   - Exact code may contain process addresses and is not a portable golden.
     Compare `code-normalized.bin` across processes; its relocation tokens and
     branch targets are symbolic, and it is not executable. `relocations.json`
@@ -488,10 +493,17 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     prototype chain, fixed, spread, and generated-super receivers start with
     undefined own slots and their bodies perform ordinary existing-slot stores.
     The observable region is the pre-effect miss fallback.
-    Non-simple base/derived class-field additions may expose
-    `machineConstructorFieldTransition`; this region guards the receiver and
-    complete ordinary prototype chain before committing one VM-interned child
-    shape and pre-reserved slot at the original `StoreProperty`. Generated
+    The legacy optimizing backend retains that compact canonical construct
+    transition for parameter-free callees with at most three frame registers;
+    `directCallLowered` reports `unprofitable` instead of presenting
+    this deliberate code-size decision as a layout failure.
+    Non-simple class-chain fields and exact ordinary function-constructor
+    fields may expose `machineConstructorFieldTransition`; this region guards
+    the receiver and complete ordinary prototype chain before committing one
+    VM-interned child shape and pre-reserved slot at the original
+    `StoreProperty`. Ordinary functions are admitted only when `new.target` is
+    the entered function; a distinct ordinary target retains the canonical
+    path. Generated
     constructor semantics additionally expose `machineClassSuperLoad`,
     `machineDerivedThisBindFast` / `machineDerivedThisBindCold`, and
     `directConstructResultFast` / `directConstructResultThrow`. The fast result

@@ -59,10 +59,10 @@ use otter_vm::{
     JitCompileSnapshot, NativeFrameFlags, UPVALUE_CELL_TYPE_TAG, Value,
     deopt::DeoptRuntime,
     native_abi::{
-        RuntimeStubDescriptor, STUB_JIT_BACKEDGE_POLL, STUB_JIT_BIND_DERIVED_THIS,
-        STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_DEOPT_WRITEBACK, STUB_NUMBER_POW_F64_LEAF,
-        STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF, STUB_STRICT_EQ_LEAF,
-        STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF,
+        RuntimeStubDescriptor, STUB_ARRAY_CONSTRUCT_ALLOC, STUB_JIT_BACKEDGE_POLL,
+        STUB_JIT_BIND_DERIVED_THIS, STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_DEOPT_WRITEBACK,
+        STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF,
+        STUB_STRICT_EQ_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF,
     },
 };
 
@@ -283,6 +283,7 @@ pub(super) fn emit(
     initialize_upvalues_entry: u64,
     bind_derived_this_entry: u64,
     string_concat_entry: u64,
+    array_construct_entry: u64,
     number_rem_entry: u64,
     number_pow_entry: u64,
     number_to_int32_entry: u64,
@@ -1086,6 +1087,13 @@ pub(super) fn emit(
                     ; .arch aarch64
                     ; cmp w16, w15
                     ; b.ne =>deopt
+                    // An intervening call in a non-simple constructor may
+                    // freeze `this` after the transition plan was baked.
+                    // Adding an own field to a non-extensible receiver would
+                    // bypass the canonical StoreProperty semantics, so prove
+                    // the live flag before any shape/length mutation.
+                    ; ldrb w16, [x13, view.object_extensible_byte]
+                    ; cbz w16, =>deopt
                     ; ldrh w16, [x13, view.object_slab_len_byte]
                     ; cmp w16, transition.slot as u32
                     ; b.ne =>deopt
@@ -1123,10 +1131,19 @@ pub(super) fn emit(
                     ; mov x12, x13
                 );
                 if transition.slot == 0 {
+                    let values_ready = ops.new_dynamic_label();
                     dynasm!(ops
                         ; .arch aarch64
+                        // Receiver preparation can reserve an out-of-line
+                        // slab for a multi-field transition program before
+                        // the first StoreProperty executes. Preserve that
+                        // stable slab pointer; only a genuinely inline object
+                        // needs its cached values pointer initialized here.
+                        ; ldr w16, [x13, view.object_slab_handle_byte]
+                        ; cbnz w16, =>values_ready
                         ; add x16, x13, view.object_inline_values_byte
                         ; str x16, [x13, view.object_values_ptr_byte]
+                        ; =>values_ready
                     );
                 }
                 dynasm!(ops ; .arch aarch64 ; mov x10, x17);
@@ -1645,6 +1662,20 @@ pub(super) fn emit(
                             }
                             (*target, string_concat_entry, 3, true)
                         }
+                        CallTarget::RuntimeStub(target)
+                            if *target == STUB_ARRAY_CONSTRUCT_ALLOC =>
+                        {
+                            if locations.len() < 4
+                                || integer_register(locations[0])? != 2
+                                || integer_register(locations[1])? != 3
+                                || integer_register(locations[2])? != 4
+                            {
+                                return Err(Unsupported::OperandShape(
+                                    "scalar ArrayConstruct call",
+                                ));
+                            }
+                            (*target, array_construct_entry, 3, true)
+                        }
                         CallTarget::RuntimeStub(_) => {
                             return Err(Unsupported::OperandShape("scalar runtime call target"));
                         }
@@ -1657,6 +1688,22 @@ pub(super) fn emit(
                         return Err(Unsupported::OperandShape("scalar runtime call result"));
                     }
                     let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                    let array_construct_region = if target == STUB_ARRAY_CONSTRUCT_ALLOC {
+                        let byte_pc = instruction
+                            .deopt
+                            .and_then(|deopt| {
+                                deopt_runtime
+                                    .table
+                                    .lookup(otter_vm::deopt::DeoptExitId(deopt.0))
+                            })
+                            .map(|state| state.innermost().byte_pc)
+                            .ok_or(Unsupported::OperandShape(
+                                "scalar ArrayConstruct deopt state",
+                            ))?;
+                        Some((byte_pc, ops.offset().0))
+                    } else {
+                        None
+                    };
                     if allocating {
                         let site = safepoints
                             .site(id)
@@ -1698,6 +1745,14 @@ pub(super) fn emit(
                             ; cmp x0, x16
                             ; cset w0, eq
                         );
+                    }
+                    if let Some((byte_pc, start)) = array_construct_region {
+                        structural_regions.push((
+                            "machineArrayConstruct",
+                            Some(byte_pc),
+                            start,
+                            ops.offset().0,
+                        ));
                     }
                 }
             }

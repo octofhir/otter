@@ -6,7 +6,8 @@
 //!   block parameters, edge arguments, branches, and returns.
 //! - [`NumericNode`] — tagged/scalar parameters, constants, captured-binding
 //!   reads, guarded coercions, ordinary properties, indexed elements,
-//!   arithmetic, comparison, and typed plain/method calls.
+//!   arithmetic, comparison, typed array construction, and typed plain/method
+//!   calls.
 //!
 //! # Invariants
 //! - Parameters remain tagged unless their uses prove a numeric representation;
@@ -26,6 +27,10 @@
 //!   window.
 //! - Captured-binding reads require the GC cage and retain an exact pre-load
 //!   frame state so an invalid spine or TDZ hole resumes canonically.
+//! - `ArrayConstruct` accepts only zero arguments or one exact Int32 length.
+//!   The allocating operation and any required tagged decode retain the same
+//!   exact pre-construction frame state; all wider arities stay on the legacy
+//!   backend.
 //! - A protected instruction's deopt state retains values used only by its
 //!   innermost catch. This implicit liveness is solved with normal CFG
 //!   liveness; element and scalar guards do not become generated throw edges.
@@ -112,6 +117,10 @@ pub(super) enum NumericNode {
         receiver: NumericValue,
         index: NumericValue,
         value: NumericValue,
+        byte_pc: u32,
+    },
+    ArrayConstruct {
+        length: NumericValue,
         byte_pc: u32,
     },
     TaggedToBoolean(NumericValue),
@@ -320,6 +329,7 @@ impl NumericNode {
             | Self::PropertyStore { .. }
             | Self::ElementLoad { .. }
             | Self::ElementStore { .. }
+            | Self::ArrayConstruct { .. }
             | Self::TaggedStringConcat(..)
             | Self::DirectCall { .. }
             | Self::ColdCallExit { .. }
@@ -905,6 +915,17 @@ fn infer_instruction_parameters(
             }
             *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
+        Op::ArrayConstruct => {
+            let count = usize::try_from(instruction.const_index(code, 1)?).ok()?;
+            match count {
+                0 => {}
+                1 => {
+                    *int32_parameters |= read(register(instruction, code, 2)?)?;
+                }
+                _ => return None,
+            }
+            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
+        }
         Op::ToPrimitive | Op::ToNumeric | Op::ToNumber => {
             let source = read(register(instruction, code, 1)?)?;
             *number_parameters |= source;
@@ -1255,6 +1276,7 @@ fn instruction_has_implicit_exception_side_exit(op: Op) -> bool {
             | Op::StoreProperty
             | Op::LoadElement
             | Op::StoreElement
+            | Op::ArrayConstruct
             | Op::ToPrimitive
             | Op::ToNumeric
             | Op::ToNumber
@@ -1374,6 +1396,15 @@ fn instruction_accesses(
             for index in 0..count {
                 reads.push(register(instruction, code, 4 + index)?);
             }
+            Some((reads, vec![register(instruction, code, 0)?]))
+        }
+        Op::ArrayConstruct => {
+            let count = usize::try_from(instruction.const_index(code, 1)?).ok()?;
+            let reads = match count {
+                0 => Vec::new(),
+                1 => vec![register(instruction, code, 2)?],
+                _ => return None,
+            };
             Some((reads, vec![register(instruction, code, 0)?]))
         }
         Op::ToPrimitive
@@ -1838,6 +1869,46 @@ fn lower_instruction(
         Op::LoadNumber => {
             instruction.const_index(code, 1)?;
             NumericNode::Constant(instruction.load_number?)
+        }
+        Op::ArrayConstruct => {
+            let argument_count = usize::try_from(instruction.const_index(code, 1)?).ok()?;
+            let length = match argument_count {
+                0 => {
+                    let length = push(nodes, NumericNode::IntegerConstant(0));
+                    block_nodes.push(length);
+                    length
+                }
+                1 => read_int32(
+                    decode_site,
+                    nodes,
+                    block_nodes,
+                    frame_states,
+                    register(instruction, code, 2)?,
+                )?,
+                _ => return None,
+            };
+            let value = push(
+                nodes,
+                NumericNode::ArrayConstruct {
+                    length,
+                    byte_pc: instruction.byte_pc,
+                },
+            );
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
+            write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            )?;
+            return Some(());
         }
         Op::Call => {
             let source = read_value(registers, register(instruction, code, 1)?)?;
@@ -2760,6 +2831,54 @@ mod tests {
         )
     }
 
+    fn array_construct_view(argument_count: u32) -> JitCompileSnapshot {
+        let mut operands = vec![Operand::Register(2), Operand::ConstIndex(argument_count)];
+        operands
+            .extend((0..argument_count).map(|register| {
+                Operand::Register(u16::try_from(register).expect("test register"))
+            }));
+        JitCompileSnapshot::without_feedback(
+            111,
+            2,
+            3,
+            vec![
+                JitTestInstruction::new(Op::ArrayConstruct, 0, 0, operands),
+                JitTestInstruction::new(Op::ReturnValue, 1, 8, vec![Operand::Register(2)]),
+            ],
+        )
+    }
+
+    fn tagged_array_construct_view() -> JitCompileSnapshot {
+        JitCompileSnapshot::without_feedback(
+            112,
+            1,
+            3,
+            vec![
+                JitTestInstruction::new(
+                    Op::LoadProperty,
+                    0,
+                    0,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                JitTestInstruction::new(
+                    Op::ArrayConstruct,
+                    1,
+                    8,
+                    vec![
+                        Operand::Register(2),
+                        Operand::ConstIndex(1),
+                        Operand::Register(1),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 2, 16, vec![Operand::Register(2)]),
+            ],
+        )
+    }
+
     fn catch_liveness_view() -> JitCompileSnapshot {
         let instructions = vec![
             (
@@ -3093,6 +3212,181 @@ mod tests {
             view.direct_methods.insert(0, methods);
             assert!(NumericFunction::build(&view).is_none());
         }
+    }
+
+    #[test]
+    fn array_construct_accepts_only_zero_or_one_exact_int32_length() {
+        let zero = NumericFunction::build(&array_construct_view(0)).expect("zero-argument HIR");
+        let (construct, length) = zero
+            .nodes
+            .iter()
+            .enumerate()
+            .find_map(|(index, node)| match node {
+                NumericNode::ArrayConstruct { length, byte_pc: 0 } => {
+                    Some((NumericValue(index), *length))
+                }
+                _ => None,
+            })
+            .expect("zero-argument array construct");
+        assert_eq!(zero.nodes[length.0], NumericNode::IntegerConstant(0));
+        assert_eq!(zero.nodes[construct.0].value_type(), NumericType::Tagged);
+        assert_eq!(
+            zero.frame_states
+                .iter()
+                .find(|state| state.point == NumericFramePoint::Node(construct))
+                .expect("exact zero-argument construction state")
+                .byte_pc,
+            0
+        );
+
+        let one = NumericFunction::build(&array_construct_view(1)).expect("one-argument HIR");
+        let (construct, length) = one
+            .nodes
+            .iter()
+            .enumerate()
+            .find_map(|(index, node)| match node {
+                NumericNode::ArrayConstruct { length, byte_pc: 0 } => {
+                    Some((NumericValue(index), *length))
+                }
+                _ => None,
+            })
+            .expect("one-argument array construct");
+        assert_eq!(one.nodes[length.0].value_type(), NumericType::Int32);
+        let state = one
+            .frame_states
+            .iter()
+            .find(|state| state.point == NumericFramePoint::Node(construct))
+            .expect("exact one-argument construction state");
+        assert_eq!(state.byte_pc, 0);
+        assert_eq!(state.slots[0], NumericFrameSlot::Value(length));
+        assert_eq!(state.slots[2], NumericFrameSlot::Undefined);
+
+        assert!(
+            NumericFunction::build(&array_construct_view(2)).is_none(),
+            "wider Array construction must retain the legacy backend"
+        );
+    }
+
+    #[test]
+    fn tagged_array_length_decode_and_construct_share_exact_pre_operation_state() {
+        let hir =
+            NumericFunction::build(&tagged_array_construct_view()).expect("tagged length HIR");
+        let decode = hir
+            .nodes
+            .iter()
+            .position(|node| matches!(node, NumericNode::TaggedToInt32(_)))
+            .map(NumericValue)
+            .expect("exact tagged Int32 decode");
+        let construct = hir
+            .nodes
+            .iter()
+            .position(|node| {
+                matches!(
+                    node,
+                    NumericNode::ArrayConstruct {
+                        length,
+                        byte_pc: 8
+                    } if *length == decode
+                )
+            })
+            .map(NumericValue)
+            .expect("array construct consuming the decoded length");
+        let property = match hir.nodes[decode.0] {
+            NumericNode::TaggedToInt32(source) => source,
+            _ => unreachable!("matched tagged decode"),
+        };
+
+        for point in [decode, construct] {
+            let state = hir
+                .frame_states
+                .iter()
+                .find(|state| state.point == NumericFramePoint::Node(point))
+                .expect("exact pre-construction state");
+            assert_eq!(state.byte_pc, 8);
+            assert_eq!(state.slots[1], NumericFrameSlot::Value(property));
+            assert_eq!(state.slots[2], NumericFrameSlot::Undefined);
+        }
+    }
+
+    #[test]
+    fn array_construct_inference_accesses_and_exception_liveness_are_exact() {
+        let zero = array_construct_view(0);
+        let zero_code = zero.code_block.as_ref();
+        let mut zero_origins = vec![1, 2, 4];
+        let mut zero_int32 = 0;
+        let mut zero_number = 0;
+        infer_instruction_parameters(
+            &zero.instructions[0],
+            zero_code,
+            &mut zero_origins,
+            &mut zero_int32,
+            &mut zero_number,
+        )
+        .expect("zero-argument inference");
+        assert_eq!(zero_origins, [1, 2, 0]);
+        assert_eq!(zero_int32, 0);
+        assert_eq!(
+            instruction_accesses(&zero.instructions[0], zero_code),
+            Some((Vec::new(), vec![2]))
+        );
+
+        let one = array_construct_view(1);
+        let one_code = one.code_block.as_ref();
+        let mut one_origins = vec![1, 2, 4];
+        let mut one_int32 = 0;
+        let mut one_number = 0;
+        infer_instruction_parameters(
+            &one.instructions[0],
+            one_code,
+            &mut one_origins,
+            &mut one_int32,
+            &mut one_number,
+        )
+        .expect("one-argument inference");
+        assert_eq!(one_origins, [1, 2, 0]);
+        assert_eq!(one_int32, 1);
+        assert_eq!(one_number, 0);
+        assert_eq!(
+            instruction_accesses(&one.instructions[0], one_code),
+            Some((vec![0], vec![2]))
+        );
+
+        let mut live = vec![false; 6];
+        let mut catch_live = vec![false; 6];
+        catch_live[4] = true;
+        catch_live[5] = true;
+        transfer_instruction_liveness(
+            &one.instructions[0],
+            one_code,
+            Some(InstructionExceptionHandler {
+                block: 0,
+                exception_register: 4,
+            }),
+            &[catch_live],
+            &mut live,
+        )
+        .expect("implicit ArrayConstruct exception liveness");
+        assert!(instruction_has_implicit_exception_side_exit(
+            Op::ArrayConstruct
+        ));
+        assert!(live[0], "length is an ordinary read");
+        assert!(!live[2], "destination is killed before the operation");
+        assert!(!live[4], "the catch supplies its exception register");
+        assert!(live[5], "catch-only state remains live at the exact exit");
+
+        let two = array_construct_view(2);
+        let two_code = two.code_block.as_ref();
+        assert!(instruction_accesses(&two.instructions[0], two_code).is_none());
+        assert!(
+            infer_instruction_parameters(
+                &two.instructions[0],
+                two_code,
+                &mut [1, 2, 4],
+                &mut 0,
+                &mut 0,
+            )
+            .is_none()
+        );
     }
 
     #[test]

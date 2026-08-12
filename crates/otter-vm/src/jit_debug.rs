@@ -252,6 +252,9 @@ pub enum JitDirectCallLoweringRejectionReason {
     /// The exact callee register/native-stack layout exceeds the bounded
     /// generated-call contract.
     LayoutUnsupported,
+    /// The backend cost model selected the smaller canonical call transition
+    /// because fixed generated-linkage work would dominate this callee.
+    Unprofitable,
     /// Backend dead-code elimination removed the call site.
     Eliminated,
 }
@@ -1044,6 +1047,22 @@ mod tests {
         assert_eq!(
             value["outcome"]["reason"],
             "SsaConstruction(RegisterOutOfRange)"
+        );
+    }
+
+    #[test]
+    fn direct_call_cost_rejection_has_a_stable_typed_name() {
+        let value = serde_json::to_value(JitDirectCallLoweringOutcome::Rejected {
+            reason: JitDirectCallLoweringRejectionReason::Unprofitable,
+        })
+        .expect("serialize direct-call lowering");
+
+        assert_eq!(
+            value,
+            json!({
+                "kind": "rejected",
+                "reason": "unprofitable"
+            })
         );
     }
 

@@ -2,8 +2,8 @@
 //!
 //! # Contents
 //! - `hir` — typed scalar semantic graph with direct captured-binding reads,
-//!   guarded property and element accesses, explicit reentrant calls, and catch
-//!   landing pads.
+//!   guarded property and element accesses, typed array construction, explicit
+//!   reentrant calls, and catch landing pads.
 //! - `arm64` — allocation-driven AArch64 emission.
 //! - [`try_compile`] — production optimizing-tier entry for this vertical slice.
 //!
@@ -27,6 +27,9 @@
 //! - Allocating calls save every live tagged value from its exact late-use
 //!   location into the frame's collector-visible root area and reload it after
 //!   moving GC; no interpreter-window shuttle or emitter-local map exists.
+//! - Zero-argument and one-Int32-argument `ArrayConstruct` operations call the
+//!   stack-owned allocating boundary directly with fixed ABI registers. Wider
+//!   or non-Int32 forms remain outside this pipeline.
 //! - Complete one-to-four-target guarded method chains, monomorphic plain calls,
 //!   and fixed/spread base/derived/super construction share one typed descriptor
 //!   and generated linkage emitter. A never-attempted unplanned plain/method call
@@ -44,10 +47,11 @@ use otter_vm::{
     JitArtifactFileName, JitCompileSnapshot,
     deopt::{DeoptExitDescriptor, DeoptExitId, DeoptRuntime},
     native_abi::{
-        STUB_JIT_BACKEDGE_POLL, STUB_JIT_BIND_DERIVED_THIS, STUB_JIT_COPY_SPREAD_ARGUMENTS,
-        STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_DERIVED_CONSTRUCT_RESULT,
-        STUB_JIT_INITIALIZE_UPVALUES, STUB_JIT_PREPARE_BASE_CONSTRUCT,
-        STUB_JIT_RESOLVE_DIRECT_ENTRY, STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
+        STUB_ARRAY_CONSTRUCT_ALLOC, STUB_JIT_BACKEDGE_POLL, STUB_JIT_BIND_DERIVED_THIS,
+        STUB_JIT_COPY_SPREAD_ARGUMENTS, STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK,
+        STUB_JIT_DERIVED_CONSTRUCT_RESULT, STUB_JIT_INITIALIZE_UPVALUES,
+        STUB_JIT_PREPARE_BASE_CONSTRUCT, STUB_JIT_RESOLVE_DIRECT_ENTRY,
+        STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
     },
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -142,6 +146,11 @@ pub(crate) fn try_compile(
             .entry_addr()
             .ok_or(Unsupported::OperandShape(
                 "scalar string concat runtime entry",
+            ))? as u64,
+        otter_vm::runtime_stubs::ARRAY_CONSTRUCT_ALLOC
+            .entry_addr()
+            .ok_or(Unsupported::OperandShape(
+                "scalar ArrayConstruct runtime entry",
             ))? as u64,
         otter_vm::runtime_stubs::NUMBER_REM_F64_LEAF.entry_addr() as u64,
         otter_vm::runtime_stubs::NUMBER_POW_F64_LEAF.entry_addr() as u64,
@@ -601,6 +610,72 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                     );
                     store.clobbers = element_clobbers();
                     store
+                }
+                NumericNode::ArrayConstruct { length, byte_pc: _ } => {
+                    if hir.nodes[length.0].value_type() != NumericType::Int32 {
+                        return Err(super::VerificationError::InvalidValue(result));
+                    }
+                    let boxed_length =
+                        push_value(&mut representations, MachineRepresentation::Tagged);
+                    instructions.push(MachineInstruction::plain(
+                        MachineOpcode::BoxInt32,
+                        vec![
+                            MachineOperand::register_input(machine_value(&values, length)),
+                            MachineOperand::fixed_register_output(
+                                boxed_length,
+                                PhysicalRegister::integer(2),
+                            ),
+                        ],
+                    ));
+                    let undefined_this =
+                        push_value(&mut representations, MachineRepresentation::Tagged);
+                    instructions.push(MachineInstruction::plain(
+                        MachineOpcode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
+                        vec![MachineOperand::fixed_register_output(
+                            undefined_this,
+                            PhysicalRegister::integer(3),
+                        )],
+                    ));
+                    let undefined_new_target =
+                        push_value(&mut representations, MachineRepresentation::Tagged);
+                    instructions.push(MachineInstruction::plain(
+                        MachineOpcode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
+                        vec![MachineOperand::fixed_register_output(
+                            undefined_new_target,
+                            PhysicalRegister::integer(4),
+                        )],
+                    ));
+                    let descriptor_index = intern_call_descriptor(
+                        &mut call_descriptors,
+                        array_construct_call_descriptor(),
+                    );
+                    let mut call = MachineInstruction::plain(
+                        MachineOpcode::Call(descriptor_index as u32),
+                        vec![
+                            MachineOperand::fixed_register_input(
+                                boxed_length,
+                                PhysicalRegister::integer(2),
+                            ),
+                            MachineOperand::fixed_register_input(
+                                undefined_this,
+                                PhysicalRegister::integer(3),
+                            ),
+                            MachineOperand::fixed_register_input(
+                                undefined_new_target,
+                                PhysicalRegister::integer(4),
+                            ),
+                            MachineOperand::fixed_register_output(
+                                result,
+                                PhysicalRegister::integer(0),
+                            ),
+                        ],
+                    );
+                    call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
+                    call.safepoint = Some(super::SafepointId(next_safepoint));
+                    next_safepoint = next_safepoint
+                        .checked_add(1)
+                        .expect("bounded scalar function safepoint count");
+                    call
                 }
                 NumericNode::PropertyLoad {
                     receiver,
@@ -1331,6 +1406,20 @@ fn string_concat_call_descriptor() -> CallDescriptor {
     }
 }
 
+fn array_construct_call_descriptor() -> CallDescriptor {
+    let mut clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
+    clobbers.retain(|register| *register != PhysicalRegister::integer(0));
+    CallDescriptor {
+        target: CallTarget::RuntimeStub(STUB_ARRAY_CONSTRUCT_ALLOC),
+        arguments: vec![MachineRepresentation::Tagged; 3],
+        result: Some(MachineRepresentation::Tagged),
+        effects: CallEffects::READS_HEAP.union(CallEffects::WRITES_HEAP),
+        clobbers,
+        exceptional: ExceptionalEdge::None,
+        safepoint: SafepointKind::Gc,
+    }
+}
+
 fn direct_call_descriptor(
     target: &NumericDirectCallTarget,
     hir: &NumericFunction,
@@ -1842,6 +1931,44 @@ mod tests {
             direct_call_arguments: Vec::new(),
             parameter_count: 1,
             register_count: 3,
+            arithmetic_op_count: 0,
+        }
+    }
+
+    fn array_construct_selection_hir() -> NumericFunction {
+        let value = hir::NumericValue;
+        NumericFunction {
+            function_id: 152,
+            nodes: vec![
+                NumericNode::IntegerConstant(7),
+                NumericNode::ArrayConstruct {
+                    length: value(0),
+                    byte_pc: 24,
+                },
+            ],
+            blocks: vec![hir::NumericBlock {
+                logical_pc: 0,
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                parameters: Vec::new(),
+                parameter_registers: Vec::new(),
+                successor_arguments: Vec::new(),
+                nodes: vec![value(0), value(1)],
+                terminator: NumericTerminator::Return(value(1)),
+            }],
+            frame_states: vec![hir::NumericFrameState {
+                point: NumericFramePoint::Node(value(1)),
+                function_id: 152,
+                byte_pc: 24,
+                slots: vec![
+                    hir::NumericFrameSlot::Value(value(0)),
+                    hir::NumericFrameSlot::Undefined,
+                ],
+            }],
+            direct_call_targets: Vec::new(),
+            direct_call_arguments: Vec::new(),
+            parameter_count: 0,
+            register_count: 2,
             arithmetic_op_count: 0,
         }
     }
@@ -4078,6 +4205,78 @@ mod tests {
             1,
             "argument boxing is shared by the whole chain"
         );
+    }
+
+    #[test]
+    fn array_construct_selection_uses_typed_allocating_abi_and_exact_state() {
+        let sequence = select(&array_construct_selection_hir()).expect("ArrayConstruct Machine IR");
+        assert_eq!(sequence.call_descriptors().len(), 1);
+        let descriptor = &sequence.call_descriptors()[0];
+        assert_eq!(
+            descriptor.target,
+            CallTarget::RuntimeStub(STUB_ARRAY_CONSTRUCT_ALLOC)
+        );
+        assert_eq!(descriptor.arguments, [MachineRepresentation::Tagged; 3]);
+        assert_eq!(descriptor.result, Some(MachineRepresentation::Tagged));
+        assert_eq!(
+            descriptor.effects,
+            CallEffects::READS_HEAP.union(CallEffects::WRITES_HEAP)
+        );
+        assert_eq!(descriptor.exceptional, ExceptionalEdge::None);
+        assert_eq!(descriptor.safepoint, SafepointKind::Gc);
+        assert_eq!(
+            descriptor.clobbers,
+            TargetRegisterFile::aarch64_scalar_call_clobbers()
+                .into_iter()
+                .filter(|register| *register != PhysicalRegister::integer(0))
+                .collect::<Vec<_>>()
+        );
+
+        let (call_id, call) = sequence
+            .instructions()
+            .iter()
+            .enumerate()
+            .find(|(_, instruction)| matches!(instruction.opcode, MachineOpcode::Call(0)))
+            .map(|(index, instruction)| (MachineInstructionId(index as u32), instruction))
+            .expect("typed allocating call");
+        for (operand, register) in call.operands[..4]
+            .iter()
+            .zip([2_u8, 3, 4, 0].map(PhysicalRegister::integer))
+        {
+            assert_eq!(operand.constraint, OperandConstraint::Fixed(register));
+        }
+        assert_ne!(
+            call.operands[1].value, call.operands[2].value,
+            "the two ABI padding values must remain separate SSA definitions"
+        );
+        assert_eq!(call.safepoint, Some(SafepointId(0)));
+        assert!(call.deopt.is_some());
+        assert!(sequence.instructions().iter().any(|instruction| {
+            instruction.opcode == MachineOpcode::BoxInt32
+                && instruction.operands[1].value == call.operands[0].value
+                && instruction.operands[1].constraint
+                    == OperandConstraint::Fixed(PhysicalRegister::integer(2))
+        }));
+        for padding in [&call.operands[1], &call.operands[2]] {
+            assert!(sequence.instructions().iter().any(|instruction| {
+                instruction.opcode
+                    == MachineOpcode::TaggedConstant(otter_vm::Value::undefined().to_bits())
+                    && instruction.operands[0].value == padding.value
+            }));
+        }
+
+        let allocation = sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("ArrayConstruct allocation");
+        let locations = allocation
+            .instruction_locations(call_id)
+            .expect("ArrayConstruct call locations");
+        for (&location, register) in locations[..4]
+            .iter()
+            .zip([2_u8, 3, 4, 0].map(PhysicalRegister::integer))
+        {
+            assert_eq!(location, AllocatedLocation::Register(register));
+        }
     }
 
     #[test]

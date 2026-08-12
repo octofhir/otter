@@ -48,6 +48,14 @@ It already owns:
   area, VM `SafepointRecord` spill locations, and post-GC reloads. Rope length
   uses checked `u32` arithmetic: an unrepresentable concatenation exits before
   allocation and becomes one catchable `RangeError`, never a saturated body;
+- stack-owned zero-argument and exact-Int32 `ArrayConstruct` allocation through
+  one VM-owned `AllocValue3` boundary shared by template and Machine code. The
+  safepoint roots the complete generated frame plus allocator spill area; a
+  tag, sign, or allocation-status miss resumes the original opcode before any
+  constructor effect. Wider arities retain the canonical variadic path. The
+  legacy optimizing construct cost model also retains the compact canonical
+  call boundary for parameter-free three-register callees, reporting the exact
+  `unprofitable` lowering reason instead of a fake layout failure;
 - guarded dense indexed-element and ordinary settled own-data property loads
   and existing-slot stores in Machine IR. Immutable mono/polymorphic snapshot
   programs replace mutable IC cells, every guard miss deoptimizes at the exact
@@ -104,14 +112,17 @@ It already owns:
   proves every initializer name absent from the selected prototype chain,
   installs undefined own slots before entry, and lets the body overwrite them
   without StoreProperty shape-transition reentry;
-- exact class-constructor field transitions at original `StoreProperty` sites. The
+- exact constructor field transitions at original `StoreProperty` sites. The
   VM retains movement-stable shape identities, the compile snapshot resolves
   live handles, and Machine IR guards the receiver plus the complete ordinary
   prototype chain before publishing shape, slab length, inline storage, and
-  both GC barriers. Non-simple base and derived class fields therefore stay native
-  without moving initializer effects earlier. The immutable plan and reserved
-  capacity are cached per exact base/derived chain, so receiver allocation does
-  not rescan prototypes after the guarded plan is installed;
+  both GC barriers. Non-simple base/derived class fields and exact ordinary
+  function-constructor fields therefore stay native without moving initializer
+  effects earlier. Ordinary functions are admitted only when `new.target` is
+  the entered function; a distinct ordinary target retains the canonical path.
+  The immutable plan and reserved capacity are cached per exact constructor
+  chain, so receiver allocation does not rescan prototypes after the guarded
+  plan is installed;
 - generated superclass lookup, derived-`this` binding, and base/derived return
   selection in Machine code. Materialized bind and invalid derived returns are
   cold siblings; fixed/spread direct arguments remain late tagged roots across

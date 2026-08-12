@@ -654,6 +654,115 @@ pub(crate) fn element_access_for(
         .filter(|access| access.type_tag != 0)
 }
 
+/// Prove the receiver and immutable body guards for one in-body dense view.
+///
+/// On success `x16` contains the current element base and `x14` contains the
+/// zero-extended live length. The returned pair may be cached only while the
+/// caller proves that no allocation, reentry, or representation-changing
+/// effect can occur. Nothing here publishes a GC root: `x16` is a raw host
+/// address and must not survive such a boundary.
+///
+/// Clobbers `x9`, `x11`-`x16`.
+pub(crate) fn emit_dense_element_view<R>(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    access: &JitElementAccess,
+    load_receiver: R,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported>
+where
+    R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
+{
+    let JitElementBase::InBody { byte: base_byte } = access.base else {
+        return Err(Unsupported::OperandShape("dense element view base"));
+    };
+    load_receiver(ops, 9)?;
+    emit_cell_test(ops, 9, 11, CellTest::IsNotCell, miss);
+    dynasm!(ops ; .arch aarch64 ; mov w12, w9); // low-32 Gc offset
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        13,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; add x13, x13, x12        // x13 = GcHeader ptr
+        ; ldrb w14, [x13]
+        ; cmp w14, access.type_tag as u32
+        ; b.ne =>miss
+    );
+    for guard in access.guards.iter().flatten() {
+        emit_body_guard(ops, *guard, miss);
+    }
+    match access.length_width {
+        JitGuardWidth::Byte => dynasm!(ops
+            ; .arch aarch64
+            ; ldrb w14, [x13, access.length_byte]
+        ),
+        JitGuardWidth::Word32 => dynasm!(ops
+            ; .arch aarch64
+            ; ldr w14, [x13, access.length_byte]
+        ),
+        JitGuardWidth::Word64 => dynasm!(ops
+            ; .arch aarch64
+            ; ldr x14, [x13, access.length_byte]
+        ),
+    }
+    dynasm!(ops ; .arch aarch64 ; ldr x16, [x13, base_byte]);
+    Ok(())
+}
+
+/// Prove one index against an already validated in-body dense view.
+///
+/// The caller supplies the raw base in `x16` and normalized length in `x14`.
+/// On success `x16` is advanced to the addressed element. The tagged form
+/// first proves the exact int32 number tag; the unsigned bounds comparison then
+/// rejects negative indices without a separate branch.
+///
+/// Clobbers `x11`, `x12`, `x15`, and `x16`.
+pub(crate) fn emit_element_address_from_dense_view<I>(
+    ops: &mut Assembler,
+    access: &JitElementAccess,
+    load_index: I,
+    index_form: DenseIndexForm,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported>
+where
+    I: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
+{
+    load_index(ops, 15)?;
+    if index_form == DenseIndexForm::Tagged {
+        dynasm!(ops
+            ; .arch aarch64
+            ; lsr x11, x15, #48
+            ; movz x12, NUMBER_TAG_HI16
+            ; cmp x11, x12
+            ; b.ne =>miss
+        );
+    }
+    match access.length_width {
+        JitGuardWidth::Byte | JitGuardWidth::Word32 => dynasm!(ops
+            ; .arch aarch64
+            ; cmp w15, w14
+            ; b.hs =>miss
+        ),
+        JitGuardWidth::Word64 => dynasm!(ops
+            ; .arch aarch64
+            ; mov w15, w15
+            ; cmp x15, x14
+            ; b.hs =>miss
+        ),
+    }
+    match access.element.stride_shift() {
+        2 => dynasm!(ops ; .arch aarch64 ; add x16, x16, w15, uxtw #2),
+        _ => dynasm!(ops ; .arch aarch64 ; add x16, x16, w15, uxtw #3),
+    }
+    Ok(())
+}
+
 /// Prove an in-bounds indexed element access, leaving the element's address in
 /// `x16`.
 ///
@@ -685,6 +794,10 @@ where
     R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
     I: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
 {
+    if matches!(access.base, JitElementBase::InBody { .. }) {
+        emit_dense_element_view(ops, relocations, view, access, load_receiver, miss)?;
+        return emit_element_address_from_dense_view(ops, access, load_index, index_form, miss);
+    }
     load_receiver(ops, 9)?;
     emit_cell_test(ops, 9, 11, CellTest::IsNotCell, miss);
     dynasm!(ops ; .arch aarch64 ; mov w12, w9); // low-32 Gc offset

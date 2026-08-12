@@ -25,8 +25,17 @@ impl Interpreter {
     /// describes; anything else is generic and keeps the runtime path.
     pub(crate) fn element_family_of(&self, recv: Value) -> crate::jit::JitElementFamily {
         use crate::jit::JitElementFamily as Family;
-        if recv.as_array().is_some() {
-            return Family::Dense;
+        if let Some(array) = recv.as_array() {
+            return match crate::array::dense_element_kind(array, &self.gc_heap) {
+                crate::array::DenseElementKind::PackedDouble => Family::DenseFloat64,
+                crate::array::DenseElementKind::Tagged => Family::DenseTagged,
+                // Empty and holey numeric storage are transient layouts that
+                // no generated packed hit may consume. The feedback cell
+                // deliberately ignores Unseen until a complete packed prefix
+                // has been published.
+                crate::array::DenseElementKind::Empty
+                | crate::array::DenseElementKind::HoleyDouble => Family::Unseen,
+            };
         }
         match recv.as_typed_array(&self.gc_heap).map(|view| view.kind()) {
             Some(crate::binary::TypedArrayKind::Int32) => Family::TypedInt32,

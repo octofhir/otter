@@ -76,6 +76,63 @@ use std::fmt::Write as _;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MachineValue(pub u32);
 
+/// Maximum number of loop-scoped packed-double view caches in one body.
+///
+/// Each cache owns two untraced native-stack words, so the bound also caps
+/// persistent raw frame growth at 512 bytes on 64-bit targets.
+pub const MAX_PACKED_DOUBLE_VIEW_CACHES: usize = 32;
+
+/// Number of untraced native-stack words owned by one packed-double view
+/// cache: the non-null element base followed by the live dense length.
+pub const PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS: usize = 2;
+
+/// Dense identity of one loop-scoped packed-double element-view cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PackedDoubleViewCacheId(u8);
+
+impl PackedDoubleViewCacheId {
+    /// Construct a bounded cache identity.
+    #[must_use]
+    pub const fn new(index: usize) -> Option<Self> {
+        if index < MAX_PACKED_DOUBLE_VIEW_CACHES {
+            Some(Self(index as u8))
+        } else {
+            None
+        }
+    }
+
+    /// Zero-based cache index.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    /// First raw frame word owned by this cache.
+    #[must_use]
+    pub const fn raw_word(self) -> usize {
+        self.index() * PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS
+    }
+}
+
+/// Boundary that invalidates every persistent packed-double view cache.
+///
+/// The target emitter consumes this semantic reason when placing zeroing
+/// operations. Cached words contain raw host addresses rather than GC roots
+/// and may survive only across a generated loop backedge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackedDoubleViewCacheClearReason {
+    /// Ordinary function activation before any generated instruction.
+    FunctionEntry,
+    /// Interpreter-to-native loop-header entry.
+    OsrEntry,
+    /// Non-backedge control entering the owning natural-loop header.
+    LoopEntry,
+    /// Generated control leaves through a cold or exact-deoptimization path.
+    ColdExit,
+    /// Generated control may allocate, collect, or invoke JavaScript.
+    Reentry,
+}
+
 /// Dense identity of a machine basic block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MachineBlock(pub u32);
@@ -553,6 +610,11 @@ pub enum MachineOpcode {
     Uint32ToFloat64,
     /// Convert an unboxed Float64 through ECMAScript ToInt32.
     Float64ToInt32,
+    /// Prove that one Float64 is an exact unsigned dense-element index.
+    ///
+    /// The conversion deoptimizes at the owning element operation for a
+    /// fraction, non-finite value, negative value, or value outside Uint32.
+    CheckedFloat64ToElementIndex(u32),
     /// Reinterpret canonical Boolean bits as Int32.
     BooleanToInt32,
     /// Floating-point addition.
@@ -633,6 +695,22 @@ pub enum MachineOpcode {
     /// Guard and store one VM-baked indexed element, deoptimizing before the
     /// first effect on any miss.
     ElementStore(u32),
+    /// Guard and directly load one ordinary Array PackedDouble element.
+    PackedDoubleElementLoad {
+        /// Source bytecode offset used by artifacts and exact deoptimization.
+        byte_pc: u32,
+        /// Optional loop-scoped raw view cache.
+        cache: Option<PackedDoubleViewCacheId>,
+    },
+    /// Guard and directly store one ordinary Array PackedDouble element.
+    PackedDoubleElementStore {
+        /// Source bytecode offset used by artifacts and exact deoptimization.
+        byte_pc: u32,
+        /// Optional loop-scoped raw view cache.
+        cache: Option<PackedDoubleViewCacheId>,
+    },
+    /// Clear every persistent packed-double view word at one semantic boundary.
+    ClearPackedDoubleViewCaches(PackedDoubleViewCacheClearReason),
     /// Guard and load one settled own-data property or exotic array/string
     /// length, deoptimizing at the source operation before effects on a miss.
     PropertyLoad {
@@ -742,11 +820,15 @@ pub struct InstructionSequence {
     call_descriptors: Vec<CallDescriptor>,
     blocks: Vec<MachineBlockData>,
     instructions: Vec<MachineInstruction>,
+    packed_double_view_cache_count: u8,
 }
 
 /// Structural failure in a target-selected instruction sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationError {
+    /// The sequence requests more persistent raw view caches than the frame
+    /// contract permits.
+    TooManyPackedDoubleViewCaches(u8),
     /// Entry block does not exist.
     InvalidEntry,
     /// A block owns an empty or invalid instruction range.
@@ -774,6 +856,8 @@ pub enum VerificationError {
     /// A selected opcode's ordinary operands or effect metadata violate its
     /// target-neutral signature.
     OpcodeSignatureMismatch(MachineInstructionId),
+    /// A packed-double operation references a cache outside this sequence.
+    InvalidPackedDoubleViewCache(MachineInstructionId, PackedDoubleViewCacheId),
     /// Metadata operands must be late uses.
     InvalidMetadataOperand(MachineInstructionId, MachineValue),
     /// Root metadata does not match the value representation.
@@ -817,12 +901,32 @@ impl InstructionSequence {
         blocks: Vec<MachineBlockData>,
         instructions: Vec<MachineInstruction>,
     ) -> Result<Self, VerificationError> {
+        Self::new_with_packed_double_view_caches(
+            entry,
+            representations,
+            call_descriptors,
+            blocks,
+            instructions,
+            0,
+        )
+    }
+
+    /// Construct and verify a sequence with bounded raw packed-double caches.
+    pub fn new_with_packed_double_view_caches(
+        entry: MachineBlock,
+        representations: Vec<MachineRepresentation>,
+        call_descriptors: Vec<CallDescriptor>,
+        blocks: Vec<MachineBlockData>,
+        instructions: Vec<MachineInstruction>,
+        packed_double_view_cache_count: u8,
+    ) -> Result<Self, VerificationError> {
         let sequence = Self {
             entry,
             representations,
             call_descriptors,
             blocks,
             instructions,
+            packed_double_view_cache_count,
         };
         sequence.verify()?;
         Ok(sequence)
@@ -860,10 +964,19 @@ impl InstructionSequence {
         &self.instructions
     }
 
+    /// Number of two-word raw packed-double view caches owned by the frame.
+    #[must_use]
+    pub const fn packed_double_view_cache_count(&self) -> u8 {
+        self.packed_double_view_cache_count
+    }
+
     /// Deterministic identity excluding source/module/function identities.
     #[must_use]
     pub fn normalized(&self) -> String {
-        let mut output = String::from("machine-ir\n");
+        let mut output = format!(
+            "machine-ir packed-double-view-caches={}\n",
+            self.packed_double_view_cache_count
+        );
         for (index, representation) in self.representations.iter().enumerate() {
             writeln!(output, "v{index}:{representation:?}").expect("writing to String cannot fail");
         }
@@ -898,7 +1011,63 @@ impl InstructionSequence {
         output
     }
 
+    /// Recover the VM-semantic value behind selection-only exact conversions.
+    ///
+    /// Packed element instructions consume checked indices and widened Number
+    /// temporaries that intentionally do not appear in the pre-operation VM
+    /// state. Their source does. Parameter-entry decodes are not unwrapped:
+    /// that HIR parameter itself is the deopt value and its guard has no deopt
+    /// identity. This bounded walk lets the verifier prove that every semantic
+    /// operand, rather than merely some metadata, is reconstructible.
+    fn semantic_deopt_source_before(
+        &self,
+        before: MachineInstructionId,
+        mut value: MachineValue,
+    ) -> MachineValue {
+        for _ in 0..self.representations.len() {
+            let Some(definition) =
+                self.instructions[..before.0 as usize]
+                    .iter()
+                    .rev()
+                    .find(|instruction| {
+                        instruction.operands.iter().any(|operand| {
+                            operand.value == value
+                                && operand.role == OperandRole::Definition
+                                && operand.purpose == OperandPurpose::Output
+                        })
+                    })
+            else {
+                break;
+            };
+            let unwrap = matches!(
+                definition.opcode,
+                MachineOpcode::CheckedFloat64ToElementIndex(..)
+                    | MachineOpcode::Int32ToFloat64
+                    | MachineOpcode::Uint32ToFloat64
+            ) || (definition.opcode == MachineOpcode::DecodeNumber
+                && definition.deopt.is_some());
+            if !unwrap {
+                break;
+            }
+            let Some(source) = definition.operands.iter().find(|operand| {
+                operand.role == OperandRole::Use && operand.purpose == OperandPurpose::Input
+            }) else {
+                break;
+            };
+            if source.value == value {
+                break;
+            }
+            value = source.value;
+        }
+        value
+    }
+
     pub(super) fn verify(&self) -> Result<(), VerificationError> {
+        if usize::from(self.packed_double_view_cache_count) > MAX_PACKED_DOUBLE_VIEW_CACHES {
+            return Err(VerificationError::TooManyPackedDoubleViewCaches(
+                self.packed_double_view_cache_count,
+            ));
+        }
         if self.entry.0 as usize >= self.blocks.len() {
             return Err(VerificationError::InvalidEntry);
         }
@@ -1103,6 +1272,132 @@ impl InstructionSequence {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     }
                 }
+                if matches!(
+                    instruction.opcode,
+                    MachineOpcode::ClearPackedDoubleViewCaches(..)
+                ) && (!instruction.operands.is_empty()
+                    || !instruction.clobbers.is_empty()
+                    || instruction.safepoint.is_some()
+                    || instruction.deopt.is_some()
+                    || instruction.control != ControlFlow::None)
+                {
+                    return Err(VerificationError::OpcodeSignatureMismatch(id));
+                }
+                if matches!(
+                    instruction.opcode,
+                    MachineOpcode::CheckedFloat64ToElementIndex(..)
+                ) {
+                    let Some((ordinary, metadata)) = instruction.operands.split_at_checked(2)
+                    else {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    };
+                    let input = ordinary[0];
+                    let output = ordinary[1];
+                    let ordinary_signature = input == MachineOperand::register_input(input.value)
+                        && self.representations[input.value.0 as usize]
+                            == MachineRepresentation::Float64
+                        && output == MachineOperand::register_output(output.value)
+                        && self.representations[output.value.0 as usize]
+                            == MachineRepresentation::Uint32;
+                    let mut deopt_values = std::collections::BTreeSet::new();
+                    let metadata_is_exact_deopt = metadata.iter().all(|operand| {
+                        *operand == MachineOperand::deopt(operand.value)
+                            && operand.value != output.value
+                            && deopt_values.insert(operand.value)
+                    });
+                    if !ordinary_signature
+                        || !metadata_is_exact_deopt
+                        || !deopt_values.contains(&input.value)
+                        || instruction.deopt.is_none()
+                        || instruction.safepoint.is_some()
+                        || instruction.clobbers
+                            != [PhysicalRegister::integer(16), PhysicalRegister::float(31)]
+                    {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    }
+                }
+                if matches!(
+                    instruction.opcode,
+                    MachineOpcode::PackedDoubleElementLoad { .. }
+                        | MachineOpcode::PackedDoubleElementStore { .. }
+                ) {
+                    let cache = match instruction.opcode {
+                        MachineOpcode::PackedDoubleElementLoad { cache, .. }
+                        | MachineOpcode::PackedDoubleElementStore { cache, .. } => cache,
+                        _ => unreachable!("matched packed-double operation"),
+                    };
+                    if let Some(cache) = cache
+                        && cache.index() >= usize::from(self.packed_double_view_cache_count)
+                    {
+                        return Err(VerificationError::InvalidPackedDoubleViewCache(id, cache));
+                    }
+                    let Some((ordinary, metadata)) = instruction.operands.split_at_checked(3)
+                    else {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    };
+                    let receiver = ordinary[0];
+                    let index = ordinary[1];
+                    let payload = ordinary[2];
+                    let receiver_is_tagged_location = receiver
+                        == MachineOperand::location_input(receiver.value)
+                        && self.representations[receiver.value.0 as usize]
+                            == MachineRepresentation::Tagged;
+                    let index_representation = self.representations[index.value.0 as usize];
+                    let index_is_scalar_location = index
+                        == MachineOperand::location_input(index.value)
+                        && matches!(
+                            index_representation,
+                            MachineRepresentation::Tagged
+                                | MachineRepresentation::Int32
+                                | MachineRepresentation::Uint32
+                        );
+                    let payload_signature = match instruction.opcode {
+                        MachineOpcode::PackedDoubleElementLoad { .. } => {
+                            payload == MachineOperand::register_output(payload.value)
+                                && self.representations[payload.value.0 as usize]
+                                    == MachineRepresentation::Float64
+                        }
+                        MachineOpcode::PackedDoubleElementStore { .. } => {
+                            payload == MachineOperand::register_input(payload.value)
+                                && self.representations[payload.value.0 as usize]
+                                    == MachineRepresentation::Float64
+                        }
+                        _ => false,
+                    };
+                    let output = matches!(
+                        instruction.opcode,
+                        MachineOpcode::PackedDoubleElementLoad { .. }
+                    )
+                    .then_some(payload.value);
+                    let mut deopt_values = std::collections::BTreeSet::new();
+                    let metadata_is_exact_deopt = metadata.iter().all(|operand| {
+                        *operand == MachineOperand::deopt(operand.value)
+                            && Some(operand.value) != output
+                            && deopt_values.insert(operand.value)
+                    });
+                    let semantic_receiver = self.semantic_deopt_source_before(id, receiver.value);
+                    let semantic_index = self.semantic_deopt_source_before(id, index.value);
+                    let semantic_payload = self.semantic_deopt_source_before(id, payload.value);
+                    let expected_clobbers = std::iter::once(PhysicalRegister::integer(9))
+                        .chain((11..=16).map(PhysicalRegister::integer))
+                        .collect::<Vec<_>>();
+                    if !receiver_is_tagged_location
+                        || !index_is_scalar_location
+                        || !payload_signature
+                        || !metadata_is_exact_deopt
+                        || !deopt_values.contains(&semantic_receiver)
+                        || !deopt_values.contains(&semantic_index)
+                        || (matches!(
+                            instruction.opcode,
+                            MachineOpcode::PackedDoubleElementStore { .. }
+                        ) && !deopt_values.contains(&semantic_payload))
+                        || instruction.deopt.is_none()
+                        || instruction.safepoint.is_some()
+                        || instruction.clobbers != expected_clobbers
+                    {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    }
+                }
                 if let MachineOpcode::Call(descriptor_index) = instruction.opcode {
                     let Some(descriptor) = self.call_descriptors.get(descriptor_index as usize)
                     else {
@@ -1251,6 +1546,149 @@ impl InstructionSequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_double_view_cache_ids_bound_raw_frame_words() {
+        let first = PackedDoubleViewCacheId::new(0).expect("first cache");
+        let last = PackedDoubleViewCacheId::new(MAX_PACKED_DOUBLE_VIEW_CACHES - 1)
+            .expect("last bounded cache");
+        assert_eq!(first.raw_word(), 0);
+        assert_eq!(last.index(), 31);
+        assert_eq!(last.raw_word(), 62);
+        assert!(PackedDoubleViewCacheId::new(MAX_PACKED_DOUBLE_VIEW_CACHES).is_none());
+        assert_eq!(
+            MAX_PACKED_DOUBLE_VIEW_CACHES * PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS,
+            64
+        );
+    }
+
+    #[test]
+    fn verifier_bounds_packed_double_view_caches_and_clear_signature() {
+        let input = MachineValue(0);
+        let mut clear = MachineInstruction::plain(
+            MachineOpcode::ClearPackedDoubleViewCaches(PackedDoubleViewCacheClearReason::LoopEntry),
+            Vec::new(),
+        );
+        let mut ret = MachineInstruction::plain(
+            MachineOpcode::Return,
+            vec![MachineOperand::register_input(input)],
+        );
+        ret.control = ControlFlow::Return;
+        let mut sequence = InstructionSequence::new_with_packed_double_view_caches(
+            MachineBlock(0),
+            vec![MachineRepresentation::Tagged],
+            Vec::new(),
+            vec![MachineBlockData {
+                first: MachineInstructionId(0),
+                end: MachineInstructionId(3),
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                parameters: Vec::new(),
+                successor_arguments: Vec::new(),
+            }],
+            vec![
+                MachineInstruction::plain(
+                    MachineOpcode::EntryValue(0),
+                    vec![MachineOperand::register_output(input)],
+                ),
+                clear.clone(),
+                ret,
+            ],
+            1,
+        )
+        .expect("one-cache sequence");
+        assert!(
+            sequence
+                .normalized()
+                .starts_with("machine-ir packed-double-view-caches=1\n")
+        );
+
+        sequence.packed_double_view_cache_count = 33;
+        assert_eq!(
+            sequence.verify(),
+            Err(VerificationError::TooManyPackedDoubleViewCaches(33))
+        );
+        sequence.packed_double_view_cache_count = 1;
+        clear.clobbers.push(PhysicalRegister::integer(9));
+        sequence.instructions[1] = clear;
+        assert_eq!(
+            sequence.verify(),
+            Err(VerificationError::OpcodeSignatureMismatch(
+                MachineInstructionId(1)
+            ))
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_packed_double_cache_outside_sequence() {
+        let receiver = MachineValue(0);
+        let index = MachineValue(1);
+        let result = MachineValue(2);
+        let mut load = MachineInstruction::plain(
+            MachineOpcode::PackedDoubleElementLoad {
+                byte_pc: 24,
+                cache: PackedDoubleViewCacheId::new(0),
+            },
+            vec![
+                MachineOperand::location_input(receiver),
+                MachineOperand::location_input(index),
+                MachineOperand::register_output(result),
+                MachineOperand::deopt(receiver),
+                MachineOperand::deopt(index),
+            ],
+        );
+        load.clobbers = std::iter::once(PhysicalRegister::integer(9))
+            .chain((11..=16).map(PhysicalRegister::integer))
+            .collect();
+        load.deopt = Some(DeoptId(0));
+        let mut ret = MachineInstruction::plain(
+            MachineOpcode::Return,
+            vec![MachineOperand::register_input(result)],
+        );
+        ret.control = ControlFlow::Return;
+        let mut sequence = InstructionSequence::new_with_packed_double_view_caches(
+            MachineBlock(0),
+            vec![
+                MachineRepresentation::Tagged,
+                MachineRepresentation::Uint32,
+                MachineRepresentation::Float64,
+            ],
+            Vec::new(),
+            vec![MachineBlockData {
+                first: MachineInstructionId(0),
+                end: MachineInstructionId(4),
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                parameters: Vec::new(),
+                successor_arguments: Vec::new(),
+            }],
+            vec![
+                MachineInstruction::plain(
+                    MachineOpcode::EntryValue(0),
+                    vec![MachineOperand::register_output(receiver)],
+                ),
+                MachineInstruction::plain(
+                    MachineOpcode::IntegerConstant(0),
+                    vec![MachineOperand::register_output(index)],
+                ),
+                load,
+                ret,
+            ],
+            1,
+        )
+        .expect("cached packed load");
+        sequence.instructions[2].opcode = MachineOpcode::PackedDoubleElementLoad {
+            byte_pc: 24,
+            cache: PackedDoubleViewCacheId::new(1),
+        };
+        assert_eq!(
+            sequence.verify(),
+            Err(VerificationError::InvalidPackedDoubleViewCache(
+                MachineInstructionId(2),
+                PackedDoubleViewCacheId::new(1).expect("bounded id")
+            ))
+        );
+    }
 
     fn checked_instruction_sequence(
         result_representation: MachineRepresentation,

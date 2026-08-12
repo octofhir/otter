@@ -6,8 +6,10 @@
 //! - [`FrameLayoutError`] — checked arithmetic and invalid-alignment failures.
 //!
 //! # Invariants
-//! - Every spill slot is one eight-byte machine word.
-//! - Allocator spills precede the reusable tagged-root save area.
+//! - Every spill, root, and raw-cache slot is one eight-byte machine word.
+//! - Allocator spills precede the reusable tagged-root save area, which in
+//!   turn precedes untraced raw-cache words.
+//! - Raw-cache words never enter safepoint or deoptimization root metadata.
 //! - The total native reservation includes target-owned fixed bytes and is
 //!   aligned to the target ABI requirement.
 //! - Spill offsets are relative to the post-prologue stack pointer and never
@@ -26,6 +28,8 @@ pub enum FrameLayoutError {
     FrameSizeOverflow,
     /// Requested spill slot is outside the allocator-owned range.
     InvalidSpillSlot(u32),
+    /// Requested raw-cache slot is outside the target-owned range.
+    InvalidRawSlot(u16),
 }
 
 impl std::fmt::Display for FrameLayoutError {
@@ -43,6 +47,8 @@ pub struct MachineFrameLayout {
     spill_slots: u32,
     root_slots: u16,
     root_area_offset: u32,
+    raw_slots: u16,
+    raw_area_offset: u32,
     spill_area_bytes: u32,
     frame_bytes: u32,
 }
@@ -52,6 +58,17 @@ impl MachineFrameLayout {
     pub fn new(
         allocation: &AllocatedSequence,
         root_slots: u16,
+        fixed_bytes: u32,
+        stack_alignment: u32,
+    ) -> Result<Self, FrameLayoutError> {
+        Self::new_with_raw_slots(allocation, root_slots, 0, fixed_bytes, stack_alignment)
+    }
+
+    /// Build an aligned frame with an additional untraced raw-cache area.
+    pub fn new_with_raw_slots(
+        allocation: &AllocatedSequence,
+        root_slots: u16,
+        raw_slots: u16,
         fixed_bytes: u32,
         stack_alignment: u32,
     ) -> Result<Self, FrameLayoutError> {
@@ -66,8 +83,15 @@ impl MachineFrameLayout {
         let root_bytes = u32::from(root_slots)
             .checked_mul(SPILL_SLOT_BYTES)
             .ok_or(FrameLayoutError::FrameSizeOverflow)?;
+        let raw_area_offset = root_area_offset
+            .checked_add(root_bytes)
+            .ok_or(FrameLayoutError::FrameSizeOverflow)?;
+        let raw_bytes = u32::from(raw_slots)
+            .checked_mul(SPILL_SLOT_BYTES)
+            .ok_or(FrameLayoutError::FrameSizeOverflow)?;
         let raw_spill_bytes = allocator_spill_bytes
             .checked_add(root_bytes)
+            .and_then(|bytes| bytes.checked_add(raw_bytes))
             .ok_or(FrameLayoutError::FrameSizeOverflow)?;
         let unaligned_total = fixed_bytes
             .checked_add(raw_spill_bytes)
@@ -81,6 +105,8 @@ impl MachineFrameLayout {
             spill_slots: allocation.spill_slots(),
             root_slots,
             root_area_offset,
+            raw_slots,
+            raw_area_offset,
             spill_area_bytes,
             frame_bytes,
         })
@@ -110,6 +136,12 @@ impl MachineFrameLayout {
         self.root_slots
     }
 
+    /// Number of untraced target-owned raw-cache words.
+    #[must_use]
+    pub const fn raw_slots(self) -> u16 {
+        self.raw_slots
+    }
+
     /// Byte offset of one spill slot from the post-prologue stack pointer.
     pub fn spill_offset(self, slot: u32) -> Result<u32, FrameLayoutError> {
         if slot >= self.spill_slots {
@@ -127,6 +159,17 @@ impl MachineFrameLayout {
         u32::from(slot)
             .checked_mul(SPILL_SLOT_BYTES)
             .and_then(|offset| self.root_area_offset.checked_add(offset))
+            .ok_or(FrameLayoutError::FrameSizeOverflow)
+    }
+
+    /// Byte offset of one untraced raw-cache word from the post-prologue SP.
+    pub fn raw_offset(self, slot: u16) -> Result<u32, FrameLayoutError> {
+        if slot >= self.raw_slots {
+            return Err(FrameLayoutError::InvalidRawSlot(slot));
+        }
+        u32::from(slot)
+            .checked_mul(SPILL_SLOT_BYTES)
+            .and_then(|offset| self.raw_area_offset.checked_add(offset))
             .ok_or(FrameLayoutError::FrameSizeOverflow)
     }
 }
@@ -219,5 +262,13 @@ mod tests {
             layout.spill_offset(allocation.spill_slots()),
             Err(FrameLayoutError::InvalidSpillSlot(_))
         ));
+
+        let raw = MachineFrameLayout::new_with_raw_slots(&allocation, 3, 4, 16, 16)
+            .expect("valid raw-cache frame");
+        assert_eq!(raw.raw_slots(), 4);
+        assert_eq!(raw.raw_offset(0), Ok(raw.root_offset(2).unwrap() + 8));
+        assert_eq!(raw.raw_offset(3), Ok(raw.raw_offset(0).unwrap() + 24));
+        assert_eq!(raw.raw_offset(4), Err(FrameLayoutError::InvalidRawSlot(4)));
+        assert!(raw.frame_bytes() >= layout.frame_bytes() + 32);
     }
 }

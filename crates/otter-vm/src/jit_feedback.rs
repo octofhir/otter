@@ -69,10 +69,11 @@ const NON_NUMERIC: u8 = ARITH_STRING | ARITH_BIGINT | ARITH_OTHER;
 const ARITH_WIDEN_FLOAT: u8 = 1 << 7;
 
 const ELEMENT_UNSEEN: u8 = 0;
-const ELEMENT_DENSE: u8 = 1;
+const ELEMENT_DENSE_TAGGED: u8 = 1;
 const ELEMENT_TYPED_INT32: u8 = 2;
 const ELEMENT_TYPED_FLOAT64: u8 = 3;
 const ELEMENT_GENERIC: u8 = 4;
+const ELEMENT_DENSE_FLOAT64: u8 = 5;
 const ELEMENT_MASK: u8 = 0b0000_0111;
 
 const CALL_ATTEMPTED_SEEN: u8 = 1 << 3;
@@ -720,17 +721,27 @@ impl InstructionFeedback {
     pub fn record_element_family(&self, observed: crate::jit::JitElementFamily) -> bool {
         use crate::jit::JitElementFamily as Family;
         let observed = match observed {
-            Family::Dense => ELEMENT_DENSE,
-            Family::TypedInt32 => ELEMENT_TYPED_INT32,
-            Family::TypedFloat64 => ELEMENT_TYPED_FLOAT64,
-            Family::Unseen | Family::Generic => ELEMENT_GENERIC,
+            // Empty and holey numeric Arrays are transient construction
+            // layouts rather than generated-hit families. Ignore them only
+            // while the site is genuinely unseen. Once code has specialized,
+            // observing either layout must invalidate that specialization;
+            // otherwise its exact kind guard would deopt forever without an
+            // epoch change.
+            Family::Unseen => None,
+            Family::DenseTagged => Some(ELEMENT_DENSE_TAGGED),
+            Family::DenseFloat64 => Some(ELEMENT_DENSE_FLOAT64),
+            Family::TypedInt32 => Some(ELEMENT_TYPED_INT32),
+            Family::TypedFloat64 => Some(ELEMENT_TYPED_FLOAT64),
+            Family::Generic => Some(ELEMENT_GENERIC),
         };
         let mut states = self.states.load(Ordering::Relaxed);
         loop {
             let current = states & ELEMENT_MASK;
-            let next_family = match current {
-                ELEMENT_UNSEEN => observed,
-                value if value == observed => value,
+            let next_family = match (current, observed) {
+                (ELEMENT_UNSEEN, None) => ELEMENT_UNSEEN,
+                (ELEMENT_UNSEEN, Some(observed)) => observed,
+                (_, None) => ELEMENT_GENERIC,
+                (value, Some(observed)) if value == observed => value,
                 _ => ELEMENT_GENERIC,
             };
             if next_family == current {
@@ -754,7 +765,8 @@ impl InstructionFeedback {
     pub fn element_family(&self) -> crate::jit::JitElementFamily {
         use crate::jit::JitElementFamily as Family;
         match self.states.load(Ordering::Relaxed) & ELEMENT_MASK {
-            ELEMENT_DENSE => Family::Dense,
+            ELEMENT_DENSE_TAGGED => Family::DenseTagged,
+            ELEMENT_DENSE_FLOAT64 => Family::DenseFloat64,
             ELEMENT_TYPED_INT32 => Family::TypedInt32,
             ELEMENT_TYPED_FLOAT64 => Family::TypedFloat64,
             ELEMENT_GENERIC => Family::Generic,
@@ -1031,6 +1043,21 @@ mod tests {
     #[test]
     fn dense_cell_layout_stays_compact() {
         assert_eq!(std::mem::size_of::<InstructionFeedback>(), 4);
+    }
+
+    #[test]
+    fn transient_holey_arrays_do_not_poison_packed_numeric_feedback() {
+        use crate::jit::JitElementFamily as Family;
+
+        let cell = InstructionFeedback::default();
+        assert!(!cell.record_element_family(Family::Unseen));
+        assert_eq!(cell.element_family(), Family::Unseen);
+        assert!(cell.record_element_family(Family::DenseFloat64));
+        assert_eq!(cell.element_family(), Family::DenseFloat64);
+        assert!(!cell.record_element_family(Family::DenseFloat64));
+        assert!(cell.record_element_family(Family::Unseen));
+        assert_eq!(cell.element_family(), Family::Generic);
+        assert!(!cell.record_element_family(Family::DenseTagged));
     }
 
     #[test]

@@ -260,6 +260,44 @@ fn array_element_root_survives_force_gc() {
 }
 
 #[test]
+fn packed_array_widening_traces_new_object_element() {
+    let mut interp = Interpreter::new();
+    let arr = crate::test_support::alloc_old_array(interp.gc_heap_mut()).expect("alloc array");
+    crate::array::push(arr, interp.gc_heap_mut(), crate::Value::number_i32(1))
+        .expect("push numeric element");
+    assert_eq!(
+        crate::array::dense_element_kind(arr, interp.gc_heap()),
+        crate::array::DenseElementKind::PackedDouble
+    );
+
+    let mut global_this = *interp.global_this();
+    crate::object::set(
+        &mut global_this,
+        interp.gc_heap_mut(),
+        "__packed_array_root",
+        crate::Value::array(arr),
+    );
+    let object = crate::object::alloc_object_with_roots(interp.gc_heap_mut(), &mut |_| {})
+        .expect("alloc object");
+    crate::array::set(arr, interp.gc_heap_mut(), 0, crate::Value::object(object))
+        .expect("widen packed array");
+    assert_eq!(
+        crate::array::dense_element_kind(arr, interp.gc_heap()),
+        crate::array::DenseElementKind::Tagged
+    );
+
+    let _ = (arr, object);
+    interp.force_gc().expect("force GC");
+    let rooted = crate::object::get(global_this, interp.gc_heap(), "__packed_array_root")
+        .and_then(crate::Value::as_array)
+        .expect("array root survives force_gc");
+    assert!(
+        crate::array::get(rooted, interp.gc_heap(), 0).is_object(),
+        "numeric-to-tagged publication and slab barrier must retain the object"
+    );
+}
+
+#[test]
 fn map_entry_root_survives_force_gc() {
     let mut interp = Interpreter::new();
     let map = crate::collections::alloc_map(interp.gc_heap_mut()).expect("alloc map");

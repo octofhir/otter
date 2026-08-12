@@ -1038,6 +1038,73 @@ pub struct JitElementAccess {
     pub element: JitElementRepr,
 }
 
+impl JitElementAccess {
+    /// Build the VM's complete ordinary packed-double Array access program.
+    #[must_use]
+    pub fn packed_double_array() -> Self {
+        let header = std::mem::size_of::<otter_gc::GcHeader>() as u32;
+        Self {
+            type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
+            guards: [
+                Some(JitBodyGuard::clear(
+                    header + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
+                    JitGuardWidth::Word32,
+                )),
+                Some(Self::packed_double_kind_guard(
+                    header + crate::array::ARRAY_BODY_DENSE_KIND_OFFSET as u32,
+                )),
+            ],
+            length_byte: header + crate::array::ARRAY_BODY_DENSE_LEN_OFFSET as u32,
+            length_width: JitGuardWidth::Word32,
+            base: JitElementBase::InBody {
+                byte: header + crate::array::ARRAY_BODY_ELEMENTS_PTR_OFFSET as u32,
+            },
+            element: JitElementRepr::Float64,
+        }
+    }
+
+    /// Build the exact body guard for the VM's packed-double array storage.
+    ///
+    /// The byte offset is snapshot data; the physical discriminant remains
+    /// owned here instead of leaking the private storage enum to a backend.
+    #[must_use]
+    pub const fn packed_double_kind_guard(byte: u32) -> JitBodyGuard {
+        JitBodyGuard {
+            byte,
+            width: JitGuardWidth::Byte,
+            expect: crate::array::DENSE_ELEMENT_KIND_PACKED_DOUBLE,
+        }
+    }
+
+    /// Whether this immutable guard program proves an ordinary Array whose
+    /// complete live dense prefix is stored as raw hole-free doubles.
+    ///
+    /// The physical discriminant remains VM-private; JIT backends consume the
+    /// semantic layout through this snapshot-owned predicate.
+    #[must_use]
+    pub fn is_packed_double_array(&self) -> bool {
+        let [Some(exotic), Some(kind)] = self.guards else {
+            return false;
+        };
+        let header = std::mem::size_of::<otter_gc::GcHeader>() as u32;
+        self.type_tag == crate::array::ARRAY_BODY_TYPE_TAG
+            && self.element == JitElementRepr::Float64
+            && matches!(
+                self.base,
+                JitElementBase::InBody { byte }
+                    if byte == header + crate::array::ARRAY_BODY_ELEMENTS_PTR_OFFSET as u32
+            )
+            && self.length_byte == header + crate::array::ARRAY_BODY_DENSE_LEN_OFFSET as u32
+            && self.length_width == JitGuardWidth::Word32
+            && exotic.byte == header + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32
+            && exotic.width == JitGuardWidth::Word32
+            && exotic.expect == 0
+            && kind.byte == header + crate::array::ARRAY_BODY_DENSE_KIND_OFFSET as u32
+            && kind.width == JitGuardWidth::Byte
+            && kind.expect == crate::array::DENSE_ELEMENT_KIND_PACKED_DOUBLE
+    }
+}
+
 /// One receiver shape a property site resolves, with the own slot it reaches.
 ///
 /// A site contributes one of these per installed cache program, so a
@@ -1368,18 +1435,21 @@ impl JitInstructionMetadata {
     }
 }
 
-/// Receiver family observed at one `Op::LoadElement` site.
+/// Receiver family observed at one indexed-element site.
 ///
-/// Selects which [`JitElementAccess`] the site bakes. A site that sees more
-/// than one family stays `Dense`, which is the only family whose guard also
-/// admits the ordinary miss path cheaply.
+/// Ordinary arrays are split by their live dense-storage representation. A
+/// representation transition is therefore the same material feedback change
+/// as switching between an Array and a TypedArray: generated code either
+/// proves the exact current layout or leaves through its pre-effect deopt.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum JitElementFamily {
     /// Nothing observed yet, or a receiver no instance describes.
     #[default]
     Unseen,
-    /// Ordinary dense arrays only.
-    Dense,
+    /// Ordinary dense arrays whose slots contain boxed [`Value`] words.
+    DenseTagged,
+    /// Ordinary dense arrays whose complete live prefix contains raw `f64`s.
+    DenseFloat64,
     /// `Int32Array` receivers only.
     TypedInt32,
     /// `Float64Array` receivers only.

@@ -1824,7 +1824,7 @@ impl Interpreter {
                 }
                 let mut elems = Vec::with_capacity(cap);
                 for k in 0..cap {
-                    let v = body.elements().get(k).copied().unwrap_or(Value::hole());
+                    let v = body.dense_value(k).unwrap_or(Value::hole());
                     // A hole is only join-equivalent to `undefined` when
                     // no prototype supplies the index — `Get(O, k)` walks
                     // the chain, so any gap sends us to the generic
@@ -2705,7 +2705,7 @@ impl Interpreter {
         // Dense fast path: a plain extensible array with a writable `length`,
         // the default `%Array.prototype%` (no inherited integer setter), and no
         // accessor/attribute override across the appended range appends straight
-        // to the dense element vector — no `ToString(index)` key, no per-element
+        // to the dense element slab — no `ToString(index)` key, no per-element
         // ordinary-set protocol. Anything else (sealed/frozen, non-writable
         // length, prototype override, accessor in range, oversize) returns
         // `false` from the guard and falls to the spec-generic path below.

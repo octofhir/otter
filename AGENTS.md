@@ -421,8 +421,24 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     and post-deopt spill counts. Exact-bit `LoadLocal` / `StoreLocal` / `Reuse`
     webs share one home; unread rematerializable heads own no emitted state.
     Machine direct data access is attributed by `machineElementLoad` /
-    `machineElementStore` and `machinePropertyLoad` / `machinePropertyStore`,
-    each with `bytePc`; direct captured-cell reads use `machineUpvalueLoad`.
+    `machineElementStore`, `machinePackedDoubleElementLoad` /
+    `machinePackedDoubleElementStore`, and `machinePropertyLoad` /
+    `machinePropertyStore`, each with `bytePc`; direct captured-cell reads use
+    `machineUpvalueLoad`. Ordinary packed-double Array operations prove the
+    exact exotic and physical-kind guards, keep the element payload in Float64
+    SSA, and use an exact Float64-to-Uint32 index check. Integral values and
+    `-0` stay generated; fractions, negatives, NaN, and values beyond Uint32
+    deopt before the access. The hit performs a direct FP load/store with no
+    hole test, Number box/decode, or write barrier.
+    Reducible non-reentrant loops may group invariant packed-double receivers
+    into bounded native-stack view caches. `optimized-ir.txt` reports
+    `packed-double-view-caches=<N>` and annotates each packed access with its
+    cache id; `machinePackedDoubleViewCacheClear` marks an external loop-entry
+    reset. Each cache owns an untraced raw base/length pair, proves the complete
+    receiver/layout program lazily on first use, and retains the pair only over
+    generated backedges. Function entry, every OSR trampoline, and every
+    external edge into the selected loop start with an empty cache. No loaded
+    value or GC reference is cached.
     Settled property regions consume immutable snapshot shape/slot chains and
     never retain a `propertyIcCell` relocation. Guard misses reconstruct the
     exact pre-operation frame, while a committed store has no later deopt edge.

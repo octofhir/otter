@@ -804,20 +804,31 @@ impl Interpreter {
                     crate::binary::TypedArrayKind::Float64,
                     jit::JitElementRepr::Float64,
                 ),
-                jit::JitElementFamily::Dense | jit::JitElementFamily::Unseen => {
-                    Self::dense_element_access()
-                }
-                jit::JitElementFamily::Generic => continue,
+                jit::JitElementFamily::DenseTagged => Self::dense_element_access(
+                    jit::JitElementRepr::Boxed,
+                    crate::array::DENSE_ELEMENT_KIND_TAGGED,
+                ),
+                jit::JitElementFamily::DenseFloat64 => Self::dense_element_access(
+                    jit::JitElementRepr::Float64,
+                    crate::array::DENSE_ELEMENT_KIND_PACKED_DOUBLE,
+                ),
+                jit::JitElementFamily::Unseen | jit::JitElementFamily::Generic => continue,
             };
             view.element_accesses.insert(byte_pc, access);
         }
     }
 
-    /// A dense array's elements are boxed `Value`s behind the body's element
-    /// cache, and its exotic sidecar is what invalidates that layout: a
-    /// non-null sidecar means custom prototype, accessor or descriptor state
-    /// can make a plain indexed access observable.
-    fn dense_element_access() -> jit::JitElementAccess {
+    /// Describe one exact ordinary-array dense representation behind the
+    /// body's element cache. Both the exotic sidecar and the physical element
+    /// kind are guarded: a custom prototype/descriptor or a monotonic
+    /// numeric-to-tagged transition must leave generated code before access.
+    fn dense_element_access(
+        element: jit::JitElementRepr,
+        dense_kind: u32,
+    ) -> jit::JitElementAccess {
+        if element == jit::JitElementRepr::Float64 {
+            return jit::JitElementAccess::packed_double_array();
+        }
         let header = otter_gc::header::HEADER_SIZE as u32;
         jit::JitElementAccess {
             type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
@@ -827,14 +838,18 @@ impl Interpreter {
                     header + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
                     jit::JitGuardWidth::Word32,
                 )),
-                None,
+                Some(jit::JitBodyGuard {
+                    byte: header + crate::array::ARRAY_BODY_DENSE_KIND_OFFSET as u32,
+                    width: jit::JitGuardWidth::Byte,
+                    expect: dense_kind,
+                }),
             ],
             length_byte: header + crate::array::ARRAY_BODY_DENSE_LEN_OFFSET as u32,
             length_width: jit::JitGuardWidth::Word32,
             base: jit::JitElementBase::InBody {
                 byte: header + crate::array::ARRAY_BODY_ELEMENTS_PTR_OFFSET as u32,
             },
-            element: jit::JitElementRepr::Boxed,
+            element,
         }
     }
 

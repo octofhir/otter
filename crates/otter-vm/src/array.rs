@@ -13,12 +13,12 @@
 //!
 //! # Invariants
 //!
-//! - Low, contiguous indices live in `elements`.
+//! - Low, contiguous indices live in one GC-owned element slab.
 //! - Large sparse indices live in `sparse_elements` so Array-index
 //!   semantics do not force host-sized dense allocations.
 //! - Missing-index reads return `undefined`.
-//! - Element growth goes through helpers that reserve off-slot dense
-//!   `Vec` capacity against the heap cap before resizing.
+//! - Element growth allocates a rooted replacement slab, copies the live
+//!   prefix semantically, then republishes its base, length, and kind.
 //! - Rare array state (sparse/named/accessor/symbol properties,
 //!   descriptor flags, captured JSON source text, and per-instance
 //!   prototype overrides) lives behind one sidecar so plain dense
@@ -30,6 +30,10 @@
 //!
 //! - <https://tc39.es/ecma262/#sec-array-exotic-objects>
 //! - [GC API](../../../docs/book/src/engine/gc-api.md)
+
+pub(crate) mod elements;
+
+pub(crate) use elements::DenseElementKind;
 
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap};
@@ -64,16 +68,16 @@ pub type JsArray = otter_gc::Gc<ArrayBody>;
 /// closure call header's `upvalue_base`.
 #[derive(Debug)]
 pub struct ArrayBody {
-    /// Dense element storage: an [`crate::value_slab::ValueSlabBody`] whose
-    /// values live in its own GC cell, so the array owns nothing outside
-    /// the heap. Null while the array has no dense storage.
+    /// Dense element storage in its own GC cell. Null while the array has no
+    /// dense storage. Numeric slabs hold raw doubles plus a hole bitmap;
+    /// tagged slabs hold ordinary `Value` words.
     ///
     /// Crate-internal callers must go through this module's helpers so
     /// growth allocates. Native code never observes the handle: compiled
     /// fast paths read the cached [`Self::elements_ptr`]/[`Self::dense_len`]
     /// pair instead, and everything else goes through classified runtime
     /// stubs.
-    pub(crate) slab: crate::value_slab::ValueSlabHandle,
+    pub(crate) slab: elements::ElementSlabHandle,
     /// Logical `length` property. This may be larger than dense
     /// storage when `length` is assigned directly or when sparse
     /// elements are written.
@@ -89,7 +93,7 @@ pub struct ArrayBody {
     /// field so compiled code can address elements without knowing where the
     /// slab lives. The slab is an old-space body, so a scavenge leaves the
     /// base valid; only growth and a restore change it, and both refresh it.
-    elements_ptr: Cell<*mut Value>,
+    elements_ptr: Cell<*mut u8>,
     /// Live dense length. Authoritative, and sited next to the base pointer
     /// so a compiled bounds check reads it as one 32-bit load. Dense storage
     /// beyond `u32::MAX` elements is unreachable in practice — growth helpers
@@ -98,6 +102,10 @@ pub struct ArrayBody {
     /// Values the current slab can hold. Cached beside the base for the same
     /// reason the length is: a push under a payload borrow has no heap to ask.
     dense_cap: Cell<u32>,
+    /// JIT-visible [`DenseElementKind`] discriminant for the current slab.
+    /// The slab header is authoritative; this byte is refreshed with the base
+    /// and capacity after every adoption or restore.
+    dense_kind: Cell<u8>,
 }
 
 impl otter_gc::SafeTraceable for ArrayBody {
@@ -109,8 +117,7 @@ impl otter_gc::SafeTraceable for ArrayBody {
     /// recomputed from the relocated value.
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
         if !self.slab.is_null() {
-            let p = &mut self.slab as *mut crate::value_slab::ValueSlabHandle
-                as *mut otter_gc::raw::RawGc;
+            let p = &mut self.slab as *mut elements::ElementSlabHandle as *mut otter_gc::raw::RawGc;
             visitor(p);
         }
         if !self.exotic.is_null() {
@@ -124,12 +131,13 @@ impl otter_gc::SafeTraceable for ArrayBody {
 impl Default for ArrayBody {
     fn default() -> Self {
         Self {
-            slab: crate::value_slab::ValueSlabHandle::null(),
+            slab: elements::ElementSlabHandle::null(),
             length: 0,
             exotic: ArrayExoticHandle::null(),
             elements_ptr: Cell::new(std::ptr::null_mut()),
             dense_len: Cell::new(0),
             dense_cap: Cell::new(0),
+            dense_kind: Cell::new(DenseElementKind::Empty as u8),
         }
     }
 }
@@ -141,10 +149,10 @@ impl ArrayBody {
     /// and adopting a larger slab must not change it.
     #[inline]
     pub(crate) fn refresh_element_cache(&self) {
-        self.elements_ptr
-            .set(crate::value_slab::values_base(self.slab));
+        self.elements_ptr.set(elements::data_base(self.slab));
         self.dense_cap
-            .set(u32::try_from(crate::value_slab::capacity_of(self.slab)).unwrap_or(u32::MAX));
+            .set(u32::try_from(elements::capacity_of(self.slab)).unwrap_or(u32::MAX));
+        self.dense_kind.set(elements::kind_of(self.slab) as u8);
     }
 
     /// Debug verifier for the always-current element cache: the cached
@@ -152,36 +160,61 @@ impl ArrayBody {
     /// path that forgets to refresh fails deterministically.
     #[cfg(debug_assertions)]
     pub(crate) fn element_cache_is_current(&self) -> bool {
-        let slab_len = crate::value_slab::body_of(self.slab).map_or(0, |body| {
-            // SAFETY: the handle names a live slab payload.
-            unsafe { (*body).len() }
-        });
-        self.elements_ptr.get() == crate::value_slab::values_base(self.slab)
-            && self.dense_cap.get() as usize == crate::value_slab::capacity_of(self.slab)
+        let slab_len = elements::len_of(self.slab);
+        self.elements_ptr.get() == elements::data_base(self.slab)
+            && self.dense_cap.get() as usize == elements::capacity_of(self.slab)
             && self.dense_len.get() as usize == slab_len
+            && self.dense_kind() == elements::kind_of(self.slab)
     }
 
-    /// Live dense elements.
+    /// Read one raw dense slot, including the internal hole sentinel.
     #[inline]
-    pub(crate) fn elements(&self) -> &[Value] {
-        let base = self.elements_ptr.get();
-        if base.is_null() {
-            return &[];
-        }
-        // SAFETY: the cache names the live slab's trailing array, and
-        // `dense_len <= dense_cap` bounds the live prefix.
-        unsafe { std::slice::from_raw_parts(base.cast_const(), self.dense_len.get() as usize) }
+    pub(crate) fn dense_value(&self, index: usize) -> Option<Value> {
+        let body = elements::body_of(self.slab)?;
+        // SAFETY: the array body keeps the slab reachable for this borrow.
+        unsafe { (*body).get(index) }
     }
 
-    /// Live dense elements, mutably.
+    /// Materialize the live dense prefix as tagged values.
     #[inline]
-    pub(crate) fn elements_mut(&mut self) -> &mut [Value] {
-        let base = self.elements_ptr.get();
-        if base.is_null() {
-            return &mut [];
+    pub(crate) fn dense_values(&self) -> Vec<Value> {
+        let Some(body) = elements::body_of(self.slab) else {
+            return Vec::new();
+        };
+        // SAFETY: the array body keeps the slab reachable for this borrow.
+        unsafe { (*body).values_vec() }
+    }
+
+    #[inline]
+    fn slab_body_mut(&mut self) -> Option<&mut elements::ElementSlabBody> {
+        let body = elements::body_of(self.slab)?;
+        // SAFETY: `&mut self` excludes another mutation through this owner.
+        Some(unsafe { &mut *body })
+    }
+
+    #[inline]
+    fn write_dense_value(&mut self, index: usize, value: Value) {
+        self.slab_body_mut()
+            .expect("dense write without a slab")
+            .set(index, value);
+        self.refresh_element_cache();
+    }
+
+    #[inline]
+    fn truncate_dense(&mut self, len: usize) {
+        if let Some(slab) = self.slab_body_mut() {
+            slab.truncate(len);
+        } else {
+            debug_assert_eq!(len, 0, "an array with no slab has no dense elements");
         }
-        // SAFETY: as in `elements`; `&mut self` rules out an aliasing read.
-        unsafe { std::slice::from_raw_parts_mut(base, self.dense_len.get() as usize) }
+        self.dense_len
+            .set(u32::try_from(len).expect("dense length exceeds u32"));
+        self.refresh_element_cache();
+    }
+
+    #[inline]
+    pub(crate) fn dense_kind(&self) -> DenseElementKind {
+        DenseElementKind::from_raw(self.dense_kind.get()).expect("invalid dense element kind")
     }
 
     /// Number of live dense elements.
@@ -199,7 +232,7 @@ impl ArrayBody {
     /// Adopt `slab` as this array's dense storage, with its first `len`
     /// values already written.
     #[inline]
-    pub(crate) fn adopt_slab(&mut self, slab: crate::value_slab::ValueSlabHandle, len: usize) {
+    pub(crate) fn adopt_slab(&mut self, slab: elements::ElementSlabHandle, len: usize) {
         self.slab = slab;
         self.refresh_element_cache();
         self.set_dense_len(len);
@@ -212,7 +245,7 @@ impl ArrayBody {
     /// two must never be written apart.
     #[inline]
     pub(crate) fn set_dense_len(&self, len: usize) {
-        if let Some(body) = crate::value_slab::body_of(self.slab) {
+        if let Some(body) = elements::body_of(self.slab) {
             // SAFETY: the handle names a live slab, and no other borrow
             // of its payload is open while this body holds it.
             unsafe { (*body).set_len(len) };
@@ -221,6 +254,7 @@ impl ArrayBody {
         }
         self.dense_len
             .set(u32::try_from(len).expect("dense length exceeds u32"));
+        self.dense_kind.set(elements::kind_of(self.slab) as u8);
     }
 }
 
@@ -238,8 +272,7 @@ fn body_elements_push(body: &mut ArrayBody, value: Value) {
     if len >= body.dense_capacity() {
         return;
     }
-    // SAFETY: `len < capacity`, so the slot is inside the slab.
-    unsafe { *body.elements_ptr.get().add(len) = value };
+    body.write_dense_value(len, value);
     body.set_dense_len(len + 1);
 }
 
@@ -251,12 +284,7 @@ fn body_elements_truncate(body: &mut ArrayBody, len: usize) {
     if len >= current {
         return;
     }
-    let base = body.elements_ptr.get();
-    for index in len..current {
-        // SAFETY: `index < current <= capacity`.
-        unsafe { *base.add(index) = Value::undefined() };
-    }
-    body.set_dense_len(len);
+    body.truncate_dense(len);
 }
 
 /// Insert one dense element at `index`, shifting the tail up. The slab
@@ -268,13 +296,20 @@ fn body_elements_insert(body: &mut ArrayBody, index: usize, value: Value) {
     if index > len || len >= body.dense_capacity() {
         return;
     }
-    let base = body.elements_ptr.get();
-    // SAFETY: the source range is live and the destination is inside the
-    // slab because `len < capacity`; the ranges may overlap, so this is a
-    // `copy`, not `copy_nonoverlapping`.
-    unsafe { std::ptr::copy(base.add(index), base.add(index + 1), len - index) };
-    // SAFETY: `index <= len < capacity`.
-    unsafe { *base.add(index) = value };
+    // A non-number makes tagged storage terminal. Widen before shifting so
+    // the newly initialized tail slot participates in tagged representation;
+    // converting after the shift would only visit the old live prefix.
+    if body.dense_kind().is_numeric() && !value.is_number() && !value.is_hole() {
+        body.slab_body_mut()
+            .expect("dense insert without a slab")
+            .convert_to_tagged();
+        body.refresh_element_cache();
+    }
+    for source in (index..len).rev() {
+        let moved = body.dense_value(source).expect("live dense slot");
+        body.write_dense_value(source + 1, moved);
+    }
+    body.write_dense_value(index, value);
     body.set_dense_len(len + 1);
 }
 
@@ -283,15 +318,12 @@ fn body_elements_insert(body: &mut ArrayBody, index: usize, value: Value) {
 fn body_elements_remove(body: &mut ArrayBody, index: usize) -> Value {
     let len = body.dense_len();
     assert!(index < len, "dense remove out of range");
-    let base = body.elements_ptr.get();
-    // SAFETY: `index < len <= capacity`.
-    let removed = unsafe { *base.add(index) };
-    // SAFETY: source and destination are both inside the live prefix.
-    unsafe { std::ptr::copy(base.add(index + 1), base.add(index), len - index - 1) };
-    // SAFETY: the vacated last slot is inside the slab; clearing it stops
-    // the tracer from keeping a value the array no longer holds.
-    unsafe { *base.add(len - 1) = Value::undefined() };
-    body.set_dense_len(len - 1);
+    let removed = body.dense_value(index).expect("live dense slot");
+    for source in index + 1..len {
+        let moved = body.dense_value(source).expect("live dense slot");
+        body.write_dense_value(source - 1, moved);
+    }
+    body.truncate_dense(len - 1);
     removed
 }
 
@@ -301,6 +333,15 @@ pub(crate) const ARRAY_BODY_ELEMENTS_PTR_OFFSET: usize =
 
 /// Byte offset of the cached dense length within [`ArrayBody`].
 pub(crate) const ARRAY_BODY_DENSE_LEN_OFFSET: usize = std::mem::offset_of!(ArrayBody, dense_len);
+
+/// Byte offset of the cached [`DenseElementKind`] discriminant.
+pub(crate) const ARRAY_BODY_DENSE_KIND_OFFSET: usize = std::mem::offset_of!(ArrayBody, dense_kind);
+
+/// Native guard literal for terminal tagged dense storage.
+pub(crate) const DENSE_ELEMENT_KIND_TAGGED: u32 = DenseElementKind::Tagged as u32;
+
+/// Native guard literal for a hole-free unboxed-double dense prefix.
+pub(crate) const DENSE_ELEMENT_KIND_PACKED_DOUBLE: u32 = DenseElementKind::PackedDouble as u32;
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`ArrayExoticSlots`].
 pub const ARRAY_EXOTIC_SLOTS_TYPE_TAG: u8 = 0x38;
@@ -792,7 +833,7 @@ pub(crate) fn from_elements_old_for_fixture(
         length,
         ..Default::default()
     };
-    body.adopt_slab(slab, length);
+    body.adopt_slab(slab, 0);
     copy_values_into(&mut body, &collected);
     record_slab_contents(heap, slab, length);
     heap.alloc_old(body)
@@ -832,7 +873,7 @@ pub(crate) fn from_vec_with_roots(
         length,
         ..Default::default()
     };
-    body.adopt_slab(slab, length);
+    body.adopt_slab(slab, 0);
     copy_values_into(&mut body, &collected);
     record_slab_contents(heap, slab, length);
     alloc_body_with_adopted_elements(heap, body, external_visit)
@@ -847,9 +888,9 @@ fn slab_from_values(
     heap: &mut GcHeap,
     values: &mut [Value],
     external_visit: &mut RootSlotVisitor<'_>,
-) -> Result<crate::value_slab::ValueSlabHandle, otter_gc::OutOfMemory> {
+) -> Result<elements::ElementSlabHandle, otter_gc::OutOfMemory> {
     if values.is_empty() {
-        return Ok(crate::value_slab::ValueSlabHandle::null());
+        return Ok(elements::ElementSlabHandle::null());
     }
     let count = values.len();
     let base = values.as_mut_ptr();
@@ -862,23 +903,53 @@ fn slab_from_values(
             value.trace_value_slot_mut(visitor);
         }
     };
-    crate::value_slab::alloc_value_slab(heap, count, &mut visit)
+    let kind = initial_dense_kind(values);
+    elements::alloc_element_slab(heap, count, kind, &mut visit)
+}
+
+fn initial_dense_kind(values: &[Value]) -> DenseElementKind {
+    let mut saw_hole = false;
+    for value in values {
+        if value.is_hole() {
+            saw_hole = true;
+        } else if !value.is_number() {
+            return DenseElementKind::Tagged;
+        }
+    }
+    if saw_hole {
+        DenseElementKind::HoleyDouble
+    } else {
+        DenseElementKind::PackedDouble
+    }
+}
+
+#[inline]
+fn dense_kind_for_value(value: Value) -> DenseElementKind {
+    if value.is_hole() {
+        DenseElementKind::HoleyDouble
+    } else if value.is_number() {
+        DenseElementKind::PackedDouble
+    } else {
+        DenseElementKind::Tagged
+    }
 }
 
 /// Copy `values` into a body that has already adopted a slab big enough
 /// for them.
 fn copy_values_into(body: &mut ArrayBody, values: &[Value]) {
     debug_assert!(body.dense_capacity() >= values.len());
-    body.elements_mut().copy_from_slice(values);
+    for (index, value) in values.iter().copied().enumerate() {
+        body.write_dense_value(index, value);
+    }
+    body.set_dense_len(values.len());
 }
 
-/// Allocate an [`ArrayBody`] whose dense element vector has already been
-/// materialized and moved into the body.
+/// Allocate an [`ArrayBody`] whose dense element slab has already been
+/// materialized and adopted by the body.
 ///
-/// The vector's backing store is accounted exactly once. When there is no hard
-/// heap cap, the common path reserves those bytes without a safepoint and tries
-/// a no-collect young allocation for the array shell. Any miss falls back to
-/// the rooted allocator, which traces the pending body and its dense elements.
+/// The slab was accounted when it was allocated. The common path now tries a
+/// no-collect young allocation for the array shell; any miss falls back to the
+/// rooted allocator, which traces the pending body and its slab handle.
 fn alloc_body_with_adopted_elements(
     heap: &mut GcHeap,
     body: ArrayBody,
@@ -925,7 +996,7 @@ fn from_elements_with_source_old_for_fixture(
         exotic: sidecar,
         ..Default::default()
     };
-    body.adopt_slab(slab, length);
+    body.adopt_slab(slab, 0);
     copy_values_into(&mut body, &collected);
     record_slab_contents(heap, slab, length);
     heap.alloc_old(body)
@@ -987,7 +1058,7 @@ pub(crate) fn from_elements_with_source_and_roots(
         exotic: sidecar,
         ..Default::default()
     };
-    body.adopt_slab(slab, length);
+    body.adopt_slab(slab, 0);
     copy_values_into(&mut body, &collected);
     record_slab_contents(heap, slab, length);
     alloc_body_with_adopted_elements(heap, body, &mut visit)
@@ -1005,6 +1076,12 @@ pub fn is_empty(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
     len(arr, heap) == 0
 }
 
+/// Current physical representation of the array's dense prefix.
+#[must_use]
+pub(crate) fn dense_element_kind(arr: JsArray, heap: &otter_gc::GcHeap) -> DenseElementKind {
+    heap.read_payload(arr, ArrayBody::dense_kind)
+}
+
 /// Read element at `idx`. Out-of-range and array-hole slots both
 /// return `undefined` per ECMA-262 §10.4.2 OrdinaryGet —
 /// internal hole sentinel never escapes the array.
@@ -1017,9 +1094,7 @@ pub fn get(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> Value {
             "stale dense-element cache on array read",
         );
         let raw = body
-            .elements()
-            .get(idx)
-            .cloned()
+            .dense_value(idx)
             .or_else(|| {
                 body.sparse_elements()
                     .and_then(|sparse| sparse.get(&idx).cloned())
@@ -1041,7 +1116,7 @@ pub fn get(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> Value {
 #[must_use]
 pub fn has_own_element(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> bool {
     heap.read_payload(arr, |body| {
-        if let Some(slot) = body.elements().get(idx) {
+        if let Some(slot) = body.dense_value(idx) {
             return !slot.is_hole();
         }
         body.sparse_elements()
@@ -1064,7 +1139,7 @@ pub(crate) fn own_data_element_without_accessors(
         if body.accessors().is_some() {
             return None;
         }
-        let value = body.elements().get(idx).cloned().or_else(|| {
+        let value = body.dense_value(idx).or_else(|| {
             body.sparse_elements()
                 .and_then(|sparse| sparse.get(&idx).cloned())
         })?;
@@ -1088,7 +1163,7 @@ pub(crate) fn plain_dense_element(
         if !body.exotic.is_null() || body.accessors().is_some() {
             return None;
         }
-        let value = *body.elements().get(idx)?;
+        let value = body.dense_value(idx)?;
         if value.is_hole() { None } else { Some(value) }
     })
 }
@@ -1100,11 +1175,7 @@ pub(crate) fn plain_dense_element(
 #[must_use]
 pub(crate) fn is_plain_dense_hole(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> bool {
     heap.read_payload(arr, |body| {
-        body.exotic.is_null()
-            && body
-                .elements()
-                .get(idx)
-                .is_some_and(|value| value.is_hole())
+        body.exotic.is_null() && body.dense_value(idx).is_some_and(Value::is_hole)
     })
 }
 
@@ -1124,13 +1195,13 @@ pub(crate) fn set_plain_dense_slot(
         if !body.exotic.is_null() {
             return false;
         }
-        let Some(slot) = body.elements_mut().get_mut(idx) else {
+        let Some(previous) = body.dense_value(idx) else {
             return false;
         };
-        if slot.is_hole() && !allow_hole {
+        if previous.is_hole() && !allow_hole {
             return false;
         }
-        *slot = value;
+        body.write_dense_value(idx, value);
         body.length = body.length.max(idx.saturating_add(1));
         body.mark_dirty();
         true
@@ -1204,10 +1275,16 @@ fn set_index_value(
         record_exotic_array_write(heap, arr, &barrier_value);
         return Ok(());
     }
-    reserve_dense_capacity(&mut arr, heap, target_len, &mut |_| {})?;
+    reserve_dense_capacity(
+        &mut arr,
+        heap,
+        target_len,
+        dense_kind_for_value(value),
+        &mut |_| {},
+    )?;
     heap.with_payload(arr, |body| {
         if idx < body.dense_len() {
-            body.elements_mut()[idx] = value;
+            body.write_dense_value(idx, value);
             body.length = body.length.max(target_len);
             body.mark_dirty();
             return;
@@ -1270,11 +1347,17 @@ pub(crate) fn set_with_roots(
             external_visit(visitor);
             value.trace_value_slots(visitor);
         };
-        reserve_dense_capacity(&mut arr, heap, target_len, &mut reserve_roots)?;
+        reserve_dense_capacity(
+            &mut arr,
+            heap,
+            target_len,
+            dense_kind_for_value(value),
+            &mut reserve_roots,
+        )?;
     }
     heap.with_payload(arr, |body| {
         if idx < body.dense_len() {
-            body.elements_mut()[idx] = value;
+            body.write_dense_value(idx, value);
             body.length = body.length.max(target_len);
             body.mark_dirty();
             return;
@@ -1356,7 +1439,13 @@ pub(crate) fn fill_dense_range_with_roots(
             external_visit(visitor);
             value.trace_value_slots(visitor);
         };
-        reserve_dense_capacity(&mut arr, heap, end, &mut reserve_roots)?;
+        reserve_dense_capacity(
+            &mut arr,
+            heap,
+            end,
+            dense_kind_for_value(value),
+            &mut reserve_roots,
+        )?;
     }
     heap.with_payload(arr, |body| {
         body.refresh_element_cache();
@@ -1365,7 +1454,7 @@ pub(crate) fn fill_dense_range_with_roots(
         }
         let existing_end = end.min(body.dense_len());
         for idx in start..existing_end {
-            body.elements_mut()[idx] = value;
+            body.write_dense_value(idx, value);
         }
         while body.dense_len() < end {
             body_elements_push(body, value);
@@ -1390,7 +1479,13 @@ pub fn push(
 ) -> Result<usize, otter_gc::OutOfMemory> {
     let barrier_value = value;
     let target_len = len(arr, heap).saturating_add(1);
-    reserve_dense_capacity(&mut arr, heap, target_len, &mut |_| {})?;
+    reserve_dense_capacity(
+        &mut arr,
+        heap,
+        target_len,
+        dense_kind_for_value(value),
+        &mut |_| {},
+    )?;
     let new_len = heap.with_payload(arr, |body| {
         body.refresh_element_cache();
         while body.dense_len() + 1 < target_len {
@@ -1425,7 +1520,13 @@ pub(crate) fn push_with_roots(
             external_visit(visitor);
             value.trace_value_slots(visitor);
         };
-        reserve_dense_capacity(&mut arr, heap, target_len, &mut reserve_roots)?;
+        reserve_dense_capacity(
+            &mut arr,
+            heap,
+            target_len,
+            dense_kind_for_value(value),
+            &mut reserve_roots,
+        )?;
     }
     let new_len = heap.with_payload(arr, |body| {
         body.refresh_element_cache();
@@ -1493,7 +1594,13 @@ pub fn set_length(
     }
     const MAX_DENSE_LENGTH_GROWTH: usize = 1 << 20;
     if new_len <= MAX_DENSE_LENGTH_GROWTH {
-        reserve_dense_capacity(&mut arr, heap, new_len, &mut |_| {})?;
+        reserve_dense_capacity(
+            &mut arr,
+            heap,
+            new_len,
+            DenseElementKind::HoleyDouble,
+            &mut |_| {},
+        )?;
     }
     heap.with_payload(arr, |body| {
         if new_len <= MAX_DENSE_LENGTH_GROWTH {
@@ -1533,7 +1640,7 @@ pub(crate) fn set_length_checked(
         let mut present: Vec<usize> = Vec::new();
         let dense_hi = body.dense_len().min(cur);
         for idx in new_len..dense_hi {
-            if !body.elements()[idx].is_hole() {
+            if body.dense_value(idx).is_some_and(|value| !value.is_hole()) {
                 present.push(idx);
             }
         }
@@ -1587,8 +1694,8 @@ pub(crate) fn set_length_writable(arr: JsArray, heap: &mut otter_gc::GcHeap, wri
 }
 
 fn delete_array_body_index(body: &mut ArrayBody, idx: usize) {
-    if let Some(slot) = body.elements_mut().get_mut(idx) {
-        *slot = Value::hole();
+    if body.dense_value(idx).is_some() {
+        body.write_dense_value(idx, Value::hole());
     }
     if let Some(exotic) = body.exotic_opt_mut()
         && let Some(sparse) = exotic.sparse_elements.as_mut()
@@ -1662,7 +1769,7 @@ fn array_index_at_or_above(key: &str, limit: usize) -> bool {
 pub(crate) fn dense_shift(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
     heap.with_payload(arr, |body| {
         debug_assert!(body.exotic.is_null(), "dense shift over an exotic array");
-        if body.elements().is_empty() {
+        if body.dense_len() == 0 {
             return Value::undefined();
         }
         let head = body_elements_remove(body, 0);
@@ -1698,7 +1805,13 @@ pub(crate) fn dense_unshift_with_roots(
             external_visit(visitor);
             value.trace_value_slots(visitor);
         };
-        reserve_dense_capacity(&mut arr, heap, target_len, &mut reserve_roots)?;
+        reserve_dense_capacity(
+            &mut arr,
+            heap,
+            target_len,
+            dense_kind_for_value(value),
+            &mut reserve_roots,
+        )?;
     }
     let new_len = heap.with_payload(arr, |body| {
         debug_assert!(body.exotic.is_null(), "dense unshift over an exotic array");
@@ -1723,7 +1836,12 @@ pub(crate) fn is_fully_dense(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
     heap.read_payload(arr, |body| {
         body.exotic.is_null()
             && body.length == body.dense_len()
-            && !body.elements().iter().any(|value| value.is_hole())
+            && match body.dense_kind() {
+                DenseElementKind::Empty | DenseElementKind::PackedDouble => true,
+                DenseElementKind::HoleyDouble => false,
+                DenseElementKind::Tagged => !(0..body.dense_len())
+                    .any(|index| body.dense_value(index).is_some_and(Value::is_hole)),
+            }
     })
 }
 
@@ -1737,7 +1855,7 @@ pub fn pop(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
         }
         let idx = body.length - 1;
         let popped = if idx < body.dense_len() {
-            body.elements().get(idx).cloned()
+            body.dense_value(idx)
         } else {
             body.exotic_opt_mut()
                 .and_then(|exotic| exotic.sparse_elements.as_mut())
@@ -1773,7 +1891,7 @@ pub fn set_integrity_level(arr: JsArray, heap: &mut otter_gc::GcHeap, frozen: bo
     prevent_extensions(arr, heap);
     heap.with_payload(arr, |body| {
         let mut keys: Vec<(String, bool)> = Vec::new();
-        for (i, v) in body.elements().iter().enumerate() {
+        for (i, v) in body.dense_values().into_iter().enumerate() {
             if !v.is_hole() {
                 keys.push((i.to_string(), false));
             }
@@ -1811,7 +1929,7 @@ pub fn test_integrity_level(arr: JsArray, heap: &otter_gc::GcHeap, frozen: bool)
     }
     heap.read_payload(arr, |body| {
         let mut keys: Vec<String> = Vec::new();
-        for (i, v) in body.elements().iter().enumerate() {
+        for (i, v) in body.dense_values().into_iter().enumerate() {
             if !v.is_hole() {
                 keys.push(i.to_string());
             }
@@ -2207,10 +2325,8 @@ pub fn get_named_property(arr: JsArray, heap: &otter_gc::GcHeap, key: &str) -> O
     if let Some(idx) = crate::object::array_index_property_name(key) {
         let idx = idx as usize;
         return heap.read_payload(arr, |body| {
-            body.elements()
-                .get(idx)
-                .filter(|v| !v.is_hole())
-                .cloned()
+            body.dense_value(idx)
+                .filter(|value| !value.is_hole())
                 .or_else(|| {
                     body.sparse_elements()
                         .and_then(|sparse| sparse.get(&idx).cloned())
@@ -2270,8 +2386,8 @@ pub fn set_accessor(
         // previous data value.
         if let Some(idx) = crate::object::array_index_property_name(key) {
             let idx = idx as usize;
-            if let Some(slot) = body.elements_mut().get_mut(idx) {
-                *slot = Value::hole();
+            if body.dense_value(idx).is_some() {
+                body.write_dense_value(idx, Value::hole());
             }
             if let Some(exotic) = body.exotic_opt_mut()
                 && let Some(sparse) = exotic.sparse_elements.as_mut()
@@ -2351,8 +2467,8 @@ pub fn delete_named_property(arr: JsArray, heap: &mut otter_gc::GcHeap, key: &st
                     exotic.accessors = None;
                 }
             }
-            if let Some(slot) = body.elements_mut().get_mut(idx) {
-                *slot = Value::hole();
+            if body.dense_value(idx).is_some() {
+                body.write_dense_value(idx, Value::hole());
             }
             if let Some(exotic) = body.exotic_opt_mut()
                 && let Some(sparse) = exotic.sparse_elements.as_mut()
@@ -2412,7 +2528,7 @@ pub(crate) fn own_index_and_string_keys(
 ) -> (BTreeSet<usize>, Vec<String>) {
     heap.read_payload(arr, |body| {
         let mut indices = BTreeSet::new();
-        for (idx, value) in body.elements().iter().enumerate() {
+        for (idx, value) in body.dense_values().into_iter().enumerate() {
             if !value.is_hole() {
                 indices.insert(idx);
             }
@@ -2466,7 +2582,21 @@ fn can_delete_array_property(arr: JsArray, heap: &otter_gc::GcHeap, key: &str) -
 /// Read-only access to dense elements for call sites that need to
 /// derive an aggregate result without exposing the body borrow.
 pub fn with_elements<R>(arr: JsArray, heap: &otter_gc::GcHeap, f: impl FnOnce(&[Value]) -> R) -> R {
-    heap.read_payload(arr, |body| f(body.elements()))
+    heap.read_payload(arr, |body| {
+        let Some(slab) = elements::body_of(body.slab) else {
+            return f(&[]);
+        };
+        // SAFETY: the array body keeps the slab reachable for the duration of
+        // this payload borrow.
+        if let Some(values) = unsafe { (*slab).tagged_slice() } {
+            f(values)
+        } else {
+            // Cold borrowed-slice consumers materialize the numeric prefix;
+            // exposing raw `f64` words as `Value` would violate the API.
+            let values = unsafe { (*slab).values_vec() };
+            f(&values)
+        }
+    })
 }
 
 /// Clone a proven plain dense prefix for builtin fast paths.
@@ -2483,7 +2613,8 @@ pub(crate) fn plain_dense_prefix_values(
         if !body.exotic.is_null() || body.length != len || body.dense_len() < len {
             return None;
         }
-        let prefix = &body.elements()[..len];
+        let values = body.dense_values();
+        let prefix = &values[..len];
         if prefix.iter().any(|value| value.is_hole()) {
             return None;
         }
@@ -2512,7 +2643,13 @@ pub(crate) fn write_dense_range_with_roots(
                 value.trace_value_slots(visitor);
             }
         };
-        reserve_dense_capacity(&mut arr, heap, end, &mut reserve_roots)?;
+        reserve_dense_capacity(
+            &mut arr,
+            heap,
+            end,
+            initial_dense_kind(values),
+            &mut reserve_roots,
+        )?;
     }
     heap.with_payload(arr, |body| {
         body.refresh_element_cache();
@@ -2520,11 +2657,13 @@ pub(crate) fn write_dense_range_with_roots(
             body_elements_push(body, Value::hole());
         }
         let existing_end = end.min(body.dense_len());
-        for (slot, value) in body.elements_mut()[start..existing_end]
-            .iter_mut()
-            .zip(values.iter().copied())
+        for (index, value) in values
+            .iter()
+            .copied()
+            .take(existing_end.saturating_sub(start))
+            .enumerate()
         {
-            *slot = value;
+            body.write_dense_value(start + index, value);
         }
         for value in &values[existing_end.saturating_sub(start)..] {
             body_elements_push(body, *value);
@@ -2543,18 +2682,27 @@ pub(crate) fn write_dense_range_with_roots(
 /// The helper conservatively fires write barriers for every
 /// GC-bearing element left in the array after the mutation. This keeps
 /// fixed-length rewrites from duplicating barrier bookkeeping. Exposing a
-/// slice instead of the backing `Vec` makes growth impossible: allocation,
-/// external-byte accounting, and the JIT-visible dense cache must stay owned
-/// by this module's rooted construction and mutation APIs.
+/// slice instead of the backing slab makes growth impossible: allocation and
+/// the JIT-visible dense cache must stay owned by this module's rooted
+/// construction and mutation APIs.
 pub(crate) fn with_elements_rewrite<R>(
     arr: JsArray,
     heap: &mut otter_gc::GcHeap,
     f: impl FnOnce(&mut [Value]) -> R,
 ) -> R {
     let (out, children) = heap.with_payload(arr, |body| {
-        let out = f(body.elements_mut());
+        let (out, children) = if let Some(slab) = body.slab_body_mut() {
+            slab.convert_to_tagged();
+            let values = slab.tagged_slice_mut().expect("converted tagged slab");
+            let out = f(values);
+            let children: SmallVec<[Value; 8]> = values.iter().copied().collect();
+            (out, children)
+        } else {
+            let out = f(&mut []);
+            (out, SmallVec::new())
+        };
+        body.refresh_element_cache();
         body.mark_dirty();
-        let children: SmallVec<[Value; 8]> = body.elements().iter().cloned().collect();
         (out, children)
     });
     for child in children {
@@ -2587,7 +2735,7 @@ pub fn clean_source_bytes(arr: JsArray, heap: &otter_gc::GcHeap) -> Option<Arc<[
             return None;
         }
         let source = exotic.source_bytes.as_ref()?;
-        if !body.elements().iter().all(is_render_stable_primitive) {
+        if !body.dense_values().iter().all(is_render_stable_primitive) {
             return None;
         }
         Some(Arc::clone(source))
@@ -2646,14 +2794,14 @@ where
 ///
 /// Construction and growth copy values in behind the mutator's back, so
 /// the edges they create need recording in one pass afterwards.
-fn record_slab_contents(heap: &mut GcHeap, slab: crate::value_slab::ValueSlabHandle, len: usize) {
-    if slab.is_null() {
+fn record_slab_contents(heap: &mut GcHeap, slab: elements::ElementSlabHandle, len: usize) {
+    if slab.is_null() || elements::kind_of(slab) != DenseElementKind::Tagged {
         return;
     }
-    let base = crate::value_slab::values_base(slab);
+    let body = elements::body_of(slab).expect("live element slab");
     for index in 0..len {
-        // SAFETY: `index < len`, the prefix the caller just wrote.
-        let value = unsafe { *base.add(index) };
+        // SAFETY: `index < len`, the tagged prefix the caller just wrote.
+        let value = unsafe { (*body).get(index).expect("live tagged slot") };
         heap.record_write(slab, &value);
     }
 }
@@ -2673,14 +2821,22 @@ fn reserve_dense_capacity(
     arr: &mut JsArray,
     heap: &mut otter_gc::GcHeap,
     target_len: usize,
+    preferred_kind: DenseElementKind,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let (current_capacity, live_len) =
-        heap.read_payload(*arr, |body| (body.dense_capacity(), body.dense_len()));
+    let (current_capacity, live_len, current_kind) = heap.read_payload(*arr, |body| {
+        (body.dense_capacity(), body.dense_len(), body.dense_kind())
+    });
     if target_len <= current_capacity {
         return Ok(());
     }
     let grown = target_len.max(current_capacity.saturating_mul(2)).max(4);
+    let target_kind = match (current_kind, preferred_kind) {
+        (DenseElementKind::Tagged, _) | (_, DenseElementKind::Tagged) => DenseElementKind::Tagged,
+        (DenseElementKind::Empty, preferred) => preferred,
+        (current, _) => current,
+    };
+    debug_assert_ne!(target_kind, DenseElementKind::Empty);
 
     // The array roots the outgoing slab, and the slab roots every value in
     // it, so rooting the array is enough to carry the elements being
@@ -2690,18 +2846,24 @@ fn reserve_dense_capacity(
         external_visit(visitor);
         visitor(owner_slot.cast::<RawGc>());
     };
-    let slab = crate::value_slab::alloc_value_slab(heap, grown, &mut visit)?;
+    let slab = elements::alloc_element_slab(heap, grown, target_kind, &mut visit)?;
 
     let owner = *arr;
     heap.with_payload(owner, |body| {
-        let old_base = body.elements_ptr.get();
-        let new_base = crate::value_slab::values_base(slab);
-        if !old_base.is_null() && live_len != 0 {
-            // SAFETY: the outgoing slab holds `live_len` values and the
-            // incoming one has room for at least that many; the two cells
-            // are distinct allocations.
-            unsafe { std::ptr::copy_nonoverlapping(old_base, new_base, live_len) };
+        let old_slab = elements::body_of(body.slab);
+        let new_slab = elements::body_of(slab).expect("fresh element slab");
+        for index in 0..live_len {
+            // SAFETY: both handles remain live through the owner payload;
+            // `index` lies in the old prefix and the new capacity is `grown`.
+            let value = unsafe {
+                (*old_slab.expect("non-empty prefix has a slab"))
+                    .get(index)
+                    .expect("live dense slot")
+            };
+            unsafe { (*new_slab).set(index, value) };
         }
+        // SAFETY: every word in the copied prefix is now initialized.
+        unsafe { (*new_slab).set_len(live_len) };
         body.adopt_slab(slab, live_len);
         true
     });
@@ -2724,8 +2886,8 @@ fn should_store_sparse(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> boo
 
 impl ArrayBody {
     /// Iterate over elements.
-    pub fn iter(&self) -> impl Iterator<Item = &Value> {
-        self.elements().iter()
+    pub fn iter(&self) -> impl Iterator<Item = Value> + '_ {
+        (0..self.dense_len()).filter_map(|index| self.dense_value(index))
     }
 }
 
@@ -2770,8 +2932,81 @@ mod tests {
         .unwrap();
 
         assert_eq!(len(a, &heap), 6);
-        assert_eq!(get(a, &heap, 0), Value::number_i32(0));
-        assert_eq!(get(a, &heap, 5), Value::number_i32(5));
+        assert_eq!(dense_element_kind(a, &heap), DenseElementKind::PackedDouble);
+        assert_eq!(get(a, &heap, 0).as_f64(), Some(0.0));
+        assert_eq!(get(a, &heap, 5).as_f64(), Some(5.0));
+    }
+
+    #[test]
+    fn numeric_holes_fill_to_packed_and_tagged_is_terminal() {
+        let mut heap = fresh_heap();
+        let a = alloc_array_old_for_fixture(&mut heap).unwrap();
+        set_length(a, &mut heap, 70).unwrap();
+        assert_eq!(dense_element_kind(a, &heap), DenseElementKind::HoleyDouble);
+
+        for index in 0..70 {
+            set(a, &mut heap, index, Value::number_f64(index as f64 + 0.25)).unwrap();
+        }
+        assert_eq!(dense_element_kind(a, &heap), DenseElementKind::PackedDouble);
+        assert_eq!(get(a, &heap, 69).as_f64(), Some(69.25));
+
+        set(a, &mut heap, 7, Value::boolean(true)).unwrap();
+        assert_eq!(dense_element_kind(a, &heap), DenseElementKind::Tagged);
+        set(a, &mut heap, 7, Value::number_i32(7)).unwrap();
+        assert_eq!(dense_element_kind(a, &heap), DenseElementKind::Tagged);
+        assert_eq!(get(a, &heap, 7), Value::number_i32(7));
+    }
+
+    #[test]
+    fn numeric_growth_preserves_values_and_bitmap_transitions() {
+        let mut heap = fresh_heap();
+        let a = from_elements_old_for_fixture(
+            &mut heap,
+            [Value::number_f64(-0.0), Value::number_f64(f64::NAN)],
+        )
+        .unwrap();
+        assert_eq!(dense_element_kind(a, &heap), DenseElementKind::PackedDouble);
+
+        set(a, &mut heap, 5, Value::number_f64(5.5)).unwrap();
+        assert_eq!(dense_element_kind(a, &heap), DenseElementKind::HoleyDouble);
+        assert!(get(a, &heap, 0).as_f64().unwrap().is_sign_negative());
+        assert!(get(a, &heap, 1).as_f64().unwrap().is_nan());
+        for index in 2..5 {
+            set(a, &mut heap, index, Value::number_f64(index as f64)).unwrap();
+        }
+        assert_eq!(dense_element_kind(a, &heap), DenseElementKind::PackedDouble);
+        assert_eq!(get(a, &heap, 5).as_f64(), Some(5.5));
+
+        assert!(delete_named_property(a, &mut heap, "3"));
+        assert_eq!(dense_element_kind(a, &heap), DenseElementKind::HoleyDouble);
+        assert!(!has_own_element(a, &heap, 3));
+        set(a, &mut heap, 3, Value::number_i32(3)).unwrap();
+        assert_eq!(dense_element_kind(a, &heap), DenseElementKind::PackedDouble);
+    }
+
+    #[test]
+    fn numeric_truncate_republishes_dense_cache() {
+        let mut heap = fresh_heap();
+        let a = from_elements_old_for_fixture(
+            &mut heap,
+            [Value::number_f64(1.25), Value::number_f64(2.5)],
+        )
+        .unwrap();
+
+        set_length(a, &mut heap, 5).unwrap();
+        assert_eq!(dense_element_kind(a, &heap), DenseElementKind::HoleyDouble);
+        set_length(a, &mut heap, 2).unwrap();
+        assert_eq!(dense_element_kind(a, &heap), DenseElementKind::PackedDouble);
+        heap.read_payload(a, |body| {
+            assert_eq!(body.dense_len(), 2);
+            assert_eq!(elements::len_of(body.slab), 2);
+            assert_eq!(body.elements_ptr.get(), elements::data_base(body.slab));
+            assert_eq!(body.dense_capacity(), elements::capacity_of(body.slab));
+            assert_eq!(body.dense_kind(), elements::kind_of(body.slab));
+        });
+
+        assert_eq!(push(a, &mut heap, Value::number_f64(3.75)).unwrap(), 3);
+        assert_eq!(get(a, &heap, 2).as_f64(), Some(3.75));
     }
 
     #[test]

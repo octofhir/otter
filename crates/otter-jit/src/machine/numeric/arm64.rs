@@ -34,6 +34,10 @@
 //!   Reducible non-reentrant packed-double loops may retain an untraced raw
 //!   base/length pair in the Machine frame across backedges. Entry, OSR, and
 //!   external loop-entry paths clear every pair before it can be observed.
+//!   An unsupported or unprepared element access clears those raw caches,
+//!   publishes exact moving roots, and calls the fixed boxed-value VM boundary.
+//!   The operation either completes once or propagates its parked exception;
+//!   no post-call status may deopt and replay it.
 //! - Settled ordinary named properties consume the VM's complete monomorphic
 //!   or polymorphic shape/slot chain directly. Loads remain tagged; stores
 //!   guard the whole chain before one commit. Tagged values use the `x19`
@@ -68,8 +72,9 @@ use otter_vm::{
     native_abi::{
         RuntimeStubDescriptor, STUB_ARRAY_CONSTRUCT_ALLOC, STUB_JIT_BACKEDGE_POLL,
         STUB_JIT_BIND_DERIVED_THIS, STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_DEOPT_WRITEBACK,
-        STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF,
-        STUB_STRICT_EQ_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF,
+        STUB_JIT_LOAD_ELEMENT, STUB_JIT_STORE_ELEMENT, STUB_NUMBER_POW_F64_LEAF,
+        STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF, STUB_STRICT_EQ_LEAF,
+        STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF,
     },
 };
 
@@ -413,6 +418,8 @@ pub(super) fn emit(
     number_to_int32_entry: u64,
     strict_eq_entry: u64,
     to_boolean_entry: u64,
+    load_element_entry: u64,
+    store_element_entry: u64,
     vm_register_count: u16,
     capture_artifacts: bool,
 ) -> Result<Emission, Unsupported> {
@@ -1838,6 +1845,116 @@ pub(super) fn emit(
                         ));
                         continue;
                     }
+                    if let CallTarget::RuntimeStub(target) = descriptor.target
+                        && matches!(target, STUB_JIT_LOAD_ELEMENT | STUB_JIT_STORE_ELEMENT)
+                    {
+                        let load = target == STUB_JIT_LOAD_ELEMENT;
+                        let argument_count = if load { 2 } else { 3 };
+                        if descriptor.arguments.len() != argument_count
+                            || locations.len() < argument_count + usize::from(load)
+                        {
+                            return Err(Unsupported::OperandShape(
+                                "scalar generic element value call",
+                            ));
+                        }
+                        let deopt = instruction.deopt.ok_or(Unsupported::OperandShape(
+                            "scalar generic element frame state",
+                        ))?;
+                        let exit = deopt_runtime.exits.get(deopt.0 as usize).ok_or(
+                            Unsupported::OperandShape("scalar generic element deopt exit"),
+                        )?;
+                        let logical_pc = *exit.resume_pcs.first().ok_or(
+                            Unsupported::OperandShape("scalar generic element logical PC"),
+                        )?;
+                        let byte_pc = deopt_runtime
+                            .table
+                            .lookup(otter_vm::deopt::DeoptExitId(deopt.0))
+                            .map(|state| state.innermost().byte_pc)
+                            .ok_or(Unsupported::OperandShape("scalar generic element byte PC"))?;
+                        let site = safepoints
+                            .site(id)
+                            .filter(|site| instruction.safepoint == Some(site.id))
+                            .ok_or(Unsupported::OperandShape(
+                                "scalar generic element safepoint",
+                            ))?;
+                        let start = ops.offset().0;
+                        emit_clear_packed_double_view_caches(&mut ops, frame)?;
+                        emit_save_safepoint_roots(&mut ops, frame, site)?;
+                        emit_publish_machine_roots(&mut ops, frame, site)?;
+                        for (argument, target_register) in (0..argument_count).zip(1_u8..) {
+                            let value = instruction
+                                .operands
+                                .get(argument)
+                                .ok_or(Unsupported::OperandShape(
+                                    "scalar generic element argument",
+                                ))?
+                                .value;
+                            emit_load_safepoint_root(
+                                &mut ops,
+                                frame,
+                                site,
+                                value,
+                                target_register,
+                                MACHINE_ROOT_RECORD_SIZE,
+                            )?;
+                        }
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr x16, [x19, NATIVE_FRAME_OFFSET]
+                            ; movz w15, logical_pc
+                            ; str w15, [x16, NATIVE_FRAME_PC_OFFSET]
+                            ; mov x0, x19
+                        );
+                        let entry = if load {
+                            load_element_entry
+                        } else {
+                            store_element_entry
+                        };
+                        emit_load_symbolic_u64(
+                            &mut ops,
+                            &mut relocations,
+                            16,
+                            entry,
+                            RelocationTarget::runtime_stub(target),
+                        );
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; blr x16
+                            ; mov x17, x0
+                            ; and x15, x1, #0xff
+                        );
+                        emit_clear_machine_roots(&mut ops);
+                        emit_reload_safepoint_roots(&mut ops, frame, site)?;
+                        dynasm!(ops ; .arch aarch64 ; cbnz x15, =>threw);
+                        if load {
+                            emit_store_allocated_tagged(
+                                &mut ops,
+                                frame,
+                                locations[argument_count],
+                                17,
+                                0,
+                            )?;
+                        }
+                        structural_regions.push((
+                            if load {
+                                "machineGenericElementLoad"
+                            } else {
+                                "machineGenericElementStore"
+                            },
+                            Some(byte_pc),
+                            start,
+                            ops.offset().0,
+                        ));
+                        if !is_terminator {
+                            emit_edits(
+                                &mut ops,
+                                allocation.edits(),
+                                AllocationPoint::After(id),
+                                frame,
+                            )?;
+                        }
+                        continue;
+                    }
                     if matches!(
                         descriptor.target,
                         CallTarget::RuntimeStub(target)
@@ -2402,6 +2519,30 @@ fn emit_save_safepoint_roots(
             }
         }
     }
+    Ok(())
+}
+
+fn emit_load_safepoint_root(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    frame: MachineFrameLayout,
+    site: &MachineSafepointSite,
+    value: super::super::MachineValue,
+    target: u8,
+    sp_bias: u32,
+) -> Result<(), Unsupported> {
+    let root =
+        site.roots
+            .iter()
+            .find(|root| root.value == value)
+            .ok_or(Unsupported::OperandShape(
+                "scalar canonical safepoint argument root",
+            ))?;
+    let offset = root_offset(frame, root.save_slot)?
+        .checked_add(sp_bias)
+        .ok_or(Unsupported::OperandShape(
+            "scalar safepoint argument root offset",
+        ))?;
+    emit_sp_ldr_x(ops, target, offset);
     Ok(())
 }
 

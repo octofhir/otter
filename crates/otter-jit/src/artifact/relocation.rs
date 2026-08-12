@@ -167,6 +167,8 @@ fn runtime_stub_signature_name(signature: RuntimeStubSignature) -> &'static str 
         RuntimeStubSignature::Variadic => "variadic",
         RuntimeStubSignature::MutatingLeafValue2 => "mutatingLeafValue2",
         RuntimeStubSignature::MutatingLeafValue3 => "mutatingLeafValue3",
+        RuntimeStubSignature::ReentrantValue2 => "reentrantValue2",
+        RuntimeStubSignature::ReentrantValue3 => "reentrantValue3",
     }
 }
 

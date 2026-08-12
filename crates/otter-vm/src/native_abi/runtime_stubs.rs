@@ -155,6 +155,17 @@ pub enum RuntimeStubSignature {
     Float64Leaf2 = 7,
     /// `(value: f64) -> word` pure numeric conversion leaf.
     Float64ToWordLeaf1 = 8,
+    /// `(jit_ctx, receiver, key) -> RuntimeStubResultPair` reentrant value call.
+    ///
+    /// Unlike [`Self::Variadic`], both operands are boxed JavaScript values,
+    /// never register indices into an interpreter-compatible window. The call
+    /// site publishes precise roots independently of this fixed value ABI.
+    ReentrantValue2 = 9,
+    /// `(jit_ctx, receiver, key, value) -> RuntimeStubResultPair` reentrant
+    /// value call.
+    ///
+    /// This is the three-value form of [`Self::ReentrantValue2`].
+    ReentrantValue3 = 10,
 }
 
 /// Safepoint requirement encoded in the descriptor.
@@ -470,25 +481,33 @@ pub const STUB_JIT_LOAD_GLOBAL: RuntimeStubDescriptor = descriptor(
     RuntimeStubException::Status,
     RuntimeStubResultAbi::StatusWord,
 );
-/// Computed element read; getters/proxies may re-enter JS.
+/// Computed element read over boxed value operands.
+///
+/// `ToPropertyKey`, proxies, accessors, and prototype lookup may all re-enter
+/// JavaScript. The fixed entry completes the operation or reports a parked
+/// exception; it never asks generated code to replay the access.
 pub const STUB_JIT_LOAD_ELEMENT: RuntimeStubDescriptor = descriptor(
     16,
     RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubSignature::ReentrantValue2,
+    2,
     RuntimeStubEffects::reentrant(true),
     RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
+    RuntimeStubResultAbi::StatusPair,
 );
-/// Computed element write; setters/proxies may re-enter JS.
+/// Computed element write over boxed value operands.
+///
+/// The store may mutate arbitrary GC-managed state and invoke proxy traps,
+/// setters, or property-key coercion hooks. Once entered it either completes
+/// exactly once or reports a parked exception.
 pub const STUB_JIT_STORE_ELEMENT: RuntimeStubDescriptor = descriptor(
     17,
     RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubSignature::ReentrantValue3,
+    3,
     RuntimeStubEffects::reentrant(true),
     RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
+    RuntimeStubResultAbi::StatusPair,
 );
 /// Descriptor-driven define; descriptor reads may re-enter JS.
 pub const STUB_JIT_DEFINE_OWN_PROPERTY: RuntimeStubDescriptor = descriptor(
@@ -1684,7 +1703,9 @@ pub const fn validate_stub_descriptor(
         RuntimeStubSignature::LeafValue2
         | RuntimeStubSignature::MutatingLeafValue2
         | RuntimeStubSignature::MutatingLeafValue3
-        | RuntimeStubSignature::AllocValue3 => {
+        | RuntimeStubSignature::AllocValue3
+        | RuntimeStubSignature::ReentrantValue2
+        | RuntimeStubSignature::ReentrantValue3 => {
             matches!(desc.result_abi, RuntimeStubResultAbi::StatusPair)
         }
         RuntimeStubSignature::Poll1 => {
@@ -1778,5 +1799,45 @@ mod tests {
             NO_SAFEPOINT
         ));
         assert!(validate_stub_descriptor(STUB_COLLECTION_MAP_SET_ALLOC, 7));
+    }
+
+    #[test]
+    fn element_entries_are_fixed_value_reentrant_status_pairs() {
+        assert_eq!(STUB_JIT_LOAD_ELEMENT.id, 16);
+        assert_eq!(
+            STUB_JIT_LOAD_ELEMENT.signature,
+            RuntimeStubSignature::ReentrantValue2
+        );
+        assert_eq!(STUB_JIT_LOAD_ELEMENT.argument_count, 2);
+        assert_eq!(
+            STUB_JIT_LOAD_ELEMENT.result_abi,
+            RuntimeStubResultAbi::StatusPair
+        );
+
+        assert_eq!(STUB_JIT_STORE_ELEMENT.id, 17);
+        assert_eq!(
+            STUB_JIT_STORE_ELEMENT.signature,
+            RuntimeStubSignature::ReentrantValue3
+        );
+        assert_eq!(STUB_JIT_STORE_ELEMENT.argument_count, 3);
+        assert_eq!(
+            STUB_JIT_STORE_ELEMENT.result_abi,
+            RuntimeStubResultAbi::StatusPair
+        );
+
+        for descriptor in [STUB_JIT_LOAD_ELEMENT, STUB_JIT_STORE_ELEMENT] {
+            assert_eq!(descriptor.class, RuntimeStubClass::Reentrant);
+            assert_eq!(descriptor.safepoint, RuntimeStubSafepoint::Required);
+            assert_eq!(descriptor.exception, RuntimeStubException::Status);
+            assert!(descriptor.effects.contains(
+                RuntimeStubEffects::MAY_ALLOCATE
+                    | RuntimeStubEffects::MAY_TRIGGER_GC
+                    | RuntimeStubEffects::MAY_THROW
+                    | RuntimeStubEffects::MAY_REENTER_JS
+                    | RuntimeStubEffects::MAY_MUTATE_GC
+            ));
+            assert!(validate_stub_descriptor(descriptor, 0));
+            assert!(!validate_stub_descriptor(descriptor, NO_SAFEPOINT));
+        }
     }
 }

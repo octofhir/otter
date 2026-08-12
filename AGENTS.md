@@ -430,6 +430,13 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     `-0` stay generated; fractions, negatives, NaN, and values beyond Uint32
     deopt before the access. The hit performs a direct FP load/store with no
     hole test, Number box/decode, or write barrier.
+    An indexed access without a usable direct snapshot remains inside the same
+    Machine body as `machineGenericElementLoad` / `machineGenericElementStore`.
+    These regions clear raw view caches, publish precise moving roots, and call
+    the canonical fixed boxed-value `[[Get]]` / `[[Set]]` boundary. Success or
+    throw commits exactly once; it never deoptimizes and replays the source
+    operation. Generic accesses protected by a local catch remain on a
+    materialized backend until Machine committed-throw landing is available.
     Reducible non-reentrant loops may group invariant packed-double receivers
     into bounded native-stack view caches. `optimized-ir.txt` reports
     `packed-double-view-caches=<N>` and annotates each packed access with its

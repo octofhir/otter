@@ -73,7 +73,11 @@ It already owns:
   generated load family; lengths above int32 deopt to exact unsigned Number
   boxing instead of wrapping. Fixed TypedArray views over resizable buffers
   additionally prove the complete cached view extent against the live backing
-  byte length before either a load or a store;
+  byte length before either a load or a store. Missing or incompatible direct
+  element metadata stays within the Machine function through one fixed
+  boxed-value reentrant call with precise roots and effect-once success/throw
+  semantics; generic element operations inside local catches remain on the
+  materialized backend pending a committed-throw landing path;
 - loop-scoped packed-double view caching in scalar Machine IR. The planner
   selects only innermost reducible loops with an invariant receiver and no
   allocation, reentry, or representation-changing effect. A bounded untraced

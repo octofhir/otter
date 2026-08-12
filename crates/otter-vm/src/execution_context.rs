@@ -338,7 +338,7 @@ impl ExecutionContext {
             if instr.op(&code_block) == otter_bytecode::Op::LoadNumber
                 && let Some(otter_bytecode::Operand::ConstIndex(idx)) =
                     instr.operand(&code_block, 1)
-                && let Some(bits) = self.number_constant_bits(idx)
+                && let Some(bits) = self.number_constant_bits_for_function(function_id, idx)
             {
                 instr.load_number = Some(f64::from_bits(bits));
             }
@@ -533,6 +533,32 @@ impl ExecutionContext {
     #[must_use]
     pub fn number_constant_bits(&self, idx: u32) -> Option<u64> {
         match self.module.constants.get(idx as usize) {
+            Some(Constant::Number { bits }) => Some(*bits),
+            _ => None,
+        }
+    }
+
+    /// Resolve a numeric constant in the chunk that owns `function_id`.
+    ///
+    /// Feedback invalidation may request recompilation while an unrelated
+    /// sibling script is the ambient execution context. Bytecode constant
+    /// indices remain local to their owning chunk, so JIT snapshots must not
+    /// read the ambient module's pool.
+    #[must_use]
+    pub(crate) fn number_constant_bits_for_function(
+        &self,
+        function_id: u32,
+        idx: u32,
+    ) -> Option<u64> {
+        if self.local_function_index(function_id).is_some() {
+            return self.number_constant_bits(idx);
+        }
+        match self
+            .sibling_tables(function_id)?
+            .module
+            .constants
+            .get(idx as usize)
+        {
             Some(Constant::Number { bits }) => Some(*bits),
             _ => None,
         }
@@ -795,6 +821,38 @@ mod tests {
             view.instructions[1].method_hint,
             crate::jit::JitMethodHint::None
         );
+    }
+
+    #[test]
+    fn sibling_jit_snapshot_resolves_load_number_from_its_own_chunk() {
+        let mut interp = Interpreter::new();
+        let owner = interp.link_module(module_with(
+            vec![
+                instr(
+                    0,
+                    Op::LoadNumber,
+                    [Operand::Register(0), Operand::ConstIndex(0)],
+                ),
+                instr(1, Op::ReturnValue, [Operand::Register(0)]),
+            ],
+            vec![Constant::Number {
+                bits: 17.25_f64.to_bits(),
+            }],
+            1,
+        ));
+        let owner_function = owner.function_base();
+        let ambient = interp.link_module(module_with(
+            vec![instr(0, Op::ReturnUndefined, [])],
+            vec![Constant::Number {
+                bits: (-99.0_f64).to_bits(),
+            }],
+            0,
+        ));
+
+        let snapshot = ambient
+            .jit_compile_snapshot(owner_function)
+            .expect("sibling function snapshot");
+        assert_eq!(snapshot.instructions[0].load_number, Some(17.25));
     }
 
     #[test]

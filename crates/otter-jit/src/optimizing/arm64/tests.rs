@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use otter_vm::{
-    JitFunctionCode,
-    jit::JitTestInstruction,
+    JitDirectCallThisMode, JitDirectCallee, JitFunctionCode,
+    jit::{JitDirectCallPlan, JitTestInstruction},
     jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ArithFeedback},
     native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader, VmThread},
 };
@@ -13,6 +13,85 @@ use super::*;
 use crate::entry::{JitCtx, JitEntry, JitRet, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW};
 
 const STRIDE: u32 = 8;
+
+fn construct_target(
+    parameter_count: u16,
+    register_count: u16,
+    generated_stack_frame_bytes: Option<u32>,
+    derived: bool,
+    upvalues: (u16, u16),
+) -> JitDirectCallee {
+    JitDirectCallee {
+        plan: JitDirectCallPlan {
+            function_id: 73,
+            code_object_id: 74,
+            entry_cell: 0x1000,
+            tier: NativeFrameKind::Optimizing,
+            this_mode: JitDirectCallThisMode::ConstructReceiver,
+            is_derived_constructor: derived,
+            generated_stack_frame_bytes,
+            param_count: parameter_count,
+            register_count,
+            own_upvalue_count: upvalues.0,
+            inherited_upvalue_count: upvalues.1,
+        },
+        receiver_allocation: None,
+    }
+}
+
+#[test]
+fn tiny_zero_argument_construct_uses_the_canonical_cost_model_path() {
+    use otter_vm::JitDirectCallLoweringRejectionReason::{LayoutUnsupported, Unprofitable};
+
+    let tiny = construct_target(
+        0,
+        TINY_BASE_CONSTRUCT_REGISTER_LIMIT,
+        Some(16),
+        false,
+        (0, 0),
+    );
+    assert!(direct_call_target_is_supported(&tiny));
+    assert_eq!(
+        optimizing_direct_construct_rejection(&tiny, 0),
+        Some(Unprofitable)
+    );
+
+    assert_eq!(
+        optimizing_direct_construct_rejection(&construct_target(0, 4, Some(16), false, (0, 0)), 0,),
+        None,
+        "a larger body can amortize generated receiver and frame setup"
+    );
+    assert_eq!(
+        optimizing_direct_construct_rejection(&construct_target(1, 3, Some(16), false, (0, 0)), 1,),
+        None,
+        "a parameterized body retains stack-owned argument entry"
+    );
+    assert_eq!(
+        optimizing_direct_construct_rejection(&construct_target(0, 3, Some(16), false, (0, 0)), 1,),
+        None,
+        "extra arguments are not covered by the measured tiny-body gate"
+    );
+    assert_eq!(
+        optimizing_direct_construct_rejection(&construct_target(0, 3, Some(16), true, (0, 0)), 0,),
+        None,
+        "derived receiver and result semantics retain generated linkage"
+    );
+    for upvalues in [(1, 0), (0, 1)] {
+        assert_eq!(
+            optimizing_direct_construct_rejection(
+                &construct_target(0, 3, Some(16), false, upvalues),
+                0,
+            ),
+            None,
+            "capture setup is not covered by the measured tiny-body gate"
+        );
+    }
+    assert_eq!(
+        optimizing_direct_construct_rejection(&construct_target(0, 3, None, false, (0, 0)), 0,),
+        Some(LayoutUnsupported),
+        "layout rejection remains distinct from the cost-model decision"
+    );
+}
 
 /// A spliced unit compiles, and its callee-identity guard deoptimizes when
 /// the runtime callee is not the body the tree spliced. Wrong-callee is the

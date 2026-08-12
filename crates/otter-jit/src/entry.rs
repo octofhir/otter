@@ -502,6 +502,52 @@ mod tests {
     }
 
     #[test]
+    fn lowering_plan_assigns_typed_array_construct_safepoints() {
+        let v = view(&[
+            (
+                Op::ArrayConstruct,
+                vec![Operand::Register(0), Operand::ConstIndex(0)],
+            ),
+            (
+                Op::ArrayConstruct,
+                vec![
+                    Operand::Register(1),
+                    Operand::ConstIndex(1),
+                    Operand::Register(2),
+                ],
+            ),
+            (
+                Op::ArrayConstruct,
+                vec![
+                    Operand::Register(3),
+                    Operand::ConstIndex(2),
+                    Operand::Register(4),
+                    Operand::Register(5),
+                ],
+            ),
+            (Op::ReturnUndefined, vec![]),
+        ]);
+        let plan = BaselinePlan::build(&v).expect("plan");
+        assert_eq!(plan.array_construct_alloc_safepoints.len(), 2);
+        assert!(
+            plan.array_construct_alloc_safepoints
+                .contains_key(&plan.instructions[0].byte_pc)
+        );
+        assert!(
+            plan.array_construct_alloc_safepoints
+                .contains_key(&plan.instructions[1].byte_pc)
+        );
+        assert!(
+            !plan
+                .array_construct_alloc_safepoints
+                .contains_key(&plan.instructions[2].byte_pc)
+        );
+        for id in plan.array_construct_alloc_safepoints.values() {
+            assert!(plan.safepoint_records.iter().any(|record| record.id == *id));
+        }
+    }
+
+    #[test]
     fn lowering_plan_publishes_typed_fixed_operands() {
         let v = view(&[
             (

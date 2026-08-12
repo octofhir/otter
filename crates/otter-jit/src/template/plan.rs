@@ -474,6 +474,14 @@ pub(crate) enum TemplateOp {
         arg1: u64,
         arg2: u64,
     },
+    /// Allocate `Array()` or `Array(Int32)` through the VM-owned rooted
+    /// allocating ABI. `None` is the zero-argument form; every guarded miss
+    /// exits at the original opcode before construction begins.
+    ArrayConstruct {
+        dst: u16,
+        length: Option<u16>,
+        safepoint: SafepointId,
+    },
     /// Complete one variadic construction opcode (`ArrayConstruct`, `ArrayFrom`,
     /// `ArrayOf`, `QueueMicrotask`) through the shared reentrant variadic
     /// transition. `prefix` is the destination/callee register, `argc` the
@@ -1385,7 +1393,41 @@ impl TemplatePlan {
                         arg1: u64::from(operands.src),
                     }
                 }
-                Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf | Op::QueueMicrotask => {
+                Op::ArrayConstruct => {
+                    let operands = lowered.new_array_operands()?;
+                    let arguments = lowering.register_tail(operands.elements)?;
+                    if arguments.len() <= 1 {
+                        let safepoint = lowering
+                            .array_construct_alloc_safepoints
+                            .get(&lowered.byte_pc)
+                            .copied()
+                            .ok_or(Unsupported::OperandShape(
+                                "ArrayConstruct without a safepoint",
+                            ))?;
+                        TemplateOp::ArrayConstruct {
+                            dst: operands.dst,
+                            length: arguments.first().copied(),
+                            safepoint,
+                        }
+                    } else {
+                        if arguments.len() > MAX_METHOD_ARGS {
+                            osr_only = true;
+                            instructions.push(TemplateInstr {
+                                pc,
+                                byte_pc: lowered.byte_pc,
+                                op: TemplateOp::UnsupportedBail,
+                            });
+                            continue;
+                        }
+                        TemplateOp::VariadicOp {
+                            opcode: lowered.op as u8,
+                            prefix: operands.dst,
+                            argc: arguments.len() as u16,
+                            packed_args: pack_method_arg_regs(arguments),
+                        }
+                    }
+                }
+                Op::ArrayFrom | Op::ArrayOf | Op::QueueMicrotask => {
                     let operands = lowered.new_array_operands()?;
                     let arguments = lowering.register_tail(operands.elements)?;
                     if arguments.len() > MAX_METHOD_ARGS {
@@ -2530,6 +2572,47 @@ mod tests {
                 .iter()
                 .any(|record| record.id == concat_safepoint)
         );
+    }
+
+    #[test]
+    fn plan_uses_typed_array_construct_for_zero_and_one_argument() {
+        let v = view(&[
+            (
+                Op::ArrayConstruct,
+                vec![Operand::Register(0), Operand::ConstIndex(0)],
+            ),
+            (
+                Op::ArrayConstruct,
+                vec![
+                    Operand::Register(1),
+                    Operand::ConstIndex(1),
+                    Operand::Register(2),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(1)]),
+        ]);
+        let plan = TemplatePlan::build(&v).expect("plan");
+        let TemplateOp::ArrayConstruct {
+            dst: 0,
+            length: None,
+            safepoint: zero_safepoint,
+        } = plan.instructions[0].op
+        else {
+            panic!("expected zero-argument typed ArrayConstruct");
+        };
+        let TemplateOp::ArrayConstruct {
+            dst: 1,
+            length: Some(2),
+            safepoint: length_safepoint,
+        } = plan.instructions[1].op
+        else {
+            panic!("expected one-argument typed ArrayConstruct");
+        };
+        assert_ne!(zero_safepoint, length_safepoint);
+        for id in [zero_safepoint, length_safepoint] {
+            assert!(plan.safepoint_records.iter().any(|record| record.id == id));
+        }
+        assert!(!plan.osr_only);
     }
 
     #[test]

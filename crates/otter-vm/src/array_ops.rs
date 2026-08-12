@@ -6,12 +6,15 @@
 //!
 //! # Contents
 //! - `Array(...)` / `new Array(...)` construction.
+//! - Shared rooted initialization for canonical and typed-JIT length arrays.
 //! - `Array.from(...)` and `Array.of(...)` static calls.
 //!
 //! # Invariants
 //! - The current frame PC is advanced before running `Array.from` so any
 //!   synchronous iterator/property callbacks observe the post-call PC.
 //! - Arguments are read from executable operands, not cloned bytecode DTOs.
+//! - Length-array shell and hole growth always retain both caller roots and
+//!   the fresh array owner across every possible moving collection.
 //! - `Array.from` roots its copied arguments for the complete observable
 //!   iterator/property/callback sequence and reloads them after GC safepoints.
 //!
@@ -72,38 +75,41 @@ impl Interpreter {
                 return Err(self.err_range(("Invalid array length".to_string()).into()));
             }
             let arr = self.alloc_stack_rooted_array(stack, &[], &[args])?;
-            if len > 0 {
-                let roots = self.collect_allocation_roots(stack);
-                let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                    for &slot in &roots {
-                        visitor(slot);
-                    }
-                    for value in args {
-                        value.trace_value_slots(visitor);
-                    }
-                };
-                if len <= MAX_DENSE_ARRAY_CONSTRUCT_HOLES {
-                    array::fill_dense_range_with_roots(
-                        arr,
-                        &mut self.gc_heap,
-                        0,
-                        len as usize,
-                        Value::hole(),
-                        &mut external_visit,
-                    )?;
-                } else {
-                    array::set_with_roots(
-                        arr,
-                        &mut self.gc_heap,
-                        (len - 1) as usize,
-                        Value::hole(),
-                        &mut external_visit,
-                    )?;
-                }
+            if len == 0 {
+                return Ok(Value::array(arr));
             }
+            let roots = self.collect_allocation_roots(stack);
+            let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                for &slot in &roots {
+                    visitor(slot);
+                }
+                for value in args {
+                    value.trace_value_slots(visitor);
+                }
+            };
+            let arr = initialize_array_length_with_roots(
+                arr,
+                &mut self.gc_heap,
+                len,
+                &mut external_visit,
+            )?;
             return Ok(Value::array(arr));
         }
         self.array_of_stack_rooted(stack, args)
+    }
+
+    /// Allocate the guarded typed-JIT `Array(length)` result through the full
+    /// runtime root provider rather than a materialized interpreter frame.
+    pub(crate) fn array_construct_length_runtime_rooted(
+        &mut self,
+        len: u32,
+    ) -> Result<Value, otter_gc::OutOfMemory> {
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
+        let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
+        let arr = array::alloc_array_with_roots(&mut self.gc_heap, &mut external_visit)?;
+        let arr =
+            initialize_array_length_with_roots(arr, &mut self.gc_heap, len, &mut external_visit)?;
+        Ok(Value::array(arr))
     }
 
     /// §23.1.2.3 `Array.of(...items)`.
@@ -517,6 +523,41 @@ impl Interpreter {
         )?;
         Ok(target)
     }
+}
+
+fn initialize_array_length_with_roots(
+    mut arr: array::JsArray,
+    heap: &mut otter_gc::GcHeap,
+    len: u32,
+    external_visit: &mut dyn FnMut(&mut dyn FnMut(*mut otter_gc::raw::RawGc)),
+) -> Result<array::JsArray, otter_gc::OutOfMemory> {
+    if len == 0 {
+        return Ok(arr);
+    }
+    let owner_slot = std::ptr::addr_of_mut!(arr);
+    let mut rooted_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        external_visit(visitor);
+        visitor(owner_slot.cast::<otter_gc::raw::RawGc>());
+    };
+    if len <= MAX_DENSE_ARRAY_CONSTRUCT_HOLES {
+        array::fill_dense_range_with_roots(
+            arr,
+            heap,
+            0,
+            len as usize,
+            Value::hole(),
+            &mut rooted_visit,
+        )?;
+    } else {
+        array::set_with_roots(
+            arr,
+            heap,
+            (len - 1) as usize,
+            Value::hole(),
+            &mut rooted_visit,
+        )?;
+    }
+    Ok(arr)
 }
 
 fn collect_array_args(

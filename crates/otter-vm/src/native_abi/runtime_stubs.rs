@@ -1451,6 +1451,22 @@ pub const STUB_PARSE_INT_I32_LEAF: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusPair,
 );
 
+/// Allocating `Array(length)` specialization for one exact nonnegative int32.
+///
+/// Invalid tags and negative lengths miss before allocation so the generated
+/// caller can resume the canonical constructor at its exact pre-operation
+/// frame. Heap refusal is reported separately through the status pair; this
+/// entry never constructs or parks a JavaScript exception.
+pub const STUB_ARRAY_CONSTRUCT_ALLOC: RuntimeStubDescriptor = descriptor(
+    96,
+    RuntimeStubClass::Alloc,
+    RuntimeStubSignature::AllocValue3,
+    3,
+    RuntimeStubEffects::allocating(false, false),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::StatusPair,
+);
+
 /// Human-readable symbol for a runtime-stub id in the current contract.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -1550,6 +1566,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         93 => "jit_initialize_upvalues",
         94 => "jit_try_prepare_base_construct",
         95 => "parse_int_i32_leaf",
+        96 => "array_construct_alloc",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1651,6 +1668,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_INITIALIZE_UPVALUES,
     STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
     STUB_PARSE_INT_I32_LEAF,
+    STUB_ARRAY_CONSTRUCT_ALLOC,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

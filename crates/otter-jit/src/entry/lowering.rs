@@ -646,6 +646,10 @@ pub(crate) struct BaselinePlan {
     pub(crate) store_property_count: usize,
     pub(crate) safepoint_records: Vec<SafepointRecord>,
     pub(crate) add_alloc_safepoints: BTreeMap<u32, SafepointId>,
+    /// Allocating safepoints owned by the typed zero/one-argument
+    /// `ArrayConstruct` path. The byte PC is the stable join key consumed by
+    /// both template planning and artifact capture.
+    pub(crate) array_construct_alloc_safepoints: BTreeMap<u32, SafepointId>,
 }
 
 impl BaselinePlan {
@@ -1150,11 +1154,21 @@ impl BaselinePlan {
             .map_or(1, |id| id.saturating_add(1))
             .max(1);
         let mut add_alloc_safepoints = BTreeMap::new();
+        let mut array_construct_alloc_safepoints = BTreeMap::new();
         for lowered in &instructions {
-            if lowered.op == Op::Add || lowered.op == Op::AddImm {
+            let allocating_site = match lowered.op {
+                Op::Add | Op::AddImm => Some(&mut add_alloc_safepoints),
+                Op::ArrayConstruct => {
+                    let operands = lowered.new_array_operands()?;
+                    let arguments = self::slice_range(&register_operands, operands.elements)?;
+                    (arguments.len() <= 1).then_some(&mut array_construct_alloc_safepoints)
+                }
+                _ => None,
+            };
+            if let Some(sites) = allocating_site {
                 let safepoint = next_safepoint;
                 next_safepoint = next_safepoint.saturating_add(1);
-                add_alloc_safepoints.insert(lowered.byte_pc, safepoint);
+                sites.insert(lowered.byte_pc, safepoint);
                 safepoint_records.push(SafepointRecord::frame_slot_window(
                     safepoint,
                     NO_FRAME_STATE,
@@ -1171,6 +1185,7 @@ impl BaselinePlan {
             store_property_count,
             safepoint_records,
             add_alloc_safepoints,
+            array_construct_alloc_safepoints,
         })
     }
 

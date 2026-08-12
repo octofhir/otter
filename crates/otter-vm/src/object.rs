@@ -2253,7 +2253,9 @@ impl ObjectBody {
     /// (inline ↔ out-of-line migration, vector realloc, body relocation). Points
     /// at the active buffer — the in-body inline array for a small object, the
     /// out-of-line vector once spilled — so slot access and the JIT both index
-    /// `values_ptr` uniformly. `null` only for a slotless object.
+    /// `values_ptr` uniformly. An inline slotless object has no stable base and
+    /// keeps this null; a fresh object with reserved out-of-line capacity
+    /// already points at that slab before its first slot is published.
     ///
     /// This is the **sole** writer of the always-current `values_ptr` base
     /// invariant: no code path may leave `values_ptr` aimed at a stale
@@ -2283,14 +2285,14 @@ impl ObjectBody {
 
     #[inline]
     fn expected_values_ptr(&self) -> *const Value {
-        if self.slab_len == 0 {
-            std::ptr::null()
-        } else if self.slab_is_inline() {
-            self.inline_values.as_ptr()
-        } else {
+        if !self.slab_is_inline() {
             // SAFETY: the handle is non-null, so it addresses a live slab
             // whose words follow its header.
             unsafe { (*self.slab_body_ptr()).words_ptr().cast_const() }
+        } else if self.slab_len == 0 {
+            std::ptr::null()
+        } else {
+            self.inline_values.as_ptr()
         }
     }
 

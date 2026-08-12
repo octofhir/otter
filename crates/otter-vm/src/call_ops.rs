@@ -719,32 +719,34 @@ impl Interpreter {
         roots: &SyncJsCallRoots,
     ) -> Result<usize, VmError> {
         const MAX_PROTOTYPE_HOPS: usize = 64;
-        // This transition program is class-chain metadata. Ordinary function
-        // constructors retain their settled StoreProperty/IC path; installing
-        // and recompiling a one-off program there would perturb call-tier
-        // feedback without providing a stable class/prototype identity.
-        if !new_target.is_class_constructor() {
-            return Ok(0);
-        }
-        let derived_function_id = new_target
+        // Class wrappers and an exact ordinary `new.target` both provide the
+        // stable constructor identity generated linkage needs. The latter is
+        // important for non-simple function constructors: their first
+        // `this.x = value` is an add-property transition, not an existing-slot
+        // StoreProperty IC, so leaving it out would compile a body that exits
+        // at that store on every generated entry. A distinct ordinary
+        // `new.target` (for example Reflect.construct with another target)
+        // keeps the canonical path because the `(base, base)` cache key could
+        // not distinguish its prototype contract.
+        let class_new_target = new_target.is_class_constructor();
+        let callable_new_target = new_target
             .as_class_constructor()
             .map(|class| class.ctor(&self.gc_heap))
-            .unwrap_or(new_target)
-            .as_function()
-            .or_else(|| {
-                new_target
-                    .as_class_constructor()
-                    .map(|class| class.ctor(&self.gc_heap))
-                    .unwrap_or(new_target)
-                    .as_closure(&self.gc_heap)
-                    .map(|closure| closure.function_id())
-            })
-            .filter(|&function_id| {
-                function_id != base_function_id
-                    && context
-                        .exec_function(function_id)
-                        .is_some_and(|function| function.is_derived_constructor)
-            });
+            .unwrap_or(new_target);
+        let new_target_function_id = callable_new_target.as_function().or_else(|| {
+            callable_new_target
+                .as_closure(&self.gc_heap)
+                .map(|closure| closure.function_id())
+        });
+        if !class_new_target && new_target_function_id != Some(base_function_id) {
+            return Ok(0);
+        }
+        let derived_function_id = new_target_function_id.filter(|&function_id| {
+            function_id != base_function_id
+                && context
+                    .exec_function(function_id)
+                    .is_some_and(|function| function.is_derived_constructor)
+        });
         let chain_key = (
             base_function_id,
             derived_function_id.unwrap_or(base_function_id),

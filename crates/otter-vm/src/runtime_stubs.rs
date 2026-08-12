@@ -12,7 +12,7 @@
 //!   exact-int32 `parseInt` identity case.
 //! - Unboxed binary64 math and scalar-conversion leaves for typed numeric
 //!   machine code.
-//! - Allocating collection mutation and string-concat entries.
+//! - Allocating collection, string-concat, and length-array entries.
 //! - JIT transition-binding validation against the static descriptor inventory.
 //!
 //! # Invariants
@@ -33,18 +33,19 @@
 
 use crate::native_abi::{
     CodeRegistryView, NO_SAFEPOINT, RuntimeStubAllocContext, RuntimeStubDescriptor, RuntimeStubId,
-    RuntimeStubResult, RuntimeStubResultPair, STUB_ARRAY_POP_LEAF, STUB_ARRAY_PUSH_ALLOC,
-    STUB_ARRAY_SHIFT_LEAF, STUB_ARRAY_UNSHIFT_ALLOC, STUB_COLLECTION_MAP_DELETE_ALLOC,
-    STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC,
-    STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_MAP_SET_MUTATING,
-    STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC,
-    STUB_COLLECTION_SET_HAS_LEAF, STUB_MATH_ABS_LEAF, STUB_MATH_FLOOR_LEAF, STUB_MATH_MAX_LEAF,
-    STUB_MATH_MIN_LEAF, STUB_MATH_SQRT_LEAF, STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF,
-    STUB_NUMBER_REM_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF, STUB_PARSE_INT_I32_LEAF,
-    STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF, STUB_STRING_CODE_POINT_AT_LEAF,
-    STUB_STRING_CONCAT_ALLOC, STUB_STRING_ENDS_WITH_LEAF, STUB_STRING_INCLUDES_LEAF,
-    STUB_STRING_INDEX_OF_LEAF, STUB_STRING_STARTS_WITH_LEAF, STUB_TO_BOOLEAN_LEAF, SafepointId,
-    SafepointRecord, TaggedLocationKind, validate_stub_descriptor,
+    RuntimeStubResult, RuntimeStubResultPair, STUB_ARRAY_CONSTRUCT_ALLOC, STUB_ARRAY_POP_LEAF,
+    STUB_ARRAY_PUSH_ALLOC, STUB_ARRAY_SHIFT_LEAF, STUB_ARRAY_UNSHIFT_ALLOC,
+    STUB_COLLECTION_MAP_DELETE_ALLOC, STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF,
+    STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC,
+    STUB_COLLECTION_MAP_SET_MUTATING, STUB_COLLECTION_SET_ADD_ALLOC,
+    STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
+    STUB_MATH_ABS_LEAF, STUB_MATH_FLOOR_LEAF, STUB_MATH_MAX_LEAF, STUB_MATH_MIN_LEAF,
+    STUB_MATH_SQRT_LEAF, STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_REM_LEAF,
+    STUB_NUMBER_TO_INT32_F64_LEAF, STUB_PARSE_INT_I32_LEAF, STUB_STRICT_EQ_LEAF,
+    STUB_STRING_CHAR_CODE_AT_LEAF, STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC,
+    STUB_STRING_ENDS_WITH_LEAF, STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF,
+    STUB_STRING_STARTS_WITH_LEAF, STUB_TO_BOOLEAN_LEAF, SafepointId, SafepointRecord,
+    TaggedLocationKind, validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
@@ -734,6 +735,12 @@ pub const STRING_CONCAT_ALLOC: AllocValueStub = AllocValueStub {
     entry: Some(string_concat_alloc),
 };
 
+/// ABI descriptor for guarded `Array(length)` allocation.
+pub const ARRAY_CONSTRUCT_ALLOC: AllocValueStub = AllocValueStub {
+    descriptor: STUB_ARRAY_CONSTRUCT_ALLOC,
+    entry: Some(array_construct_alloc),
+};
+
 /// Callable ABI entry for `Array.prototype.pop` over a dense array.
 pub const ARRAY_POP_LEAF: MutatingLeafStub2 = MutatingLeafStub2 {
     descriptor: STUB_ARRAY_POP_LEAF,
@@ -835,6 +842,7 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
         id if id == STUB_COLLECTION_MAP_DELETE_ALLOC.id => Some(COLLECTION_MAP_DELETE_ALLOC),
         id if id == STUB_COLLECTION_SET_DELETE_ALLOC.id => Some(COLLECTION_SET_DELETE_ALLOC),
         id if id == STUB_STRING_CONCAT_ALLOC.id => Some(STRING_CONCAT_ALLOC),
+        id if id == STUB_ARRAY_CONSTRUCT_ALLOC.id => Some(ARRAY_CONSTRUCT_ALLOC),
         id if id == STUB_ARRAY_PUSH_ALLOC.id => Some(ARRAY_PUSH_ALLOC),
         id if id == STUB_ARRAY_UNSHIFT_ALLOC.id => Some(ARRAY_UNSHIFT_ALLOC),
         _ => None,
@@ -1084,6 +1092,21 @@ pub extern "C" fn string_concat_alloc(
     alloc_value_stub_result_pair(
         ctx,
         string_concat_alloc_inner(ctx, safepoint, lhs_bits, rhs_bits, unused_bits),
+    )
+}
+
+/// Allocating `Array(length)` stub for an exact nonnegative int32 length.
+#[must_use]
+pub extern "C" fn array_construct_alloc(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    length_bits: u64,
+    padding0_bits: u64,
+    padding1_bits: u64,
+) -> RuntimeStubResultPair {
+    alloc_value_stub_result_pair(
+        ctx,
+        array_construct_alloc_inner(ctx, safepoint, length_bits, padding0_bits, padding1_bits),
     )
 }
 
@@ -2098,6 +2121,49 @@ fn string_concat_alloc_inner(
     })()
 }
 
+fn array_construct_alloc_inner(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    length_bits: u64,
+    padding0_bits: u64,
+    padding1_bits: u64,
+) -> RuntimeStubResult {
+    let Some(length) = Value::from_abi_bits(length_bits).as_i32() else {
+        return RuntimeStubResult::miss();
+    };
+    let Ok(length) = u32::try_from(length) else {
+        return RuntimeStubResult::miss();
+    };
+    let Some(ctx) = alloc_context_mut(ctx) else {
+        return RuntimeStubResult::miss();
+    };
+    let Some(interp) = alloc_interpreter_mut(ctx) else {
+        return RuntimeStubResult::miss();
+    };
+    // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
+    // table and frame/spill windows stay published for this synchronous call.
+    let Ok(roots) = (unsafe {
+        alloc_value_stub_call_roots(
+            ctx,
+            safepoint,
+            [
+                Value::from_abi_bits(length_bits),
+                Value::from_abi_bits(padding0_bits),
+                Value::from_abi_bits(padding1_bits),
+            ],
+        )
+    }) else {
+        return RuntimeStubResult::miss();
+    };
+    let _call_roots_guard = interp
+        .gc_heap
+        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    match interp.array_construct_length_runtime_rooted(length) {
+        Ok(array) => RuntimeStubResult::ok_value(array),
+        Err(_) => RuntimeStubResult::out_of_memory(),
+    }
+}
+
 /// `true` when a dense-array receiver still satisfies the `push` / `pop` fast
 /// path over `[start, end)`.
 ///
@@ -2564,6 +2630,10 @@ mod tests {
         assert!(STRING_CONCAT_ALLOC.is_valid_for_safepoint(1));
         assert!(STRING_CONCAT_ALLOC.has_entry());
         assert!(STRING_CONCAT_ALLOC.entry_addr().is_some());
+        assert!(!ARRAY_CONSTRUCT_ALLOC.is_valid_for_safepoint(NO_SAFEPOINT));
+        assert!(ARRAY_CONSTRUCT_ALLOC.is_valid_for_safepoint(1));
+        assert!(ARRAY_CONSTRUCT_ALLOC.has_entry());
+        assert!(ARRAY_CONSTRUCT_ALLOC.entry_addr().is_some());
         assert_eq!(
             alloc_value_stub_by_id(STUB_COLLECTION_MAP_SET_ALLOC.id).map(|stub| stub.descriptor),
             Some(STUB_COLLECTION_MAP_SET_ALLOC)
@@ -2595,6 +2665,10 @@ mod tests {
         assert_eq!(
             alloc_value_stub_by_id(STUB_STRING_CONCAT_ALLOC.id).map(|stub| stub.descriptor),
             Some(STUB_STRING_CONCAT_ALLOC)
+        );
+        assert_eq!(
+            alloc_value_stub_by_id(STUB_ARRAY_CONSTRUCT_ALLOC.id).map(|stub| stub.descriptor),
+            Some(STUB_ARRAY_CONSTRUCT_ALLOC)
         );
         assert!(alloc_value_stub_by_id(u32::MAX).is_none());
     }
@@ -2837,6 +2911,89 @@ mod tests {
             )
             .expect("entry");
         assert_eq!(pair.status(), RuntimeStubStatus::Miss);
+    }
+
+    #[test]
+    fn array_construct_alloc_entry_builds_empty_and_dense_hole_arrays() {
+        let mut interp = Interpreter::new();
+        let safepoints = [SafepointRecord::frame_slot_window(25, NO_FRAME_STATE, 3)];
+        let mut slots = [
+            n(0).to_abi_bits(),
+            Value::undefined().to_abi_bits(),
+            Value::undefined().to_abi_bits(),
+        ];
+        let mut ctx = test_alloc_context(&mut interp, &mut slots, &safepoints, 25);
+
+        let pair = ARRAY_CONSTRUCT_ALLOC
+            .invoke_raw(&mut ctx, 25, slots[0], slots[1], slots[2])
+            .expect("entry");
+        assert_eq!(pair.status(), RuntimeStubStatus::Ok);
+        let empty = pair
+            .into_result()
+            .into_value()
+            .and_then(Value::as_array)
+            .expect("empty array");
+        assert_eq!(crate::array::len(empty, interp.gc_heap()), 0);
+
+        let pair = ARRAY_CONSTRUCT_ALLOC
+            .invoke_raw(&mut ctx, 25, n(8).to_abi_bits(), slots[1], slots[2])
+            .expect("entry");
+        assert_eq!(pair.status(), RuntimeStubStatus::Ok);
+        let array = pair
+            .into_result()
+            .into_value()
+            .and_then(Value::as_array)
+            .expect("length array");
+        assert_eq!(crate::array::len(array, interp.gc_heap()), 8);
+        assert!(!crate::array::has_own_element(array, interp.gc_heap(), 0));
+        assert!(!crate::array::has_own_element(array, interp.gc_heap(), 7));
+    }
+
+    #[test]
+    fn array_construct_alloc_entry_misses_invalid_length_before_allocation() {
+        let mut interp = Interpreter::new();
+        let safepoints = [SafepointRecord::frame_slot_window(26, NO_FRAME_STATE, 3)];
+        let mut slots = [
+            n(0).to_abi_bits(),
+            Value::undefined().to_abi_bits(),
+            Value::undefined().to_abi_bits(),
+        ];
+        let mut ctx = test_alloc_context(&mut interp, &mut slots, &safepoints, 26);
+        let before = interp.gc_heap().stats();
+
+        for invalid in [
+            n(-1),
+            Value::number_f64(7.0),
+            Value::number_f64(1.5),
+            Value::undefined(),
+        ] {
+            let pair = ARRAY_CONSTRUCT_ALLOC
+                .invoke_raw(&mut ctx, 26, invalid.to_abi_bits(), slots[1], slots[2])
+                .expect("entry");
+            assert_eq!(pair.status(), RuntimeStubStatus::Miss);
+        }
+
+        let after = interp.gc_heap().stats();
+        assert_eq!(after.allocated_bytes, before.allocated_bytes);
+        assert_eq!(after.new_allocated_bytes, before.new_allocated_bytes);
+        assert_eq!(after.old_allocated_bytes, before.old_allocated_bytes);
+    }
+
+    #[test]
+    fn array_construct_alloc_entry_reports_dense_backing_oom() {
+        let mut interp = Interpreter::with_string_heap_cap(2 * 1024 * 1024);
+        let safepoints = [SafepointRecord::frame_slot_window(27, NO_FRAME_STATE, 3)];
+        let mut slots = [
+            n(1_048_576).to_abi_bits(),
+            Value::undefined().to_abi_bits(),
+            Value::undefined().to_abi_bits(),
+        ];
+        let mut ctx = test_alloc_context(&mut interp, &mut slots, &safepoints, 27);
+
+        let pair = ARRAY_CONSTRUCT_ALLOC
+            .invoke_raw(&mut ctx, 27, slots[0], slots[1], slots[2])
+            .expect("entry");
+        assert_eq!(pair.status(), RuntimeStubStatus::OutOfMemory);
     }
 
     #[test]

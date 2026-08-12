@@ -252,6 +252,34 @@ const FP_SCRATCH_2: u8 = 17;
 const STACK_SLOT_BYTES: u32 = 8;
 const MAX_SPILL_FRAME_BYTES: u32 = 1 << 20;
 const MAX_PARAMETER_OFFSET: u32 = 32_760;
+/// Largest parameter-free callee window for which the legacy optimizing
+/// backend deliberately retains the compact materialized construct entry.
+///
+/// Generated construction has fixed receiver preparation, callee-frame, and
+/// cleanup machinery. For a zero-argument body whose complete window is only
+/// `this`, `new.target`, and one local, that machinery is materially larger
+/// and slower than the existing canonical transition. Larger or parameterized
+/// callees still amortize the generated boundary and retain stack-owned entry.
+const TINY_BASE_CONSTRUCT_REGISTER_LIMIT: u16 = 3;
+
+fn optimizing_direct_construct_rejection(
+    target: &otter_vm::JitDirectCallee,
+    argument_count: usize,
+) -> Option<otter_vm::JitDirectCallLoweringRejectionReason> {
+    if !direct_call_target_is_supported(target) {
+        return Some(otter_vm::JitDirectCallLoweringRejectionReason::LayoutUnsupported);
+    }
+    if !target.plan.is_derived_constructor
+        && argument_count == 0
+        && target.plan.param_count == 0
+        && target.plan.register_count <= TINY_BASE_CONSTRUCT_REGISTER_LIMIT
+        && target.plan.own_upvalue_count == 0
+        && target.plan.inherited_upvalue_count == 0
+    {
+        return Some(otter_vm::JitDirectCallLoweringRejectionReason::Unprofitable);
+    }
+    None
+}
 
 #[derive(Debug, Clone, Copy)]
 struct GuardedUse {
@@ -3287,9 +3315,9 @@ fn emit(
                             instruction,
                         )?;
                         let direct_target = frame.body.direct_constructs.get(&byte_pc);
-                        if let Some(target) =
-                            direct_target.filter(|target| direct_call_target_is_supported(target))
-                        {
+                        if let Some(target) = direct_target.filter(|target| {
+                            optimizing_direct_construct_rejection(target, arg_regs.len()).is_none()
+                        }) {
                             let succeeded = ops.new_dynamic_label();
                             let finished = ops.new_dynamic_label();
                             let direct_bail = ops.new_dynamic_label();
@@ -3483,7 +3511,11 @@ fn emit(
                                         0,
                                         1,
                                         otter_vm::JitDirectCallLoweringOutcome::Rejected {
-                                            reason: otter_vm::JitDirectCallLoweringRejectionReason::LayoutUnsupported,
+                                            reason: optimizing_direct_construct_rejection(
+                                                target,
+                                                arg_regs.len(),
+                                            )
+                                                .expect("the construct target reached the rejected lowering"),
                                         },
                                     ),
                                 );

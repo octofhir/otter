@@ -178,8 +178,12 @@ Rust was entered. Proven Int32 `Math.abs`, `Math.max`, and `Math.min` use the
 latter path. An extracted static call exposes a
 `nativeInt32MathIntrinsic` code-map region, while the absence of the matching
 Math leaf from `relocations.json` proves that the guarded hit stays in machine
-code. Separate plan and lowering events keep feedback selection distinct from
-emitted machine code.
+code. The exact bootstrap `parseInt` with one Int32 argument uses the same
+static-native plan and exposes the allocation-free `parse_int_i32_leaf` on the
+generated hit. Other tags, arities, explicit radix calls, and global
+replacement retain the canonical call before observable coercion. Separate
+plan and lowering events keep feedback selection distinct from emitted machine
+code.
 
 `generatedCallDeopt` is emitted only when an already-started generated callee
 bails into cold interpreter continuation. It records baked `callKind`, exact
@@ -279,6 +283,23 @@ post-deopt spill counts. A copy web assigns one machine home to exact-bit
 heads reconstructed as literals on deoptimization, so they consume no emitted
 machine state. Both IR families are payloads of the one current artifact bundle,
 not separate artifact formats.
+
+Scalar Machine bundles attribute direct data access with
+`machineElementLoad`, `machineElementStore`, `machinePropertyLoad`, and
+`machinePropertyStore` regions. Each region carries the source `bytePc`.
+Property regions execute an immutable settled shape/slot chain from the compile
+snapshot and therefore must not have a `propertyIcCell` relocation. Indexed
+element regions similarly guard the baked dense layout before the direct
+access. A load miss and every store guard miss use the exact pre-operation
+deopt state; a successful store commits once and never deoptimizes afterward.
+Fixed TypedArray views over resizable ArrayBuffers also compare the complete
+baked view extent with the backing store's live byte length. A shrink therefore
+exits before either reading or writing even when the requested index still fits
+the stale cached view length.
+`machineUpvalueLoad` identifies a direct captured-cell read with the same exact
+TDZ/malformed-layout exit contract. Primitive-string and dense-array `.length`
+may appear inside `machinePropertyLoad`; an unsigned length outside the int32
+tag range exits to canonical Number boxing.
 
 ### Optimizing frame-free method intrinsics
 

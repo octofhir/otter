@@ -781,7 +781,10 @@ pub(crate) fn emit_direct_call(
 /// `load` and `store` receive an opaque site value id and the current stack
 /// bias introduced by the linkage frame. `restore_roots` runs after every
 /// effect-free rejection, normal return, or throw, with the original stack
-/// pointer restored and before the result is committed.
+/// pointer restored and before the result is committed. `refresh_roots` may
+/// rewrite every allocator-owned register after a moving collection; the
+/// linkage therefore reloads its private `x25` generation handle from the
+/// linkage frame after each refresh.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_direct_call_with_access<Load, Store, Restore, RootReceiver, Refresh>(
     ops: &mut Assembler,
@@ -1335,6 +1338,7 @@ where
         // receiver in its caller-owned root home.
         dynasm!(ops ; .arch aarch64 ; str x0, [sp, NATIVE_FRAME_THIS_OFFSET]);
         refresh_roots(ops, layout.frame_bytes)?;
+        dynasm!(ops ; .arch aarch64 ; ldr x25, [sp, layout.target_cell]);
         load(ops, callable, 9, layout.frame_bytes)?;
         dynasm!(ops ; .arch aarch64 ; ldr x12, [sp, NATIVE_FRAME_THIS_OFFSET]);
         root_receiver(ops, 12, layout.frame_bytes)?;
@@ -1497,6 +1501,7 @@ where
         // receiver preparation may move the array. The Machine root record is
         // the sole owner of that live value across both transitions.
         refresh_roots(ops, layout.frame_bytes)?;
+        dynasm!(ops ; .arch aarch64 ; ldr x25, [sp, layout.target_cell]);
         load(ops, arguments, 1, layout.frame_bytes)?;
         dynasm!(ops
             ; .arch aarch64

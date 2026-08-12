@@ -70,6 +70,12 @@ fn emit_load_length_fast(
         ; b.ne =>slow
         ; ldr w9, [x13, length_byte]
     );
+    emit_load_u64(ops, 11, i32::MAX as u64);
+    dynasm!(ops
+        ; .arch aarch64
+        ; cmp x9, x11
+        ; b.hi =>slow
+    );
     emit_box_int32(ops, 9, 11);
     emit_store_reg(ops, 9, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done);
@@ -187,4 +193,79 @@ pub(super) fn emit_scalar_op(
         ; =>done
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dynasmrt::{AssemblyOffset, ExecutableBuffer};
+
+    const STRING_TAG: u8 = 0x20;
+
+    #[repr(C, align(8))]
+    struct FakeString {
+        header: [u8; 8],
+        length: u32,
+    }
+
+    impl FakeString {
+        fn new(length: u32) -> Self {
+            let mut header = [0; 8];
+            header[0] = STRING_TAG;
+            Self { header, length }
+        }
+    }
+
+    fn load_length_program() -> (ExecutableBuffer, AssemblyOffset) {
+        let mut view = JitCompileSnapshot::without_feedback(0, 0, 2, Vec::new());
+        view.string_layout.string_type_tag = STRING_TAG;
+        view.string_layout.string_len_byte = std::mem::offset_of!(FakeString, length) as u32;
+
+        let mut ops = Assembler::new().expect("assembler");
+        let entry = ops.offset();
+        let slow = ops.new_dynamic_label();
+        let done = ops.new_dynamic_label();
+        let exit = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch aarch64
+            ; stp x19, x30, [sp, #-16]!
+            ; mov x19, x0
+        );
+        emit_load_length_fast(&mut ops, &view, 0, 1, slow, done).expect("encodable registers");
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>slow
+            ; movz x0, #0
+            ; b =>exit
+            ; =>done
+            ; ldr x0, [x19]
+            ; =>exit
+            ; ldp x19, x30, [sp], #16
+            ; ret
+        );
+        let buffer = ops.finalize().expect("finalize");
+        (buffer, entry)
+    }
+
+    fn run_load_length(length: u32) -> u64 {
+        let string = FakeString::new(length);
+        let mut regs = [0, std::ptr::addr_of!(string) as u64];
+        let (buffer, entry) = load_length_program();
+        // SAFETY: the emitted leaf matches `extern "C" fn(*mut u64) -> u64`,
+        // preserves its callee-saved register, and `buffer`/`regs`/`string`
+        // outlive the call.
+        let load: extern "C" fn(*mut u64) -> u64 =
+            unsafe { std::mem::transmute(buffer.ptr(entry)) };
+        load(regs.as_mut_ptr())
+    }
+
+    #[test]
+    fn load_length_wide_u32_uses_canonical_slow_continuation() {
+        assert_eq!(
+            run_load_length(i32::MAX as u32),
+            otter_vm::value::tag::box_int32(i32::MAX)
+        );
+        assert_eq!(run_load_length(i32::MAX as u32 + 1), 0);
+        assert_eq!(run_load_length(u32::MAX), 0);
+    }
 }

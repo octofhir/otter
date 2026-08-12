@@ -8,6 +8,8 @@
 //! # Contents
 //! - Leaf/no-allocation collection probes for `Map.get`, `Map.has`, and
 //!   `Set.has`.
+//! - Guarded boxed-value leaves for numeric bootstrap natives, including the
+//!   exact-int32 `parseInt` identity case.
 //! - Unboxed binary64 math and scalar-conversion leaves for typed numeric
 //!   machine code.
 //! - Allocating collection mutation and string-concat entries.
@@ -38,11 +40,11 @@ use crate::native_abi::{
     STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC,
     STUB_COLLECTION_SET_HAS_LEAF, STUB_MATH_ABS_LEAF, STUB_MATH_FLOOR_LEAF, STUB_MATH_MAX_LEAF,
     STUB_MATH_MIN_LEAF, STUB_MATH_SQRT_LEAF, STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF,
-    STUB_NUMBER_REM_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF, STUB_STRICT_EQ_LEAF,
-    STUB_STRING_CHAR_CODE_AT_LEAF, STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC,
-    STUB_STRING_ENDS_WITH_LEAF, STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF,
-    STUB_STRING_STARTS_WITH_LEAF, STUB_TO_BOOLEAN_LEAF, SafepointId, SafepointRecord,
-    TaggedLocationKind, validate_stub_descriptor,
+    STUB_NUMBER_REM_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF, STUB_PARSE_INT_I32_LEAF,
+    STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF, STUB_STRING_CODE_POINT_AT_LEAF,
+    STUB_STRING_CONCAT_ALLOC, STUB_STRING_ENDS_WITH_LEAF, STUB_STRING_INCLUDES_LEAF,
+    STUB_STRING_INDEX_OF_LEAF, STUB_STRING_STARTS_WITH_LEAF, STUB_TO_BOOLEAN_LEAF, SafepointId,
+    SafepointRecord, TaggedLocationKind, validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
@@ -594,6 +596,12 @@ pub const MATH_MIN_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     entry: math_min_leaf,
 };
 
+/// Callable ABI entry for exact-one-argument `parseInt(Int32)`.
+pub const PARSE_INT_I32_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_PARSE_INT_I32_LEAF,
+    entry: parse_int_i32_leaf,
+};
+
 /// Callable ABI entry for `String.prototype.charCodeAt`.
 pub const STRING_CHAR_CODE_AT_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: STUB_STRING_CHAR_CODE_AT_LEAF,
@@ -780,6 +788,7 @@ pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocS
         id if id == STUB_MATH_SQRT_LEAF.id => Some(MATH_SQRT_LEAF),
         id if id == STUB_MATH_MAX_LEAF.id => Some(MATH_MAX_LEAF),
         id if id == STUB_MATH_MIN_LEAF.id => Some(MATH_MIN_LEAF),
+        id if id == STUB_PARSE_INT_I32_LEAF.id => Some(PARSE_INT_I32_LEAF),
         id if id == STUB_COLLECTION_MAP_HAS_LEAF.id => Some(COLLECTION_MAP_HAS_LEAF),
         id if id == STUB_COLLECTION_SET_HAS_LEAF.id => Some(COLLECTION_SET_HAS_LEAF),
         id if id == STUB_STRICT_EQ_LEAF.id => Some(STRICT_EQ_LEAF),
@@ -1479,6 +1488,27 @@ pub extern "C" fn math_min_leaf(
     RuntimeStubResultPair::from_result(math_binary_leaf(lhs_bits, rhs_bits, js_math_min))
 }
 
+/// Leaf ABI entry for exact-one-argument `parseInt(Int32)`.
+///
+/// Int32-to-decimal-string-to-integer is the identity over the full int32
+/// domain. Every other boxed representation misses before coercion so the
+/// ordinary native performs the canonical observable `ToString` and radix
+/// handling.
+pub extern "C" fn parse_int_i32_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> RuntimeStubResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let value = Value::from_abi_bits(arg_bits);
+    let result = if value.is_int32() {
+        RuntimeStubResult::ok_bits(arg_bits)
+    } else {
+        RuntimeStubResult::miss()
+    };
+    RuntimeStubResultPair::from_result(result)
+}
+
 /// Leaf `Map.prototype.get` probe.
 ///
 /// Returns `Miss` when the receiver is not a Map or the key would need string
@@ -2054,7 +2084,16 @@ fn string_concat_alloc_inner(
         };
         match crate::string::JsString::concat(lhs_string, rhs_string, &mut interp.gc_heap) {
             Ok(result) => RuntimeStubResult::ok_value(Value::string(result)),
-            Err(_) => RuntimeStubResult::out_of_memory(),
+            // The generated caller owns the exact source FrameState. A logical
+            // length overflow is therefore a pre-effect miss: deopt/replay lets
+            // the canonical interpreter raise one catchable RangeError. It is
+            // not heap exhaustion and must never increment the OOM outcome.
+            Err(crate::string::StringConcatError::StringTooLong { .. }) => {
+                RuntimeStubResult::miss()
+            }
+            Err(crate::string::StringConcatError::OutOfMemory(_)) => {
+                RuntimeStubResult::out_of_memory()
+            }
         }
     })()
 }
@@ -2452,6 +2491,7 @@ mod tests {
         assert!(NUMBER_REM_F64_LEAF.is_valid());
         assert!(NUMBER_POW_F64_LEAF.is_valid());
         assert!(NUMBER_TO_INT32_F64_LEAF.is_valid());
+        assert!(PARSE_INT_I32_LEAF.is_valid());
         assert_eq!(
             leaf_no_alloc_stub2_by_id(STUB_COLLECTION_MAP_GET_LEAF.id).map(|stub| stub.descriptor),
             Some(STUB_COLLECTION_MAP_GET_LEAF)
@@ -2469,6 +2509,25 @@ mod tests {
         assert!(leaf_no_alloc_stub2_by_id(u32::MAX).is_none());
         assert!(float64_leaf_stub2_by_id(u32::MAX).is_none());
         assert!(float64_to_word_leaf_stub1_by_id(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn parse_int_leaf_is_exact_int32_identity_and_misses_other_tags() {
+        for value in [i32::MIN, -1, 0, 1, i32::MAX] {
+            let boxed = Value::number_i32(value).to_abi_bits();
+            let pair = parse_int_i32_leaf(std::ptr::null(), boxed, 0);
+            assert_eq!(pair.status(), RuntimeStubStatus::Ok);
+            assert_eq!(pair.value_bits, boxed);
+        }
+
+        for value in [
+            Value::number_f64(7.0),
+            Value::undefined(),
+            Value::boolean(true),
+        ] {
+            let pair = parse_int_i32_leaf(std::ptr::null(), value.to_abi_bits(), 0);
+            assert_eq!(pair.status(), RuntimeStubStatus::Miss);
+        }
     }
 
     #[test]

@@ -1437,6 +1437,20 @@ pub const STUB_MATH_MIN_LEAF: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusPair,
 );
 
+/// Leaf `parseInt(value)` for one exact int32-tagged argument.
+///
+/// Other argument representations and all non-one-argument JavaScript call
+/// shapes retain the canonical coercing parser before any observable effect.
+pub const STUB_PARSE_INT_I32_LEAF: RuntimeStubDescriptor = descriptor(
+    95,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::StatusPair,
+);
+
 /// Human-readable symbol for a runtime-stub id in the current contract.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -1535,6 +1549,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         92 => "jit_copy_spread_arguments",
         93 => "jit_initialize_upvalues",
         94 => "jit_try_prepare_base_construct",
+        95 => "parse_int_i32_leaf",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1635,6 +1650,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_COPY_SPREAD_ARGUMENTS,
     STUB_JIT_INITIALIZE_UPVALUES,
     STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
+    STUB_PARSE_INT_I32_LEAF,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

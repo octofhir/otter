@@ -57,6 +57,16 @@ fn range_error(name: &'static str, reason: impl Into<String>) -> NativeError {
     }
 }
 
+fn concat_error(error: crate::string::StringConcatError) -> NativeError {
+    match error {
+        crate::string::StringConcatError::StringTooLong { .. } => range_error(
+            "String.prototype.concat",
+            crate::string::STRING_TOO_LONG_MESSAGE,
+        ),
+        crate::string::StringConcatError::OutOfMemory(error) => error.into(),
+    }
+}
+
 /// §22.1.3.1 thisStringValue / §7.1.17 ToString glue for
 /// `String.prototype.*` receivers.
 ///
@@ -444,7 +454,7 @@ fn impl_length(
     _args: &[Value],
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
-    Ok(Value::number(NumberValue::from_i32(recv.len() as i32)))
+    Ok(Value::number_u32(recv.len()))
 }
 
 fn impl_char_code_at(
@@ -713,7 +723,7 @@ fn impl_concat(
     let mut result = recv;
     for i in 0..args.len() {
         let piece = arg_to_string(ctx, args, i as u16)?;
-        result = JsString::concat(result, piece, ctx.heap_mut())?;
+        result = JsString::concat(result, piece, ctx.heap_mut()).map_err(concat_error)?;
     }
     Ok(Value::string(result))
 }

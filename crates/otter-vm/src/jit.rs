@@ -963,9 +963,9 @@ pub enum JitElementBase {
     },
     /// A word in a separate buffer cell the receiver names by a compressed
     /// handle, at the receiver's own byte offset into it, as a typed view
-    /// keeps. The buffer's own liveness is guarded on the way through, because
-    /// a detached buffer leaves the view's cached length untouched and so is
-    /// invisible to a bounds check.
+    /// keeps. The buffer's own liveness and live byte length are guarded on the
+    /// way through, because detach or resizable-buffer shrinkage leaves a fixed
+    /// view's cached length untouched and so is invisible to that bounds check.
     ThroughLocalBuffer {
         /// Byte offset, in the receiver body, of the buffer's storage
         /// discriminant.
@@ -979,6 +979,10 @@ pub enum JitElementBase {
         detached_byte: u32,
         /// Byte offset, in the buffer body, of the element base pointer.
         data_ptr_byte: u32,
+        /// Byte offset, in the buffer body, of the live backing-store byte
+        /// length. A fixed view is wholly out of bounds when its complete
+        /// construction-time extent no longer fits after a resize.
+        byte_len_byte: u32,
         /// Byte offset, in the receiver body, of the view's own byte offset
         /// into the buffer.
         view_offset_byte: u32,

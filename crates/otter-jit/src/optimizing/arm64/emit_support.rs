@@ -120,7 +120,7 @@ pub(super) fn emit_backedge_poll(
         ; .arch aarch64
         ; subs w29, w29, #1
         ; b.ne =>batched
-        ; movz w29, OPTIMIZED_POLL_BATCH
+        ; movz w29, GENERATED_POLL_BATCH
     );
     dynasm!(ops
         ; .arch aarch64
@@ -130,7 +130,7 @@ pub(super) fn emit_backedge_poll(
         ; cbnz w9, =>slow
         ; ldr x9, [x17, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET]
         ; ldr x10, [x9]
-        ; subs x10, x10, OPTIMIZED_POLL_BATCH
+        ; subs x10, x10, GENERATED_POLL_BATCH
         ; str x10, [x9]
         ; b.gt =>cont
         ; =>slow

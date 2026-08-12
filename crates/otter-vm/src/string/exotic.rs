@@ -43,7 +43,7 @@ pub(crate) fn descriptor_for_name(
 ) -> Result<Option<PropertyDescriptor>, VmError> {
     if key == "length" {
         return Ok(Some(PropertyDescriptor::data(
-            Value::number_i32(value.len() as i32),
+            Value::number_u32(value.len()),
             false,
             false,
             false,

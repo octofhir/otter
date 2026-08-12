@@ -1,8 +1,9 @@
 //! Production scalar-function lowering through the shared Machine IR pipeline.
 //!
 //! # Contents
-//! - `hir` — typed scalar semantic graph with explicit reentrant calls and
-//!   catch landing pads.
+//! - `hir` — typed scalar semantic graph with direct captured-binding reads,
+//!   guarded property and element accesses, explicit reentrant calls, and catch
+//!   landing pads.
 //! - `arm64` — allocation-driven AArch64 emission.
 //! - [`try_compile`] — production optimizing-tier entry for this vertical slice.
 //!
@@ -13,6 +14,16 @@
 //! - Machine locations, edits, and frame size come only from regalloc2 output.
 //! - Reducible loop headers publish one representation-checked OSR trampoline
 //!   that fills only live block parameters and never mutates the VM window.
+//! - Settled element accesses consume late allocator locations, perform no
+//!   allocation or reentry on the generated path, and deopt before effects on
+//!   any receiver, index, bounds, layout, or representation miss.
+//! - Settled own-data property accesses likewise consume tagged late locations;
+//!   metadata and shape misses deopt at the original operation before effects.
+//!   Stores whose pre-boxing scalar type proves a non-cell value omit both the
+//!   post-commit conditional generational barrier and its call clobbers.
+//! - Captured-binding reads walk the current frame's validated cell spine
+//!   without a runtime call and deopt at the original operation for TDZ or an
+//!   invalid layout.
 //! - Allocating calls save every live tagged value from its exact late-use
 //!   location into the frame's collector-visible root area and reload it after
 //!   moving GC; no interpreter-window shuttle or emitter-local map exists.
@@ -33,7 +44,7 @@ use otter_vm::{
     native_abi::{
         STUB_JIT_BACKEDGE_POLL, STUB_JIT_BIND_DERIVED_THIS, STUB_JIT_COPY_SPREAD_ARGUMENTS,
         STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_DERIVED_CONSTRUCT_RESULT,
-        STUB_JIT_INITIALIZE_UPVALUES, STUB_JIT_LOAD_UPVALUE_VALUE, STUB_JIT_PREPARE_BASE_CONSTRUCT,
+        STUB_JIT_INITIALIZE_UPVALUES, STUB_JIT_PREPARE_BASE_CONSTRUCT,
         STUB_JIT_RESOLVE_DIRECT_ENTRY, STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
     },
 };
@@ -123,7 +134,6 @@ pub(crate) fn try_compile(
         transitions.entry(STUB_JIT_COPY_SPREAD_ARGUMENTS),
         transitions.entry(STUB_JIT_INITIALIZE_UPVALUES),
         transitions.entry(STUB_JIT_BIND_DERIVED_THIS),
-        transitions.entry(STUB_JIT_LOAD_UPVALUE_VALUE),
         otter_vm::runtime_stubs::STRING_CONCAT_ALLOC
             .entry_addr()
             .ok_or(Unsupported::OperandShape(
@@ -181,8 +191,11 @@ pub(crate) fn try_compile(
                 byte_pc,
             ));
         }
-        for &(kind, start, end) in &structural_regions {
-            code_map.record(CodeRegion::structural(kind, start, end));
+        for &(kind, byte_pc, start, end) in &structural_regions {
+            code_map.record(match byte_pc {
+                Some(byte_pc) => CodeRegion::structural_at_byte_pc(kind, start, end, byte_pc),
+                None => CodeRegion::structural(kind, start, end),
+            });
         }
         build_bundle(
             request,
@@ -238,7 +251,7 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
             NumericType::Int32 => MachineRepresentation::Int32,
             NumericType::Uint32 => MachineRepresentation::Uint32,
             NumericType::Number => MachineRepresentation::Float64,
-            NumericType::Boolean => MachineRepresentation::Int32,
+            NumericType::Boolean => MachineRepresentation::Boolean,
         })
         .collect::<Vec<_>>();
     let values = (0..hir.nodes.len())
@@ -429,6 +442,20 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         vec![MachineOperand::register_input(tagged), output],
                     )
                 }
+                NumericNode::TaggedToNumber(source) => MachineInstruction::plain(
+                    MachineOpcode::DecodeNumber,
+                    vec![
+                        MachineOperand::register_input(machine_value(&values, source)),
+                        MachineOperand::register_output(result),
+                    ],
+                ),
+                NumericNode::TaggedToInt32(source) => MachineInstruction::plain(
+                    MachineOpcode::DecodeInt32,
+                    vec![
+                        MachineOperand::register_input(machine_value(&values, source)),
+                        MachineOperand::register_reuse_output(result, 0),
+                    ],
+                ),
                 NumericNode::BlockParameter(_) => continue,
                 NumericNode::TaggedConstant(bits) => MachineInstruction::plain(
                     MachineOpcode::TaggedConstant(bits),
@@ -460,36 +487,13 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                     call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
                     call
                 }
-                NumericNode::Upvalue {
-                    index,
-                    exceptional_edge,
-                } => {
-                    let index_value =
-                        push_value(&mut representations, MachineRepresentation::Int64);
-                    instructions.push(MachineInstruction::plain(
-                        MachineOpcode::IntegerConstant(i64::from(index)),
-                        vec![MachineOperand::register_output(index_value)],
-                    ));
-                    let descriptor_index = intern_call_descriptor(
-                        &mut call_descriptors,
-                        load_upvalue_value_descriptor(exceptional_edge.map(|edge| {
-                            let edge = usize::from(edge);
-                            selection_cfg
-                                .split_edges
-                                .get(&(block_index, edge))
-                                .copied()
-                                .unwrap_or_else(|| selection_cfg.originals[block.successors[edge]])
-                        })),
+                NumericNode::Upvalue { index, byte_pc } => {
+                    let mut load = MachineInstruction::plain(
+                        MachineOpcode::LoadUpvalue { index, byte_pc },
+                        vec![MachineOperand::register_output(result)],
                     );
-                    let mut call = MachineInstruction::plain(
-                        MachineOpcode::Call(descriptor_index as u32),
-                        vec![
-                            MachineOperand::register_input(index_value),
-                            MachineOperand::register_output(result),
-                        ],
-                    );
-                    call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
-                    call
+                    load.clobbers = upvalue_load_clobbers();
+                    load
                 }
                 NumericNode::BindThis {
                     source,
@@ -552,6 +556,105 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         ],
                     );
                     store.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
+                    store
+                }
+                NumericNode::ElementLoad {
+                    receiver,
+                    index,
+                    byte_pc,
+                } => {
+                    let mut load = MachineInstruction::plain(
+                        MachineOpcode::ElementLoad(byte_pc),
+                        vec![
+                            MachineOperand::location_input(machine_value(&values, receiver)),
+                            MachineOperand::location_input(machine_value(&values, index)),
+                            MachineOperand::register_output(result),
+                        ],
+                    );
+                    load.clobbers = element_clobbers();
+                    load
+                }
+                NumericNode::ElementStore {
+                    receiver,
+                    index,
+                    value,
+                    byte_pc,
+                } => {
+                    let value = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        value,
+                    );
+                    let mut store = MachineInstruction::plain(
+                        MachineOpcode::ElementStore(byte_pc),
+                        vec![
+                            MachineOperand::location_input(machine_value(&values, receiver)),
+                            MachineOperand::location_input(machine_value(&values, index)),
+                            MachineOperand::location_input(value),
+                        ],
+                    );
+                    store.clobbers = element_clobbers();
+                    store
+                }
+                NumericNode::PropertyLoad {
+                    receiver,
+                    byte_pc,
+                    exotic_length,
+                } => {
+                    let receiver = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        receiver,
+                    );
+                    let mut load = MachineInstruction::plain(
+                        MachineOpcode::PropertyLoad {
+                            byte_pc,
+                            exotic_length,
+                        },
+                        vec![
+                            MachineOperand::location_input(receiver),
+                            MachineOperand::register_output(result),
+                        ],
+                    );
+                    load.clobbers = property_load_clobbers();
+                    load
+                }
+                NumericNode::PropertyStore {
+                    receiver,
+                    value,
+                    byte_pc,
+                } => {
+                    let receiver = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        receiver,
+                    );
+                    let value_is_non_cell =
+                        property_store_value_is_non_cell(hir.nodes[value.0].value_type());
+                    let value = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        value,
+                    );
+                    let mut store = MachineInstruction::plain(
+                        MachineOpcode::PropertyStore {
+                            byte_pc,
+                            value_is_non_cell,
+                        },
+                        vec![
+                            MachineOperand::location_input(receiver),
+                            MachineOperand::location_input(value),
+                        ],
+                    );
+                    store.clobbers = property_store_clobbers(value_is_non_cell);
                     store
                 }
                 NumericNode::IntegerConstant(value) => MachineInstruction::plain(
@@ -1129,6 +1232,44 @@ fn intern_leaf_boolean_call_descriptor(
     )
 }
 
+fn element_clobbers() -> Vec<PhysicalRegister> {
+    std::iter::once(PhysicalRegister::integer(9))
+        .chain((11..=16).map(PhysicalRegister::integer))
+        .collect()
+}
+
+fn property_load_clobbers() -> Vec<PhysicalRegister> {
+    [9, 11, 12, 13, 14]
+        .into_iter()
+        .map(PhysicalRegister::integer)
+        .collect()
+}
+
+fn property_store_clobbers(value_is_non_cell: bool) -> Vec<PhysicalRegister> {
+    if value_is_non_cell {
+        // x17 selects the settled slot but is outside the allocatable bank.
+        // The remaining registers are exactly the receiver guard and value
+        // store scratch set; no ABI call exists on this specialized path.
+        property_load_clobbers()
+    } else {
+        TargetRegisterFile::aarch64_scalar_call_clobbers()
+    }
+}
+
+const fn property_store_value_is_non_cell(value_type: NumericType) -> bool {
+    matches!(
+        value_type,
+        NumericType::Int32 | NumericType::Uint32 | NumericType::Number | NumericType::Boolean
+    )
+}
+
+fn upvalue_load_clobbers() -> Vec<PhysicalRegister> {
+    [9, 10, 11, 13]
+        .into_iter()
+        .map(PhysicalRegister::integer)
+        .collect()
+}
+
 fn intern_call_descriptor(
     descriptors: &mut Vec<CallDescriptor>,
     descriptor: CallDescriptor,
@@ -1226,20 +1367,6 @@ fn class_super_constructor_descriptor() -> CallDescriptor {
     }
 }
 
-fn load_upvalue_value_descriptor(landing_pad: Option<MachineBlock>) -> CallDescriptor {
-    CallDescriptor {
-        target: CallTarget::RuntimeStub(otter_vm::native_abi::STUB_JIT_LOAD_UPVALUE_VALUE),
-        arguments: vec![MachineRepresentation::Int64],
-        result: Some(MachineRepresentation::Tagged),
-        effects: CallEffects::READS_HEAP,
-        clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
-        exceptional: landing_pad
-            .map(ExceptionalEdge::LandingPad)
-            .unwrap_or(ExceptionalEdge::Propagate),
-        safepoint: SafepointKind::None,
-    }
-}
-
 fn attach_safepoint_roots(
     representations: &[MachineRepresentation],
     instruction: &mut MachineInstruction,
@@ -1286,7 +1413,7 @@ fn leaf_boolean_call_descriptor(
     CallDescriptor {
         target: CallTarget::RuntimeStub(target),
         arguments: vec![MachineRepresentation::Tagged; argument_count],
-        result: Some(MachineRepresentation::Int32),
+        result: Some(MachineRepresentation::Boolean),
         effects: CallEffects::READS_HEAP,
         clobbers,
         exceptional: ExceptionalEdge::None,
@@ -1506,7 +1633,7 @@ mod tests {
     use otter_bytecode::{Op, Operand};
     use otter_vm::{
         JitArtifactFileName, JitArtifactIdentity, JitCompileSnapshot, JitDebugTarget, JitDebugTier,
-        JitFunctionCode, Value,
+        JitFunctionCode, JitInlinePropertyLoad, Value,
         jit::JitTestInstruction,
         jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ARITH_STRING, ArithFeedback},
         native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader, VmThread},
@@ -1519,6 +1646,8 @@ mod tests {
         AllocatedLocation, OperandConstraint, OperandPurpose, OperandTiming, SafepointId,
         lower_deopt_table,
     };
+
+    const POLL_BATCH: i32 = crate::arm64::GENERATED_POLL_BATCH as i32;
 
     fn numeric_view(
         param_count: u16,
@@ -2628,7 +2757,7 @@ mod tests {
                     vec![
                         Operand::Register(4),
                         Operand::Register(1),
-                        Operand::Imm32(2),
+                        Operand::Imm32(POLL_BATCH + 4),
                     ],
                 ),
                 (
@@ -3523,6 +3652,530 @@ mod tests {
         }
     }
 
+    fn element_selection_hir(store_value: bool) -> NumericFunction {
+        let value = |index| hir::NumericValue(index);
+        NumericFunction {
+            function_id: 93,
+            nodes: vec![
+                NumericNode::Parameter {
+                    register: 0,
+                    value_type: NumericType::Tagged,
+                },
+                NumericNode::Parameter {
+                    register: 1,
+                    value_type: NumericType::Tagged,
+                },
+                NumericNode::ElementLoad {
+                    receiver: value(0),
+                    index: value(1),
+                    byte_pc: 24,
+                },
+                NumericNode::TaggedToNumber(value(2)),
+                NumericNode::TaggedToInt32(value(2)),
+                NumericNode::BooleanConstant(store_value),
+                NumericNode::ElementStore {
+                    receiver: value(0),
+                    index: value(1),
+                    value: value(5),
+                    byte_pc: 40,
+                },
+            ],
+            blocks: vec![hir::NumericBlock {
+                logical_pc: 0,
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                parameters: Vec::new(),
+                parameter_registers: Vec::new(),
+                successor_arguments: Vec::new(),
+                nodes: (0..7).map(value).collect(),
+                terminator: NumericTerminator::Return(value(2)),
+            }],
+            frame_states: [
+                (value(2), 24, vec![value(0), value(1)]),
+                (value(3), 32, vec![value(0), value(1), value(2)]),
+                (value(4), 36, vec![value(0), value(1), value(2)]),
+                (value(6), 40, vec![value(0), value(1), value(5)]),
+            ]
+            .into_iter()
+            .map(|(point, byte_pc, slots)| hir::NumericFrameState {
+                point: NumericFramePoint::Node(point),
+                function_id: 93,
+                byte_pc,
+                slots: slots
+                    .into_iter()
+                    .map(hir::NumericFrameSlot::Value)
+                    .collect(),
+            })
+            .collect(),
+            direct_call_targets: Vec::new(),
+            direct_call_arguments: Vec::new(),
+            parameter_count: 2,
+            register_count: 3,
+            arithmetic_op_count: 0,
+        }
+    }
+
+    fn property_selection_hir() -> NumericFunction {
+        let value = |index| hir::NumericValue(index);
+        NumericFunction {
+            function_id: 94,
+            nodes: vec![
+                NumericNode::IntegerConstant(7),
+                NumericNode::BooleanConstant(true),
+                NumericNode::PropertyLoad {
+                    receiver: value(0),
+                    byte_pc: 24,
+                    exotic_length: false,
+                },
+                NumericNode::PropertyStore {
+                    receiver: value(0),
+                    value: value(1),
+                    byte_pc: 40,
+                },
+            ],
+            blocks: vec![hir::NumericBlock {
+                logical_pc: 0,
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                parameters: Vec::new(),
+                parameter_registers: Vec::new(),
+                successor_arguments: Vec::new(),
+                nodes: (0..4).map(value).collect(),
+                terminator: NumericTerminator::Return(value(2)),
+            }],
+            frame_states: [
+                hir::NumericFrameState {
+                    point: NumericFramePoint::Node(value(2)),
+                    function_id: 94,
+                    byte_pc: 24,
+                    slots: vec![
+                        hir::NumericFrameSlot::Value(value(0)),
+                        hir::NumericFrameSlot::Value(value(1)),
+                        hir::NumericFrameSlot::Undefined,
+                    ],
+                },
+                hir::NumericFrameState {
+                    point: NumericFramePoint::Node(value(3)),
+                    function_id: 94,
+                    byte_pc: 40,
+                    slots: vec![
+                        hir::NumericFrameSlot::Value(value(0)),
+                        hir::NumericFrameSlot::Value(value(1)),
+                        hir::NumericFrameSlot::Value(value(2)),
+                    ],
+                },
+            ]
+            .into(),
+            direct_call_targets: Vec::new(),
+            direct_call_arguments: Vec::new(),
+            parameter_count: 0,
+            register_count: 3,
+            arithmetic_op_count: 0,
+        }
+    }
+
+    fn property_store_emission_view(value_is_non_cell: bool) -> JitCompileSnapshot {
+        let (parameter_count, store_byte_pc, instructions) = if value_is_non_cell {
+            (
+                1,
+                8,
+                vec![
+                    (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(7)]),
+                    (
+                        Op::StoreProperty,
+                        vec![
+                            Operand::Register(0),
+                            Operand::ConstIndex(0),
+                            Operand::Register(1),
+                            Operand::Register(2),
+                        ],
+                    ),
+                    (Op::ReturnValue, vec![Operand::Register(0)]),
+                ],
+            )
+        } else {
+            (
+                2,
+                0,
+                vec![
+                    (
+                        Op::StoreProperty,
+                        vec![
+                            Operand::Register(0),
+                            Operand::ConstIndex(0),
+                            Operand::Register(1),
+                            Operand::Register(2),
+                        ],
+                    ),
+                    (Op::ReturnValue, vec![Operand::Register(0)]),
+                ],
+            )
+        };
+        let mut view = numeric_view(parameter_count, 3, instructions);
+        view.cage_base = 0x1000;
+        // Frozen object-body offsets asserted by the shared slab-base emitter.
+        view.object_slab_handle_byte = 24;
+        view.object_inline_values_byte = 64;
+        view.property_stores.insert(
+            store_byte_pc,
+            vec![JitInlinePropertyLoad {
+                receiver_shape: 7,
+                value_byte: 16,
+            }],
+        );
+        view
+    }
+
+    #[test]
+    fn selects_settled_properties_with_tagged_late_locations_and_exact_deopts() {
+        let hir = property_selection_hir();
+        let sequence = select(&hir).expect("property Machine IR");
+
+        let load = sequence
+            .instructions()
+            .iter()
+            .find(|instruction| {
+                instruction.opcode
+                    == MachineOpcode::PropertyLoad {
+                        byte_pc: 24,
+                        exotic_length: false,
+                    }
+            })
+            .expect("selected property load");
+        let load_receiver = load.operands[0].value;
+        assert_eq!(
+            &load.operands[..2],
+            &[
+                MachineOperand::location_input(load_receiver),
+                MachineOperand::register_output(MachineValue(2)),
+            ]
+        );
+        assert_eq!(
+            sequence.representations()[load_receiver.0 as usize],
+            MachineRepresentation::Tagged
+        );
+        assert_eq!(load.clobbers, property_load_clobbers());
+        assert_eq!(load.deopt, Some(DeoptId(0)));
+        assert_eq!(
+            load.operands[2..]
+                .iter()
+                .map(|operand| (operand.value, operand.purpose))
+                .collect::<Vec<_>>(),
+            [
+                (MachineValue(0), OperandPurpose::Deopt),
+                (MachineValue(1), OperandPurpose::Deopt),
+            ]
+        );
+        assert!(sequence.instructions().iter().any(|instruction| {
+            instruction.opcode == MachineOpcode::BoxInt32
+                && instruction.operands.last().map(|operand| operand.value) == Some(load_receiver)
+        }));
+
+        let store = sequence
+            .instructions()
+            .iter()
+            .find(|instruction| {
+                instruction.opcode
+                    == MachineOpcode::PropertyStore {
+                        byte_pc: 40,
+                        value_is_non_cell: true,
+                    }
+            })
+            .expect("selected property store");
+        let store_receiver = store.operands[0].value;
+        let store_value = store.operands[1].value;
+        assert_eq!(
+            &store.operands[..2],
+            &[
+                MachineOperand::location_input(store_receiver),
+                MachineOperand::location_input(store_value),
+            ]
+        );
+        assert!(
+            store
+                .operands
+                .iter()
+                .all(|operand| operand.purpose != OperandPurpose::Output)
+        );
+        assert_eq!(
+            sequence.representations()[store_receiver.0 as usize],
+            MachineRepresentation::Tagged
+        );
+        assert_eq!(
+            sequence.representations()[store_value.0 as usize],
+            MachineRepresentation::Tagged
+        );
+        assert_eq!(store.clobbers, property_store_clobbers(true));
+        assert_eq!(store.deopt, Some(DeoptId(1)));
+        assert_eq!(
+            store.operands[2..]
+                .iter()
+                .map(|operand| (operand.value, operand.purpose))
+                .collect::<Vec<_>>(),
+            [
+                (MachineValue(0), OperandPurpose::Deopt),
+                (MachineValue(1), OperandPurpose::Deopt),
+                (MachineValue(2), OperandPurpose::Deopt),
+            ]
+        );
+        assert!(sequence.instructions().iter().any(|instruction| {
+            instruction.opcode == MachineOpcode::BoxInt32
+                && instruction.operands.last().map(|operand| operand.value) == Some(store_receiver)
+        }));
+        assert!(sequence.instructions().iter().any(|instruction| {
+            instruction.opcode == MachineOpcode::BoxBoolean
+                && instruction.operands.last().map(|operand| operand.value) == Some(store_value)
+        }));
+
+        let normalized = sequence.normalized();
+        assert!(normalized.contains("PropertyLoad { byte_pc: 24, exotic_length: false }"));
+        assert!(normalized.contains("PropertyStore { byte_pc: 40, value_is_non_cell: true }"));
+        sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("property late-location allocation");
+    }
+
+    #[test]
+    fn property_store_barrier_classification_uses_the_pre_boxing_scalar_type() {
+        for value_type in [
+            NumericType::Int32,
+            NumericType::Uint32,
+            NumericType::Number,
+            NumericType::Boolean,
+        ] {
+            assert!(property_store_value_is_non_cell(value_type));
+        }
+        assert!(!property_store_value_is_non_cell(NumericType::Tagged));
+
+        let mut hir = property_selection_hir();
+        hir.nodes[1] = NumericNode::TaggedConstant(Value::undefined().to_bits());
+        let sequence = select(&hir).expect("tagged property-store Machine IR");
+        let store = sequence
+            .instructions()
+            .iter()
+            .find(|instruction| {
+                instruction.opcode
+                    == MachineOpcode::PropertyStore {
+                        byte_pc: 40,
+                        value_is_non_cell: false,
+                    }
+            })
+            .expect("tagged property store");
+
+        assert_eq!(
+            sequence.representations()[store.operands[1].value.0 as usize],
+            MachineRepresentation::Tagged
+        );
+        assert_eq!(
+            store.clobbers,
+            TargetRegisterFile::aarch64_scalar_call_clobbers()
+        );
+        assert!(sequence.instructions().iter().all(|instruction| {
+            instruction.opcode != MachineOpcode::BoxBoolean
+                || instruction.operands.last().map(|operand| operand.value)
+                    != Some(store.operands[1].value)
+        }));
+    }
+
+    #[test]
+    fn property_store_emission_omits_only_the_proven_non_cell_barrier() {
+        let compile_relocations = |value_is_non_cell, function_name: &str| {
+            let output = compile_output(
+                &property_store_emission_view(value_is_non_cell),
+                Some(ArtifactRequest {
+                    identity: JitArtifactIdentity {
+                        function_name: function_name.to_owned(),
+                        module: "test:machine-property-store-barrier".to_owned(),
+                    },
+                    tier: JitDebugTier::Optimizing,
+                    entry: JitDebugTarget::Entry,
+                }),
+            );
+            String::from_utf8(
+                output
+                    .artifact
+                    .expect("property-store artifact")
+                    .file(JitArtifactFileName::Relocations)
+                    .expect("property-store relocations")
+                    .contents()
+                    .to_vec(),
+            )
+            .expect("property-store relocations are UTF-8")
+        };
+
+        let non_cell = compile_relocations(true, "storeInt32");
+        assert!(
+            !non_cell.contains("write_barrier"),
+            "proven non-cell store must not emit the barrier: {non_cell}"
+        );
+
+        let tagged = compile_relocations(false, "storeTagged");
+        assert!(
+            tagged.contains("write_barrier"),
+            "tagged store must retain the conditional barrier: {tagged}"
+        );
+    }
+
+    #[test]
+    fn property_selection_preserves_exotic_length_program() {
+        let mut hir = property_selection_hir();
+        let NumericNode::PropertyLoad { exotic_length, .. } = &mut hir.nodes[2] else {
+            panic!("property selection fixture load");
+        };
+        *exotic_length = true;
+
+        let sequence = select(&hir).expect("exotic length Machine IR");
+        assert!(sequence.instructions().iter().any(|instruction| {
+            instruction.opcode
+                == MachineOpcode::PropertyLoad {
+                    byte_pc: 24,
+                    exotic_length: true,
+                }
+        }));
+    }
+
+    #[test]
+    fn property_store_deopt_retains_unboxed_source_representations() {
+        let hir = property_selection_hir();
+        let sequence = select(&hir).expect("property Machine IR");
+        let allocation = sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("property deopt allocation");
+        let layout = arm64::frame_layout(&allocation, 0).expect("property deopt frame");
+        let table = lower_deopt_table(
+            &sequence,
+            &allocation,
+            layout,
+            arm64::GPR_BUDGET,
+            arm64::FP_BUDGET,
+            &machine_frame_states(&hir),
+        )
+        .expect("property deopt table");
+        let exit = table
+            .lookup(DeoptExitId(1))
+            .expect("property-store exit")
+            .outermost();
+        assert_eq!(exit.slots[0].repr, otter_vm::deopt::DeoptRepr::Int32);
+        assert_eq!(exit.slots[1].repr, otter_vm::deopt::DeoptRepr::Boolean);
+        assert_eq!(exit.slots[2].repr, otter_vm::deopt::DeoptRepr::Tagged);
+    }
+
+    #[test]
+    fn selects_guarded_elements_with_late_locations_and_exact_deopt_state() {
+        let hir = element_selection_hir(true);
+        let sequence = select(&hir).expect("element Machine IR");
+        let load = sequence
+            .instructions()
+            .iter()
+            .find(|instruction| instruction.opcode == MachineOpcode::ElementLoad(24))
+            .expect("selected element load");
+        assert_eq!(
+            &load.operands[..3],
+            &[
+                MachineOperand::location_input(MachineValue(0)),
+                MachineOperand::location_input(MachineValue(1)),
+                MachineOperand::register_output(MachineValue(2)),
+            ]
+        );
+        assert_eq!(load.clobbers, element_clobbers());
+        assert_eq!(load.deopt, Some(DeoptId(0)));
+
+        let number_decode = sequence
+            .instructions()
+            .iter()
+            .find(|instruction| instruction.opcode == MachineOpcode::DecodeNumber)
+            .expect("selected tagged Number decode");
+        assert_eq!(
+            &number_decode.operands[..2],
+            &[
+                MachineOperand::register_input(MachineValue(2)),
+                MachineOperand::register_output(MachineValue(3)),
+            ]
+        );
+        assert_eq!(number_decode.deopt, Some(DeoptId(1)));
+
+        let int32_decode = sequence
+            .instructions()
+            .iter()
+            .find(|instruction| instruction.opcode == MachineOpcode::DecodeInt32)
+            .expect("selected tagged Int32 decode");
+        assert_eq!(
+            &int32_decode.operands[..2],
+            &[
+                MachineOperand::register_input(MachineValue(2)),
+                MachineOperand::register_reuse_output(MachineValue(4), 0),
+            ]
+        );
+        assert_eq!(int32_decode.deopt, Some(DeoptId(2)));
+
+        let store = sequence
+            .instructions()
+            .iter()
+            .find(|instruction| instruction.opcode == MachineOpcode::ElementStore(40))
+            .expect("selected element store");
+        let boxed_value = store.operands[2].value;
+        assert_eq!(
+            &store.operands[..3],
+            &[
+                MachineOperand::location_input(MachineValue(0)),
+                MachineOperand::location_input(MachineValue(1)),
+                MachineOperand::location_input(boxed_value),
+            ]
+        );
+        assert_eq!(
+            sequence.representations()[boxed_value.0 as usize],
+            MachineRepresentation::Tagged
+        );
+        assert_eq!(store.clobbers, element_clobbers());
+        assert_eq!(store.deopt, Some(DeoptId(3)));
+        assert!(sequence.instructions().iter().any(|instruction| {
+            instruction.opcode == MachineOpcode::BoxBoolean
+                && instruction.operands.last().map(|operand| operand.value) == Some(boxed_value)
+        }));
+
+        let normalized = sequence.normalized();
+        assert!(normalized.contains("ElementLoad(24)"));
+        assert!(normalized.contains("ElementStore(40)"));
+        sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("element late-location allocation");
+    }
+
+    #[test]
+    fn element_store_deopt_preserves_boolean_value_semantics() {
+        for source in [false, true] {
+            let hir = element_selection_hir(source);
+            let sequence = select(&hir).expect("element Machine IR");
+            assert_eq!(
+                sequence.representations()[5],
+                MachineRepresentation::Boolean
+            );
+            let allocation = sequence
+                .allocate(&TargetRegisterFile::aarch64_scalar_function())
+                .expect("element Boolean allocation");
+            let layout = arm64::frame_layout(&allocation, 0).expect("element Boolean frame");
+            let table = lower_deopt_table(
+                &sequence,
+                &allocation,
+                layout,
+                arm64::GPR_BUDGET,
+                arm64::FP_BUDGET,
+                &machine_frame_states(&hir),
+            )
+            .expect("element Boolean deopt table");
+            let slot = table
+                .lookup(DeoptExitId(3))
+                .expect("element-store exit")
+                .outermost()
+                .slots[2];
+            assert_eq!(slot.repr, otter_vm::deopt::DeoptRepr::Boolean);
+            assert_eq!(
+                slot.repr.reconstitute(u64::from(u8::from(source))),
+                Value::boolean(source)
+            );
+        }
+    }
+
     #[test]
     fn executes_ieee_edges_and_boxes_canonical_results() {
         let identity = compile_output(&identity_view(), None).code;
@@ -3695,9 +4348,10 @@ mod tests {
         assert_eq!(normal.status, STATUS_RETURNED);
         assert_eq!(normal.value, Value::null().to_bits());
 
+        let loop_limit = POLL_BATCH + 4;
         let mut frame = vec![Value::undefined().to_bits(); 5];
         frame[0] = Value::boolean(true).to_bits();
-        frame[1] = tag::box_int32(4);
+        frame[1] = tag::box_int32(loop_limit);
         frame[2] = tag::box_int32(0);
         frame[3] = tag::box_int32(1);
         let interrupt = 0_u8;
@@ -3719,7 +4373,17 @@ mod tests {
             execute_osr_with_poll_cells(&code, 2, frame, std::ptr::addr_of!(interrupt), &mut fuel);
         assert_eq!(bail.status, STATUS_BAILED);
         assert_eq!(pc, 2);
-        assert_eq!(after[0], Value::boolean(true).to_bits());
+        assert_eq!(
+            after,
+            [
+                Value::boolean(true).to_bits(),
+                tag::box_int32(loop_limit),
+                tag::box_int32(POLL_BATCH),
+                tag::box_int32(1),
+                Value::undefined().to_bits(),
+            ],
+            "the batched interrupt exit must publish the pre-phi loop state"
+        );
     }
 
     #[test]
@@ -3744,7 +4408,7 @@ mod tests {
             descriptor.arguments,
             [MachineRepresentation::Tagged, MachineRepresentation::Tagged]
         );
-        assert_eq!(descriptor.result, Some(MachineRepresentation::Int32));
+        assert_eq!(descriptor.result, Some(MachineRepresentation::Boolean));
         assert_eq!(descriptor.effects, CallEffects::READS_HEAP);
         assert_eq!(descriptor.exceptional, ExceptionalEdge::None);
         assert_eq!(descriptor.safepoint, SafepointKind::None);
@@ -3869,7 +4533,7 @@ mod tests {
             descriptor.arguments,
             [MachineRepresentation::Tagged, MachineRepresentation::Tagged]
         );
-        assert_eq!(descriptor.result, Some(MachineRepresentation::Int32));
+        assert_eq!(descriptor.result, Some(MachineRepresentation::Boolean));
         assert_eq!(descriptor.effects, CallEffects::READS_HEAP);
         assert_eq!(descriptor.exceptional, ExceptionalEdge::None);
         assert_eq!(descriptor.safepoint, SafepointKind::None);
@@ -4989,8 +5653,20 @@ mod tests {
             execute_with_poll_cells(&code, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
         assert_eq!(result.status, STATUS_BAILED);
         assert_eq!(pc, 6);
-        assert_eq!(unbox_number(frame[0]), 4_294_967_295_f64);
-        assert_eq!(frame[1], tag::box_int32(1));
+        assert_eq!(
+            frame,
+            [
+                boxed_f64(4_294_967_295_f64),
+                tag::box_int32(POLL_BATCH),
+                Value::undefined().to_bits(),
+                tag::box_int32(0),
+                Value::undefined().to_bits(),
+                Value::undefined().to_bits(),
+                Value::undefined().to_bits(),
+                Value::undefined().to_bits(),
+            ],
+            "the Uint32 exit must retain the exact state before batched phi edits"
+        );
     }
 
     #[test]
@@ -5223,9 +5899,15 @@ mod tests {
         );
         assert_eq!(result.status, STATUS_BAILED);
         assert_eq!(pc, 6);
-        assert_eq!(unbox_number(frame[0]), 0.75);
-        assert_eq!(frame[1], tag::box_int32(1));
-        assert_eq!(frame[2], tag::box_int32(2));
+        let mut expected = vec![Value::undefined().to_bits(); 19];
+        expected[0] = boxed_f64(12.073_463_237_907_212);
+        expected[1] = tag::box_int32(POLL_BATCH);
+        expected[2] = tag::box_int32(POLL_BATCH + 1);
+        expected[3] = tag::box_int32(200_000);
+        assert_eq!(
+            frame, expected,
+            "the FP-leaf exit must publish the exact state before batched phi edits"
+        );
     }
 
     #[test]
@@ -5310,9 +5992,15 @@ mod tests {
         );
         assert_eq!(result.status, STATUS_BAILED);
         assert_eq!(pc, 4);
-        assert_eq!(unbox_number(frame[0]), 4_294_967_299.25);
-        assert_eq!(frame[1], tag::box_int32(0));
-        assert_eq!(frame[2], tag::box_int32(1));
+        let mut expected = vec![Value::undefined().to_bits(); 12];
+        expected[0] = boxed_f64(4_294_967_321.75);
+        expected[1] = tag::box_int32(12);
+        expected[2] = tag::box_int32(POLL_BATCH);
+        expected[3] = tag::box_int32(200_000);
+        assert_eq!(
+            frame, expected,
+            "the bitwise exit must publish the exact state before batched phi edits"
+        );
     }
 
     #[test]
@@ -5395,7 +6083,8 @@ mod tests {
         assert_eq!(frame[1], tag::box_int32(0));
         assert_eq!(frame[2], tag::box_int32(2));
 
-        let code = compile_output(&branch_phi_loop_view_with(0, 0, 5, 1), None).code;
+        let loop_limit = POLL_BATCH + 4;
+        let code = compile_output(&branch_phi_loop_view_with(0, 0, loop_limit, 1), None).code;
         let mut frame = vec![Value::undefined().to_bits(); 12];
         frame[0] = tag::box_int32(2);
         frame[1] = tag::box_int32(1);
@@ -5405,9 +6094,13 @@ mod tests {
             execute_osr_with_poll_cells(&code, 3, frame, std::ptr::addr_of!(interrupt), &mut fuel);
         assert_eq!(result.status, STATUS_BAILED);
         assert_eq!(pc, 3);
-        assert_eq!(frame[0], tag::box_int32(-12));
-        assert_eq!(frame[1], tag::box_int32(2));
-        assert_eq!(frame[2], Value::undefined().to_bits());
+        let mut expected = vec![Value::undefined().to_bits(); 12];
+        expected[0] = tag::box_int32(-94);
+        expected[1] = tag::box_int32(POLL_BATCH + 1);
+        assert_eq!(
+            frame, expected,
+            "the OSR interrupt exit must publish the exact pre-phi state"
+        );
     }
 
     #[test]
@@ -5582,8 +6275,9 @@ mod tests {
 
         let mut transitions = TransitionTable::resolve();
         transitions.replace_entry_for_test(STUB_JIT_BACKEDGE_POLL, refill as *const () as usize);
+        let loop_limit = POLL_BATCH * 2 + 1;
         let code = compile_output_with_transitions(
-            &branch_phi_loop_view_with(0, 0, 5, 1),
+            &branch_phi_loop_view_with(0, 0, loop_limit, 1),
             &transitions,
             None,
         )
@@ -5593,8 +6287,8 @@ mod tests {
         let (result, _, _) =
             execute_with_poll_cells(&code, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
         assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(-22));
-        assert_eq!(fuel, 96);
+        assert_eq!(result.value, tag::box_int32(-190));
+        assert_eq!(fuel, 84);
 
         let interrupt = 1_u8;
         let mut fuel = i64::MAX as u64;
@@ -5602,9 +6296,13 @@ mod tests {
             execute_with_poll_cells(&code, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
         assert_eq!(result.status, STATUS_BAILED);
         assert_eq!(pc, 3);
-        assert_eq!(frame[0], tag::box_int32(2));
-        assert_eq!(frame[1], tag::box_int32(1));
-        assert_eq!(frame[2], Value::undefined().to_bits());
+        let mut expected = vec![Value::undefined().to_bits(); 12];
+        expected[0] = tag::box_int32(-96);
+        expected[1] = tag::box_int32(POLL_BATCH);
+        assert_eq!(
+            frame, expected,
+            "the batched interrupt exit must precede loop-header phi edits"
+        );
     }
 
     #[test]

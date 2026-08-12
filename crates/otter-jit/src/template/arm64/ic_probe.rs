@@ -16,6 +16,9 @@
 //! - [`emit_load_header`] / [`emit_check_shape`] / [`emit_load_field`] — the
 //!   three parts of a settled own-slot read, which the optimizing tier emits as
 //!   separate IR nodes over a holder address the allocator placed.
+//! - [`emit_settled_property_load`] / [`emit_settled_property_store_guard`] —
+//!   the complete monomorphic or polymorphic settled-own-slot program, without
+//!   requiring a live IC cell.
 //! - [`emit_property_ic_load`] / [`emit_property_ic_store_guard`] — the
 //!   named-property cache probes.
 //! - [`emit_native_leaf_guard`] / [`emit_native_leaf_call`] — prove a static
@@ -28,9 +31,12 @@
 //! - [`emit_native_entry_call`] — one call sequence per declared ABI family.
 //!
 //! # Invariants
-//! - Both tiers emit property probes from here. A cache program has exactly one
+//! - Every tier emits property probes from here. A cache program has exactly one
 //!   machine lowering, so a tier cannot disagree with the interpreter about
 //!   what a site caches.
+//! - A settled chain is self-contained compile metadata. Its lowering never
+//!   fabricates an IC cell: every receiver shape and slot offset is guarded
+//!   directly, and an empty chain branches to the caller's pre-effect miss.
 //! - The call protocol is chosen by the family the entry id resolves in, never
 //!   by which builtin a site named. A read, an in-place mutation and an
 //!   allocating write reach the same sequence from one description.
@@ -294,6 +300,117 @@ pub(crate) fn emit_load_field(
     );
 }
 
+/// Execute one complete settled own-property load program.
+///
+/// Every entry is a receiver-shape/slot pair installed by the VM. A
+/// monomorphic program uses the same split header/shape/field helpers as the
+/// optimizing settled-access vocabulary. A polymorphic program proves the
+/// receiver once, compares every baked shape in order, and selects that
+/// entry's fixed slot without consulting a mutable IC cell. An empty program
+/// is not executable and branches to `miss` before reading the receiver.
+///
+/// On a hit the boxed value is left in `x9`. Clobbers `x9`, `x11`-`x14`, and
+/// the non-allocatable slot scratch `x17` for a polymorphic chain.
+pub(crate) fn emit_settled_property_load<R>(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    chain: &[otter_vm::JitInlinePropertyLoad],
+    load_receiver: R,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported>
+where
+    R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
+{
+    let [first, rest @ ..] = chain else {
+        dynasm!(ops ; .arch aarch64 ; b =>miss);
+        return Ok(());
+    };
+    if rest.is_empty() {
+        emit_load_header(ops, relocations, view, load_receiver, 13, miss)?;
+        emit_check_shape(ops, view, 13, first.receiver_shape, miss);
+        emit_load_field(ops, view, 13, first.value_byte, miss);
+        return Ok(());
+    }
+
+    emit_receiver_shape(ops, relocations, view, load_receiver, miss)?;
+    let resolved = ops.new_dynamic_label();
+    for entry in chain {
+        let next = ops.new_dynamic_label();
+        emit_load_u64(ops, 12, u64::from(entry.receiver_shape));
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp w14, w12
+            ; b.ne =>next
+        );
+        emit_load_u64(ops, 17, u64::from(entry.value_byte));
+        dynasm!(ops ; .arch aarch64 ; b =>resolved ; =>next);
+    }
+    dynasm!(ops ; .arch aarch64 ; b =>miss ; =>resolved);
+    super::values::emit_slab_base(ops, view, 13, 14);
+    dynasm!(ops
+        ; .arch aarch64
+        ; cbz x13, =>miss
+        ; ldr x9, [x13, x17]
+    );
+    Ok(())
+}
+
+/// Execute the guard half of one complete settled own-property store program.
+///
+/// The full receiver-shape chain is checked before the caller loads or commits
+/// its value. On a hit `x12` retains the receiver header for a write barrier,
+/// `x13` is its live value-slab base, and `x17` is the selected slot byte. An
+/// empty program branches to `miss` without reading the receiver.
+pub(crate) fn emit_settled_property_store_guard<R>(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    chain: &[otter_vm::JitInlinePropertyLoad],
+    load_receiver: R,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported>
+where
+    R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
+{
+    if chain.is_empty() {
+        dynasm!(ops ; .arch aarch64 ; b =>miss);
+        return Ok(());
+    }
+
+    emit_receiver_shape(ops, relocations, view, load_receiver, miss)?;
+    if let [only] = chain {
+        emit_load_u64(ops, 12, u64::from(only.receiver_shape));
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp w14, w12
+            ; b.ne =>miss
+        );
+        emit_load_u64(ops, 17, u64::from(only.value_byte));
+    } else {
+        let resolved = ops.new_dynamic_label();
+        for entry in chain {
+            let next = ops.new_dynamic_label();
+            emit_load_u64(ops, 12, u64::from(entry.receiver_shape));
+            dynasm!(ops
+                ; .arch aarch64
+                ; cmp w14, w12
+                ; b.ne =>next
+            );
+            emit_load_u64(ops, 17, u64::from(entry.value_byte));
+            dynasm!(ops ; .arch aarch64 ; b =>resolved ; =>next);
+        }
+        dynasm!(ops ; .arch aarch64 ; b =>miss ; =>resolved);
+    }
+
+    // The slab-base helper overwrites x13. Preserve the guarded parent header
+    // in x12 so a pointer-valued commit can run its generational barrier.
+    dynasm!(ops ; .arch aarch64 ; mov x12, x13);
+    super::values::emit_slab_base(ops, view, 13, 14);
+    dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);
+    Ok(())
+}
+
 /// Probe a named-property load site and leave the loaded `Value` in `x9`.
 ///
 /// One program serves both tiers: prove the receiver is an ordinary object
@@ -321,60 +438,30 @@ pub(crate) fn emit_property_ic_load<R>(
 where
     R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
 {
-    // A site settled on one shape is exactly the guard-then-load pair, so it
-    // reaches the slot through the same two sequences the optimizing tier
-    // emits as separate nodes.
-    if let Some([only]) = settled.filter(|chain| !chain.is_empty()) {
-        emit_load_header(ops, relocations, view, load_receiver, 13, miss)?;
-        emit_check_shape(ops, view, 13, only.receiver_shape, miss);
-        emit_load_field(ops, view, 13, only.value_byte, miss);
-        return Ok(());
-    }
-    emit_receiver_shape(ops, relocations, view, load_receiver, miss)?;
     if let Some(chain) = settled.filter(|chain| !chain.is_empty()) {
-        // Every shape the site installed is a compile-time constant, so the
-        // guard is a compare against an immediate per shape and the slot is a
-        // fixed offset: no cell load, no way walk, no prototype hop.
-        let resolved = ops.new_dynamic_label();
-        for entry in chain {
-            let next = ops.new_dynamic_label();
-            emit_load_u64(ops, 12, u64::from(entry.receiver_shape));
-            dynasm!(ops
-                ; .arch aarch64
-                ; cmp w14, w12
-                ; b.ne =>next
-            );
-            emit_load_u64(ops, 17, u64::from(entry.value_byte));
-            dynasm!(ops ; .arch aarch64 ; b =>resolved ; =>next);
-        }
-        dynasm!(ops ; .arch aarch64 ; b =>miss ; =>resolved);
-        super::values::emit_slab_base(ops, view, 13, 14);
-        dynasm!(ops
-            ; .arch aarch64
-            ; cbz x13, =>miss
-            ; ldr x9, [x13, x17]
-        );
-    } else {
-        emit_load_symbol_u64(
-            ops,
-            relocations,
-            15,
-            cell_addr as u64,
-            RelocationTarget::PropertyIcCell {
-                access: crate::artifact::relocation::PropertyIcAccess::Load,
-                ordinal: cell_ordinal,
-            },
-        );
-        let do_load = ops.new_dynamic_label();
-        emit_way_walk(ops, do_load, miss);
-        emit_resolve_holder(ops, relocations, view, miss);
-        super::values::emit_slab_base(ops, view, 13, 14);
-        dynasm!(ops
-            ; .arch aarch64
-            ; cbz x13, =>miss
-            ; ldr x9, [x13, x17]
-        );
+        return emit_settled_property_load(ops, relocations, view, chain, load_receiver, miss);
     }
+
+    emit_receiver_shape(ops, relocations, view, load_receiver, miss)?;
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        15,
+        cell_addr as u64,
+        RelocationTarget::PropertyIcCell {
+            access: crate::artifact::relocation::PropertyIcAccess::Load,
+            ordinal: cell_ordinal,
+        },
+    );
+    let do_load = ops.new_dynamic_label();
+    emit_way_walk(ops, do_load, miss);
+    emit_resolve_holder(ops, relocations, view, miss);
+    super::values::emit_slab_base(ops, view, 13, 14);
+    dynasm!(ops
+        ; .arch aarch64
+        ; cbz x13, =>miss
+        ; ldr x9, [x13, x17]
+    );
     Ok(())
 }
 
@@ -405,68 +492,31 @@ pub(crate) fn emit_property_ic_store_guard<R>(
 where
     R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
 {
-    let shape_byte = view.object_shape_byte;
-    load_receiver(ops, 9)?;
-    super::values::emit_cell_test(ops, 9, 11, super::values::CellTest::IsNotCell, miss);
-    dynasm!(ops
-        ; .arch aarch64
-        ; mov w12, w9              // low-32 Gc offset
-    );
+    if let Some(chain) = settled.filter(|chain| !chain.is_empty()) {
+        return emit_settled_property_store_guard(
+            ops,
+            relocations,
+            view,
+            chain,
+            load_receiver,
+            miss,
+        );
+    }
+
+    emit_receiver_shape(ops, relocations, view, load_receiver, miss)?;
     emit_load_symbol_u64(
         ops,
         relocations,
-        13,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
+        15,
+        cell_addr as u64,
+        RelocationTarget::PropertyIcCell {
+            access: crate::artifact::relocation::PropertyIcAccess::Store,
+            ordinal: cell_ordinal,
+        },
     );
-    dynasm!(ops
-        ; .arch aarch64
-        ; add x13, x13, x12        // x13 = GcHeader ptr
-        ; ldrb w14, [x13]
-        ; cmp w14, OBJECT_BODY_TYPE_TAG
-        ; b.ne =>miss
-        ; ldr w14, [x13, shape_byte] // receiver shape handle
-        ; cbz w14, =>miss
-    );
-    if let Some(chain) = settled.filter(|chain| !chain.is_empty()) {
-        if let [only] = chain {
-            emit_load_u64(ops, 12, u64::from(only.receiver_shape));
-            dynasm!(ops
-                ; .arch aarch64
-                ; cmp w14, w12
-                ; b.ne =>miss
-            );
-            emit_load_u64(ops, 17, u64::from(only.value_byte));
-        } else {
-            let resolved = ops.new_dynamic_label();
-            for entry in chain {
-                let next = ops.new_dynamic_label();
-                emit_load_u64(ops, 12, u64::from(entry.receiver_shape));
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; cmp w14, w12
-                    ; b.ne =>next
-                );
-                emit_load_u64(ops, 17, u64::from(entry.value_byte));
-                dynasm!(ops ; .arch aarch64 ; b =>resolved ; =>next);
-            }
-            dynasm!(ops ; .arch aarch64 ; b =>miss ; =>resolved);
-        }
-    } else {
-        emit_load_symbol_u64(
-            ops,
-            relocations,
-            15,
-            cell_addr as u64,
-            RelocationTarget::PropertyIcCell {
-                access: crate::artifact::relocation::PropertyIcAccess::Store,
-                ordinal: cell_ordinal,
-            },
-        );
-        let do_store = ops.new_dynamic_label();
-        emit_way_walk(ops, do_store, miss);
-        emit_refuse_prototype_hop(ops, miss);
-    }
+    let do_store = ops.new_dynamic_label();
+    emit_way_walk(ops, do_store, miss);
+    emit_refuse_prototype_hop(ops, miss);
     // `x12` retains the guarded receiver's header: the slab base overwrites
     // `x13`, and a pointer store's write barrier names the parent object, not
     // its value slab.
@@ -567,6 +617,15 @@ pub(crate) fn emit_exotic_length_fast(
         ; b.ne =>not_length
         ; ldr w9, [x13, string_len_byte]
     );
+    // Ropes carry a u32 length and can exceed the tagged int32 range without
+    // allocating a contiguous multi-gigabyte buffer. Let the canonical
+    // property operation box those lengths as Number instead of wrapping.
+    emit_load_u64(ops, 12, i32::MAX as u64);
+    dynasm!(ops
+        ; .arch aarch64
+        ; cmp x9, x12
+        ; b.hi =>not_length
+    );
     emit_box_int32(ops, 9, 12);
     dynasm!(ops ; .arch aarch64 ; b =>have_length);
 }
@@ -600,9 +659,11 @@ pub(crate) fn element_access_for(
 ///
 /// The guard is one program over the declared family: the receiver is a heap
 /// cell carrying that cell tag, its latch reads clean, the index is a
-/// non-negative int32 below the body's live element count, and the address
-/// comes from the body's element base pointer so the backing container's
-/// layout stays unobserved. Nothing here allocates, so no safepoint is owed.
+/// non-negative int32 below the body's live element count, a fixed typed view's
+/// complete construction-time extent still fits its live backing buffer, and
+/// the address comes from the body's element base pointer so the backing
+/// container's layout stays unobserved. Nothing here allocates, so no
+/// safepoint is owed.
 ///
 /// `load_receiver` and `load_index` materialize their operand into the register
 /// they are handed and run inside the guard sequence, so they must touch no
@@ -681,6 +742,7 @@ where
             ; b.hs =>miss
         ),
     }
+    let shift = access.element.stride_shift();
     match access.base {
         JitElementBase::None => return Err(Unsupported::OperandShape("element base")),
         JitElementBase::InBody { byte } => {
@@ -692,6 +754,7 @@ where
             handle_byte,
             detached_byte,
             data_ptr_byte,
+            byte_len_byte,
             view_offset_byte,
         } => {
             dynasm!(ops
@@ -718,6 +781,34 @@ where
                 ; add x11, x11, x12        // x11 = buffer GcHeader ptr
                 ; ldrb w14, [x11, detached_byte]
                 ; cbnz w14, =>miss         // a detach leaves the view's length alone
+                ; ldr x14, [x13, view_offset_byte]
+            );
+            // A fixed-length view becomes wholly out of bounds when shrinkage
+            // leaves any part of its original extent outside the backing
+            // buffer. Checking only the selected index would incorrectly keep
+            // an in-prefix element accessible. Reject both the stride shift
+            // and the following offset addition if either overflows `usize`.
+            match shift {
+                2 => dynasm!(ops
+                    ; .arch aarch64
+                    ; lsr x12, x16, #62
+                    ; cbnz x12, =>miss
+                    ; lsl x12, x16, #2
+                ),
+                _ => dynasm!(ops
+                    ; .arch aarch64
+                    ; lsr x12, x16, #61
+                    ; cbnz x12, =>miss
+                    ; lsl x12, x16, #3
+                ),
+            }
+            dynasm!(ops
+                ; .arch aarch64
+                ; adds x12, x14, x12
+                ; b.cs =>miss
+                ; ldr x14, [x11, byte_len_byte]
+                ; cmp x12, x14
+                ; b.hi =>miss
                 ; ldr x16, [x11, data_ptr_byte]
                 ; cbz x16, =>miss
                 ; ldr x14, [x13, view_offset_byte]
@@ -725,7 +816,6 @@ where
             );
         }
     }
-    let shift = access.element.stride_shift();
     match shift {
         2 => dynasm!(ops ; .arch aarch64 ; add x16, x16, w15, uxtw #2),
         _ => dynasm!(ops ; .arch aarch64 ; add x16, x16, w15, uxtw #3),
@@ -843,7 +933,7 @@ pub(crate) fn native_leaf_call_is_supported(
     stub_id: RuntimeStubId,
     argc: usize,
 ) -> bool {
-    let Some(declaration) = otter_vm::math::jit_leaf_builtin(stub_id) else {
+    let Some(declaration) = otter_vm::jit_static_native::jit_leaf_builtin(stub_id) else {
         return false;
     };
     view.native_ref_byte != 0
@@ -903,7 +993,7 @@ where
 {
     emit_native_leaf_guard(ops, view, builtin_native_ref, callee_x, bail)?;
 
-    let Some(declaration) = otter_vm::math::jit_leaf_builtin(stub_id) else {
+    let Some(declaration) = otter_vm::jit_static_native::jit_leaf_builtin(stub_id) else {
         return Err(Unsupported::OperandShape("native leaf entry"));
     };
     emit_native_entry_call(

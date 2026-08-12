@@ -164,6 +164,7 @@ fn lower_slot(
     let repr = match representation {
         MachineRepresentation::Tagged => DeoptRepr::Tagged,
         MachineRepresentation::Int32 => DeoptRepr::Int32,
+        MachineRepresentation::Boolean => DeoptRepr::Boolean,
         MachineRepresentation::Uint32 => DeoptRepr::Uint32,
         MachineRepresentation::Float64 => DeoptRepr::Float64,
         MachineRepresentation::Cell | MachineRepresentation::Int64 => {

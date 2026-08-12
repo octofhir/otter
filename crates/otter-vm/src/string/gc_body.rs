@@ -25,6 +25,9 @@
 //!   non-moving preserves those local handles across GC.
 //! - `len` is precomputed at construction and is O(1) heap-free at
 //!   the body level (callers read it via `heap.read_payload`).
+//! - A body length is always exact in `u32`. Concatenation rejects a sum beyond
+//!   that representation before flattening or allocation; it never saturates
+//!   or truncates a rope's logical length.
 //! - `hash` is the FNV-1a hash over the materialised UTF-16 code
 //!   units. Cons / sliced bodies cache the hash at construction so
 //!   later atom-table probes never re-walk the rope.
@@ -72,6 +75,23 @@ pub const STRING_REPR_SLICED: u8 = 5;
 /// GC handle to a JavaScript string body. `Copy`. Packs into
 /// [`crate::Value`] under `TAG_PTR_STRING`.
 pub type JsStringHandle = otter_gc::Gc<JsStringBody>;
+
+/// Failure modes specific to joining two already-coerced strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum StringConcatError {
+    /// The exact UTF-16 length cannot be represented by [`JsStringBody::len`].
+    #[error("string length overflow: {left_len} + {right_len} UTF-16 code units exceeds u32::MAX")]
+    StringTooLong {
+        /// Left operand's exact UTF-16 length.
+        left_len: u32,
+        /// Right operand's exact UTF-16 length.
+        right_len: u32,
+    },
+    /// The collector refused the result body allocation.
+    #[error(transparent)]
+    OutOfMemory(#[from] otter_gc::OutOfMemory),
+}
 
 /// Stable identity assigned by the VM-side string interner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -410,13 +430,15 @@ pub fn alloc_latin1_string_body_with_roots(
 /// child is flattened first.
 ///
 /// # Errors
-/// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+/// Returns [`StringConcatError::StringTooLong`] before flattening or allocation
+/// when the exact UTF-16 length would exceed `u32::MAX`, or wraps the
+/// collector's allocation failure in [`StringConcatError::OutOfMemory`].
 pub fn concat_string_bodies(
     heap: &mut GcHeap,
     left: JsStringHandle,
     right: JsStringHandle,
     external_visit: &mut RootSlotVisitor<'_>,
-) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
+) -> Result<JsStringHandle, StringConcatError> {
     let (left_len, left_depth, left_hash) = heap.read_payload(left, |b| (b.len, b.depth(), b.hash));
     let (right_len, right_depth, right_hash) =
         heap.read_payload(right, |b| (b.len, b.depth(), b.hash));
@@ -428,7 +450,12 @@ pub fn concat_string_bodies(
         return Ok(right);
     }
 
-    let new_len = left_len.saturating_add(right_len);
+    let new_len = left_len
+        .checked_add(right_len)
+        .ok_or(StringConcatError::StringTooLong {
+            left_len,
+            right_len,
+        })?;
 
     // Short-result fast path: when the concatenation fits an inline flat body
     // and both sides are already materialised (non-cons/non-sliced), build the
@@ -467,7 +494,7 @@ pub fn concat_string_bodies(
             }
         }
         if both_flat {
-            return if all_latin1 {
+            return Ok(if all_latin1 {
                 let mut bytes = [0u8; INLINE_LATIN1_CAP];
                 for (dst, &unit) in bytes.iter_mut().zip(units[..n].iter()) {
                     *dst = unit as u8;
@@ -477,15 +504,15 @@ pub fn concat_string_bodies(
                     JsStringId::new(0),
                     &bytes[..n],
                     external_visit,
-                )
+                )?
             } else {
                 alloc_flat_string_body_with_roots(
                     heap,
                     JsStringId::new(0),
                     &units[..n],
                     external_visit,
-                )
-            };
+                )?
+            });
         }
     }
 
@@ -512,7 +539,7 @@ pub fn concat_string_bodies(
     // right)` because FNV-1a is a streaming hash.
     let combined_hash = fnv_combine(left_hash, right_hash, right_len as usize);
 
-    heap.alloc_old_with_roots(
+    Ok(heap.alloc_old_with_roots(
         JsStringBody {
             id: JsStringId::new(0),
             len: new_len,
@@ -525,7 +552,7 @@ pub fn concat_string_bodies(
             utf16_cache: JsStringHandle::null(),
         },
         external_visit,
-    )
+    )?)
 }
 
 /// Take an O(1) substring view over a contiguous parent. Cons sources

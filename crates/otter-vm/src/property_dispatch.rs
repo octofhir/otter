@@ -203,7 +203,7 @@ impl Interpreter {
                 )?)),
                 None => Ok(Value::undefined()),
             },
-            None if name == "length" => Ok(Value::number_i32(string.len() as i32)),
+            None if name == "length" => Ok(Value::number_u32(string.len())),
             None => self.load_from_constructor_prototype(stack, context, "String", receiver, name),
         }
     }

@@ -125,9 +125,11 @@ impl Interpreter {
                     jit_debug::JitDebugTarget::Entry,
                     pc,
                 );
-                if optimized {
-                    self.note_jit_optimized_bail(fid, pc);
-                } else if !self.reoptimize_arith_overflow_bail(context, fid, pc) {
+                // `run_optimized_frame` owns optimizing-bail accounting because
+                // callers such as the iterator fast path consume its outcome
+                // directly. Do not count the same exit again at this dispatch
+                // wrapper.
+                if !optimized && !self.reoptimize_arith_overflow_bail(context, fid, pc) {
                     self.note_jit_entry_bail(fid);
                 }
                 Ok(None)
@@ -657,9 +659,9 @@ impl Interpreter {
                     jit_debug::JitDebugTarget::SyncEntry,
                     pc,
                 );
-                if optimized {
-                    self.note_jit_optimized_bail(fid, pc);
-                } else if !self.reoptimize_arith_overflow_bail(context, fid, pc) {
+                // The optimizing entry helper already recorded this exit; this
+                // synchronous wrapper only owns template-entry accounting.
+                if !optimized && !self.reoptimize_arith_overflow_bail(context, fid, pc) {
                     self.note_jit_entry_bail(fid);
                 }
                 Ok(None)

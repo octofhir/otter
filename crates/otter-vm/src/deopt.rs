@@ -29,9 +29,9 @@
 //!
 //! A register held unboxed in compiled code must be re-tagged on the way out.
 //! [`DeoptRepr::reconstitute`] is the single source of truth: integer slots
-//! re-tag through the matching signed or unsigned Number conversion, a
-//! `Float64` slot re-boxes through [`Value::number_f64`], and a `Tagged` slot
-//! is already a full `Value`.
+//! re-tag through the matching signed or unsigned Number conversion, Boolean
+//! slots re-tag as `false` or `true`, a `Float64` slot re-boxes through
+//! [`Value::number_f64`], and a `Tagged` slot is already a full `Value`.
 //!
 //! # Invariants
 //!
@@ -138,6 +138,8 @@ pub enum DeoptRepr {
     Tagged,
     /// An unboxed `i32` in the low 32 bits; re-tag to a number `Value`.
     Int32,
+    /// An unboxed canonical Boolean encoded as integer zero or one.
+    Boolean,
     /// An unboxed `u32` in the low 32 bits; re-tag to a number `Value`.
     Uint32,
     /// An unboxed `f64` bit pattern; re-box to a number `Value`.
@@ -152,6 +154,7 @@ impl DeoptRepr {
         match self {
             DeoptRepr::Tagged => Value::from_bits(raw),
             DeoptRepr::Int32 => Value::number_i32(raw as u32 as i32),
+            DeoptRepr::Boolean => Value::boolean(raw != 0),
             DeoptRepr::Uint32 => Value::number_f64(f64::from(raw as u32)),
             DeoptRepr::Float64 => Value::number_f64(f64::from_bits(raw)),
         }
@@ -333,7 +336,11 @@ impl DeoptFrame {
             }
 
             match slot.repr {
-                DeoptRepr::Tagged | DeoptRepr::Int32 | DeoptRepr::Uint32 | DeoptRepr::Float64 => {}
+                DeoptRepr::Tagged
+                | DeoptRepr::Int32
+                | DeoptRepr::Boolean
+                | DeoptRepr::Uint32
+                | DeoptRepr::Float64 => {}
             }
         }
         Ok(())
@@ -549,6 +556,8 @@ mod tests {
             DeoptRepr::Int32.reconstitute(u32::MAX as u64),
             Value::number_i32(-1)
         );
+        assert_eq!(DeoptRepr::Boolean.reconstitute(0), Value::boolean(false));
+        assert_eq!(DeoptRepr::Boolean.reconstitute(1), Value::boolean(true));
         assert_eq!(
             DeoptRepr::Float64.reconstitute(3.5f64.to_bits()),
             Value::number_f64(3.5)

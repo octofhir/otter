@@ -411,6 +411,17 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     unit's summary reports copy-web, coalesced-value, inactive-value, raw-spill,
     and post-deopt spill counts. Exact-bit `LoadLocal` / `StoreLocal` / `Reuse`
     webs share one home; unread rematerializable heads own no emitted state.
+    Machine direct data access is attributed by `machineElementLoad` /
+    `machineElementStore` and `machinePropertyLoad` / `machinePropertyStore`,
+    each with `bytePc`; direct captured-cell reads use `machineUpvalueLoad`.
+    Settled property regions consume immutable snapshot shape/slot chains and
+    never retain a `propertyIcCell` relocation. Guard misses reconstruct the
+    exact pre-operation frame, while a committed store has no later deopt edge.
+    Primitive-string and dense-array `.length` share the property-load region;
+    unsigned lengths outside int32 exit to canonical Number boxing. A fixed
+    TypedArray view over a resizable ArrayBuffer also guards its complete baked
+    extent against the backing store's live byte length before direct element
+    access; shrink misses deopt before a load or store effect.
   - Exact code may contain process addresses and is not a portable golden.
     Compare `code-normalized.bin` across processes; its relocation tokens and
     branch targets are symbolic, and it is not executable. `relocations.json`
@@ -503,7 +514,11 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     `Math.min` complete directly for proven Int32 operands after the same
     static or method identity guard as the declared leaf call. Extracted static
     calls use the `nativeInt32MathIntrinsic` code-map region and carry no
-    relocation for the replaced Math leaf.
+    relocation for the replaced Math leaf. The exact bootstrap `parseInt` with
+    one Int32 argument uses the same static-native planning boundary and an
+    allocation-free `parse_int_i32_leaf`; other tags, arities, explicit radix
+    calls, and global replacement retain the canonical call before observable
+    coercion.
     Generated code links through the permanent function cell and reads the
     selected generation's actual code-object id, tier, and frame reservation
     before entry; tier publication does not recompile callers. Eager target

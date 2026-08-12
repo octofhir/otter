@@ -11,6 +11,8 @@
 //! # Contents
 //! - [`InstructionSequence`] — verified block, value, and instruction storage.
 //! - [`MachineInstruction`] — one selected operation and its allocator inputs.
+//! - [`MachineOpcode`] — scalar operations, guarded element accesses, control
+//!   flow, and descriptor-backed calls.
 //! - [`CallDescriptor`] and [`DirectCallKind`] — complete semantic target,
 //!   guard, ABI, effects, and normal/exceptional exits.
 //! - [`TargetRegisterFile`] — complete allocatable target register inventory.
@@ -29,6 +31,8 @@
 //!   consumed by the emitter; there is no pre-allocation location fallback.
 //! - OSR sources are immutable entry metadata aligned with ordinary late-use
 //!   operands; their target locations come from that same allocation table.
+//! - Guarded element operands are late location uses, so target emission may
+//!   materialize stack or register homes without overwriting a live input.
 //! - Target register files enumerate physical registers explicitly. There is
 //!   no synthetic constant register budget.
 //!
@@ -88,6 +92,8 @@ pub enum MachineRepresentation {
     Cell,
     /// Unboxed signed 32-bit integer.
     Int32,
+    /// Unboxed canonical Boolean stored as integer zero or one.
+    Boolean,
     /// Unboxed unsigned 32-bit integer.
     Uint32,
     /// Unboxed 64-bit integer or address-sized scalar.
@@ -99,9 +105,12 @@ pub enum MachineRepresentation {
 impl MachineRepresentation {
     fn register_class(self) -> regalloc2::RegClass {
         match self {
-            Self::Tagged | Self::Cell | Self::Int32 | Self::Uint32 | Self::Int64 => {
-                regalloc2::RegClass::Int
-            }
+            Self::Tagged
+            | Self::Cell
+            | Self::Int32
+            | Self::Boolean
+            | Self::Uint32
+            | Self::Int64 => regalloc2::RegClass::Int,
             Self::Float64 => regalloc2::RegClass::Float,
         }
     }
@@ -538,6 +547,37 @@ pub enum MachineOpcode {
     BoxUint32,
     /// Canonically box one Boolean represented as integer 0 or 1.
     BoxBoolean,
+    /// Read one captured binding from the current native frame's stable cell
+    /// spine, deoptimizing at the source operation on a TDZ or invalid layout.
+    LoadUpvalue {
+        /// Zero-based cell handle in the upvalue spine.
+        index: i32,
+        /// Source bytecode offset used by artifacts and exact deoptimization.
+        byte_pc: u32,
+    },
+    /// Guard and load one VM-baked indexed element, deoptimizing on any miss.
+    ElementLoad(u32),
+    /// Guard and store one VM-baked indexed element, deoptimizing before the
+    /// first effect on any miss.
+    ElementStore(u32),
+    /// Guard and load one settled own-data property or exotic array/string
+    /// length, deoptimizing at the source operation before effects on a miss.
+    PropertyLoad {
+        /// Source bytecode offset used for settled metadata and artifacts.
+        byte_pc: u32,
+        /// Whether the property name is `length` and should first try the
+        /// dense-array/primitive-string layout program.
+        exotic_length: bool,
+    },
+    /// Guard and store one settled existing own-data property, deoptimizing
+    /// before the first effect on any metadata, receiver, shape, or slot miss.
+    PropertyStore {
+        /// Source bytecode offset used for settled metadata and artifacts.
+        byte_pc: u32,
+        /// Whether scalar typing proves the boxed value cannot be a GC cell,
+        /// allowing emission to omit the conditional generational barrier.
+        value_is_non_cell: bool,
+    },
     /// Apply one VM-baked constructor-owned add-property transition.
     ConstructorFieldStore(u32),
     /// Target ABI call through a call descriptor.

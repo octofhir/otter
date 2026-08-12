@@ -217,7 +217,10 @@ fn number_is_safe_integer_native(
     Ok(Value::boolean(crate::number::parse::is_safe_integer(&v)))
 }
 
-fn number_parse_int_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn number_parse_int_native(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
     // §19.2.5 step 1: `inputString = ? ToString(string)` runs first
     // and is observable through a user `toString`/`valueOf`/
     // `@@toPrimitive` override.

@@ -169,6 +169,8 @@ fn runtime_stub_signature_name(signature: RuntimeStubSignature) -> &'static str 
         RuntimeStubSignature::MutatingLeafValue3 => "mutatingLeafValue3",
         RuntimeStubSignature::ReentrantValue2 => "reentrantValue2",
         RuntimeStubSignature::ReentrantValue3 => "reentrantValue3",
+        RuntimeStubSignature::ReentrantNamedLoad => "reentrantNamedLoad",
+        RuntimeStubSignature::ReentrantNamedStore => "reentrantNamedStore",
     }
 }
 
@@ -1324,6 +1326,22 @@ mod tests {
                 id: 2,
                 name: "collection_map_get_leaf",
                 signature: "leafValue2",
+            }
+        );
+        assert_eq!(
+            RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY),
+            RelocationTarget::RuntimeStub {
+                id: 19,
+                name: "jit_load_property_value",
+                signature: "reentrantNamedLoad",
+            }
+        );
+        assert_eq!(
+            RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_JIT_STORE_PROPERTY),
+            RelocationTarget::RuntimeStub {
+                id: 20,
+                name: "jit_store_property_value",
+                signature: "reentrantNamedStore",
             }
         );
     }

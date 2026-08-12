@@ -3,7 +3,7 @@
 //! # Contents
 //! - Inline guarded own-data loads/stores through self-patching WhiskerIC
 //!   cells, with the Array exotic `length` fast path.
-//! - Window-transition misses that resolve full load/`[[Set]]` semantics and
+//! - Fixed-value misses that resolve full load/`[[Set]]` semantics and
 //!   self-patch cacheable sites.
 //!
 //! # Invariants
@@ -15,14 +15,15 @@
 //!   collector could dangle.
 //! - Pointer-valued stores run the generational write barrier; primitive
 //!   stores skip it. Every slot stores the complete runtime `Value` word.
-//! - Store misses publish the frame window before entering the VM, so setters,
-//!   proxies, exceptions, reentry, and moving GC complete without replay.
+//! - The active frame already publishes and traces the complete register
+//!   window. Misses pass boxed values directly, so setters, proxies,
+//!   exceptions, reentry, and moving GC complete without replay.
 //! - Cage bases, IC cells, and transition entries carry semantic relocation
 //!   identities; IC ordinals are assigned before emission in ownership order.
 //!
 //! # See also
 //! - [`super::values`] — slot compression/decompression primitives.
-//! - `crates/otter-jit/src/entry/runtime_ops/vm_ops.rs` — the window
+//! - `crates/otter-jit/src/entry/runtime_ops/vm_ops.rs` — fixed-value
 //!   transitions and the authoritative cell layout.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -32,8 +33,8 @@ use otter_vm::native_abi as abi;
 use super::ic_probe;
 use super::transitions::TransitionTable;
 use super::values::{
-    CellTest, emit_cell_test, emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64,
-    emit_write_barrier,
+    CellTest, emit_cell_test, emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64,
+    emit_store_reg, emit_write_barrier,
 };
 use crate::artifact::relocation::{PropertyIcAccess, RelocationCapture, RelocationTarget};
 use crate::entry::{Unsupported, reg_offset};
@@ -47,8 +48,8 @@ pub(super) fn emit_load_property(
     view: &JitCompileSnapshot,
     dst: u16,
     object: u16,
-    name: u32,
-    site: u64,
+    _name: u32,
+    _site: u64,
     array_length: bool,
     cell_addr: usize,
     cell_ordinal: u32,
@@ -102,28 +103,25 @@ pub(super) fn emit_load_property(
         );
     }
 
-    // Miss / no cage base: the window transition resolves own-data IC state,
-    // self-patches cacheable sites, and completes full `[[Get]]` semantics.
+    // Miss / no cage base: pass the boxed receiver directly. The published
+    // native frame supplies function/PC/name/site identity, and the stable IC
+    // pointer lets the canonical completion patch this code object's probe.
     dynasm!(ops
         ; .arch aarch64
         ; =>miss
         ; mov x0, x20
-        ; movz x1, dst as u32
-        ; movz x2, object as u32
     );
-    emit_load_u64(ops, 3, u64::from(name));
-    emit_load_u64(ops, 4, site);
+    emit_load_reg(ops, 1, object)?;
     emit_load_symbol_u64(
         ops,
         relocations,
-        5,
+        2,
         cell_addr as u64,
         RelocationTarget::PropertyIcCell {
             access: PropertyIcAccess::Load,
             ordinal: cell_ordinal,
         },
     );
-    emit_load_u64(ops, 6, u64::from(view.code_block.id));
     emit_load_runtime_stub(
         ops,
         relocations,
@@ -134,10 +132,11 @@ pub(super) fn emit_load_property(
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
-        ; cmp x0, #1
-        ; b.eq =>threw
-        ; =>done
+        ; and x15, x1, #0xff
+        ; cbnz x15, =>threw
     );
+    emit_store_reg(ops, 0, dst)?;
+    dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
 }
 
@@ -149,9 +148,9 @@ pub(super) fn emit_store_property(
     table: &TransitionTable,
     view: &JitCompileSnapshot,
     object: u16,
-    name: u32,
+    _name: u32,
     value: u16,
-    site: u64,
+    _site: u64,
     cell_addr: usize,
     cell_ordinal: u32,
     settled: Option<&[otter_vm::JitInlinePropertyLoad]>,
@@ -186,39 +185,37 @@ pub(super) fn emit_store_property(
             ; .arch aarch64
             ; str x9, [x13, x17]
         );
+        ic_probe::emit_property_transition_shape_barrier(ops, relocations, view, 20);
         emit_write_barrier(ops, relocations, view, 12, 9);
         dynasm!(ops
             ; .arch aarch64
             ; b =>done
             ; =>store_prim
             ; str x9, [x13, x17]
-            ; b =>done
         );
+        ic_probe::emit_property_transition_shape_barrier(ops, relocations, view, 20);
+        dynasm!(ops ; .arch aarch64 ; b =>done);
     }
 
-    // Miss / no cage base: the window transition resolves the store and
-    // self-patches the cell. Accessor/exotic/proxy/primitive semantics complete
-    // in place through the VM's single value-level `[[Set]]` funnel.
+    // Miss / no cage base: receiver and value are read from the published,
+    // traced window immediately before the fixed-value call.
     dynasm!(ops
         ; .arch aarch64
         ; =>miss
         ; mov x0, x20
-        ; movz x1, object as u32
     );
-    emit_load_u64(ops, 2, u64::from(name));
-    dynasm!(ops ; .arch aarch64 ; movz x3, value as u32);
-    emit_load_u64(ops, 4, site);
+    emit_load_reg(ops, 1, object)?;
+    emit_load_reg(ops, 2, value)?;
     emit_load_symbol_u64(
         ops,
         relocations,
-        5,
+        3,
         cell_addr as u64,
         RelocationTarget::PropertyIcCell {
             access: PropertyIcAccess::Store,
             ordinal: cell_ordinal,
         },
     );
-    emit_load_u64(ops, 6, u64::from(view.code_block.id));
     emit_load_runtime_stub(
         ops,
         relocations,
@@ -229,8 +226,8 @@ pub(super) fn emit_store_property(
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
-        ; cmp x0, #1
-        ; b.eq =>threw
+        ; and x15, x1, #0xff
+        ; cbnz x15, =>threw
         ; =>done
     );
     Ok(())

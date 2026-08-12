@@ -29,8 +29,9 @@
 //! - [`SetOutcome`] — what the runtime should do after a property
 //!   write resolved through the prototype chain (write data, invoke
 //!   setter, or reject).
-//! - [`StorePropertyTransition`] / [`StorePropertyTransitionKind`] — guarded
-//!   transition records used by StoreProperty IC replay.
+//! - [`StorePropertyTransition`] / [`StorePropertyTransitionKind`] and
+//!   [`LowerableStoreTransition`] — guarded StoreProperty replay records and
+//!   their allocation-free native subset.
 //! - [`ShapeCacheMode`] — fast-shape eligibility marker for current and future
 //!   dictionary-compatible object storage.
 //! - [`JsObject`] / [`ObjectBody`] / [`Properties`] — the public object handle,
@@ -100,12 +101,12 @@ pub use lookup::{PropertyLookup, SetOutcome, SetRejectReason};
 pub(crate) use shape_body::ShapeBody;
 pub(crate) use shape_body::ShapeHandle;
 pub(crate) use shape_body::shape_offset_of_str;
-pub(crate) use shape_cache::{ShapeCacheInvalidation, ShapeCacheMode};
+pub(crate) use shape_cache::{SHAPE_CACHE_MODE_FAST, ShapeCacheInvalidation, ShapeCacheMode};
 pub(crate) use shape_runtime::ShapeRuntime;
 #[cfg(test)]
 pub(crate) use shape_transition::capture_store_property_transition;
 pub(crate) use shape_transition::{
-    StorePropertyTransition, StorePropertyTransitionKind,
+    LowerableStoreTransition, StorePropertyTransition, StorePropertyTransitionKind,
     capture_store_property_transition_with_shape, replay_store_property_transition,
 };
 
@@ -1927,6 +1928,16 @@ pub(crate) const OBJECT_BODY_SLAB_HANDLE_OFFSET: usize = std::mem::offset_of!(Ob
 /// Byte offset of the ordinary `[[Extensible]]` flag.
 pub(crate) const OBJECT_BODY_EXTENSIBLE_OFFSET: usize =
     std::mem::offset_of!(ObjectBody, extensible);
+/// Byte offset of the `u8` fast-shape eligibility discriminant.
+pub(crate) const OBJECT_BODY_SHAPE_CACHE_MODE_OFFSET: usize =
+    std::mem::offset_of!(ObjectBody, shape_cache_mode);
+/// Byte offset of the in-place descriptor-override Boolean.
+pub(crate) const OBJECT_BODY_SLOT_ATTRS_OVERRIDDEN_OFFSET: usize =
+    std::mem::offset_of!(ObjectBody, slot_attrs_overridden);
+/// Byte offset of the 4-byte rare-state GC handle inside [`ExoticSlot`].
+/// A zero word proves the complete sidecar is absent.
+pub(crate) const OBJECT_BODY_EXOTIC_HANDLE_OFFSET: usize =
+    std::mem::offset_of!(ObjectBody, exotic) + std::mem::offset_of!(ExoticSlot, handle);
 /// Total fixed cell bytes for an ordinary object, including its GC header.
 pub(crate) const OBJECT_BODY_CELL_BYTES: usize = align_object_cell_bytes();
 
@@ -1948,6 +1959,9 @@ const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET == 56);
 const _: () = assert!(OBJECT_BODY_SLAB_LEN_OFFSET == 80);
 const _: () = assert!(OBJECT_BODY_SLAB_HANDLE_OFFSET == 16);
 const _: () = assert!(OBJECT_BODY_EXTENSIBLE_OFFSET == 40);
+const _: () = assert!(OBJECT_BODY_SHAPE_CACHE_MODE_OFFSET == 32);
+const _: () = assert!(OBJECT_BODY_SLOT_ATTRS_OVERRIDDEN_OFFSET == 41);
+const _: () = assert!(OBJECT_BODY_EXOTIC_HANDLE_OFFSET == 48);
 const _: () = assert!(OBJECT_BODY_CELL_BYTES == 96);
 // The shape guard word must sit at offset 0 (single-compare guard) and the
 // slab base must stay 8-aligned for the JIT's pointer load.
@@ -6545,6 +6559,18 @@ mod tests {
             .iter()
             .map(|row| row.alloc_count_total)
             .sum()
+    }
+
+    #[test]
+    fn jit_semantic_guard_layout_is_frozen() {
+        assert_eq!(std::mem::size_of::<ShapeCacheMode>(), 1);
+        assert_eq!(SHAPE_CACHE_MODE_FAST, 0);
+        assert_eq!(OBJECT_BODY_SHAPE_CACHE_MODE_OFFSET, 32);
+        assert_eq!(OBJECT_BODY_EXTENSIBLE_OFFSET, 40);
+        assert_eq!(OBJECT_BODY_SLOT_ATTRS_OVERRIDDEN_OFFSET, 41);
+        assert_eq!(OBJECT_BODY_EXOTIC_HANDLE_OFFSET, 48);
+        assert_eq!(std::mem::size_of::<ExoticHandle>(), 4);
+        assert_eq!(std::mem::size_of::<bool>(), 1);
     }
 
     #[test]

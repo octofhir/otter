@@ -320,8 +320,22 @@ pub struct JitCompileSnapshot {
     /// string-keyed slots or fewer holds them inline; a larger one spills to the
     /// out-of-line `values` vector whose base is a stable heap allocation.
     pub object_inline_slot_cap: u32,
-    /// Byte offset of the ordinary object's `[[Extensible]]` byte.
+    /// Byte offset of the ordinary object's one-byte `[[Extensible]]` Boolean.
     pub object_extensible_byte: u32,
+    /// Byte offset of the `u8` fast-shape eligibility discriminant. Generated
+    /// property programs compare it with [`Self::object_shape_cache_fast`]
+    /// before trusting an otherwise-equal hidden class.
+    pub object_shape_cache_mode_byte: u32,
+    /// Exact `u8` discriminant for append-only fast-shape semantics.
+    pub object_shape_cache_fast: u8,
+    /// Byte offset of the one-byte Boolean set by in-place descriptor mutations
+    /// such as `freeze` and `defineProperty`. Generated property programs
+    /// require zero.
+    pub object_slot_attrs_overridden_byte: u32,
+    /// Byte offset of the 4-byte rare-state GC handle. Generated property
+    /// programs require a zero handle on every receiver/prototype they inspect;
+    /// a sidecar may carry semantics the shape alone cannot prove.
+    pub object_exotic_handle_byte: u32,
     /// Fixed aligned bytes in one ordinary object cell, header included.
     pub object_cell_bytes: u32,
     /// Static GC layout for the inline generational write barrier emitted on a
@@ -753,21 +767,42 @@ pub struct JitPropertyIcWay {
     /// Guarded receiver shape. `0` marks an empty way and never matches a live
     /// receiver, so empty ways are skipped without a branch of their own.
     pub receiver_shape: u32,
-    /// Guarded shape of the object that owns the slot when the program hops to
-    /// the receiver's prototype. `0` means the receiver owns the slot and the
-    /// probe performs no hop.
+    /// Guarded shape of the direct prototype. For an existing-slot program it
+    /// owns the loaded slot; `0` means the receiver owns the slot. For an add
+    /// transition it proves the property absent on that direct prototype;
+    /// `0` means the receiver instead has a null prototype.
     pub holder_shape: u32,
     /// Byte offset of the slot inside the holder's value slab.
     pub value_byte: u32,
+    /// Canonical child shape installed by an add-property transition. `0`
+    /// keeps the existing-slot load/store meaning above. A non-zero token
+    /// changes the program into an append: `receiver_shape` is then the parent
+    /// shape, `value_byte` is the new own slot, and `holder_shape` is either
+    /// zero for a null receiver prototype or the guarded direct-prototype
+    /// shape for a completely missing property.
+    pub transition_shape: u32,
 }
 
 impl JitPropertyIcWay {
     /// Whether the program reaches the slot through the receiver's prototype.
     #[must_use]
     pub const fn hops_to_prototype(&self) -> bool {
-        self.holder_shape != 0
+        self.transition_shape == 0 && self.holder_shape != 0
+    }
+
+    /// Whether the program appends one own slot and publishes a child shape.
+    #[must_use]
+    pub const fn is_add_transition(&self) -> bool {
+        self.transition_shape != 0
     }
 }
+
+const _: [(); 16] = [(); std::mem::size_of::<JitPropertyIcWay>()];
+const _: [(); 4] = [(); std::mem::align_of::<JitPropertyIcWay>()];
+const _: [(); 0] = [(); std::mem::offset_of!(JitPropertyIcWay, receiver_shape)];
+const _: [(); 4] = [(); std::mem::offset_of!(JitPropertyIcWay, holder_shape)];
+const _: [(); 8] = [(); std::mem::offset_of!(JitPropertyIcWay, value_byte)];
+const _: [(); 12] = [(); std::mem::offset_of!(JitPropertyIcWay, transition_shape)];
 
 /// One monomorphic native leaf call selected from ordinary-call feedback.
 ///
@@ -1291,6 +1326,10 @@ impl JitCompileSnapshot {
             object_slab_len_byte: 0,
             object_inline_slot_cap: 0,
             object_extensible_byte: 0,
+            object_shape_cache_mode_byte: 0,
+            object_shape_cache_fast: 0,
+            object_slot_attrs_overridden_byte: 0,
+            object_exotic_handle_byte: 0,
             object_cell_bytes: 0,
             gc_barrier: JitGcBarrierLayout::default(),
             jit_proto_byte: 0,

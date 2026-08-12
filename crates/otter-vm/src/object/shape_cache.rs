@@ -28,14 +28,20 @@
 use super::ObjectBody;
 
 /// Internal eligibility mode for hidden-class based IC assumptions.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShapeCacheMode {
     /// Object is represented by append-only shape transitions.
-    Fast,
+    Fast = 0,
     /// Object has taken a mutation such as delete that future dictionary mode
     /// may represent without ordinary append-only transitions.
-    DictionaryCompatible,
+    DictionaryCompatible = 1,
 }
+
+/// Machine value proving append-only hidden-class semantics.
+pub(crate) const SHAPE_CACHE_MODE_FAST: u8 = ShapeCacheMode::Fast as u8;
+
+const _: () = assert!(std::mem::size_of::<ShapeCacheMode>() == 1);
 
 /// Reason an object leaves fast-shape IC eligibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

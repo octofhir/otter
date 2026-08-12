@@ -109,6 +109,20 @@ pub(crate) fn try_compile(
     let packed_double_view_caches = hir.plan_packed_double_view_caches(view);
     let sequence = select_with_packed_double_view_caches(&hir, &packed_double_view_caches)
         .map_err(|_error| Unsupported::OperandShape("scalar HIR to Machine IR selection"))?;
+    let load_property_sites = sequence
+        .instructions()
+        .iter()
+        .filter(|instruction| matches!(instruction.opcode, MachineOpcode::PropertyLoad { .. }))
+        .count();
+    let store_property_sites = sequence
+        .instructions()
+        .iter()
+        .filter(|instruction| matches!(instruction.opcode, MachineOpcode::PropertyStore { .. }))
+        .count();
+    let mut load_ic_cells =
+        vec![crate::entry::WhiskerIcCell::default(); load_property_sites].into_boxed_slice();
+    let mut store_ic_cells =
+        vec![crate::entry::WhiskerIcCell::default(); store_property_sites].into_boxed_slice();
     let allocation = sequence
         .allocate(&TargetRegisterFile::aarch64_scalar_function())
         .map_err(|_| Unsupported::OperandShape("scalar Machine IR allocation"))?;
@@ -189,6 +203,10 @@ pub(crate) fn try_compile(
         otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
         transitions.entry(otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT),
         transitions.entry(otter_vm::native_abi::STUB_JIT_STORE_ELEMENT),
+        transitions.entry(otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY),
+        transitions.entry(otter_vm::native_abi::STUB_JIT_STORE_PROPERTY),
+        &mut load_ic_cells,
+        &mut store_ic_cells,
         view.code_block.register_count,
         artifact_request.is_some(),
     )?;
@@ -265,8 +283,8 @@ pub(crate) fn try_compile(
         frame_map_bitmap_words,
         osr_entries,
         Box::default(),
-        Box::default(),
-        Box::default(),
+        load_ic_cells,
+        store_ic_cells,
         OptimizedMetadata {
             code_object_id,
             function_id: view.code_block.id,
@@ -951,9 +969,14 @@ fn select_with_packed_double_view_caches(
                         vec![
                             MachineOperand::location_input(receiver),
                             MachineOperand::register_output(result),
+                            MachineOperand::tagged_root(receiver),
                         ],
                     );
                     load.clobbers = property_load_clobbers();
+                    load.safepoint = Some(super::SafepointId(next_safepoint));
+                    next_safepoint = next_safepoint
+                        .checked_add(1)
+                        .expect("bounded scalar function safepoint count");
                     load
                 }
                 NumericNode::PropertyStore {
@@ -985,9 +1008,15 @@ fn select_with_packed_double_view_caches(
                         vec![
                             MachineOperand::location_input(receiver),
                             MachineOperand::location_input(value),
+                            MachineOperand::tagged_root(receiver),
+                            MachineOperand::tagged_root(value),
                         ],
                     );
                     store.clobbers = property_store_clobbers(value_is_non_cell);
+                    store.safepoint = Some(super::SafepointId(next_safepoint));
+                    next_safepoint = next_safepoint
+                        .checked_add(1)
+                        .expect("bounded scalar function safepoint count");
                     store
                 }
                 NumericNode::IntegerConstant(value) => MachineInstruction::plain(
@@ -1623,21 +1652,11 @@ fn element_clobbers() -> Vec<PhysicalRegister> {
 }
 
 fn property_load_clobbers() -> Vec<PhysicalRegister> {
-    [9, 11, 12, 13, 14]
-        .into_iter()
-        .map(PhysicalRegister::integer)
-        .collect()
+    TargetRegisterFile::aarch64_scalar_call_clobbers()
 }
 
-fn property_store_clobbers(value_is_non_cell: bool) -> Vec<PhysicalRegister> {
-    if value_is_non_cell {
-        // x17 selects the settled slot but is outside the allocatable bank.
-        // The remaining registers are exactly the receiver guard and value
-        // store scratch set; no ABI call exists on this specialized path.
-        property_load_clobbers()
-    } else {
-        TargetRegisterFile::aarch64_scalar_call_clobbers()
-    }
+fn property_store_clobbers(_value_is_non_cell: bool) -> Vec<PhysicalRegister> {
+    TargetRegisterFile::aarch64_scalar_call_clobbers()
 }
 
 const fn property_store_value_is_non_cell(value_type: NumericType) -> bool {
@@ -5508,8 +5527,9 @@ mod tests {
         );
         assert_eq!(load.clobbers, property_load_clobbers());
         assert_eq!(load.deopt, Some(DeoptId(0)));
+        assert!(load.safepoint.is_some());
         assert_eq!(
-            load.operands[2..]
+            load.operands[3..]
                 .iter()
                 .map(|operand| (operand.value, operand.purpose))
                 .collect::<Vec<_>>(),
@@ -5518,6 +5538,7 @@ mod tests {
                 (MachineValue(1), OperandPurpose::Deopt),
             ]
         );
+        assert_eq!(load.operands[2], MachineOperand::tagged_root(load_receiver));
         assert!(sequence.instructions().iter().any(|instruction| {
             instruction.opcode == MachineOpcode::BoxInt32
                 && instruction.operands.last().map(|operand| operand.value) == Some(load_receiver)
@@ -5559,8 +5580,14 @@ mod tests {
         );
         assert_eq!(store.clobbers, property_store_clobbers(true));
         assert_eq!(store.deopt, Some(DeoptId(1)));
+        assert!(store.safepoint.is_some());
         assert_eq!(
-            store.operands[2..]
+            store.operands[2],
+            MachineOperand::tagged_root(store_receiver)
+        );
+        assert_eq!(store.operands[3], MachineOperand::tagged_root(store_value));
+        assert_eq!(
+            store.operands[4..]
                 .iter()
                 .map(|operand| (operand.value, operand.purpose))
                 .collect::<Vec<_>>(),
@@ -5568,6 +5595,7 @@ mod tests {
                 (MachineValue(0), OperandPurpose::Deopt),
                 (MachineValue(1), OperandPurpose::Deopt),
                 (MachineValue(2), OperandPurpose::Deopt),
+                (MachineValue(2), OperandPurpose::TaggedRoot),
             ]
         );
         assert!(sequence.instructions().iter().any(|instruction| {
@@ -5630,7 +5658,7 @@ mod tests {
     }
 
     #[test]
-    fn property_store_emission_omits_only_the_proven_non_cell_barrier() {
+    fn property_store_emission_keeps_shape_barrier_and_classifies_value_barrier() {
         let compile_relocations = |value_is_non_cell, function_name: &str| {
             let output = compile_output(
                 &property_store_emission_view(value_is_non_cell),
@@ -5656,15 +5684,19 @@ mod tests {
         };
 
         let non_cell = compile_relocations(true, "storeInt32");
-        assert!(
-            !non_cell.contains("write_barrier"),
-            "proven non-cell store must not emit the barrier: {non_cell}"
+        assert_eq!(
+            non_cell.matches("\"name\": \"write_barrier\"").count(),
+            1,
+            "a proven non-cell store keeps only the possible transition-shape barrier: \
+             {non_cell}"
         );
 
         let tagged = compile_relocations(false, "storeTagged");
-        assert!(
-            tagged.contains("write_barrier"),
-            "tagged store must retain the conditional barrier: {tagged}"
+        assert_eq!(
+            tagged.matches("\"name\": \"write_barrier\"").count(),
+            3,
+            "a tagged store emits the possible transition-shape barrier on both tag arms and \
+             the conditional value barrier on the cell arm: {tagged}"
         );
     }
 

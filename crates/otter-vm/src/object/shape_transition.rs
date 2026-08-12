@@ -9,6 +9,8 @@
 //! - [`StorePropertyTransition`] — frozen replay record for one own-slot add.
 //! - [`StorePropertyTransitionKind`] — explicit transition categories cached by
 //!   StoreProperty ICs.
+//! - [`LowerableStoreTransition`] — allocation-free subset whose complete
+//!   guards can be emitted by the native property cell.
 //! - [`capture_store_property_transition`] — apply a resolved `[[Set]]` data
 //!   write and return replay metadata when the path is IC-compatible.
 //! - [`replay_store_property_transition`] — validate guards and add the cached
@@ -23,6 +25,10 @@
 //!   slot.
 //! - Descriptor changes that do not alter shape are still guarded: inherited
 //!   writable-data replay rechecks the direct prototype slot's writability.
+//! - Native lowering is deliberately narrower than VM replay: it admits only
+//!   inline-capacity null-prototype additions and a direct, terminal prototype
+//!   on which the key is absent. Every other transition stays on the runtime
+//!   stub.
 //! - Accessors, proxies, string wrapper objects, deep prototype hits,
 //!   non-writable inherited data, and dictionary-compatible objects remain
 //!   fallback paths.
@@ -57,6 +63,21 @@ pub(crate) struct StorePropertyTransition {
     pub(crate) slot: u16,
 }
 
+/// Complete immutable metadata for one add-property transition that generated
+/// code may execute without calling the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LowerableStoreTransition {
+    /// Parent shape guarded before the append.
+    pub(crate) from_shape: ShapeHandle,
+    /// Direct-prototype shape for a terminal missing-property proof, or null
+    /// when the receiver itself has a null prototype.
+    pub(crate) prototype_shape: ShapeHandle,
+    /// Canonical child shape published after the value append.
+    pub(crate) to_shape: ShapeHandle,
+    /// New inline own-slot index.
+    pub(crate) slot: u16,
+}
+
 impl StorePropertyTransition {
     pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
         if !self.to_shape.get().is_null() {
@@ -64,6 +85,103 @@ impl StorePropertyTransition {
             visitor(p);
         }
     }
+
+    /// Revalidate the committed transition as the allocation-free subset a
+    /// native property cell can replay.
+    ///
+    /// `obj` is the receiver immediately after this transition committed. Its
+    /// child shape lets us recover the immutable parent handle without storing
+    /// another GC root in the cache record. The generated program will guard
+    /// the parent shape, the exact pre-append slot count, extensibility, and the
+    /// same prototype topology before performing any write.
+    pub(crate) fn lowerable_add(
+        &self,
+        obj: JsObject,
+        heap: &otter_gc::GcHeap,
+        key: AtomizedPropertyKey<'_>,
+    ) -> Option<LowerableStoreTransition> {
+        if self.atom_id != key.atom().id() || usize::from(self.slot) >= super::INLINE_SLOT_CAP {
+            return None;
+        }
+
+        let to_shape = self.to_shape.get();
+        let to_shape_offset = to_shape.offset();
+        if to_shape.is_null()
+            || to_shape_offset == 0
+            || object_shape(obj, heap) != to_shape
+            || !super::is_extensible(obj, heap)
+            || heap.read_payload(obj, ObjectBody::slab_len) != usize::from(self.slot) + 1
+        {
+            return None;
+        }
+        let (to_shape_id, from_shape, transition_atom, property_count, own_offset) = heap
+            .read_payload(to_shape, |body| {
+                (
+                    body.id(),
+                    body.parent(),
+                    body.transition_atom(),
+                    body.property_count(),
+                    body.own_offset(),
+                )
+            });
+        if from_shape.is_null() || from_shape.offset() == 0 {
+            return None;
+        }
+        let (from_shape_id, from_property_count) =
+            heap.read_payload(from_shape, |body| (body.id(), body.property_count()));
+        if to_shape_id == ShapeId::UNASSIGNED
+            || to_shape_id != self.to_shape_id
+            || transition_atom != self.atom_id
+            || property_count != u32::from(self.slot) + 1
+            || own_offset != u32::from(self.slot)
+            || from_shape_id != self.from_shape_id
+            || from_property_count != u32::from(self.slot)
+            || self.from_shape_id == ShapeId::UNASSIGNED
+        {
+            return None;
+        }
+
+        let prototype_shape = match &self.kind {
+            StorePropertyTransitionKind::OwnAdd => {
+                if prototype_value(obj, heap).is_some() {
+                    return None;
+                }
+                ShapeHandle::null()
+            }
+            StorePropertyTransitionKind::DirectPrototypeMissing { prototype_shape_id } => {
+                let proto = super::prototype(obj, heap)?;
+                if !super::supports_fast_property_ic(proto, heap)
+                    || prototype_value(proto, heap).is_some()
+                    || shape_id(proto, heap) != *prototype_shape_id
+                    || *prototype_shape_id == ShapeId::UNASSIGNED
+                {
+                    return None;
+                }
+                let lookup = lookup_own_atom(proto, heap, key);
+                if lookup.hit.is_some() || !matches!(lookup.lookup, PropertyLookup::Absent) {
+                    return None;
+                }
+                let shape = object_shape(proto, heap);
+                if shape.is_null() || shape.offset() == 0 {
+                    return None;
+                }
+                shape
+            }
+            StorePropertyTransitionKind::DirectPrototypeWritableData { .. } => return None,
+        };
+
+        Some(LowerableStoreTransition {
+            from_shape,
+            prototype_shape,
+            to_shape,
+            slot: self.slot,
+        })
+    }
+}
+
+#[inline]
+fn object_shape(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeHandle {
+    super::shape(obj, heap)
 }
 
 /// Explicit StoreProperty transition categories.

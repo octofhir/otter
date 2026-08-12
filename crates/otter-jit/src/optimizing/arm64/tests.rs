@@ -1,6 +1,9 @@
 //! Backend tests for the optimizing AArch64 emitter.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use otter_vm::{
     JitDirectCallThisMode, JitDirectCallee, JitFunctionCode, RuntimeStubResult,
@@ -545,6 +548,78 @@ extern "C" fn throwing_element_store(
     RuntimeStubResultPair::from_result(RuntimeStubResult::thrown())
 }
 
+extern "C" fn relocating_property_load(
+    ctx: *mut JitCtx,
+    receiver_bits: u64,
+    cell: *mut WhiskerIcCell,
+) -> RuntimeStubResultPair {
+    // SAFETY: the fixture publishes the canonical two-slot frame for the
+    // complete fixed-value property call.
+    let regs = unsafe { fixture_registers(ctx) };
+    unsafe {
+        assert_eq!(receiver_bits, box_i32(99));
+        assert!(!cell.is_null());
+        assert_eq!((*(*ctx).native_frame).header.pc, 0);
+        assert_eq!(*regs.add(0), receiver_bits);
+        *regs.add(0) = box_i32(5);
+    }
+    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(box_i32(37)))
+}
+
+extern "C" fn throwing_property_load(
+    ctx: *mut JitCtx,
+    _receiver_bits: u64,
+    cell: *mut WhiskerIcCell,
+) -> RuntimeStubResultPair {
+    unsafe {
+        assert!(!cell.is_null());
+        assert_eq!((*(*ctx).native_frame).header.pc, 0);
+        *(*ctx).error = Some(otter_vm::VmError::InvalidOperand);
+    }
+    RuntimeStubResultPair::from_result(RuntimeStubResult::thrown())
+}
+
+static PROPERTY_STORE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn relocating_property_store(
+    ctx: *mut JitCtx,
+    receiver_bits: u64,
+    value_bits: u64,
+    cell: *mut WhiskerIcCell,
+) -> RuntimeStubResultPair {
+    PROPERTY_STORE_CALLS.fetch_add(1, Ordering::SeqCst);
+    // SAFETY: the fixture publishes the canonical three-slot frame for the
+    // complete fixed-value property call.
+    let regs = unsafe { fixture_registers(ctx) };
+    unsafe {
+        assert_eq!(receiver_bits, box_i32(99));
+        assert_eq!(value_bits, box_i32(20));
+        assert!(!cell.is_null());
+        assert_eq!((*(*ctx).native_frame).header.pc, 0);
+        assert_eq!(*regs.add(0), receiver_bits);
+        assert_eq!(*regs.add(1), value_bits);
+        *regs.add(0) = box_i32(5);
+        *regs.add(1) = box_i32(7);
+    }
+    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(
+        otter_vm::Value::undefined().to_bits(),
+    ))
+}
+
+extern "C" fn throwing_property_store(
+    ctx: *mut JitCtx,
+    _receiver_bits: u64,
+    _value_bits: u64,
+    cell: *mut WhiskerIcCell,
+) -> RuntimeStubResultPair {
+    unsafe {
+        assert!(!cell.is_null());
+        assert_eq!((*(*ctx).native_frame).header.pc, 0);
+        *(*ctx).error = Some(otter_vm::VmError::InvalidOperand);
+    }
+    RuntimeStubResultPair::from_result(RuntimeStubResult::thrown())
+}
+
 extern "C" fn successful_construct(
     ctx: *mut JitCtx,
     dst: u64,
@@ -574,6 +649,18 @@ fn element_load_transitions(entry: usize) -> TransitionTable {
 fn element_store_transitions(entry: usize) -> TransitionTable {
     let mut transitions = TransitionTable::resolve();
     transitions.replace_entry_for_test(STUB_JIT_STORE_ELEMENT, entry);
+    transitions
+}
+
+fn property_load_transitions(entry: usize) -> TransitionTable {
+    let mut transitions = TransitionTable::resolve();
+    transitions.replace_entry_for_test(STUB_JIT_LOAD_PROPERTY, entry);
+    transitions
+}
+
+fn property_store_transitions(entry: usize) -> TransitionTable {
+    let mut transitions = TransitionTable::resolve();
+    transitions.replace_entry_for_test(STUB_JIT_STORE_PROPERTY, entry);
     transitions
 }
 
@@ -982,6 +1069,112 @@ fn element_store_nonzero_status_uses_shared_throw_exit() {
 }
 
 #[test]
+fn property_load_uses_fixed_values_and_reloads_result() {
+    let view = view(
+        1,
+        2,
+        vec![
+            (
+                Op::LoadProperty,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(1)]),
+        ],
+    );
+    let transitions = property_load_transitions(relocating_property_load as *const () as usize);
+    let code = compile_with_transitions(&view, 114, &transitions)
+        .expect("fixed-value property load is optimizing-eligible");
+    let result = execute(&code, &[box_i32(99)]);
+    assert_eq!(result.status, STATUS_RETURNED);
+    assert_eq!(unbox_i32(result.value), 37);
+}
+
+#[test]
+fn property_load_nonzero_status_uses_shared_throw_exit() {
+    let view = view(
+        1,
+        2,
+        vec![
+            (
+                Op::LoadProperty,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(1)]),
+        ],
+    );
+    let transitions = property_load_transitions(throwing_property_load as *const () as usize);
+    let code = compile_with_transitions(&view, 115, &transitions)
+        .expect("throwing fixed-value property load is optimizing-eligible");
+    let (result, _, pc) = execute_with_frame(&code, &[box_i32(99)]);
+    assert_eq!(result.status, STATUS_THREW);
+    assert_eq!(result.value, 0);
+    assert_eq!(pc, 0);
+}
+
+#[test]
+fn property_store_uses_fixed_values_once_and_reloads_roots() {
+    let view = view(
+        2,
+        3,
+        vec![
+            (
+                Op::StoreProperty,
+                vec![
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(1)]),
+        ],
+    );
+    PROPERTY_STORE_CALLS.store(0, Ordering::SeqCst);
+    let transitions = property_store_transitions(relocating_property_store as *const () as usize);
+    let code = compile_with_transitions(&view, 116, &transitions)
+        .expect("fixed-value property store is optimizing-eligible");
+    let result = execute(&code, &[box_i32(99), box_i32(20)]);
+    assert_eq!(result.status, STATUS_RETURNED);
+    assert_eq!(unbox_i32(result.value), 7);
+    assert_eq!(PROPERTY_STORE_CALLS.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn property_store_nonzero_status_uses_shared_throw_exit() {
+    let view = view(
+        2,
+        3,
+        vec![
+            (
+                Op::StoreProperty,
+                vec![
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ],
+            ),
+            (Op::ReturnUndefined, vec![]),
+        ],
+    );
+    let transitions = property_store_transitions(throwing_property_store as *const () as usize);
+    let code = compile_with_transitions(&view, 117, &transitions)
+        .expect("throwing fixed-value property store is optimizing-eligible");
+    let (result, _, pc) = execute_with_frame(&code, &[box_i32(99), box_i32(20)]);
+    assert_eq!(result.status, STATUS_THREW);
+    assert_eq!(result.value, 0);
+    assert_eq!(pc, 0);
+}
+
+#[test]
 fn property_store_roots_tagged_value_dead_after_transition() {
     let view = view(
         2,
@@ -999,7 +1192,7 @@ fn property_store_roots_tagged_value_dead_after_transition() {
             (Op::ReturnUndefined, vec![]),
         ],
     );
-    let code = compile(&view, 114).expect("property store is optimizing-eligible");
+    let code = compile(&view, 118).expect("property store is optimizing-eligible");
 
     let record = code.safepoint_record(0).expect("property-store safepoint");
     assert_eq!(

@@ -138,6 +138,16 @@ impl RuntimeStubResult {
         }
     }
 
+    /// JavaScript exception already parked by the active runtime context.
+    #[must_use]
+    pub const fn thrown() -> Self {
+        Self {
+            status: RuntimeStubStatus::Throw,
+            value_bits: 0,
+            payload: 0,
+        }
+    }
+
     /// Exact frame-state exit.
     #[must_use]
     pub const fn deopt(frame_state: FrameStateId) -> Self {

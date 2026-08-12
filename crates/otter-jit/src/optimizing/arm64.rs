@@ -701,11 +701,11 @@ pub(super) fn compile_with_artifacts(
             tree: &unit.tree,
             load_element_entry: ResolvedRuntimeEntry::new(
                 STUB_JIT_LOAD_ELEMENT,
-                transitions.variadic_entry(STUB_JIT_LOAD_ELEMENT),
+                transitions.entry(STUB_JIT_LOAD_ELEMENT),
             ),
             store_element_entry: ResolvedRuntimeEntry::new(
                 STUB_JIT_STORE_ELEMENT,
-                transitions.variadic_entry(STUB_JIT_STORE_ELEMENT),
+                transitions.entry(STUB_JIT_STORE_ELEMENT),
             ),
             load_property_entry: ResolvedRuntimeEntry::new(
                 STUB_JIT_LOAD_PROPERTY,
@@ -1656,30 +1656,31 @@ fn emit(
                             &mut deopt_exits,
                             instruction,
                         )?;
+                        let window =
+                            emit_window_base(&mut ops, &inline_windows, instruction.inline)?;
+                        emit_load_frame_register_in(&mut ops, window, u32::from(receiver), 1)?;
+                        emit_load_frame_register_in(&mut ops, window, u32::from(index), 2)?;
                         dynasm!(ops
                             ; .arch aarch64
                             ; mov x0, x20
-                            ; movz x1, dst as u32
-                            ; movz x2, receiver as u32
-                            ; movz x3, index as u32
                         );
                         emit_runtime_entry(&mut ops, &mut relocations, 16, load_element_entry);
                         let succeeded = ops.new_dynamic_label();
+                        let call_threw = ops.new_dynamic_label();
                         dynasm!(ops
                             ; .arch aarch64
                             ; blr x16
+                            ; and x15, x1, #0xff
+                            ; cbnz x15, =>call_threw
                         );
+                        let window =
+                            emit_window_base(&mut ops, &inline_windows, instruction.inline)?;
+                        emit_store_frame_register_in(&mut ops, window, u32::from(dst), 0)?;
                         emit_unpublish_transition_frame(
                             &mut ops,
                             &inline_windows,
                             transition_depth,
                         )?;
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; cbz x0, =>succeeded
-                            ; b =>threw
-                            ; =>succeeded
-                        );
                         emit_reload_element_transition(
                             &mut ops,
                             allocation,
@@ -1695,6 +1696,13 @@ fn emit(
                                 ),
                             )),
                         )?;
+                        dynasm!(ops ; .arch aarch64 ; b =>succeeded ; =>call_threw);
+                        emit_unpublish_transition_frame(
+                            &mut ops,
+                            &inline_windows,
+                            transition_depth,
+                        )?;
+                        dynasm!(ops ; .arch aarch64 ; b =>threw ; =>succeeded);
                         dynasm!(ops ; .arch aarch64 ; =>done);
                     }
                     Op::StoreElement => {
@@ -1805,30 +1813,29 @@ fn emit(
                             &mut deopt_exits,
                             instruction,
                         )?;
+                        let window =
+                            emit_window_base(&mut ops, &inline_windows, instruction.inline)?;
+                        emit_load_frame_register_in(&mut ops, window, u32::from(receiver), 1)?;
+                        emit_load_frame_register_in(&mut ops, window, u32::from(index), 2)?;
+                        emit_load_frame_register_in(&mut ops, window, u32::from(value), 3)?;
                         dynasm!(ops
                             ; .arch aarch64
                             ; mov x0, x20
-                            ; movz x1, receiver as u32
-                            ; movz x2, index as u32
-                            ; movz x3, value as u32
                         );
                         emit_runtime_entry(&mut ops, &mut relocations, 16, store_element_entry);
                         let succeeded = ops.new_dynamic_label();
+                        let call_threw = ops.new_dynamic_label();
                         dynasm!(ops
                             ; .arch aarch64
                             ; blr x16
+                            ; and x15, x1, #0xff
+                            ; cbnz x15, =>call_threw
                         );
                         emit_unpublish_transition_frame(
                             &mut ops,
                             &inline_windows,
                             transition_depth,
                         )?;
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; cbz x0, =>succeeded
-                            ; b =>threw
-                            ; =>succeeded
-                        );
                         emit_reload_element_transition(
                             &mut ops,
                             allocation,
@@ -1837,6 +1844,13 @@ fn emit(
                             site,
                             None,
                         )?;
+                        dynasm!(ops ; .arch aarch64 ; b =>succeeded ; =>call_threw);
+                        emit_unpublish_transition_frame(
+                            &mut ops,
+                            &inline_windows,
+                            transition_depth,
+                        )?;
+                        dynasm!(ops ; .arch aarch64 ; b =>threw ; =>succeeded);
                         dynasm!(ops ; .arch aarch64 ; =>done);
                     }
                     Op::LoadProperty if inline_method_property(tree, instruction).is_some() => {

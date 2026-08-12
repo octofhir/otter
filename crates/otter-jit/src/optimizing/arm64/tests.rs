@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use otter_vm::{
-    JitDirectCallThisMode, JitDirectCallee, JitFunctionCode,
+    JitDirectCallThisMode, JitDirectCallee, JitFunctionCode, RuntimeStubResult,
+    RuntimeStubResultPair,
     jit::{JitDirectCallPlan, JitTestInstruction},
     jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ArithFeedback},
     native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader, VmThread},
@@ -444,33 +445,34 @@ unsafe fn fixture_registers(ctx: *mut JitCtx) -> *mut u64 {
 
 extern "C" fn relocating_element_load(
     ctx: *mut JitCtx,
-    dst: u64,
-    receiver: u64,
-    _index: u64,
-) -> u64 {
+    receiver_bits: u64,
+    index_bits: u64,
+) -> RuntimeStubResultPair {
     // SAFETY: the execution fixture supplies a live three-or-more-slot
     // register window for the duration of this transition call.
     let regs = unsafe { fixture_registers(ctx) };
     unsafe {
-        *regs.add(receiver as usize) = box_i32(5);
-        *regs.add(dst as usize) = box_i32(37);
+        assert_eq!(receiver_bits, box_i32(99));
+        assert_eq!(index_bits, box_i32(0));
+        *regs.add(0) = box_i32(5);
     }
-    0
+    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(box_i32(37)))
 }
 
 extern "C" fn relocating_precise_element_load(
     ctx: *mut JitCtx,
-    dst: u64,
-    receiver: u64,
-    index: u64,
-) -> u64 {
+    receiver_bits: u64,
+    index_bits: u64,
+) -> RuntimeStubResultPair {
     // SAFETY: this fixture compiles a twenty-six-slot frame and keeps it live
     // for the transition. Tagged slots model moving-GC rewrites; numeric
     // slots are deliberately poisoned to prove they are never reloaded.
     let regs = unsafe { fixture_registers(ctx) };
     unsafe {
-        assert_eq!(*regs.add(receiver as usize), box_i32(99));
-        assert_eq!(*regs.add(index as usize), box_i32(0));
+        assert_eq!(receiver_bits, box_i32(99));
+        assert_eq!(index_bits, box_i32(0));
+        assert_eq!(*regs.add(0), receiver_bits);
+        assert_eq!(*regs.add(10), index_bits);
         assert_eq!(*regs.add(1), box_i32(20));
         assert_eq!(*regs.add(2), box_i32(30));
         assert_eq!(*regs.add(11), otter_vm::Value::undefined().to_bits());
@@ -484,60 +486,63 @@ extern "C" fn relocating_precise_element_load(
         *regs.add(10) = box_i32(1_000);
         *regs.add(11) = box_i32(1_000);
         *regs.add(12) = box_f64(1_000.0);
-        *regs.add(dst as usize) = box_i32(37);
     }
-    0
+    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(box_i32(37)))
 }
 
 extern "C" fn throwing_element_load(
     ctx: *mut JitCtx,
-    _dst: u64,
-    _receiver: u64,
-    _index: u64,
-) -> u64 {
+    _receiver_bits: u64,
+    _index_bits: u64,
+) -> RuntimeStubResultPair {
     // SAFETY: the execution fixture owns the live error slot for the
     // complete entry call, matching the production transition contract.
     unsafe {
         *(*ctx).error = Some(otter_vm::VmError::InvalidOperand);
     }
-    1
+    RuntimeStubResultPair::from_result(RuntimeStubResult::thrown())
 }
 
 extern "C" fn relocating_precise_element_store(
     ctx: *mut JitCtx,
-    receiver: u64,
-    index: u64,
-    value: u64,
-) -> u64 {
+    receiver_bits: u64,
+    index_bits: u64,
+    value_bits: u64,
+) -> RuntimeStubResultPair {
     // SAFETY: this fixture owns a seven-slot interpreter window for the
     // transition. Slots 0..=2 model moving-GC rewrites; the numeric index
     // is poisoned to prove optimized code ignores its window contents
     // after the call.
     let regs = unsafe { fixture_registers(ctx) };
     unsafe {
-        assert_eq!(*regs.add(receiver as usize), box_i32(99));
-        assert_eq!(*regs.add(index as usize), box_i32(0));
-        assert_eq!(*regs.add(value as usize), box_i32(20));
+        assert_eq!(receiver_bits, box_i32(99));
+        assert_eq!(index_bits, box_i32(0));
+        assert_eq!(value_bits, box_i32(20));
+        assert_eq!(*regs.add(0), receiver_bits);
+        assert_eq!(*regs.add(3), index_bits);
+        assert_eq!(*regs.add(1), value_bits);
         *regs.add(0) = box_i32(5);
         *regs.add(1) = box_i32(7);
         *regs.add(2) = box_i32(11);
-        *regs.add(index as usize) = box_i32(1_000);
+        *regs.add(3) = box_i32(1_000);
     }
-    0
+    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(
+        otter_vm::Value::undefined().to_bits(),
+    ))
 }
 
 extern "C" fn throwing_element_store(
     ctx: *mut JitCtx,
-    _receiver: u64,
-    _index: u64,
-    _value: u64,
-) -> u64 {
+    _receiver_bits: u64,
+    _index_bits: u64,
+    _value_bits: u64,
+) -> RuntimeStubResultPair {
     // SAFETY: the execution fixture owns the live error slot for the
     // complete entry call, matching the production transition contract.
     unsafe {
         *(*ctx).error = Some(otter_vm::VmError::InvalidOperand);
     }
-    1
+    RuntimeStubResultPair::from_result(RuntimeStubResult::thrown())
 }
 
 extern "C" fn successful_construct(
@@ -562,13 +567,13 @@ extern "C" fn successful_construct(
 
 fn element_load_transitions(entry: usize) -> TransitionTable {
     let mut transitions = TransitionTable::resolve();
-    transitions.replace_variadic_entry_for_test(STUB_JIT_LOAD_ELEMENT, entry);
+    transitions.replace_entry_for_test(STUB_JIT_LOAD_ELEMENT, entry);
     transitions
 }
 
 fn element_store_transitions(entry: usize) -> TransitionTable {
     let mut transitions = TransitionTable::resolve();
-    transitions.replace_variadic_entry_for_test(STUB_JIT_STORE_ELEMENT, entry);
+    transitions.replace_entry_for_test(STUB_JIT_STORE_ELEMENT, entry);
     transitions
 }
 

@@ -26,9 +26,12 @@
 //!   any receiver, index, bounds, layout, or representation miss. Ordinary
 //!   packed-double arrays keep their payload and scalar index unboxed through
 //!   an exact Float64-to-Uint32 index guard; other families retain the tagged
-//!   value and tagged Float64-index path. A never-attempted element site with
-//!   no baked program selects a pure, root-free, safepoint-free exact deopt
-//!   boundary; an attempted missing site rejects the whole Machine body.
+//!   value and tagged Float64-index path. Missing or incompatible direct
+//!   metadata selects the canonical reentrant boxed-value call, which roots
+//!   every live tagged value and completes the operation exactly once without
+//!   deoptimization or replay. Generic accesses inside local catch regions
+//!   remain on a materialized backend until Machine committed-throw landing is
+//!   explicit.
 //! - Settled own-data property accesses likewise consume tagged late locations;
 //!   metadata and shape misses deopt at the original operation before effects.
 //!   Stores whose pre-boxing scalar type proves a non-cell value omit both the
@@ -184,6 +187,8 @@ pub(crate) fn try_compile(
         otter_vm::runtime_stubs::NUMBER_TO_INT32_F64_LEAF.entry_addr() as u64,
         otter_vm::runtime_stubs::STRICT_EQ_LEAF.entry_addr() as u64,
         otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
+        transitions.entry(otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT),
+        transitions.entry(otter_vm::native_abi::STUB_JIT_STORE_ELEMENT),
         view.code_block.register_count,
         artifact_request.is_some(),
     )?;
@@ -754,6 +759,99 @@ fn select_with_packed_double_view_caches(
                     );
                     store.clobbers = element_clobbers();
                     store
+                }
+                NumericNode::GenericElementLoad {
+                    receiver, index, ..
+                } => {
+                    let receiver = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        receiver,
+                    );
+                    let index = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        index,
+                    );
+                    let descriptor_index = intern_call_descriptor(
+                        &mut call_descriptors,
+                        generic_element_call_descriptor(
+                            otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT,
+                            2,
+                        ),
+                    );
+                    let mut call = MachineInstruction::plain(
+                        MachineOpcode::Call(descriptor_index as u32),
+                        vec![
+                            MachineOperand::register_input(receiver),
+                            MachineOperand::register_input(index),
+                            MachineOperand::register_output(result),
+                            MachineOperand::tagged_root(receiver),
+                            MachineOperand::tagged_root(index),
+                        ],
+                    );
+                    call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
+                    call.safepoint = Some(super::SafepointId(next_safepoint));
+                    next_safepoint = next_safepoint
+                        .checked_add(1)
+                        .expect("bounded scalar function safepoint count");
+                    call
+                }
+                NumericNode::GenericElementStore {
+                    receiver,
+                    index,
+                    value,
+                    ..
+                } => {
+                    let receiver = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        receiver,
+                    );
+                    let index = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        index,
+                    );
+                    let value = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        value,
+                    );
+                    let descriptor_index = intern_call_descriptor(
+                        &mut call_descriptors,
+                        generic_element_call_descriptor(
+                            otter_vm::native_abi::STUB_JIT_STORE_ELEMENT,
+                            3,
+                        ),
+                    );
+                    let mut call = MachineInstruction::plain(
+                        MachineOpcode::Call(descriptor_index as u32),
+                        vec![
+                            MachineOperand::register_input(receiver),
+                            MachineOperand::register_input(index),
+                            MachineOperand::register_input(value),
+                            MachineOperand::tagged_root(receiver),
+                            MachineOperand::tagged_root(index),
+                            MachineOperand::tagged_root(value),
+                        ],
+                    );
+                    call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
+                    call.safepoint = Some(super::SafepointId(next_safepoint));
+                    next_safepoint = next_safepoint
+                        .checked_add(1)
+                        .expect("bounded scalar function safepoint count");
+                    call
                 }
                 NumericNode::CheckedFloat64ToElementIndex { value, byte_pc } => {
                     let mut conversion = MachineInstruction::plain(
@@ -1612,6 +1710,29 @@ fn array_construct_call_descriptor() -> CallDescriptor {
         effects: CallEffects::READS_HEAP.union(CallEffects::WRITES_HEAP),
         clobbers,
         exceptional: ExceptionalEdge::None,
+        safepoint: SafepointKind::Gc,
+    }
+}
+
+fn generic_element_call_descriptor(
+    target: otter_vm::native_abi::RuntimeStubDescriptor,
+    argument_count: usize,
+) -> CallDescriptor {
+    debug_assert!(matches!(
+        target,
+        otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT | otter_vm::native_abi::STUB_JIT_STORE_ELEMENT
+    ));
+    let load = target == otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT;
+    CallDescriptor {
+        target: CallTarget::RuntimeStub(target),
+        arguments: vec![MachineRepresentation::Tagged; argument_count],
+        result: load.then_some(MachineRepresentation::Tagged),
+        effects: CallEffects::READS_HEAP
+            .union(CallEffects::WRITES_HEAP)
+            .union(CallEffects::INVALIDATES_SHAPES)
+            .union(CallEffects::REENTRANT),
+        clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+        exceptional: ExceptionalEdge::Propagate,
         safepoint: SafepointKind::Gc,
     }
 }
@@ -4446,6 +4567,67 @@ mod tests {
         }
     }
 
+    fn generic_element_selection_hir() -> NumericFunction {
+        let value = |index| hir::NumericValue(index);
+        NumericFunction {
+            function_id: 96,
+            nodes: vec![
+                NumericNode::Parameter {
+                    register: 0,
+                    value_type: NumericType::Tagged,
+                },
+                NumericNode::Parameter {
+                    register: 1,
+                    value_type: NumericType::Number,
+                },
+                NumericNode::BooleanConstant(true),
+                NumericNode::GenericElementLoad {
+                    receiver: value(0),
+                    index: value(1),
+                    logical_pc: 4,
+                    byte_pc: 24,
+                },
+                NumericNode::GenericElementStore {
+                    receiver: value(0),
+                    index: value(1),
+                    value: value(2),
+                    logical_pc: 5,
+                    byte_pc: 32,
+                },
+            ],
+            blocks: vec![hir::NumericBlock {
+                logical_pc: 0,
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                parameters: Vec::new(),
+                parameter_registers: Vec::new(),
+                successor_arguments: Vec::new(),
+                nodes: (0..5).map(value).collect(),
+                terminator: NumericTerminator::Return(value(3)),
+            }],
+            frame_states: [
+                (value(3), 24, vec![value(0), value(1), value(2)]),
+                (value(4), 32, vec![value(0), value(1), value(2)]),
+            ]
+            .into_iter()
+            .map(|(point, byte_pc, slots)| hir::NumericFrameState {
+                point: NumericFramePoint::Node(point),
+                function_id: 96,
+                byte_pc,
+                slots: slots
+                    .into_iter()
+                    .map(hir::NumericFrameSlot::Value)
+                    .collect(),
+            })
+            .collect(),
+            direct_call_targets: Vec::new(),
+            direct_call_arguments: Vec::new(),
+            parameter_count: 2,
+            register_count: 3,
+            arithmetic_op_count: 0,
+        }
+    }
+
     fn packed_double_element_selection_hir() -> NumericFunction {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
@@ -5609,6 +5791,67 @@ mod tests {
         sequence
             .allocate(&TargetRegisterFile::aarch64_scalar_function())
             .expect("element late-location allocation");
+    }
+
+    #[test]
+    fn generic_elements_use_reentrant_value_calls_and_precise_gc_roots() {
+        let sequence =
+            select(&generic_element_selection_hir()).expect("generic element Machine IR");
+        let calls = sequence
+            .instructions()
+            .iter()
+            .filter_map(|instruction| {
+                let MachineOpcode::Call(descriptor) = instruction.opcode else {
+                    return None;
+                };
+                Some((
+                    instruction,
+                    &sequence.call_descriptors()[descriptor as usize],
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        let (load, load_descriptor) = calls[0];
+        assert_eq!(
+            load_descriptor.target,
+            CallTarget::RuntimeStub(otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT)
+        );
+        assert_eq!(load_descriptor.safepoint, SafepointKind::Gc);
+        assert_eq!(load_descriptor.exceptional, ExceptionalEdge::Propagate);
+        assert_eq!(load_descriptor.result, Some(MachineRepresentation::Tagged));
+        assert_eq!(load.operands[0].constraint, OperandConstraint::Register);
+        assert_eq!(load.operands[1].constraint, OperandConstraint::Register);
+        assert_eq!(load.operands[2].constraint, OperandConstraint::Register);
+        assert!(load.safepoint.is_some());
+        assert!(load.deopt.is_some());
+
+        let (store, store_descriptor) = calls[1];
+        assert_eq!(
+            store_descriptor.target,
+            CallTarget::RuntimeStub(otter_vm::native_abi::STUB_JIT_STORE_ELEMENT)
+        );
+        assert_eq!(store_descriptor.result, None);
+        assert_eq!(store_descriptor.safepoint, SafepointKind::Gc);
+        assert_eq!(store_descriptor.exceptional, ExceptionalEdge::Propagate);
+        assert!(store.safepoint.is_some());
+        assert!(store.deopt.is_some());
+        for (instruction, argument_count) in [(load, 2_usize), (store, 3_usize)] {
+            let roots = instruction
+                .operands
+                .iter()
+                .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
+                .map(|operand| operand.value)
+                .collect::<BTreeSet<_>>();
+            for operand in &instruction.operands[..argument_count] {
+                assert!(
+                    roots.contains(&operand.value),
+                    "every boxed value argument must use the canonical moving root home"
+                );
+            }
+        }
+        sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("generic element allocation");
     }
 
     #[test]

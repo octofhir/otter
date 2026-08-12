@@ -6,14 +6,17 @@
 //! - Write-barrier entries.
 //!
 //! # Invariants
-//! Register operands address the published JIT window. Allocating or throwing
-//! operations keep that window live and park failures in the shared error slot.
+//! Register-index operands address the published JIT window. Computed element
+//! entries instead receive fixed boxed-value operands and return a status pair.
+//! Allocating or throwing operations keep the window live and park failures in
+//! the shared error slot.
 //!
 //! # See also
 //! - `otter_vm::jit_runtime_ops` — safe VM-side implementations.
 
 use super::super::{JitCtx, JitRet, STATUS_RETURNED, STATUS_THREW};
 use super::park_jit_error;
+use otter_vm::{RuntimeStubResult, RuntimeStubResultPair, Value};
 
 /// Number of shapes a WhiskerIC site caches inline before it is megamorphic and
 /// always misses to the stub. Four matches the polymorphism most real sites
@@ -204,30 +207,28 @@ pub(crate) extern "C" fn jit_write_barrier_stub(ctx: *mut JitCtx, obj: u64, src:
     }
 }
 
-/// Runtime stub: perform a computed `LoadElement` (`recv[idx]`) from compiled
-/// code, delegating to the safe [`Interpreter::jit_runtime_load_element`].
-/// Returns `0` on success, `1` when the read threw (error parked in `ctx`).
+/// Complete computed `[[Get]]` from fixed boxed-value operands.
+///
+/// The active native frame supplies the exact function/PC feedback identity
+/// and precise roots. Success returns the loaded value. Failure parks the
+/// error and returns `Throw`; this entry never requests replay or deopt.
 pub(crate) extern "C" fn jit_load_element_stub(
     ctx: *mut JitCtx,
-    dst: u64,
-    recv: u64,
-    idx: u64,
-) -> u64 {
+    receiver_bits: u64,
+    key_bits: u64,
+) -> RuntimeStubResultPair {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let mut runtime = match ctx.runtime_call() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            return 1;
-        }
-    };
-    let result = runtime.load_element(dst as u16, recv as u16, idx as u16);
+    let result = ctx.runtime_call().and_then(|mut runtime| {
+        runtime.load_element_value(Value::from_bits(receiver_bits), Value::from_bits(key_bits))
+    });
     match result {
-        Ok(()) => 0,
+        Ok(value) => {
+            RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(value.to_bits()))
+        }
         Err(err) => {
             park_jit_error(ctx, err);
-            1
+            RuntimeStubResultPair::from_result(RuntimeStubResult::thrown())
         }
     }
 }
@@ -381,31 +382,32 @@ pub(crate) extern "C" fn jit_load_regexp_stub(ctx: *mut JitCtx, dst: u64, idx: u
     }
 }
 
-/// Runtime stub: perform a computed `StoreElement` (`recv[idx] = src`) from
-/// compiled code, delegating to the safe
-/// [`Interpreter::jit_runtime_store_element`]. Returns `0` on success, `1` when
-/// the write threw (error parked in `ctx`).
+/// Complete computed `[[Set]]` from fixed boxed-value operands.
+///
+/// Success returns `undefined`. Failure parks the error and returns `Throw`;
+/// the committed operation is never replayed or converted into a deopt miss.
 pub(crate) extern "C" fn jit_store_element_stub(
     ctx: *mut JitCtx,
-    recv: u64,
-    idx: u64,
-    src: u64,
-) -> u64 {
+    receiver_bits: u64,
+    key_bits: u64,
+    value_bits: u64,
+) -> RuntimeStubResultPair {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let mut runtime = match ctx.runtime_call() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            return 1;
-        }
-    };
-    let result = runtime.store_element(recv as u16, idx as u16, src as u16);
+    let result = ctx.runtime_call().and_then(|mut runtime| {
+        runtime.store_element_value(
+            Value::from_bits(receiver_bits),
+            Value::from_bits(key_bits),
+            Value::from_bits(value_bits),
+        )
+    });
     match result {
-        Ok(()) => 0,
+        Ok(()) => RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(
+            Value::undefined().to_bits(),
+        )),
         Err(err) => {
             park_jit_error(ctx, err);
-            1
+            RuntimeStubResultPair::from_result(RuntimeStubResult::thrown())
         }
     }
 }

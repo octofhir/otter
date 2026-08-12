@@ -314,6 +314,14 @@ load, arithmetic, and store, with no adjacent Number box/decode, hole test, or
 write barrier. A Float64 index uses an exact Uint32 check: integral values and
 `-0` address directly (`-0` is key 0), while fractional, negative, NaN, or
 out-of-Uint32 values leave before the element access.
+Missing or incompatible direct element metadata does not reject the surrounding
+Machine function. `machineGenericElementLoad` and
+`machineGenericElementStore` identify a fixed boxed-value runtime call with
+precise moving roots and source `bytePc`. The call performs canonical
+`[[Get]]` / `[[Set]]` exactly once and returns either success or a parked throw;
+there is no post-call deopt that could replay a proxy trap, getter, setter, or
+key coercion. A local-catch generic access currently retains the materialized
+backend so the handler cannot observe stale Machine SSA homes.
 When a reducible non-reentrant loop has an invariant packed-double receiver,
 the normalized header reports `packed-double-view-caches=<N>` and packed access
 opcodes name `cache: Some(...)`. The first access proves the complete receiver

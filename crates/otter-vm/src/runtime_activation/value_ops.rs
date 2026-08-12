@@ -1,8 +1,10 @@
 //! Value, binding, property, element, and allocation operations.
 //!
-//! Each method owns its short [`crate::ActiveFrameMut`] scope internally. The
-//! JIT supplies decoded operands and receives semantic results; no VM service
-//! or frame/window representation crosses the boundary.
+//! Register-index methods own a short [`crate::ActiveFrameMut`] scope
+//! internally. Fixed-value methods instead use the published frame only for
+//! function/PC identity and operate on explicitly rooted boxed operands. The
+//! JIT supplies decoded inputs and receives semantic results; no borrowed
+//! frame/window representation crosses the VM service boundary.
 
 use smallvec::SmallVec;
 
@@ -394,16 +396,25 @@ impl RuntimeCall<'_> {
         vm.jit_runtime_store_upvalue(&mut frame, src, index)
     }
 
-    /// Load one computed element.
-    pub fn load_element(&mut self, dst: u16, recv: u16, index: u16) -> Result<(), VmError> {
+    /// Complete one computed `[[Get]]` over boxed SSA values.
+    ///
+    /// The published frame supplies only the exact feedback identity and GC
+    /// root map. Operand words are JavaScript values, never register indices,
+    /// and the operation returns its value directly without frame replay.
+    pub fn load_element_value(&mut self, receiver: Value, key: Value) -> Result<Value, VmError> {
+        let function_id = self.function_id();
+        let instruction_pc = self.pc();
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = unsafe { self.context.as_ref() };
-        let frame = self.frame.as_ptr();
-        // SAFETY: as [`Self::add`].
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
-        vm.jit_runtime_load_element(context, &mut frame, stack, dst, recv, index)
+        vm.jit_runtime_load_element_value(
+            stack,
+            context,
+            function_id,
+            instruction_pc,
+            receiver,
+            key,
+        )
     }
 
     /// Load one global binding through the owning function's constant pool.
@@ -503,24 +514,157 @@ impl RuntimeCall<'_> {
         )
     }
 
-    /// Store one computed element through the representation-neutral frame.
-    /// The VM's value-level `[[Set]]` funnel completes every receiver kind
-    /// synchronously, including typed arrays, proxies, and callable setters.
-    pub fn store_element(&mut self, recv: u16, index: u16, source: u16) -> Result<(), VmError> {
+    /// Complete one computed `[[Set]]` over boxed SSA values.
+    ///
+    /// The fixed-value boundary covers arrays, typed arrays, proxies, and
+    /// callable setters. Success means the store committed exactly once;
+    /// failures are returned for the native entry to park as a throw.
+    pub fn store_element_value(
+        &mut self,
+        receiver: Value,
+        key: Value,
+        value: Value,
+    ) -> Result<(), VmError> {
+        let function_id = self.function_id();
+        let instruction_pc = self.pc();
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = unsafe { self.context.as_ref() };
-        let frame = self.frame.as_ptr();
-        // SAFETY: RuntimeCall validated the raw descriptor and retains its
-        // owner. The frame view is used only to copy the four scalar inputs;
-        // the VM helper receives no frame reference.
-        let frame = unsafe { crate::ActiveFrameRef::from_native_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
-        vm.jit_runtime_store_element(stack, context, &frame, recv, index, source)
+        vm.jit_runtime_store_element_value(
+            stack,
+            context,
+            function_id,
+            instruction_pc,
+            receiver,
+            key,
+            value,
+        )
     }
 
     /// Commit a value without exposing the destination window.
     pub fn commit(&mut self, dst: u16, value: Value) -> Result<(), VmError> {
         self.write(dst, value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ptr::NonNull;
+
+    use otter_bytecode::{BytecodeModule, Function, Instruction, Op, Operand, SourceKind};
+
+    use crate::{
+        ActivationStack, ExecutionContext, Interpreter, JitElementFamily, NativeFrame,
+        NativeFrameKind, Value, VmFrameHeader, VmRuntimeActivation,
+    };
+
+    use super::RuntimeCall;
+
+    fn element_context() -> ExecutionContext {
+        let element_operands = vec![
+            Operand::Register(0),
+            Operand::Register(1),
+            Operand::Register(2),
+        ];
+        ExecutionContext::from_module(BytecodeModule {
+            module: "runtime-value-element-test.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "elementBoundary".to_string(),
+                locals: 3,
+                code: vec![
+                    Instruction {
+                        pc: 0,
+                        op: Op::LoadElement,
+                        operands: element_operands.clone(),
+                    },
+                    Instruction {
+                        pc: 1,
+                        op: Op::LoadElement,
+                        operands: element_operands,
+                    },
+                    Instruction {
+                        pc: 2,
+                        op: Op::ReturnUndefined,
+                        operands: Vec::new(),
+                    },
+                ]
+                .into(),
+                ..Function::default()
+            }],
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn stack_owned_value_elements_use_published_feedback_identity() {
+        let context = element_context();
+        let mut vm = Interpreter::new();
+        let array =
+            crate::array::from_elements_old_for_fixture(&mut vm.gc_heap, [Value::number_f64(4.0)])
+                .expect("packed array fixture");
+        let receiver = Value::array(array);
+        let key = Value::number_i32(0);
+        let mut stack = ActivationStack::new();
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+        let mut registers = [Value::undefined(); 3];
+        let mut frame = NativeFrame::new(
+            VmFrameHeader {
+                function_id: 0,
+                code_block_id: 0,
+                pc: 1,
+                register_count: 3,
+                kind: NativeFrameKind::Optimizing,
+                flags: Default::default(),
+            },
+            registers.as_mut_ptr() as u64,
+            Value::function(0),
+            Value::undefined(),
+        );
+        frame.set_stack_registers();
+
+        {
+            // SAFETY: activation, native frame, and its register window remain
+            // live and exclusively owned for this RuntimeCall scope.
+            let mut call = unsafe {
+                RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame))
+            }
+            .expect("stack-owned runtime call");
+            assert_eq!(
+                call.load_element_value(receiver, key)
+                    .expect("value load")
+                    .as_f64(),
+                Some(4.0)
+            );
+            call.store_element_value(receiver, key, Value::number_f64(9.5))
+                .expect("value store");
+            assert_eq!(
+                call.load_element_value(receiver, key)
+                    .expect("updated value load")
+                    .as_f64(),
+                Some(9.5)
+            );
+        }
+
+        let code_block = context.exec_function(0).expect("test function");
+        assert_eq!(
+            code_block
+                .feedback_at(0)
+                .expect("cold feedback cell")
+                .element_family(),
+            JitElementFamily::Unseen
+        );
+        assert_eq!(
+            code_block
+                .feedback_at(1)
+                .expect("published-PC feedback cell")
+                .element_family(),
+            JitElementFamily::DenseFloat64
+        );
+        assert_eq!(code_block.feedback_epoch(), 1);
     }
 }

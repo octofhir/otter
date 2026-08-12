@@ -11,8 +11,9 @@
 //!   looks up a `CodeBlockInstruction` at runtime.
 //! - Raw metadata pointers target immutable boxed slices retained by the
 //!   active code object for the executable mapping's full lifetime.
-//! - JS values remain in the published frame window across every allocating or
-//!   throwing operation, preserving precise moving-GC roots.
+//! - JS values remain in the published frame window or its precise safepoint
+//!   spill map across every allocating or throwing operation, preserving
+//!   moving-GC roots for fixed-value and register-index entries alike.
 //! - Arithmetic and coercion entries validate machine-word operands, then use
 //!   the VM-owned typed runtime boundary; no VM/container pointer escapes.
 //!

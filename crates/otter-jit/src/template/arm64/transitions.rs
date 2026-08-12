@@ -10,8 +10,10 @@
 //! - Every baked entry is resolved by descriptor id and validated against the
 //!   descriptor's signature family before emission; raw addresses are never
 //!   consumed without that check.
-//! - Reentrant transitions receive the entry context and report status in
-//!   `x0`; nonzero branches to the shared throw epilogue.
+//! - Register-window reentrant transitions receive the entry context and report
+//!   status in `x0`. Computed element transitions use the fixed boxed-value
+//!   result-pair ABI (`x0` value, low byte of `x1` status); either form branches
+//!   to the shared throw epilogue on nonzero status.
 //! - Allocating calls build the frozen call-packet layout on the machine
 //!   stack, name a concrete safepoint, and are followed by no derived-pointer
 //!   reuse — operands re-load from the rooted frame window.
@@ -490,19 +492,17 @@ pub(super) fn emit_load_element(
     }
     dynasm!(ops ; .arch aarch64 ; =>miss);
     emit_ctx_arg(ops);
-    dynasm!(ops
-        ; .arch aarch64
-        ; movz x1, dst as u32
-        ; movz x2, receiver as u32
-        ; movz x3, index as u32
-    );
-    emit_transition_call(
+    emit_load_reg(ops, 1, receiver)?;
+    emit_load_reg(ops, 2, index)?;
+    emit_load_runtime_stub(
         ops,
         relocations,
-        table.variadic_entry(abi::STUB_JIT_LOAD_ELEMENT),
+        16,
+        table.entry(abi::STUB_JIT_LOAD_ELEMENT),
         abi::STUB_JIT_LOAD_ELEMENT,
-        threw,
     );
+    dynasm!(ops ; .arch aarch64 ; blr x16 ; and x1, x1, #0xff ; cbnz x1, =>threw);
+    emit_store_reg(ops, 0, dst)?;
     dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
 }
@@ -542,19 +542,17 @@ pub(super) fn emit_store_element(
     }
     dynasm!(ops ; .arch aarch64 ; =>miss);
     emit_ctx_arg(ops);
-    dynasm!(ops
-        ; .arch aarch64
-        ; movz x1, receiver as u32
-        ; movz x2, index as u32
-        ; movz x3, value as u32
-    );
-    emit_transition_call(
+    emit_load_reg(ops, 1, receiver)?;
+    emit_load_reg(ops, 2, index)?;
+    emit_load_reg(ops, 3, value)?;
+    emit_load_runtime_stub(
         ops,
         relocations,
-        table.variadic_entry(abi::STUB_JIT_STORE_ELEMENT),
+        16,
+        table.entry(abi::STUB_JIT_STORE_ELEMENT),
         abi::STUB_JIT_STORE_ELEMENT,
-        threw,
     );
+    dynasm!(ops ; .arch aarch64 ; blr x16 ; and x1, x1, #0xff ; cbnz x1, =>threw);
     dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
 }

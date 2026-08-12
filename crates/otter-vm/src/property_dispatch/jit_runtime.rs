@@ -265,33 +265,28 @@ impl Interpreter {
             .whisker_load_cell_fill(site, obj, &self.gc_heap, atomized_key)
     }
 
-    /// Complete one computed `LoadElement` (`recv[idx]`) from a compiled
-    /// activation. The value-level operation covers dense/sparse arrays, typed
-    /// arrays, string indices, and the ordinary `[[Get]]` fallback without
-    /// mutating the caller's PC.
+    /// Complete one computed `[[Get]]` from boxed values owned by generated
+    /// SSA rather than an interpreter-compatible register window.
     ///
-    /// # Errors
-    /// Propagates a throwing getter, a `null`/`undefined` receiver `TypeError`,
-    /// or `InvalidOperand`.
-    pub fn jit_runtime_load_element(
+    /// `function_id` and `instruction_pc` identify the currently published
+    /// native frame. Recording happens before key coercion or receiver
+    /// dispatch, so a throwing proxy/getter still matures the same feedback
+    /// cell as interpreted execution. The operation either returns its value
+    /// or throws; it never requests replay at the original instruction.
+    pub fn jit_runtime_load_element_value(
         &mut self,
-        context: &ExecutionContext,
-        frame: &mut crate::ActiveFrameMut<'_>,
         stack: &mut ActivationStack,
-        dst: u16,
-        recv_reg: u16,
-        idx_reg: u16,
-    ) -> Result<(), VmError> {
+        context: &ExecutionContext,
+        function_id: u32,
+        instruction_pc: u32,
+        receiver: Value,
+        key: Value,
+    ) -> Result<Value, VmError> {
         self.record_jit_runtime_property_stub();
-        let function_id = frame.function_id();
-        let instruction_pc = frame.pc();
-        let receiver = frame.read(recv_reg)?;
-        let key = frame.read(idx_reg)?;
         if let Some(code_block) = context.exec_function(function_id) {
             self.record_element_family_feedback(code_block, instruction_pc, function_id, receiver);
         }
-        let value = self.load_element_values(stack, context, receiver, key)?;
-        frame.write(dst, value)
+        self.load_element_values(stack, context, receiver, key)
     }
 
     /// Complete `LoadGlobalOrThrow` from a compiled activation. Resolves a free
@@ -444,29 +439,25 @@ impl Interpreter {
         frame.write(dst, value)
     }
 
-    /// Representation-neutral compiled operation for computed stores.
+    /// Complete one computed `[[Set]]` from boxed values owned by generated
+    /// SSA rather than an interpreter-compatible register window.
     ///
-    /// The published activation is only an operand source. Once the operands
-    /// are rooted, the value-level `[[Set]]` funnel owns every receiver shape:
-    /// ordinary objects and arrays, typed arrays, proxies, callable setters,
-    /// and hosted object families all complete synchronously without
-    /// materialising an interpreter frame. This keeps one semantic authority
-    /// for interpreted and compiled `StoreElement` execution.
-    pub fn jit_runtime_store_element(
+    /// Strictness is derived from `function_id`; feedback is recorded at the
+    /// exact published logical PC before any observable key coercion, proxy
+    /// trap, or setter call. A successful return means the complete store has
+    /// committed exactly once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn jit_runtime_store_element_value(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
-        frame: &ActiveFrameRef<'_>,
-        recv_reg: u16,
-        idx_reg: u16,
-        src_reg: u16,
+        function_id: u32,
+        instruction_pc: u32,
+        receiver: Value,
+        key_value: Value,
+        value: Value,
     ) -> Result<(), VmError> {
         self.record_jit_runtime_property_stub();
-        let function_id = frame.function_id();
-        let instruction_pc = frame.pc();
-        let receiver = frame.read(recv_reg)?;
-        let key_value = frame.read(idx_reg)?;
-        let value = frame.read(src_reg)?;
         if let Some(code_block) = context.exec_function(function_id) {
             self.record_element_family_feedback(code_block, instruction_pc, function_id, receiver);
         }

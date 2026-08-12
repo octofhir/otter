@@ -24,12 +24,15 @@
 //!   original bytecode before any observable effect can be replayed.
 //! - Parameters outside the exact entry live-in set have no HIR value, load,
 //!   guard, or allocator interval.
-//! - Indexed loads and stores require a baked VM element program plus the GC
-//!   cage. An ordinary packed-double array produces and consumes unboxed
+//! - Indexed loads and stores use a baked VM element program plus the GC cage
+//!   when one is available. An ordinary packed-double array produces and consumes unboxed
 //!   Number values. Its scalar Number index is converted to an exact Uint32
 //!   before the address guard, while a still-tagged index retains the ordinary
 //!   exact int32-tag proof. Neither form boxes an already-scalar payload.
-//!   Other families retain the tagged-value contract.
+//!   Other prepared families retain the tagged-value contract. Missing or
+//!   incompatible direct metadata becomes a reentrant boxed-value call that
+//!   owns canonical `[[Get]]`/`[[Set]]` completion; a generic operation inside
+//!   a local catch conservatively keeps the whole function materialized.
 //!   Every conversion and access frame state describes the exact pre-access
 //!   register window; every side exit precedes the load or effect-only store.
 //! - Ordinary property nodes exist independently of settled shape/slot
@@ -164,6 +167,19 @@ pub(super) enum NumericNode {
         value: NumericValue,
         byte_pc: u32,
         access: NumericElementAccess,
+    },
+    GenericElementLoad {
+        receiver: NumericValue,
+        index: NumericValue,
+        logical_pc: u32,
+        byte_pc: u32,
+    },
+    GenericElementStore {
+        receiver: NumericValue,
+        index: NumericValue,
+        value: NumericValue,
+        logical_pc: u32,
+        byte_pc: u32,
     },
     CheckedFloat64ToElementIndex {
         value: NumericValue,
@@ -385,6 +401,8 @@ impl NumericNode {
             | Self::PropertyLoad { .. }
             | Self::PropertyStore { .. }
             | Self::ElementStore { .. }
+            | Self::GenericElementLoad { .. }
+            | Self::GenericElementStore { .. }
             | Self::ArrayConstruct { .. }
             | Self::TaggedStringConcat(..)
             | Self::DirectCall { .. }
@@ -2369,22 +2387,48 @@ fn lower_instruction(
             return Some(());
         }
         Op::LoadElement => {
-            let access =
-                element_access_kind(element_accesses, instruction.byte_pc, cage_available)?;
             let receiver = read_value(registers, register(instruction, code, 1)?)?;
-            if value_type(nodes, receiver)? != NumericType::Tagged {
-                return None;
-            }
             let mut index = read_value(registers, register(instruction, code, 2)?)?;
-            if !matches!(
-                value_type(nodes, index)?,
-                NumericType::Tagged
-                    | NumericType::Int32
-                    | NumericType::Uint32
-                    | NumericType::Number
-            ) {
-                return None;
-            }
+            let receiver_type = value_type(nodes, receiver)?;
+            let index_type = value_type(nodes, index)?;
+            let access = element_access_kind(element_accesses, instruction.byte_pc, cage_available);
+            let direct = receiver_type == NumericType::Tagged
+                && matches!(
+                    index_type,
+                    NumericType::Tagged
+                        | NumericType::Int32
+                        | NumericType::Uint32
+                        | NumericType::Number
+                );
+            let Some(access) = access.filter(|_| direct) else {
+                if has_local_exception_handler(code, logical_pc) {
+                    return None;
+                }
+                let value = push(
+                    nodes,
+                    NumericNode::GenericElementLoad {
+                        receiver,
+                        index,
+                        logical_pc,
+                        byte_pc: instruction.byte_pc,
+                    },
+                );
+                block_nodes.push(value);
+                push_frame_state(
+                    frame_states,
+                    NumericFramePoint::Node(value),
+                    function_id,
+                    instruction.byte_pc,
+                    registers,
+                    live_in,
+                );
+                write(
+                    registers,
+                    register(instruction, code, 0)?,
+                    RegisterState::Value(value),
+                )?;
+                return Some(());
+            };
             if access == NumericElementAccess::PackedDouble
                 && value_type(nodes, index)? == NumericType::Number
             {
@@ -2432,22 +2476,57 @@ fn lower_instruction(
             return Some(());
         }
         Op::StoreElement => {
-            let access =
-                element_access_kind(element_accesses, instruction.byte_pc, cage_available)?;
             let receiver = read_value(registers, register(instruction, code, 0)?)?;
-            if value_type(nodes, receiver)? != NumericType::Tagged {
-                return None;
-            }
             let mut index = read_value(registers, register(instruction, code, 1)?)?;
-            if !matches!(
-                value_type(nodes, index)?,
+            let source_register = register(instruction, code, 2)?;
+            let mut stored = read_value(registers, source_register)?;
+            let receiver_type = value_type(nodes, receiver)?;
+            let index_type = value_type(nodes, index)?;
+            let stored_type = value_type(nodes, stored)?;
+            let access = element_access_kind(element_accesses, instruction.byte_pc, cage_available);
+            let direct_index = matches!(
+                index_type,
                 NumericType::Tagged
                     | NumericType::Int32
                     | NumericType::Uint32
                     | NumericType::Number
-            ) {
-                return None;
-            }
+            );
+            let direct_value = match access {
+                Some(NumericElementAccess::Tagged) => true,
+                Some(NumericElementAccess::PackedDouble) => match stored_type {
+                    NumericType::Number | NumericType::Int32 | NumericType::Uint32 => true,
+                    NumericType::Tagged => instruction.arith_feedback().is_numeric_only(),
+                    NumericType::Boolean => false,
+                },
+                None => false,
+            };
+            let Some(access) = access
+                .filter(|_| receiver_type == NumericType::Tagged && direct_index && direct_value)
+            else {
+                if has_local_exception_handler(code, logical_pc) {
+                    return None;
+                }
+                let value = push(
+                    nodes,
+                    NumericNode::GenericElementStore {
+                        receiver,
+                        index,
+                        value: stored,
+                        logical_pc,
+                        byte_pc: instruction.byte_pc,
+                    },
+                );
+                block_nodes.push(value);
+                push_frame_state(
+                    frame_states,
+                    NumericFramePoint::Node(value),
+                    function_id,
+                    instruction.byte_pc,
+                    registers,
+                    live_in,
+                );
+                return Some(());
+            };
             if access == NumericElementAccess::PackedDouble
                 && value_type(nodes, index)? == NumericType::Number
             {
@@ -2469,8 +2548,6 @@ fn lower_instruction(
                 );
                 index = checked;
             }
-            let source_register = register(instruction, code, 2)?;
-            let mut stored = read_value(registers, source_register)?;
             if access == NumericElementAccess::PackedDouble {
                 stored = match value_type(nodes, stored)? {
                     NumericType::Number => stored,
@@ -3287,6 +3364,12 @@ fn push_frame_state(
             })
             .collect(),
     });
+}
+
+fn has_local_exception_handler(code: &otter_vm::CodeBlock, logical_pc: u32) -> bool {
+    code.control_flow()
+        .enclosing_exception_region(logical_pc)
+        .is_some_and(|region| region.catch_pc.is_some())
 }
 
 fn element_access_kind(
@@ -5008,9 +5091,14 @@ mod tests {
             .get_mut(&8)
             .expect("packed load access")
             .guards[1] = None;
+        let incomplete = NumericFunction::build(&incomplete)
+            .expect("malformed direct metadata keeps the canonical generic element path");
         assert!(
-            NumericFunction::build(&incomplete).is_none(),
-            "raw Float64 InBody storage is unsafe without the physical-kind guard"
+            incomplete
+                .nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::GenericElementLoad { byte_pc: 8, .. })),
+            "raw Float64 InBody storage must never select the direct packed path"
         );
 
         let hir = NumericFunction::build(&packed_double_number_index_element_view())
@@ -5088,6 +5176,58 @@ mod tests {
             })
             .expect("PackedDouble element store");
         assert_eq!(store.value_type(), NumericType::Tagged);
+    }
+
+    #[test]
+    fn unprepared_elements_use_generic_value_calls_but_local_catches_stay_legacy() {
+        let mut view = number_index_element_view();
+        view.element_accesses.clear();
+        let hir = NumericFunction::build(&view).expect("generic element HIR");
+        let load = hir
+            .nodes
+            .iter()
+            .position(|node| {
+                matches!(
+                    node,
+                    NumericNode::GenericElementLoad {
+                        logical_pc: 1,
+                        byte_pc: 8,
+                        ..
+                    }
+                )
+            })
+            .map(NumericValue)
+            .expect("generic element load");
+        let store = hir
+            .nodes
+            .iter()
+            .position(|node| {
+                matches!(
+                    node,
+                    NumericNode::GenericElementStore {
+                        logical_pc: 2,
+                        byte_pc: 16,
+                        ..
+                    }
+                )
+            })
+            .map(NumericValue)
+            .expect("generic element store");
+        for (point, byte_pc) in [(load, 8), (store, 16)] {
+            let state = hir
+                .frame_states
+                .iter()
+                .find(|state| state.point == NumericFramePoint::Node(point))
+                .expect("generic element pre-operation state");
+            assert_eq!(state.byte_pc, byte_pc);
+        }
+
+        let mut caught = catch_liveness_view();
+        caught.element_accesses.clear();
+        assert!(
+            NumericFunction::build(&caught).is_none(),
+            "a generic value call inside a local catch stays on the materialized backend"
+        );
     }
 
     #[test]

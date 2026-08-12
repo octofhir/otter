@@ -69,11 +69,16 @@ It already owns:
   remains Machine IR with 30
   property loads, two non-cell stores, zero spills, no write-barrier stub, and
   5,788 bytes of code (down from 6,064 before store specialization);
-- descriptor-driven monomorphic plain, guarded-method, and fixed-arity base,
-  derived, and superclass JavaScript calls from Machine IR through the shared
-  generated-linkage emitter, with exact pre-call FrameState, allocator-owned
-  receiver/arguments/results, own/prototype guards, inherited `new.target`,
-  derived-`this` binding, and no interpreter-window shuttle;
+- descriptor-driven monomorphic plain/fixed-arity constructor calls and
+  complete dense one-to-four-target guarded method chains from Machine IR
+  through the shared generated-linkage emitter. One call descriptor, root
+  publication, safepoint, and exact pre-call FrameState cover the whole method
+  chain; each candidate retains its own receiver/prototype guard, callee
+  generation, and `targetIndex` / `targetCount` artifact identity. A final
+  guard miss deoptimizes before lookup or call effects. A call opcode that has
+  never executed may remain in an otherwise native body as a zero-effect cold
+  exit; the first real attempt invalidates that body, while attempted sites
+  without a complete plan still select the legacy fallback;
 - allocator-driven spills, AAPCS64 callee-saved allocation, exact frame sizing,
   fixed leaf ABI operands, and deterministic normalized allocation artifacts;
 - `MachineFrameState -> lower_deopt_table -> VM DeoptTable`, shared cold exits,
@@ -237,11 +242,18 @@ It already owns:
   materialized or generated stack-owned frames, and never recover an
   interpreter frame index merely to complete semantics.
 
+The bounded-method slice was frozen against the R47 release and run as two
+fresh B/C/C/B series, with a separate wrapper log and exit manifest for every
+process. Four-score medians moved DeltaBlue 571.5 -> 835 (+46.11%), Box2D
+1,895 -> 2,013.5 (+6.25%), and Richards 1,185.5 -> 1,162 (-1.98%); the
+three-workload geometric mean improved 15.02%. The Richards loss remains an
+explicit next-profile target rather than being relabelled as noise.
+
 The old optimizing compiler and template emitter remain in the active graph
 only for operations and function shapes not yet selected by the replacement
 pipeline. They are fallback, not contracts to preserve.
 
-Latest accepted gate: 53 bytecode, 86 compiler, 300 JIT, and 847 VM tests;
+Latest accepted gate: 53 bytecode, 86 compiler, 308 JIT, and 852 VM tests;
 the complete runtime suite; all-target/all-feature Clippy;
 compile-fail/rooting checks; and 21/21 differential
 interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.
@@ -250,9 +262,12 @@ interpreter/tier/GC-stress cases. Test262 was not run for the engine slices.
 
 ### 1. Complete reentrant operation families
 
-Plain calls, guarded methods, and fixed or spread base, derived, and superclass
-constructs now use the same descriptor, allocator roots, stable entry cells,
-frame publication, cold deopt machinery, and explicit catch landing edges.
+Plain calls, complete one-to-four-target guarded method chains, and fixed or
+spread base, derived, and superclass constructs now use the same descriptor,
+allocator roots, stable entry cells, frame publication, cold deopt machinery,
+and explicit catch landing edges. Cold unattempted plain/method sites are exact
+pre-effect exits; feedback records the first attempt before semantic work and
+evicts the obsolete caller generation, preventing a permanent deopt loop.
 Construction validates the generation before observable receiver work,
 publishes or inherits `new.target`, preserves the derived-`this` TDZ, and
 applies the one base/derived return contract without replaying `New` or

@@ -13,6 +13,9 @@
 //!   JIT code owns no parallel JS call semantics.
 //! - No frame borrow survives reentrant completion; the destination is
 //!   re-borrowed from the published stack afterwards.
+//! - A compiled generic method call records its attempt before receiver or
+//!   method lookup, matching interpreter dispatch and invalidating any stale
+//!   cold-exit snapshot even when lookup throws.
 //! - Spread validation order matches interpreter dispatch.
 //!
 //! # See also
@@ -38,6 +41,10 @@ impl Interpreter {
         name_index: u32,
         args: SmallVec<[Value; 8]>,
     ) -> Result<Value, VmError> {
+        let function = context
+            .exec_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        self.record_call_attempt_feedback(function, call_pc, function_id);
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         self.jit_runtime_stats.jit_to_rust_call_transitions = self
             .jit_runtime_stats

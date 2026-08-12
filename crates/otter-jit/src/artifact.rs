@@ -189,6 +189,8 @@ pub(crate) struct DirectCallArtifact {
     pub(crate) call_kind: DirectCallKindArtifact,
     pub(crate) argument_mode: DirectCallArgumentModeArtifact,
     pub(crate) target_function_id: u32,
+    pub(crate) target_index: u32,
+    pub(crate) target_count: u32,
     pub(crate) target_code_object_id: u64,
     pub(crate) target_tier: DirectCallTierArtifact,
     pub(crate) this_mode: DirectCallThisModeArtifact,
@@ -845,6 +847,8 @@ mod tests {
                 call_kind: DirectCallKindArtifact::Plain,
                 argument_mode: DirectCallArgumentModeArtifact::Fixed,
                 target_function_id: 11,
+                target_index: 0,
+                target_count: 1,
                 target_code_object_id: 29,
                 target_tier: DirectCallTierArtifact::Optimizing,
                 this_mode: DirectCallThisModeArtifact::SloppyGlobal,
@@ -865,6 +869,8 @@ mod tests {
         assert_eq!(region["bytePc"], 19);
         assert_eq!(region["directCall"]["callKind"], "plain");
         assert_eq!(region["directCall"]["targetFunctionId"], 11);
+        assert_eq!(region["directCall"]["targetIndex"], 0);
+        assert_eq!(region["directCall"]["targetCount"], 1);
         assert_eq!(region["directCall"]["targetCodeObjectId"], 29);
         assert_eq!(region["directCall"]["targetTier"], "optimizing");
         assert_eq!(region["directCall"]["thisMode"], "sloppyGlobal");

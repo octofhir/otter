@@ -1019,6 +1019,8 @@ pub(super) fn emit_call(
             view,
             DirectCallSite {
                 target,
+                target_index: 0,
+                target_count: 1,
                 caller_function_id: view.code_block.id,
                 logical_pc,
                 byte_pc,
@@ -1175,6 +1177,8 @@ pub(super) fn emit_construct(
             view,
             DirectCallSite {
                 target,
+                target_index: 0,
+                target_count: 1,
                 caller_function_id: view.code_block.id,
                 logical_pc,
                 byte_pc,
@@ -1429,6 +1433,8 @@ pub(super) fn emit_method_call(
         let next_target = ops.new_dynamic_label();
         let direct_site = DirectCallSite {
             target: &method.callee,
+            target_index: method.target_index,
+            target_count: method.target_count,
             caller_function_id: view.code_block.id,
             logical_pc,
             byte_pc,

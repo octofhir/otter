@@ -27,8 +27,10 @@
 //! - Allocating calls save every live tagged value from its exact late-use
 //!   location into the frame's collector-visible root area and reload it after
 //!   moving GC; no interpreter-window shuttle or emitter-local map exists.
-//! - Guarded methods, plain calls, and fixed/spread base/derived/super
-//!   construction share one typed descriptor and generated linkage emitter.
+//! - Complete one-to-four-target guarded method chains, monomorphic plain calls,
+//!   and fixed/spread base/derived/super construction share one typed descriptor
+//!   and generated linkage emitter. A never-attempted unplanned plain/method call
+//!   selects a pure, root-free, safepoint-free exact deopt boundary.
 //!   Spread lowering consumes the compiler-created dense argument array;
 //!   eligible callees cannot observe discarded arguments through rest or the
 //!   `arguments` object.
@@ -51,15 +53,17 @@ use otter_vm::{
 use std::collections::{BTreeMap, BTreeSet};
 
 use self::hir::{
-    NumericDirectCallArguments, NumericDirectCallKind, NumericDirectCallTarget, NumericFramePoint,
-    NumericFunction, NumericNode, NumericTerminator, NumericType,
+    NumericColdCallKind, NumericDirectCallArguments, NumericDirectCallKind,
+    NumericDirectCallTarget, NumericFramePoint, NumericFunction, NumericNode, NumericTerminator,
+    NumericType,
 };
 use super::{
-    CallDescriptor, CallEffects, CallTarget, ControlFlow, DeoptId, DirectCallArgumentMode,
-    DirectCallKind, ExceptionalEdge, InstructionSequence, MachineBlock, MachineBlockData,
-    MachineInstruction, MachineInstructionId, MachineOpcode, MachineOperand, MachineOsrInput,
-    MachineOsrType, MachineRepresentation, MachineValue, PhysicalRegister, SafepointKind,
-    TargetRegisterFile, lower_deopt_table, lower_safepoints,
+    CallDescriptor, CallEffects, CallTarget, ColdCallKind, ControlFlow, DeoptId,
+    DirectCallArgumentMode, DirectCallCandidate, DirectCallKind, ExceptionalEdge,
+    InstructionSequence, MachineBlock, MachineBlockData, MachineInstruction, MachineInstructionId,
+    MachineOpcode, MachineOperand, MachineOsrInput, MachineOsrType, MachineRepresentation,
+    MachineValue, PhysicalRegister, SafepointKind, TargetRegisterFile, lower_deopt_table,
+    lower_safepoints,
 };
 use crate::{
     Unsupported,
@@ -1085,6 +1089,35 @@ fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::Verificat
                         .expect("bounded scalar function safepoint count");
                     call
                 }
+                NumericNode::ColdCallExit {
+                    kind,
+                    logical_pc,
+                    byte_pc,
+                    exceptional_edge,
+                } => {
+                    let landing_pad = exceptional_edge.map(|edge| {
+                        let edge = usize::from(edge);
+                        selection_cfg
+                            .split_edges
+                            .get(&(block_index, edge))
+                            .copied()
+                            .unwrap_or_else(|| selection_cfg.originals[block.successors[edge]])
+                    });
+                    let descriptor_index = intern_call_descriptor(
+                        &mut call_descriptors,
+                        cold_call_exit_descriptor(
+                            kind,
+                            hir.function_id,
+                            logical_pc,
+                            byte_pc,
+                            landing_pad,
+                        ),
+                    );
+                    MachineInstruction::plain(
+                        MachineOpcode::Call(descriptor_index as u32),
+                        vec![MachineOperand::register_output(result)],
+                    )
+                }
                 NumericNode::FloatToBoolean(source) => MachineInstruction::plain(
                     MachineOpcode::FloatToBoolean,
                     vec![
@@ -1309,11 +1342,9 @@ fn direct_call_descriptor(
 ) -> CallDescriptor {
     CallDescriptor {
         target: CallTarget::Direct {
-            kind: match &target.kind {
+            kind: match target.kind {
                 NumericDirectCallKind::Plain => DirectCallKind::Plain,
-                NumericDirectCallKind::Method(guard) => DirectCallKind::Method {
-                    guard: guard.clone(),
-                },
+                NumericDirectCallKind::Method => DirectCallKind::Method,
                 NumericDirectCallKind::Construct => DirectCallKind::Construct,
                 NumericDirectCallKind::DerivedConstruct => DirectCallKind::DerivedConstruct,
                 NumericDirectCallKind::SuperConstruct => DirectCallKind::SuperConstruct,
@@ -1322,7 +1353,16 @@ fn direct_call_descriptor(
                 }
             },
             argument_mode,
-            callee: target.callee,
+            candidates: target
+                .candidates
+                .iter()
+                .map(|candidate| DirectCallCandidate {
+                    target_index: candidate.target_index,
+                    target_count: candidate.target_count,
+                    guard: candidate.guard.clone(),
+                    callee: candidate.callee,
+                })
+                .collect(),
             caller_function_id: hir.function_id,
             logical_pc,
             byte_pc,
@@ -1338,6 +1378,34 @@ fn direct_call_descriptor(
             .map(ExceptionalEdge::LandingPad)
             .unwrap_or(ExceptionalEdge::Propagate),
         safepoint: SafepointKind::Gc,
+    }
+}
+
+fn cold_call_exit_descriptor(
+    kind: NumericColdCallKind,
+    caller_function_id: u32,
+    logical_pc: u32,
+    byte_pc: u32,
+    landing_pad: Option<MachineBlock>,
+) -> CallDescriptor {
+    CallDescriptor {
+        target: CallTarget::ColdCallExit {
+            kind: match kind {
+                NumericColdCallKind::Plain => ColdCallKind::Plain,
+                NumericColdCallKind::Method => ColdCallKind::Method,
+            },
+            caller_function_id,
+            logical_pc,
+            byte_pc,
+        },
+        arguments: Vec::new(),
+        result: Some(MachineRepresentation::Tagged),
+        effects: CallEffects::PURE,
+        clobbers: Vec::new(),
+        exceptional: landing_pad
+            .map(ExceptionalEdge::LandingPad)
+            .unwrap_or(ExceptionalEdge::Propagate),
+        safepoint: SafepointKind::None,
     }
 }
 
@@ -1633,8 +1701,8 @@ mod tests {
     use otter_bytecode::{Op, Operand};
     use otter_vm::{
         JitArtifactFileName, JitArtifactIdentity, JitCompileSnapshot, JitDebugTarget, JitDebugTier,
-        JitFunctionCode, JitInlinePropertyLoad, Value,
-        jit::JitTestInstruction,
+        JitDirectCallThisMode, JitDirectCallee, JitFunctionCode, JitInlinePropertyLoad, Value,
+        jit::{JitDirectCallPlan, JitMethodGuard, JitTestInstruction},
         jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ARITH_STRING, ArithFeedback},
         native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader, VmThread},
         value::tag,
@@ -1648,6 +1716,135 @@ mod tests {
     };
 
     const POLL_BATCH: i32 = crate::arm64::GENERATED_POLL_BATCH as i32;
+
+    fn selection_direct_callee(function_id: u32) -> JitDirectCallee {
+        JitDirectCallee {
+            plan: JitDirectCallPlan {
+                function_id,
+                code_object_id: u64::from(function_id) + 1,
+                entry_cell: u64::from(function_id) + 2,
+                tier: NativeFrameKind::Baseline,
+                this_mode: JitDirectCallThisMode::StrictOrLexical,
+                is_derived_constructor: false,
+                generated_stack_frame_bytes: Some(0),
+                param_count: 1,
+                register_count: 2,
+                own_upvalue_count: 0,
+                inherited_upvalue_count: 0,
+            },
+            receiver_allocation: None,
+        }
+    }
+
+    fn method_call_selection_hir() -> NumericFunction {
+        let value = hir::NumericValue;
+        NumericFunction {
+            function_id: 150,
+            nodes: vec![
+                NumericNode::Parameter {
+                    register: 0,
+                    value_type: NumericType::Int32,
+                },
+                NumericNode::BooleanConstant(true),
+                NumericNode::DirectCall {
+                    source: value(0),
+                    target: 0,
+                    arguments: NumericDirectCallArguments::Fixed { start: 0, count: 1 },
+                    logical_pc: 4,
+                    byte_pc: 32,
+                    exceptional_edge: None,
+                },
+            ],
+            blocks: vec![hir::NumericBlock {
+                logical_pc: 0,
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                parameters: Vec::new(),
+                parameter_registers: Vec::new(),
+                successor_arguments: Vec::new(),
+                nodes: vec![value(0), value(1), value(2)],
+                terminator: NumericTerminator::Return(value(2)),
+            }],
+            frame_states: vec![hir::NumericFrameState {
+                point: NumericFramePoint::Node(value(2)),
+                function_id: 150,
+                byte_pc: 32,
+                slots: vec![
+                    hir::NumericFrameSlot::Value(value(0)),
+                    hir::NumericFrameSlot::Value(value(1)),
+                    hir::NumericFrameSlot::Undefined,
+                ],
+            }],
+            direct_call_targets: vec![NumericDirectCallTarget {
+                kind: NumericDirectCallKind::Method,
+                candidates: (0..4)
+                    .map(|target_index| {
+                        let function_id = 160 + target_index;
+                        hir::NumericDirectCallCandidate {
+                            target_index,
+                            target_count: 4,
+                            guard: Some(JitMethodGuard {
+                                method_fid: function_id,
+                                recv_shape: 20 + target_index,
+                                proto_chain: vec![30 + target_index],
+                                method_value_byte: 40 + target_index * 8,
+                            }),
+                            callee: selection_direct_callee(function_id),
+                        }
+                    })
+                    .collect(),
+            }],
+            direct_call_arguments: vec![value(1)],
+            parameter_count: 1,
+            register_count: 3,
+            arithmetic_op_count: 0,
+        }
+    }
+
+    fn cold_call_selection_hir() -> NumericFunction {
+        let value = hir::NumericValue;
+        NumericFunction {
+            function_id: 151,
+            nodes: vec![
+                NumericNode::Parameter {
+                    register: 0,
+                    value_type: NumericType::Int32,
+                },
+                NumericNode::BooleanConstant(true),
+                NumericNode::ColdCallExit {
+                    kind: NumericColdCallKind::Plain,
+                    logical_pc: 5,
+                    byte_pc: 40,
+                    exceptional_edge: None,
+                },
+            ],
+            blocks: vec![hir::NumericBlock {
+                logical_pc: 0,
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                parameters: Vec::new(),
+                parameter_registers: Vec::new(),
+                successor_arguments: Vec::new(),
+                nodes: vec![value(0), value(1), value(2)],
+                terminator: NumericTerminator::Return(value(2)),
+            }],
+            frame_states: vec![hir::NumericFrameState {
+                point: NumericFramePoint::Node(value(2)),
+                function_id: 151,
+                byte_pc: 40,
+                slots: vec![
+                    hir::NumericFrameSlot::Value(value(0)),
+                    hir::NumericFrameSlot::Value(value(1)),
+                    hir::NumericFrameSlot::Undefined,
+                ],
+            }],
+            direct_call_targets: Vec::new(),
+            direct_call_arguments: Vec::new(),
+            parameter_count: 1,
+            register_count: 3,
+            arithmetic_op_count: 0,
+        }
+    }
 
     fn numeric_view(
         param_count: u16,
@@ -3824,6 +4021,213 @@ mod tests {
             }],
         );
         view
+    }
+
+    #[test]
+    fn selects_one_call_boundary_for_a_four_target_method_chain() {
+        let sequence = select(&method_call_selection_hir()).expect("polymorphic method Machine IR");
+        let calls = sequence
+            .instructions()
+            .iter()
+            .filter(|instruction| matches!(instruction.opcode, MachineOpcode::Call(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        let call = calls[0];
+        let MachineOpcode::Call(descriptor_index) = call.opcode else {
+            unreachable!("filtered call")
+        };
+        let descriptor = &sequence.call_descriptors()[descriptor_index as usize];
+        let CallTarget::Direct {
+            kind, candidates, ..
+        } = &descriptor.target
+        else {
+            panic!("direct method target")
+        };
+        assert_eq!(*kind, DirectCallKind::Method);
+        assert_eq!(candidates.len(), 4);
+        for (index, candidate) in candidates.iter().enumerate() {
+            assert_eq!(candidate.target_index, index as u32);
+            assert_eq!(candidate.target_count, 4);
+            assert!(candidate.guard.is_some());
+        }
+        assert_eq!(call.safepoint, Some(SafepointId(0)));
+        assert_eq!(call.deopt, Some(DeoptId(0)));
+        assert_eq!(
+            call.operands
+                .iter()
+                .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
+                .count(),
+            1,
+            "the shared argument root must not be multiplied by candidate count"
+        );
+        assert_eq!(
+            sequence
+                .instructions()
+                .iter()
+                .filter(|instruction| instruction.opcode == MachineOpcode::BoxInt32)
+                .count(),
+            1,
+            "receiver boxing is shared by the whole chain"
+        );
+        assert_eq!(
+            sequence
+                .instructions()
+                .iter()
+                .filter(|instruction| instruction.opcode == MachineOpcode::BoxBoolean)
+                .count(),
+            1,
+            "argument boxing is shared by the whole chain"
+        );
+    }
+
+    #[test]
+    fn cold_call_selection_is_deopt_only_and_allocates_no_call_state() {
+        let sequence = select(&cold_call_selection_hir()).expect("cold call Machine IR");
+        let (call_id, call) = sequence
+            .instructions()
+            .iter()
+            .enumerate()
+            .find(|(_, instruction)| matches!(instruction.opcode, MachineOpcode::Call(_)))
+            .expect("cold call instruction");
+        let MachineOpcode::Call(descriptor_index) = call.opcode else {
+            unreachable!("selected call")
+        };
+        let descriptor = &sequence.call_descriptors()[descriptor_index as usize];
+        assert_eq!(
+            descriptor.target,
+            CallTarget::ColdCallExit {
+                kind: ColdCallKind::Plain,
+                caller_function_id: 151,
+                logical_pc: 5,
+                byte_pc: 40,
+            }
+        );
+        assert_eq!(descriptor.arguments, Vec::new());
+        assert_eq!(descriptor.result, Some(MachineRepresentation::Tagged));
+        assert_eq!(descriptor.effects, CallEffects::PURE);
+        assert_eq!(descriptor.safepoint, SafepointKind::None);
+        assert!(descriptor.clobbers.is_empty());
+        assert!(call.clobbers.is_empty());
+        assert_eq!(call.safepoint, None);
+        assert_eq!(call.deopt, Some(DeoptId(0)));
+        assert!(call.operands.iter().all(|operand| {
+            !matches!(
+                operand.purpose,
+                OperandPurpose::Input | OperandPurpose::TaggedRoot | OperandPurpose::CellRoot
+            )
+        }));
+        assert!(sequence.instructions().iter().all(|instruction| {
+            !matches!(
+                instruction.opcode,
+                MachineOpcode::BoxInt32
+                    | MachineOpcode::BoxUint32
+                    | MachineOpcode::BoxNumber
+                    | MachineOpcode::BoxBoolean
+            )
+        }));
+        assert_eq!(
+            sequence.verify(),
+            Ok(()),
+            "cold call i{call_id} retains a valid exact deopt contract"
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_partial_or_malformed_direct_method_chains() {
+        let valid = select(&method_call_selection_hir()).expect("valid method chain");
+        let assert_invalid =
+            |mut sequence: InstructionSequence,
+             mutate: &dyn Fn(&mut DirectCallKind, &mut Vec<DirectCallCandidate>)| {
+                let (call_id, descriptor_index) = sequence
+                    .instructions
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, instruction)| match instruction.opcode {
+                        MachineOpcode::Call(descriptor_index) => Some((index, descriptor_index)),
+                        _ => None,
+                    })
+                    .expect("direct call");
+                let CallTarget::Direct {
+                    kind, candidates, ..
+                } = &mut sequence.call_descriptors[descriptor_index as usize].target
+                else {
+                    panic!("direct target")
+                };
+                mutate(kind, candidates);
+                assert_eq!(
+                    sequence.verify(),
+                    Err(crate::machine::VerificationError::InvalidCallTarget(
+                        MachineInstructionId(call_id as u32)
+                    ))
+                );
+            };
+
+        assert_invalid(valid.clone(), &|_, candidates| {
+            candidates.clear();
+        });
+        assert_invalid(valid.clone(), &|_, candidates| {
+            candidates[1].target_index = 2;
+        });
+        assert_invalid(valid.clone(), &|_, candidates| {
+            candidates[1].target_count = 3;
+        });
+        assert_invalid(valid.clone(), &|_, candidates| {
+            candidates[1].guard = None;
+        });
+        assert_invalid(valid.clone(), &|_, candidates| {
+            candidates[1]
+                .guard
+                .as_mut()
+                .expect("method guard")
+                .method_fid += 1;
+        });
+        assert_invalid(valid.clone(), &|_, candidates| {
+            let mut fifth = candidates[3].clone();
+            fifth.target_index = 4;
+            fifth.target_count = 5;
+            fifth.guard.as_mut().expect("method guard").method_fid = fifth.callee.plan.function_id;
+            for candidate in candidates.iter_mut() {
+                candidate.target_count = 5;
+            }
+            candidates.push(fifth);
+        });
+        assert_invalid(valid, &|kind, candidates| {
+            *kind = DirectCallKind::Plain;
+            for candidate in candidates {
+                candidate.guard = None;
+            }
+        });
+    }
+
+    #[test]
+    fn verifier_requires_the_complete_cold_exit_contract() {
+        let valid = select(&cold_call_selection_hir()).expect("valid cold call");
+        let call_id = valid
+            .instructions
+            .iter()
+            .position(|instruction| matches!(instruction.opcode, MachineOpcode::Call(_)))
+            .expect("cold call");
+
+        let mut missing_deopt = valid.clone();
+        missing_deopt.instructions[call_id].deopt = None;
+        assert_eq!(
+            missing_deopt.verify(),
+            Err(crate::machine::VerificationError::InvalidCallTarget(
+                MachineInstructionId(call_id as u32)
+            ))
+        );
+
+        let mut effectful = valid;
+        let MachineOpcode::Call(descriptor_index) = effectful.instructions[call_id].opcode else {
+            unreachable!("cold call")
+        };
+        effectful.call_descriptors[descriptor_index as usize].effects = CallEffects::READS_HEAP;
+        assert_eq!(
+            effectful.verify(),
+            Err(crate::machine::VerificationError::InvalidCallTarget(
+                MachineInstructionId(call_id as u32)
+            ))
+        );
     }
 
     #[test]

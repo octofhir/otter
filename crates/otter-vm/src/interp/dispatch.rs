@@ -268,6 +268,13 @@ impl Interpreter {
                     continue;
                 }
                 Op::Call => {
+                    if jit_installed {
+                        self.record_call_attempt_feedback(
+                            function,
+                            instr.instruction_pc,
+                            function_id,
+                        );
+                    }
                     let depth_before = stack.len();
                     let static_native_target = if jit_installed {
                         register_operand(function.operand(instr, 1))
@@ -343,6 +350,13 @@ impl Interpreter {
                     continue;
                 }
                 Op::CallMethodValue => {
+                    if jit_installed {
+                        self.record_call_attempt_feedback(
+                            function,
+                            instr.instruction_pc,
+                            function_id,
+                        );
+                    }
                     let depth_before = stack.len();
                     let feedback_site = instr.property_ic_site();
                     // Capture the receiver/prototype layout before the call for
@@ -397,7 +411,12 @@ impl Interpreter {
                     if jit_installed && stack.len() > depth_before {
                         let method_fid = stack[stack.len() - 1].function_id;
                         if let (Some(feedback_site), Some(site)) = (feedback_site, method_site) {
-                            self.note_method_target(feedback_site, method_fid, site);
+                            let changed = self.note_method_target(feedback_site, method_fid, site);
+                            self.commit_method_call_feedback_transition(
+                                function,
+                                function_id,
+                                changed,
+                            );
                         }
                         if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)? {
                             return Ok(value);
@@ -406,7 +425,9 @@ impl Interpreter {
                         && let (Some(feedback_site), Some(site), Some(stub_id)) =
                             (feedback_site, method_site, native_leaf)
                     {
-                        self.record_method_native_leaf_feedback(feedback_site, stub_id, site);
+                        let changed =
+                            self.record_method_native_leaf_feedback(feedback_site, stub_id, site);
+                        self.commit_method_call_feedback_transition(function, function_id, changed);
                     }
                     continue;
                 }

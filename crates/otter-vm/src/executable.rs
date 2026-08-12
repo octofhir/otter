@@ -322,6 +322,12 @@ impl CodeBlock {
                     // Resolved by `ExecutionContext::jit_compile_snapshot`, which
                     // can read the number-constant pool for a `LoadNumber`.
                     load_number: None,
+                    // A call attempt is recorded before callable/property
+                    // resolution, so absence means the branch truly stayed
+                    // cold rather than merely throwing before target feedback.
+                    call_attempted: self
+                        .feedback_at(index)
+                        .is_some_and(crate::feedback::InstructionFeedback::call_attempted),
                     // A site that has never executed falls back to the
                     // compiler's TypeScript annotation, which is enough for the
                     // optimizing tier to pick a guarded numeric lowering
@@ -483,6 +489,12 @@ impl CodeBlock {
         index: usize,
     ) -> Option<crate::feedback::InstructionFeedbackRecorder<'_>> {
         self.feedback.recorder(index)
+    }
+
+    /// Advance the shared epoch for isolate-owned feedback that changed
+    /// outside the dense CodeBlock cells.
+    pub(crate) fn bump_feedback_epoch(&self) {
+        self.feedback.bump_epoch();
     }
 
     /// Bounded ordinary-call distribution at one canonical instruction.

@@ -13,8 +13,9 @@
 //! - [`MachineInstruction`] — one selected operation and its allocator inputs.
 //! - [`MachineOpcode`] — scalar operations, guarded element accesses, control
 //!   flow, and descriptor-backed calls.
-//! - [`CallDescriptor`] and [`DirectCallKind`] — complete semantic target,
-//!   guard, ABI, effects, and normal/exceptional exits.
+//! - [`CallDescriptor`], [`DirectCallCandidate`], and [`DirectCallKind`] —
+//!   complete semantic target chains, guards, ABI, effects, and
+//!   normal/exceptional exits.
 //! - [`TargetRegisterFile`] — complete allocatable target register inventory.
 //! - [`AllocatedSequence`] — allocator edits, per-operand locations, and exact
 //!   safepoint/deoptimization locations.
@@ -27,6 +28,10 @@
 //!   branch or return instruction.
 //! - Metadata values are ordinary late uses. Calls therefore cannot leave a
 //!   live GC/deopt value in a clobbered register.
+//! - Direct methods own one complete dense one-to-four-candidate chain; plain
+//!   and constructor targets remain monomorphic. A cold call exit owns no
+//!   inputs, effects, clobbers, roots, or safepoint and must carry an exact
+//!   pre-call deoptimization state.
 //! - Root and deopt maps are built from the same per-operand allocation table
 //!   consumed by the emitter; there is no pre-allocation location fallback.
 //! - OSR sources are immutable entry metadata aligned with ordinary late-use
@@ -364,16 +369,13 @@ pub enum SafepointKind {
 }
 
 /// JavaScript entry semantics for one compiler-generated call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectCallKind {
     /// Ordinary call whose dynamic callable is an allocator-owned operand.
     Plain,
     /// Method call whose receiver/prototype chain and current callable must be
     /// revalidated immediately before native entry.
-    Method {
-        /// Exact VM-baked receiver, prototype, and method-slot identity.
-        guard: otter_vm::jit::JitMethodGuard,
-    },
+    Method,
     /// Base construction with receiver creation and `new.target` publication
     /// owned by the generated call boundary.
     Construct,
@@ -383,6 +385,35 @@ pub enum DirectCallKind {
     SuperConstruct,
     /// Derived superclass construction with the caller's `new.target`.
     DerivedSuperConstruct,
+}
+
+/// Maximum complete guarded method chain accepted by the Machine backend.
+///
+/// The VM may retain a larger bounded feedback chain for other tiers. Machine
+/// lowering never truncates one: a site is selected only when its entire dense
+/// chain fits this limit.
+pub const MAX_MACHINE_DIRECT_METHOD_TARGETS: usize = 4;
+
+/// One member of a complete compiler-generated call target chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectCallCandidate {
+    /// Zero-based dense position in the captured chain.
+    pub target_index: u32,
+    /// Total captured target count, repeated on every candidate.
+    pub target_count: u32,
+    /// Exact receiver/prototype/method-slot guard for method candidates.
+    pub guard: Option<otter_vm::jit::JitMethodGuard>,
+    /// Exact callee generation plan and stable function entry cell.
+    pub callee: otter_vm::JitDirectCallee,
+}
+
+/// Source call family represented by an always-deoptimizing cold exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColdCallKind {
+    /// Ordinary `Call` whose site had never executed at snapshot time.
+    Plain,
+    /// Receiver-bound `CallMethodValue` whose site had never executed.
+    Method,
 }
 
 /// How a generated call obtains the callee's declared parameter prefix.
@@ -399,20 +430,33 @@ pub enum DirectCallArgumentMode {
 pub enum CallTarget {
     /// VM-owned runtime entry with one statically declared ABI.
     RuntimeStub(otter_vm::native_abi::RuntimeStubDescriptor),
-    /// VM-planned monomorphic JavaScript callee entered through generated
-    /// stack-owned linkage.
+    /// VM-planned JavaScript callee chain entered through generated stack-owned
+    /// linkage. Plain and constructor calls remain monomorphic; guarded methods
+    /// may carry one complete dense bounded chain.
     Direct {
         /// Plain or receiver-bound method entry through the shared linkage.
         kind: DirectCallKind,
         /// Fixed operands or one compiler-created dense spread array.
         argument_mode: DirectCallArgumentMode,
-        /// Exact callee generation plan and stable function entry cell.
-        callee: otter_vm::JitDirectCallee,
+        /// Complete target chain in guard order.
+        candidates: Vec<DirectCallCandidate>,
         /// Calling function identity used by started-call deoptimization.
         caller_function_id: u32,
         /// Canonical caller instruction index.
         logical_pc: u32,
         /// Caller byte offset used by diagnostics and relocations.
+        byte_pc: u32,
+    },
+    /// A proven-never-attempted ordinary call. Generated code exits at the
+    /// exact pre-call state before boxing, rooting, or any observable effect.
+    ColdCallExit {
+        /// Plain or receiver-bound source call family.
+        kind: ColdCallKind,
+        /// Calling function identity used by exact deoptimization.
+        caller_function_id: u32,
+        /// Canonical caller instruction index.
+        logical_pc: u32,
+        /// Caller byte offset used by diagnostics.
         byte_pc: u32,
     },
 }
@@ -712,6 +756,8 @@ pub enum VerificationError {
     DuplicateDeopt(DeoptId),
     /// A call references a missing descriptor.
     InvalidCallDescriptor(MachineInstructionId, u32),
+    /// A direct or cold call target violates its bounded semantic contract.
+    InvalidCallTarget(MachineInstructionId),
     /// A call's ordinary inputs/results disagree with its descriptor.
     CallSignatureMismatch(MachineInstructionId),
     /// A call's safepoint marker disagrees with its descriptor.
@@ -960,6 +1006,45 @@ impl InstructionSequence {
                             descriptor_index,
                         ));
                     };
+                    let valid_target = match &descriptor.target {
+                        CallTarget::RuntimeStub(_) => true,
+                        CallTarget::Direct {
+                            kind, candidates, ..
+                        } => {
+                            let method = *kind == DirectCallKind::Method;
+                            let count = candidates.len();
+                            let valid_count = if method {
+                                (1..=MAX_MACHINE_DIRECT_METHOD_TARGETS).contains(&count)
+                            } else {
+                                count == 1
+                            };
+                            let target_count = u32::try_from(count).ok();
+                            valid_count
+                                && candidates.iter().enumerate().all(|(index, candidate)| {
+                                    candidate.target_index == index as u32
+                                        && Some(candidate.target_count) == target_count
+                                        && if method {
+                                            candidate.guard.as_ref().is_some_and(|guard| {
+                                                guard.method_fid
+                                                    == candidate.callee.plan.function_id
+                                            })
+                                        } else {
+                                            candidate.guard.is_none()
+                                        }
+                                })
+                        }
+                        CallTarget::ColdCallExit { .. } => {
+                            descriptor.arguments.is_empty()
+                                && descriptor.result == Some(MachineRepresentation::Tagged)
+                                && descriptor.effects == CallEffects::PURE
+                                && descriptor.clobbers.is_empty()
+                                && descriptor.safepoint == SafepointKind::None
+                                && instruction.deopt.is_some()
+                        }
+                    };
+                    if !valid_target {
+                        return Err(VerificationError::InvalidCallTarget(id));
+                    }
                     let inputs = instruction
                         .operands
                         .iter()

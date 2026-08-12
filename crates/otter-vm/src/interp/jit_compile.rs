@@ -977,20 +977,16 @@ impl Interpreter {
 
     /// Record the live `Mono`/`Poly` overlay for one `Op::CallMethodValue` site.
     ///
-    /// Method feedback does not invalidate installed machine code. Baseline
-    /// method sites always retain their runtime IC/direct-link fallback, so new
-    /// receiver shapes can populate that live overlay without rebuilding the
-    /// caller's immutable executable body. The initial snapshot may still bake
-    /// already-observed tiny method bodies; later observations use the live
-    /// multi-entry link table until normal bail-driven tier policy decides that
-    /// a fresh compilation is warranted.
+    /// Returns `true` when the bounded target population changes. The caller
+    /// uses that transition to invalidate an immutable optimizing guard chain;
+    /// repeated hits merely update frequency and return `false`.
     pub(crate) fn note_method_target(
         &mut self,
         feedback_site: usize,
         method_fid: u32,
         site: MethodSite,
-    ) {
-        self.record_method_target_feedback(feedback_site, method_fid, site);
+    ) -> bool {
+        self.record_method_target_feedback(feedback_site, method_fid, site)
     }
 
     /// Classify the method a `CallMethodValue` site is about to invoke against
@@ -1779,9 +1775,9 @@ impl Interpreter {
 
     /// Bake one compiler-generated method call independently of leaf inlining.
     ///
-    /// Only a monomorphic feedback target reaches this helper. The target must
-    /// be an ordinary synchronous function with an exact fresh/inherited
-    /// upvalue count and one entry-capable native generation.
+    /// Each bounded mono/poly feedback target reaches this helper independently.
+    /// The target must be an ordinary synchronous function with exact fresh and
+    /// inherited upvalue counts and one entry-capable native generation.
     /// Recursive entry resolves through the same stable generation cell as
     /// every other generated call. Inherited closure captures are consumed
     /// directly.

@@ -75,6 +75,7 @@ const ELEMENT_TYPED_FLOAT64: u8 = 3;
 const ELEMENT_GENERIC: u8 = 4;
 const ELEMENT_MASK: u8 = 0b0000_0111;
 
+const CALL_ATTEMPTED_SEEN: u8 = 1 << 3;
 const BRANCH_TAKEN_SEEN: u8 = 1 << 4;
 const BRANCH_NOT_TAKEN_SEEN: u8 = 1 << 5;
 
@@ -649,6 +650,21 @@ impl Clone for InstructionFeedback {
 }
 
 impl InstructionFeedback {
+    /// Record that one call-family instruction reached semantic dispatch.
+    ///
+    /// This precedes callable/property resolution, so even a throwing or
+    /// otherwise unclassifiable call is no longer mistaken for an unexecuted
+    /// cold branch. Returns `true` only on the first attempt.
+    pub fn record_call_attempted(&self) -> bool {
+        self.states.fetch_or(CALL_ATTEMPTED_SEEN, Ordering::Relaxed) & CALL_ATTEMPTED_SEEN == 0
+    }
+
+    /// Whether semantic dispatch has been attempted at this call site.
+    #[must_use]
+    pub fn call_attempted(&self) -> bool {
+        self.states.load(Ordering::Relaxed) & CALL_ATTEMPTED_SEEN != 0
+    }
+
     /// Record one conditional-branch outcome in this instruction's dense cell.
     /// Returns `true` only for the first observation of each direction; compact
     /// hit counters continue saturating independently on every observation.
@@ -927,6 +943,11 @@ impl<'a> InstructionFeedbackRecorder<'a> {
         self.note_transition(self.cell.record_element_family(observed))
     }
 
+    /// Record the first call attempt and advance the owning feedback epoch.
+    pub(crate) fn record_call_attempted(self) -> bool {
+        self.note_transition(self.cell.record_call_attempted())
+    }
+
     /// Record a branch sample and advance the epoch on a newly seen direction.
     pub(crate) fn record_branch(self, taken: bool) -> bool {
         self.note_transition(self.cell.record_branch(taken))
@@ -1019,6 +1040,26 @@ mod tests {
         assert!(!cell.record_branch(true));
         assert_eq!(cell.branch_counts(), (2, 3));
         assert_eq!(cell.clone().branch_counts(), (2, 3));
+    }
+
+    #[test]
+    fn call_attempt_feedback_is_monotonic_and_survives_clone() {
+        let cell = InstructionFeedback::default();
+        assert!(!cell.call_attempted());
+        assert!(cell.record_call_attempted());
+        assert!(cell.call_attempted());
+        assert!(!cell.record_call_attempted());
+        assert!(cell.clone().call_attempted());
+    }
+
+    #[test]
+    fn call_attempt_advances_vector_epoch_once() {
+        let vector = FeedbackVector::for_instruction_ops([Op::Call]);
+        let feedback = vector.recorder(0).expect("call feedback cell");
+        assert!(feedback.record_call_attempted());
+        assert_eq!(vector.epoch(), 1);
+        assert!(!feedback.record_call_attempted());
+        assert_eq!(vector.epoch(), 1);
     }
 
     #[test]

@@ -3314,6 +3314,8 @@ fn emit(
                                 view,
                                 DirectCallSite {
                                     target,
+                                    target_index: 0,
+                                    target_count: 1,
                                     caller_function_id: frame.function_id(),
                                     logical_pc: instruction.pc,
                                     byte_pc,
@@ -4365,6 +4367,8 @@ fn emit(
                                     view,
                                     DirectCallSite {
                                         target,
+                                        target_index: 0,
+                                        target_count: 1,
                                         caller_function_id: frame.function_id(),
                                         logical_pc: instruction.pc,
                                         byte_pc,

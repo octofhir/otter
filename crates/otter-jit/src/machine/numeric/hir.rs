@@ -29,10 +29,13 @@
 //! - A protected instruction's deopt state retains values used only by its
 //!   innermost catch. This implicit liveness is solved with normal CFG
 //!   liveness; element and scalar guards do not become generated throw edges.
-//! - Reentrant calls require one VM-planned direct target and carry an exact
-//!   pre-call FrameState. Guarded methods additionally retain the VM-baked
-//!   receiver/prototype/slot identity. Supported catch regions become explicit
-//!   exceptional CFG edges whose landing state receives the thrown value.
+//! - Reentrant plain/constructor calls remain monomorphic. Guarded methods
+//!   accept only a complete dense one-to-four-target VM plan and carry one exact
+//!   pre-call FrameState for the whole chain. A never-attempted unplanned plain
+//!   or method call becomes an exact pre-effect cold exit; an attempted
+//!   unplanned site keeps the whole function on the legacy backend. Supported
+//!   catch regions become explicit exceptional CFG edges whose landing state
+//!   receives the thrown value.
 //! - All other tagged coercions/equality use declared leaf stubs; primitive
 //!   string concatenation uses the allocating stub family.
 //! - Register merges become typed block parameters. Only loop-header OSR
@@ -122,6 +125,12 @@ pub(super) enum NumericNode {
         byte_pc: u32,
         exceptional_edge: Option<u16>,
     },
+    ColdCallExit {
+        kind: NumericColdCallKind,
+        logical_pc: u32,
+        byte_pc: u32,
+        exceptional_edge: Option<u16>,
+    },
     IntegerConstant(i32),
     BooleanConstant(bool),
     Constant(f64),
@@ -176,20 +185,126 @@ pub(super) enum NumericDirectCallArguments {
     Spread(NumericValue),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NumericDirectCallKind {
     Plain,
-    Method(otter_vm::jit::JitMethodGuard),
+    Method,
     Construct,
     DerivedConstruct,
     SuperConstruct,
     DerivedSuperConstruct,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NumericColdCallKind {
+    Plain,
+    Method,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NumericDirectCallCandidate {
+    pub(super) target_index: u32,
+    pub(super) target_count: u32,
+    pub(super) guard: Option<otter_vm::jit::JitMethodGuard>,
+    pub(super) callee: otter_vm::JitDirectCallee,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct NumericDirectCallTarget {
     pub(super) kind: NumericDirectCallKind,
-    pub(super) callee: otter_vm::JitDirectCallee,
+    pub(super) candidates: Vec<NumericDirectCallCandidate>,
+}
+
+fn monomorphic_direct_call_target(
+    kind: NumericDirectCallKind,
+    callee: otter_vm::JitDirectCallee,
+) -> NumericDirectCallTarget {
+    NumericDirectCallTarget {
+        kind,
+        candidates: vec![NumericDirectCallCandidate {
+            target_index: 0,
+            target_count: 1,
+            guard: None,
+            callee,
+        }],
+    }
+}
+
+fn method_direct_call_target(
+    methods: &[otter_vm::jit::JitDirectMethod],
+) -> Option<NumericDirectCallTarget> {
+    let target_count = u32::try_from(methods.len()).ok()?;
+    if !(1..=crate::machine::MAX_MACHINE_DIRECT_METHOD_TARGETS).contains(&methods.len()) {
+        return None;
+    }
+    let mut candidates = Vec::with_capacity(methods.len());
+    for (target_index, method) in methods.iter().enumerate() {
+        if method.target_index != u32::try_from(target_index).ok()?
+            || method.target_count != target_count
+            || method.guard.method_fid != method.callee.plan.function_id
+        {
+            return None;
+        }
+        candidates.push(NumericDirectCallCandidate {
+            target_index: method.target_index,
+            target_count: method.target_count,
+            guard: Some(method.guard.clone()),
+            callee: method.callee,
+        });
+    }
+    Some(NumericDirectCallTarget {
+        kind: NumericDirectCallKind::Method,
+        candidates,
+    })
+}
+
+fn intern_direct_call_target(
+    targets: &mut Vec<NumericDirectCallTarget>,
+    target: NumericDirectCallTarget,
+) -> Option<u16> {
+    let index = targets
+        .iter()
+        .position(|candidate| *candidate == target)
+        .unwrap_or_else(|| {
+            targets.push(target);
+            targets.len() - 1
+        });
+    u16::try_from(index).ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_cold_call_exit(
+    kind: NumericColdCallKind,
+    destination: u16,
+    logical_pc: u32,
+    byte_pc: u32,
+    exceptional_edge: Option<usize>,
+    registers: &mut [RegisterState],
+    nodes: &mut Vec<NumericNode>,
+    block_nodes: &mut Vec<NumericValue>,
+    frame_states: &mut Vec<NumericFrameState>,
+    function_id: u32,
+    live_in: &[bool],
+) -> Option<()> {
+    let value = push(
+        nodes,
+        NumericNode::ColdCallExit {
+            kind,
+            logical_pc,
+            byte_pc,
+            exceptional_edge: exceptional_edge.map(u16::try_from).transpose().ok()?,
+        },
+    );
+    block_nodes.push(value);
+    push_frame_state(
+        frame_states,
+        NumericFramePoint::Node(value),
+        function_id,
+        byte_pc,
+        registers,
+        live_in,
+    );
+    write(registers, destination, RegisterState::Value(value))
 }
 
 impl NumericNode {
@@ -207,6 +322,7 @@ impl NumericNode {
             | Self::ElementStore { .. }
             | Self::TaggedStringConcat(..)
             | Self::DirectCall { .. }
+            | Self::ColdCallExit { .. }
             | Self::BlockParameter(NumericType::Tagged) => NumericType::Tagged,
             Self::IntegerConstant(..)
             | Self::TaggedToInt32(..)
@@ -1724,31 +1840,40 @@ fn lower_instruction(
             NumericNode::Constant(instruction.load_number?)
         }
         Op::Call => {
-            let target = NumericDirectCallTarget {
-                kind: NumericDirectCallKind::Plain,
-                callee: *direct_callees.get(&instruction.byte_pc)?,
-            };
             let source = read_value(registers, register(instruction, code, 1)?)?;
             let argument_count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
-            let argument_start = u16::try_from(direct_call_arguments.len()).ok()?;
-            for index in 0..argument_count {
-                direct_call_arguments.push(read_value(
+            let arguments = (0..argument_count)
+                .map(|index| read_value(registers, register(instruction, code, 3 + index)?))
+                .collect::<Option<Vec<_>>>()?;
+            let Some(callee) = direct_callees.get(&instruction.byte_pc).copied() else {
+                if instruction.call_attempted {
+                    return None;
+                }
+                return lower_cold_call_exit(
+                    NumericColdCallKind::Plain,
+                    register(instruction, code, 0)?,
+                    logical_pc,
+                    instruction.byte_pc,
+                    exceptional_edge,
                     registers,
-                    register(instruction, code, 3 + index)?,
-                )?);
-            }
-            let target_index = direct_call_targets
-                .iter()
-                .position(|candidate| *candidate == target)
-                .unwrap_or_else(|| {
-                    direct_call_targets.push(target);
-                    direct_call_targets.len() - 1
-                });
+                    nodes,
+                    block_nodes,
+                    frame_states,
+                    function_id,
+                    live_in,
+                );
+            };
+            let argument_start = u16::try_from(direct_call_arguments.len()).ok()?;
+            direct_call_arguments.extend(arguments);
+            let target = intern_direct_call_target(
+                direct_call_targets,
+                monomorphic_direct_call_target(NumericDirectCallKind::Plain, callee),
+            )?;
             let value = push(
                 nodes,
                 NumericNode::DirectCall {
                     source,
-                    target: u16::try_from(target_index).ok()?,
+                    target,
                     arguments: NumericDirectCallArguments::Fixed {
                         start: argument_start,
                         count: u8::try_from(argument_count).ok()?,
@@ -1776,15 +1901,12 @@ fn lower_instruction(
         }
         Op::New | Op::SuperConstruct => {
             let callee = *direct_constructs.get(&instruction.byte_pc)?;
-            let target = NumericDirectCallTarget {
-                kind: match (op, callee.plan.is_derived_constructor) {
-                    (Op::New, false) => NumericDirectCallKind::Construct,
-                    (Op::New, true) => NumericDirectCallKind::DerivedConstruct,
-                    (Op::SuperConstruct, false) => NumericDirectCallKind::SuperConstruct,
-                    (Op::SuperConstruct, true) => NumericDirectCallKind::DerivedSuperConstruct,
-                    _ => return None,
-                },
-                callee,
+            let kind = match (op, callee.plan.is_derived_constructor) {
+                (Op::New, false) => NumericDirectCallKind::Construct,
+                (Op::New, true) => NumericDirectCallKind::DerivedConstruct,
+                (Op::SuperConstruct, false) => NumericDirectCallKind::SuperConstruct,
+                (Op::SuperConstruct, true) => NumericDirectCallKind::DerivedSuperConstruct,
+                _ => return None,
             };
             let source = read_value(registers, register(instruction, code, 1)?)?;
             let argument_count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
@@ -1795,18 +1917,15 @@ fn lower_instruction(
                     register(instruction, code, 3 + index)?,
                 )?);
             }
-            let target_index = direct_call_targets
-                .iter()
-                .position(|candidate| *candidate == target)
-                .unwrap_or_else(|| {
-                    direct_call_targets.push(target);
-                    direct_call_targets.len() - 1
-                });
+            let target = intern_direct_call_target(
+                direct_call_targets,
+                monomorphic_direct_call_target(kind, callee),
+            )?;
             let value = push(
                 nodes,
                 NumericNode::DirectCall {
                     source,
-                    target: u16::try_from(target_index).ok()?,
+                    target,
                     arguments: NumericDirectCallArguments::Fixed {
                         start: argument_start,
                         count: u8::try_from(argument_count).ok()?,
@@ -1840,36 +1959,28 @@ fn lower_instruction(
                 }
                 _ => return None,
             };
-            let target = NumericDirectCallTarget {
-                kind: match (op, callee.plan.is_derived_constructor) {
-                    (Op::CallSpread, _) => NumericDirectCallKind::Plain,
-                    (Op::NewSpread, false) => NumericDirectCallKind::Construct,
-                    (Op::NewSpread, true) => NumericDirectCallKind::DerivedConstruct,
-                    (Op::SuperConstructSpread, false) => NumericDirectCallKind::SuperConstruct,
-                    (Op::SuperConstructSpread, true) => {
-                        NumericDirectCallKind::DerivedSuperConstruct
-                    }
-                    _ => return None,
-                },
-                callee,
+            let kind = match (op, callee.plan.is_derived_constructor) {
+                (Op::CallSpread, _) => NumericDirectCallKind::Plain,
+                (Op::NewSpread, false) => NumericDirectCallKind::Construct,
+                (Op::NewSpread, true) => NumericDirectCallKind::DerivedConstruct,
+                (Op::SuperConstructSpread, false) => NumericDirectCallKind::SuperConstruct,
+                (Op::SuperConstructSpread, true) => NumericDirectCallKind::DerivedSuperConstruct,
+                _ => return None,
             };
             let source = read_value(registers, register(instruction, code, 1)?)?;
             let arguments = NumericDirectCallArguments::Spread(read_value(
                 registers,
                 register(instruction, code, 2)?,
             )?);
-            let target_index = direct_call_targets
-                .iter()
-                .position(|candidate| *candidate == target)
-                .unwrap_or_else(|| {
-                    direct_call_targets.push(target);
-                    direct_call_targets.len() - 1
-                });
+            let target = intern_direct_call_target(
+                direct_call_targets,
+                monomorphic_direct_call_target(kind, callee),
+            )?;
             let value = push(
                 nodes,
                 NumericNode::DirectCall {
                     source,
-                    target: u16::try_from(target_index).ok()?,
+                    target,
                     arguments,
                     logical_pc,
                     byte_pc: instruction.byte_pc,
@@ -1893,39 +2004,39 @@ fn lower_instruction(
             return Some(());
         }
         Op::CallMethodValue => {
-            let methods = direct_methods.get(&instruction.byte_pc)?;
-            let [method] = methods.as_slice() else {
-                return None;
-            };
-            if method.target_count != 1 || method.target_index != 0 {
-                return None;
-            }
             let _name = instruction.const_index(code, 2)?;
-            let target = NumericDirectCallTarget {
-                kind: NumericDirectCallKind::Method(method.guard.clone()),
-                callee: method.callee,
-            };
             let source = read_value(registers, register(instruction, code, 1)?)?;
             let argument_count = usize::try_from(instruction.const_index(code, 3)?).ok()?;
-            let argument_start = u16::try_from(direct_call_arguments.len()).ok()?;
-            for index in 0..argument_count {
-                direct_call_arguments.push(read_value(
+            let arguments = (0..argument_count)
+                .map(|index| read_value(registers, register(instruction, code, 4 + index)?))
+                .collect::<Option<Vec<_>>>()?;
+            let Some(methods) = direct_methods.get(&instruction.byte_pc) else {
+                if instruction.call_attempted {
+                    return None;
+                }
+                return lower_cold_call_exit(
+                    NumericColdCallKind::Method,
+                    register(instruction, code, 0)?,
+                    logical_pc,
+                    instruction.byte_pc,
+                    exceptional_edge,
                     registers,
-                    register(instruction, code, 4 + index)?,
-                )?);
-            }
-            let target_index = direct_call_targets
-                .iter()
-                .position(|candidate| *candidate == target)
-                .unwrap_or_else(|| {
-                    direct_call_targets.push(target);
-                    direct_call_targets.len() - 1
-                });
+                    nodes,
+                    block_nodes,
+                    frame_states,
+                    function_id,
+                    live_in,
+                );
+            };
+            let target = method_direct_call_target(methods)?;
+            let argument_start = u16::try_from(direct_call_arguments.len()).ok()?;
+            direct_call_arguments.extend(arguments);
+            let target = intern_direct_call_target(direct_call_targets, target)?;
             let value = push(
                 nodes,
                 NumericNode::DirectCall {
                     source,
-                    target: u16::try_from(target_index).ok()?,
+                    target,
                     arguments: NumericDirectCallArguments::Fixed {
                         start: argument_start,
                         count: u8::try_from(argument_count).ok()?,
@@ -2571,12 +2682,83 @@ mod tests {
     use otter_bytecode::{NO_HANDLER_OFFSET, Op, Operand};
     use otter_vm::{
         JitCompileSnapshot, JitDirectCallThisMode, JitDirectCallee, JitElementAccess,
-        jit::{JitDirectCallPlan, JitTestInstruction},
+        jit::{JitDirectCallPlan, JitDirectMethod, JitMethodGuard, JitTestInstruction},
         jit_feedback::{ARITH_INT32, ArithFeedback},
         native_abi::NativeFrameKind,
     };
 
     use super::*;
+
+    fn direct_callee(function_id: u32) -> JitDirectCallee {
+        JitDirectCallee {
+            plan: JitDirectCallPlan {
+                function_id,
+                code_object_id: u64::from(function_id) + 1,
+                entry_cell: u64::from(function_id) + 2,
+                tier: NativeFrameKind::Baseline,
+                this_mode: JitDirectCallThisMode::StrictOrLexical,
+                is_derived_constructor: false,
+                generated_stack_frame_bytes: Some(0),
+                param_count: 1,
+                register_count: 2,
+                own_upvalue_count: 0,
+                inherited_upvalue_count: 0,
+            },
+            receiver_allocation: None,
+        }
+    }
+
+    fn direct_method(target_index: u32, target_count: u32, function_id: u32) -> JitDirectMethod {
+        JitDirectMethod {
+            target_index,
+            target_count,
+            guard: JitMethodGuard {
+                method_fid: function_id,
+                recv_shape: 10 + target_index,
+                proto_chain: vec![20 + target_index],
+                method_value_byte: 32 + target_index * 8,
+            },
+            callee: direct_callee(function_id),
+        }
+    }
+
+    fn call_view(method: bool) -> JitCompileSnapshot {
+        let call = if method {
+            JitTestInstruction::new(
+                Op::CallMethodValue,
+                0,
+                0,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(1),
+                    Operand::Register(1),
+                ],
+            )
+        } else {
+            JitTestInstruction::new(
+                Op::Call,
+                0,
+                0,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::ConstIndex(1),
+                    Operand::Register(1),
+                ],
+            )
+        };
+        JitCompileSnapshot::without_feedback(
+            110,
+            2,
+            3,
+            vec![
+                call,
+                JitTestInstruction::new(Op::ReturnValue, 1, 8, vec![Operand::Register(2)]),
+            ],
+        )
+    }
 
     fn catch_liveness_view() -> JitCompileSnapshot {
         let instructions = vec![
@@ -2780,6 +2962,137 @@ mod tests {
             },
         );
         view
+    }
+
+    #[test]
+    fn unseen_plain_and_method_calls_build_exact_cold_exits() {
+        for (method, expected_kind) in [
+            (false, NumericColdCallKind::Plain),
+            (true, NumericColdCallKind::Method),
+        ] {
+            let hir = NumericFunction::build(&call_view(method)).expect("cold call HIR");
+            let (cold, logical_pc, byte_pc) = hir
+                .nodes
+                .iter()
+                .enumerate()
+                .find_map(|(index, node)| match node {
+                    NumericNode::ColdCallExit {
+                        kind,
+                        logical_pc,
+                        byte_pc,
+                        ..
+                    } => Some((NumericValue(index), (*kind, *logical_pc), *byte_pc)),
+                    _ => None,
+                })
+                .map(|(value, (kind, logical_pc), byte_pc)| {
+                    assert_eq!(kind, expected_kind);
+                    (value, logical_pc, byte_pc)
+                })
+                .expect("cold call node");
+            assert_eq!((logical_pc, byte_pc), (0, 0));
+            assert!(hir.direct_call_targets.is_empty());
+            assert!(hir.direct_call_arguments.is_empty());
+
+            let state = hir
+                .frame_states
+                .iter()
+                .find(|state| state.point == NumericFramePoint::Node(cold))
+                .expect("exact pre-call state");
+            let receiver = hir
+                .nodes
+                .iter()
+                .enumerate()
+                .find_map(|(index, node)| match node {
+                    NumericNode::Parameter { register: 0, .. } => Some(NumericValue(index)),
+                    _ => None,
+                })
+                .expect("receiver parameter");
+            let argument = hir
+                .nodes
+                .iter()
+                .enumerate()
+                .find_map(|(index, node)| match node {
+                    NumericNode::Parameter { register: 1, .. } => Some(NumericValue(index)),
+                    _ => None,
+                })
+                .expect("argument parameter");
+            assert_eq!(state.slots[0], NumericFrameSlot::Value(receiver));
+            assert_eq!(state.slots[1], NumericFrameSlot::Value(argument));
+            assert_eq!(state.slots[2], NumericFrameSlot::Undefined);
+        }
+    }
+
+    #[test]
+    fn attempted_unplanned_plain_and_method_calls_reject_machine_hir() {
+        for method in [false, true] {
+            let mut view = call_view(method);
+            view.seed_call_attempted_for_test(0);
+            assert!(
+                NumericFunction::build(&view).is_none(),
+                "attempted unplanned call must keep the whole function legacy"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_plan_wins_and_complete_method_chains_are_preserved() {
+        let mut plain = call_view(false);
+        plain.seed_call_attempted_for_test(0);
+        plain.direct_callees.insert(0, direct_callee(120));
+        let hir = NumericFunction::build(&plain).expect("planned plain call HIR");
+        assert!(
+            hir.nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::DirectCall { .. }))
+        );
+        assert!(
+            hir.nodes
+                .iter()
+                .all(|node| !matches!(node, NumericNode::ColdCallExit { .. }))
+        );
+        assert_eq!(hir.direct_call_targets[0].candidates.len(), 1);
+        assert!(hir.direct_call_targets[0].candidates[0].guard.is_none());
+
+        for count in [1_u32, 2, 3, 4] {
+            let mut view = call_view(true);
+            view.seed_call_attempted_for_test(0);
+            view.direct_methods.insert(
+                0,
+                (0..count)
+                    .map(|index| direct_method(index, count, 130 + index))
+                    .collect(),
+            );
+            let hir = NumericFunction::build(&view).expect("complete method chain HIR");
+            let target = &hir.direct_call_targets[0];
+            assert_eq!(target.kind, NumericDirectCallKind::Method);
+            assert_eq!(target.candidates.len(), count as usize);
+            for (index, candidate) in target.candidates.iter().enumerate() {
+                assert_eq!(candidate.target_index, index as u32);
+                assert_eq!(candidate.target_count, count);
+                assert!(candidate.guard.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn partial_gapped_or_oversized_method_chains_reject_machine_hir() {
+        let mut wrong_function = direct_method(0, 1, 140);
+        wrong_function.guard.method_fid += 1;
+        let invalid = [
+            Vec::new(),
+            vec![direct_method(0, 2, 140)],
+            vec![direct_method(0, 2, 140), direct_method(2, 2, 141)],
+            vec![direct_method(0, 2, 140), direct_method(1, 3, 141)],
+            vec![wrong_function],
+            (0..5)
+                .map(|index| direct_method(index, 5, 140 + index))
+                .collect(),
+        ];
+        for methods in invalid {
+            let mut view = call_view(true);
+            view.direct_methods.insert(0, methods);
+            assert!(NumericFunction::build(&view).is_none());
+        }
     }
 
     #[test]

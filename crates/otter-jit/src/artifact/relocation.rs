@@ -1051,6 +1051,8 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
         } => {
             output.push(TARGET_DIRECT_CALL_ENTRY_CELL);
             put_u32(output, direct_call.target_function_id);
+            put_u32(output, direct_call.target_index);
+            put_u32(output, direct_call.target_count);
             put_u32(output, *byte_pc);
             output.push(match direct_call.call_kind {
                 DirectCallKindArtifact::Plain => 0,
@@ -1143,6 +1145,8 @@ mod tests {
                 call_kind: DirectCallKindArtifact::Plain,
                 argument_mode: DirectCallArgumentModeArtifact::Fixed,
                 target_function_id: 12,
+                target_index: 0,
+                target_count: 1,
                 target_code_object_id,
                 target_tier,
                 this_mode,
@@ -1453,6 +1457,8 @@ mod tests {
         assert_eq!(target["kind"], "directCallEntryCell");
         assert_eq!(target["bytePc"], 13);
         assert_eq!(target["directCall"]["targetFunctionId"], 12);
+        assert_eq!(target["directCall"]["targetIndex"], 0);
+        assert_eq!(target["directCall"]["targetCount"], 1);
         assert_eq!(target["directCall"]["targetCodeObjectId"], 29);
         assert_eq!(target["directCall"]["targetTier"], "optimizing");
         assert_eq!(target["directCall"]["thisMode"], "sloppyGlobal");
@@ -1482,6 +1488,19 @@ mod tests {
             ),
         );
         assert_ne!(first.normalized_code, strict_or_lexical.normalized_code);
+
+        let mut chained = direct_call_target(
+            29,
+            DirectCallTierArtifact::Optimizing,
+            DirectCallThisModeArtifact::SloppyGlobal,
+        );
+        let RelocationTarget::DirectCallEntryCell { direct_call, .. } = &mut chained else {
+            unreachable!("direct-call fixture target")
+        };
+        direct_call.target_index = 1;
+        direct_call.target_count = 4;
+        let chained = render_single(&code, 4, chained);
+        assert_ne!(first.normalized_code, chained.normalized_code);
     }
 
     #[test]

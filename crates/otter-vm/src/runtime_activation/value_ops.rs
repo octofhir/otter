@@ -455,62 +455,44 @@ impl RuntimeCall<'_> {
         vm.jit_runtime_write_barrier(&frame, object, source)
     }
 
-    /// Resolve and complete one named-property read miss.
-    #[allow(clippy::too_many_arguments)]
-    pub fn load_property(
+    /// Complete the named-property read identified by the published frame.
+    ///
+    /// The caller supplies one boxed receiver rather than register indices.
+    /// Function id, logical PC, property name, and feedback site are decoded
+    /// and validated against the immutable CodeBlock by the VM.
+    pub fn load_property_value(
         &mut self,
-        function_id: u32,
-        dst: u16,
-        object: u16,
-        name_index: u32,
-        site: usize,
-    ) -> Result<Option<crate::jit::JitPropertyIcWay>, VmError> {
+        receiver: Value,
+    ) -> Result<(Value, Option<crate::jit::JitPropertyIcWay>), VmError> {
+        let function_id = self.function_id();
+        let instruction_pc = self.pc();
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = unsafe { self.context.as_ref() };
-        let frame = self.frame.as_ptr();
-        // SAFETY: RuntimeCall owns the descriptor. Its raw slot descriptors do
-        // not borrow the materialized stack and stay scoped to this operation.
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
-        vm.jit_runtime_load_property(
-            context,
-            &mut frame,
-            stack,
-            function_id,
-            dst,
-            object,
-            name_index,
-            site,
-        )
+        vm.jit_runtime_load_property_value(stack, context, function_id, instruction_pc, receiver)
     }
 
-    /// Resolve and complete one named-property write miss.
-    #[allow(clippy::too_many_arguments)]
-    pub fn store_property(
+    /// Complete the named-property write identified by the published frame.
+    ///
+    /// Success means the complete store committed exactly once and returns an
+    /// optional inline-cache program for the compiler-owned cell.
+    pub fn store_property_value(
         &mut self,
-        function_id: u32,
-        object: u16,
-        name_index: u32,
-        source: u16,
-        site: usize,
+        receiver: Value,
+        value: Value,
     ) -> Result<Option<crate::jit::JitPropertyIcWay>, VmError> {
+        let function_id = self.function_id();
+        let instruction_pc = self.pc();
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = unsafe { self.context.as_ref() };
-        let frame = self.frame.as_ptr();
-        // SAFETY: as [`Self::load_property`].
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
-        vm.jit_runtime_store_property(
-            context,
-            &mut frame,
+        vm.jit_runtime_store_property_value(
             stack,
+            context,
             function_id,
-            object,
-            name_index,
-            source,
-            site,
+            instruction_pc,
+            receiver,
+            value,
         )
     }
 
@@ -551,11 +533,13 @@ impl RuntimeCall<'_> {
 mod tests {
     use std::ptr::NonNull;
 
-    use otter_bytecode::{BytecodeModule, Function, Instruction, Op, Operand, SourceKind};
+    use otter_bytecode::{
+        BytecodeModule, Constant, Function, Instruction, Op, Operand, SourceKind,
+    };
 
     use crate::{
         ActivationStack, ExecutionContext, Interpreter, JitElementFamily, NativeFrame,
-        NativeFrameKind, Value, VmFrameHeader, VmRuntimeActivation,
+        NativeFrameKind, Value, VmError, VmFrameHeader, VmRuntimeActivation, rooting::RootScopeExt,
     };
 
     use super::RuntimeCall;
@@ -598,6 +582,66 @@ mod tests {
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
         })
+    }
+
+    fn named_property_module() -> BytecodeModule {
+        BytecodeModule {
+            module: "runtime-value-property-test.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "propertyBoundary".to_string(),
+                locals: 4,
+                code: vec![
+                    Instruction {
+                        pc: 0,
+                        op: Op::LoadProperty,
+                        operands: vec![
+                            Operand::Register(0),
+                            Operand::Register(1),
+                            Operand::ConstIndex(0),
+                        ],
+                    },
+                    Instruction {
+                        pc: 1,
+                        op: Op::LoadProperty,
+                        operands: vec![
+                            Operand::Register(0),
+                            Operand::Register(1),
+                            Operand::ConstIndex(1),
+                        ],
+                    },
+                    Instruction {
+                        pc: 2,
+                        op: Op::StoreProperty,
+                        operands: vec![
+                            Operand::Register(1),
+                            Operand::ConstIndex(0),
+                            Operand::Register(2),
+                            Operand::Register(3),
+                        ],
+                    },
+                    Instruction {
+                        pc: 3,
+                        op: Op::ReturnUndefined,
+                        operands: Vec::new(),
+                    },
+                ]
+                .into(),
+                ..Function::default()
+            }],
+            constants: vec![
+                Constant::String {
+                    utf16: "x".encode_utf16().collect(),
+                },
+                Constant::String {
+                    utf16: "y".encode_utf16().collect(),
+                },
+            ],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        }
     }
 
     #[test]
@@ -666,5 +710,498 @@ mod tests {
             JitElementFamily::DenseFloat64
         );
         assert_eq!(code_block.feedback_epoch(), 1);
+    }
+
+    #[test]
+    fn stack_owned_named_properties_decode_and_validate_published_pc() {
+        let mut vm = Interpreter::new();
+        let context = vm.link_module(named_property_module());
+        vm.ensure_property_ic_capacity(&context);
+        let mut receiver = vm
+            .allocate_object_literal_value()
+            .expect("ordinary receiver");
+        let mut setup_roots = otter_gc::RootScope::new(&mut vm.gc_heap);
+        // SAFETY: `receiver` remains live until `setup_roots` is dropped after
+        // both potentially allocating fixture stores.
+        unsafe {
+            setup_roots.add_value(&mut receiver);
+        }
+        let object = receiver.as_object().expect("ordinary object");
+        vm.set_property(object, "x", Value::number_i32(11))
+            .expect("x fixture");
+        let object = receiver.as_object().expect("relocated ordinary object");
+        vm.set_property(object, "y", Value::number_i32(22))
+            .expect("y fixture");
+        drop(setup_roots);
+        let mut stack = ActivationStack::new();
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+        let mut registers = [
+            Value::undefined(),
+            receiver,
+            Value::number_i32(33),
+            Value::undefined(),
+        ];
+        let mut frame = NativeFrame::new(
+            VmFrameHeader {
+                function_id: 0,
+                code_block_id: 0,
+                pc: 1,
+                register_count: 4,
+                kind: NativeFrameKind::Optimizing,
+                flags: Default::default(),
+            },
+            registers.as_mut_ptr() as u64,
+            Value::function(0),
+            Value::undefined(),
+        );
+        frame.set_stack_registers();
+
+        // SAFETY: activation, frame, and register window remain live and
+        // exclusively owned for this boundary scope.
+        let mut call =
+            unsafe { RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame)) }
+                .expect("stack-owned runtime call");
+        let (y, _) = call.load_property_value(receiver).expect("pc 1 selects y");
+        assert_eq!(y.as_i32(), Some(22));
+
+        call.set_pc(0);
+        let (x, _) = call.load_property_value(receiver).expect("pc 0 selects x");
+        assert_eq!(x.as_i32(), Some(11));
+        let (_, fill) = call.load_property_value(receiver).expect("warmed x load");
+        assert!(fill.is_some(), "warmed own-data load should seed the cell");
+
+        call.set_pc(2);
+        call.store_property_value(receiver, Value::number_i32(33))
+            .expect("pc 2 selects x store");
+        assert!(
+            call.store_property_value(receiver, Value::number_i32(33))
+                .expect("warmed x store")
+                .is_some(),
+            "ordinary existing-slot store should seed the cell"
+        );
+        call.set_pc(0);
+        assert_eq!(
+            call.load_property_value(receiver)
+                .expect("updated x")
+                .0
+                .as_i32(),
+            Some(33)
+        );
+
+        call.set_pc(3);
+        assert!(matches!(
+            call.load_property_value(receiver),
+            Err(VmError::InvalidOperand)
+        ));
+    }
+
+    #[test]
+    fn named_store_boundary_publishes_canonical_inline_add_transition() {
+        let mut vm = Interpreter::new();
+        let context = vm.link_module(named_property_module());
+        vm.ensure_property_ic_capacity(&context);
+        let mut first = vm
+            .allocate_object_literal_value()
+            .expect("first ordinary receiver");
+        let mut second = {
+            let mut allocation_roots = otter_gc::RootScope::new(&mut vm.gc_heap);
+            // SAFETY: `first` outlives the scope and is re-read only after the
+            // potentially moving second allocation has rewritten this slot.
+            unsafe {
+                allocation_roots.add_value(&mut first);
+            }
+            vm.allocate_object_literal_value()
+                .expect("second ordinary receiver")
+        };
+        {
+            let mut setup_roots = otter_gc::RootScope::new(&mut vm.gc_heap);
+            // SAFETY: both locals outlive the scope and are re-read after each
+            // potentially moving shape allocation.
+            unsafe {
+                setup_roots.add_value(&mut first);
+                setup_roots.add_value(&mut second);
+            }
+            assert!(
+                vm.ordinary_set_data_property(
+                    first.as_object().expect("first object"),
+                    "anchor",
+                    Value::number_i32(1),
+                )
+                .expect("first anchor")
+            );
+            assert!(
+                vm.ordinary_set_data_property(
+                    second.as_object().expect("second object"),
+                    "anchor",
+                    Value::number_i32(2),
+                )
+                .expect("second anchor")
+            );
+            // The fixture targets the null-prototype transition program so the
+            // property key need not already be interned on `%Object.prototype%`.
+            crate::object::set_prototype(
+                first.as_object().expect("first object"),
+                vm.gc_heap_mut(),
+                None,
+            );
+            crate::object::set_prototype(
+                second.as_object().expect("second object"),
+                vm.gc_heap_mut(),
+                None,
+            );
+        }
+        let parent_shape =
+            crate::object::shape(first.as_object().expect("first object"), vm.gc_heap()).offset();
+        assert_eq!(
+            crate::object::shape(second.as_object().expect("second object"), vm.gc_heap()).offset(),
+            parent_shape,
+            "fresh peers must share the transition parent"
+        );
+
+        let mut stack = ActivationStack::new();
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+        let mut registers = [first, second, Value::undefined(), Value::undefined()];
+        let mut frame = NativeFrame::new(
+            VmFrameHeader {
+                function_id: 0,
+                code_block_id: 0,
+                pc: 2,
+                register_count: 4,
+                kind: NativeFrameKind::Optimizing,
+                flags: Default::default(),
+            },
+            registers.as_mut_ptr() as u64,
+            Value::function(0),
+            Value::undefined(),
+        );
+        frame.set_stack_registers();
+        // SAFETY: activation, frame, and both rooted locals remain live and
+        // exclusively owned for the complete boundary scope.
+        {
+            let mut call = unsafe {
+                RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame))
+            }
+            .expect("stack-owned runtime call");
+            let first_way = call
+                .store_property_value(registers[0], Value::number_i32(11))
+                .expect("first canonical transition")
+                .expect("inline transition way");
+            assert!(first_way.is_add_transition());
+            assert_eq!(first_way.receiver_shape, parent_shape);
+            assert_ne!(first_way.transition_shape, 0);
+            assert_eq!(
+                first_way.value_byte,
+                std::mem::size_of::<Value>() as u32,
+                "the transition appends after the shared anchor slot"
+            );
+
+            let second_way = call
+                .store_property_value(registers[1], Value::number_i32(22))
+                .expect("installed VM transition replay")
+                .expect("replayed transition way");
+            assert_eq!(second_way, first_way);
+        }
+        assert_eq!(
+            crate::object::get_own(
+                registers[1].as_object().expect("second object"),
+                vm.gc_heap(),
+                "x",
+            )
+            .and_then(Value::as_i32),
+            Some(22)
+        );
+    }
+
+    #[test]
+    fn named_store_default_prototype_keeps_cell_rhs_on_canonical_boundary() {
+        let mut vm = Interpreter::new();
+        let context = vm.link_module(named_property_module());
+        vm.ensure_property_ic_capacity(&context);
+        let mut first = Value::undefined();
+        let mut second = Value::undefined();
+        let mut first_rhs = Value::undefined();
+        let mut second_rhs = Value::undefined();
+        {
+            let mut setup_roots = otter_gc::RootScope::new(&mut vm.gc_heap);
+            // SAFETY: all four locals outlive the scope and are re-read only
+            // after every potentially moving object/shape allocation rewrites
+            // their exact slots.
+            unsafe {
+                setup_roots.add_value(&mut first);
+                setup_roots.add_value(&mut second);
+                setup_roots.add_value(&mut first_rhs);
+                setup_roots.add_value(&mut second_rhs);
+            }
+            first = vm
+                .allocate_object_literal_value()
+                .expect("first ordinary peer");
+            second = vm
+                .allocate_object_literal_value()
+                .expect("second ordinary peer");
+            first_rhs = vm.allocate_object_literal_value().expect("first cell RHS");
+            second_rhs = vm.allocate_object_literal_value().expect("second cell RHS");
+            assert!(
+                vm.ordinary_set_data_property(
+                    first.as_object().expect("first ordinary peer"),
+                    "anchor",
+                    Value::number_i32(1),
+                )
+                .expect("first peer anchor")
+            );
+            assert!(
+                vm.ordinary_set_data_property(
+                    second.as_object().expect("second ordinary peer"),
+                    "anchor",
+                    Value::number_i32(2),
+                )
+                .expect("second peer anchor")
+            );
+            assert!(
+                vm.ordinary_set_data_property(
+                    first_rhs.as_object().expect("first cell RHS object"),
+                    "marker",
+                    Value::number_i32(41),
+                )
+                .expect("first RHS marker")
+            );
+            assert!(
+                vm.ordinary_set_data_property(
+                    second_rhs.as_object().expect("second cell RHS object"),
+                    "marker",
+                    Value::number_i32(42),
+                )
+                .expect("second RHS marker")
+            );
+        }
+
+        let first_object = first.as_object().expect("first peer object");
+        let second_object = second.as_object().expect("second peer object");
+        let parent_shape = crate::object::shape(first_object, vm.gc_heap()).offset();
+        assert_eq!(
+            crate::object::shape(second_object, vm.gc_heap()).offset(),
+            parent_shape,
+            "fresh peers must share the default-prototype parent shape"
+        );
+        let first_prototype = crate::object::prototype(first_object, vm.gc_heap())
+            .expect("ordinary object must use Object.prototype");
+        assert_eq!(
+            crate::object::prototype(second_object, vm.gc_heap()),
+            Some(first_prototype),
+            "both peers must retain the realm's ordinary Object.prototype"
+        );
+        assert!(
+            crate::object::prototype(first_prototype, vm.gc_heap()).is_none(),
+            "Object.prototype must be the terminal direct prototype"
+        );
+
+        let mut stack = ActivationStack::new();
+        let mut registers = [first, second, first_rhs, second_rhs];
+        let mut frame = NativeFrame::new(
+            VmFrameHeader {
+                function_id: 0,
+                code_block_id: 0,
+                pc: 2,
+                register_count: 4,
+                kind: NativeFrameKind::Optimizing,
+                flags: Default::default(),
+            },
+            registers.as_mut_ptr() as u64,
+            Value::function(0),
+            Value::undefined(),
+        );
+        frame.set_stack_registers();
+        // SAFETY: `frame` and its register window remain stable and live until
+        // the matching pop after the complete RuntimeCall scope.
+        unsafe {
+            vm.jit_push_native_frame(&mut frame)
+                .expect("publish stack-owned test frame");
+        }
+        {
+            let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+            // SAFETY: the activation, published frame, and register array are
+            // exclusively owned for both transition calls.
+            let mut call = unsafe {
+                RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame))
+            }
+            .expect("stack-owned transition call");
+            let first_way = call
+                .store_property_value(registers[0], registers[2])
+                .expect("first canonical Cell store");
+            assert_eq!(
+                first_way, None,
+                "dictionary-shaped Object.prototype has no complete native absence guard"
+            );
+
+            let second_way = call
+                .store_property_value(registers[1], registers[3])
+                .expect("second canonical Cell store");
+            assert_eq!(
+                second_way, None,
+                "each default-prototype peer remains on the canonical store boundary"
+            );
+        }
+        vm.jit_pop_native_activation();
+
+        for (receiver, rhs, marker) in [
+            (registers[0], registers[2], 41),
+            (registers[1], registers[3], 42),
+        ] {
+            let stored = crate::object::get_own(
+                receiver.as_object().expect("relocated peer object"),
+                vm.gc_heap(),
+                "x",
+            )
+            .expect("transition must install x");
+            assert_eq!(stored, rhs, "transition must preserve exact Cell identity");
+            assert_eq!(
+                crate::object::get_own(
+                    stored.as_object().expect("stored Cell RHS"),
+                    vm.gc_heap(),
+                    "marker",
+                )
+                .and_then(Value::as_i32),
+                Some(marker),
+                "stored Cell payload must survive both transition paths"
+            );
+        }
+    }
+
+    #[test]
+    fn named_store_transition_encodes_direct_terminal_prototype_guard() {
+        let mut vm = Interpreter::new();
+        let context = vm.link_module(named_property_module());
+        vm.ensure_property_ic_capacity(&context);
+        let mut prototype = Value::object(
+            vm.alloc_runtime_rooted_object_with_roots(&[], &[])
+                .expect("clean terminal prototype"),
+        );
+        let mut first = Value::undefined();
+        let mut second = Value::undefined();
+        {
+            let mut allocation_roots = otter_gc::RootScope::new(&mut vm.gc_heap);
+            // SAFETY: all three slots outlive the scope and are the sole
+            // authorities re-read after each potentially moving allocation.
+            unsafe {
+                allocation_roots.add_value(&mut prototype);
+                allocation_roots.add_value(&mut first);
+                allocation_roots.add_value(&mut second);
+            }
+            first = vm
+                .allocate_object_literal_value()
+                .expect("first direct-prototype receiver");
+            second = vm
+                .allocate_object_literal_value()
+                .expect("second direct-prototype receiver");
+            let prototype = prototype.as_object().expect("prototype object");
+            crate::object::set_prototype(
+                first.as_object().expect("first object"),
+                vm.gc_heap_mut(),
+                Some(prototype),
+            );
+            crate::object::set_prototype(
+                second.as_object().expect("second object"),
+                vm.gc_heap_mut(),
+                Some(prototype),
+            );
+        }
+        let prototype_shape = crate::object::shape(
+            prototype.as_object().expect("prototype object"),
+            vm.gc_heap(),
+        )
+        .offset();
+        assert_ne!(prototype_shape, 0);
+
+        let mut stack = ActivationStack::new();
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+        let mut registers = [prototype, first, second, Value::undefined()];
+        let mut frame = NativeFrame::new(
+            VmFrameHeader {
+                function_id: 0,
+                code_block_id: 0,
+                pc: 2,
+                register_count: 4,
+                kind: NativeFrameKind::Optimizing,
+                flags: Default::default(),
+            },
+            registers.as_mut_ptr() as u64,
+            Value::function(0),
+            Value::undefined(),
+        );
+        frame.set_stack_registers();
+        // SAFETY: activation/frame/register storage outlive the boundary.
+        let mut call =
+            unsafe { RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame)) }
+                .expect("stack-owned runtime call");
+        let first_way = call
+            .store_property_value(registers[1], Value::number_i32(7))
+            .expect("first direct-prototype transition")
+            .expect("direct-prototype transition way");
+        assert!(first_way.is_add_transition());
+        assert_eq!(first_way.holder_shape, prototype_shape);
+        let second_way = call
+            .store_property_value(registers[2], Value::number_i32(9))
+            .expect("transition replay")
+            .expect("replayed direct-prototype way");
+        assert_eq!(second_way, first_way);
+    }
+
+    #[test]
+    fn strict_named_store_boundary_rejects_non_extensible_receiver() {
+        let mut vm = Interpreter::new();
+        let mut module = named_property_module();
+        module.functions[0].is_strict = true;
+        let context = vm.link_module(module);
+        vm.ensure_property_ic_capacity(&context);
+        let receiver = vm
+            .allocate_object_literal_value()
+            .expect("ordinary receiver");
+        crate::object::prevent_extensions(
+            receiver.as_object().expect("receiver object"),
+            vm.gc_heap_mut(),
+        );
+
+        let mut stack = ActivationStack::new();
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+        let mut registers = [
+            receiver,
+            Value::undefined(),
+            Value::undefined(),
+            Value::undefined(),
+        ];
+        let mut frame = NativeFrame::new(
+            VmFrameHeader {
+                function_id: 0,
+                code_block_id: 0,
+                pc: 2,
+                register_count: 4,
+                kind: NativeFrameKind::Optimizing,
+                flags: Default::default(),
+            },
+            registers.as_mut_ptr() as u64,
+            Value::function(0),
+            Value::undefined(),
+        );
+        frame.set_stack_registers();
+        // SAFETY: activation/frame/register storage outlive the boundary.
+        {
+            let mut call = unsafe {
+                RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame))
+            }
+            .expect("stack-owned runtime call");
+            assert!(
+                call.store_property_value(registers[0], Value::number_i32(1))
+                    .is_err(),
+                "strict StoreProperty must throw instead of using construction-time set"
+            );
+        }
+        assert_eq!(
+            crate::object::get_own(
+                registers[0].as_object().expect("rooted receiver"),
+                vm.gc_heap(),
+                "x",
+            ),
+            None,
+            "the rejected store must not mutate the receiver"
+        );
     }
 }

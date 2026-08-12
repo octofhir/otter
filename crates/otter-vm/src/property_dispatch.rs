@@ -82,7 +82,7 @@ impl Interpreter {
         Ok(true)
     }
 
-    fn capture_store_property_transition_with_stack_roots(
+    pub(crate) fn capture_store_property_transition_with_stack_roots(
         &mut self,
         stack: &ActivationStack,
         mut obj: JsObject,

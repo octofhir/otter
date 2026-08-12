@@ -1274,6 +1274,64 @@ impl InstructionSequence {
                 }
                 if matches!(
                     instruction.opcode,
+                    MachineOpcode::PropertyLoad { .. } | MachineOpcode::PropertyStore { .. }
+                ) {
+                    let Some((ordinary, metadata)) = instruction.operands.split_at_checked(2)
+                    else {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    };
+                    let receiver = ordinary[0];
+                    let receiver_is_tagged_location = receiver
+                        == MachineOperand::location_input(receiver.value)
+                        && self.representations[receiver.value.0 as usize]
+                            == MachineRepresentation::Tagged;
+                    let ordinary_signature = match &instruction.opcode {
+                        MachineOpcode::PropertyLoad { .. } => {
+                            let output = ordinary[1];
+                            output == MachineOperand::register_output(output.value)
+                                && self.representations[output.value.0 as usize]
+                                    == MachineRepresentation::Tagged
+                        }
+                        MachineOpcode::PropertyStore { .. } => {
+                            let value = ordinary[1];
+                            value == MachineOperand::location_input(value.value)
+                                && self.representations[value.value.0 as usize]
+                                    == MachineRepresentation::Tagged
+                        }
+                        _ => false,
+                    };
+                    let metadata_shape = metadata.iter().all(|operand| {
+                        *operand == MachineOperand::tagged_root(operand.value)
+                            || *operand == MachineOperand::deopt(operand.value)
+                    });
+                    let root_values = metadata
+                        .iter()
+                        .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
+                        .map(|operand| operand.value)
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let required_roots = match &instruction.opcode {
+                        MachineOpcode::PropertyLoad { .. } => root_values.contains(&receiver.value),
+                        MachineOpcode::PropertyStore { .. } => {
+                            root_values.contains(&receiver.value)
+                                && root_values.contains(&ordinary[1].value)
+                        }
+                        _ => false,
+                    };
+                    if !receiver_is_tagged_location
+                        || !ordinary_signature
+                        || !metadata_shape
+                        || !required_roots
+                        || instruction.clobbers
+                            != TargetRegisterFile::aarch64_scalar_call_clobbers()
+                        || instruction.deopt.is_none()
+                        || instruction.safepoint.is_none()
+                        || instruction.control != ControlFlow::None
+                    {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    }
+                }
+                if matches!(
+                    instruction.opcode,
                     MachineOpcode::ClearPackedDoubleViewCaches(..)
                 ) && (!instruction.operands.is_empty()
                     || !instruction.clobbers.is_empty()

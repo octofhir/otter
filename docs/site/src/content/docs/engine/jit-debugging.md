@@ -303,11 +303,19 @@ Scalar Machine bundles attribute direct data access with
 `machinePropertyStore` regions. Ordinary packed-double arrays instead use
 `machinePackedDoubleElementLoad` and `machinePackedDoubleElementStore`. Each
 region carries the source `bytePc`.
-Property regions execute an immutable settled shape/slot chain from the compile
-snapshot and therefore must not have a `propertyIcCell` relocation. Indexed
-element regions similarly guard the baked dense layout before the direct
-access. A load miss and every store guard miss use the exact pre-operation
-deopt state; a successful store commits once and never deoptimizes afterward.
+Property regions execute an immutable settled shape/slot chain when one is
+available, then a code-owned `propertyIcCell`, then the fixed boxed-value named
+property boundary. The cell can learn own/prototype loads, existing-slot
+stores, and guarded no-allocation add-property transitions. Transition hits
+prove the parent shape, supported prototype topology, receiver extensibility,
+and inline slot capacity before publishing the child shape and value. The
+current transition program supports null prototypes and a fast direct terminal
+prototype; dictionary-backed `%Object.prototype%` additions remain canonical.
+Success or throw commits once; named-property misses do not exact-deopt and
+replay the source operation. A property operation with a local catch stays on
+the materialized backend until Machine can commit a throw into handler SSA.
+Indexed element regions similarly guard a baked dense layout before direct
+access.
 Packed-double Array regions additionally prove the ordinary receiver's exotic
 state and exact physical storage kind. Their payload remains Float64 across the
 load, arithmetic, and store, with no adjacent Number box/decode, hole test, or

@@ -446,9 +446,19 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     generated backedges. Function entry, every OSR trampoline, and every
     external edge into the selected loop start with an empty cache. No loaded
     value or GC reference is cached.
-    Settled property regions consume immutable snapshot shape/slot chains and
-    never retain a `propertyIcCell` relocation. Guard misses reconstruct the
-    exact pre-operation frame, while a committed store has no later deopt edge.
+    Named-property regions first consume any immutable snapshot shape/slot
+    chain, then probe a code-owned `propertyIcCell`, and finally call the fixed
+    boxed-value `jit_load_property_value` / `jit_store_property_value` boundary.
+    The cell caches own/prototype loads, existing-slot stores, and guarded
+    no-allocation add-property transitions. A transition proves the parent
+    shape, complete supported prototype topology, receiver extensibility, and
+    inline slot capacity before publishing the child shape and value. The
+    current transition program covers null prototypes and a fast direct
+    terminal prototype; dictionary-backed `%Object.prototype%` additions stay
+    on the canonical store boundary. Runtime success or throw commits exactly
+    once; a property miss never deoptimizes and replays the source operation.
+    Property operations protected by a local catch remain on a materialized
+    backend until Machine committed-throw landing is available.
     Primitive-string and dense-array `.length` share the property-load region;
     unsigned lengths outside int32 exit to canonical Number boxing. A fixed
     TypedArray view over a resizable ArrayBuffer also guards its complete baked

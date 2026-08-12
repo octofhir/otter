@@ -72,9 +72,10 @@ use otter_vm::{
     native_abi::{
         RuntimeStubDescriptor, STUB_ARRAY_CONSTRUCT_ALLOC, STUB_JIT_BACKEDGE_POLL,
         STUB_JIT_BIND_DERIVED_THIS, STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_DEOPT_WRITEBACK,
-        STUB_JIT_LOAD_ELEMENT, STUB_JIT_STORE_ELEMENT, STUB_NUMBER_POW_F64_LEAF,
-        STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF, STUB_STRICT_EQ_LEAF,
-        STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF,
+        STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_PROPERTY, STUB_JIT_STORE_ELEMENT,
+        STUB_JIT_STORE_PROPERTY, STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF,
+        STUB_NUMBER_TO_INT32_F64_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CONCAT_ALLOC,
+        STUB_TO_BOOLEAN_LEAF,
     },
 };
 
@@ -91,7 +92,7 @@ use crate::{
         DirectCallArguments, DirectCallForm, DirectCallSite, GENERATED_POLL_BATCH,
         emit_direct_call_with_access, emit_method_guard_from_tagged_register,
     },
-    artifact::relocation::{RelocationCapture, RelocationTarget},
+    artifact::relocation::{PropertyIcAccess, RelocationCapture, RelocationTarget},
     entry::{
         ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET,
         ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET,
@@ -106,12 +107,14 @@ use crate::{
         OBJECT_BODY_TYPE_TAG, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THREAD_OFFSET,
         VALUE_HOLE, VALUE_NULL, VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
         VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
-        VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
+        VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET, WhiskerIcCell,
     },
     template::arm64::ic_probe::{
         DenseIndexForm, element_access_for, emit_dense_element_view, emit_element_address,
         emit_element_address_from_dense_view, emit_element_read, emit_element_write,
-        emit_exotic_length_fast, emit_settled_property_load, emit_settled_property_store_guard,
+        emit_exotic_length_fast, emit_property_ic_load, emit_property_ic_store_guard,
+        emit_property_transition_shape_barrier, emit_settled_property_load,
+        emit_settled_property_store_guard,
     },
     template::arm64::values::{
         CellTest, emit_cell_test, emit_slab_base, emit_write_barrier_with_context,
@@ -420,6 +423,10 @@ pub(super) fn emit(
     to_boolean_entry: u64,
     load_element_entry: u64,
     store_element_entry: u64,
+    load_property_entry: u64,
+    store_property_entry: u64,
+    load_ic_cells: &mut [WhiskerIcCell],
+    store_ic_cells: &mut [WhiskerIcCell],
     vm_register_count: u16,
     capture_artifacts: bool,
 ) -> Result<Emission, Unsupported> {
@@ -443,6 +450,8 @@ pub(super) fn emit(
     let mut relocations = RelocationCapture::new(capture_artifacts);
     let mut constructor_field_regions = Vec::new();
     let mut structural_regions = Vec::new();
+    let mut next_load_ic = 0usize;
+    let mut next_store_ic = 0usize;
     let block_labels = sequence
         .blocks()
         .iter()
@@ -1098,9 +1107,32 @@ pub(super) fn emit(
                 byte_pc,
                 exotic_length,
             } => {
-                let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let deopt = instruction.deopt.ok_or(Unsupported::OperandShape(
+                    "scalar property load frame state",
+                ))?;
+                let exit = deopt_runtime
+                    .exits
+                    .get(deopt.0 as usize)
+                    .ok_or(Unsupported::OperandShape("scalar property load deopt exit"))?;
+                let logical_pc = *exit
+                    .resume_pcs
+                    .first()
+                    .ok_or(Unsupported::OperandShape("scalar property load logical PC"))?;
+                let site = safepoints
+                    .site(id)
+                    .filter(|site| instruction.safepoint == Some(site.id))
+                    .ok_or(Unsupported::OperandShape("scalar property load safepoint"))?;
+                let cell_ordinal = u32::try_from(next_load_ic)
+                    .map_err(|_| Unsupported::OperandShape("scalar property load IC ordinal"))?;
+                let cell = load_ic_cells
+                    .get_mut(next_load_ic)
+                    .ok_or(Unsupported::OperandShape("scalar property load IC cell"))?;
+                let cell_addr = std::ptr::from_mut::<WhiskerIcCell>(cell) as usize;
+                next_load_ic += 1;
                 let start = ops.offset().0;
                 let done = ops.new_dynamic_label();
+                let probe_cell = ops.new_dynamic_label();
+                let runtime = ops.new_dynamic_label();
 
                 // Dense-array and primitive-string `.length` values do not
                 // live in an ordinary own-property slab, so no settled shape
@@ -1140,14 +1172,82 @@ pub(super) fn emit(
                         |ops, target| {
                             emit_load_allocated_tagged(ops, frame, locations[0], target, 0)
                         },
-                        deopt,
+                        probe_cell,
                     )?;
                     emit_store_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
-                } else {
-                    // Missing settled metadata is an ordinary speculation
-                    // miss, not a reason to discard the whole scalar body.
-                    dynasm!(ops ; .arch aarch64 ; b =>deopt);
+                    dynasm!(ops ; .arch aarch64 ; b =>done);
                 }
+
+                // A baked program is only the first way. Its miss walks the
+                // code-owned dynamic cell so a newly observed shape becomes a
+                // generated hit after one canonical runtime completion.
+                dynasm!(ops ; .arch aarch64 ; =>probe_cell);
+                if view.cage_base != 0 {
+                    emit_property_ic_load(
+                        &mut ops,
+                        &mut relocations,
+                        view,
+                        None,
+                        |ops, target| {
+                            emit_load_allocated_tagged(ops, frame, locations[0], target, 0)
+                        },
+                        cell_addr,
+                        cell_ordinal,
+                        runtime,
+                    )?;
+                    emit_store_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
+                    dynasm!(ops ; .arch aarch64 ; b =>done);
+                }
+
+                // Canonical `[[Get]]` owns every observable effect. Save and
+                // publish the exact roots only on this cold path; direct and
+                // dynamic-cell hits pay no root-spill or call overhead.
+                dynasm!(ops ; .arch aarch64 ; =>runtime);
+                emit_clear_packed_double_view_caches(&mut ops, frame)?;
+                emit_save_safepoint_roots(&mut ops, frame, site)?;
+                emit_publish_machine_roots(&mut ops, frame, site)?;
+                emit_load_safepoint_root(
+                    &mut ops,
+                    frame,
+                    site,
+                    instruction.operands[0].value,
+                    1,
+                    MACHINE_ROOT_RECORD_SIZE,
+                )?;
+                emit_load_symbolic_u64(
+                    &mut ops,
+                    &mut relocations,
+                    2,
+                    cell_addr as u64,
+                    RelocationTarget::PropertyIcCell {
+                        access: PropertyIcAccess::Load,
+                        ordinal: cell_ordinal,
+                    },
+                );
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr x16, [x19, NATIVE_FRAME_OFFSET]
+                    ; movz w15, logical_pc
+                    ; str w15, [x16, NATIVE_FRAME_PC_OFFSET]
+                    ; mov x0, x19
+                );
+                emit_load_symbolic_u64(
+                    &mut ops,
+                    &mut relocations,
+                    16,
+                    load_property_entry,
+                    RelocationTarget::runtime_stub(STUB_JIT_LOAD_PROPERTY),
+                );
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; blr x16
+                    ; mov x17, x0
+                    ; and x15, x1, #0xff
+                );
+                emit_clear_machine_roots(&mut ops);
+                emit_reload_safepoint_roots(&mut ops, frame, site)?;
+                dynasm!(ops ; .arch aarch64 ; cbnz x15, =>threw);
+                emit_store_allocated_tagged(&mut ops, frame, locations[1], 17, 0)?;
                 dynasm!(ops ; .arch aarch64 ; =>done);
                 structural_regions.push((
                     "machinePropertyLoad",
@@ -1160,8 +1260,35 @@ pub(super) fn emit(
                 byte_pc,
                 value_is_non_cell,
             } => {
-                let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let deopt = instruction.deopt.ok_or(Unsupported::OperandShape(
+                    "scalar property store frame state",
+                ))?;
+                let exit =
+                    deopt_runtime
+                        .exits
+                        .get(deopt.0 as usize)
+                        .ok_or(Unsupported::OperandShape(
+                            "scalar property store deopt exit",
+                        ))?;
+                let logical_pc = *exit.resume_pcs.first().ok_or(Unsupported::OperandShape(
+                    "scalar property store logical PC",
+                ))?;
+                let site = safepoints
+                    .site(id)
+                    .filter(|site| instruction.safepoint == Some(site.id))
+                    .ok_or(Unsupported::OperandShape("scalar property store safepoint"))?;
+                let cell_ordinal = u32::try_from(next_store_ic)
+                    .map_err(|_| Unsupported::OperandShape("scalar property store IC ordinal"))?;
+                let cell = store_ic_cells
+                    .get_mut(next_store_ic)
+                    .ok_or(Unsupported::OperandShape("scalar property store IC cell"))?;
+                let cell_addr = std::ptr::from_mut::<WhiskerIcCell>(cell) as usize;
+                next_store_ic += 1;
                 let start = ops.offset().0;
+                let probe_cell = ops.new_dynamic_label();
+                let commit = ops.new_dynamic_label();
+                let runtime = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
                 if let Some(chain) = (view.cage_base != 0)
                     .then(|| view.property_stores.get(&byte_pc))
                     .flatten()
@@ -1175,44 +1302,111 @@ pub(super) fn emit(
                         |ops, target| {
                             emit_load_allocated_tagged(ops, frame, locations[0], target, 0)
                         },
-                        deopt,
+                        probe_cell,
                     )?;
-
-                    // Selection has already boxed the value and keeps it in a
-                    // late allocator location. Nothing after this load may
-                    // deopt: every observable guard has completed.
-                    emit_load_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
-                    if value_is_non_cell {
-                        // Scalar typing survived boxing in the opcode. No bit
-                        // pattern produced by these box operations is a cell,
-                        // so the commit cannot create a traced heap edge.
-                        dynasm!(ops ; .arch aarch64 ; str x9, [x13, x17]);
-                    } else {
-                        let primitive = ops.new_dynamic_label();
-                        let committed = ops.new_dynamic_label();
-                        emit_cell_test(&mut ops, 9, 11, CellTest::IsNotCell, primitive);
-                        dynasm!(ops ; .arch aarch64 ; str x9, [x13, x17]);
-                        emit_write_barrier_with_context(
-                            &mut ops,
-                            &mut relocations,
-                            view,
-                            12,
-                            9,
-                            19,
-                        );
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; b =>committed
-                            ; =>primitive
-                            ; str x9, [x13, x17]
-                            ; =>committed
-                        );
-                    }
-                } else {
-                    // No receiver/value load and no effect precedes this exact
-                    // fallback; the interpreter re-executes StoreProperty.
-                    dynasm!(ops ; .arch aarch64 ; b =>deopt);
+                    dynasm!(ops ; .arch aarch64 ; mov w16, wzr ; b =>commit);
                 }
+
+                dynasm!(ops ; .arch aarch64 ; =>probe_cell);
+                if view.cage_base != 0 {
+                    emit_property_ic_store_guard(
+                        &mut ops,
+                        &mut relocations,
+                        view,
+                        None,
+                        |ops, target| {
+                            emit_load_allocated_tagged(ops, frame, locations[0], target, 0)
+                        },
+                        cell_addr,
+                        cell_ordinal,
+                        runtime,
+                    )?;
+                    dynasm!(ops ; .arch aarch64 ; b =>commit);
+                } else {
+                    dynasm!(ops ; .arch aarch64 ; b =>runtime);
+                }
+
+                // Both settled and dynamic-cell guards leave the same parent,
+                // slab, and slot registers. Nothing after this label may miss.
+                dynasm!(ops ; .arch aarch64 ; =>commit);
+                // x16 carries the add-transition child shape. A large stack
+                // operand may use x16 as address scratch, so save the token
+                // around value materialization and account for the SP bias.
+                dynasm!(ops ; .arch aarch64 ; str x16, [sp, #-16]!);
+                emit_load_allocated_tagged(&mut ops, frame, locations[1], 9, 16)?;
+                dynasm!(ops ; .arch aarch64 ; ldr x16, [sp], #16);
+                if value_is_non_cell {
+                    dynasm!(ops ; .arch aarch64 ; str x9, [x13, x17]);
+                    emit_property_transition_shape_barrier(&mut ops, &mut relocations, view, 19);
+                } else {
+                    let primitive = ops.new_dynamic_label();
+                    let committed = ops.new_dynamic_label();
+                    emit_cell_test(&mut ops, 9, 11, CellTest::IsNotCell, primitive);
+                    dynasm!(ops ; .arch aarch64 ; str x9, [x13, x17]);
+                    emit_property_transition_shape_barrier(&mut ops, &mut relocations, view, 19);
+                    emit_write_barrier_with_context(&mut ops, &mut relocations, view, 12, 9, 19);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; b =>committed
+                        ; =>primitive
+                        ; str x9, [x13, x17]
+                    );
+                    emit_property_transition_shape_barrier(&mut ops, &mut relocations, view, 19);
+                    dynasm!(ops ; .arch aarch64 ; =>committed);
+                }
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>runtime);
+
+                emit_clear_packed_double_view_caches(&mut ops, frame)?;
+                emit_save_safepoint_roots(&mut ops, frame, site)?;
+                emit_publish_machine_roots(&mut ops, frame, site)?;
+                emit_load_safepoint_root(
+                    &mut ops,
+                    frame,
+                    site,
+                    instruction.operands[0].value,
+                    1,
+                    MACHINE_ROOT_RECORD_SIZE,
+                )?;
+                emit_load_safepoint_root(
+                    &mut ops,
+                    frame,
+                    site,
+                    instruction.operands[1].value,
+                    2,
+                    MACHINE_ROOT_RECORD_SIZE,
+                )?;
+                emit_load_symbolic_u64(
+                    &mut ops,
+                    &mut relocations,
+                    3,
+                    cell_addr as u64,
+                    RelocationTarget::PropertyIcCell {
+                        access: PropertyIcAccess::Store,
+                        ordinal: cell_ordinal,
+                    },
+                );
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr x16, [x19, NATIVE_FRAME_OFFSET]
+                    ; movz w15, logical_pc
+                    ; str w15, [x16, NATIVE_FRAME_PC_OFFSET]
+                    ; mov x0, x19
+                );
+                emit_load_symbolic_u64(
+                    &mut ops,
+                    &mut relocations,
+                    16,
+                    store_property_entry,
+                    RelocationTarget::runtime_stub(STUB_JIT_STORE_PROPERTY),
+                );
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; blr x16
+                    ; and x15, x1, #0xff
+                );
+                emit_clear_machine_roots(&mut ops);
+                emit_reload_safepoint_roots(&mut ops, frame, site)?;
+                dynasm!(ops ; .arch aarch64 ; cbnz x15, =>threw ; =>done);
                 structural_regions.push((
                     "machinePropertyStore",
                     Some(byte_pc),
@@ -2239,6 +2433,12 @@ pub(super) fn emit(
                 frame,
             )?;
         }
+    }
+
+    if next_load_ic != load_ic_cells.len() || next_store_ic != store_ic_cells.len() {
+        return Err(Unsupported::OperandShape(
+            "scalar property IC ownership mismatch",
+        ));
     }
 
     dynasm!(ops ; .arch aarch64 ; =>bail);

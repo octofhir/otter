@@ -7,8 +7,10 @@
 //! - [`vm_ops`] — typed VM operations.
 //!
 //! # Invariants
-//! - Operands are decoded during compilation. No entry accepts a byte PC or
-//!   looks up a `CodeBlockInstruction` at runtime.
+//! - No entry accepts a byte PC. Most operands are decoded during compilation;
+//!   fixed-value named-property entries use the published function/logical-PC
+//!   identity to validate the exact `CodeBlockInstruction` and derive its
+//!   immutable property name and feedback site.
 //! - Raw metadata pointers target immutable boxed slices retained by the
 //!   active code object for the executable mapping's full lifetime.
 //! - JS values remain in the published frame window or its precise safepoint

@@ -234,6 +234,13 @@ impl CodeBlock {
             object_inline_slot_cap: crate::object::INLINE_SLOT_CAP as u32,
             object_extensible_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_EXTENSIBLE_OFFSET as u32,
+            object_shape_cache_mode_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::OBJECT_BODY_SHAPE_CACHE_MODE_OFFSET as u32,
+            object_shape_cache_fast: crate::object::SHAPE_CACHE_MODE_FAST,
+            object_slot_attrs_overridden_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::OBJECT_BODY_SLOT_ATTRS_OVERRIDDEN_OFFSET as u32,
+            object_exotic_handle_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::OBJECT_BODY_EXOTIC_HANDLE_OFFSET as u32,
             object_cell_bytes: crate::object::OBJECT_BODY_CELL_BYTES as u32,
             gc_barrier: crate::jit::JitGcBarrierLayout {
                 header_flags_byte: otter_gc::header::HEADER_FLAGS_BYTE_OFFSET as u32,
@@ -1502,6 +1509,31 @@ mod tests {
                 bound_new_target_flag: crate::closure::CLOSURE_CALL_FLAG_BOUND_NEW_TARGET,
                 runtime_setup_flags: crate::closure::CLOSURE_CALL_RUNTIME_SETUP_FLAGS,
             }
+        );
+    }
+
+    #[test]
+    fn jit_snapshot_publishes_property_semantic_guard_layout() {
+        let executable = ExecutableModule::from_bytecode(&module(function(Vec::new())));
+        let function = executable.function_arc(0).expect("function");
+        let snapshot = function.jit_compile_snapshot();
+        let header = otter_gc::header::HEADER_SIZE as u32;
+
+        assert_eq!(
+            snapshot.object_shape_cache_mode_byte,
+            header + crate::object::OBJECT_BODY_SHAPE_CACHE_MODE_OFFSET as u32
+        );
+        assert_eq!(
+            snapshot.object_shape_cache_fast,
+            crate::object::SHAPE_CACHE_MODE_FAST
+        );
+        assert_eq!(
+            snapshot.object_slot_attrs_overridden_byte,
+            header + crate::object::OBJECT_BODY_SLOT_ATTRS_OVERRIDDEN_OFFSET as u32
+        );
+        assert_eq!(
+            snapshot.object_exotic_handle_byte,
+            header + crate::object::OBJECT_BODY_EXOTIC_HANDLE_OFFSET as u32
         );
     }
 

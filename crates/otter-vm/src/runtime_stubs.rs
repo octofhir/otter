@@ -3313,6 +3313,8 @@ mod tests {
                         | crate::native_abi::RuntimeStubSignature::Variadic
                         | crate::native_abi::RuntimeStubSignature::ReentrantValue2
                         | crate::native_abi::RuntimeStubSignature::ReentrantValue3
+                        | crate::native_abi::RuntimeStubSignature::ReentrantNamedLoad
+                        | crate::native_abi::RuntimeStubSignature::ReentrantNamedStore
                 ));
             }
         }

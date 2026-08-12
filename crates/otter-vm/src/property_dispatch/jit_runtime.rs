@@ -15,48 +15,78 @@ use crate::{
     VmPropertyKey, cache_ir, object, property_atom::AtomizedPropertyKey,
     property_ic::PropertyIcKind, read_register, rooting::RootScopeExt, value_kind_name,
 };
+use otter_bytecode::Op;
+
+/// Decode one fixed named-property operation from the exact published native
+/// frame identity. Generated code supplies values only; the immutable
+/// CodeBlock remains the authority for property spelling and feedback site.
+fn named_property_site(
+    context: &ExecutionContext,
+    function_id: u32,
+    instruction_pc: u32,
+    expected_op: Op,
+) -> Result<(AtomizedPropertyKey<'_>, usize), VmError> {
+    let function = context
+        .exec_function(function_id)
+        .ok_or(VmError::InvalidOperand)?;
+    let instruction = function
+        .instr_at_index(instruction_pc as usize)
+        .ok_or(VmError::InvalidOperand)?;
+    if instruction.instruction_pc != instruction_pc || function.op(instruction) != expected_op {
+        return Err(VmError::InvalidOperand);
+    }
+    let name_operand = match expected_op {
+        Op::LoadProperty => 2,
+        Op::StoreProperty => 1,
+        _ => return Err(VmError::InvalidOperand),
+    };
+    let name_index = function
+        .const_index(instruction, name_operand)
+        .ok_or(VmError::InvalidOperand)?;
+    let key = context
+        .property_atom_for_function(function_id, name_index)
+        .ok_or(VmError::InvalidOperand)?;
+    let site = instruction
+        .property_ic_site()
+        .ok_or(VmError::InvalidOperand)?;
+    Ok((key, site))
+}
 
 impl Interpreter {
-    /// Resolve a compiled `LoadProperty` against the canonical activation.
+    /// Resolve and complete the exact published `LoadProperty` over one boxed
+    /// receiver.
     ///
-    /// Writes the result into `frame[dst]` and returns the WhiskerIC cell-fill
-    /// (`0` = no inline). Non-object, accessor, prototype, proxy, exotic, and
-    /// megamorphic misses complete through the full `[[Get]]` ladder; this
-    /// transition never requests an exact side exit.
-    ///
-    pub fn jit_runtime_load_property(
+    /// The function id and logical PC select and validate the immutable
+    /// instruction, property name, and feedback site. The receiver and result
+    /// remain rooted across IC setup, moving collection, and synchronous
+    /// accessor/proxy reentry. A successful return contains the loaded value
+    /// plus an optional WhiskerIC program; no outcome requests replay.
+    pub fn jit_runtime_load_property_value(
         &mut self,
-        context: &ExecutionContext,
-        frame: &mut crate::ActiveFrameMut<'_>,
         stack: &mut ActivationStack,
+        context: &ExecutionContext,
         function_id: u32,
-        dst: u16,
-        obj_reg: u16,
-        name_idx: u32,
-        site: usize,
-    ) -> Result<Option<crate::jit::JitPropertyIcWay>, VmError> {
+        instruction_pc: u32,
+        mut receiver: Value,
+    ) -> Result<(Value, Option<crate::jit::JitPropertyIcWay>), VmError> {
+        let (atomized_key, site) =
+            named_property_site(context, function_id, instruction_pc, Op::LoadProperty)?;
         self.record_jit_runtime_property_stub();
-        let atomized_key = context
-            .property_atom_for_function(function_id, name_idx)
-            .ok_or(VmError::InvalidOperand)?;
-        let receiver = frame.read(obj_reg)?;
+        let mut result = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: both locals precede `roots` and remain live and stationary
+        // until the complete property operation and optional cell program are
+        // produced.
+        unsafe {
+            roots.add_value(&mut receiver);
+            roots.add_value(&mut result);
+        }
         // Non-object receivers (primitives, proxies) and saturated sites
         // complete through the full resolution cascade below; the IC layers
         // only serve cache-representable ordinary-object loads.
-        let full_get = |vm: &mut Self,
-                        frame: &mut crate::ActiveFrameMut<'_>,
-                        stack: &mut ActivationStack|
-         -> Result<Option<crate::jit::JitPropertyIcWay>, VmError> {
-            // Re-read the receiver from the traced activation: the IC probes
-            // above may have allocated (cache-stub install) and moved the
-            // handle read at entry.
-            let receiver = frame.read(obj_reg)?;
-            let value = vm.load_property_value(context, stack, receiver, atomized_key.name())?;
-            frame.write(dst, value)?;
-            Ok(None)
-        };
         let Some(obj) = receiver.as_object() else {
-            return full_get(self, frame, stack);
+            result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
+            return Ok((result, None));
         };
         if self
             .feedback_directory
@@ -69,10 +99,11 @@ impl Interpreter {
             if let Some(resolved) = self.resolve_property_data_slot(obj, atomized_key) {
                 self.feedback_directory
                     .record_property_hit(PropertyIcKind::Load);
-                frame.write(dst, resolved.value)?;
-                return Ok(None);
+                result = resolved.value;
+                return Ok((result, None));
             }
-            return full_get(self, frame, stack);
+            result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
+            return Ok((result, None));
         }
         if let Some(value) =
             self.feedback_directory
@@ -85,8 +116,8 @@ impl Interpreter {
             // optimizing OSR transition). Reading the receiver after the write
             // would then inspect the loaded property value as an object.
             let fill = self.whisker_load_cell_fill(site, obj, atomized_key);
-            frame.write(dst, value)?;
-            return Ok(fill);
+            result = value;
+            return Ok((result, fill));
         }
         if self
             .feedback_directory
@@ -106,6 +137,7 @@ impl Interpreter {
         // then re-read it — the migration allocates and may relocate it.
         let mut migrating = obj;
         self.migrate_slow_to_fast(&mut migrating);
+        receiver = Value::object(migrating);
         let obj = migrating;
         if let Some(resolved) = self.resolve_property_data_slot(obj, atomized_key) {
             if self
@@ -120,62 +152,83 @@ impl Interpreter {
                 self.feedback_directory
                     .install_property_stub(site, PropertyIcKind::Load, ic);
             }
-            // `dst` may alias the receiver in an optimized register window;
-            // capture its relocated object identity before the commit.
-            let current_obj = frame
-                .read(obj_reg)?
-                .as_object()
-                .ok_or(VmError::InvalidOperand)?;
+            let current_obj = receiver.as_object().ok_or(VmError::InvalidOperand)?;
             let fill = self.whisker_load_cell_fill(site, current_obj, atomized_key);
-            frame.write(dst, resolved.value)?;
-            return Ok(fill);
+            result = resolved.value;
+            return Ok((result, fill));
         }
         // Not cache-representable (accessor, deep prototype, absent):
         // complete the load in place through the full cascade.
-        full_get(self, frame, stack)
+        result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
+        Ok((result, None))
     }
 
-    /// Canonical-activation `StoreProperty` — the
-    /// [`Self::jit_runtime_load_property`] counterpart. Resolves existing-own-data stores and ordinary shape
-    /// transitions through the current IC/data path. Every non-cacheable miss
-    /// completes through [`Self::store_property_value`], including accessors,
-    /// exotics, proxies, primitive bases, megamorphic sites, and exceptions.
+    /// Complete the exact published `StoreProperty` over boxed receiver/value
+    /// operands.
     ///
-    pub fn jit_runtime_store_property(
+    /// Instruction metadata is decoded from `function_id` and logical PC.
+    /// Both operands remain rooted across shape work, moving collection, and
+    /// setter/proxy reentry. Success means the store committed exactly once and
+    /// optionally returns an inline WhiskerIC program.
+    pub fn jit_runtime_store_property_value(
         &mut self,
-        context: &ExecutionContext,
-        frame: &mut crate::ActiveFrameMut<'_>,
         stack: &mut ActivationStack,
+        context: &ExecutionContext,
         function_id: u32,
-        obj_reg: u16,
-        name_idx: u32,
-        src: u16,
-        site: usize,
+        instruction_pc: u32,
+        mut receiver: Value,
+        mut value: Value,
     ) -> Result<Option<crate::jit::JitPropertyIcWay>, VmError> {
+        let (atomized_key, site) =
+            named_property_site(context, function_id, instruction_pc, Op::StoreProperty)?;
         self.record_jit_runtime_property_stub();
-        let atomized_key = context
-            .property_atom_for_function(function_id, name_idx)
-            .ok_or(VmError::InvalidOperand)?;
-        let receiver = frame.read(obj_reg)?;
-        let value = frame.read(src)?;
-        let full_set = |vm: &mut Self,
-                        frame: &mut crate::ActiveFrameMut<'_>,
-                        stack: &mut ActivationStack|
-         -> Result<Option<crate::jit::JitPropertyIcWay>, VmError> {
-            // Re-read both values from the published, traced window. IC setup
-            // and property-key materialisation may allocate and move either
-            // operand before the semantic slow path begins.
-            let receiver = frame.read(obj_reg)?;
-            let value = frame.read(src)?;
-            let strict = context.function_is_strict(function_id);
-            vm.store_property_value(context, stack, receiver, atomized_key.name(), value, strict)?;
-            Ok(None)
-        };
+        let strict = context.function_is_strict(function_id);
+        let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: both boxed operands outlive `roots`; the collector rewrites
+        // these exact slots before execution resumes after any moving GC.
+        unsafe {
+            roots.add_value(&mut receiver);
+            roots.add_value(&mut value);
+        }
         let Some(obj) = receiver.as_object() else {
-            return full_set(self, frame, stack);
+            self.store_property_value(
+                context,
+                stack,
+                receiver,
+                atomized_key.name(),
+                value,
+                strict,
+            )?;
+            return Ok(None);
         };
         if !object::supports_fast_property_ic(obj, &self.gc_heap) {
-            return full_set(self, frame, stack);
+            self.store_property_value(
+                context,
+                stack,
+                receiver,
+                atomized_key.name(),
+                value,
+                strict,
+            )?;
+            return Ok(None);
+        }
+        // A shape token is useful only after canonical `[[Set]]` has selected
+        // an ordinary data assignment. Inherited setters, non-writable data,
+        // proxies/exotic parents, and non-extensible receivers retain the full
+        // value-level implementation (and strict-mode throwing behavior).
+        if !matches!(
+            object::resolve_set_atomized(obj, &self.gc_heap, atomized_key),
+            object::SetOutcome::AssignData
+        ) {
+            self.store_property_value(
+                context,
+                stack,
+                receiver,
+                atomized_key.name(),
+                value,
+                strict,
+            )?;
+            return Ok(None);
         }
         if let Some(entries_len) = self
             .feedback_directory
@@ -194,10 +247,7 @@ impl Interpreter {
             ) {
                 self.feedback_directory
                     .record_property_hit(PropertyIcKind::Store);
-                let current_obj = frame
-                    .read(obj_reg)?
-                    .as_object()
-                    .ok_or(VmError::InvalidOperand)?;
+                let current_obj = receiver.as_object().ok_or(VmError::InvalidOperand)?;
                 return Ok(self.whisker_store_cell_fill(
                     site,
                     current_obj,
@@ -212,29 +262,51 @@ impl Interpreter {
                 self.feedback_directory
                     .record_property_uncached_miss(site, PropertyIcKind::Store);
             }
-            // A store IC is not authority to bypass an inherited accessor,
-            // non-writable, or exotic `[[Set]]` outcome it has no stub for.
-            // Prove the miss is an ordinary data assignment before installing.
-            let set_outcome = object::resolve_set_atomized(obj, &self.gc_heap, atomized_key);
-            if !matches!(set_outcome, object::SetOutcome::AssignData) {
-                return full_set(self, frame, stack);
-            }
-            if self
-                .feedback_directory
-                .property_is_megamorphic(site, PropertyIcKind::Store)
-                == Some(false)
-                && let Some(ic) =
-                    cache_ir::CacheStub::install_store_existing(obj, &self.gc_heap, atomized_key)
-                && ic
-                    .run_store(obj, &mut self.gc_heap, atomized_key, &value)
-                    .is_some()
+        }
+
+        // Canonical resolution above proved an ordinary data assignment. Only
+        // now may the cache install a writable existing slot or capture the
+        // first add as its authoritative transition sample; the very next peer
+        // receiver can then stay entirely in generated code.
+        let current_obj = receiver.as_object().ok_or(VmError::InvalidOperand)?;
+        if self
+            .feedback_directory
+            .property_is_megamorphic(site, PropertyIcKind::Store)
+            == Some(false)
+        {
+            if let Some(ic) = cache_ir::CacheStub::install_store_existing(
+                current_obj,
+                &self.gc_heap,
+                atomized_key,
+            ) && ic
+                .run_store(current_obj, &mut self.gc_heap, atomized_key, &value)
+                .is_some()
             {
                 self.feedback_directory
                     .install_property_stub(site, PropertyIcKind::Store, ic);
-                let current_obj = frame
-                    .read(obj_reg)?
-                    .as_object()
-                    .ok_or(VmError::InvalidOperand)?;
+                return Ok(self.whisker_store_cell_fill(
+                    site,
+                    current_obj,
+                    &self.gc_heap,
+                    atomized_key,
+                ));
+            }
+
+            // Shape interning and slab preparation may collect. The helper
+            // roots the complete stack plus receiver/value and commits the
+            // property exactly once when it returns a transition.
+            if let Some(transition) = self.capture_store_property_transition_with_stack_roots(
+                stack,
+                current_obj,
+                atomized_key,
+                &value,
+            )? {
+                self.feedback_directory.install_property_stub(
+                    site,
+                    PropertyIcKind::Store,
+                    cache_ir::CacheStub::store_transition(transition),
+                );
+                let current_obj = receiver.as_object().ok_or(VmError::InvalidOperand)?;
                 return Ok(self.whisker_store_cell_fill(
                     site,
                     current_obj,
@@ -244,12 +316,15 @@ impl Interpreter {
             }
         }
 
-        let current_obj = frame
-            .read(obj_reg)?
-            .as_object()
-            .ok_or(VmError::InvalidOperand)?;
-        let current_value = frame.read(src)?;
-        self.set_property(current_obj, atomized_key.name(), current_value)?;
+        // A rejected transition attempt may have collected while interning its
+        // child shape, so never reuse the pre-attempt raw object handle.
+        let current_obj = receiver.as_object().ok_or(VmError::InvalidOperand)?;
+        if !self.ordinary_set_data_property(current_obj, atomized_key.name(), value)? {
+            self.failed_set_result(
+                strict,
+                format!("Cannot assign to property '{}'", atomized_key.name()),
+            )?;
+        }
         Ok(None)
     }
 
@@ -563,11 +638,10 @@ impl Interpreter {
     /// This store site's cache program lowered for inline execution, or `None`
     /// to leave the access on the stub.
     ///
-    /// An add-transition store mutates the shape and grows the value slab, so
-    /// its program has no inline form and stays on the stub. The shape guard
-    /// the emitted site keeps also guarantees the slot is the writable data
-    /// slot the cache captured (a shape encodes per-slot flags and key), so the
-    /// inline write is sound.
+    /// Existing-slot programs name their guarded writable own slot. A bounded
+    /// add-transition program additionally names immutable parent/child shapes
+    /// and the complete null/direct-terminal-prototype proof; anything that may
+    /// allocate or observe user code stays on the stub.
     pub(crate) fn whisker_store_cell_fill(
         &self,
         site: usize,

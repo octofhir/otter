@@ -56,11 +56,18 @@ It already owns:
   legacy optimizing construct cost model also retains the compact canonical
   call boundary for parameter-free three-register callees, reporting the exact
   `unprofitable` lowering reason instead of a fake layout failure;
-- guarded dense indexed-element and ordinary settled own-data property loads
-  and existing-slot stores in Machine IR. Immutable mono/polymorphic snapshot
-  programs replace mutable IC cells, every guard miss deoptimizes at the exact
-  pre-operation frame state, and cell stores execute the collector barrier only
-  after all guards pass. Ordinary arrays use Empty, holey-double,
+- guarded dense indexed-element and complete miss-capable named-property loads
+  and stores in Machine IR. Property operations consume immutable settled
+  snapshot programs first, then a code-owned polymorphic cell, then one fixed
+  boxed-value canonical boundary. The cell learns own/prototype loads,
+  existing-slot stores, and guarded no-allocation add-property transitions;
+  all transition, extensibility, prototype, and capacity guards precede the
+  first mutation. This first transition program covers null prototypes and a
+  fast direct terminal prototype; the dictionary-backed bootstrap
+  `%Object.prototype%` remains on the canonical store boundary. Success or
+  throw commits exactly once without deopt replay, while local-catch sites
+  remain on the materialized backend pending an explicit committed-throw
+  landing. Ordinary arrays use Empty, holey-double,
   packed-double, and terminal tagged physical storage; Machine IR consumes only
   an immutable packed-double snapshot with exact receiver, exotic-state, and
   storage-kind guards. Packed loads produce Float64 and packed stores consume

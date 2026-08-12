@@ -2336,6 +2336,14 @@ fn lower_instruction(
         }
         Op::LoadProperty => {
             let _ = instruction.const_index(code, 2)?;
+            // A runtime-backed named-property miss can invoke getters, proxies,
+            // and user coercion before throwing. Machine landing pads do not
+            // yet reconstruct a committed exceptional state, so keep local
+            // handlers on the materialized backend instead of replaying the
+            // original operation after an observable effect.
+            if has_local_exception_handler(code, logical_pc) {
+                return None;
+            }
             let value = push(
                 nodes,
                 NumericNode::PropertyLoad {
@@ -2362,6 +2370,9 @@ fn lower_instruction(
         }
         Op::StoreProperty => {
             let _ = instruction.const_index(code, 1)?;
+            if has_local_exception_handler(code, logical_pc) {
+                return None;
+            }
             let value = push(
                 nodes,
                 NumericNode::PropertyStore {
@@ -5736,26 +5747,10 @@ mod tests {
             "LoadProperty may throw to the catch that reads the redefined value"
         );
 
-        let hir = NumericFunction::build(&view).expect("exception-aware property HIR");
-        let catch_value = hir
-            .nodes
-            .iter()
-            .position(|node| *node == NumericNode::IntegerConstant(41))
-            .map(NumericValue)
-            .expect("post-call catch-only definition");
-        let property = hir
-            .nodes
-            .iter()
-            .position(|node| matches!(node, NumericNode::PropertyLoad { .. }))
-            .map(NumericValue)
-            .expect("property load node");
-        let state = hir
-            .frame_states
-            .iter()
-            .find(|state| state.point == NumericFramePoint::Node(property))
-            .expect("exact pre-property state");
-        assert_eq!(state.slots[5], NumericFrameSlot::Value(catch_value));
-        assert_eq!(state.slots[7], NumericFrameSlot::Undefined);
+        assert!(
+            NumericFunction::build(&view).is_none(),
+            "a runtime-backed property operation inside a local catch stays on the materialized backend"
+        );
     }
 
     #[test]

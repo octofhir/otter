@@ -14,7 +14,8 @@
 //! - [`CacheOp`] — the guard/load opcodes.
 //! - [`CacheStub`] — an op sequence plus its referenced shape ids and hits.
 //! - executor entry points: [`CacheStub::run_load`], [`CacheStub::run_has`],
-//!   [`CacheStub::run_store`].
+//!   [`CacheStub::run_store`], plus [`CacheStub::lower_jit_way`] for the exact
+//!   allocation-free native subset.
 //!
 //! # Invariants
 //!
@@ -537,9 +538,12 @@ impl CacheStub {
     /// new op composition becomes inline-capable the moment its ops are
     /// individually lowerable — no new recognizer, no new emitter case.
     ///
-    /// `recv` is the live receiver the site just saw: the returned way's guard
-    /// token is its current shape, and every op is replayed against it so a
-    /// stub that no longer applies lowers to `None` instead of a wrong slot.
+    /// `recv` is the live receiver the site just saw. Existing-slot programs
+    /// guard its current shape. An add-transition program sees the receiver
+    /// after the first committed append, revalidates that child shape and its
+    /// complete prototype proof, then publishes the immutable parent/child
+    /// pair generated code needs for the next fresh receiver. A stale or
+    /// allocation-capable program lowers to `None`.
     #[must_use]
     pub(crate) fn lower_jit_way(
         &self,
@@ -585,6 +589,7 @@ impl CacheStub {
                         receiver_shape,
                         holder_shape,
                         value_byte: slot_value_byte(hit.slot),
+                        transition_shape: 0,
                     });
                 }
                 CacheOp::StoreDataSlot { obj: 0, hit } => {
@@ -596,6 +601,17 @@ impl CacheStub {
                         receiver_shape,
                         holder_shape,
                         value_byte: slot_value_byte(hit.slot),
+                        transition_shape: 0,
+                    });
+                }
+                CacheOp::StoreAddTransition { transition } => {
+                    let transition: object::LowerableStoreTransition =
+                        self.transitions[transition as usize].lowerable_add(recv, heap, key)?;
+                    return Some(crate::jit::JitPropertyIcWay {
+                        receiver_shape: transition.from_shape.offset(),
+                        holder_shape: transition.prototype_shape.offset(),
+                        value_byte: slot_value_byte(transition.slot),
+                        transition_shape: transition.to_shape.offset(),
                     });
                 }
                 // Ops with no inline lowering yet keep the site on the stub.

@@ -5,17 +5,19 @@
 //!   load/store program, including a generated Boolean existing-slot store.
 //! - One `.length` site shared by dense arrays, primitive strings, and an
 //!   ordinary settled own-data object, including a rope length beyond i32.
-//! - Accessor and unprofiled-branch misses with exact pre-effect deopt counts.
+//! - Accessor, unprofiled-branch, and oversized-length misses through the fixed
+//!   reentrant named-property boundary without source-operation replay.
 //! - An old-parent to young-child generated store followed by full collection
 //!   and reuse of the same optimized body.
 //!
 //! # Invariants
 //! - Every hot function publishes through the scalar Machine IR backend and
 //!   attributes every property region to its source bytecode PC.
-//! - Settled Machine property bodies embed immutable shape/slot programs and
-//!   never retain a mutable `propertyIcCell` relocation.
-//! - A property miss deoptimizes before its source operation: accessors fire
-//!   once, and already committed earlier property effects are never replayed.
+//! - Every Machine property site owns a stable code-object WhiskerIC cell after
+//!   its immutable snapshot program. A miss completes canonically and may fill
+//!   that cell without invalidating the generated body.
+//! - Accessors fire once, and already committed earlier property effects are
+//!   never replayed through an exact-deopt transition.
 //! - Generated cell stores preserve the collector barrier contract across
 //!   moving stress collection and later full-GC reuse.
 //!
@@ -294,6 +296,8 @@ struct FinalRun {
     completion: String,
     optimized_entries: u64,
     optimized_deopts: u64,
+    runtime_property_stubs: u64,
+    reentrant_stub_transitions: u64,
 }
 
 #[derive(Debug)]
@@ -399,11 +403,60 @@ fn assert_machine_property_artifact(
     let relocations = relocations["relocations"]
         .as_array()
         .expect("Machine property relocation entries");
-    assert!(
-        relocations
+    for (access, minimum) in [("load", minimum_loads), ("store", minimum_stores)] {
+        let matching = relocations
             .iter()
-            .all(|relocation| relocation["target"]["kind"] != "propertyIcCell"),
-        "{function_name} must not retain mutable property IC cells: {relocations:?}"
+            .filter(|relocation| {
+                relocation["target"]["kind"] == "propertyIcCell"
+                    && relocation["target"]["access"] == access
+            })
+            .count();
+        assert!(
+            matching >= minimum,
+            "{function_name} must own at least {minimum} {access} IC-cell relocations: \
+             {relocations:?}"
+        );
+    }
+    for (minimum, stub_id, stub, signature) in [
+        (
+            minimum_loads,
+            19u64,
+            "jit_load_property_value",
+            "reentrantNamedLoad",
+        ),
+        (
+            minimum_stores,
+            20u64,
+            "jit_store_property_value",
+            "reentrantNamedStore",
+        ),
+    ] {
+        if minimum > 0 {
+            assert!(
+                relocations.iter().any(|relocation| {
+                    relocation["target"]["kind"] == "runtimeStub"
+                        && relocation["target"]["id"].as_u64() == Some(stub_id)
+                        && relocation["target"]["name"] == stub
+                        && relocation["target"]["signature"] == signature
+                }),
+                "{function_name} must retain fixed stub {stub_id}:{stub}:{signature}: \
+                 {relocations:?}"
+            );
+        }
+    }
+
+    let safepoints: serde_json::Value = serde_json::from_slice(
+        bundle
+            .file(JitArtifactFileName::Safepoints)
+            .expect("Machine property safepoints")
+            .contents(),
+    )
+    .expect("valid Machine property safepoint JSON");
+    assert!(
+        safepoints["safepoints"]
+            .as_array()
+            .is_some_and(|safepoints| safepoints.len() >= minimum_loads + minimum_stores),
+        "{function_name} must publish roots for every miss-capable property site: {safepoints}"
     );
 }
 
@@ -446,6 +499,10 @@ fn run_fixture(
         completion,
         optimized_entries: after.jit_optimized_entries - before.jit_optimized_entries,
         optimized_deopts: after.jit_optimized_deopts - before.jit_optimized_deopts,
+        runtime_property_stubs: after.jit_runtime_property_stubs
+            - before.jit_runtime_property_stubs,
+        reentrant_stub_transitions: after.jit_reentrant_stub_transitions
+            - before.jit_reentrant_stub_transitions,
     }
 }
 
@@ -491,6 +548,10 @@ fn run_barrier_fixture(selection: JitSelection) -> BarrierRun {
         completion: probe_completion,
         optimized_entries: after_probe.jit_optimized_entries - before_probe.jit_optimized_entries,
         optimized_deopts: after_probe.jit_optimized_deopts - before_probe.jit_optimized_deopts,
+        runtime_property_stubs: after_probe.jit_runtime_property_stubs
+            - before_probe.jit_runtime_property_stubs,
+        reentrant_stub_transitions: after_probe.jit_reentrant_stub_transitions
+            - before_probe.jit_reentrant_stub_transitions,
     };
 
     runtime
@@ -510,6 +571,10 @@ fn run_barrier_fixture(selection: JitSelection) -> BarrierRun {
         completion: reuse_completion,
         optimized_entries: after_reuse.jit_optimized_entries - before_reuse.jit_optimized_entries,
         optimized_deopts: after_reuse.jit_optimized_deopts - before_reuse.jit_optimized_deopts,
+        runtime_property_stubs: after_reuse.jit_runtime_property_stubs
+            - before_reuse.jit_runtime_property_stubs,
+        reentrant_stub_transitions: after_reuse.jit_reentrant_stub_transitions
+            - before_reuse.jit_reentrant_stub_transitions,
     };
 
     BarrierRun { probe, reuse }
@@ -548,6 +613,14 @@ fn monomorphic_numeric_rmw_uses_machine_properties_without_deopt() {
         compiled.optimized_deopts, 0,
         "settled monomorphic property RMW must stay generated: {compiled:?}"
     );
+    assert_eq!(
+        (
+            compiled.runtime_property_stubs,
+            compiled.reentrant_stub_transitions
+        ),
+        (0, 0),
+        "the settled snapshot program must not enter its cold boundary: {compiled:?}"
+    );
 }
 
 #[test]
@@ -583,10 +656,18 @@ fn two_shape_load_store_and_boolean_existing_slot_stay_generated() {
         compiled.optimized_deopts, 0,
         "both settled shapes and the Boolean existing slot must hit: {compiled:?}"
     );
+    assert_eq!(
+        (
+            compiled.runtime_property_stubs,
+            compiled.reentrant_stub_transitions
+        ),
+        (0, 0),
+        "both prepared shapes must bypass their empty dynamic cells: {compiled:?}"
+    );
 }
 
 #[test]
-fn accessor_store_miss_deopts_before_effect_and_runs_setter_once() {
+fn accessor_miss_completes_in_place_and_runs_getter_and_setter_once() {
     let oracle = run_fixture(
         JitSelection::InterpreterOnly,
         ACCESSOR_SETUP,
@@ -615,13 +696,21 @@ fn accessor_store_miss_deopts_before_effect_and_runs_setter_once() {
         "accessor receiver must reach the generated property guard: {compiled:?}"
     );
     assert_eq!(
-        compiled.optimized_deopts, 1,
-        "the StoreProperty shape miss must be the sole pre-effect deopt: {compiled:?}"
+        compiled.optimized_deopts, 0,
+        "accessor effects must complete through the fixed boundary without replay: {compiled:?}"
+    );
+    assert_eq!(
+        compiled.runtime_property_stubs, 2,
+        "the accessor store and load must each execute one canonical boundary: {compiled:?}"
+    );
+    assert_eq!(
+        compiled.reentrant_stub_transitions, 2,
+        "the setter and getter boundaries must each reenter exactly once: {compiled:?}"
     );
 }
 
 #[test]
-fn never_taken_unprofiled_property_branch_remains_machine_and_deopts_once() {
+fn never_taken_unprofiled_property_branch_completes_once_without_deopt() {
     let oracle = run_fixture(
         JitSelection::InterpreterOnly,
         COLD_BRANCH_SETUP,
@@ -650,8 +739,16 @@ fn never_taken_unprofiled_property_branch_remains_machine_and_deopts_once() {
         "the cold branch must start in the complete Machine body: {compiled:?}"
     );
     assert_eq!(
-        compiled.optimized_deopts, 1,
-        "the first unprofiled cold property must deopt exactly once: {compiled:?}"
+        compiled.optimized_deopts, 0,
+        "the first unprofiled cold property pair must not replay through deopt: {compiled:?}"
+    );
+    assert_eq!(
+        compiled.runtime_property_stubs, 2,
+        "the cold existing-slot store and load must each complete once: {compiled:?}"
+    );
+    assert_eq!(
+        compiled.reentrant_stub_transitions, 2,
+        "both cold property operations must cross the fixed boundary once: {compiled:?}"
     );
 }
 
@@ -688,10 +785,18 @@ fn array_string_and_ordinary_object_length_share_one_machine_site() {
         compiled.optimized_deopts, 0,
         "all three .length receiver classes must stay generated: {compiled:?}"
     );
+    assert_eq!(
+        (
+            compiled.runtime_property_stubs,
+            compiled.reentrant_stub_transitions
+        ),
+        (0, 0),
+        "all prepared .length classes must bypass the cold boundary: {compiled:?}"
+    );
 }
 
 #[test]
-fn string_length_beyond_int32_deopts_without_wrapping() {
+fn string_length_beyond_int32_completes_in_place_without_wrapping() {
     let oracle = run_fixture(
         JitSelection::InterpreterOnly,
         LENGTH_SETUP,
@@ -720,8 +825,16 @@ fn string_length_beyond_int32_deopts_without_wrapping() {
         "the oversized rope must reach the Machine length guard: {compiled:?}"
     );
     assert_eq!(
-        compiled.optimized_deopts, 1,
-        "the oversized rope must deopt once for Number boxing: {compiled:?}"
+        compiled.optimized_deopts, 0,
+        "the oversized rope must use canonical Number boxing without replay: {compiled:?}"
+    );
+    assert_eq!(
+        compiled.runtime_property_stubs, 1,
+        "the oversized rope must enter the named-load boundary once: {compiled:?}"
+    );
+    assert_eq!(
+        compiled.reentrant_stub_transitions, 1,
+        "the oversized rope load must cross one reentrant boundary: {compiled:?}"
     );
 }
 
@@ -740,6 +853,14 @@ fn old_parent_young_child_store_survives_full_gc_and_machine_reuse() {
         compiled.probe.optimized_deopts, 0,
         "settled cell store and write barrier must not deopt: {compiled:?}"
     );
+    assert_eq!(
+        (
+            compiled.probe.runtime_property_stubs,
+            compiled.probe.reentrant_stub_transitions
+        ),
+        (0, 0),
+        "the settled old-to-young store must bypass the miss boundary: {compiled:?}"
+    );
 
     assert_eq!(compiled.reuse.completion, oracle.reuse.completion);
     assert_eq!(compiled.reuse.completion, r#"["young",41,true,"again",42]"#);
@@ -750,5 +871,13 @@ fn old_parent_young_child_store_survives_full_gc_and_machine_reuse() {
     assert_eq!(
         compiled.reuse.optimized_deopts, 0,
         "post-GC shape/slot guards must remain valid: {compiled:?}"
+    );
+    assert_eq!(
+        (
+            compiled.reuse.runtime_property_stubs,
+            compiled.reuse.reentrant_stub_transitions
+        ),
+        (0, 0),
+        "post-GC reuse must stay on the settled program: {compiled:?}"
     );
 }

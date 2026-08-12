@@ -166,6 +166,20 @@ pub enum RuntimeStubSignature {
     ///
     /// This is the three-value form of [`Self::ReentrantValue2`].
     ReentrantValue3 = 10,
+    /// `(jit_ctx, receiver, property_ic_cell) -> RuntimeStubResultPair`
+    /// reentrant named-property read.
+    ///
+    /// The receiver is a boxed JavaScript value. `property_ic_cell` is stable
+    /// compiler-owned metadata rather than a GC value; the published native
+    /// frame supplies the exact function and logical-PC identity from which
+    /// the VM decodes the property name and feedback site.
+    ReentrantNamedLoad = 11,
+    /// `(jit_ctx, receiver, value, property_ic_cell) -> RuntimeStubResultPair`
+    /// reentrant named-property write.
+    ///
+    /// This is the two-value store counterpart of
+    /// [`Self::ReentrantNamedLoad`].
+    ReentrantNamedStore = 12,
 }
 
 /// Safepoint requirement encoded in the descriptor.
@@ -519,25 +533,35 @@ pub const STUB_JIT_DEFINE_OWN_PROPERTY: RuntimeStubDescriptor = descriptor(
     RuntimeStubException::Status,
     RuntimeStubResultAbi::StatusWord,
 );
-/// Named-property IC miss handler over the canonical activation.
+/// Named-property read over one boxed receiver and stable IC cell.
+///
+/// Accessors, proxies, and exotic receivers may re-enter JavaScript. The
+/// published native frame identifies the exact `LoadProperty`; success returns
+/// its value and may patch the supplied cell, while failure reports one parked
+/// exception without replay.
 pub const STUB_JIT_LOAD_PROPERTY: RuntimeStubDescriptor = descriptor(
     19,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::allocating(true, true),
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::ReentrantNamedLoad,
+    1,
+    RuntimeStubEffects::reentrant(true),
     RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
+    RuntimeStubResultAbi::StatusPair,
 );
-/// Named-property store miss handler; shape transitions allocate.
+/// Named-property write over boxed receiver/value operands and a stable IC
+/// cell.
+///
+/// Shape transitions may allocate and setters or proxy traps may re-enter
+/// JavaScript. Entry commits the complete store exactly once or reports one
+/// parked exception; it never asks generated code to replay the operation.
 pub const STUB_JIT_STORE_PROPERTY: RuntimeStubDescriptor = descriptor(
     20,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::allocating(true, true),
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::ReentrantNamedStore,
+    2,
+    RuntimeStubEffects::reentrant(true),
     RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
+    RuntimeStubResultAbi::StatusPair,
 );
 /// Plain data-property define.
 pub const STUB_JIT_DEFINE_DATA_PROPERTY: RuntimeStubDescriptor = descriptor(
@@ -1508,8 +1532,8 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         16 => "jit_load_element",
         17 => "jit_store_element",
         18 => "jit_define_own_property",
-        19 => "jit_load_prop_window",
-        20 => "jit_store_prop_window",
+        19 => "jit_load_property_value",
+        20 => "jit_store_property_value",
         21 => "jit_define_data_property",
         22 => "jit_load_string",
         23 => "jit_load_builtin_error",
@@ -1705,7 +1729,9 @@ pub const fn validate_stub_descriptor(
         | RuntimeStubSignature::MutatingLeafValue3
         | RuntimeStubSignature::AllocValue3
         | RuntimeStubSignature::ReentrantValue2
-        | RuntimeStubSignature::ReentrantValue3 => {
+        | RuntimeStubSignature::ReentrantValue3
+        | RuntimeStubSignature::ReentrantNamedLoad
+        | RuntimeStubSignature::ReentrantNamedStore => {
             matches!(desc.result_abi, RuntimeStubResultAbi::StatusPair)
         }
         RuntimeStubSignature::Poll1 => {
@@ -1829,6 +1855,41 @@ mod tests {
             assert_eq!(descriptor.class, RuntimeStubClass::Reentrant);
             assert_eq!(descriptor.safepoint, RuntimeStubSafepoint::Required);
             assert_eq!(descriptor.exception, RuntimeStubException::Status);
+            assert!(descriptor.effects.contains(
+                RuntimeStubEffects::MAY_ALLOCATE
+                    | RuntimeStubEffects::MAY_TRIGGER_GC
+                    | RuntimeStubEffects::MAY_THROW
+                    | RuntimeStubEffects::MAY_REENTER_JS
+                    | RuntimeStubEffects::MAY_MUTATE_GC
+            ));
+            assert!(validate_stub_descriptor(descriptor, 0));
+            assert!(!validate_stub_descriptor(descriptor, NO_SAFEPOINT));
+        }
+    }
+
+    #[test]
+    fn named_property_entries_are_fixed_value_reentrant_status_pairs() {
+        assert_eq!(STUB_JIT_LOAD_PROPERTY.id, 19);
+        assert_eq!(
+            STUB_JIT_LOAD_PROPERTY.signature,
+            RuntimeStubSignature::ReentrantNamedLoad
+        );
+        assert_eq!(STUB_JIT_LOAD_PROPERTY.argument_count, 1);
+        assert_eq!(runtime_stub_name(19), "jit_load_property_value");
+
+        assert_eq!(STUB_JIT_STORE_PROPERTY.id, 20);
+        assert_eq!(
+            STUB_JIT_STORE_PROPERTY.signature,
+            RuntimeStubSignature::ReentrantNamedStore
+        );
+        assert_eq!(STUB_JIT_STORE_PROPERTY.argument_count, 2);
+        assert_eq!(runtime_stub_name(20), "jit_store_property_value");
+
+        for descriptor in [STUB_JIT_LOAD_PROPERTY, STUB_JIT_STORE_PROPERTY] {
+            assert_eq!(descriptor.class, RuntimeStubClass::Reentrant);
+            assert_eq!(descriptor.safepoint, RuntimeStubSafepoint::Required);
+            assert_eq!(descriptor.exception, RuntimeStubException::Status);
+            assert_eq!(descriptor.result_abi, RuntimeStubResultAbi::StatusPair);
             assert!(descriptor.effects.contains(
                 RuntimeStubEffects::MAY_ALLOCATE
                     | RuntimeStubEffects::MAY_TRIGGER_GC

@@ -156,6 +156,14 @@ a TDZ hole still enters the canonical throwing global lookup.
 Global-object records similarly retain only structural identity and the
 property slot. Generated code proves the realm epoch and dictionary shape
 before reading the live value; a mismatch uses the canonical lookup.
+Scalar Machine IR exposes these operations as `machineGlobalLexicalLoad` and
+`machineGlobalObjectLoad` code-map regions. They allocate nowhere and own no
+safepoint; TDZ, epoch, shape, or missing-slab guards instead exact-deoptimize at
+the source `LoadGlobalOrThrow` before its destination is written.
+Tagged loose comparisons with a static `null` or `undefined` operand expose a
+`machineTaggedNullishEqual` region. Immediate nullish and non-cell primitive
+cases complete without reentry; a Cell exact-deoptimizes before writing the
+Boolean result so HTMLDDA semantics remain canonical.
 For a completely generated, non-reentrant outermost loop, a
 `loopInvariantGlobalObjectLoadCache` code-map region identifies the first
 proof plus its activation-local fast reuse. The native-stack slot retains the

@@ -5,9 +5,9 @@
 //! - [`NumericBlock`] and [`NumericTerminator`] — predecessor/successor edges,
 //!   block parameters, edge arguments, branches, and returns.
 //! - [`NumericNode`] — tagged/scalar parameters, constants, captured-binding
-//!   reads, guarded coercions, ordinary properties, indexed elements,
-//!   arithmetic, comparison, typed array construction, and typed plain/method
-//!   calls.
+//!   and prepared global reads, guarded coercions, ordinary properties,
+//!   indexed elements, arithmetic, comparison, typed array construction, and
+//!   typed plain/method calls.
 //!
 //! # Invariants
 //! - Parameters remain tagged unless their uses prove a numeric representation;
@@ -27,6 +27,12 @@
 //!   window.
 //! - Captured-binding reads require the GC cage and retain an exact pre-load
 //!   frame state so an invalid spine or TDZ hole resumes canonically.
+//! - Prepared global loads retain copied lexical-cell or guarded global-object
+//!   metadata plus an exact pre-load frame state. An absent prepared target
+//!   keeps the whole function on the legacy backend.
+//! - Loose numeric equality reuses the guarded numeric path. A tagged value may
+//!   compare directly with a static nullish literal, but the node retains an
+//!   exact pre-operation state so every Cell can deopt for HTMLDDA semantics.
 //! - `ArrayConstruct` accepts only zero arguments or one exact Int32 length.
 //!   The allocating operation and any required tagged decode retain the same
 //!   exact pre-construction frame state; all wider arities stay on the legacy
@@ -87,6 +93,14 @@ pub(super) enum NumericNode {
         index: i32,
         byte_pc: u32,
     },
+    GlobalLexicalLoad {
+        byte_pc: u32,
+        target: otter_vm::jit::JitGlobalLexicalLoad,
+    },
+    GlobalObjectLoad {
+        byte_pc: u32,
+        target: otter_vm::jit::JitGlobalObjectLoad,
+    },
     BindThis {
         source: NumericValue,
         logical_pc: u32,
@@ -125,6 +139,11 @@ pub(super) enum NumericNode {
     },
     TaggedToBoolean(NumericValue),
     TaggedStrictEqual(NumericValue, NumericValue),
+    TaggedNullishEqual {
+        value: NumericValue,
+        equal: bool,
+        byte_pc: u32,
+    },
     TaggedStringConcat(NumericValue, NumericValue),
     DirectCall {
         source: NumericValue,
@@ -323,6 +342,8 @@ impl NumericNode {
             | Self::This
             | Self::ClassSuperConstructor(..)
             | Self::Upvalue { .. }
+            | Self::GlobalLexicalLoad { .. }
+            | Self::GlobalObjectLoad { .. }
             | Self::BindThis { .. }
             | Self::ConstructorFieldStore { .. }
             | Self::PropertyLoad { .. }
@@ -369,6 +390,7 @@ impl NumericNode {
             | Self::IntegerGreaterEqual(..)
             | Self::TaggedToBoolean(..)
             | Self::TaggedStrictEqual(..)
+            | Self::TaggedNullishEqual { .. }
             | Self::IntegerToBoolean(..)
             | Self::FloatToBoolean(..)
             | Self::BooleanNot(..)
@@ -639,6 +661,8 @@ impl NumericFunction {
                     &view.direct_methods,
                     &view.constructor_field_transitions,
                     &view.element_accesses,
+                    &view.global_lexical_loads,
+                    &view.global_object_loads,
                     view.cage_base != 0,
                     &mut direct_call_targets,
                     &mut direct_call_arguments,
@@ -862,7 +886,8 @@ fn infer_instruction_parameters(
         | Op::LoadInt32
         | Op::LoadNumber
         | Op::LoadThis
-        | Op::LoadUpvalue => {
+        | Op::LoadUpvalue
+        | Op::LoadGlobalOrThrow => {
             *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
         Op::GetPrototype => {
@@ -960,7 +985,7 @@ fn infer_instruction_parameters(
                 *origins.get_mut(destination)? = 0;
             }
         }
-        Op::Equal | Op::NotEqual => {
+        Op::Equal | Op::NotEqual | Op::LooseEqual | Op::LooseNotEqual => {
             let inputs =
                 read(register(instruction, code, 1)?)? | read(register(instruction, code, 2)?)?;
             if instruction.arith_feedback().is_numeric_only() {
@@ -1271,6 +1296,7 @@ fn instruction_has_implicit_exception_side_exit(op: Op) -> bool {
         op,
         Op::GetPrototype
             | Op::LoadUpvalue
+            | Op::LoadGlobalOrThrow
             | Op::BindThisValue
             | Op::LoadProperty
             | Op::StoreProperty
@@ -1299,6 +1325,8 @@ fn instruction_has_implicit_exception_side_exit(op: Op) -> bool {
             | Op::Ushr
             | Op::Equal
             | Op::NotEqual
+            | Op::LooseEqual
+            | Op::LooseNotEqual
             | Op::LessThan
             | Op::LessEq
             | Op::GreaterThan
@@ -1334,7 +1362,13 @@ fn instruction_accesses(
         | Op::LoadInt32
         | Op::LoadNumber
         | Op::LoadThis
-        | Op::LoadUpvalue => Some((Vec::new(), vec![register(instruction, code, 0)?])),
+        | Op::LoadUpvalue
+        | Op::LoadGlobalOrThrow => {
+            if instruction.op(code) == Op::LoadGlobalOrThrow {
+                let _ = instruction.const_index(code, 1)?;
+            }
+            Some((Vec::new(), vec![register(instruction, code, 0)?]))
+        }
         Op::GetPrototype => Some((
             vec![register(instruction, code, 1)?],
             vec![register(instruction, code, 0)?],
@@ -1432,6 +1466,8 @@ fn instruction_accesses(
         | Op::Ushr
         | Op::Equal
         | Op::NotEqual
+        | Op::LooseEqual
+        | Op::LooseNotEqual
         | Op::LessThan
         | Op::LessEq
         | Op::GreaterThan
@@ -1607,6 +1643,8 @@ fn lower_instruction(
         otter_vm::jit::JitConstructorFieldTransition,
     >,
     element_accesses: &rustc_hash::FxHashMap<u32, otter_vm::JitElementAccess>,
+    global_lexical_loads: &rustc_hash::FxHashMap<u32, otter_vm::jit::JitGlobalLexicalLoad>,
+    global_object_loads: &rustc_hash::FxHashMap<u32, otter_vm::jit::JitGlobalObjectLoad>,
     cage_available: bool,
     direct_call_targets: &mut Vec<NumericDirectCallTarget>,
     direct_call_arguments: &mut Vec<NumericValue>,
@@ -1634,6 +1672,38 @@ fn lower_instruction(
         Op::LoadUndefined => NumericNode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
         Op::LoadNull => NumericNode::TaggedConstant(otter_vm::Value::null().to_bits()),
         Op::LoadThis => NumericNode::This,
+        Op::LoadGlobalOrThrow => {
+            let _ = instruction.const_index(code, 1)?;
+            let node = if let Some(target) = global_lexical_loads.get(&instruction.byte_pc) {
+                NumericNode::GlobalLexicalLoad {
+                    byte_pc: instruction.byte_pc,
+                    target: *target,
+                }
+            } else if let Some(target) = global_object_loads.get(&instruction.byte_pc) {
+                NumericNode::GlobalObjectLoad {
+                    byte_pc: instruction.byte_pc,
+                    target: *target,
+                }
+            } else {
+                return None;
+            };
+            let value = push(nodes, node);
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
+            write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            )?;
+            return Some(());
+        }
         Op::LoadUpvalue => {
             if !cage_available {
                 return None;
@@ -2384,26 +2454,68 @@ fn lower_instruction(
                 NumericNode::Neg(widen_to_number(source, nodes, block_nodes)?)
             }
         }
-        Op::Equal | Op::NotEqual => {
+        Op::Equal | Op::NotEqual | Op::LooseEqual | Op::LooseNotEqual => {
             if !instruction.arith_feedback().is_numeric_only() {
                 let left = read_value(registers, register(instruction, code, 1)?)?;
                 let right = read_value(registers, register(instruction, code, 2)?)?;
-                let equal = push(nodes, NumericNode::TaggedStrictEqual(left, right));
-                block_nodes.push(equal);
-                push_frame_state(
-                    frame_states,
-                    NumericFramePoint::Node(equal),
-                    function_id,
-                    instruction.byte_pc,
-                    registers,
-                    live_in,
-                );
-                let value = if op == Op::NotEqual {
-                    let value = push(nodes, NumericNode::BooleanNot(equal));
-                    block_nodes.push(value);
-                    value
+                let value = if matches!(op, Op::Equal | Op::NotEqual) {
+                    let equal = push(nodes, NumericNode::TaggedStrictEqual(left, right));
+                    block_nodes.push(equal);
+                    push_frame_state(
+                        frame_states,
+                        NumericFramePoint::Node(equal),
+                        function_id,
+                        instruction.byte_pc,
+                        registers,
+                        live_in,
+                    );
+                    if op == Op::NotEqual {
+                        let value = push(nodes, NumericNode::BooleanNot(equal));
+                        block_nodes.push(value);
+                        value
+                    } else {
+                        equal
+                    }
                 } else {
-                    equal
+                    let left_nullish = value_is_static_nullish(nodes, left);
+                    let right_nullish = value_is_static_nullish(nodes, right);
+                    let source = match (left_nullish, right_nullish) {
+                        (true, true) => {
+                            let value =
+                                push(nodes, NumericNode::BooleanConstant(op == Op::LooseEqual));
+                            block_nodes.push(value);
+                            write(
+                                registers,
+                                register(instruction, code, 0)?,
+                                RegisterState::Value(value),
+                            )?;
+                            return Some(());
+                        }
+                        (true, false) => right,
+                        (false, true) => left,
+                        (false, false) => return None,
+                    };
+                    if value_type(nodes, source)? != NumericType::Tagged {
+                        return None;
+                    }
+                    let value = push(
+                        nodes,
+                        NumericNode::TaggedNullishEqual {
+                            value: source,
+                            equal: op == Op::LooseEqual,
+                            byte_pc: instruction.byte_pc,
+                        },
+                    );
+                    block_nodes.push(value);
+                    push_frame_state(
+                        frame_states,
+                        NumericFramePoint::Node(value),
+                        function_id,
+                        instruction.byte_pc,
+                        registers,
+                        live_in,
+                    );
+                    value
                 };
                 write(
                     registers,
@@ -2438,17 +2550,17 @@ fn lower_instruction(
                 && value_type(nodes, right)? == NumericType::Int32
             {
                 match op {
-                    Op::Equal => NumericNode::IntegerEqual(left, right),
-                    Op::NotEqual => NumericNode::IntegerNotEqual(left, right),
-                    _ => unreachable!("matched strict equality"),
+                    Op::Equal | Op::LooseEqual => NumericNode::IntegerEqual(left, right),
+                    Op::NotEqual | Op::LooseNotEqual => NumericNode::IntegerNotEqual(left, right),
+                    _ => unreachable!("matched equality"),
                 }
             } else {
                 let left = widen_to_number(left, nodes, block_nodes)?;
                 let right = widen_to_number(right, nodes, block_nodes)?;
                 match op {
-                    Op::Equal => NumericNode::Equal(left, right),
-                    Op::NotEqual => NumericNode::NotEqual(left, right),
-                    _ => unreachable!("matched strict equality"),
+                    Op::Equal | Op::LooseEqual => NumericNode::Equal(left, right),
+                    Op::NotEqual | Op::LooseNotEqual => NumericNode::NotEqual(left, right),
+                    _ => unreachable!("matched equality"),
                 }
             }
         }
@@ -2705,6 +2817,13 @@ fn value_type(nodes: &[NumericNode], value: NumericValue) -> Option<NumericType>
     nodes.get(value.0).copied().map(NumericNode::value_type)
 }
 
+fn value_is_static_nullish(nodes: &[NumericNode], value: NumericValue) -> bool {
+    let Some(NumericNode::TaggedConstant(bits)) = nodes.get(value.0) else {
+        return false;
+    };
+    *bits == otter_vm::Value::null().to_bits() || *bits == otter_vm::Value::undefined().to_bits()
+}
+
 fn to_boolean(
     value: NumericValue,
     nodes: &mut Vec<NumericNode>,
@@ -2753,8 +2872,11 @@ mod tests {
     use otter_bytecode::{NO_HANDLER_OFFSET, Op, Operand};
     use otter_vm::{
         JitCompileSnapshot, JitDirectCallThisMode, JitDirectCallee, JitElementAccess,
-        jit::{JitDirectCallPlan, JitDirectMethod, JitMethodGuard, JitTestInstruction},
-        jit_feedback::{ARITH_INT32, ArithFeedback},
+        jit::{
+            JitDirectCallPlan, JitDirectMethod, JitGlobalLexicalLoad, JitGlobalObjectLoad,
+            JitMethodGuard, JitTestInstruction,
+        },
+        jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ArithFeedback},
         native_abi::NativeFrameKind,
     };
 
@@ -2877,6 +2999,66 @@ mod tests {
                 JitTestInstruction::new(Op::ReturnValue, 2, 16, vec![Operand::Register(2)]),
             ],
         )
+    }
+
+    fn global_load_view() -> JitCompileSnapshot {
+        JitCompileSnapshot::without_feedback(
+            113,
+            1,
+            2,
+            vec![
+                JitTestInstruction::new(
+                    Op::LoadGlobalOrThrow,
+                    0,
+                    24,
+                    vec![Operand::Register(1), Operand::ConstIndex(0)],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 1, 32, vec![Operand::Register(0)]),
+            ],
+        )
+    }
+
+    fn loose_nullish_view(op: Op, literal: Op, literal_left: bool) -> JitCompileSnapshot {
+        debug_assert!(matches!(op, Op::LooseEqual | Op::LooseNotEqual));
+        debug_assert!(matches!(literal, Op::LoadNull | Op::LoadUndefined));
+        let (left, right) = if literal_left {
+            (Operand::Register(1), Operand::Register(0))
+        } else {
+            (Operand::Register(0), Operand::Register(1))
+        };
+        JitCompileSnapshot::without_feedback(
+            114,
+            1,
+            3,
+            vec![
+                JitTestInstruction::new(literal, 0, 0, vec![Operand::Register(1)]),
+                JitTestInstruction::new(op, 1, 8, vec![Operand::Register(2), left, right]),
+                JitTestInstruction::new(Op::ReturnValue, 2, 16, vec![Operand::Register(2)]),
+            ],
+        )
+    }
+
+    fn loose_numeric_view(op: Op, feedback: ArithFeedback) -> JitCompileSnapshot {
+        let mut view = JitCompileSnapshot::without_feedback(
+            115,
+            2,
+            3,
+            vec![
+                JitTestInstruction::new(
+                    op,
+                    0,
+                    24,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 1, 32, vec![Operand::Register(2)]),
+            ],
+        );
+        view.seed_arith_feedback_for_test(0, feedback);
+        view
     }
 
     fn catch_liveness_view() -> JitCompileSnapshot {
@@ -3306,6 +3488,371 @@ mod tests {
             assert_eq!(state.slots[1], NumericFrameSlot::Value(property));
             assert_eq!(state.slots[2], NumericFrameSlot::Undefined);
         }
+    }
+
+    #[test]
+    fn prepared_global_loads_build_tagged_nodes_with_exact_pre_operation_state() {
+        let lexical_target = JitGlobalLexicalLoad { cell_offset: 0x88 };
+        let object_target = JitGlobalObjectLoad {
+            shape: 0x1234,
+            dictionary: true,
+            value_byte: 40,
+            global_lexical_epoch: 9,
+        };
+
+        for lexical in [true, false] {
+            let mut view = global_load_view();
+            if lexical {
+                view.global_lexical_loads.insert(24, lexical_target);
+            } else {
+                view.global_object_loads.insert(24, object_target);
+            }
+            let hir = NumericFunction::build(&view).expect("prepared global-load HIR");
+            let global = hir
+                .nodes
+                .iter()
+                .position(|node| match node {
+                    NumericNode::GlobalLexicalLoad { byte_pc, target } => {
+                        lexical && (*byte_pc, *target) == (24, lexical_target)
+                    }
+                    NumericNode::GlobalObjectLoad { byte_pc, target } => {
+                        !lexical && (*byte_pc, *target) == (24, object_target)
+                    }
+                    _ => false,
+                })
+                .map(NumericValue)
+                .expect("copied global-load metadata");
+            assert_eq!(hir.nodes[global.0].value_type(), NumericType::Tagged);
+
+            let parameter = hir
+                .nodes
+                .iter()
+                .position(|node| {
+                    matches!(
+                        node,
+                        NumericNode::Parameter {
+                            register: 0,
+                            value_type: NumericType::Tagged
+                        }
+                    )
+                })
+                .map(NumericValue)
+                .expect("live entry parameter");
+            let state = hir
+                .frame_states
+                .iter()
+                .find(|state| state.point == NumericFramePoint::Node(global))
+                .expect("exact pre-global-load state");
+            assert_eq!(state.byte_pc, 24);
+            assert_eq!(state.slots[0], NumericFrameSlot::Value(parameter));
+            assert_eq!(state.slots[1], NumericFrameSlot::Undefined);
+        }
+    }
+
+    #[test]
+    fn global_load_requires_prepared_metadata_and_prefers_lexical_binding() {
+        let mut view = global_load_view();
+        assert!(
+            NumericFunction::build(&view).is_none(),
+            "an unprepared global load must keep the whole function legacy"
+        );
+
+        let lexical_target = JitGlobalLexicalLoad { cell_offset: 0x90 };
+        view.global_lexical_loads.insert(24, lexical_target);
+        view.global_object_loads.insert(
+            24,
+            JitGlobalObjectLoad {
+                shape: 5,
+                dictionary: false,
+                value_byte: 16,
+                global_lexical_epoch: 2,
+            },
+        );
+        let hir = NumericFunction::build(&view).expect("prepared lexical global-load HIR");
+        assert!(hir.nodes.iter().any(|node| {
+            matches!(
+                node,
+                NumericNode::GlobalLexicalLoad {
+                    byte_pc: 24,
+                    target
+                } if *target == lexical_target
+            )
+        }));
+        assert!(
+            hir.nodes
+                .iter()
+                .all(|node| !matches!(node, NumericNode::GlobalObjectLoad { .. }))
+        );
+    }
+
+    #[test]
+    fn global_load_inference_accesses_and_exception_liveness_are_exact() {
+        let view = global_load_view();
+        let code = view.code_block.as_ref();
+        let mut origins = vec![1, 2];
+        let mut int32_parameters = 0;
+        let mut number_parameters = 0;
+        infer_instruction_parameters(
+            &view.instructions[0],
+            code,
+            &mut origins,
+            &mut int32_parameters,
+            &mut number_parameters,
+        )
+        .expect("global-load inference");
+        assert_eq!(origins, [1, 0]);
+        assert_eq!(int32_parameters, 0);
+        assert_eq!(number_parameters, 0);
+        assert_eq!(
+            instruction_accesses(&view.instructions[0], code),
+            Some((Vec::new(), vec![1]))
+        );
+
+        let mut live = vec![false; 3];
+        live[1] = true;
+        let mut catch_live = vec![false; 3];
+        catch_live[0] = true;
+        catch_live[2] = true;
+        transfer_instruction_liveness(
+            &view.instructions[0],
+            code,
+            Some(InstructionExceptionHandler {
+                block: 0,
+                exception_register: 2,
+            }),
+            &[catch_live],
+            &mut live,
+        )
+        .expect("implicit global-load exception liveness");
+        assert!(instruction_has_implicit_exception_side_exit(
+            Op::LoadGlobalOrThrow
+        ));
+        assert!(live[0], "catch-only state remains live at the exact exit");
+        assert!(!live[1], "the destination is killed before the operation");
+        assert!(!live[2], "the catch supplies its exception register");
+    }
+
+    #[test]
+    fn tagged_loose_nullish_equality_keeps_direction_and_exact_pre_operation_state() {
+        for (op, equal) in [(Op::LooseEqual, true), (Op::LooseNotEqual, false)] {
+            for literal in [Op::LoadNull, Op::LoadUndefined] {
+                for literal_left in [false, true] {
+                    let hir =
+                        NumericFunction::build(&loose_nullish_view(op, literal, literal_left))
+                            .expect("tagged nullish equality HIR");
+                    let parameter = hir
+                        .nodes
+                        .iter()
+                        .position(|node| {
+                            matches!(
+                                node,
+                                NumericNode::Parameter {
+                                    register: 0,
+                                    value_type: NumericType::Tagged
+                                }
+                            )
+                        })
+                        .map(NumericValue)
+                        .expect("dynamic tagged operand");
+                    let comparison = hir
+                        .nodes
+                        .iter()
+                        .position(|node| {
+                            matches!(
+                                node,
+                                NumericNode::TaggedNullishEqual {
+                                    value,
+                                    equal: node_equal,
+                                    byte_pc: 8,
+                                } if *value == parameter && *node_equal == equal
+                            )
+                        })
+                        .map(NumericValue)
+                        .expect("direction-preserving nullish comparison");
+                    assert_eq!(hir.nodes[comparison.0].value_type(), NumericType::Boolean);
+                    let state = hir
+                        .frame_states
+                        .iter()
+                        .find(|state| state.point == NumericFramePoint::Node(comparison))
+                        .expect("exact pre-nullish-comparison state");
+                    assert_eq!(state.byte_pc, 8);
+                    assert_eq!(state.slots[0], NumericFrameSlot::Value(parameter));
+                    assert_eq!(state.slots[2], NumericFrameSlot::Undefined);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn two_static_nullish_operands_fold_without_an_htmldda_exit() {
+        for (op, expected) in [(Op::LooseEqual, true), (Op::LooseNotEqual, false)] {
+            let view = JitCompileSnapshot::without_feedback(
+                118,
+                0,
+                3,
+                vec![
+                    JitTestInstruction::new(Op::LoadNull, 0, 0, vec![Operand::Register(0)]),
+                    JitTestInstruction::new(Op::LoadUndefined, 1, 8, vec![Operand::Register(1)]),
+                    JitTestInstruction::new(
+                        op,
+                        2,
+                        16,
+                        vec![
+                            Operand::Register(2),
+                            Operand::Register(0),
+                            Operand::Register(1),
+                        ],
+                    ),
+                    JitTestInstruction::new(Op::ReturnValue, 3, 24, vec![Operand::Register(2)]),
+                ],
+            );
+            let hir = NumericFunction::build(&view).expect("constant nullish equality HIR");
+            assert!(hir.nodes.contains(&NumericNode::BooleanConstant(expected)));
+            assert!(
+                hir.nodes
+                    .iter()
+                    .all(|node| !matches!(node, NumericNode::TaggedNullishEqual { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn loose_numeric_equality_reuses_integer_and_float_comparison_nodes() {
+        for op in [Op::LooseEqual, Op::LooseNotEqual] {
+            let int_hir = NumericFunction::build(&loose_numeric_view(
+                op,
+                ArithFeedback::from_bits(ARITH_INT32),
+            ))
+            .expect("Int32 loose equality HIR");
+            assert!(int_hir.nodes.iter().any(|node| match *node {
+                NumericNode::IntegerEqual(left, right) if op == Op::LooseEqual => {
+                    int_hir.nodes[left.0].value_type() == NumericType::Int32
+                        && int_hir.nodes[right.0].value_type() == NumericType::Int32
+                }
+                NumericNode::IntegerNotEqual(left, right) if op == Op::LooseNotEqual => {
+                    int_hir.nodes[left.0].value_type() == NumericType::Int32
+                        && int_hir.nodes[right.0].value_type() == NumericType::Int32
+                }
+                _ => false,
+            }));
+
+            let float_hir = NumericFunction::build(&loose_numeric_view(
+                op,
+                ArithFeedback::from_bits(ARITH_INT32 | ARITH_FLOAT64),
+            ))
+            .expect("Float64 loose equality HIR");
+            assert!(float_hir.nodes.iter().any(|node| match *node {
+                NumericNode::Equal(left, right) if op == Op::LooseEqual => {
+                    float_hir.nodes[left.0].value_type() == NumericType::Number
+                        && float_hir.nodes[right.0].value_type() == NumericType::Number
+                }
+                NumericNode::NotEqual(left, right) if op == Op::LooseNotEqual => {
+                    float_hir.nodes[left.0].value_type() == NumericType::Number
+                        && float_hir.nodes[right.0].value_type() == NumericType::Number
+                }
+                _ => false,
+            }));
+        }
+    }
+
+    #[test]
+    fn loose_equality_declines_coercive_and_malformed_shapes() {
+        let generic = JitCompileSnapshot::without_feedback(
+            116,
+            2,
+            3,
+            vec![
+                JitTestInstruction::new(
+                    Op::LooseEqual,
+                    0,
+                    0,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 1, 8, vec![Operand::Register(2)]),
+            ],
+        );
+        assert!(
+            NumericFunction::build(&generic).is_none(),
+            "generic tagged equality requires coercion and must stay legacy"
+        );
+
+        for operands in [
+            vec![
+                Operand::Register(9),
+                Operand::Register(0),
+                Operand::Register(1),
+            ],
+            vec![
+                Operand::Register(2),
+                Operand::Register(9),
+                Operand::Register(1),
+            ],
+            vec![
+                Operand::Register(2),
+                Operand::Register(0),
+                Operand::Register(9),
+            ],
+        ] {
+            let malformed = JitCompileSnapshot::without_feedback(
+                117,
+                2,
+                3,
+                vec![
+                    JitTestInstruction::new(Op::LooseNotEqual, 0, 0, operands),
+                    JitTestInstruction::new(Op::ReturnValue, 1, 8, vec![Operand::Register(2)]),
+                ],
+            );
+            assert!(NumericFunction::build(&malformed).is_none());
+        }
+    }
+
+    #[test]
+    fn loose_equality_accesses_and_exception_liveness_are_exact() {
+        let view = loose_nullish_view(Op::LooseEqual, Op::LoadNull, false);
+        let code = view.code_block.as_ref();
+        let comparison = &view.instructions[1];
+        let mut origins = vec![1, 2, 4];
+        let mut int32_parameters = 0;
+        let mut number_parameters = 0;
+        infer_instruction_parameters(
+            comparison,
+            code,
+            &mut origins,
+            &mut int32_parameters,
+            &mut number_parameters,
+        )
+        .expect("loose-equality inference");
+        assert_eq!(origins, [1, 2, 0]);
+        assert_eq!(
+            instruction_accesses(comparison, code),
+            Some((vec![0, 1], vec![2]))
+        );
+
+        let mut live = vec![false; 5];
+        live[2] = true;
+        let mut catch_live = vec![false; 5];
+        catch_live[3] = true;
+        catch_live[4] = true;
+        transfer_instruction_liveness(
+            comparison,
+            code,
+            Some(InstructionExceptionHandler {
+                block: 0,
+                exception_register: 3,
+            }),
+            &[catch_live],
+            &mut live,
+        )
+        .expect("implicit loose-equality exception liveness");
+        assert!(instruction_has_implicit_exception_side_exit(Op::LooseEqual));
+        assert!(live[0] && live[1], "both operands are ordinary reads");
+        assert!(!live[2], "destination is killed before the operation");
+        assert!(!live[3], "the catch supplies its exception register");
+        assert!(live[4], "catch-only state survives the exact deopt exit");
     }
 
     #[test]
